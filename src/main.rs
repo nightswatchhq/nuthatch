@@ -167,7 +167,8 @@ async fn main() -> Result<()> {
                 publish::run_sync(std::path::Path::new(&a.dir), &a.target, a.dry_run).await
             }
             cli::PublishWhat::Verify(a) => {
-                publish::run_verify(std::path::Path::new(&a.dir), &a.target, a.deep).await
+                publish::run_verify(std::path::Path::new(&a.dir), &a.target, a.deep, a.etag_md5)
+                    .await
             }
             cli::PublishWhat::Status(a) => {
                 publish::run_status(std::path::Path::new(&a.dir), &a.target).await

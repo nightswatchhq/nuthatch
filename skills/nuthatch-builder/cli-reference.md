@@ -137,6 +137,7 @@ Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width,
 - `--json` - Print one JSON object per endpoint on stdout (no prose). The live-endpoints gate keys on these fields, not on the wording of the human report (#716)
 - `--catalogue` - Check the segment catalogue in `--dir`: every entry's file exists and hashes. Does not quarantine (that is startup). Exit 1 if anything disagrees. With `--json` and no `--rpc`, stdout is the catalogue check only, so the live-endpoints gate is unchanged
 - `--publish <PUBLISH>` - Check the mirror of the nest in `--dir` at this target, as `publish verify` does without `--deep`. Exit 1 if an object is missing, differs, or cannot be content-checked
+- `--publish-etag-md5` - For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use `publish verify --deep` otherwise
 
 ## `nuthatch init`
 
@@ -328,6 +329,7 @@ Check every published file's size and ETag against the local segment
 - `--target <TARGET>` - The prefix `publish sync` wrote to
 - `--dir <DIR>` - Nest directory
 - `--deep` - Re-download and re-hash every object
+- `--etag-md5` - For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use --deep otherwise
 
 ## `nuthatch recipe`
 

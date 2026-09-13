@@ -1081,11 +1081,13 @@ Five consecutive failures on the same object set `nuthatch_publish_dead_letter` 
 tenfold until one succeeds. A runtime directory publishes per mount instead, from `[mounts.publish]`
 in `mounts.toml`, and refuses `--publish-target`. `nuthatch publish status --target <target>` prints
 the target, local and remote `sealed_through`, and the segments and bytes still to upload, and writes
-nothing. `nuthatch doctor --publish <target>` checks every object's size and ETag against the local
-segment, so an object replaced by hand fails it even at the same size. On SSE-KMS and other stores
-whose ETag is not an MD5 of the bytes that check fails closed rather than passing, and
-`nuthatch publish verify --deep`, which downloads and re-hashes, is the check for them. `/_admin/`
-shows each publishing nest's target, lag and last success.
+nothing. `nuthatch doctor --publish <target>` checks every object against the local segment, so an
+object replaced by hand fails it even at the same size: a filesystem mirror is hashed, and a bucket's
+ETags are compared only with `--publish-etag-md5` (`--etag-md5` on `publish verify`), which is right
+when the store's ETag is the MD5 of the object, as on AWS S3 without SSE-KMS or SSE-C and on MinIO.
+Without it a bucket fails closed as not content-checked, and on any other store
+`nuthatch publish verify --deep`, which downloads and re-hashes, is the check. `/_admin/` shows each
+publishing nest's target, lag and last success.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 

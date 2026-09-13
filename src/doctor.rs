@@ -376,8 +376,8 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
     let mut publish_bad = false;
     if let Some(target) = &args.publish {
         println!("publish    {target}");
-        match crate::publish::verify(dir, target, false).await {
-            Ok(n) => println!("  {n} object(s) match by size and ETag"),
+        match crate::publish::verify(dir, target, false, args.publish_etag_md5).await {
+            Ok(n) => println!("  {n} object(s) match the local segments"),
             Err(e) => {
                 println!("  FAILED {e:#}");
                 publish_bad = true;
@@ -846,6 +846,7 @@ abi = "abis/busiest.json"
             json: false,
             catalogue: false,
             publish: None,
+            publish_etag_md5: false,
         })
         .await
         .unwrap();
@@ -912,6 +913,7 @@ abi = "abis/second.json"
             json: false,
             catalogue: false,
             publish: None,
+            publish_etag_md5: false,
         })
         .await
         .unwrap();
@@ -952,6 +954,7 @@ abi = "abis/second.json"
             json: true,
             catalogue: true,
             publish: None,
+            publish_etag_md5: false,
         })
         .await
         .unwrap();

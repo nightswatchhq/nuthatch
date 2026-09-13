@@ -60,6 +60,11 @@ trait Mirror: Send + Sync {
     async fn head_content(&self, key: &str) -> Result<Option<Head>> {
         self.head(key).await
     }
+    /// Whether [`Mirror::head_content`]'s ETag is computed from the bytes, rather than whatever a
+    /// store chose to send, which only the operator can vouch for.
+    fn content_etags(&self) -> bool {
+        false
+    }
 }
 
 struct FsMirror {
@@ -130,6 +135,10 @@ impl Mirror for FsMirror {
             e_tag: Some(s3_etag(&self.path(key))?),
             ..head
         }))
+    }
+
+    fn content_etags(&self) -> bool {
+        true
     }
 }
 
@@ -707,9 +716,10 @@ pub async fn sync_with(
     })
 }
 
-/// HEAD every published file, comparing its size and ETag with the local segment, and return how many
-/// were checked. `--deep` downloads and re-hashes instead of trusting the ETag.
-pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<usize> {
+/// HEAD every published file, comparing its size and, on a filesystem or when `etag_md5` declares the
+/// store's ETags content MD5s, its ETag with the local segment. Returns how many were checked. `deep`
+/// downloads and re-hashes instead, ignoring `etag_md5`.
+pub async fn verify(dir: &Path, target: &str, deep: bool, etag_md5: bool) -> Result<usize> {
     let local = seal::load_manifest(dir)?;
     let (data_identity, nid, bundle_hash, chain_id) = identity_of(dir)?;
     let mirror = open_mirror(target)?;
@@ -774,6 +784,8 @@ pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<usize> {
         }
     }
     let mut unverified = Vec::new();
+    // A store's ETag semantics are not visible over HEAD, so only the operator can say they are MD5s.
+    let compare = etag_md5 || mirror.content_etags();
     for (table, seg) in &want {
         let key = prefix(&parquet_key(table, &seg.hash));
         let head = if deep {
@@ -803,7 +815,7 @@ pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<usize> {
             }
             continue;
         }
-        match head.e_tag.filter(|t| is_md5_etag(t)) {
+        match head.e_tag.filter(|t| compare && is_md5_etag(t)) {
             Some(remote) => {
                 let expected = s3_etag(&src)?;
                 if !remote.eq_ignore_ascii_case(&expected) {
@@ -819,9 +831,17 @@ pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<usize> {
         }
     }
     if let Some(first) = unverified.first() {
+        if etag_md5 {
+            bail!(
+                "{} object(s) match by size but the store gave them no MD5 ETag to compare \
+                 (first: {first}); run --deep to compare the bytes",
+                unverified.len()
+            );
+        }
         bail!(
-            "{} object(s) could not be content-checked, because the store gives them no MD5 ETag \
-             (first: {first}); sizes match, run with --deep to compare the bytes",
+            "{} object(s) match by size but were not content-checked (first: {first}): pass \
+             --etag-md5 if this store's ETags are the MD5 of each object, or run --deep to compare \
+             the bytes",
             unverified.len()
         );
     }
@@ -926,8 +946,8 @@ pub async fn run_sync(dir: &Path, target: &str, dry_run: bool) -> Result<()> {
 }
 
 /// `nuthatch publish verify`.
-pub async fn run_verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
-    let objects = verify(dir, target, deep).await?;
+pub async fn run_verify(dir: &Path, target: &str, deep: bool, etag_md5: bool) -> Result<()> {
+    let objects = verify(dir, target, deep, etag_md5).await?;
     println!("ok, {objects} object(s)");
     Ok(())
 }
@@ -1279,6 +1299,9 @@ mod tests {
         }
         async fn head_content(&self, key: &str) -> Result<Option<Head>> {
             self.0.head_content(key).await
+        }
+        fn content_etags(&self) -> bool {
+            self.0.content_etags()
         }
     }
 
@@ -1725,7 +1748,7 @@ abi = "abis/usdc.json"
             "missing object must be put again, got {:?}",
             second.uploaded
         );
-        verify(nest.path(), target, false).await.unwrap();
+        verify(nest.path(), target, false, false).await.unwrap();
     }
 
     #[tokio::test]
@@ -1763,7 +1786,7 @@ abi = "abis/usdc.json"
             !report.uploaded.iter().any(|k| k.ends_with(".parquet")),
             "a provisional segment must not be published"
         );
-        verify(dir.path(), mirror.path().to_str().unwrap(), false)
+        verify(dir.path(), mirror.path().to_str().unwrap(), false, false)
             .await
             .unwrap();
     }
@@ -1774,7 +1797,7 @@ abi = "abis/usdc.json"
         let mirror = tempfile::tempdir().unwrap();
         let target = mirror.path().to_str().unwrap();
         sync(nest.path(), target, false).await.unwrap();
-        verify(nest.path(), target, true).await.unwrap();
+        verify(nest.path(), target, true, false).await.unwrap();
     }
 
     #[tokio::test]
@@ -1798,7 +1821,7 @@ abi = "abis/usdc.json"
         let target = mirror.path().to_str().unwrap();
         let report = sync(nest.path(), target, false).await.unwrap();
         std::fs::remove_file(mirror.path().join(&report.dataset).join("publish.json")).unwrap();
-        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let err = verify(nest.path(), target, false, false).await.unwrap_err();
         assert!(
             err.to_string().contains("publish.json"),
             "wanted a publish.json failure, got {err}"
@@ -1816,7 +1839,7 @@ abi = "abis/usdc.json"
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         env["nid"] = serde_json::json!("0".repeat(64));
         std::fs::write(&path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
-        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let err = verify(nest.path(), target, false, false).await.unwrap_err();
         assert!(
             err.to_string().contains("nid"),
             "wanted an nid failure, got {err}"
@@ -1830,7 +1853,7 @@ abi = "abis/usdc.json"
         let target = mirror.path().to_str().unwrap();
         let report = sync(nest.path(), target, false).await.unwrap();
         std::fs::remove_file(mirror.path().join(&report.dataset).join("schema.json")).unwrap();
-        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let err = verify(nest.path(), target, false, false).await.unwrap_err();
         assert!(
             err.to_string().contains("schema.json"),
             "wanted a schema.json failure, got {err}"
@@ -1845,7 +1868,7 @@ abi = "abis/usdc.json"
         sync(nest.path(), target, false).await.unwrap();
         let second = sync(nest.path(), target, false).await.unwrap();
         assert_eq!(second.uploaded, vec!["publish.json".to_string()]);
-        verify(nest.path(), target, true).await.unwrap();
+        verify(nest.path(), target, true, false).await.unwrap();
     }
 
     #[cfg(feature = "object-store")]
@@ -2050,15 +2073,15 @@ abi = "abis/usdc.json"
             .unwrap()
             .insert(target.to_string(), store.clone());
         let report = sync(nest.path(), target, false).await.unwrap();
-        verify(nest.path(), target, false)
+        verify(nest.path(), target, false, true)
             .await
-            .expect("premise: shallow verify passes on the faithful mirror");
+            .expect("premise: with --etag-md5 shallow verify passes on the faithful mirror");
 
         let parquet = a_parquet_key(&report);
         let key = format!("{}/{parquet}", report.dataset);
         replace_in_store(store.as_ref(), &format!("s4-replaced/{key}")).await;
 
-        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let err = verify(nest.path(), target, false, true).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains(&key) && msg.contains("bytes differ"),
@@ -2084,13 +2107,13 @@ abi = "abis/usdc.json"
             "5f2b51ca2fdc5baa31ec02e002f69aec",
         );
 
-        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let err = verify(nest.path(), target, false, true).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains(&key) && msg.contains("--deep"),
             "wanted a failure naming {key} and pointing at --deep, got {err:#}"
         );
-        verify(nest.path(), target, true)
+        verify(nest.path(), target, true, true)
             .await
             .expect("the bytes are unchanged, so the failure was the ETag");
     }
@@ -2108,12 +2131,13 @@ abi = "abis/usdc.json"
         )
         .await;
 
-        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let err = verify(nest.path(), target, false, true).await.unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("could not be content-checked"),
-            "an InMemory ETag counts writes and proves nothing about bytes: {err:#}"
+            msg.contains("no MD5 ETag") && msg.contains("--deep"),
+            "an InMemory ETag counts writes, so even --etag-md5 cannot compare it: {err:#}"
         );
-        let deep = verify(nest.path(), target, true).await.unwrap_err();
+        let deep = verify(nest.path(), target, true, false).await.unwrap_err();
         assert!(deep.to_string().contains(&key), "{deep:#}");
     }
 
@@ -2123,7 +2147,7 @@ abi = "abis/usdc.json"
         let mirror = tempfile::tempdir().unwrap();
         let target = mirror.path().to_str().unwrap();
         let report = sync(nest.path(), target, false).await.unwrap();
-        verify(nest.path(), target, false).await.unwrap();
+        verify(nest.path(), target, false, false).await.unwrap();
 
         let key = format!("{}/{}", report.dataset, a_parquet_key(&report));
         let path = mirror.path().join(&key);
@@ -2132,7 +2156,7 @@ abi = "abis/usdc.json"
         bytes[mid] ^= 0xff;
         std::fs::write(&path, bytes).unwrap();
 
-        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let err = verify(nest.path(), target, false, false).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains(&key) && msg.contains("bytes differ"),
@@ -2140,13 +2164,73 @@ abi = "abis/usdc.json"
         );
     }
 
+    #[cfg(feature = "object-store")]
+    fn s3_etag_target(name: &str) -> (std::sync::Arc<s3_etags::S3Etags>, String) {
+        let store = std::sync::Arc::new(s3_etags::S3Etags::default());
+        let target = format!("memory://{name}");
+        memory_stores()
+            .lock()
+            .unwrap()
+            .insert(target.clone(), store.clone());
+        (store, target)
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn without_etag_md5_a_faithful_bucket_fails_closed() {
+        let nest = sealed_nest();
+        let (_store, target) = s3_etag_target("s4-unflagged");
+        sync(nest.path(), &target, false).await.unwrap();
+
+        let err = verify(nest.path(), &target, false, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not content-checked")
+                && msg.contains("--etag-md5")
+                && msg.contains("--deep"),
+            "wanted a fail-closed error naming both remedies, got {err:#}"
+        );
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn without_etag_md5_a_bucket_still_fails_a_size_mismatch() {
+        use object_store::ObjectStore as _;
+        let nest = sealed_nest();
+        let (store, target) = s3_etag_target("s4-unflagged-size");
+        let report = sync(nest.path(), &target, false).await.unwrap();
+        let key = format!("{}/{}", report.dataset, a_parquet_key(&report));
+        let path = object_store::path::Path::from(format!("s4-unflagged-size/{key}"));
+        let mut bytes = store
+            .get(&path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        bytes.push(0);
+        store.put(&path, bytes.into()).await.unwrap();
+
+        let err = verify(nest.path(), &target, false, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&key) && msg.contains("bytes remotely"),
+            "wanted a size mismatch naming {key}, got {err:#}"
+        );
+    }
+
+    #[cfg(feature = "object-store")]
     #[tokio::test]
     async fn doctor_publish_fails_on_a_replaced_object_and_passes_a_faithful_one() {
         let nest = sealed_nest();
-        let mirror = tempfile::tempdir().unwrap();
-        let target = mirror.path().to_str().unwrap().to_string();
+        let (store, target) = s3_etag_target("s4-doctor");
         let report = sync(nest.path(), &target, false).await.unwrap();
-        let doctor = || {
+        let doctor = |etag_md5: bool| {
             crate::doctor::run(crate::cli::DoctorArgs {
                 rpc: Vec::new(),
                 dir: nest.path().to_string_lossy().into_owned(),
@@ -2154,19 +2238,21 @@ abi = "abis/usdc.json"
                 json: false,
                 catalogue: false,
                 publish: Some(target.clone()),
+                publish_etag_md5: etag_md5,
             })
         };
-        doctor().await.expect("a faithful mirror passes");
-
-        let path = mirror
-            .path()
-            .join(&report.dataset)
-            .join(a_parquet_key(&report));
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes[0] ^= 0xff;
-        std::fs::write(&path, bytes).unwrap();
+        doctor(true)
+            .await
+            .expect("a faithful mirror passes with --publish-etag-md5");
         assert!(
-            doctor().await.is_err(),
+            doctor(false).await.is_err(),
+            "without --publish-etag-md5 a bucket fails closed"
+        );
+
+        let key = format!("{}/{}", report.dataset, a_parquet_key(&report));
+        replace_in_store(store.as_ref(), &format!("s4-doctor/{key}")).await;
+        assert!(
+            doctor(true).await.is_err(),
             "a replaced object must fail doctor"
         );
     }

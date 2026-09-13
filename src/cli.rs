@@ -348,6 +348,9 @@ pub struct PublishVerifyArgs {
     /// Re-download and re-hash every object.
     #[arg(long)]
     pub deep: bool,
+    /// For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use --deep otherwise.
+    #[arg(long)]
+    pub etag_md5: bool,
 }
 
 #[derive(Args)]
@@ -1318,4 +1321,8 @@ pub struct DoctorArgs {
     /// `--deep`. Exit 1 if an object is missing, differs, or cannot be content-checked.
     #[arg(long, value_name = "TARGET", conflicts_with = "json")]
     pub publish: Option<String>,
+
+    /// For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use `publish verify --deep` otherwise.
+    #[arg(long, requires = "publish")]
+    pub publish_etag_md5: bool,
 }
