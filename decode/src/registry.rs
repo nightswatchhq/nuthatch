@@ -1283,10 +1283,19 @@ fn register_events(
 /// [`value_from_dynsol`] stores it as a JSON object, and nothing otherwise, so every other line is
 /// the v3.6.1 line (#1364).
 ///
-/// That is a non-indexed `tuple` with fully, uniquely named components: an indexed tuple is a topic
-/// hash, and a `tuple[]` stays positional whatever its names.
+/// That is a non-indexed `tuple` whose component names are all non-empty and unique, checked here
+/// rather than trusted from `tuple_components`: an indexed tuple is a topic hash, and a `tuple[]`
+/// stays positional whatever its names.
 pub fn object_shape(c: &Column) -> String {
     if c.components.is_empty() || c.sol_type != "tuple" || c.kind == StorageKind::Hash32 {
+        return String::new();
+    }
+    let mut names = HashSet::with_capacity(c.components.len());
+    if !c
+        .components
+        .iter()
+        .all(|f| !f.name.is_empty() && names.insert(f.name.as_str()))
+    {
         return String::new();
     }
     // `(` and `;` cannot occur in an ABI identifier or type, and `;` leaves the `,` column split alone.
@@ -2535,6 +2544,32 @@ mod tests {
             a.hash(),
             b.hash(),
             "registry hash must not depend on input order"
+        );
+    }
+
+    /// `object_shape` states the decoder's name predicate itself, so a column built without
+    /// `tuple_components` cannot claim an object the decoder would not write.
+    #[test]
+    fn object_shape_refuses_duplicate_or_missing_names_on_its_own() {
+        let column = |names: &[&str]| Column {
+            name: "order".into(),
+            sol_type: "tuple".into(),
+            kind: StorageKind::Json,
+            indexed: false,
+            components: names
+                .iter()
+                .map(|n| Component {
+                    name: (*n).into(),
+                    sol_type: "uint256".into(),
+                    storage: "word32".into(),
+                })
+                .collect(),
+        };
+        assert_eq!(object_shape(&column(&["x", "x"])), "");
+        assert_eq!(object_shape(&column(&["a", ""])), "");
+        assert_eq!(
+            object_shape(&column(&["a", "b"])),
+            ":object(a:uint256;b:uint256)"
         );
     }
 
