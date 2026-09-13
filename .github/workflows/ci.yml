@@ -373,6 +373,77 @@ jobs:
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 60m timeout-minutes ceiling. Close to 60m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
+  # #1343. RFC-0052 S1's closed acceptance asked for a reconciler proof "over FsStore and S3 (MinIO
+  # in CI)", but #1335 shipped the S3 mirror with every sync test run against `memory://` and no job
+  # here ever started a real object store - S3 publishing had never touched one. This job does.
+  minio-publish:
+    name: publish (S3 via MinIO)
+    runs-on: ubuntu-latest
+    env:
+      MINIO_ROOT_USER: nuthatch
+      MINIO_ROOT_PASSWORD: nuthatch-minio-test
+      AWS_ACCESS_KEY_ID: nuthatch
+      AWS_SECRET_ACCESS_KEY: nuthatch-minio-test
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT: http://127.0.0.1:9000
+      AWS_ALLOW_HTTP: "true"
+      NUTHATCH_MINIO_ENDPOINT: http://127.0.0.1:9000
+      NUTHATCH_MINIO_BUCKET: nuthatch-publish-test
+      # A missing endpoint must fail this job, not skip it quietly - the same reasoning as
+      # `NUTHATCH_REQUIRE_PG` above, for the same reason (#1343 exists because a silent skip is
+      # exactly how S3 publishing went untested for as long as it did).
+      NUTHATCH_REQUIRE_MINIO: "1"
+    timeout-minutes: 30
+    steps:
+      - name: record start time
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          key: minio-publish
+      # `minio/minio` needs an explicit `server /data` command, and GitHub's `services:` block has
+      # no field for that - its `options` are `docker create` flags, not the container's CMD - so
+      # this starts MinIO as an ordinary step instead of a service container.
+      - name: start MinIO
+        # `minio/minio` was pulled from Docker Hub entirely in late 2025 ("pull access denied,
+        # repository does not exist") - `quay.io/minio/minio` is the current source, same tags.
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::MinIO did not become ready within 30s"
+          docker logs minio || true
+          exit 1
+      # The AWS CLI defaults to virtual-hosted-style addressing (bucket.host), which does not
+      # resolve against an IP-addressed MinIO; path-style (host/bucket) is what MinIO and
+      # `object_store`'s default `aws_virtual_hosted_style_request=false` both expect.
+      - name: point the AWS CLI at MinIO (path-style)
+        run: aws configure set default.s3.addressing_style path
+      - name: create the test bucket
+        run: aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
+      - name: publish suite against MinIO
+        run: cargo test --locked --test e2e_minio_publish
+      - name: distinguish an expired timeout from a cancel or supersede
+        if: always() && cancelled()
+        run: |
+          if [ -z "${JOB_START_EPOCH:-}" ]; then
+            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 30m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
+            exit 0
+          fi
+          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
+          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 30m timeout-minutes ceiling. Close to 30m: almost certainly an expiry. Well under it: almost certainly a real cancel or supersede."
+      - name: stop MinIO
+        if: always()
+        run: |
+          docker logs minio 2>&1 | tail -n 100 || true
+          docker rm -f minio || true
+
   fleet:
     name: the compose fleet comes up
     # The compose stack requires its credentials rather than shipping defaults, so CI supplies them
