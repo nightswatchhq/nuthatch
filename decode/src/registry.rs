@@ -2586,7 +2586,11 @@ mod tests {
 
     fn made_hash(ty: &str, indexed: bool, components: &str) -> String {
         let abi = made_abi(ty, indexed, components);
-        hex::encode(DecodeRegistry::build(vec![spec("t", USDC, &abi)]).unwrap().hash())
+        hex::encode(
+            DecodeRegistry::build(vec![spec("t", USDC, &abi)])
+                .unwrap()
+                .hash(),
+        )
     }
 
     /// A registry with no tuple keeps the hash v3.6.1 gave it, so #1364 re-indexes only nests that
@@ -2607,10 +2611,21 @@ mod tests {
         let blank = r#"[{"name":"","type":"uint256"},{"name":"","type":"uint256"}]"#;
         let named = made_abi("tuple", false, YZ);
         let unnamed = made_abi("tuple", false, blank);
-        let topic0 = |abi: &str| DecodeRegistry::build(vec![spec("t", USDC, abi)]).unwrap().topic0s();
-        assert_eq!(topic0(&named), topic0(&unnamed), "one signature, one topic0");
+        let topic0 = |abi: &str| {
+            DecodeRegistry::build(vec![spec("t", USDC, abi)])
+                .unwrap()
+                .topic0s()
+        };
+        assert_eq!(
+            topic0(&named),
+            topic0(&unnamed),
+            "one signature, one topic0"
+        );
 
-        assert_ne!(made_hash("tuple", false, YZ), made_hash("tuple", false, blank));
+        assert_ne!(
+            made_hash("tuple", false, YZ),
+            made_hash("tuple", false, blank)
+        );
         assert_eq!(made_hash("tuple", false, blank), V361_MADE_TUPLE);
 
         // The outer tuple of a nested one is still an object; its inner tuple stays positional.
@@ -2649,8 +2664,8 @@ mod tests {
         }
 
         // A named tuple[] really is stored positionally, which is why it keeps the old line.
-        let reg = DecodeRegistry::build(vec![spec("t", USDC, &made_abi("tuple[]", false, YZ))])
-            .unwrap();
+        let reg =
+            DecodeRegistry::build(vec![spec("t", USDC, &made_abi("tuple[]", false, YZ))]).unwrap();
         let topic0 = format!("0x{}", hex::encode(reg.tables()[0].topic0));
         let word = |n: u8| format!("{}{n:02x}", "00".repeat(31));
         let data = format!("0x{}{}{}{}", word(0x20), word(1), word(1), word(2));
@@ -2661,7 +2676,10 @@ mod tests {
         let Value::Json(raw) = &row.params[0].1 else {
             panic!("orders must be Json, got {:?}", row.params[0].1);
         };
-        assert_eq!(serde_json::from_str::<Json>(raw).unwrap(), json!([["1", "2"]]));
+        assert_eq!(
+            serde_json::from_str::<Json>(raw).unwrap(),
+            json!([["1", "2"]])
+        );
     }
 
     #[test]
