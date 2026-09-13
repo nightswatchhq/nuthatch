@@ -169,6 +169,9 @@ async fn main() -> Result<()> {
             cli::PublishWhat::Verify(a) => {
                 publish::run_verify(std::path::Path::new(&a.dir), &a.target, a.deep).await
             }
+            cli::PublishWhat::Status(a) => {
+                publish::run_status(std::path::Path::new(&a.dir), &a.target).await
+            }
         },
         cli::Command::Mcp(args) => {
             if args.print_config {

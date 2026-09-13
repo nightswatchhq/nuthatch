@@ -40,6 +40,14 @@ struct PublishEnvelope {
     tables: Vec<String>,
 }
 
+/// What a HEAD says about one object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Head {
+    size: u64,
+    /// Unquoted. Not necessarily content-derived: an in-memory store counts writes.
+    e_tag: Option<String>,
+}
+
 #[async_trait]
 trait Mirror: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
@@ -47,7 +55,11 @@ trait Mirror: Send + Sync {
     async fn put_file(&self, key: &str, src: &Path) -> Result<()>;
     /// Create if `expected` is `None`; otherwise replace only when the current bytes match.
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()>;
-    async fn head_size(&self, key: &str) -> Result<Option<u64>>;
+    async fn head(&self, key: &str) -> Result<Option<Head>>;
+    /// [`Mirror::head`] for a content check, which a filesystem answers by hashing the object.
+    async fn head_content(&self, key: &str) -> Result<Option<Head>> {
+        self.head(key).await
+    }
 }
 
 struct FsMirror {
@@ -99,12 +111,25 @@ impl Mirror for FsMirror {
         self.put(key, bytes).await
     }
 
-    async fn head_size(&self, key: &str) -> Result<Option<u64>> {
+    async fn head(&self, key: &str) -> Result<Option<Head>> {
         match std::fs::metadata(self.path(key)) {
-            Ok(m) => Ok(Some(m.len())),
+            Ok(m) => Ok(Some(Head {
+                size: m.len(),
+                e_tag: None,
+            })),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("stat {}", key)),
         }
+    }
+
+    async fn head_content(&self, key: &str) -> Result<Option<Head>> {
+        let Some(head) = self.head(key).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Head {
+            e_tag: Some(s3_etag(&self.path(key))?),
+            ..head
+        }))
     }
 }
 
@@ -278,10 +303,15 @@ impl Mirror for ObjMirror {
         }
     }
 
-    async fn head_size(&self, key: &str) -> Result<Option<u64>> {
+    async fn head(&self, key: &str) -> Result<Option<Head>> {
         use object_store::ObjectStore as _;
         match self.inner.head(&self.key(key)).await {
-            Ok(m) => Ok(Some(m.size)),
+            Ok(m) => Ok(Some(Head {
+                size: m.size,
+                e_tag: m
+                    .e_tag
+                    .map(|t| t.trim_start_matches("W/").trim_matches('"').to_string()),
+            })),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(anyhow::Error::new(e).context(key.to_string())),
         }
@@ -349,18 +379,66 @@ fn cas_bytes(current: Option<Vec<u8>>, expected: Option<&[u8]>, key: &str) -> Re
 }
 
 #[cfg(feature = "object-store")]
+type MemoryStores =
+    std::sync::Mutex<HashMap<String, std::sync::Arc<dyn object_store::ObjectStore>>>;
+
+#[cfg(feature = "object-store")]
+fn memory_stores() -> &'static MemoryStores {
+    static STORES: std::sync::OnceLock<MemoryStores> = std::sync::OnceLock::new();
+    STORES.get_or_init(Default::default)
+}
+
+#[cfg(feature = "object-store")]
 fn memory_store(locator: &str) -> std::sync::Arc<dyn object_store::ObjectStore> {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-    static STORES: OnceLock<Mutex<HashMap<String, Arc<object_store::memory::InMemory>>>> =
-        OnceLock::new();
-    let mut map = STORES
-        .get_or_init(|| Mutex::new(HashMap::new()))
+    memory_stores()
         .lock()
-        .expect("memory publish store");
-    map.entry(locator.to_string())
-        .or_insert_with(|| Arc::new(object_store::memory::InMemory::new()))
+        .expect("memory publish store")
+        .entry(locator.to_string())
+        .or_insert_with(|| std::sync::Arc::new(object_store::memory::InMemory::new()))
         .clone()
+}
+
+/// The ETag S3 gives `src` uploaded as [`ObjMirror::put_file`] uploads it: the MD5 of a file shorter
+/// than one part, else the MD5 of the parts' MD5s and the part count.
+fn s3_etag(src: &Path) -> Result<String> {
+    use md5::{Digest, Md5};
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
+    let mut parts = Vec::new();
+    let mut total = 0u64;
+    loop {
+        let mut part = Md5::new();
+        let n = std::io::copy(&mut (&mut file).take(PART_BUFFER as u64), &mut part)
+            .with_context(|| format!("reading {}", src.display()))?;
+        if n == 0 && !parts.is_empty() {
+            break;
+        }
+        total += n;
+        parts.push(part.finalize());
+        if n < PART_BUFFER as u64 {
+            break;
+        }
+    }
+    if total < PART_BUFFER as u64 {
+        return Ok(hex::encode(parts[0]));
+    }
+    let mut whole = Md5::new();
+    for part in &parts {
+        whole.update(part);
+    }
+    Ok(format!("{}-{}", hex::encode(whole.finalize()), parts.len()))
+}
+
+/// Whether `e_tag` is an MD5-derived ETag at all. An encrypted S3 object's is not, though it looks it.
+fn is_md5_etag(e_tag: &str) -> bool {
+    let (digest, parts) = match e_tag.split_once('-') {
+        Some((d, n)) => (d, Some(n)),
+        None => (e_tag, None),
+    };
+    digest.len() == 32
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        && parts.is_none_or(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn open_mirror(target: &str) -> Result<Box<dyn Mirror>> {
@@ -419,12 +497,44 @@ async fn remote_present(
     for (table, segs) in &remote.tables {
         for s in segs.iter().filter(|s| !s.provisional) {
             let key = format!("{prefix}/{}", parquet_key(table, &s.hash));
-            if mirror.head_size(&key).await?.is_some() {
+            if mirror.head(&key).await?.is_some() {
                 have.insert((table.clone(), s.hash.clone()));
             }
         }
     }
     Ok(have)
+}
+
+fn read_local(dir: &Path) -> Result<(Vec<u8>, Manifest)> {
+    let local_path = dir.join(seal::SEGMENTS_DIR).join(MANIFEST_FILE);
+    let local_bytes = match std::fs::read(&local_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::to_vec(&Manifest::default())?
+        }
+        Err(e) => return Err(e).context("reading local catalogue"),
+    };
+    let local = serde_json::from_slice(&local_bytes).context("corrupt local catalogue")?;
+    Ok((local_bytes, local))
+}
+
+/// The entries of `want` a pass would upload, and how many it would skip.
+async fn missing_entries<'a>(
+    mirror: &dyn Mirror,
+    dataset: &str,
+    want: &[(String, &'a Segment)],
+    remote_catalogue: Option<&[u8]>,
+) -> Result<(Vec<(String, &'a Segment)>, usize)> {
+    let remote: Manifest = match remote_catalogue {
+        Some(b) => serde_json::from_slice(b).context("corrupt remote catalogue")?,
+        None => Manifest::default(),
+    };
+    let have = remote_present(mirror, dataset, &remote).await?;
+    let (held, missing): (Vec<_>, Vec<_>) = want
+        .iter()
+        .cloned()
+        .partition(|(t, s)| have.contains(&(t.clone(), s.hash.clone())));
+    Ok((missing, held.len()))
 }
 
 fn identity_of(dir: &Path) -> Result<(String, String, String, u64)> {
@@ -471,36 +581,20 @@ pub async fn sync_with(
     parallelism: usize,
     metrics: Option<&crate::metrics::NestMetrics>,
 ) -> Result<SyncReport> {
-    let local_path = dir.join(seal::SEGMENTS_DIR).join(MANIFEST_FILE);
-    let local_bytes = match std::fs::read(&local_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            serde_json::to_vec(&Manifest::default())?
-        }
-        Err(e) => return Err(e).context("reading local catalogue"),
-    };
-    let local: Manifest =
-        serde_json::from_slice(&local_bytes).context("corrupt local catalogue")?;
+    let (local_bytes, local) = read_local(dir)?;
     let (data_identity, nid, bundle_hash, chain_id) = identity_of(dir)?;
     let mirror = open_mirror(target)?;
     let prefix = |k: &str| format!("{data_identity}/{k}");
 
     let remote_bytes = mirror.get(&prefix(MANIFEST_FILE)).await?;
-    let remote: Manifest = match &remote_bytes {
-        Some(b) => serde_json::from_slice(b).context("corrupt remote catalogue")?,
-        None => Manifest::default(),
-    };
-    let have = remote_present(mirror.as_ref(), &data_identity, &remote).await?;
     let want = want_entries(&local);
-    let skipped = want
-        .iter()
-        .filter(|(t, s)| have.contains(&(t.clone(), s.hash.clone())))
-        .count();
-    let missing: Vec<(String, &Segment)> = want
-        .iter()
-        .filter(|(t, s)| !have.contains(&(t.clone(), s.hash.clone())))
-        .cloned()
-        .collect();
+    let (missing, skipped) = missing_entries(
+        mirror.as_ref(),
+        &data_identity,
+        &want,
+        remote_bytes.as_deref(),
+    )
+    .await?;
 
     if dry_run {
         return Ok(SyncReport {
@@ -613,8 +707,9 @@ pub async fn sync_with(
     })
 }
 
-/// HEAD every published file. `--deep` re-hashes parquet against the local bytes.
-pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
+/// HEAD every published file, comparing its size and ETag with the local segment, and return how many
+/// were checked. `--deep` downloads and re-hashes instead of trusting the ETag.
+pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<usize> {
     let local = seal::load_manifest(dir)?;
     let (data_identity, nid, bundle_hash, chain_id) = identity_of(dir)?;
     let mirror = open_mirror(target)?;
@@ -678,18 +773,24 @@ pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
             bail!("publish.json schema_sha256 does not match schema.json");
         }
     }
-    for (table, seg) in want_entries(&local) {
-        let key = prefix(&parquet_key(&table, &seg.hash));
-        let size = mirror
-            .head_size(&key)
-            .await?
-            .with_context(|| format!("missing {key}"))?;
+    let mut unverified = Vec::new();
+    for (table, seg) in &want {
+        let key = prefix(&parquet_key(table, &seg.hash));
+        let head = if deep {
+            mirror.head(&key).await?
+        } else {
+            mirror.head_content(&key).await?
+        }
+        .with_context(|| format!("missing {key}"))?;
         let src = seal::segment_path(dir, &seg.file, &seg.hash);
         let local_size = std::fs::metadata(&src)
             .with_context(|| format!("stat {}", src.display()))?
             .len();
-        if size != local_size {
-            bail!("{key} is {size} bytes remotely, {local_size} locally");
+        if head.size != local_size {
+            bail!(
+                "{key} is {} bytes remotely, {local_size} locally",
+                head.size
+            );
         }
         if deep {
             let remote = mirror
@@ -700,8 +801,111 @@ pub async fn verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
             if sha256_hex(&remote) != sha256_hex(&local_file) {
                 bail!("{key} hash does not match the local segment");
             }
+            continue;
+        }
+        match head.e_tag.filter(|t| is_md5_etag(t)) {
+            Some(remote) => {
+                let expected = s3_etag(&src)?;
+                if !remote.eq_ignore_ascii_case(&expected) {
+                    bail!(
+                        "{key} has ETag {remote} but the local segment's bytes give {expected}: \
+                         the object was replaced, or the bucket encrypts with KMS (check with --deep)"
+                    );
+                }
+            }
+            None => unverified.push(key),
         }
     }
+    if let Some(first) = unverified.first() {
+        bail!(
+            "{} object(s) could not be content-checked, because the store gives them no MD5 ETag \
+             (first: {first}); sizes match, run with --deep to compare the bytes",
+            unverified.len()
+        );
+    }
+    Ok(want.len())
+}
+
+/// What `nuthatch publish status` reports. Reading it puts nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    pub target: String,
+    pub dataset: String,
+    pub local_sealed_through: Option<u64>,
+    pub remote_sealed_through: Option<u64>,
+    pub pending_segments: usize,
+    pub pending_bytes: u64,
+    /// A fault the next pass would meet, as far as this read can see one.
+    pub last_error: Option<String>,
+}
+
+/// Compare `dir`'s catalogue with the mirror at `target` without writing to either.
+pub async fn status(dir: &Path, target: &str) -> Result<Status> {
+    let (_, local) = read_local(dir)?;
+    let (dataset, ..) = identity_of(dir)?;
+    let mirror = open_mirror(target)?;
+    let remote_catalogue = mirror.get(&format!("{dataset}/{MANIFEST_FILE}")).await?;
+    let want = want_entries(&local);
+    let (missing, _) = missing_entries(
+        mirror.as_ref(),
+        &dataset,
+        &want,
+        remote_catalogue.as_deref(),
+    )
+    .await?;
+    let mut last_error = None;
+    let remote_sealed_through = match mirror.get(&format!("{dataset}/publish.json")).await? {
+        None => None,
+        Some(b) => match serde_json::from_slice::<PublishEnvelope>(&b) {
+            Ok(env) => env.sealed_through,
+            Err(e) => {
+                last_error = Some(format!("corrupt remote publish.json: {e}"));
+                None
+            }
+        },
+    };
+    let mut pending_bytes = 0;
+    for (_, seg) in &missing {
+        let src = seal::segment_path(dir, &seg.file, &seg.hash);
+        match std::fs::metadata(&src) {
+            Ok(m) => pending_bytes += m.len(),
+            Err(_) => {
+                last_error = Some(format!(
+                    "catalogue names {} but the file is missing at {}",
+                    seg.file,
+                    src.display()
+                ))
+            }
+        }
+    }
+    Ok(Status {
+        target: target.to_string(),
+        dataset,
+        local_sealed_through: want.iter().map(|(_, s)| s.to_block).max(),
+        remote_sealed_through,
+        pending_segments: missing.len(),
+        pending_bytes,
+        last_error,
+    })
+}
+
+/// `nuthatch publish status`.
+pub async fn run_status(dir: &Path, target: &str) -> Result<()> {
+    // First, so an operator sees where this nest is going even if the store cannot be reached.
+    println!("target          {target}");
+    let s = status(dir, target).await?;
+    let block = |b: Option<u64>| b.map_or("-".to_string(), |b| b.to_string());
+    println!("dataset         {}", s.dataset);
+    println!("sealed_through  local {}", block(s.local_sealed_through));
+    println!("                remote {}", block(s.remote_sealed_through));
+    println!(
+        "pending         {} segment(s), {} bytes",
+        s.pending_segments, s.pending_bytes
+    );
+    println!(
+        "last error      {}",
+        s.last_error.as_deref().unwrap_or("none")
+    );
     Ok(())
 }
 
@@ -721,8 +925,8 @@ pub async fn run_sync(dir: &Path, target: &str, dry_run: bool) -> Result<()> {
 
 /// `nuthatch publish verify`.
 pub async fn run_verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
-    verify(dir, target, deep).await?;
-    println!("ok");
+    let objects = verify(dir, target, deep).await?;
+    println!("ok, {objects} object(s)");
     Ok(())
 }
 
@@ -846,7 +1050,7 @@ async fn reconcile(
     mut stopped: tokio::sync::oneshot::Receiver<()>,
 ) {
     let metrics = crate::metrics::METRICS.nest(&nest);
-    metrics.set_publish_enabled();
+    metrics.set_publish_enabled(&settings.target);
     let mut changes = seal::manifest_changes(&dir);
     let mut failures = Failures::default();
     loop {
@@ -1068,8 +1272,11 @@ mod tests {
         async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
             self.0.put_if(key, bytes, expected).await
         }
-        async fn head_size(&self, key: &str) -> Result<Option<u64>> {
-            self.0.head_size(key).await
+        async fn head(&self, key: &str) -> Result<Option<Head>> {
+            self.0.head(key).await
+        }
+        async fn head_content(&self, key: &str) -> Result<Option<Head>> {
+            self.0.head_content(key).await
         }
     }
 
@@ -1091,7 +1298,7 @@ mod tests {
         async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
             Ok(())
         }
-        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+        async fn head(&self, _: &str) -> Result<Option<Head>> {
             Ok(None)
         }
     }
@@ -1112,7 +1319,7 @@ mod tests {
         async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
             Ok(())
         }
-        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+        async fn head(&self, _: &str) -> Result<Option<Head>> {
             Ok(None)
         }
     }
@@ -1141,7 +1348,7 @@ mod tests {
         async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
             Ok(())
         }
-        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+        async fn head(&self, _: &str) -> Result<Option<Head>> {
             Ok(None)
         }
     }
@@ -1318,7 +1525,7 @@ mod tests {
         async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
             Ok(())
         }
-        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+        async fn head(&self, _: &str) -> Result<Option<Head>> {
             Ok(None)
         }
     }
@@ -1672,6 +1879,357 @@ abi = "abis/usdc.json"
         assert!(
             got == b"aaa" || got == b"bbb",
             "winner must be one of the two new catalogues, got {got:?}"
+        );
+    }
+
+    #[cfg(feature = "object-store")]
+    mod s3_etags {
+        use futures::stream::BoxStream;
+        use md5::{Digest, Md5};
+        use object_store::path::Path;
+        use object_store::{
+            GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+            PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart,
+        };
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        type Tags = Arc<Mutex<HashMap<Path, String>>>;
+
+        /// An in-memory store whose HEAD answers with the ETag S3 computes, quoted as S3 sends it.
+        #[derive(Debug, Default)]
+        pub struct S3Etags {
+            pub inner: object_store::memory::InMemory,
+            tags: Tags,
+        }
+
+        impl std::fmt::Display for S3Etags {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "S3Etags")
+            }
+        }
+
+        fn md5_of(payload: &PutPayload) -> [u8; 16] {
+            let mut h = Md5::new();
+            for chunk in payload {
+                h.update(chunk);
+            }
+            h.finalize().into()
+        }
+
+        #[derive(Debug)]
+        struct Parts {
+            upload: Box<dyn MultipartUpload>,
+            location: Path,
+            digests: Vec<[u8; 16]>,
+            tags: Tags,
+        }
+
+        #[async_trait::async_trait]
+        impl MultipartUpload for Parts {
+            fn put_part(&mut self, data: PutPayload) -> UploadPart {
+                self.digests.push(md5_of(&data));
+                self.upload.put_part(data)
+            }
+            async fn complete(&mut self) -> Result<PutResult> {
+                let done = self.upload.complete().await?;
+                let whole = Md5::digest(self.digests.concat());
+                let tag = format!("{}-{}", hex::encode(whole), self.digests.len());
+                self.tags.lock().unwrap().insert(self.location.clone(), tag);
+                Ok(done)
+            }
+            async fn abort(&mut self) -> Result<()> {
+                self.upload.abort().await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for S3Etags {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> Result<PutResult> {
+                let tag = hex::encode(md5_of(&payload));
+                let done = self.inner.put_opts(location, payload, opts).await?;
+                self.tags.lock().unwrap().insert(location.clone(), tag);
+                Ok(done)
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: PutMultipartOptions,
+            ) -> Result<Box<dyn MultipartUpload>> {
+                let upload = self.inner.put_multipart_opts(location, opts).await?;
+                Ok(Box::new(Parts {
+                    upload,
+                    location: location.clone(),
+                    digests: Vec::new(),
+                    tags: self.tags.clone(),
+                }))
+            }
+            async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+                self.inner.get_opts(location, options).await
+            }
+            async fn head(&self, location: &Path) -> Result<ObjectMeta> {
+                let mut meta = self.inner.head(location).await?;
+                meta.e_tag = self
+                    .tags
+                    .lock()
+                    .unwrap()
+                    .get(location)
+                    .map(|t| format!("\"{t}\""));
+                Ok(meta)
+            }
+            async fn delete(&self, location: &Path) -> Result<()> {
+                self.inner.delete(location).await
+            }
+            fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+                self.inner.copy(from, to).await
+            }
+            async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+                self.inner.copy_if_not_exists(from, to).await
+            }
+        }
+    }
+
+    fn a_parquet_key(report: &SyncReport) -> String {
+        report
+            .uploaded
+            .iter()
+            .find(|k| k.ends_with(".parquet"))
+            .expect("the sync uploaded parquet")
+            .clone()
+    }
+
+    /// Rewrites one object in place with bytes of the same length, as an operator with a
+    /// credential and `aws s3 cp` would.
+    #[cfg(feature = "object-store")]
+    async fn replace_in_store(store: &dyn object_store::ObjectStore, path: &str) {
+        let path = object_store::path::Path::from(path);
+        let mut bytes = store
+            .get(&path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        store.put(&path, bytes.into()).await.unwrap();
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn shallow_verify_catches_an_object_replaced_with_same_length_bytes() {
+        let nest = sealed_nest();
+        let store = std::sync::Arc::new(s3_etags::S3Etags::default());
+        let target = "memory://s4-replaced";
+        memory_stores()
+            .lock()
+            .unwrap()
+            .insert(target.to_string(), store.clone());
+        let report = sync(nest.path(), target, false).await.unwrap();
+        verify(nest.path(), target, false)
+            .await
+            .expect("premise: shallow verify passes on the faithful mirror");
+
+        let parquet = a_parquet_key(&report);
+        let key = format!("{}/{parquet}", report.dataset);
+        replace_in_store(store.as_ref(), &format!("s4-replaced/{key}")).await;
+
+        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&key) && msg.contains("was replaced"),
+            "wanted a content mismatch naming {key}, got {err:#}"
+        );
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn shallow_verify_does_not_pass_a_store_without_content_etags() {
+        let nest = sealed_nest();
+        let target = "memory://s4-counter-etags";
+        let report = sync(nest.path(), target, false).await.unwrap();
+        let key = format!("{}/{}", report.dataset, a_parquet_key(&report));
+        replace_in_store(
+            memory_store(target).as_ref(),
+            &format!("s4-counter-etags/{key}"),
+        )
+        .await;
+
+        let err = verify(nest.path(), target, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("could not be content-checked"),
+            "an InMemory ETag counts writes and proves nothing about bytes: {err:#}"
+        );
+        let deep = verify(nest.path(), target, true).await.unwrap_err();
+        assert!(deep.to_string().contains(&key), "{deep:#}");
+    }
+
+    #[tokio::test]
+    async fn shallow_verify_catches_a_replaced_file_on_a_filesystem_mirror() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        let report = sync(nest.path(), target, false).await.unwrap();
+        verify(nest.path(), target, false).await.unwrap();
+
+        let key = format!("{}/{}", report.dataset, a_parquet_key(&report));
+        let path = mirror.path().join(&key);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = verify(nest.path(), target, false).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&key) && msg.contains("was replaced"),
+            "wanted a content mismatch naming {key}, got {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_publish_fails_on_a_replaced_object_and_passes_a_faithful_one() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap().to_string();
+        let report = sync(nest.path(), &target, false).await.unwrap();
+        let doctor = || {
+            crate::doctor::run(crate::cli::DoctorArgs {
+                rpc: Vec::new(),
+                dir: nest.path().to_string_lossy().into_owned(),
+                address: None,
+                json: false,
+                catalogue: false,
+                publish: Some(target.clone()),
+            })
+        };
+        doctor().await.expect("a faithful mirror passes");
+
+        let path = mirror
+            .path()
+            .join(&report.dataset)
+            .join(a_parquet_key(&report));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            doctor().await.is_err(),
+            "a replaced object must fail doctor"
+        );
+    }
+
+    /// Expected values computed outside Rust: `split -b 8388608`, `md5` each part, `md5` of the
+    /// concatenated binary digests.
+    #[test]
+    fn the_multipart_etag_is_the_md5_of_the_part_md5s() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("f.bin");
+        let bytes: Vec<u8> = (0..20_971_520u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &bytes).unwrap();
+        assert_eq!(s3_etag(&src).unwrap(), "0e7f77975c09731444156f23125696f6-3");
+
+        std::fs::write(&src, b"abc").unwrap();
+        assert_eq!(s3_etag(&src).unwrap(), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn put_file_parts_give_the_etag_verify_expects() {
+        let store = std::sync::Arc::new(s3_etags::S3Etags::default());
+        let mirror = ObjMirror {
+            inner: store.clone(),
+            prefix: object_store::path::Path::from("mirror"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("segment.parquet");
+        let bytes: Vec<u8> = (0..(PART_BUFFER * 5 / 2))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&src, &bytes).unwrap();
+        mirror.put_file("t/segment.parquet", &src).await.unwrap();
+        let head = mirror.head("t/segment.parquet").await.unwrap().unwrap();
+        assert_eq!(head.e_tag, Some(s3_etag(&src).unwrap()));
+    }
+
+    #[test]
+    fn only_md5_shaped_etags_are_compared() {
+        assert!(is_md5_etag("900150983cd24fb0d6963f7d28e17f72"));
+        assert!(is_md5_etag("0e7f77975c09731444156f23125696f6-3"));
+        assert!(!is_md5_etag("7"), "InMemory's write counter");
+        assert!(!is_md5_etag("0e7f77975c09731444156f23125696f6-"));
+        assert!(!is_md5_etag("1a2b-3c4d-5e6f"));
+    }
+
+    fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.extend(files_under(&p));
+            } else {
+                out.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn status_counts_what_a_partial_mirror_still_needs_and_writes_nothing() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        let first = sync(nest.path(), target, false).await.unwrap();
+        for (block, value) in [(12, 9), (13, 4)] {
+            seal_range(nest.path(), &[row(block, value)], block, block)
+                .unwrap()
+                .expect("sealed");
+        }
+        let local = seal::load_manifest(nest.path()).unwrap();
+        let unpublished: u64 = local.tables["usdc__transfer"]
+            .iter()
+            .filter(|s| s.from_block >= 12)
+            .map(|s| {
+                std::fs::metadata(seal::segment_path(nest.path(), &s.file, &s.hash))
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        let before = files_under(mirror.path());
+
+        let s = status(nest.path(), target).await.unwrap();
+
+        assert_eq!(
+            files_under(mirror.path()),
+            before,
+            "status wrote to the mirror"
+        );
+        assert_eq!(s.target, target);
+        assert_eq!(s.dataset, first.dataset);
+        assert_eq!(s.local_sealed_through, Some(13));
+        assert_eq!(s.remote_sealed_through, Some(11));
+        assert_eq!(s.pending_segments, 2);
+        assert_eq!(s.pending_bytes, unpublished);
+        assert_eq!(s.last_error, None);
+
+        sync(nest.path(), target, false).await.unwrap();
+        let caught_up = status(nest.path(), target).await.unwrap();
+        assert_eq!(caught_up.remote_sealed_through, Some(13));
+        assert_eq!(
+            (caught_up.pending_segments, caught_up.pending_bytes),
+            (0, 0)
         );
     }
 }

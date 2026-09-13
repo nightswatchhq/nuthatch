@@ -307,8 +307,21 @@ pub struct PublishArgs {
 pub enum PublishWhat {
     /// Reconcile this nest's sealed catalogue onto a prefix (RFC-0052 S1).
     Sync(PublishSyncArgs),
-    /// HEAD every published file against the local catalogue.
+    /// Check every published file's size and ETag against the local segment.
     Verify(PublishVerifyArgs),
+    /// Where this nest publishes, how far each side is sealed, and what is still to upload. Writes
+    /// nothing.
+    Status(PublishStatusArgs),
+}
+
+#[derive(Args)]
+pub struct PublishStatusArgs {
+    /// The prefix `publish sync` writes to.
+    #[arg(long)]
+    pub target: String,
+    /// Nest directory.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
 }
 
 #[derive(Args)]
@@ -1300,4 +1313,9 @@ pub struct DoctorArgs {
     /// stdout is the catalogue check only, so the live-endpoints gate is unchanged.
     #[arg(long)]
     pub catalogue: bool,
+
+    /// Check the mirror of the nest in `--dir` at this target, as `publish verify` does without
+    /// `--deep`. Exit 1 if an object is missing, differs, or cannot be content-checked.
+    #[arg(long, value_name = "TARGET", conflicts_with = "json")]
+    pub publish: Option<String>,
 }

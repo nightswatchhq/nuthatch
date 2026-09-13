@@ -65,6 +65,9 @@ rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_
 wasmtime = { version = "46", features = ["component-model"] }
 wasmtime-wasi = "46"
 sha2 = "0.10"
+# RFC-0052 S4: an S3 ETag is an MD5, so a shallow `publish verify` can see replaced bytes. Already in
+# the tree via object_store at this version; MIT OR Apache-2.0.
+md-5 = "0.10"
 arc-swap = "1"
 ed25519-dalek = "2"
 getrandom = "0.3"

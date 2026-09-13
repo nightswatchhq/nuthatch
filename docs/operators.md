@@ -1050,12 +1050,41 @@ s3://bucket/prefix>` copies every non-provisional segment and the catalogue unde
 `dev` and `serve` do it continuously with `--publish-target`: a pass at start, one after every seal,
 and one every `--publish-interval` (60 s) otherwise, with `--publish-parallelism` uploads in flight
 (2). The publisher runs on its own thread, so a slow or unreachable bucket delays the mirror and never
-a seal. Credentials are the usual `AWS_*` environment variables, never `nuthatch.toml`. It needs
-`PutObject`, `GetObject`, `HeadObject` and `ListBucket` on the prefix and not `DeleteObject`, which is
-worth withholding: a credential that cannot delete keeps the mirror append-only by policy. Five
-consecutive failures on the same object set `nuthatch_publish_dead_letter` and slow retries tenfold
-until one succeeds. A runtime directory publishes per mount instead, from `[mounts.publish]` in
-`mounts.toml`, and refuses `--publish-target`.
+a seal. Credentials are the usual `AWS_*` environment variables, never `nuthatch.toml`. The policy
+is `s3:PutObject` and `s3:GetObject` on the prefix (HEAD is authorised by `GetObject`) and
+`s3:ListBucket` on the bucket for that prefix, without which a missing object answers 403 rather
+than 404. Do not grant `s3:DeleteObject`: a credential that cannot delete cannot take a published
+segment away, so the mirror is append-only by policy rather than by promise. It can still overwrite
+a key, which is what `doctor --publish` below catches, and bucket versioning makes that recoverable.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::my-bucket/nuthatch/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-bucket",
+      "Condition": { "StringLike": { "s3:prefix": "nuthatch/*" } }
+    }
+  ]
+}
+```
+
+Five consecutive failures on the same object set `nuthatch_publish_dead_letter` and slow retries
+tenfold until one succeeds. A runtime directory publishes per mount instead, from `[mounts.publish]`
+in `mounts.toml`, and refuses `--publish-target`. `nuthatch publish status --target <target>` prints
+the target, local and remote `sealed_through`, and the segments and bytes still to upload, and writes
+nothing. `nuthatch doctor --publish <target>` checks every object's size and ETag against the local
+segment, so an object replaced by hand fails it even at the same size. An object encrypted with
+SSE-KMS has an ETag that is not an MD5 and fails that check; use `nuthatch publish verify --deep`
+there, which downloads and re-hashes. `/_admin/` shows each publishing nest's target, lag and last
+success.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 
