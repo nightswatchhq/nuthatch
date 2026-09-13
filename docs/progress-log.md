@@ -13,6 +13,21 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-09-13 - RFC-0028 §4 amended: a seal cut is bounded by bytes; call bodies fetch in parallel;
+  an aborted seal stops.** Chief ruled the byte bound on 2026-09-13. A cut is now the earliest of
+  20,000 rows, 64 MiB of row JSON (`SEAL_DIRECT_BYTES`) and the span, all read from the rows, so
+  segments still do not depend on `--window`; a provisional segment is final past 16 MiB; the tip path
+  chooses a cut with a streaming scan and reads only `[from, cut]`. Event nests cut where they always
+  did. Block bodies for `top_level_calls` come in 20-block batches, 4 at once
+  (`NUTHATCH_CALL_BODY_CONCURRENCY`, ceiling 10). `maybe_seal` yields between segments, so an aborted
+  ingest stops at the next one: a SIGTERM that kept a seal running 26 s had caught it with nothing left
+  to pend, since shutdown RPC calls fail at once. **Measured on Gnosis**, the QoS nest without
+  `blocks = true` from 48,119,000, release builds, same config: peak RSS **11,352,539,136 bytes before,
+  1,998,815,232 after** (`/usr/bin/time -l`); 100,000 blocks at **79.7 blocks/s before, 138.6 after**;
+  SIGTERM during the seal exited in 0.35 s. The document tables sealed as 25 and 24 segments of about
+  28 payloads, where the old build wrote one of each. **Watch**: 1.86 GiB is under the 2 GB budget by
+  little, and what holds it is not isolated; the faster fetch drew one rate-limited timestamp batch from
+  the two public endpoints, narrowed and retried. Mutation-proven: 7 of 7 caught.
 - **2026-09-13 - RFC-0037 slice 6: every document resolves, or is given up on in the open.** The
   per-window budget is gone: documents resolve out of band, re-derived from the hot store, with retry
   and backoff (a body cut off mid-read included), a recorded give-up after 10 failures, and sealing

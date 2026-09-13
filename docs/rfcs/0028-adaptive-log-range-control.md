@@ -161,6 +161,10 @@ at `289a08a1`), past the 2 GB per-cursor budget in both cases.
 - **Bounded read.** The tip path chooses a cut with a streaming scan of the hot store
   (`HotStore::scan_entities_in_range`) that stops as soon as the cut is known, then reads only
   `[from, cut]`. Sealing never holds more than one cut's rows.
+- **Measured** on the same nest and range with release builds before and after: peak RSS 11,352,539,136
+  bytes before, 1,998,815,232 after. The document tables sealed as 25 and 24 segments of about 28
+  payloads each, where the old rule wrote one segment per table. 1.86 GiB is inside the budget with
+  little room, and this measurement does not say which component holds it.
 
 ## 5. Non-goals
 
