@@ -51,6 +51,24 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "RFC-0052 §8 names a future cold-start follow-on and explicitly says it needs its own RFC",
     ),
     (
+        "docs/rfcs/0055-the-dune-view-emitter.md",
+        "emit",
+        3,
+        "RFC-0055 (accepted 2026-09-13) specifies `nuthatch emit dune`; not implemented until S1 (#1357)",
+    ),
+    (
+        "docs/rfcs/0055-the-dune-view-emitter.md",
+        "--source",
+        1,
+        "RFC-0055 specifies `emit dune --source`, the Dune namespace the rows were loaded into; not implemented until S1 (#1357)",
+    ),
+    (
+        "docs/rfcs/README.md",
+        "emit",
+        1,
+        "the RFC index row for RFC-0055 names its accepted `nuthatch emit dune`; not implemented until S1 (#1357)",
+    ),
+    (
         "docs/operators.md",
         "roost",
         1,
