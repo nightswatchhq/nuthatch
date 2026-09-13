@@ -112,7 +112,7 @@ The source columns are `varchar` except the four counters (§4). Citation keys a
 | `string` | `varchar` | `c` | n/a | |
 | `json` | `varchar` | `c`, read with `json_value(c, 'strict $.field')` | `try` handles path errors | D12, T2 |
 
-Three rules sit around the table:
+Four rules sit around the table:
 
 - **Every wide integer keeps its exact text beside the typed column**, as `<name>_raw` `varchar`, the
   suffix Spellbook's seeds use for raw amounts (S11). A user can always reach the exact value, and a
@@ -271,7 +271,7 @@ it:
 Types and conventions, from brief 8:
 
 5. Whether `cast(varchar as uint256)` and `cast(varchar as int256)` accept the full ranges. S0 answers it.
-6. Whether Dune's `from_hex` accepts a `0x` prefix, which §3.2 avoids depending on, and what it does with malformed input, and what `cast` does with out-of-range text into `bigint`.
+6. Whether Dune's `from_hex` accepts a `0x` prefix, which §3.2 avoids depending on, and what it does with malformed input. Also what `cast` does with out-of-range text into `bigint`.
    The source text is canonical, so neither should occur, but neither is documented.
 7. The types of the decoded `evt_*` columns, and whether `evt_tx_from`, `evt_tx_to` or `evt_block_date`
    exist in Dune's own tables. §3.3 follows `ethereum.logs` and says so.
