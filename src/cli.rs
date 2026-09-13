@@ -170,6 +170,24 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    #[test]
+    fn dev_and_serve_refuse_a_zero_publish_interval() {
+        for sub in ["dev", "serve"] {
+            let err = Cli::command()
+                .try_get_matches_from(["nuthatch", sub, "--publish-interval", "0s"])
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{sub}: {err}"
+            );
+            assert!(
+                err.to_string().contains("at least one second"),
+                "{sub}: {err}"
+            );
+        }
+    }
+
     /// The grouping in `src/help.rs::GROUPS` must cover exactly the visible subcommands declared
     /// above - no more (a stale name after a rename/removal), no fewer (a new variant nobody sorted
     /// into a heading, which would otherwise fall through render_top_level_help's "unheaded" bucket
