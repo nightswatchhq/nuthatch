@@ -410,6 +410,7 @@ async fn bring_up_live(
         live,
         states: cursor.states,
         alert_workers: cursor.alert_workers,
+        publishers: Vec::new(),
         lifecycle: std::collections::HashMap::from([(
             "arbitrum-one".to_string(),
             cursor.lifecycle.clone(),

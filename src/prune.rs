@@ -518,6 +518,7 @@ mod tests {
             nid: a.clone(),
             sql: Default::default(),
             queries: Vec::new(),
+            publish: None,
             #[cfg(feature = "counter")]
             counter: None,
         });
