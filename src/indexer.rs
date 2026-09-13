@@ -3364,6 +3364,168 @@ fn apply_row_timestamps(
 /// resolved nothing at all until #743 - the same "the harness measures a workload `dev` does not
 /// run" failure as #224 and #725, on the arm `bench backfill` takes when given no path flag.
 #[allow(clippy::too_many_arguments)]
+/// What a seal-direct pass decodes beyond events: top-level calls, and the `[[ipfs]]` documents rows
+/// name. Both were skipped by these paths without a word, so a calldata-only nest backfilled that way
+/// sealed nothing.
+#[derive(Clone, Copy, Default)]
+pub struct DirectExtras<'a> {
+    pub call_registry: Option<&'a crate::calldata::CallRegistry>,
+    pub ipfs: Option<&'a crate::ipfs_resolve::Gate>,
+    pub gateways: &'a [String],
+}
+
+impl DirectExtras<'_> {
+    /// Top-level calls and resolved documents for `from..=to`, merged into `rows` in canonical order.
+    async fn extend(
+        &self,
+        source: &dyn Source,
+        addresses: &[String],
+        rows: &mut Vec<crate::registry::DecodedRow>,
+        from: u64,
+        to: u64,
+        timestamps: bool,
+    ) -> Result<()> {
+        if let Some(creg) = self.call_registry {
+            rows.extend(
+                decode_top_level_calls(source, creg, addresses, from, to, timestamps).await?,
+            );
+        }
+        if let Some(gate) = self.ipfs {
+            let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
+                gate,
+                self.gateways,
+                &crate::ipfs_resolve::Policy::default(),
+                rows,
+                timestamps,
+            )
+            .await;
+            if given_up > 0 {
+                tracing::warn!(
+                    "seal-direct {from}..={to}: gave up on {given_up} ipfs document(s) after every \
+                     retry; they are absent from the sealed segment"
+                );
+            }
+            rows.extend(docs);
+        }
+        rows.sort_by_key(|r| (r.block_number, r.log_index));
+        Ok(())
+    }
+}
+
+/// Top-level calls to this nest's contracts in `from..=to` (RFC-0038 §5): transactions sent directly to
+/// them, which is what a subgraph's `callHandlers` fire on. Unlike the internal call tree this needs no
+/// node, since a transaction is in the block body ordinary RPC serves. The tip path and the seal-direct
+/// paths both decode through here, so a segment is the same whichever path wrote it.
+///
+/// Bounded by the nest's own contracts before decode, so a busy chain costs this nest nothing it did
+/// not ask for.
+async fn decode_top_level_calls(
+    source: &dyn Source,
+    creg: &crate::calldata::CallRegistry,
+    addresses: &[String],
+    from: u64,
+    to: u64,
+    timestamps: bool,
+) -> Result<Vec<crate::registry::DecodedRow>> {
+    let mut call_rows = Vec::new();
+    let want: Vec<u64> = (from..=to).collect();
+    // Fetched and decoded a chunk at a time. Every full body of a 20,000-block Gnosis window held at
+    // once reached 2.3 GB with nothing committed (measured 2026-09-13), past the per-cursor budget.
+    for chunk in want.chunks(TOP_LEVEL_BODY_CHUNK) {
+        let bodies = retry_transient(
+            &format!("block bodies for {} block(s)", chunk.len()),
+            BACKFILL_RETRY_BASE,
+            || async { source.block_bodies(chunk).await },
+        )
+        .await?;
+        decode_bodies(creg, addresses, chunk, &bodies, timestamps, &mut call_rows)?;
+    }
+    Ok(call_rows)
+}
+
+/// Blocks of full bodies held at once while decoding top-level calls.
+const TOP_LEVEL_BODY_CHUNK: usize = 200;
+
+fn decode_bodies(
+    creg: &crate::calldata::CallRegistry,
+    addresses: &[String],
+    want: &[u64],
+    bodies: &std::collections::HashMap<u64, serde_json::Value>,
+    timestamps: bool,
+    call_rows: &mut Vec<crate::registry::DecodedRow>,
+) -> Result<()> {
+    for b in want {
+        let Some(body) = bodies.get(b) else { continue };
+        let bhash = body
+            .get("hash")
+            .and_then(|h| h.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // The body already carries the header, so the timestamp comes from it rather than from a
+        // second fetch - and it covers blocks that emitted no matching log at all, which is most.
+        let ts = body
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        let txs = body.get("transactions").and_then(|t| t.as_array());
+        for tx in txs.into_iter().flatten() {
+            // `to` is absent for a contract creation, which is not a call to anything we index.
+            let Some(to_addr) = tx.get("to").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let lower = to_addr.to_ascii_lowercase();
+            let Ok(addr) = lower.parse::<alloy_primitives::Address>() else {
+                continue;
+            };
+            // `addresses` is the getLogs filter and holds only contracts with events, so a
+            // calldata-only contract has to be admitted by the call registry itself.
+            if !creg.declares(addr) && !addresses.iter().any(|a| a.eq_ignore_ascii_case(&lower)) {
+                continue;
+            }
+            let input = hex::decode(
+                tx.get("input")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("0x")
+                    .trim_start_matches("0x"),
+            )
+            .unwrap_or_default();
+            let idx = tx
+                .get("transactionIndex")
+                .and_then(|i| i.as_str())
+                .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            let Some(tx_from) = tx
+                .get("from")
+                .and_then(|f| f.as_str())
+                .and_then(|f| f.parse::<alloy_primitives::Address>().ok())
+            else {
+                anyhow::bail!(
+                    "block {b}: a transaction to {lower} carries no readable `from`. Every call row \
+                     records its sender, and inventing one would be worse than stopping."
+                );
+            };
+            let ctx = crate::calldata::CallContext {
+                block_number: *b,
+                block_hash: bhash.clone(),
+                block_timestamp: ts,
+                tx_hash: tx
+                    .get("hash")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                tx_from,
+                // The reserved band is applied here rather than at storage, so the row's own
+                // `log_index` is the key it lands under - one number, one meaning.
+                call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
+                timestamps,
+            };
+            call_rows.extend(creg.decode_call(addr, &input, &ctx));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn resolve_calls_for_window(
     source: &dyn Source,
     calls: &[crate::calls::CallDecl],
@@ -4042,10 +4204,51 @@ pub async fn backfill_direct_pipelined(
     from: u64,
     to: u64,
     window: u64,
+    seal_span: u64,
+    concurrency: usize,
+    on_seal: impl FnMut(u64) -> Result<()>,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> Result<u64> {
+    backfill_direct_pipelined_with(
+        source,
+        registry,
+        dir,
+        addresses,
+        topic0s,
+        calls,
+        state_rpc,
+        chain_id,
+        from,
+        to,
+        window,
+        seal_span,
+        concurrency,
+        DirectExtras::default(),
+        on_seal,
+        on_progress,
+    )
+    .await
+}
+
+/// [`backfill_direct_pipelined`], also decoding what `extras` declares.
+#[allow(clippy::too_many_arguments)]
+pub async fn backfill_direct_pipelined_with(
+    source: &dyn Source,
+    registry: &DecodeRegistry,
+    dir: &std::path::Path,
+    addresses: &[String],
+    topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&crate::rpc::RpcClient>,
+    chain_id: u64,
+    from: u64,
+    to: u64,
+    window: u64,
     // The chain's `seal_span` (#1199), passed to `take_sealable` so the backfill and the tip
     // path cut at the same boundaries. See `chains::Chain::seal_span`.
     seal_span: u64,
     concurrency: usize,
+    extras: DirectExtras<'_>,
     // Called after each segment seals, with the highest block now durably sealed - the caller
     // persists it as a resume watermark so a mid-backfill failure resumes here instead of restarting
     // from `from` (which would re-fetch, and on an adaptive path re-seal, already-sealed ranges).
@@ -4207,6 +4410,16 @@ pub async fn backfill_direct_pipelined(
                 rows.extend(call_rows);
                 rows.sort_by_key(|r| (r.block_number, r.log_index));
             }
+            extras
+                .extend(
+                    source,
+                    addresses,
+                    &mut rows,
+                    fetch_from,
+                    w_to,
+                    registry.timestamps(),
+                )
+                .await?;
             // Carry each row's block so the consumer can seal on a data-determined boundary
             // (RFC-0028 §4) instead of at whichever window filled the buffer.
             let mut json: Vec<SealRow> = rows
@@ -4326,10 +4539,53 @@ pub async fn backfill_direct_factory(
     from: u64,
     to: u64,
     window: u64,
+    seal_span: u64,
+    force_topic0: bool,
+    on_seal: impl FnMut(u64) -> Result<()>,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> Result<u64> {
+    backfill_direct_factory_with(
+        source,
+        registry,
+        factory,
+        children,
+        dir,
+        topic0s,
+        calls,
+        state_rpc,
+        chain_id,
+        from,
+        to,
+        window,
+        seal_span,
+        force_topic0,
+        DirectExtras::default(),
+        on_seal,
+        on_progress,
+    )
+    .await
+}
+
+/// [`backfill_direct_factory`], also decoding what `extras` declares.
+#[allow(clippy::too_many_arguments)]
+pub async fn backfill_direct_factory_with(
+    source: &dyn Source,
+    registry: &DecodeRegistry,
+    factory: &FactorySet,
+    children: &mut ChildRegistry,
+    dir: &std::path::Path,
+    topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&crate::rpc::RpcClient>,
+    chain_id: u64,
+    from: u64,
+    to: u64,
+    window: u64,
     // The chain's `seal_span` (#1199), passed to `take_sealable` so the backfill and the tip
     // path cut at the same boundaries. See `chains::Chain::seal_span`.
     seal_span: u64,
     force_topic0: bool,
+    extras: DirectExtras<'_>,
     // Resume watermark callback - see [`backfill_direct_pipelined`]. The factory path uses an adaptive
     // window (non-deterministic boundaries), so resuming from the last sealed block instead of `from`
     // is what prevents a re-run from re-sealing overlapping ranges under new hashes (duplicate data).
@@ -4546,6 +4802,16 @@ pub async fn backfill_direct_factory(
             rows.extend(call_rows);
             rows.sort_by_key(|r| (r.block_number, r.log_index));
         }
+        extras
+            .extend(
+                source,
+                &base,
+                &mut rows,
+                fetch_from,
+                chunk_to,
+                registry.timestamps(),
+            )
+            .await?;
         let row_count = merge_window_rows(
             &mut buf,
             fetch_from,
@@ -4809,6 +5075,15 @@ impl NestIngest {
                 // the child-event bulk is inherently ordered until the step-5 topic0-flip makes filters
                 // version-independent, so pipelining below the flip buys little (RFC-0009 §3 risk note). A
                 // static nest uses the pipelined path as before.
+                let extras = DirectExtras {
+                    call_registry: if self.top_level_calls {
+                        self.call_registry.as_deref()
+                    } else {
+                        None
+                    },
+                    ipfs: self.ipfs_gate.as_deref(),
+                    gateways: &self.ipfs_gateways,
+                };
                 let sealed = if let Some(fs) = self.factory.as_deref() {
                     if concurrency > 1 {
                         tracing::info!(
@@ -4818,7 +5093,7 @@ impl NestIngest {
                     tracing::info!(
                         "seal-direct factory backfill: {resume_from}..={finalized_through} (tip {tip}, sequential two-pass)…"
                     );
-                    backfill_direct_factory(
+                    backfill_direct_factory_with(
                         source,
                         &self.registry,
                         fs,
@@ -4833,6 +5108,7 @@ impl NestIngest {
                         window,
                         self.seal_span,
                         fs.force_topic0(),
+                        extras,
                         on_seal,
                         |blk, n, window| {
                             note_seal_direct_progress(&metrics, blk, window);
@@ -4844,7 +5120,7 @@ impl NestIngest {
                     tracing::info!(
                         "seal-direct backfill: {resume_from}..={finalized_through} (tip {tip}, {concurrency}-way)…"
                     );
-                    backfill_direct_pipelined(
+                    backfill_direct_pipelined_with(
                         source,
                         &self.registry,
                         &self.dir,
@@ -4858,6 +5134,7 @@ impl NestIngest {
                         window,
                         self.seal_span,
                         concurrency,
+                        extras,
                         on_seal,
                         |blk, n, window| {
                             note_seal_direct_progress(&metrics, blk, window);
@@ -5432,101 +5709,20 @@ impl NestIngest {
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
-        // RFC-0038 §5: decode **top-level calls** - transactions sent directly to this nest's
-        // contracts. This is what a subgraph's `callHandlers` fire on, and unlike the internal call
-        // tree it needs no node: a transaction is in the block body that ordinary RPC already serves.
-        //
-        // Bounded by the nest's own addresses before decode, so a busy chain costs this nest nothing
-        // it did not ask for.
         // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
         // oracle's CIDs arrive as calldata, not as logs.
         let mut call_rows: Vec<crate::registry::DecodedRow> = Vec::new();
         if self.top_level_calls {
             if let Some(creg) = self.call_registry.clone() {
-                let want: Vec<u64> = (next..=to).collect();
-                let bodies = retry_transient(
-                    &format!("block bodies for {} block(s)", want.len()),
-                    BACKFILL_RETRY_BASE,
-                    || async { source.block_bodies(&want).await },
+                call_rows = decode_top_level_calls(
+                    source,
+                    &creg,
+                    &self.addresses,
+                    next,
+                    to,
+                    self.registry.timestamps(),
                 )
                 .await?;
-                for b in &want {
-                    let Some(body) = bodies.get(b) else { continue };
-                    let bhash = body
-                        .get("hash")
-                        .and_then(|h| h.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    // The body already carries the header, so the timestamp comes from it rather
-                    // than from a second fetch - and unlike the `timestamps` map it covers blocks
-                    // that emitted no matching log at all, which is most of them.
-                    let ts = body
-                        .get("timestamp")
-                        .and_then(|t| t.as_str())
-                        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
-                        .unwrap_or(0);
-                    let txs = body.get("transactions").and_then(|t| t.as_array());
-                    for tx in txs.into_iter().flatten() {
-                        // `to` is absent for a contract creation, which is not a call to anything we
-                        // index.
-                        let Some(to_addr) = tx.get("to").and_then(|t| t.as_str()) else {
-                            continue;
-                        };
-                        let lower = to_addr.to_ascii_lowercase();
-                        let Ok(addr) = lower.parse::<alloy_primitives::Address>() else {
-                            continue;
-                        };
-                        // `addresses` is the getLogs filter and holds only contracts with events, so a
-                        // calldata-only contract has to be admitted by the call registry itself.
-                        if !creg.declares(addr)
-                            && !self
-                                .addresses
-                                .iter()
-                                .any(|a| a.eq_ignore_ascii_case(&lower))
-                        {
-                            continue;
-                        }
-                        let input = hex::decode(
-                            tx.get("input")
-                                .and_then(|i| i.as_str())
-                                .unwrap_or("0x")
-                                .trim_start_matches("0x"),
-                        )
-                        .unwrap_or_default();
-                        let idx = tx
-                            .get("transactionIndex")
-                            .and_then(|i| i.as_str())
-                            .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
-                            .unwrap_or(0);
-                        let Some(tx_from) = tx
-                            .get("from")
-                            .and_then(|f| f.as_str())
-                            .and_then(|f| f.parse::<alloy_primitives::Address>().ok())
-                        else {
-                            anyhow::bail!(
-                                "block {b}: a transaction to {lower} carries no readable `from`. Every \
-                                 call row records its sender, and inventing one would be worse than \
-                                 stopping."
-                            );
-                        };
-                        let ctx = crate::calldata::CallContext {
-                            block_number: *b,
-                            block_hash: bhash.clone(),
-                            block_timestamp: ts,
-                            tx_hash: tx
-                                .get("hash")
-                                .and_then(|h| h.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            tx_from,
-                            // The reserved band is applied here rather than at storage, so the row's
-                            // own `log_index` is the key it lands under - one number, one meaning.
-                            call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
-                            timestamps: self.registry.timestamps(),
-                        };
-                        call_rows.extend(creg.decode_call(addr, &input, &ctx));
-                    }
-                }
             }
         }
         for row in &call_rows {
@@ -10767,6 +10963,127 @@ template = "pool"
             .map(|e| serde_json::from_str::<serde_json::Value>(e).unwrap())
             .filter(|v| v["table"] == "qos_payload")
             .collect()
+    }
+
+    /// A 20,000-block window fetched every full block body before decoding one, and on Gnosis that held
+    /// 2.3 GB with nothing committed. Bodies come a chunk at a time now, so memory follows the chunk and
+    /// not the window, and every call in the window is still decoded.
+    #[tokio::test]
+    async fn top_level_calls_hold_one_chunk_of_block_bodies_at_a_time() {
+        struct Widest {
+            posts: PostSource,
+            widest: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Source for Widest {
+            async fn tip(&self) -> Result<u64> {
+                self.posts.tip().await
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                self.posts.block_hash(n).await
+            }
+            async fn logs(
+                &self,
+                f: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                self.posts.logs(f, from, to).await
+            }
+            async fn block_bodies(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                self.widest
+                    .fetch_max(blocks.len(), std::sync::atomic::Ordering::SeqCst);
+                self.posts.block_bodies(blocks).await
+            }
+        }
+
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let cid = crate::cid::cid_v0_for(b"one post");
+        let source = Widest {
+            posts: PostSource(vec![(3, qos_post(&cid)), (19_876, qos_post(&cid))]),
+            widest: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let rows = decode_top_level_calls(&source, &creg, &[], 0, 19_999, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            source.widest.load(std::sync::atomic::Ordering::SeqCst),
+            TOP_LEVEL_BODY_CHUNK,
+            "a window must be fetched a chunk of bodies at a time"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.block_number).collect::<Vec<_>>(),
+            [3, 19_876],
+            "chunking must not lose a call at either end of the window"
+        );
+    }
+
+    /// `--seal-direct` wrote finalized history without decoding top-level calls or resolving the
+    /// documents they name, so a QoS nest backfilled that way sealed nothing and said nothing.
+    #[tokio::test]
+    async fn seal_direct_seals_the_calls_and_documents_the_hot_path_would() {
+        let body = r#"{"bucket":1}"#.to_string();
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 0).await;
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        let gateways = vec![gateway];
+        let source = PostSource(vec![(4, qos_post(&cid))]);
+
+        backfill_direct_pipelined_with(
+            &source,
+            &registry,
+            dir.path(),
+            &[],
+            &[],
+            &[],
+            None,
+            100,
+            0,
+            10,
+            1_000,
+            SPAN_REAL,
+            1,
+            DirectExtras {
+                call_registry: Some(&creg),
+                ipfs: Some(&gate),
+                gateways: &gateways,
+            },
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        let sealed = |table: &str| {
+            let schema = tables.iter().find(|t| t.table == table).unwrap();
+            crate::seal::read_table_rows(dir.path(), schema).unwrap()
+        };
+        let calls = sealed("data_edge__call_submit_qo_s_payload");
+        assert_eq!(calls.len(), 1, "the post must be a call row in the sealed segment");
+        assert!(
+            calls[0]
+                .params
+                .iter()
+                .any(|(k, v)| k == crate::calldata::TX_FROM_COLUMN
+                    && v.to_json() == "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce"),
+            "the sealed call row must carry its sender: {:?}",
+            calls[0].params
+        );
+        let docs = sealed("qos_payload");
+        assert_eq!(docs.len(), 1, "the document it names must be sealed beside it");
+        handle.abort();
     }
 
     /// RFC-0037 §3. A window fetched at most 64 documents and never came back for the rest, which at
