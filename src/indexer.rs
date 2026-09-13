@@ -2418,6 +2418,7 @@ async fn build_nest(
         store.as_ref(),
         &identity,
         &hex::encode(registry.hash()),
+        config.extract.top_level_calls,
     )?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
@@ -3202,6 +3203,7 @@ fn guard_registry_identity(
     store: &dyn crate::store::HotStore,
     registry_hash: &str,
     legacy_hash: &str,
+    top_level_calls: bool,
 ) -> Result<()> {
     let formula = store.get_meta(IDENTITY_FORMULA_KEY)?;
     match store.get_meta(REGISTRY_KEY)? {
@@ -3212,6 +3214,16 @@ fn guard_registry_identity(
             Ok(())
         }
         Some(found) if formula.is_none() && found == legacy_hash => {
+            // Every call row has carried `tx_from` since this formula; rows written before it do
+            // not, so adopting would serve a column that is absent from the data it describes.
+            if top_level_calls && store.get_meta(LAST_BLOCK_KEY)?.is_some() {
+                anyhow::bail!(
+                    "this nest decodes top-level calls, and its stored call rows predate the \
+                     `tx_from` column every call table now carries.\n\n\
+                     Re-index from scratch to adopt it (remove `nuthatch.redb` and `segments/`), or \
+                     keep serving this data with the nuthatch build that indexed it."
+                );
+            }
             tracing::warn!(
                 "adopting decode identity 0x{registry_hash} for a store recorded under the event \
                  registry alone (0x{found}). Its event decode is verified; its call, [[ipfs]] and \
@@ -5452,6 +5464,17 @@ impl NestIngest {
                             .and_then(|i| i.as_str())
                             .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
                             .unwrap_or(0);
+                        let Some(tx_from) = tx
+                            .get("from")
+                            .and_then(|f| f.as_str())
+                            .and_then(|f| f.parse::<alloy_primitives::Address>().ok())
+                        else {
+                            anyhow::bail!(
+                                "block {b}: a transaction to {lower} carries no readable `from`. Every \
+                                 call row records its sender, and inventing one would be worse than \
+                                 stopping."
+                            );
+                        };
                         let ctx = crate::calldata::CallContext {
                             block_number: *b,
                             block_hash: bhash.clone(),
@@ -5461,6 +5484,7 @@ impl NestIngest {
                                 .and_then(|h| h.as_str())
                                 .unwrap_or_default()
                                 .to_string(),
+                            tx_from,
                             // The reserved band is applied here rather than at storage, so the row's
                             // own `log_index` is the key it lands under - one number, one meaning.
                             call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
@@ -10684,7 +10708,7 @@ template = "pool"
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
 
         // 1. Fresh store: adopts, and records what it adopted.
-        guard_registry_identity(&store, "aaaa", "aaaa").expect("a fresh store adopts");
+        guard_registry_identity(&store, "aaaa", "aaaa", false).expect("a fresh store adopts");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("aaaa"),
@@ -10692,12 +10716,12 @@ template = "pool"
         );
 
         // 2. Same registry: still fine.
-        guard_registry_identity(&store, "aaaa", "aaaa")
+        guard_registry_identity(&store, "aaaa", "aaaa", false)
             .expect("an unchanged registry must be accepted");
 
         // 3. Different registry: refused, and the message must name both hashes - a refusal that
         //    does not say what changed sends the operator to the source to find out.
-        let err = guard_registry_identity(&store, "bbbb", "bbbb")
+        let err = guard_registry_identity(&store, "bbbb", "bbbb", false)
             .expect_err("a changed registry must be refused, not adopted");
         let msg = format!("{err:#}");
         assert!(msg.contains("aaaa"), "must name the stored hash: {msg}");
@@ -10715,14 +10739,33 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "12345").unwrap();
         assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
 
-        guard_registry_identity(&store, "cccc", "cccc").expect("an older store must not be refused");
+        guard_registry_identity(&store, "cccc", "cccc", false).expect("an older store must not be refused");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("cccc")
         );
         // And having adopted, it is now held to it.
-        guard_registry_identity(&store, "dddd", "dddd")
+        guard_registry_identity(&store, "dddd", "dddd", false)
             .expect_err("once adopted, a later change must be refused");
+    }
+
+    /// Call rows written before `tx_from` do not have it. Adopting such a store onto the new identity
+    /// would serve a column its data does not contain, so it is refused; an empty one is not.
+    #[test]
+    fn a_top_level_calls_store_from_before_the_sender_column_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta(REGISTRY_KEY, "events").unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
+        let err = guard_registry_identity(&store, "full", "events", true)
+            .expect_err("indexed call rows without a sender must not be adopted");
+        assert!(format!("{err:#}").contains("tx_from"), "{err:#}");
+
+        let empty = tempfile::tempdir().unwrap();
+        let empty = Store::open(&empty.path().join("t.redb")).unwrap();
+        empty.set_meta(REGISTRY_KEY, "events").unwrap();
+        guard_registry_identity(&empty, "full", "events", true)
+            .expect("a store that never indexed a call has nothing to re-index");
     }
 
     const QOS_EDGE: &str = "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f";
@@ -10770,9 +10813,9 @@ template = "pool"
         assert_ne!(a, b, "a different json_match is a different decode identity");
 
         let store = Store::open(&indexer.path().join("t.redb")).unwrap();
-        guard_registry_identity(&store, &a, &a_events).unwrap();
+        guard_registry_identity(&store, &a, &a_events, true).unwrap();
         store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
-        guard_registry_identity(&store, &b, &b_events)
+        guard_registry_identity(&store, &b, &b_events, true)
             .expect_err("a store indexed under one [[ipfs]] declaration must refuse another");
     }
 
@@ -10786,7 +10829,7 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "100").unwrap();
         store.set_meta(REGISTRY_KEY, "events").unwrap();
 
-        guard_registry_identity(&store, "full", "events")
+        guard_registry_identity(&store, "full", "events", false)
             .expect("a store matching the old formula adopts the new one");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
@@ -10795,9 +10838,9 @@ template = "pool"
 
         let fresh = tempfile::tempdir().unwrap();
         let fresh = Store::open(&fresh.path().join("t.redb")).unwrap();
-        guard_registry_identity(&fresh, "events", "events").unwrap();
+        guard_registry_identity(&fresh, "events", "events", false).unwrap();
         fresh.set_meta(LAST_BLOCK_KEY, "100").unwrap();
-        guard_registry_identity(&fresh, "events+ipfs", "events").expect_err(
+        guard_registry_identity(&fresh, "events+ipfs", "events", false).expect_err(
             "a store recorded under the full formula must refuse a declaration added afterwards",
         );
     }
@@ -12877,6 +12920,7 @@ template="pool"
                                     // A call to the contract this nest indexes: `ping()`.
                                     {
                                         "hash": "0xaa",
+                                        "from": "0x2222222222222222222222222222222222222222",
                                         "to": "0x1111111111111111111111111111111111111111",
                                         "input": "0x5c36b186",
                                         "transactionIndex": "0x0"
@@ -13017,6 +13061,7 @@ template="pool"
                 let tx = |i: u64, input: &str| {
                     serde_json::json!({
                         "hash": format!("0x{i:064x}"),
+                        "from": "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce",
                         "to": EDGE,
                         "input": input,
                         "transactionIndex": format!("0x{i:x}"),
@@ -13111,6 +13156,12 @@ template="pool"
         assert_eq!(
             calls, 3,
             "every post is kept as a call row, resolved or not"
+        );
+        assert!(
+            rows.iter()
+                .filter(|v| v["table"] == "data_edge__call_submit_qo_s_payload")
+                .all(|v| v["tx_from"] == "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce"),
+            "a call row must name the publisher that sent it"
         );
         for (table, cid) in [
             (
