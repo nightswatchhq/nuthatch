@@ -112,11 +112,14 @@ The source columns are `varchar` except the four counters (§4). Citation keys a
 | `string` | `varchar` | `c` | n/a | |
 | `json` | `varchar` | `c`, read with `json_value(c, 'strict $.field')` | `try` handles path errors | D12, T2 |
 
-Four rules sit around the table:
+Five rules sit around the table:
 
 - **Every wide integer keeps its exact text beside the typed column**, as `<name>_raw` `varchar`, the
   suffix Spellbook's seeds use for raw amounts (S11). A user can always reach the exact value, and a
   name collision with a real ABI parameter is a refusal (§5), not a rename.
+- **Time is passed through an explicit `'UTC'`.** A bare `from_unixtime(c)` takes the session zone, and casting
+  its result to `timestamp` can shift the wall clock in a non-UTC session (trinodb/trino #6314, #7450).
+  With the zone named, the cast keeps the UTC wall clock, which is what `evt_block_time` is (D10, S9).
 - **Casts are `cast`, not `try_cast`.** `try_cast` "returns null if the cast fails" (D2). A silent NULL
   in a wide-integer column undercounts every sum over it, which is a wrong number presented as a right
   one. A cast that fails should fail the query.
@@ -248,7 +251,7 @@ than duplicating.
 
 | slice | delivers | fails if |
 | --- | --- | --- |
-| S0 - verify | the §3.2 casts marked unverified, run once on Dune with literals, recorded with the query and its output, including `from_hex(substr('0x…', 3))` against the prefixed form; a free account suffices because no upload is involved | `cast` from decimal text to `uint256` or `int256` is refused, or loses a digit, at `2^256-1`, `-2^255` or `2^255-1`; then §3.2 is redesigned before S1 |
+| S0 - verify | the §3.2 casts marked unverified, run once on Dune with literals, recorded with the query and its output, including `from_hex(substr('0x…', 3))` against the prefixed form; no upload is involved, but it needs an account that can still run queries (§9) | `cast` from decimal text to `uint256` or `int256` is refused, or loses a digit, at `2^256-1`, `-2^255` or `2^255-1`; then §3.2 is redesigned before S1 |
 | S1 - per-table queries | `nuthatch emit dune`, §3 casts and names, §5 refusals, the golden test | the golden output changes between two runs, or a `StorageKind` variant has no row |
 | S2 - descriptions | table and column descriptions and grain from `semantic.toml` in each query's comment header | a description in `semantic.toml` is missing from the emitted query |
 | S3 - authored views | the subset of `views/*.sql` that translates exactly, the rest named | a translated view returns a different result from the DuckDB original on the fixture |
@@ -277,6 +280,17 @@ Types and conventions, from brief 8:
    exist in Dune's own tables. §3.3 follows `ethereum.logs` and says so.
 8. Dune's session time zone. §3.2 passes `'UTC'` explicitly for that reason.
 
+Access and a second reading, from Chief's public-sources research report of 2026-09-13:
+
+9. **Whether a free account can run S0 at all.** Crypto Briefing reported on 2026-09-08 that accounts
+   created before 2026-07-21 lose the ability to run queries from 2026-09-10 unless upgraded, with a
+   14-day Plus trial offered. That is a press report, not a Dune page; [Pricing
+   FAQs](https://docs.dune.com/learning/how-tos/pricing-faqs) still describes paying $5.00 per 100 extra
+   credits. S0 therefore needs an account that can run queries today, whatever its plan.
+10. **Whether Dune's `from_hex` accepts the `0x` prefix.** That report reads the varbinary page as
+   saying Dune's helpers account for the prefix. §3.2 strips it anyway, so the emitter is correct
+   either way, and S0 records which reading holds.
+
 ## §10 - Sources
 
 All read 2026-09-13. Spellbook at `c73960eb` on `main`.
@@ -302,3 +316,6 @@ All read 2026-09-13. Spellbook at `c73960eb` on `main`.
 - S11 github.com/duneanalytics/spellbook `dbt_subprojects/dex/seeds/_project/zeroex/ethereum/_schema.yml`
 - T1 github.com/trinodb/trino `docs/src/main/sphinx/functions/binary.md` (`from_hex`)
 - T2 github.com/trinodb/trino `docs/src/main/sphinx/functions/conditional.md`
+- T3 github.com/trinodb/trino issues #6314 and #7450 (`from_unixtime` and session time zones)
+- P1 https://docs.dune.com/learning/how-tos/pricing-faqs
+- P2 Crypto Briefing, 2026-09-08, on Dune's free-plan change (press, cited in Chief's research report)
