@@ -175,44 +175,118 @@ pub struct ExecSubmit {
 
 impl Submit for ExecSubmit {
     fn submit(&self, row: &serde_json::Value) -> Outcome {
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(&self.command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return Outcome::Deferred(format!("spawn: {e}")),
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(error) = writeln!(stdin, "{row}") {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Outcome::Deferred(format!("write authorisation to exec: {error}"));
-            }
-        }
-        match child.wait_with_output() {
-            Ok(out) if out.status.success() => Outcome::Settled,
-            Ok(out) if out.status.code() == Some(2) => {
-                let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                Outcome::Failed(if detail.is_empty() {
+        match run_exec(&self.command, format!("{row}\n"), |_| {}) {
+            Err(why) => Outcome::Deferred(why),
+            Ok((status, _)) if status.success() => Outcome::Settled,
+            Ok((status, stderr)) if status.code() == Some(2) => {
+                Outcome::Failed(if stderr.is_empty() {
                     "exec exited 2".into()
                 } else {
-                    detail
+                    stderr
                 })
             }
-            Ok(out) => Outcome::Deferred(format!(
-                "exec exited {}",
-                out.status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "signal".into())
-            )),
-            Err(e) => Outcome::Deferred(format!("wait: {e}")),
+            Ok((status, _)) => Outcome::Deferred(format!("exec exited {}", exit_code(status))),
         }
     }
+}
+
+/// Longest stdout line kept from an operator command. A longer line is skipped, never buffered.
+const EXEC_LINE_LIMIT: usize = 64 * 1024;
+/// Stderr kept as a failure's detail; the rest is drained and dropped.
+const EXEC_STDERR_LIMIT: u64 = 4 * 1024;
+
+/// Run `command` with `input` on stdin, handing each stdout line to `line` as it arrives. stdin is
+/// written from its own thread, so a command that writes before it reads cannot deadlock on a full
+/// pipe, and nothing the command prints is retained beyond one line and [`EXEC_STDERR_LIMIT`].
+fn run_exec(
+    command: &str,
+    input: String,
+    mut line: impl FnMut(&str),
+) -> std::result::Result<(std::process::ExitStatus, String), String> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+    let stdin = child.stdin.take();
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        if let Some(mut stdin) = stdin {
+            stdin.write_all(input.as_bytes())?;
+        }
+        Ok(())
+    });
+    let stderr = child.stderr.take();
+    let drain = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = std::io::Read::read_to_end(
+                &mut std::io::Read::take(&mut stderr, EXEC_STDERR_LIMIT),
+                &mut kept,
+            );
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        }
+        String::from_utf8_lossy(&kept).trim().to_string()
+    });
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut buf = Vec::new();
+        let mut overlong = false;
+        loop {
+            buf.clear();
+            match std::io::Read::take(&mut reader, EXEC_LINE_LIMIT as u64)
+                .read_until(b'\n', &mut buf)
+            {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            // A short read without a newline is the last line; a full one is part of a long line.
+            let whole = buf.last() == Some(&b'\n') || buf.len() < EXEC_LINE_LIMIT;
+            if whole && !overlong {
+                if let Ok(text) = std::str::from_utf8(&buf) {
+                    line(text.trim_end());
+                }
+            }
+            overlong = !whole;
+        }
+    }
+    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+    let stderr = drain.join().unwrap_or_default();
+    match writer.join() {
+        Ok(Ok(())) => Ok((status, stderr)),
+        Ok(Err(e)) => Err(format!("write authorisations to exec: {e}")),
+        Err(_) => Err("the exec stdin writer panicked".into()),
+    }
+}
+
+fn exit_code(status: std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".into())
+}
+
+fn parse_outcome(line: &str) -> Option<([String; 3], Outcome)> {
+    let result = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let field = |key: &str| {
+        result
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let key = [field("network")?, field("payer")?, field("nonce")?];
+    let outcome = match field("outcome").as_deref() {
+        Some("settled") => Outcome::Settled,
+        Some("failed") => Outcome::Failed(
+            field("detail")
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "exec reported failed".into()),
+        ),
+        _ => return None,
+    };
+    Some((key, outcome))
 }
 
 /// `--exec` with `--batch`: stdin is up to N pending rows, one per line; stdout is one line per row
@@ -232,72 +306,30 @@ impl Submit for BatchExecSubmit {
     }
 
     fn submit_batch(&self, rows: &[serde_json::Value]) -> Vec<Outcome> {
-        let deferred = |why: String| {
-            rows.iter()
-                .map(|_| Outcome::Deferred(why.clone()))
-                .collect::<Vec<_>>()
-        };
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(&self.command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return deferred(format!("spawn: {e}")),
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            for row in rows {
-                if let Err(error) = writeln!(stdin, "{row}") {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return deferred(format!("write authorisations to exec: {error}"));
+        let wanted: std::collections::HashSet<[String; 3]> =
+            rows.iter().map(authorisation_key).collect();
+        let mut reported = std::collections::HashMap::new();
+        let input: String = rows.iter().map(|row| format!("{row}\n")).collect();
+        let result = run_exec(&self.command, input, |line| {
+            if let Some((key, outcome)) = parse_outcome(line) {
+                if wanted.contains(&key) {
+                    reported.insert(key, outcome);
                 }
             }
-        }
-        let out = match child.wait_with_output() {
-            Ok(out) => out,
-            Err(e) => return deferred(format!("wait: {e}")),
+        });
+        // Outcomes the command reported stand even when it then failed: money may have moved.
+        let why = match result {
+            Ok((status, _)) => format!(
+                "exec exited {} without reporting this row",
+                exit_code(status)
+            ),
+            Err(why) => why,
         };
-        let mut reported = std::collections::HashMap::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let Ok(result) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let field = |key: &str| {
-                result
-                    .get(key)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            };
-            let (Some(network), Some(payer), Some(nonce)) =
-                (field("network"), field("payer"), field("nonce"))
-            else {
-                continue;
-            };
-            let outcome = match field("outcome").as_deref() {
-                Some("settled") => Outcome::Settled,
-                Some("failed") => Outcome::Failed(
-                    field("detail")
-                        .filter(|d| !d.is_empty())
-                        .unwrap_or_else(|| "exec reported failed".into()),
-                ),
-                _ => continue,
-            };
-            reported.insert([network, payer, nonce], outcome);
-        }
-        let status = out
-            .status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
         rows.iter()
             .map(|row| {
-                reported.remove(&authorisation_key(row)).unwrap_or_else(|| {
-                    Outcome::Deferred(format!("exec exited {status} without reporting this row"))
-                })
+                reported
+                    .remove(&authorisation_key(row))
+                    .unwrap_or_else(|| Outcome::Deferred(why.clone()))
             })
             .collect()
     }
@@ -798,5 +830,51 @@ mod tests {
         assert!(crate::counter::payer_has_failed(dir.path(), "testnet", "0xbb").unwrap());
         let pending = read_jsonl(&dir.path().join(LOG)).unwrap();
         assert_eq!(pending[0]["payer"], "0xcc");
+    }
+
+    #[test]
+    fn exec_output_is_bounded_and_an_overlong_line_is_skipped() {
+        let exec = BatchExecSubmit {
+            command: concat!(
+                "cat >/dev/null; ",
+                "head -c 300000 /dev/zero | tr '\\0' x; echo; ",
+                "head -c 300000 /dev/zero | tr '\\0' e >&2; ",
+                r#"echo '{"network":"testnet","payer":"0xaa","nonce":"0x01","outcome":"settled"}'; "#,
+                r#"echo '{"network":"testnet","payer":"0xzz","nonce":"0x09","outcome":"settled"}'"#,
+            )
+            .into(),
+        };
+        assert_eq!(
+            exec.submit_batch(&[row("0xaa", "0x01")]),
+            [Outcome::Settled]
+        );
+
+        let failing = ExecSubmit {
+            command: "cat >/dev/null; head -c 300000 /dev/zero | tr '\\0' e >&2; exit 2".into(),
+        };
+        match failing.submit(&row("0xaa", "0x01")) {
+            Outcome::Failed(detail) => {
+                assert!(detail.starts_with("eee"), "{detail}");
+                assert!(
+                    detail.len() <= EXEC_STDERR_LIMIT as usize,
+                    "{}",
+                    detail.len()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_command_that_writes_before_reading_a_large_batch_does_not_deadlock() {
+        let rows: Vec<_> = (0..2000)
+            .map(|n| row("0xaa", &format!("0x{n:04x}")))
+            .collect();
+        let exec = BatchExecSubmit {
+            command: "head -c 1000000 /dev/zero | tr '\\0' y; echo; cat >/dev/null".into(),
+        };
+        let outcomes = exec.submit_batch(&rows);
+        assert_eq!(outcomes.len(), rows.len());
+        assert!(outcomes.iter().all(|o| matches!(o, Outcome::Deferred(_))));
     }
 }
