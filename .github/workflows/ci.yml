@@ -6,7 +6,7 @@ on:
     # review - the review requirement was the jam, not the writing - and CI is what still
     # catches real breakage. It runs on GitHub's machines, so it costs no Claude allowance:
     # it is the one gate that is free, and therefore the one to keep.
-    branches: [main, 'sprint/**', 'pete/1261-trino-contract'] # TEMPORARY (#1261): remove before PR
+    branches: [main, 'sprint/**']
   # No `branches:` filter here, deliberately - it filters on the PR's *base*, and a stacked PR
   # (head branch built on another feature branch, not `main`) matched neither the old
   # `[main]` list nor `[main, 'sprint/**']`: zero checks run, and the PR reads as green because
