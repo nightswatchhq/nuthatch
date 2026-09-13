@@ -295,15 +295,15 @@ pub const IPFS_ROW_LOG_INDEX_BASE: u64 = 625_000;
 /// exactly one pair is populated. They are kept as distinct fields rather than one reused pair
 /// because `schema.json` is read by humans and by agents, and a 4-byte selector sitting in a field
 /// called `topic0` would be a lie that costs more than the two extra keys.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
     pub table: String,
     pub alias: String,
     #[serde(default, skip_serializing_if = "TableKind::is_event")]
     pub kind: TableKind,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub event: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub topic0: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub function: String,
@@ -330,7 +330,7 @@ impl TableSchema {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnSchema {
     pub name: String,
     pub sol_type: String,

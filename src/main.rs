@@ -170,6 +170,9 @@ async fn main() -> Result<()> {
                 publish::run_verify(std::path::Path::new(&a.dir), &a.target, a.deep).await
             }
         },
+        cli::Command::Emit(args) => match args.what {
+            cli::EmitWhat::Dune(a) => nuthatch::dune_emit::run(a),
+        },
         cli::Command::Mcp(args) => {
             if args.print_config {
                 mcp::print_client_config(&args.url);

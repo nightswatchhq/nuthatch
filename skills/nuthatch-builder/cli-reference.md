@@ -137,6 +137,19 @@ Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width,
 - `--json` - Print one JSON object per endpoint on stdout (no prose). The live-endpoints gate keys on these fields, not on the wording of the human report (#716)
 - `--catalogue` - Check the segment catalogue in `--dir`: every entry's file exists and hashes. Does not quarantine (that is startup). Exit 1 if anything disagrees. With `--json` and no `--rpc`, stdout is the catalogue check only, so the live-endpoints gate is unchanged
 
+## `nuthatch emit`
+
+Write another engine's SQL over a nest's tables, offline and deterministically (RFC-0055)
+
+
+## `nuthatch emit dune`
+
+One DuneSQL query per event table, casting each column to its DuneSQL type (RFC-0055 S1)
+
+- `--dir <DIR>` - Nest directory. Read only
+- `--out <OUT>` - Directory the `.sql` files and `README.md` are written to
+- `--source <SOURCE>` - The Dune namespace the rows were uploaded into; queries read `dune.<source>.<table>`
+
 ## `nuthatch init`
 
 Scaffold an indexer for a contract: resolve its ABI and write a project here
