@@ -399,7 +399,14 @@ fn registry_hash(by_selector: &HashMap<[u8; 4], Vec<CallDecoder>>) -> [u8; 32] {
                 d.signature,
                 d.columns
                     .iter()
-                    .map(|c| format!("{}:{}", c.name, c.sol_type))
+                    .map(|c| {
+                        format!(
+                            "{}:{}{}",
+                            c.name,
+                            c.sol_type,
+                            nuthatch_decode::registry::object_shape(c)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             )
@@ -690,6 +697,26 @@ mod tests {
             one.hash(),
             narrowed.hash(),
             "a different decode surface must be a different decode identity"
+        );
+    }
+
+    /// A named tuple argument is stored as an object and an unnamed one as an array, so they hash
+    /// apart (#1364), while a tuple-free surface keeps its v3.6.1 hash. That literal is the v3.6.1
+    /// line format, `f|alias|contract|selector|signature|name:type,...`, hashed by hand.
+    #[test]
+    fn a_named_tuple_argument_moves_the_hash_and_nothing_else_does() {
+        assert_eq!(
+            hex::encode(reg(ERC20, &Extract::default()).hash()),
+            "fc780503e494c575b6968ac98b681f1b0c5ab230522d02c4c43790f3746b79af"
+        );
+        let place = |a: &str, b: &str| {
+            format!(
+                r#"[{{"type":"function","name":"place","inputs":[{{"name":"order","type":"tuple","components":[{{"name":"{a}","type":"uint256"}},{{"name":"{b}","type":"uint256"}}]}}],"outputs":[],"stateMutability":"nonpayable"}}]"#
+            )
+        };
+        assert_ne!(
+            reg(&place("y", "z"), &Extract::default()).hash(),
+            reg(&place("", ""), &Extract::default()).hash()
         );
     }
 

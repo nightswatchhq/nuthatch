@@ -1279,6 +1279,25 @@ fn register_events(
     skipped
 }
 
+/// What a column appends to its registry-hash line: `:object(name:type;...)` when
+/// [`value_from_dynsol`] stores it as a JSON object, and nothing otherwise, so every other line is
+/// the v3.6.1 line (#1364).
+///
+/// That is a non-indexed `tuple` with fully, uniquely named components: an indexed tuple is a topic
+/// hash, and a `tuple[]` stays positional whatever its names.
+pub fn object_shape(c: &Column) -> String {
+    if c.components.is_empty() || c.sol_type != "tuple" || c.kind == StorageKind::Hash32 {
+        return String::new();
+    }
+    // `(` and `;` cannot occur in an ABI identifier or type, and `;` leaves the `,` column split alone.
+    let fields: Vec<String> = c
+        .components
+        .iter()
+        .map(|f| format!("{}:{}", f.name, f.sol_type))
+        .collect();
+    format!(":object({})", fields.join(";"))
+}
+
 /// sha256 over a canonical serialization of the registry (deterministic, order-independent). Includes
 /// template decoders (RFC-0009) so a factory nest's data model is content-addressed too.
 fn registry_hash(
@@ -1289,7 +1308,15 @@ fn registry_hash(
         let cols: Vec<String> = d
             .columns
             .iter()
-            .map(|c| format!("{}:{}:{}", c.name, c.sol_type, c.kind.as_str()))
+            .map(|c| {
+                format!(
+                    "{}:{}:{}{}",
+                    c.name,
+                    c.sol_type,
+                    c.kind.as_str(),
+                    object_shape(c)
+                )
+            })
             .collect();
         format!(
             "{kind}|{}|0x{}|0x{}|{}|{}",
@@ -2509,6 +2536,97 @@ mod tests {
             b.hash(),
             "registry hash must not depend on input order"
         );
+    }
+
+    fn made_abi(ty: &str, indexed: bool, components: &str) -> String {
+        format!(
+            r#"[{{"type":"event","name":"Made","anonymous":false,"inputs":[{{"name":"order","type":"{ty}","indexed":{indexed},"components":{components}}}]}}]"#
+        )
+    }
+
+    const YZ: &str = r#"[{"name":"y","type":"uint256"},{"name":"z","type":"uint256"}]"#;
+    // What v3.6.1 hashed `made_abi("tuple", false, _)` to, whatever the component names.
+    const V361_MADE_TUPLE: &str =
+        "f126ed95e8b79c3d50f2c48597f8bcf9d9ad003e0f869cb3ba328d632a45ec88";
+
+    fn made_hash(ty: &str, indexed: bool, components: &str) -> String {
+        let abi = made_abi(ty, indexed, components);
+        hex::encode(DecodeRegistry::build(vec![spec("t", USDC, &abi)]).unwrap().hash())
+    }
+
+    /// A registry with no tuple keeps the hash v3.6.1 gave it, so #1364 re-indexes only nests that
+    /// store an object. The literal was printed by this build on the `v3.6.1` tag.
+    #[test]
+    fn a_tuple_free_registry_keeps_its_v3_6_1_hash() {
+        let reg = DecodeRegistry::build(vec![spec("usdc", USDC, ERC20)]).unwrap();
+        assert_eq!(
+            hex::encode(reg.hash()),
+            "d3f4a2fd9c5e50015ad2e77de1e71ef1416c5759e8b350e0f99034718048a63c"
+        );
+    }
+
+    /// The same event with named and with unnamed components stores an object and an array, so the
+    /// two are different decodings (#1364). v3.6.1 hashed both to `V361_MADE_TUPLE`.
+    #[test]
+    fn named_and_unnamed_tuples_hash_differently() {
+        let blank = r#"[{"name":"","type":"uint256"},{"name":"","type":"uint256"}]"#;
+        let named = made_abi("tuple", false, YZ);
+        let unnamed = made_abi("tuple", false, blank);
+        let topic0 = |abi: &str| DecodeRegistry::build(vec![spec("t", USDC, abi)]).unwrap().topic0s();
+        assert_eq!(topic0(&named), topic0(&unnamed), "one signature, one topic0");
+
+        assert_ne!(made_hash("tuple", false, YZ), made_hash("tuple", false, blank));
+        assert_eq!(made_hash("tuple", false, blank), V361_MADE_TUPLE);
+
+        // The outer tuple of a nested one is still an object; its inner tuple stays positional.
+        let nested = r#"[{"name":"inner","type":"tuple","components":[{"name":"leaf","type":"uint256"}]},{"name":"tail","type":"uint256"}]"#;
+        assert_ne!(
+            made_hash("tuple", false, nested),
+            "a91cafa0fa27b80ca2c76f63b13316385c31a3ce60f708f10e428d992f8e235a"
+        );
+    }
+
+    /// A tuple the decoder stores as anything but an object keeps its v3.6.1 hash: the line must not
+    /// claim a shape the stored bytes do not have.
+    #[test]
+    fn a_tuple_not_stored_as_an_object_keeps_its_v3_6_1_hash() {
+        let duped = r#"[{"name":"y","type":"uint256"},{"name":"y","type":"uint256"}]"#;
+        let partial = r#"[{"name":"y","type":"uint256"},{"name":"","type":"uint256"}]"#;
+        for (what, ty, indexed, components, v361) in [
+            ("duplicate names", "tuple", false, duped, V361_MADE_TUPLE),
+            ("a missing name", "tuple", false, partial, V361_MADE_TUPLE),
+            (
+                "an indexed tuple",
+                "tuple",
+                true,
+                YZ,
+                "39c4e7d2b4e4963207faf599017cf569ea72f567a934c52c5620aa13293b9549",
+            ),
+            (
+                "a named tuple[]",
+                "tuple[]",
+                false,
+                YZ,
+                "ebc7955973d7f13ccd2b80169933f7f5a504748b8ae236baead8932d80cbd980",
+            ),
+        ] {
+            assert_eq!(made_hash(ty, indexed, components), v361, "{what}");
+        }
+
+        // A named tuple[] really is stored positionally, which is why it keeps the old line.
+        let reg = DecodeRegistry::build(vec![spec("t", USDC, &made_abi("tuple[]", false, YZ))])
+            .unwrap();
+        let topic0 = format!("0x{}", hex::encode(reg.tables()[0].topic0));
+        let word = |n: u8| format!("{}{n:02x}", "00".repeat(31));
+        let data = format!("0x{}{}{}{}", word(0x20), word(1), word(1), word(2));
+        let row = reg
+            .decode(&log(USDC, &[&topic0], &data, 1, 0))
+            .unwrap()
+            .expect("topic0 and address match");
+        let Value::Json(raw) = &row.params[0].1 else {
+            panic!("orders must be Json, got {:?}", row.params[0].1);
+        };
+        assert_eq!(serde_json::from_str::<Json>(raw).unwrap(), json!([["1", "2"]]));
     }
 
     #[test]
