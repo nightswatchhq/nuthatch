@@ -2660,6 +2660,15 @@ async fn build_nest(
         None
     };
 
+    // A declaration may read a call table, so the gate sees those columns as well as the event ones.
+    let ipfs_gate = {
+        let mut tables = full_schema(&registry, config);
+        if let Some(calls) = &call_registry {
+            tables.extend(calls.schema(&config.extract));
+        }
+        crate::ipfs_resolve::Gate::new(&config.ipfs, &tables)
+    };
+
     let state_rpc = if config.state_rpc_urls.is_empty() {
         if !config.calls.is_empty() && config.read_only_role {
             // #1167: `serve` resolves nothing; the call tables it serves were sealed by `dev`.
@@ -2739,7 +2748,8 @@ async fn build_nest(
         addresses,
         topic0s,
         start_block,
-        ipfs: config.ipfs.clone(),
+        ipfs_gate,
+        ipfs_resolver: None,
         ipfs_gateways: if config.ipfs_gateways.is_empty() {
             crate::subgraph_import::DEFAULT_IPFS_GATEWAYS
                 .iter()
@@ -4659,8 +4669,11 @@ pub struct NestIngest {
     /// `None`. Used only by [`prepare`]'s cold-start origin computation.
     start_block: Option<u64>,
     /// RFC-0037: declared IPFS resolutions, in config order - which fixes each row's slot in the
-    /// reserved band and therefore its key.
-    ipfs: Vec<crate::ipfs::IpfsDecl>,
+    /// reserved band and therefore its key. `None` for a nest that declares none.
+    ipfs_gate: Option<Arc<crate::ipfs_resolve::Gate>>,
+    /// The out-of-band resolver for those declarations, started by [`NestIngest::prepare`]. Dropped
+    /// with the nest, which aborts it and releases its handle on the store.
+    ipfs_resolver: Option<crate::ipfs_resolve::Running>,
     /// The gateways (or local node) declared resolutions are fetched through. Never part of the
     /// nest's identity: a gateway is an access path, and content addressing is what makes two
     /// operators' answers comparable regardless of which one they used.
@@ -4909,7 +4922,28 @@ impl NestIngest {
                 start
             }
         };
+        self.start_ipfs_resolver();
         Ok(next)
+    }
+
+    /// Start resolving this nest's `[[ipfs]]` documents out of band, once.
+    fn start_ipfs_resolver(&mut self) {
+        if self.ipfs_resolver.is_some() {
+            return;
+        }
+        let Some(gate) = self.ipfs_gate.clone() else {
+            return;
+        };
+        self.ipfs_resolver = Some(crate::ipfs_resolve::spawn(
+            crate::ipfs_resolve::Resolver::new(
+                self.store.clone(),
+                gate,
+                self.ipfs_gateways.clone(),
+                self.registry.timestamps(),
+                self.metrics.clone(),
+                crate::ipfs_resolve::Policy::default(),
+            ),
+        ));
     }
 
     /// Does this log belong to this nest? Two demux modes, mirroring the two nest kinds:
@@ -5503,115 +5537,18 @@ impl NestIngest {
             stored += 1;
         }
 
-        // RFC-0037: resolve the IPFS documents this window's rows point at.
-        //
-        // Deduped by CID before any fetch, because a CID *is* a content address: a thousand rows
-        // naming the same document are one fetch and one row. Every body is verified against its CID
-        // before it is stored (`crate::cid`), so a gateway answering HTTP 200 with prose - which they
-        // really do - cannot become a nest's data.
-        //
-        // Bounded, and failure is absence rather than error: an unresolved document simply has no
-        // row, which is what the `LEFT JOIN` shape expects. Tip-following must never wait on a
-        // gateway indefinitely.
-        if !self.ipfs.is_empty() {
-            const MAX_FETCHES_PER_WINDOW: usize = 64;
-            let mut budget = MAX_FETCHES_PER_WINDOW;
-            let mut per_block: std::collections::BTreeMap<u64, Vec<(usize, String)>> =
-                std::collections::BTreeMap::new();
-            let mut unreadable = 0usize;
-            for (i, d) in self.ipfs.iter().enumerate() {
-                let col = d.column();
-                let mut seen = std::collections::HashSet::new();
-                let mut src: Vec<&crate::registry::DecodedRow> = rows
-                    .iter()
-                    .chain(&call_rows)
-                    .filter(|r| r.table == d.on)
-                    .collect();
-                src.sort_by_key(|r| (r.block_number, r.log_index));
-                for r in src {
-                    // A row without the column resolves nothing, exactly like one naming no CID, and
-                    // neither used to leave a trace.
-                    let Some(value) = r.params.iter().find(|(k, _)| k == col).map(|(_, v)| v)
-                    else {
-                        unreadable += 1;
-                        continue;
-                    };
-                    // A bare CID, an `ipfs://` URI, a full gateway URL, a raw 32-byte digest, or JSON
-                    // naming one. Only the content address is kept: the value comes from a log or a
-                    // transaction, so fetching the host it names would let its author choose what
-                    // this process connects to.
-                    let (cids, missed) = d.cids_in(value);
-                    unreadable += missed;
-                    for cid in cids {
-                        if seen.insert(cid.clone()) {
-                            per_block.entry(r.block_number).or_default().push((i, cid));
-                        }
-                    }
-                }
-            }
+        // RFC-0037 §3: the documents these rows name are fetched out of band (`ipfs_resolve`), never
+        // here, and sealing below waits for them. What the tip path still owns is saying so when a row
+        // names nothing that could be resolved.
+        if let Some(gate) = &self.ipfs_gate {
+            let named: Vec<&crate::registry::DecodedRow> = rows.iter().chain(&call_rows).collect();
+            let unreadable = crate::ipfs_resolve::unreadable(gate.decls(), &named);
             if unreadable > 0 {
                 self.metrics.add_ipfs_unreadable(unreadable as u64);
                 tracing::warn!(
                     "ipfs: {unreadable} row(s) in {next}..={to} named no usable CID - nothing to \
                      resolve for them (nuthatch_nest_ipfs_unreadable_total)"
                 );
-            }
-            for (block, items) in per_block {
-                let hash = retry_transient(
-                    &format!("block hash for {block}"),
-                    BACKFILL_RETRY_BASE,
-                    || async { source.block_hash(block).await },
-                )
-                .await?
-                .unwrap_or_default();
-                let ctx = crate::ipfs::BlockCtx {
-                    number: block,
-                    hash: &hash,
-                    timestamp: timestamps.get(&block).copied().unwrap_or(0),
-                    timestamps: self.registry.timestamps(),
-                };
-                for (slot, (i, cid)) in items.into_iter().enumerate() {
-                    if budget == 0 {
-                        tracing::warn!(
-                            "ipfs: window {next}..={to} hit the {MAX_FETCHES_PER_WINDOW}-fetch \
-                             budget; the remaining documents stay unresolved and will be retried \
-                             when a resolver runs out of band (RFC-0037)"
-                        );
-                        break;
-                    }
-                    budget -= 1;
-                    match crate::subgraph_import::fetch_ipfs(
-                        &cid,
-                        &self.ipfs_gateways,
-                        crate::subgraph_import::Origin::Manifest,
-                    )
-                    .await
-                    {
-                        Ok(content) => {
-                            // `fetch_ipfs` only returns a body that verified, or one it warned about
-                            // as too large for single-block re-encoding. Record which, so a consumer
-                            // can tell a proven document from an accepted-unverified one.
-                            let verified = content.len() <= 256 * 1024;
-                            let row = crate::ipfs::to_row(
-                                &self.ipfs[i].name,
-                                &cid,
-                                &content,
-                                verified,
-                                slot,
-                                &ctx,
-                            );
-                            to_store.push((
-                                Store::entity_key(row.block_number, row.log_index),
-                                row.to_json().to_string(),
-                            ));
-                            stored += 1;
-                        }
-                        Err(e) => tracing::warn!(
-                            "ipfs: {cid} unresolved ({e:#}) - no row written, which is what a \
-                             LEFT JOIN reads as 'not yet'"
-                        ),
-                    }
-                }
             }
         }
 
@@ -5756,6 +5693,10 @@ impl NestIngest {
             Finality::Depth(_) => None,
         };
         let finalized_through = seal_ceiling(self.finality, tip, finalized_tag);
+        let finalized_through = match &self.ipfs_gate {
+            Some(gate) => hold_for_documents(self.store.as_ref(), gate, finalized_through)?,
+            None => finalized_through,
+        };
 
         // Seal any newly-finalized range to an immutable Parquet segment, stamping the
         // discovered-child registry snapshot for a factory nest (RFC-0009 step 4).
@@ -6206,6 +6147,35 @@ fn block_number_of(json: &str) -> Option<u64> {
         serde_json::Value::String(s) => s.parse().ok(),
         _ => None,
     }
+}
+
+/// The block a finalized range may seal through while documents it names are outstanding
+/// (RFC-0037 §3): one below the lowest block holding one, or `finalized_through` when none is.
+///
+/// Read in chunks from the watermark up and stopped at the first outstanding document, which is
+/// normally near the watermark, so a long run of resolved documents above it is not reloaded per window.
+fn hold_for_documents(
+    store: &dyn crate::store::HotStore,
+    gate: &crate::ipfs_resolve::Gate,
+    finalized_through: u64,
+) -> Result<u64> {
+    const CHUNK: u64 = 256;
+    let mut lo = match store.get_meta(SEALED_THROUGH_KEY)? {
+        Some(v) => v.parse::<u64>().context("corrupt sealed_through")? + 1,
+        None => 0,
+    };
+    while lo <= finalized_through {
+        let hi = lo.saturating_add(CHUNK - 1).min(finalized_through);
+        let entities = store.entities_in_range(lo, hi)?;
+        if let Some(pending) = gate.lowest_pending(store, &entities)? {
+            return Ok(pending.saturating_sub(1));
+        }
+        if hi == u64::MAX {
+            break;
+        }
+        lo = hi + 1;
+    }
+    Ok(finalized_through)
 }
 
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
@@ -10615,28 +10585,29 @@ template = "pool"
         logs: Vec<crate::rpc::Log>,
     }
 
-    /// A source whose `block_hash` fails a fixed number of times before answering - a transport blip
-    /// with a known end, which is what a provider dropping a connection actually looks like.
-    struct FlakySource {
-        logs: Vec<crate::rpc::Log>,
-        fails_left: std::sync::Mutex<usize>,
-        calls: std::sync::atomic::AtomicUsize,
+    /// ABI-encode `submitQoSPayload(bytes)` around a JSON payload.
+    fn submit_calldata(payload: &str) -> String {
+        let b = payload.as_bytes();
+        let mut padded = b.to_vec();
+        padded.resize(b.len().div_ceil(32) * 32, 0);
+        format!("0x53b73447{:064x}{:064x}{}", 32, b.len(), hex::encode(padded))
     }
 
+    fn qos_post(cid: &str) -> String {
+        submit_calldata(&format!(
+            r#"{{"topic": "t", "hash": "{cid}", "timestamp": 1789313400}}"#
+        ))
+    }
+
+    /// A Gnosis source whose only transactions are DataEdge posts, as `(block, calldata)`.
+    struct PostSource(Vec<(u64, String)>);
+
     #[async_trait::async_trait]
-    impl Source for FlakySource {
+    impl Source for PostSource {
         async fn tip(&self) -> Result<u64> {
-            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+            Ok(10_000)
         }
         async fn block_hash(&self, n: u64) -> Result<Option<String>> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut left = self.fails_left.lock().unwrap();
-            if *left > 0 {
-                *left -= 1;
-                anyhow::bail!("transport error: error sending request for url (mock)");
-            }
-            // Must agree with the hash the fixture logs carry, or the window reads as a reorg and is
-            // discarded - which looks exactly like the bug under test and is not it.
             Ok(Some(format!("0x{n:064x}")))
         }
         async fn logs(
@@ -10645,57 +10616,306 @@ template = "pool"
             _from: u64,
             _to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
-            Ok(self.logs.clone())
+            Ok(Vec::new())
+        }
+        async fn block_bodies(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    let txs: Vec<serde_json::Value> = self
+                        .0
+                        .iter()
+                        .filter(|(at, _)| *at == b)
+                        .enumerate()
+                        .map(|(i, (_, input))| {
+                            serde_json::json!({
+                                "hash": format!("0x{b:032x}{i:032x}"),
+                                "from": "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce",
+                                "to": QOS_EDGE,
+                                "input": input,
+                                "transactionIndex": format!("0x{i:x}"),
+                            })
+                        })
+                        .collect();
+                    let body = serde_json::json!({
+                        "hash": format!("0x{b:064x}"),
+                        "timestamp": "0x65000000",
+                        "transactions": txs,
+                    });
+                    (b, body)
+                })
+                .collect())
         }
     }
 
-    /// #651. A transport blip during a window must be retried, not kill the nest.
-    ///
-    /// Driven through `process_window` with a **flaky `Source`** and a healthy gateway, because the
-    /// bug was never in `retry_transient` - that helper's own unit tests all passed while a 454M-block
-    /// backfill was dying eight hours in at 87.6% on one dropped connection. The bug was a call site
-    /// that did not use it, so only a test that exercises the call site can see it.
-    ///
-    /// Proven by mutation: restore the bare `?` on the IPFS path's `block_hash` fetch and this fails,
-    /// while every other test in the suite stays green.
-    // NOT `start_paused`: this drives a real HTTP request at the stub gateway, and a paused clock
-    // auto-advances past it so the fetch never completes. Three retries at a 250ms base is ~1.75s.
-    #[tokio::test]
-    async fn a_flaky_source_mid_window_is_retried_rather_than_killing_the_nest() {
-        const DOC: &str = r#"{"n":1}"#;
-        let (gateway, handle) = stub_gateway(DOC).await;
-        let cid = crate::cid::cid_v0_for(DOC.as_bytes());
-        let dir = tempfile::tempdir().unwrap();
-
-        let flaky = Arc::new(FlakySource {
-            logs: Vec::new(),
-            fails_left: std::sync::Mutex::new(3),
-            calls: std::sync::atomic::AtomicUsize::new(0),
+    /// A gateway serving each document at its own CID over plain HTTP. The first `cut_off` requests get
+    /// half the body under the full `Content-Length` and a hang-up, which is how a gateway fails
+    /// mid-read. A CID it does not hold is a 404.
+    async fn content_gateway(
+        docs: std::collections::HashMap<String, String>,
+        cut_off: usize,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let docs = Arc::new(docs);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let docs = docs.clone();
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let Ok(len) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..len]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or_default();
+                    let cid = path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .split('?')
+                        .next()
+                        .unwrap_or_default();
+                    let reply = match docs.get(cid) {
+                        Some(body) => {
+                            let sent = if n < cut_off {
+                                &body[..body.len() / 2]
+                            } else {
+                                body.as_str()
+                            };
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sent}",
+                                body.len()
+                            )
+                        }
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string(),
+                    };
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
         });
-        let probe = flaky.clone();
+        (format!("http://{addr}/ipfs/"), requests, handle)
+    }
 
-        // No `expect` needed here - `run_ipfs_nest_with_source` unwraps the window itself, so a
-        // propagated transport error panics and fails this test, which is precisely the regression.
-        let rows = run_ipfs_nest_with_source(dir.path(), gateway, &cid, flaky).await;
+    fn fast_policy(attempts: u32) -> crate::ipfs_resolve::Policy {
+        crate::ipfs_resolve::Policy {
+            concurrency: 8,
+            first_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(4),
+            attempts,
+            rescan_every: std::time::Duration::from_secs(600),
+            idle_poll: std::time::Duration::from_millis(1),
+        }
+    }
+
+    async fn qos_nest_with(
+        dir: &std::path::Path,
+        gateway: String,
+        posts: Vec<(u64, String)>,
+    ) -> (NestIngest, serve::AppState, Arc<dyn Source>) {
+        let mut config = Config::load(dir).unwrap();
+        config.ipfs_gateways = vec![gateway];
+        let source: Arc<dyn Source> = Arc::new(PostSource(posts));
+        let (nest, state, worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .expect("a qos nest builds");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        (nest, state, source)
+    }
+
+    /// Step a resolver until nothing is outstanding, or give up waiting. Returns what is left.
+    async fn resolve_all(resolver: &mut crate::ipfs_resolve::Resolver) -> usize {
+        let mut left = usize::MAX;
+        for _ in 0..500 {
+            left = resolver.step().await.unwrap();
+            if left == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        left
+    }
+
+    fn stored_documents(store: &dyn crate::store::HotStore, block: u64) -> Vec<serde_json::Value> {
+        store
+            .entities_in_range(block, block)
+            .unwrap()
+            .iter()
+            .map(|e| serde_json::from_str::<serde_json::Value>(e).unwrap())
+            .filter(|v| v["table"] == "qos_payload")
+            .collect()
+    }
+
+    /// RFC-0037 §3. A window fetched at most 64 documents and never came back for the rest, which at
+    /// Gnosis's default window lost most of a backfill. Every document is resolved now, and the work
+    /// list is derived from the store rather than held by the process, so a restart between the window
+    /// and the fetch loses nothing.
+    #[tokio::test]
+    async fn every_document_a_window_names_is_resolved_across_a_restart() {
+        let docs: std::collections::HashMap<String, String> = (0..100)
+            .map(|i| {
+                let body = format!(r#"{{"bucket":{i}}}"#);
+                (crate::cid::cid_v0_for(body.as_bytes()), body)
+            })
+            .collect();
+        let posts = docs.keys().map(|cid| (4, qos_post(cid))).collect();
+        let (gateway, _requests, handle) = content_gateway(docs, 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) = qos_nest_with(dir.path(), gateway, posts).await;
+        nest.process_window(source.as_ref(), &[], 4, 4, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        let gateways = nest.ipfs_gateways.clone();
+        drop(nest);
+        drop(state);
+
+        let store: Arc<dyn crate::store::HotStore> =
+            Arc::new(Store::open(&dir.path().join(DB_FILE)).unwrap());
+        let metrics = Arc::new(crate::metrics::NestMetrics::default());
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            store.clone(),
+            gate,
+            gateways,
+            true,
+            metrics.clone(),
+            fast_policy(3),
+        );
+        assert_eq!(resolve_all(&mut resolver).await, 0, "nothing may be left outstanding");
+        assert_eq!(
+            stored_documents(store.as_ref(), 4).len(),
+            100,
+            "every document the window named, not the first 64"
+        );
+        assert_eq!(metrics.ipfs_resolved(), 100);
+        assert_eq!(metrics.ipfs_pending(), 0);
         handle.abort();
+    }
 
-        assert_eq!(
-            rows.iter()
-                .filter(|(_, v)| v["table"] == "token_metadata")
-                .count(),
-            1,
-            "the document must still be resolved and stored after the blips, got {rows:?}"
+    /// A gateway that hung up mid-body left its document unresolved for good: the 2026-09-07 00:10
+    /// indexer-attempt bucket was lost that way, and shifted 49 of 56 indexers' daily figures. A body
+    /// cut short is a failed fetch like any other, and is tried again.
+    #[tokio::test]
+    async fn a_document_cut_off_mid_read_is_fetched_again() {
+        let body = "x".repeat(4096);
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 1).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(4, qos_post(&cid))]).await;
+        nest.process_window(source.as_ref(), &[], 4, 4, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            nest.store.clone(),
+            nest.ipfs_gate.clone().expect("a gate"),
+            nest.ipfs_gateways.clone(),
+            true,
+            Arc::new(crate::metrics::NestMetrics::default()),
+            fast_policy(3),
         );
-        // The premise: the failures must actually have happened, or this passed on the happy path.
-        assert_eq!(
-            *probe.fails_left.lock().unwrap(),
-            0,
-            "all three transient failures must have been consumed"
-        );
+        assert_eq!(resolve_all(&mut resolver).await, 0);
         assert!(
-            probe.calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
-            "block_hash must have been retried past the failures"
+            requests.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "premise: the first response was cut off, so a second must have been asked for"
         );
+        let stored = stored_documents(nest.store.as_ref(), 4);
+        assert_eq!(stored.len(), 1, "the document must be stored once it is served whole");
+        assert_eq!(stored[0]["cid"], cid);
+        drop(resolver);
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// A range waits for the documents it names, in the window's own seal and not only in the resolver,
+    /// until each is stored or given up on. One no gateway serves is given up on after the policy's
+    /// attempts: recorded under its block and slot, counted, and no longer holding the range back.
+    #[tokio::test]
+    async fn sealing_waits_for_a_document_until_it_is_resolved_or_given_up_on() {
+        let cid = crate::cid::cid_v0_for(b"no gateway holds this");
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::new(), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(4, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        for b in [4, 5] {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        let sealed = nest
+            .store
+            .get_meta(SEALED_THROUGH_KEY)
+            .unwrap()
+            .and_then(|v| v.parse::<u64>().ok());
+        assert!(
+            sealed.is_none_or(|s| s < 4),
+            "a window sealed past an outstanding document: sealed through {sealed:?}"
+        );
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            3
+        );
+
+        let metrics = Arc::new(crate::metrics::NestMetrics::default());
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            nest.store.clone(),
+            gate.clone(),
+            nest.ipfs_gateways.clone(),
+            true,
+            metrics.clone(),
+            fast_policy(2),
+        );
+        assert_eq!(resolve_all(&mut resolver).await, 0);
+        assert_eq!(metrics.ipfs_given_up(), 1);
+        let plan = gate.plan_stored(&nest.store.entities_in_range(4, 4).unwrap());
+        assert_eq!(
+            nest.store
+                .get_meta(&crate::ipfs_resolve::gave_up_key(&plan[&4].0[0]))
+                .unwrap()
+                .as_deref(),
+            Some(cid.as_str()),
+            "giving up must be recorded, or a restart would hold the range again"
+        );
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            9_000,
+            "a document given up on no longer holds its range"
+        );
+        drop(resolver);
+        drop(nest);
+        drop(state);
+        handle.abort();
     }
 
     /// #653. A store must not serve rows under a registry that did not produce them.
@@ -12777,6 +12997,16 @@ template="pool"
             .await
             .unwrap()
             .expect("the window must commit");
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            nest.store.clone(),
+            nest.ipfs_gate.clone().expect("a nest declaring [[ipfs]] has a gate"),
+            nest.ipfs_gateways.clone(),
+            nest.registry.timestamps(),
+            nest.metrics.clone(),
+            crate::ipfs_resolve::Policy::default(),
+        );
+        resolver.step().await.unwrap();
+        drop(resolver);
         drop(nest);
         drop(state);
 
@@ -13139,6 +13369,20 @@ template="pool"
             .await
             .unwrap()
             .expect("the window must commit");
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            nest.store.clone(),
+            nest.ipfs_gate.clone().expect("a nest declaring [[ipfs]] has a gate"),
+            nest.ipfs_gateways.clone(),
+            nest.registry.timestamps(),
+            nest.metrics.clone(),
+            crate::ipfs_resolve::Policy::default(),
+        );
+        assert_eq!(
+            resolver.step().await.unwrap(),
+            0,
+            "both documents resolve in one pass"
+        );
+        drop(resolver);
         drop(nest);
         drop(state);
 

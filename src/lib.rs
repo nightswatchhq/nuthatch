@@ -58,6 +58,7 @@ pub mod health;
 pub mod help;
 pub mod indexer;
 pub mod ipfs;
+pub mod ipfs_resolve;
 pub mod labels;
 pub mod lifecycle;
 pub mod lists;
