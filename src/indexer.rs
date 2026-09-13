@@ -41,6 +41,9 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
 /// configuration, which is what a nest's content address is a statement about.
 const REGISTRY_KEY: &str = "registry_hash";
+/// Which formula `REGISTRY_KEY` was recorded under. Absent means the event registry alone.
+const IDENTITY_FORMULA_KEY: &str = "identity_formula";
+const IDENTITY_FORMULA: &str = "2";
 const SEALED_THROUGH_KEY: &str = "sealed_through";
 const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
@@ -2409,8 +2412,13 @@ async fn build_nest(
         }
     }
     let registry = Arc::new(crate::registry::from_nest(&dir, config)?);
+    let identity = hex::encode(crate::project::decode_identity(&dir, config, &registry)?);
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
-    guard_registry_identity(store.as_ref(), &hex::encode(registry.hash()))?;
+    guard_registry_identity(
+        store.as_ref(),
+        &identity,
+        &hex::encode(registry.hash()),
+    )?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
@@ -2555,7 +2563,7 @@ async fn build_nest(
         registry.skipped_anonymous(),
         finality,
         window,
-        &hex::encode(registry.hash())[..12],
+        &identity[..12],
     );
 
     // Governed semantic layer (RFC-0016): if `semantic.toml` describes a table/column the registry
@@ -2753,7 +2761,7 @@ async fn build_nest(
         "name": config.nest.name,
         "chain": config.nest.chain,
         "chain_id": config.nest.chain_id,
-        "registry_hash": format!("0x{}", hex::encode(registry.hash())),
+        "registry_hash": format!("0x{identity}"),
         "table_count": registry.tables().len(),
         "contracts": config.contracts.iter()
             .map(|c| serde_json::json!({ "alias": c.alias, "address": c.address })).collect::<Vec<_>>(),
@@ -3186,12 +3194,37 @@ const FACTORY_FLIP_THRESHOLD: usize = 500;
 ///
 /// Same reasoning as the `--seal-direct` refusal for declared calls (RFC-0038 §6e): a run that
 /// quietly produces a table with no rows is worse than a run that refuses.
-fn guard_registry_identity(store: &dyn crate::store::HotStore, registry_hash: &str) -> Result<()> {
+///
+/// `legacy_hash` is the event registry's hash alone, which is what this guard recorded before it
+/// covered call, `[[ipfs]]` and `[[calls]]` declarations. A store stamped under that formula and
+/// matching it is adopted onto the full identity once, and recorded as such.
+fn guard_registry_identity(
+    store: &dyn crate::store::HotStore,
+    registry_hash: &str,
+    legacy_hash: &str,
+) -> Result<()> {
+    let formula = store.get_meta(IDENTITY_FORMULA_KEY)?;
     match store.get_meta(REGISTRY_KEY)? {
-        Some(found) if found != registry_hash => anyhow::bail!(
+        Some(found) if found == registry_hash => {
+            if formula.is_none() {
+                store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
+            }
+            Ok(())
+        }
+        Some(found) if formula.is_none() && found == legacy_hash => {
+            tracing::warn!(
+                "adopting decode identity 0x{registry_hash} for a store recorded under the event \
+                 registry alone (0x{found}). Its event decode is verified; its call, [[ipfs]] and \
+                 [[calls]] declarations were never checked by this guard, so if they changed since \
+                 the data was written, re-index it."
+            );
+            store.set_meta(REGISTRY_KEY, registry_hash)?;
+            store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
+            Ok(())
+        }
+        Some(found) => anyhow::bail!(
             "this nest's stored data was indexed by a different decode registry.\n\n               stored:  0x{found}\n  config:  0x{registry_hash}\n\n             The registry hash covers every contract, event and column this nest decodes, so a              difference means `nuthatch.toml` or an ABI changed after the data was written.              Continuing would serve old rows under a new content address, and any table added by the              change would read as empty rather than as absent.\n\n             Re-index from scratch to adopt the new configuration (remove `nuthatch.redb` and              `segments/`), or restore the previous configuration to keep serving this data. A nest              whose identity changed is a different nest - that is what content addressing means."
         ),
-        Some(_) => Ok(()),
         None => {
             // Absent means one of two things and they must not be conflated: a fresh store, or a
             // store written by a build from before this guard existed. Refusing the second would
@@ -3204,6 +3237,7 @@ fn guard_registry_identity(store: &dyn crate::store::HotStore, registry_hash: &s
                 );
             }
             store.set_meta(REGISTRY_KEY, registry_hash)?;
+            store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
             Ok(())
         }
     }
@@ -10650,7 +10684,7 @@ template = "pool"
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
 
         // 1. Fresh store: adopts, and records what it adopted.
-        guard_registry_identity(&store, "aaaa").expect("a fresh store adopts");
+        guard_registry_identity(&store, "aaaa", "aaaa").expect("a fresh store adopts");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("aaaa"),
@@ -10658,11 +10692,12 @@ template = "pool"
         );
 
         // 2. Same registry: still fine.
-        guard_registry_identity(&store, "aaaa").expect("an unchanged registry must be accepted");
+        guard_registry_identity(&store, "aaaa", "aaaa")
+            .expect("an unchanged registry must be accepted");
 
         // 3. Different registry: refused, and the message must name both hashes - a refusal that
         //    does not say what changed sends the operator to the source to find out.
-        let err = guard_registry_identity(&store, "bbbb")
+        let err = guard_registry_identity(&store, "bbbb", "bbbb")
             .expect_err("a changed registry must be refused, not adopted");
         let msg = format!("{err:#}");
         assert!(msg.contains("aaaa"), "must name the stored hash: {msg}");
@@ -10680,14 +10715,91 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "12345").unwrap();
         assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
 
-        guard_registry_identity(&store, "cccc").expect("an older store must not be refused");
+        guard_registry_identity(&store, "cccc", "cccc").expect("an older store must not be refused");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("cccc")
         );
         // And having adopted, it is now held to it.
-        guard_registry_identity(&store, "dddd")
+        guard_registry_identity(&store, "dddd", "dddd")
             .expect_err("once adopted, a later change must be refused");
+    }
+
+    const QOS_EDGE: &str = "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f";
+    const QOS_EDGE_ABI: &str = r#"[{"type":"function","name":"submitQoSPayload","inputs":[{"name":"_payload","type":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}]"#;
+
+    /// An event-less DataEdge nest resolving one oracle topic.
+    fn qos_topic_nest(topic: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"qos-identity\"\nchain = \"gnosis\"\nchain_id = 100\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"data_edge\"\naddress = \"{QOS_EDGE}\"\nabi = \"abis/data-edge.json\"\n\n\
+                 [extract]\ntop_level_calls = true\n\n\
+                 [[ipfs]]\nname = \"qos_payload\"\non = \"data_edge__call_submit_qo_s_payload\"\n\
+                 cid_column = \"_payload\"\ncid_json_path = \"hash\"\njson_match = {{ topic = \"{topic}\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("abis/data-edge.json"), QOS_EDGE_ABI).unwrap();
+        dir
+    }
+
+    /// The guard and provenance hashed the event registry alone, so a calldata-only nest claimed the
+    /// hash of nothing and an `[[ipfs]]` change sailed past a store indexed under the old declaration.
+    #[test]
+    fn a_calldata_only_nest_is_held_to_its_ipfs_declarations() {
+        let identity = |d: &std::path::Path| {
+            let c = Config::load(d).unwrap();
+            let r = crate::registry::from_nest(d, &c).unwrap();
+            (
+                hex::encode(crate::project::decode_identity(d, &c, &r).unwrap()),
+                hex::encode(r.hash()),
+            )
+        };
+        let indexer = qos_topic_nest("gateway_indexer_attempt_qos_5_minutes_prod_v3");
+        let query = qos_topic_nest("gateway_query_result_qos_5_minutes_prod_v3");
+        let (a, a_events) = identity(indexer.path());
+        let (b, b_events) = identity(query.path());
+
+        let nothing = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b""));
+        assert_eq!(a_events, nothing, "premise: the event registry of this nest is empty");
+        assert_ne!(a, nothing, "a calldata-only nest must not claim the hash of nothing");
+        assert_ne!(a, b, "a different json_match is a different decode identity");
+
+        let store = Store::open(&indexer.path().join("t.redb")).unwrap();
+        guard_registry_identity(&store, &a, &a_events).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
+        guard_registry_identity(&store, &b, &b_events)
+            .expect_err("a store indexed under one [[ipfs]] declaration must refuse another");
+    }
+
+    /// Stores written before the guard covered calls and `[[ipfs]]` recorded the event hash alone.
+    /// They adopt the full identity once; after that, the event hash matching is no longer a pass,
+    /// or adding an `[[ipfs]]` declaration to an indexed nest would be adopted silently.
+    #[test]
+    fn a_store_recorded_under_the_event_registry_alone_adopts_the_full_identity_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "100").unwrap();
+        store.set_meta(REGISTRY_KEY, "events").unwrap();
+
+        guard_registry_identity(&store, "full", "events")
+            .expect("a store matching the old formula adopts the new one");
+        assert_eq!(
+            store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
+            Some("full")
+        );
+
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh = Store::open(&fresh.path().join("t.redb")).unwrap();
+        guard_registry_identity(&fresh, "events", "events").unwrap();
+        fresh.set_meta(LAST_BLOCK_KEY, "100").unwrap();
+        guard_registry_identity(&fresh, "events+ipfs", "events").expect_err(
+            "a store recorded under the full formula must refuse a declaration added afterwards",
+        );
     }
 
     #[async_trait::async_trait]
@@ -12973,6 +13085,11 @@ template="pool"
         if let Some(w) = worker {
             w.abort();
         }
+        assert_ne!(
+            state.nest_info["registry_hash"],
+            format!("0x{}", hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b""))),
+            "provenance must carry this nest's decode identity, not the hash of its empty event registry"
+        );
         nest.process_window(source.as_ref(), &[], 4, 4, 100)
             .await
             .unwrap()
