@@ -3363,7 +3363,6 @@ fn apply_row_timestamps(
 /// `pub(crate)` for `bench.rs`, whose hot-store arm is a private reimplementation of this loop and
 /// resolved nothing at all until #743 - the same "the harness measures a workload `dev` does not
 /// run" failure as #224 and #725, on the arm `bench backfill` takes when given no path flag.
-#[allow(clippy::too_many_arguments)]
 /// What a seal-direct pass decodes beyond events: top-level calls, and the `[[ipfs]]` documents rows
 /// name. Both were skipped by these paths without a word, so a calldata-only nest backfilled that way
 /// sealed nothing.
@@ -3526,6 +3525,7 @@ fn decode_bodies(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_calls_for_window(
     source: &dyn Source,
     calls: &[crate::calls::CallDecl],
@@ -10786,7 +10786,12 @@ template = "pool"
         let b = payload.as_bytes();
         let mut padded = b.to_vec();
         padded.resize(b.len().div_ceil(32) * 32, 0);
-        format!("0x53b73447{:064x}{:064x}{}", 32, b.len(), hex::encode(padded))
+        format!(
+            "0x53b73447{:064x}{:064x}{}",
+            32,
+            b.len(),
+            hex::encode(padded)
+        )
     }
 
     fn qos_post(cid: &str) -> String {
@@ -11071,7 +11076,11 @@ template = "pool"
             crate::seal::read_table_rows(dir.path(), schema).unwrap()
         };
         let calls = sealed("data_edge__call_submit_qo_s_payload");
-        assert_eq!(calls.len(), 1, "the post must be a call row in the sealed segment");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the post must be a call row in the sealed segment"
+        );
         assert!(
             calls[0]
                 .params
@@ -11082,7 +11091,11 @@ template = "pool"
             calls[0].params
         );
         let docs = sealed("qos_payload");
-        assert_eq!(docs.len(), 1, "the document it names must be sealed beside it");
+        assert_eq!(
+            docs.len(),
+            1,
+            "the document it names must be sealed beside it"
+        );
         handle.abort();
     }
 
@@ -11122,7 +11135,11 @@ template = "pool"
             metrics.clone(),
             fast_policy(3),
         );
-        assert_eq!(resolve_all(&mut resolver).await, 0, "nothing may be left outstanding");
+        assert_eq!(
+            resolve_all(&mut resolver).await,
+            0,
+            "nothing may be left outstanding"
+        );
         assert_eq!(
             stored_documents(store.as_ref(), 4).len(),
             100,
@@ -11163,7 +11180,11 @@ template = "pool"
             "premise: the first response was cut off, so a second must have been asked for"
         );
         let stored = stored_documents(nest.store.as_ref(), 4);
-        assert_eq!(stored.len(), 1, "the document must be stored once it is served whole");
+        assert_eq!(
+            stored.len(),
+            1,
+            "the document must be stored once it is served whole"
+        );
         assert_eq!(stored[0]["cid"], cid);
         drop(resolver);
         drop(nest);
@@ -11276,7 +11297,8 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "12345").unwrap();
         assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
 
-        guard_registry_identity(&store, "cccc", "cccc", false).expect("an older store must not be refused");
+        guard_registry_identity(&store, "cccc", "cccc", false)
+            .expect("an older store must not be refused");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("cccc")
@@ -11345,9 +11367,18 @@ template = "pool"
         let (b, b_events) = identity(query.path());
 
         let nothing = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b""));
-        assert_eq!(a_events, nothing, "premise: the event registry of this nest is empty");
-        assert_ne!(a, nothing, "a calldata-only nest must not claim the hash of nothing");
-        assert_ne!(a, b, "a different json_match is a different decode identity");
+        assert_eq!(
+            a_events, nothing,
+            "premise: the event registry of this nest is empty"
+        );
+        assert_ne!(
+            a, nothing,
+            "a calldata-only nest must not claim the hash of nothing"
+        );
+        assert_ne!(
+            a, b,
+            "a different json_match is a different decode identity"
+        );
 
         let store = Store::open(&indexer.path().join("t.redb")).unwrap();
         guard_registry_identity(&store, &a, &a_events, true).unwrap();
@@ -13316,7 +13347,9 @@ template="pool"
             .expect("the window must commit");
         let mut resolver = crate::ipfs_resolve::Resolver::new(
             nest.store.clone(),
-            nest.ipfs_gate.clone().expect("a nest declaring [[ipfs]] has a gate"),
+            nest.ipfs_gate
+                .clone()
+                .expect("a nest declaring [[ipfs]] has a gate"),
             nest.ipfs_gateways.clone(),
             nest.registry.timestamps(),
             nest.metrics.clone(),
@@ -13688,7 +13721,9 @@ template="pool"
             .expect("the window must commit");
         let mut resolver = crate::ipfs_resolve::Resolver::new(
             nest.store.clone(),
-            nest.ipfs_gate.clone().expect("a nest declaring [[ipfs]] has a gate"),
+            nest.ipfs_gate
+                .clone()
+                .expect("a nest declaring [[ipfs]] has a gate"),
             nest.ipfs_gateways.clone(),
             nest.registry.timestamps(),
             nest.metrics.clone(),

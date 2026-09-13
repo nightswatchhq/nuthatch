@@ -195,7 +195,10 @@ impl Gate {
     }
 
     /// Every document stored rows name, with the keys already present among them, by block.
-    pub fn plan_stored(&self, entities: &[String]) -> BTreeMap<u64, (Vec<Planned>, HashSet<String>)> {
+    pub fn plan_stored(
+        &self,
+        entities: &[String],
+    ) -> BTreeMap<u64, (Vec<Planned>, HashSet<String>)> {
         let mut rows: BTreeMap<u64, Vec<DecodedRow>> = BTreeMap::new();
         let mut present: BTreeMap<u64, HashSet<String>> = BTreeMap::new();
         for e in entities {
@@ -226,11 +229,7 @@ impl Gate {
     }
 
     /// The lowest block in `entities` holding a document that is neither stored nor given up on.
-    pub fn lowest_pending(
-        &self,
-        store: &dyn HotStore,
-        entities: &[String],
-    ) -> Result<Option<u64>> {
+    pub fn lowest_pending(&self, store: &dyn HotStore, entities: &[String]) -> Result<Option<u64>> {
         for (block, (planned, present)) in self.plan_stored(entities) {
             for p in &planned {
                 if !present.contains(&p.key()) && !gave_up(store, p)? {
@@ -300,7 +299,8 @@ impl Policy {
 }
 
 async fn fetch(cid: &str, gateways: &[String]) -> Result<String> {
-    crate::subgraph_import::fetch_ipfs(cid, gateways, crate::subgraph_import::Origin::Manifest).await
+    crate::subgraph_import::fetch_ipfs(cid, gateways, crate::subgraph_import::Origin::Manifest)
+        .await
 }
 
 struct Work {
@@ -523,7 +523,10 @@ pub async fn resolve_inline(
     timestamps: bool,
 ) -> (Vec<DecodedRow>, usize) {
     let mut by_block: BTreeMap<u64, Vec<&DecodedRow>> = BTreeMap::new();
-    for r in rows.iter().filter(|r| gate.decls.iter().any(|d| d.on == r.table)) {
+    for r in rows
+        .iter()
+        .filter(|r| gate.decls.iter().any(|d| d.on == r.table))
+    {
         by_block.entry(r.block_number).or_default().push(r);
     }
     let planned: Vec<Planned> = by_block
@@ -622,13 +625,25 @@ mod tests {
     #[test]
     fn a_document_is_planned_once_per_block_that_names_it() {
         let gate = Gate::new(&[uri_decl()], &[table("nft__uri_set", "uri", "string")]).unwrap();
-        let stored: Vec<String> = [uri_row(10, 0, CID), uri_row(10, 4, CID), uri_row(11, 2, CID)]
-            .iter()
-            .map(|r| r.to_json().to_string())
-            .collect();
+        let stored: Vec<String> = [
+            uri_row(10, 0, CID),
+            uri_row(10, 4, CID),
+            uri_row(11, 2, CID),
+        ]
+        .iter()
+        .map(|r| r.to_json().to_string())
+        .collect();
         let plan = gate.plan_stored(&stored);
-        assert_eq!(plan[&10].0.len(), 1, "one fetch for a CID named twice in a block");
-        assert_eq!(plan[&11].0.len(), 1, "a later block naming the same CID has its own row");
+        assert_eq!(
+            plan[&10].0.len(),
+            1,
+            "one fetch for a CID named twice in a block"
+        );
+        assert_eq!(
+            plan[&11].0.len(),
+            1,
+            "a later block naming the same CID has its own row"
+        );
         assert_eq!(
             plan[&11].0[0].key(),
             Store::entity_key(11, IPFS_ROW_LOG_INDEX_BASE)
@@ -659,7 +674,11 @@ mod tests {
         )
         .unwrap();
         let from_tip = plan_block(std::slice::from_ref(&decl), &[&row]);
-        assert_eq!(from_tip.len(), 1, "premise: the decoded row names the document");
+        assert_eq!(
+            from_tip.len(),
+            1,
+            "premise: the decoded row names the document"
+        );
         let from_store = gate.plan_stored(&[row.to_json().to_string()]);
         assert_eq!(from_store[&48_231_985].0, from_tip);
     }

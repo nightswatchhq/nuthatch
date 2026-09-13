@@ -1102,7 +1102,8 @@ impl nuthatch::store::HotStore for HotScanFails {
         source_key: &str,
         block_hash: &str,
     ) -> anyhow::Result<bool> {
-        self.0.put_entity_if_named(key, json, source_key, block_hash)
+        self.0
+            .put_entity_if_named(key, json, source_key, block_hash)
     }
     fn get_entity(&self, key: &str) -> anyhow::Result<Option<String>> {
         self.0.get_entity(key)
