@@ -1051,9 +1051,10 @@ s3://bucket/prefix>` copies every non-provisional segment and the catalogue unde
 and one every `--publish-interval` (60 s) otherwise, with `--publish-parallelism` uploads in flight
 (2). The publisher runs on its own thread, so a slow or unreachable bucket delays the mirror and never
 a seal. Credentials are the usual `AWS_*` environment variables, never `nuthatch.toml`. The policy
-is `s3:PutObject` and `s3:GetObject` on the prefix (HEAD is authorised by `GetObject`) and
-`s3:ListBucket` on the bucket for that prefix, without which a missing object answers 403 rather
-than 404. Do not grant `s3:DeleteObject`: a credential that cannot delete cannot take a published
+is `s3:PutObject`, `s3:GetObject` and `s3:AbortMultipartUpload` on the prefix (HEAD is authorised
+by `GetObject`) and `s3:ListBucket` on the bucket for that prefix, without which a missing object
+answers 403 rather than 404. Segments upload in 8 MiB parts, so without `AbortMultipartUpload` a
+failed upload leaves its parts billable until a lifecycle rule removes them. Do not grant `s3:DeleteObject`: a credential that cannot delete cannot take a published
 segment away, so the mirror is append-only by policy rather than by promise. It can still overwrite
 a key, which is what `doctor --publish` below catches, and bucket versioning makes that recoverable.
 
@@ -1063,7 +1064,7 @@ a key, which is what `doctor --publish` below catches, and bucket versioning mak
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:AbortMultipartUpload"],
       "Resource": "arn:aws:s3:::my-bucket/nuthatch/*"
     },
     {
