@@ -150,6 +150,7 @@ fn remount(root: &Path, nid: &str) {
         nid: nid.to_string(),
         sql: Default::default(),
         queries: Vec::new(),
+        publish: None,
         #[cfg(feature = "counter")]
         counter: None,
     }];

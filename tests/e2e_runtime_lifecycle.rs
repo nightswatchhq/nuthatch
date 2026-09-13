@@ -74,6 +74,7 @@ async fn two_nest_roost(
         live,
         states: cursor.states,
         alert_workers: cursor.alert_workers,
+        publishers: Vec::new(),
         // Keyed by the nest's declared chain - `scaffold_nest` writes `arbitrum-one`. Getting this
         // wrong is not cosmetic: `unmount` refuses to proceed without a channel for the chain, rather
         // than removing routes while the cursor may still be writing.
@@ -388,6 +389,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         live,
         states: cursor.states,
         alert_workers: cursor.alert_workers,
+        publishers: Vec::new(),
         lifecycle: std::collections::HashMap::from([(
             "arbitrum-one".to_string(),
             cursor.lifecycle.clone(),
@@ -406,6 +408,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
                 nid: usdc_nid.clone(),
                 sql: Default::default(),
                 queries: Vec::new(),
+                publish: None,
                 #[cfg(feature = "counter")]
                 counter: None,
             }],
@@ -556,6 +559,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
         live,
         states: cursor.states,
         alert_workers: cursor.alert_workers,
+        publishers: Vec::new(),
         lifecycle: std::collections::HashMap::from([(
             "arbitrum-one".to_string(),
             cursor.lifecycle.clone(),
@@ -572,6 +576,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
                 nid: usdc_nid.clone(),
                 sql: Default::default(),
                 queries: Vec::new(),
+                publish: None,
                 #[cfg(feature = "counter")]
                 counter: None,
             }],
