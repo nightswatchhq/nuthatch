@@ -16,9 +16,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures::StreamExt;
 
-use crate::ipfs::{BlockCtx, IpfsDecl};
+use crate::ipfs::{BlockCtx, IpfsDecl, RowPlace, RowsRefused};
 use crate::metrics::NestMetrics;
-use crate::registry::{DecodedRow, TableSchema, Value, IPFS_ROW_LOG_INDEX_BASE};
+use crate::registry::{
+    DecodedRow, TableSchema, Value, IPFS_DOCUMENT_ROW_LOG_INDEX_BASE,
+    IPFS_DOCUMENT_ROW_LOG_INDEX_END, IPFS_DOCUMENT_SLOTS, IPFS_ROW_LOG_INDEX_BASE,
+};
 use crate::store::{HotStore, Store};
 
 /// Blocks read from the hot store at once while re-deriving the work list. Resolved documents live in
@@ -37,6 +40,10 @@ pub struct Planned {
     pub block_timestamp: u64,
     /// The first row in the block that named this document. The write is conditional on it.
     pub source_log_index: u64,
+    /// The first `log_index` of this document's typed rows, when its declaration has them.
+    pub rows_from: Option<u64>,
+    /// The document or its rows would not fit the block's key space, so it is refused without a fetch.
+    pub over_band: bool,
 }
 
 impl Planned {
@@ -75,8 +82,24 @@ pub fn plan_block(decls: &[IpfsDecl], rows: &[&DecodedRow]) -> Vec<Planned> {
                         block_hash: r.block_hash.clone(),
                         block_timestamp: r.block_timestamp,
                         source_log_index: r.log_index,
+                        rows_from: None,
+                        over_band: false,
                     });
                 }
+            }
+        }
+    }
+    // Each document with typed rows is allotted its declaration's `max_rows`, in slot order, whether or
+    // not the documents before it ever resolve. A key assigned on arrival would differ between operators.
+    if decls.iter().any(|d| d.rows.is_some()) {
+        let mut next = IPFS_DOCUMENT_ROW_LOG_INDEX_BASE;
+        for p in &mut out {
+            p.over_band = p.slot as u64 >= IPFS_DOCUMENT_SLOTS;
+            if let Some(rows) = &decls[p.decl].rows {
+                p.rows_from = Some(next);
+                p.over_band |=
+                    next.saturating_add(rows.max_rows - 1) > IPFS_DOCUMENT_ROW_LOG_INDEX_END;
+                next = next.saturating_add(rows.max_rows);
             }
         }
     }
@@ -240,22 +263,45 @@ impl Gate {
         Ok(None)
     }
 
-    /// Only a proven document reaches here, so every row says `verified = true`; rows an older build
-    /// stored unverified keep `false` until the nest is re-indexed.
-    fn document_row(&self, p: &Planned, content: &str, timestamps: bool) -> DecodedRow {
-        crate::ipfs::to_row(
-            &self.decls[p.decl].name,
-            &p.cid,
-            content,
-            true,
-            p.slot,
-            &BlockCtx {
-                number: p.block,
-                hash: &p.block_hash,
-                timestamp: p.block_timestamp,
-                timestamps,
-            },
-        )
+    /// The document row, then the typed rows its declaration explodes it into. Only a proven document
+    /// reaches here, so the document row says `verified = true`; rows an older build stored unverified
+    /// keep `false` until the nest is re-indexed.
+    fn document_rows(
+        &self,
+        p: &Planned,
+        content: &str,
+        timestamps: bool,
+    ) -> std::result::Result<Vec<DecodedRow>, RowsRefused> {
+        let decl = &self.decls[p.decl];
+        let ctx = BlockCtx {
+            number: p.block,
+            hash: &p.block_hash,
+            timestamp: p.block_timestamp,
+            timestamps,
+        };
+        let kept = match &decl.rows {
+            Some(rows) if !rows.keep_content => "",
+            _ => content,
+        };
+        let document = crate::ipfs::to_row(&decl.name, &p.cid, kept, true, p.slot, &ctx);
+        let typed = match (&decl.rows, p.rows_from) {
+            (Some(rows), Some(first)) => crate::ipfs::typed_rows(
+                rows,
+                content,
+                &RowPlace {
+                    cid: &p.cid,
+                    document_log_index: document.log_index,
+                    source_log_index: p.source_log_index,
+                    first_log_index: first,
+                },
+                &ctx,
+            )?,
+            _ => Vec::new(),
+        };
+        let mut out = Vec::with_capacity(typed.len() + 1);
+        out.push(document);
+        out.extend(typed);
+        Ok(out)
     }
 }
 
@@ -435,6 +481,23 @@ impl Resolver {
     /// Returns the documents still outstanding.
     pub async fn step(&mut self) -> Result<usize> {
         self.scan()?;
+        let unplaceable: Vec<Planned> = self
+            .work
+            .values()
+            .filter(|w| w.planned.over_band)
+            .map(|w| w.planned.clone())
+            .collect();
+        for p in unplaceable {
+            tracing::warn!(
+                "ipfs: gave up on {} (block {}, slot {}) without a fetch: the block has no room left \
+                 for its typed rows. Its range seals without it (nuthatch_nest_ipfs_rows_refused_total)",
+                p.cid,
+                p.block,
+                p.slot
+            );
+            self.metrics.add_ipfs_rows_refused(1);
+            self.give_up(&p)?;
+        }
         let now = Instant::now();
         let due: Vec<Planned> = self
             .work
@@ -456,20 +519,39 @@ impl Resolver {
         for (p, fetched) in results {
             let key = (p.block, p.slot);
             match fetched {
-                Ok(content) => {
-                    self.work.remove(&key);
-                    let row = self.gate.document_row(&p, &content, self.timestamps);
-                    // False when a reorg removed or replaced the naming row since the scan; the next
-                    // scan plans whatever the block holds now.
-                    if self.store.put_entity_if_named(
-                        &p.key(),
-                        &row.to_json().to_string(),
-                        &p.source_key(),
-                        &p.block_hash,
-                    )? {
-                        self.metrics.add_ipfs_resolved(1);
+                Ok(content) => match self.gate.document_rows(&p, &content, self.timestamps) {
+                    Ok(rows) => {
+                        self.work.remove(&key);
+                        let entries: Vec<(String, String)> = rows
+                            .iter()
+                            .map(|r| {
+                                (
+                                    Store::entity_key(r.block_number, r.log_index),
+                                    r.to_json().to_string(),
+                                )
+                            })
+                            .collect();
+                        // False when a reorg removed or replaced the naming row since the scan; the next
+                        // scan plans whatever the block holds now.
+                        if self.store.put_entities_if_named(
+                            &entries,
+                            &p.source_key(),
+                            &p.block_hash,
+                        )? {
+                            self.metrics.add_ipfs_resolved(1);
+                        }
                     }
-                }
+                    Err(refused) => {
+                        tracing::warn!(
+                            "ipfs: gave up on {} (block {}): proven, but {refused}. Its range seals \
+                             without it (nuthatch_nest_ipfs_rows_refused_total)",
+                            p.cid,
+                            p.block
+                        );
+                        self.metrics.add_ipfs_rows_refused(1);
+                        self.give_up(&p)?;
+                    }
+                },
                 Err(e) => {
                     let Some(w) = self.work.get_mut(&key) else {
                         continue;
@@ -490,9 +572,7 @@ impl Resolver {
                             p.block,
                             w.failures
                         );
-                        self.store.set_meta(&gave_up_key(&p), &p.cid)?;
-                        self.metrics.add_ipfs_given_up(1);
-                        self.work.remove(&key);
+                        self.give_up(&p)?;
                     } else {
                         w.due = Instant::now() + self.policy.backoff(w.failures);
                         tracing::debug!(
@@ -508,6 +588,13 @@ impl Resolver {
         }
         self.metrics.set_ipfs_pending(self.work.len() as u64);
         Ok(self.work.len())
+    }
+
+    fn give_up(&mut self, p: &Planned) -> Result<()> {
+        self.store.set_meta(&gave_up_key(p), &p.cid)?;
+        self.metrics.add_ipfs_given_up(1);
+        self.work.remove(&(p.block, p.slot));
+        Ok(())
     }
 
     fn next_wait(&self) -> Duration {
@@ -563,9 +650,23 @@ pub async fn resolve_inline(
     {
         by_block.entry(r.block_number).or_default().push(r);
     }
+    let mut given_up = 0;
     let planned: Vec<Planned> = by_block
         .values()
         .flat_map(|rs| plan_block(&gate.decls, rs))
+        .filter(|p| {
+            if p.over_band {
+                tracing::warn!(
+                    "ipfs: gave up on {} (block {}, slot {}) without a fetch: the block has no room \
+                     left for its typed rows",
+                    p.cid,
+                    p.block,
+                    p.slot
+                );
+                given_up += 1;
+            }
+            !p.over_band
+        })
         .collect();
     let results: Vec<(Planned, Option<String>)> = futures::stream::iter(planned)
         .map(|p| async move {
@@ -593,10 +694,17 @@ pub async fn resolve_inline(
         .await;
 
     let mut out = Vec::new();
-    let mut given_up = 0;
     for (p, content) in results {
-        match content {
-            Some(c) => out.push(gate.document_row(&p, &c, timestamps)),
+        match content.map(|c| gate.document_rows(&p, &c, timestamps)) {
+            Some(Ok(rows)) => out.extend(rows),
+            Some(Err(refused)) => {
+                tracing::warn!(
+                    "ipfs: gave up on {} (block {}): proven, but {refused}",
+                    p.cid,
+                    p.block
+                );
+                given_up += 1;
+            }
             None => given_up += 1,
         }
     }
@@ -618,6 +726,7 @@ mod tests {
             cid_column: "uri".into(),
             cid_json_path: None,
             json_match: BTreeMap::new(),
+            rows: None,
         }
     }
 
@@ -695,6 +804,7 @@ mod tests {
             cid_column: "_payload".into(),
             cid_json_path: Some("hash".into()),
             json_match: BTreeMap::from([("topic".to_string(), "t".to_string())]),
+            rows: None,
         };
         let payload = format!(r#"{{"topic": "t", "hash": "{CID}", "timestamp": 1}}"#);
         let row = DecodedRow {
@@ -761,5 +871,83 @@ mod tests {
         assert_eq!(p.backoff(4), Duration::from_secs(40));
         assert_eq!(p.backoff(5), Duration::from_secs(60));
         assert_eq!(p.backoff(40), Duration::from_secs(60));
+    }
+
+    fn one_column_rows(table: &str, max_rows: u64) -> crate::ipfs::IpfsRows {
+        crate::ipfs::IpfsRows {
+            table: table.into(),
+            max_rows,
+            keep_content: true,
+            columns: vec![crate::ipfs::RowColumn {
+                name: "a".into(),
+                ty: crate::ipfs::RowType::U64,
+            }],
+        }
+    }
+
+    /// Room for typed rows is allotted by slot from the plan alone. Keys assigned as documents arrived
+    /// would differ between two operators whose gateways answered in a different order.
+    #[test]
+    fn typed_rows_are_placed_by_slot_before_anything_resolves() {
+        let decls = [
+            IpfsDecl {
+                name: "typed_docs".into(),
+                rows: Some(one_column_rows("typed", 3_000)),
+                ..uri_decl()
+            },
+            IpfsDecl {
+                name: "plain_docs".into(),
+                ..uri_decl()
+            },
+        ];
+        let named: Vec<DecodedRow> = (0..3)
+            .map(|i| {
+                uri_row(
+                    10,
+                    i,
+                    &crate::cid::cid_v0_for(format!("doc {i}").as_bytes()),
+                )
+            })
+            .collect();
+        let refs: Vec<&DecodedRow> = named.iter().collect();
+        let plan = plan_block(&decls, &refs);
+        assert_eq!(
+            plan.iter()
+                .filter(|p| p.decl == 0)
+                .map(|p| p.rows_from)
+                .collect::<Vec<_>>(),
+            [Some(626_000), Some(629_000), Some(632_000)]
+        );
+        assert!(plan
+            .iter()
+            .filter(|p| p.decl == 1)
+            .all(|p| p.rows_from.is_none()));
+        assert!(plan.iter().all(|p| !p.over_band));
+    }
+
+    /// A document whose rows would run into the call band is refused before it is fetched: nothing a
+    /// gateway returns could make it fit.
+    #[test]
+    fn a_document_past_the_room_for_typed_rows_is_refused_without_a_fetch() {
+        let decl = IpfsDecl {
+            rows: Some(one_column_rows("typed", 100_000)),
+            ..uri_decl()
+        };
+        let named: Vec<DecodedRow> = (0..2)
+            .map(|i| {
+                uri_row(
+                    10,
+                    i,
+                    &crate::cid::cid_v0_for(format!("doc {i}").as_bytes()),
+                )
+            })
+            .collect();
+        let refs: Vec<&DecodedRow> = named.iter().collect();
+        let plan = plan_block(std::slice::from_ref(&decl), &refs);
+        assert_eq!(
+            plan.iter().map(|p| p.over_band).collect::<Vec<_>>(),
+            [false, true],
+            "the second document's 100,000 rows would start at 726,000 and end past 749,999"
+        );
     }
 }

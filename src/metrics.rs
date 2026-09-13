@@ -67,6 +67,8 @@ pub struct NestMetrics {
     ipfs_unverified: AtomicU64,
     /// RFC-0037: documents refused for exceeding the byte, block or depth cap.
     ipfs_oversize: AtomicU64,
+    /// RFC-0037 slice 8: proven documents whose content does not fit their declared typed rows.
+    ipfs_rows_refused: AtomicU64,
     /// #807: the `--seal-direct` history pass, before the hot cursor exists.
     seal_direct_active: AtomicBool,
     seal_direct_origin: AtomicU64,
@@ -269,6 +271,13 @@ impl NestMetrics {
     pub fn ipfs_oversize(&self) -> u64 {
         self.ipfs_oversize.load(Relaxed)
     }
+    pub fn add_ipfs_rows_refused(&self, n: u64) {
+        self.ipfs_rows_refused.fetch_add(n, Relaxed);
+        METRICS.add_ipfs_rows_refused(n);
+    }
+    pub fn ipfs_rows_refused(&self) -> u64 {
+        self.ipfs_rows_refused.load(Relaxed)
+    }
 
     /// Start a seal-direct history pass. `/ready` reads these instead of treating a zero cursor as
     /// WAITING (#807).
@@ -394,6 +403,7 @@ pub struct Metrics {
     ipfs_given_up: AtomicU64,
     ipfs_unverified: AtomicU64,
     ipfs_oversize: AtomicU64,
+    ipfs_rows_refused: AtomicU64,
     alert_outbox_depth: AtomicU64,
     // Serving - the surface an operator bills against.
     http_requests: AtomicU64,
@@ -464,6 +474,7 @@ impl Metrics {
             ipfs_given_up: AtomicU64::new(0),
             ipfs_unverified: AtomicU64::new(0),
             ipfs_oversize: AtomicU64::new(0),
+            ipfs_rows_refused: AtomicU64::new(0),
             alert_outbox_depth: AtomicU64::new(0),
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
@@ -589,6 +600,9 @@ impl Metrics {
     }
     pub fn add_ipfs_oversize(&self, n: u64) {
         self.ipfs_oversize.fetch_add(n, Relaxed);
+    }
+    pub fn add_ipfs_rows_refused(&self, n: u64) {
+        self.ipfs_rows_refused.fetch_add(n, Relaxed);
     }
     pub fn set_alert_outbox(&self, v: u64) {
         self.alert_outbox_depth.store(v, Relaxed);
@@ -837,6 +851,11 @@ impl Metrics {
             "nuthatch_ipfs_oversize_total",
             "IPFS documents refused for exceeding the byte, block or depth cap, since start.",
             self.ipfs_oversize.load(Relaxed),
+        ));
+        s.push_str(&counter(
+            "nuthatch_ipfs_rows_refused_total",
+            "Proven IPFS documents whose content did not fit their declared typed rows, since start.",
+            self.ipfs_rows_refused.load(Relaxed),
         ));
         s.push_str(&counter(
             "nuthatch_http_requests_total",
@@ -1094,6 +1113,12 @@ impl Metrics {
                 "IPFS documents refused for exceeding the byte, block or depth cap, per nest.",
                 "counter",
                 &|m| m.ipfs_oversize.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_ipfs_rows_refused_total",
+                "Proven IPFS documents whose content did not fit their declared typed rows, per nest.",
+                "counter",
+                &|m| m.ipfs_rows_refused.load(Relaxed),
             );
             labelled(
                 "nuthatch_nest_reorgs_total",
