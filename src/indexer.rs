@@ -6637,6 +6637,8 @@ async fn maybe_seal(
             }
         }
         from = cut + 1;
+        // Sealing is synchronous; yielding between segments lets an aborted ingest stop here.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -7936,6 +7938,83 @@ mod tests {
             largest < SEAL_DIRECT_BYTES + row + 1_024,
             "maybe_seal read {largest} bytes of rows at once against a {range_bytes}-byte range; a cut \
              is at most SEAL_DIRECT_BYTES and one row"
+        );
+    }
+
+    /// SIGTERM stopped the API and the ingest kept sealing for 26 s (qos-live/run3.log, 2026-09-13).
+    /// An abort lands only when a task pends, and in runtime shutdown the seal loop's `block_hash`
+    /// reads fail at once, so a seal under way ran every cut in one poll. This source never pends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_seal_stops_at_the_next_segment() {
+        struct HoldsFirstCut {
+            asked: std::sync::Mutex<Option<std::sync::mpsc::Sender<u64>>>,
+            go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        #[async_trait::async_trait]
+        impl Source for HoldsFirstCut {
+            async fn tip(&self) -> Result<u64> {
+                Ok(0)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                if let Some(asked) = self.asked.lock().unwrap().take() {
+                    asked.send(n).unwrap();
+                    // Holds the worker without pending, as a seal already under way does.
+                    self.go.lock().unwrap().recv().unwrap();
+                }
+                Ok(Some(format!("{n:064x}")))
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+        let n = SEAL_DIRECT_BATCH as u64 * 3;
+        load_rows(&store, n);
+        let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let source = HoldsFirstCut {
+            asked: std::sync::Mutex::new(Some(asked_tx)),
+            go: std::sync::Mutex::new(go_rx),
+        };
+        let (dir, sealer) = (tmp.path().to_path_buf(), store.clone());
+        let task = tokio::spawn(async move {
+            let metrics = crate::metrics::NestMetrics::default();
+            maybe_seal(
+                &dir,
+                sealer.as_ref(),
+                &source,
+                n - 1,
+                None,
+                &metrics,
+                SPAN_OFF,
+            )
+            .await
+        });
+        let first_cut = tokio::task::spawn_blocking(move || asked_rx.recv().unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        go_tx.send(()).unwrap();
+        assert!(
+            task.await
+                .expect_err("the seal ran to the end")
+                .is_cancelled(),
+            "the seal must end cancelled"
+        );
+        assert_eq!(
+            store
+                .get_meta(SEALED_THROUGH_KEY)
+                .unwrap()
+                .map(|s| s.parse::<u64>().unwrap()),
+            Some(first_cut),
+            "an aborted seal must stop after the segment it was writing, not run every cut"
         );
     }
 
@@ -11340,6 +11419,50 @@ template = "pool"
                 "overlapping batches must still decode in chain order"
             );
         }
+    }
+
+    /// The other half of SIGTERM: an ingest pending on a body fetch stops when aborted.
+    #[tokio::test]
+    async fn an_aborted_fetch_stops_while_its_bodies_are_pending() {
+        struct Never;
+        #[async_trait::async_trait]
+        impl Source for Never {
+            async fn tip(&self) -> Result<u64> {
+                Ok(0)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(Some(format!("{n:064x}")))
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+            async fn block_bodies(
+                &self,
+                _blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                std::future::pending().await
+            }
+        }
+
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let task = tokio::spawn(async move {
+            decode_top_level_calls(&Never, &creg, &[], 0, 399, true, 4).await
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("an aborted fetch must stop");
+        assert!(joined
+            .expect_err("a pending fetch cannot finish")
+            .is_cancelled());
     }
 
     /// `--seal-direct` wrote finalized history without decoding top-level calls or resolving the
