@@ -283,6 +283,71 @@ async fn key_ordering_survives_the_backend() {
     );
 }
 
+/// The seal cut streams the hot store rather than loading a range (RFC-0028 §4 amendment). Postgres
+/// pages that stream a thousand rows at a time, so the fixture crosses a page boundary more than once,
+/// and an early stop past the first page must stop there on both backends.
+#[tokio::test]
+async fn the_range_scan_pages_and_stops_on_both_backends() {
+    let Some((redb, pg, _dir)) = pair("range_scan") else {
+        return;
+    };
+    // 2,500 rows over 500 blocks, five a block, so pages end mid-block as well as between blocks.
+    let rows: Vec<(String, String)> = (0..500u64)
+        .flat_map(|b| (0..5u64).map(move |i| row("t", b * 7 + 3, i)))
+        .collect();
+    for s in [redb.as_ref(), pg.as_ref()] {
+        s.commit_window(&rows, None, 499 * 7 + 3).unwrap();
+    }
+
+    let scan = |s: &dyn HotStore, from: u64, to: u64, stop_after: usize| {
+        let mut seen: Vec<(u64, String)> = Vec::new();
+        s.scan_entities_in_range(from, to, &mut |block, json| {
+            seen.push((block, json.to_string()));
+            seen.len() < stop_after
+        })
+        .unwrap();
+        seen
+    };
+
+    for s in [redb.as_ref(), pg.as_ref()] {
+        let all = scan(s, 0, u64::MAX, usize::MAX);
+        assert_eq!(
+            all.iter().map(|(_, j)| j.clone()).collect::<Vec<_>>(),
+            s.entities_in_range(0, u64::MAX).unwrap(),
+            "a full scan must visit exactly what entities_in_range returns, in the same order"
+        );
+        for (block, json) in &all {
+            let stated = serde_json::from_str::<serde_json::Value>(json).unwrap()["block_number"]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                *block, stated,
+                "the visitor's block must be the row's block"
+            );
+        }
+    }
+    assert_eq!(
+        scan(redb.as_ref(), 0, u64::MAX, usize::MAX),
+        scan(pg.as_ref(), 0, u64::MAX, usize::MAX)
+    );
+
+    let stopped_redb = scan(redb.as_ref(), 0, u64::MAX, 1_500);
+    let stopped_pg = scan(pg.as_ref(), 0, u64::MAX, 1_500);
+    assert_eq!(
+        stopped_pg.len(),
+        1_500,
+        "Postgres must stop past its first page, not at it"
+    );
+    assert_eq!(stopped_redb, stopped_pg);
+
+    let bounded = scan(pg.as_ref(), 10, 3_000, usize::MAX);
+    assert_eq!(bounded, scan(redb.as_ref(), 10, 3_000, usize::MAX));
+    assert!(
+        bounded.iter().all(|(b, _)| (10..=3_000).contains(b)),
+        "a bounded scan must not include rows outside the range"
+    );
+}
+
 /// The `/sql` RAM guard must refuse on both, or a scaled deployment loses a protection the embedded
 /// one has. Postgres would happily stream the whole tip, which makes this *more* important there.
 #[tokio::test]
