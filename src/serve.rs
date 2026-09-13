@@ -753,6 +753,7 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = term => {}
     }
+    crate::analytics::interrupt_for_shutdown();
 }
 
 /// Middleware: bump the request counter, then pass through.

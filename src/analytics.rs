@@ -873,6 +873,64 @@ pub(crate) fn test_set_remove_after_define(dir: &Path, file: Option<PathBuf>) {
 /// ("No files found that match the pattern") or at execution ("Cannot open file"), always naming a
 /// path under the segments directory; nothing else on this surface produces either wording with that
 /// path in it.
+/// Interrupt handles of the DuckDB statements running now, so a shutdown can stop them rather than
+/// drain behind them.
+type LiveHandles = Mutex<Vec<(u64, PathBuf, Arc<duckdb::InterruptHandle>)>>;
+
+fn live_queries() -> &'static LiveHandles {
+    static LIVE: OnceLock<LiveHandles> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static LIVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct LiveQuery(u64);
+
+impl LiveQuery {
+    fn register(dir: &Path, handle: Arc<duckdb::InterruptHandle>) -> LiveQuery {
+        let id = LIVE_SEQ.fetch_add(1, Ordering::SeqCst);
+        live_queries()
+            .lock()
+            .unwrap()
+            .push((id, dir.to_path_buf(), handle.clone()));
+        // A statement that starts after the signal must not run to completion either.
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            handle.interrupt();
+        }
+        LiveQuery(id)
+    }
+}
+
+impl Drop for LiveQuery {
+    fn drop(&mut self) {
+        live_queries()
+            .lock()
+            .unwrap()
+            .retain(|(id, _, _)| *id != self.0);
+    }
+}
+
+/// Stop every running statement and refuse to let new ones run. Called from the shutdown signal, before
+/// the server drains in-flight requests: a `/sql` still executing kept SIGTERM waiting 5.63 s.
+pub fn interrupt_for_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    for (_, _, handle) in live_queries().lock().unwrap().iter() {
+        handle.interrupt();
+    }
+}
+
+/// [`interrupt_for_shutdown`] for one dataset and without the latch, so a test cannot stop another
+/// test's statements.
+#[cfg(test)]
+fn interrupt_live_in(dir: &Path) {
+    for (_, d, handle) in live_queries().lock().unwrap().iter() {
+        if d == dir {
+            handle.interrupt();
+        }
+    }
+}
+
 /// A planned segment was missing because the catalogue changed after the plan read it.
 #[derive(Debug)]
 struct SegmentSetChanged;
@@ -1243,6 +1301,7 @@ fn attempt(
             std::fs::remove_file(&f).expect("test hook: remove the planned segment");
         }
         let cap = guard.map(|g| g.max_rows);
+        let _live = LiveQuery::register(dir, conn.interrupt_handle());
         let outcome = evaluate.then(|| collect(conn, sql, cap));
 
         // Stop the watchdog before interpreting the result: a value arriving before the deadline makes
@@ -3902,6 +3961,43 @@ template="pool"
             out.degraded_tables
         );
         assert_eq!(out.rows[0]["n"], Value::from(5u64));
+    }
+
+    /// SIGTERM waited 5.63 s behind a `/sql` still executing: the server drains in-flight requests, and
+    /// nothing stopped the statement. A running statement must end when the live queries are interrupted.
+    #[test]
+    fn a_running_query_stops_when_live_queries_are_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (0..2_000u64).map(fold_row).collect();
+        crate::seal::seal_range(dir.path(), &rows, 0, 1_999).unwrap();
+        let path = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = query(
+                &path,
+                r#"SELECT count(*) AS n FROM "usdc__transfer" a, "usdc__transfer" b, "usdc__transfer" c"#,
+            );
+            let _ = tx.send(r.is_err());
+        });
+        let started = Instant::now();
+        while !live_queries()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, d, _)| d == dir.path())
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the query never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        interrupt_live_in(dir.path());
+        let failed = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("an interrupted statement must stop, not run eight billion rows to the end");
+        assert!(failed, "an interrupted statement must fail, not answer");
     }
 
     /// The same race without a hook: readers query while a writer folds, one row at a time. No answer
