@@ -13,6 +13,23 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-09-13 - RFC-0037 slice 6: multi-block IPFS documents are verified.** Slice 5 verified 0 of 36
+  oracle payloads, because a file past 256 KiB was re-encoded as a single block. It is now re-encoded
+  in Kubo's default layout (256 KiB leaves, a balanced tree of 174 links) or, failing that,
+  reassembled from a CAR whose every block is hashed against its CID, with `blocksizes`, `filesize`
+  and caps of 16 MiB, 4,096 blocks and visits, and 16 levels checked. A document neither proves
+  writes **no row** and counts in `nuthatch_nest_ipfs_unverified_total`; past a cap, in
+  `nuthatch_nest_ipfs_oversize_total`. The encoder is pinned to the network, not to itself: a real
+  oracle root block re-encodes byte for byte, a real leaf fixes the chunk, and Kubo's empty-file CID
+  holds, which caught the single-block encoder writing an empty Data field Kubo omits. **Measured
+  offline**: all 4,025 oracle payloads for 2026-09-06 to 09-12 verify by re-encoding. **Trustless
+  forms, measured**: The Graph's path gateway ignores `?format=raw` and `?format=car`, its Kubo RPC
+  answers 403, Pinata serves CARs in 5 to 6 s, `ipfs.io` and `trustless-gateway.link` timed out at
+  60 s. **Verified live against Gnosis, not a stub**: the slice 5 scratch nest re-run from block
+  48,231,452 to the tip at 48,232,905 resolved 50 documents, **50 verified** (25 per topic, 52.0 MB),
+  and the 36 inside slice 5's range are the same 36 it stored unverified. 0 unverified, 0 oversize,
+  caught up in 53 s, hot store 81 MB. Re-encoding costs no request; the CAR costs one per offering
+  gateway, and only for a document re-encoding cannot prove.
 - **2026-09-13 - RFC-0037 slice 5: a CID inside JSON, from calldata.** `[[ipfs]]` takes
   `cid_json_path` and `json_match`, so a nest can resolve the documents Edge & Node's QoS oracle names
   in `submitQoSPayload(bytes)` on Gnosis. Three faults stood in the way and are fixed with it: IPFS
