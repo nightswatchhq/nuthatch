@@ -6,10 +6,10 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::seal::{self, Manifest, Segment, MANIFEST_FILE};
@@ -479,30 +479,45 @@ pub async fn sync_with(
         m.set_publish_pending(missing.len() as u64);
     }
     let mirror_ref = mirror.as_ref();
-    let mut parquet: Vec<(String, u64)> =
+    let attempts: Vec<(String, Result<u64>)> =
         futures::stream::iter(missing.iter().map(|(table, seg)| {
             let src = seal::segment_path(dir, &seg.file, &seg.hash);
             let name = parquet_key(table, &seg.hash);
             let key = prefix(&name);
             async move {
-                let len = match std::fs::metadata(&src) {
-                    Ok(meta) => meta.len(),
-                    Err(_) => bail!(
-                        "catalogue names {} but the file is missing at {}",
-                        seg.file,
-                        src.display()
-                    ),
+                let upload = async {
+                    let len = match std::fs::metadata(&src) {
+                        Ok(meta) => meta.len(),
+                        Err(_) => bail!(
+                            "catalogue names {} but the file is missing at {}",
+                            seg.file,
+                            src.display()
+                        ),
+                    };
+                    mirror_ref.put_file(&key, &src).await?;
+                    if let Some(m) = metrics {
+                        m.publish_uploaded(len);
+                    }
+                    Ok(len)
                 };
-                mirror_ref.put_file(&key, &src).await?;
-                if let Some(m) = metrics {
-                    m.publish_uploaded(len);
-                }
-                Ok::<_, anyhow::Error>((name, len))
+                (name, upload.await)
             }
         }))
         .buffer_unordered(parallelism.max(1))
-        .try_collect()
-        .await?;
+        .collect()
+        .await;
+    let mut parquet = Vec::with_capacity(attempts.len());
+    let mut failed = Vec::new();
+    for (name, attempt) in attempts {
+        match attempt {
+            Ok(len) => parquet.push((name, len)),
+            Err(e) => failed.push((name, e)),
+        }
+    }
+    if !failed.is_empty() {
+        failed.sort_by(|a, b| a.0.cmp(&b.0));
+        return Err(UploadFailures(failed).into());
+    }
     parquet.sort();
     let uploaded_bytes = parquet.iter().map(|(_, len)| len).sum();
     let mut uploaded: Vec<String> = parquet.into_iter().map(|(name, _)| name).collect();
@@ -675,6 +690,66 @@ pub async fn run_verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
 pub const DEFAULT_PARALLELISM: usize = 2;
 /// Consecutive failures on one object before the mirror reports itself dead-lettered.
 const DEAD_LETTER_AFTER: u32 = 5;
+/// Where a failure outside any one object's upload is counted.
+const CATALOGUE: &str = "catalogue";
+
+/// The objects a pass could not upload, by key. The pass wrote no catalogue.
+#[derive(Debug)]
+pub struct UploadFailures(pub Vec<(String, anyhow::Error)>);
+
+impl std::fmt::Display for UploadFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self.0.iter().map(|(k, _)| k.as_str()).collect();
+        write!(
+            f,
+            "{} object(s) failed to upload: {}",
+            keys.len(),
+            keys.join(", ")
+        )?;
+        if let Some((key, e)) = self.0.first() {
+            write!(f, " ({key}: {e:#})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UploadFailures {}
+
+/// Consecutive failures per object. Every missing object is attempted on every pass that reaches
+/// the uploads, so an object absent from a pass's failures has been published.
+#[derive(Debug, Default)]
+struct Failures(HashMap<String, u32>);
+
+impl Failures {
+    fn succeeded(&mut self) {
+        self.0.clear();
+    }
+
+    /// Counts a failed pass and returns the objects it has just dead-lettered.
+    fn failed(&mut self, e: &anyhow::Error) -> Vec<String> {
+        let failed: Vec<String> = match e.downcast_ref::<UploadFailures>() {
+            Some(UploadFailures(objects)) => objects.iter().map(|(k, _)| k.clone()).collect(),
+            None => vec![CATALOGUE.to_string()],
+        };
+        // A pass that failed before uploading anything says nothing about the objects.
+        if failed != [CATALOGUE] {
+            self.0.retain(|key, _| failed.contains(key));
+        }
+        let mut dead = Vec::new();
+        for key in failed {
+            let count = self.0.entry(key.clone()).or_default();
+            *count += 1;
+            if *count == DEAD_LETTER_AFTER {
+                dead.push(key);
+            }
+        }
+        dead
+    }
+
+    fn dead(&self) -> bool {
+        self.0.values().any(|n| *n >= DEAD_LETTER_AFTER)
+    }
+}
 
 /// How a running nest mirrors itself (RFC-0052 S2). Operator config, never the nest's identity.
 #[derive(Debug, Clone)]
@@ -726,7 +801,7 @@ async fn reconcile(
     let metrics = crate::metrics::METRICS.nest(&nest);
     metrics.set_publish_enabled();
     let mut changes = seal::manifest_changes(&dir);
-    let mut failing: Option<(String, u32)> = None;
+    let mut failures = Failures::default();
     loop {
         let pass = sync_with(
             &dir,
@@ -740,30 +815,27 @@ async fn reconcile(
             result = pass => match result {
                 Ok(report) => {
                     metrics.publish_succeeded(report.sealed_through);
-                    failing = None;
+                    failures.succeeded();
                 }
                 Err(e) => {
-                    let object = e.to_string();
-                    let count = match &failing {
-                        Some((last, n)) if *last == object => n + 1,
-                        _ => 1,
-                    };
-                    metrics.publish_failed(count >= DEAD_LETTER_AFTER);
-                    if count == DEAD_LETTER_AFTER {
+                    let dead = failures.failed(&e);
+                    metrics.publish_failed(failures.dead());
+                    for object in &dead {
                         tracing::error!(
-                            "publishing {nest}: {object} has failed {count} times in a row; \
-                             dead-lettered, retrying at a tenth of the rate until it succeeds: {e:#}"
+                            "publishing {nest}: {object} has failed {DEAD_LETTER_AFTER} times in a \
+                             row; dead-lettered, retrying at a tenth of the rate until it succeeds: {e:#}"
                         );
-                    } else if count < DEAD_LETTER_AFTER {
+                    }
+                    if dead.is_empty() && !failures.dead() {
                         tracing::warn!("publishing {nest} failed, will retry: {e:#}");
                     }
-                    failing = Some((object, count));
                 }
             },
         }
-        let wait = match &failing {
-            Some((_, n)) if *n >= DEAD_LETTER_AFTER => settings.interval.saturating_mul(10),
-            _ => settings.interval,
+        let wait = if failures.dead() {
+            settings.interval.saturating_mul(10)
+        } else {
+            settings.interval
         };
         // Level-triggered: a missed wake-up costs one interval, never an object.
         tokio::select! {
@@ -978,6 +1050,107 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "a seal waited {:?} on the store",
             started.elapsed()
+        );
+    }
+
+    fn refused(keys: &[&str]) -> anyhow::Error {
+        UploadFailures(
+            keys.iter()
+                .map(|k| (k.to_string(), anyhow::anyhow!("refused")))
+                .collect(),
+        )
+        .into()
+    }
+
+    #[test]
+    fn an_object_failing_beside_others_keeps_its_own_count() {
+        let mut failures = Failures::default();
+        for pass in 1..DEAD_LETTER_AFTER {
+            let keys: &[&str] = if pass % 2 == 0 { &["a", "b"] } else { &["a"] };
+            assert!(failures.failed(&refused(keys)).is_empty());
+        }
+        assert_eq!(
+            failures.failed(&refused(&["a", "b"])),
+            vec!["a".to_string()]
+        );
+        assert!(failures.dead());
+    }
+
+    #[test]
+    fn a_catalogue_failure_neither_resets_nor_counts_an_object() {
+        let mut failures = Failures::default();
+        for _ in 1..DEAD_LETTER_AFTER {
+            failures.failed(&refused(&["a"]));
+        }
+        failures.failed(&anyhow::anyhow!("bucket unreachable"));
+        assert!(!failures.dead());
+        assert_eq!(failures.failed(&refused(&["a"])), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn an_object_that_uploads_starts_counting_again() {
+        let mut failures = Failures::default();
+        for _ in 1..DEAD_LETTER_AFTER {
+            failures.failed(&refused(&["a"]));
+        }
+        failures.failed(&refused(&["b"]));
+        failures.failed(&refused(&["a"]));
+        assert!(!failures.dead());
+    }
+
+    #[derive(Default)]
+    struct RefusingFirst {
+        refused: std::sync::Mutex<Option<String>>,
+        stored: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Mirror for RefusingFirst {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn put_file(&self, key: &str, _: &Path) -> Result<()> {
+            let mut refused = self.refused.lock().unwrap();
+            if refused.is_none() {
+                *refused = Some(key.to_string());
+                bail!("refusing {key}");
+            }
+            self.stored.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+        async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
+            Ok(())
+        }
+        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn one_refused_object_does_not_stop_the_others_uploading() {
+        let nest = sealed_nest();
+        seal_range(nest.path(), &[row(12, 9)], 12, 12)
+            .unwrap()
+            .expect("sealed");
+        let mirror = std::sync::Arc::new(RefusingFirst::default());
+        let target = install("refusing-first", mirror.clone());
+        let e = sync_with(nest.path(), &target, false, 1, None)
+            .await
+            .unwrap_err();
+        let UploadFailures(failed) = e.downcast_ref::<UploadFailures>().expect("per object");
+        let refused = mirror.refused.lock().unwrap().clone().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(
+            refused.ends_with(&failed[0].0),
+            "{refused} vs {}",
+            failed[0].0
+        );
+        assert!(
+            !mirror.stored.lock().unwrap().is_empty(),
+            "nothing uploaded after the refusal"
         );
     }
 
