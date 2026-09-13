@@ -113,6 +113,8 @@ pub enum Command {
     Offchain(OffchainArgs),
     /// Mirror sealed segments to an object-store prefix (RFC-0052).
     Publish(PublishArgs),
+    /// Write another engine's SQL over a nest's tables, offline and deterministically (RFC-0055).
+    Emit(EmitArgs),
     /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
     Nest(NestArgs),
     /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
@@ -335,6 +337,31 @@ pub struct PublishVerifyArgs {
     /// Re-download and re-hash every object.
     #[arg(long)]
     pub deep: bool,
+}
+
+#[derive(Args)]
+pub struct EmitArgs {
+    #[command(subcommand)]
+    pub what: EmitWhat,
+}
+
+#[derive(Subcommand)]
+pub enum EmitWhat {
+    /// One DuneSQL query per event table, casting each column to its DuneSQL type (RFC-0055 S1).
+    Dune(EmitDuneArgs),
+}
+
+#[derive(Args)]
+pub struct EmitDuneArgs {
+    /// Nest directory. Read only.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Directory the `.sql` files and `README.md` are written to.
+    #[arg(long)]
+    pub out: String,
+    /// The Dune namespace the rows were uploaded into; queries read `dune.<source>.<table>`.
+    #[arg(long)]
+    pub source: String,
 }
 
 #[derive(Args)]
