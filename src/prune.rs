@@ -99,28 +99,51 @@ pub fn collectable(dir: &Path) -> Result<Vec<Collectable>> {
 /// **Derived from the manifests, never stored.** A stored count drifts, and here drift deletes bytes
 /// another dataset is reading - the one data-loss failure mode in the shared store, and the same
 /// reasoning as RFC-0032 §5's dataset refcount.
-fn referenced_segments(dir: &Path, surviving: &[String]) -> std::collections::HashSet<String> {
+fn referenced_segments(
+    dir: &Path,
+    surviving: &[String],
+) -> Result<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
     for nid in surviving {
-        let Ok(manifest) = crate::seal::load_manifest(&MountTable::data_dir(dir, nid)) else {
-            continue;
-        };
+        // Skipping a manifest that will not read made every segment it names an orphan.
+        let manifest =
+            crate::seal::load_manifest(&MountTable::data_dir(dir, nid)).with_context(|| {
+                format!(
+                    "reading the manifest of mounted dataset data/{}; nothing was collected",
+                    &nid[..nid.len().min(12)]
+                )
+            })?;
         for segs in manifest.tables.values() {
             for s in segs {
                 out.insert(s.hash.clone());
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// Whether a running process holds this dataset's store, which redb locks exclusively. A placeholder
+/// or corrupt store is not held and answers false.
+fn store_is_held(dataset: &Path) -> bool {
+    let db = dataset.join(crate::config::DB_FILE);
+    db.exists()
+        && crate::store::Store::open_existing(&db).is_err_and(|e| {
+            e.chain().any(|c| {
+                matches!(
+                    c.downcast_ref::<redb::DatabaseError>(),
+                    Some(redb::DatabaseError::DatabaseAlreadyOpen)
+                )
+            })
+        })
 }
 
 /// Shared segments no surviving dataset references, with their sizes.
-fn orphan_segments(dir: &Path, surviving: &[String]) -> Vec<(PathBuf, u64)> {
-    let referenced = referenced_segments(dir, surviving);
+fn orphan_segments(dir: &Path, surviving: &[String]) -> Result<Vec<(PathBuf, u64)>> {
+    let referenced = referenced_segments(dir, surviving)?;
     let Ok(entries) = std::fs::read_dir(dir.join(crate::seal::SEGMENTS_DIR)) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    entries
+    Ok(entries
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
         .filter_map(|e| {
@@ -130,7 +153,7 @@ fn orphan_segments(dir: &Path, surviving: &[String]) -> Vec<(PathBuf, u64)> {
             }
             Some((e.path(), e.metadata().ok()?.len()))
         })
-        .collect()
+        .collect())
 }
 
 fn human(bytes: u64) -> String {
@@ -182,6 +205,21 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
         return Ok(());
     }
 
+    // A query in a running runtime can have planned against a shared segment a fold has since
+    // replaced, and its lease does not reach this process.
+    if let Some(nid) = MountTable::load(dir)?
+        .mounts
+        .iter()
+        .map(|m| m.nid.clone())
+        .find(|nid| store_is_held(&MountTable::data_dir(dir, nid)))
+    {
+        anyhow::bail!(
+            "data/{} is open in a running runtime: removing shared segments now could delete one a \
+             query there is about to read. Stop the runtime, then prune again. Nothing was deleted.",
+            &nid[..nid.len().min(12)]
+        );
+    }
+
     // **Manifest first, bytes second** (RFC-0033 §11a). Removing the dataset - and with it the
     // manifest referencing its segments - before collecting orphans means an interrupted prune leaves
     // unreferenced bytes (recoverable, just disk) rather than dangling references (not).
@@ -196,7 +234,7 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
     let surviving: Vec<String> = MountTable::load(dir)
         .map(|r| r.mounts.iter().map(|m| m.nid.clone()).collect())
         .unwrap_or_default();
-    let orphans = orphan_segments(dir, &surviving);
+    let orphans = orphan_segments(dir, &surviving)?;
     let mut freed_segments = 0u64;
     for (path, size) in &orphans {
         std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
@@ -486,6 +524,74 @@ mod tests {
             "the mounted dataset survives"
         );
         assert!(!MountTable::data_dir(root, &drop_).exists());
+    }
+
+    /// A shared-store fixture: `keep` mounted with `keep_manifest` as its manifest text, `drop_`
+    /// unmounted, and one segment only `drop_` references.
+    fn shared_fixture(root: &Path, keep_manifest: &str) -> (String, String, PathBuf) {
+        use crate::seal::SEGMENTS_DIR;
+        let (keep, drop_) = (nid("aa"), nid("bb"));
+        let lonely_hash = "22".repeat(32);
+        std::fs::create_dir_all(root.join(SEGMENTS_DIR)).unwrap();
+        let lonely = root
+            .join(SEGMENTS_DIR)
+            .join(format!("{lonely_hash}.parquet"));
+        std::fs::write(&lonely, b"bytes").unwrap();
+        for (nid_, manifest) in [(&keep, keep_manifest), (&drop_, "{\"tables\":{}}")] {
+            let dir = MountTable::data_dir(root, nid_);
+            std::fs::create_dir_all(dir.join(SEGMENTS_DIR)).unwrap();
+            std::fs::write(dir.join(SEGMENTS_DIR).join("manifest.json"), manifest).unwrap();
+        }
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+                 chain_id = 42161\nrpc_urls = []\n\n[[mounts]]\nalias = \"a\"\nnid = \"{keep}\"\n"
+            ),
+        )
+        .unwrap();
+        (keep, drop_, lonely)
+    }
+
+    /// `referenced_segments` skipped a mounted dataset whose manifest would not read, so every segment it
+    /// names counted as an orphan and was deleted: data loss with a zero exit code.
+    #[test]
+    fn an_unreadable_manifest_of_a_mounted_dataset_stops_collection() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, _, lonely) = shared_fixture(d.path(), "not json");
+        let err = run(d.path(), true).expect_err("an unreadable surviving manifest must refuse");
+        assert!(format!("{err:#}").contains("manifest"), "{err:#}");
+        assert!(
+            lonely.exists(),
+            "nothing may be collected past a manifest nobody could read"
+        );
+    }
+
+    /// A query in a running runtime can plan against a shared segment a fold has since replaced. Its
+    /// lease is in that process, so prune must not collect while any mounted store is held.
+    #[test]
+    fn prune_refuses_while_a_runtime_holds_a_mounted_store() {
+        let d = tempfile::tempdir().unwrap();
+        let (keep, drop_, lonely) = shared_fixture(d.path(), "{\"tables\":{}}");
+        let held = crate::store::Store::open(
+            &MountTable::data_dir(d.path(), &keep).join(crate::config::DB_FILE),
+        )
+        .unwrap();
+
+        let err = run(d.path(), true).expect_err("a held store must refuse");
+        assert!(format!("{err:#}").contains("running runtime"), "{err:#}");
+        assert!(
+            lonely.exists(),
+            "no shared segment may go while a runtime could read it"
+        );
+        assert!(
+            MountTable::data_dir(d.path(), &drop_).exists(),
+            "the refusal comes before anything is deleted"
+        );
+
+        drop(held);
+        run(d.path(), true).expect("with the runtime stopped, prune proceeds");
+        assert!(!lonely.exists());
     }
 
     /// Mount, unmount, prune, and the mount record's identity is all it ever took to find the data.
