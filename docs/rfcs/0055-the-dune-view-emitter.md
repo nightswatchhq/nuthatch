@@ -103,7 +103,7 @@ The source columns are `varchar` except the four counters (§4). Citation keys a
 | --- | --- | --- | --- | --- |
 | `block_number`, `log_index` | `bigint` | `cast(c as bigint)` | cannot exceed `bigint` on any chain in scope | D1, D10 |
 | `block_timestamp` | `timestamp`, and `date` | `cast(from_unixtime(c, 'UTC') as timestamp)`; `cast(... as date)` | not documented | D4, S2, D10 |
-| `bytes32` / `address` / `fixed_bytes` / `bytes` / `hash32` | `varbinary` | `from_hex(c)`, never `cast(c as varbinary)`, which encodes the string's bytes | not documented; unverified | D3 |
+| `bytes32` / `address` / `fixed_bytes` / `bytes` / `hash32` | `varbinary` | `from_hex(substr(c, 3))`, stripping the `0x`; never `cast(c as varbinary)`, which encodes the string's bytes | not documented; unverified | D3, T1 |
 | `u64` with `sol_type` up to `uint56`; `i64` | `bigint` | `cast(c as bigint)` | not documented | D2 |
 | `u64` with `sol_type` `uint64` | `uint256` | `cast(c as uint256)`, since `uint64` values can exceed `bigint`'s maximum | unverified, below | D1, D2 |
 | `word16` / `word32`, unsigned | `uint256` | `cast(c as uint256)` | unverified, below | D1, D2 |
@@ -120,6 +120,10 @@ Three rules sit around the table:
 - **Casts are `cast`, not `try_cast`.** `try_cast` "returns null if the cast fails" (D2). A silent NULL
   in a wide-integer column undercounts every sum over it, which is a wrong number presented as a right
   one. A cast that fails should fail the query.
+- **The `0x` prefix is stripped before `from_hex`.** Dune's own example passes a prefixed string,
+  `from_hex('0x6574686275696c646572')` (D3), but Trino's `from_hex` documents hex digits only (T1),
+  and RFC-0052 §5 already wrote `from_hex(substr(a, 3))` for Dune. `substr(c, 3)` is correct under both
+  readings, so the emitter does not depend on Dune accepting the prefix.
 - **The wide-integer cast is the load-bearing unverified claim.** D2 says `cast` "can be used to cast a
   varchar to a numeric value type". Every `UINT256` example in D1, D2 and D3 starts from a literal, an
   integer or `varbinary`, never from decimal text. No documented intermediate step exists from decimal
@@ -222,7 +226,7 @@ What this means for the emitter:
 ## §6 - Correctness and tests
 
 - **Golden:** a fixed `schema.json` and `semantic.toml` covering every §3.1 row, a signed and an
-  unsigned wide integer, a `uint64`, a reserved-word parameter and a `hash32` go in, and exact output
+  unsigned wide integer, a `uint64`, a reserved-word parameter, a `hash32` and a `0x`-prefixed address go in, and exact output
   files come out, compared byte for byte.
 - **Vocabulary pin:** a test enumerates `StorageKind` and fails if a variant has no §3.2 row, so the map
   cannot fall behind the decoder.
@@ -244,7 +248,7 @@ than duplicating.
 
 | slice | delivers | fails if |
 | --- | --- | --- |
-| S0 - verify | the §3.2 casts marked unverified, run once on Dune with literals, recorded with the query and its output; a free account suffices because no upload is involved | `cast` from decimal text to `uint256` or `int256` is refused, or loses a digit, at `2^256-1`, `-2^255` or `2^255-1`; then §3.2 is redesigned before S1 |
+| S0 - verify | the §3.2 casts marked unverified, run once on Dune with literals, recorded with the query and its output, including `from_hex(substr('0x…', 3))` against the prefixed form; a free account suffices because no upload is involved | `cast` from decimal text to `uint256` or `int256` is refused, or loses a digit, at `2^256-1`, `-2^255` or `2^255-1`; then §3.2 is redesigned before S1 |
 | S1 - per-table queries | `nuthatch emit dune`, §3 casts and names, §5 refusals, the golden test | the golden output changes between two runs, or a `StorageKind` variant has no row |
 | S2 - descriptions | table and column descriptions and grain from `semantic.toml` in each query's comment header | a description in `semantic.toml` is missing from the emitted query |
 | S3 - authored views | the subset of `views/*.sql` that translates exactly, the rest named | a translated view returns a different result from the DuckDB original on the fixture |
@@ -267,7 +271,7 @@ it:
 Types and conventions, from brief 8:
 
 5. Whether `cast(varchar as uint256)` and `cast(varchar as int256)` accept the full ranges. S0 answers it.
-6. What `from_hex` does with malformed input, and what `cast` does with out-of-range text into `bigint`.
+6. Whether Dune's `from_hex` accepts a `0x` prefix, which §3.2 avoids depending on, and what it does with malformed input, and what `cast` does with out-of-range text into `bigint`.
    The source text is canonical, so neither should occur, but neither is documented.
 7. The types of the decoded `evt_*` columns, and whether `evt_tx_from`, `evt_tx_to` or `evt_block_date`
    exist in Dune's own tables. §3.3 follows `ethereum.logs` and says so.
@@ -296,4 +300,5 @@ All read 2026-09-13. Spellbook at `c73960eb` on `main`.
 - S2 github.com/duneanalytics/spellbook `AGENTS.md`
 - S9 github.com/duneanalytics/spellbook `sources/aave/aave_sources.yml`
 - S11 github.com/duneanalytics/spellbook `dbt_subprojects/dex/seeds/_project/zeroex/ethereum/_schema.yml`
+- T1 github.com/trinodb/trino `docs/src/main/sphinx/functions/binary.md` (`from_hex`)
 - T2 github.com/trinodb/trino `docs/src/main/sphinx/functions/conditional.md`
