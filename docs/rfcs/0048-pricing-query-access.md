@@ -1,9 +1,10 @@
 # RFC-0048: Pricing query access behind a gateway
 
-- Status: **Draft. Design only, and not a carve-out.** Under the 2026 feature freeze this is a
-  document to argue with, not work to start. It proposes how an operator *names the number*
-  RFC-0046 left as a constant. It does not reopen §5.1 of that RFC (no facilitator in the query
-  path), does not put x402 in the binary this year, and does not add a query-shape DSL.
+- Status: **Phase 0 built, 2026-09-13: §5 items 1, 2, 3 and 5.** Written as a draft under the 2026
+  feature freeze and unfrozen with RFC-0044 to RFC-0048 on 2026-09-08. Item 4, the two-tier function,
+  is not built because its benchmark has not fired. §9 records what the build settled that this
+  document left open. It still does not reopen §5.1 of RFC-0046 (no facilitator in the query path)
+  and still adds no query-shape DSL.
 - Author: Jenny
 - Date: 2026-09-02
 - Origin: a board research note on Graph-native query pricing (Agora, TAP/GraphTally, x402 `upto`,
@@ -658,7 +659,8 @@ This RFC adds, after those:
 
 - The default admission threshold in bytes. Needs a measured distribution of named queries
   against real catalogues (Lodestar allocations nest is the obvious first), not a round
-  number from this document.
+  number from this document. *§9: measured against production catalogues; no named-query
+  distribution exists yet to measure.*
 - Whether `β·rows_returned` is worth a second coefficient, or whether the existing 50k row
   cap is the egress bound and the price stays bytes-only.
 - Whether a named query's tier is declared in the pricing manifest or inferred by the
@@ -667,4 +669,44 @@ This RFC adds, after those:
 - Catalogue **retention**, now that §3 has settled the binding itself: the quote carries the
   manifest's content hash and execution must use that exact catalogue, so the open question is only
   how long a quoted catalogue is kept resolvable, and therefore how long a quote may live. The
-  shorter of the two is the real quote lifetime; neither number is chosen here.
+  shorter of the two is the real quote lifetime; neither number is chosen here. *§9: one
+  catalogue, the current one.*
+
+## §9 - What the build settled (2026-09-13)
+
+- **Per-operator accounting without per-operator files.** DuckDB's physical plan names each
+  `READ_PARQUET` but not the files behind it, so each scan is charged the widest reachable sealed
+  table, summed over scans with no deduplication. That is rule 2 with the candidate set widened to
+  every table the statement can reach. It stays an upper bound, and it over-quotes a join of one
+  wide table and one narrow one.
+- **Rules 3b to 5 are an operator allowlist.** Nested-loop and delim joins (the plan a correlated
+  subquery keeps when DuckDB cannot flatten it), recursive CTEs, and any operator not on the list
+  refuse. So does a relation the catalogue does not account for: labels, offchain snapshots, factory
+  children, and an authored view that calls a file-reading table function. None is charged zero.
+- **Reservation and guard.** The reservation is the statement's last execution-time bound against
+  the same catalogue, or zero. Hot rows are copied against `cap - reserved`. The guard is the plan of
+  the connection that runs the statement, taken after the copy, under the query's own watchdog, and
+  checked before evaluation. The wall-clock budget covers the copy and the planning.
+- **Maintained relations** (RFC-0041) are copied into the connection per request, so their rows
+  spend the hot budget at their serialized JSON length.
+- **The quote** rides in the `402` body and in `accepts[0].extra.nuthatchQuote`, with id
+  `<catalogue_hash>.<sealed_through>`. A client that echoes the id in a `nuthatch-quote` header is
+  refused with `409` and a fresh quote when either part has moved. A client that does not echo it is
+  served against the current snapshot at the same flat price, because nothing in Phase 0 makes the
+  price depend on the snapshot. The node holds nothing between quote and payment.
+- **Retention (§8).** The node keeps one catalogue, the current one. A quote is valid while its
+  catalogue and boundary are current, which in practice means until the next seal.
+- **The threshold (§8)** stays at 512 MiB, with a measurement behind it. Across the fourteen
+  production nests on 2026-09-13, the widest sealed table is 88.1 MiB (`graph-allocations-nest-next`)
+  and the largest nest totals 642.5 MiB. The cap admits five full scans of that table and refuses a
+  sweep of that nest. No deployment serves named queries yet, so this is a catalogue measurement and
+  not the query distribution §8 asked for.
+- **Phase 0's exit benchmark** needed telemetry that did not exist. It does now:
+  `nuthatch_named_scan_bytes` is a histogram of admitted bounds and
+  `nuthatch_named_scan_refusals_total` counts refusals. Item 4 stays unbuilt until one of them shows
+  what §3 names.
+- **Settlement (item 5)** stays in the settler: `nuthatch settle --batch N` hands the operator's
+  command up to N authorisations per invocation and journals each reported outcome before the next
+  batch.
+- **Not built:** the cold bytes-read counter §3 names as what would make the total ceiling hard, and
+  the redb key/range pushdown the Phase 1 hot tier waits on. The cold half is still a plan bound.

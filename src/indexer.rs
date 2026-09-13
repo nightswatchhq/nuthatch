@@ -2771,6 +2771,7 @@ async fn build_nest(
         tables: Arc::new(full_schema(&registry, config)),
         sql_gate,
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
+        sql_max_named_scan_bytes: serve::SQL_MAX_NAMED_SCAN_BYTES,
         // Every cursor-owning role builds through here; `serve_role` flips it after (#1025).
         cursorless: false,
         // Open by default; `runtime::dev` overlays the mount's surface after the nest is built

@@ -253,28 +253,99 @@ pub fn admit(
     headers: &HeaderMap,
     resource: &str,
     description: &str,
+    quote: Option<&serde_json::Value>,
 ) -> Result<(), Box<axum::response::Response>> {
-    let seller = cfg
-        .seller()
-        .map_err(|_| Box::new(challenge(cfg, resource, description)))?;
+    let refuse = || Box::new(challenge(cfg, resource, description, quote));
     let Some(header) = headers
         .get("Payment-Signature")
         .and_then(|v| v.to_str().ok())
     else {
-        return Err(Box::new(challenge(cfg, resource, description)));
+        return Err(refuse());
     };
-    verify_and_record(dir, cfg, header, now())
-        .map_err(|_| Box::new(challenge(cfg, resource, description)))?;
-    // `seller` is constructed before receipt verification, so an invalid operator config cannot
-    // issue a challenge that promises a payment the verifier will not accept.
-    let _ = seller;
+    verify_and_record(dir, cfg, header, now()).map_err(|_| refuse())?;
     Ok(())
 }
 
-fn challenge(cfg: &Config, resource: &str, description: &str) -> axum::response::Response {
+/// Whether the request carries a valid authorisation, checked before any query work. It does not
+/// consume the nonce: [`admit`] rechecks and records it only once there is an answer to return.
+pub fn payment_verifies(cfg: &Config, headers: &HeaderMap) -> bool {
+    let Ok(seller) = cfg.seller() else {
+        return false;
+    };
+    headers
+        .get("Payment-Signature")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|header| x402::verify_payment(&seller, header, now()).is_ok())
+}
+
+/// The header a paying client echoes so its answer is held to the snapshot it was quoted.
+pub const QUOTE_HEADER: &str = "nuthatch-quote";
+
+/// `<catalogue sha256 or none>.<sealed_through>`: the two things a quote's validity rests on.
+pub fn quote_id(catalogue_hash: Option<&str>, sealed_through: u64) -> String {
+    format!("{}.{sealed_through}", catalogue_hash.unwrap_or("none"))
+}
+
+pub fn parse_quote_id(id: &str) -> Option<(Option<String>, u64)> {
+    let (catalogue, sealed_through) = id.trim().rsplit_once('.')?;
+    let sealed_through = sealed_through.parse().ok()?;
+    let catalogue = match catalogue {
+        "none" => None,
+        hash if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Some(hash.to_ascii_lowercase())
+        }
+        _ => return None,
+    };
+    Some((catalogue, sealed_through))
+}
+
+/// The quote a `402` carries (RFC-0048 §5 item 3): a flat ceiling, and the byte bound and snapshot
+/// the statement planned to, so a caller holding the catalogue can recompute the bound. In Phase 0
+/// the price does not move with the bound; the bound is what the node refuses past.
+pub fn quote(
+    cfg: &Config,
+    bound: &crate::analytics::ScanBound,
+    sealed_through: u64,
+    hot_rows: u64,
+) -> serde_json::Value {
+    let chain = cfg.seller().ok().map(|seller| seller.network.params());
+    serde_json::json!({
+        "id": quote_id(bound.catalogue_hash.as_deref(), sealed_through),
+        "tier": "flat",
+        "ceiling": {
+            "amount": cfg.price,
+            "asset": chain.map(|c| c.asset.to_string()),
+            "network": chain.map(|c| c.network),
+        },
+        "coefficients": { "base": cfg.price, "alpha_per_byte": "0" },
+        "snapshot": {
+            "catalogue_hash": bound.catalogue_hash,
+            "sealed_through": sealed_through,
+            "hot_rows": hot_rows,
+            "hot_bytes": bound.hot_bytes,
+        },
+        "bound": {
+            "rule": "each Parquet scan in the plan is charged the widest reachable table",
+            "scan_operators": bound.scan_operators,
+            "cold_bytes": bound.cold_bytes,
+            "hot_bytes": bound.hot_bytes,
+            "total_bytes": bound.cold_bytes.saturating_add(bound.hot_bytes),
+            "tables": bound.tables,
+        },
+        "admission_cap_bytes": bound.cap,
+    })
+}
+
+pub fn challenge(
+    cfg: &Config,
+    resource: &str,
+    description: &str,
+    quote: Option<&serde_json::Value>,
+) -> axum::response::Response {
+    let quote_id = quote.and_then(|q| q.get("id")).and_then(|id| id.as_str());
     let header = cfg
         .seller()
-        .map(|seller| x402::challenge_header(&seller, resource, description))
+        .map(|seller| x402::challenge_header(&seller, resource, description, quote_id))
         .unwrap_or_default();
     (
         StatusCode::PAYMENT_REQUIRED,
@@ -282,6 +353,7 @@ fn challenge(cfg: &Config, resource: &str, description: &str) -> axum::response:
         Json(serde_json::json!({
             "error": "Payment required",
             "resource": resource,
+            "quote": quote,
         })),
     )
         .into_response()

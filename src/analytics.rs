@@ -403,6 +403,8 @@ pub struct QueryOutput {
     /// `None` leaves that block off the response entirely rather than reporting an empty set, since
     /// "we did not parse it" and "it touched no entity" are different facts.
     pub referenced_tables: Option<std::collections::BTreeSet<String>>,
+    /// The bound a declared query was admitted against; `None` on every other path.
+    pub scan_bound: Option<ScanBound>,
 }
 
 impl QueryOutput {
@@ -416,6 +418,278 @@ impl QueryOutput {
 /// Hot (unsealed) rows grouped by logical table - from [`crate::store::Store::hot_rows_by_table`].
 /// Passed to the query path so the live tip is `UNION ALL`'d into each table's view (RFC-0013).
 pub type HotRows = std::collections::HashMap<String, Vec<Value>>;
+
+/// One reachable table's sealed segments, as bound into the views of the connection that plans the
+/// statement (RFC-0048 item 1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TableScan {
+    pub segments: u64,
+    pub bytes: u64,
+}
+
+/// The source-byte bound a declared query was admitted against (RFC-0048 §3 Phase 0).
+///
+/// Taken from the physical plan of the connection that runs the statement, after its hot rows are
+/// loaded, so it describes the plan that executes. DuckDB names each Parquet scan but not the files
+/// behind it, so every scan is charged the widest reachable table: a self-join pays twice, and no
+/// scan can be charged less than the table it might be reading.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ScanBound {
+    /// sha256 of the `manifest.json` bytes the views were built from; `None` before any seal.
+    pub catalogue_hash: Option<String>,
+    pub scan_operators: u64,
+    pub cold_bytes: u64,
+    /// Serialized hot-store values and maintained relation rows copied into the connection.
+    pub hot_bytes: u64,
+    pub cap: u64,
+    /// Reachable tables with sealed segments.
+    pub tables: std::collections::BTreeMap<String, TableScan>,
+}
+
+/// What the serving path asks of a declared query.
+#[derive(Debug, Clone)]
+pub struct NamedAdmission {
+    pub cap: u64,
+    pub hot_bytes: u64,
+    /// The catalogue a quote named. Any other catalogue refuses rather than serves.
+    pub pinned_catalogue: Option<Option<String>>,
+    /// `false` plans and bounds the statement without evaluating it: a quote.
+    pub execute: bool,
+}
+
+/// Why a declared query was not admitted. The statement was not evaluated in any of these.
+#[derive(Debug)]
+pub enum AdmissionRefusal {
+    OverCap(ScanBound),
+    Unboundable(String),
+    StaleCatalogue {
+        quoted: Option<String>,
+        current: Option<String>,
+    },
+}
+
+impl std::fmt::Display for AdmissionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OverCap(bound) => write!(
+                f,
+                "named query's scan bound is {} cold + {} hot source bytes, over the {}-byte admission cap",
+                bound.cold_bytes, bound.hot_bytes, bound.cap
+            ),
+            Self::Unboundable(why) => write!(f, "cannot bound this named query: {why}"),
+            Self::StaleCatalogue { .. } => {
+                write!(f, "the quoted catalogue is no longer current; ask for a new quote")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AdmissionRefusal {}
+
+fn unboundable(why: impl Into<String>) -> anyhow::Error {
+    AdmissionRefusal::Unboundable(why.into()).into()
+}
+
+static SCAN_BOUNDS: OnceLock<Mutex<std::collections::HashMap<(PathBuf, String), ScanBound>>> =
+    OnceLock::new();
+const SCAN_BOUNDS_CAPACITY: usize = 1024;
+
+/// The bound this statement last planned to against `catalogue_hash`. A reservation only: it sizes
+/// the hot budget before the copy, and the plan that executes is bounded again.
+pub fn remembered_scan_bound(
+    dir: &Path,
+    sql: &str,
+    catalogue_hash: &Option<String>,
+) -> Option<ScanBound> {
+    SCAN_BOUNDS
+        .get()?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(dir.to_path_buf(), sql.to_string()))
+        .filter(|bound| &bound.catalogue_hash == catalogue_hash)
+        .cloned()
+}
+
+fn remember_scan_bound(dir: &Path, sql: &str, bound: &ScanBound) {
+    let mut bounds = SCAN_BOUNDS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = (dir.to_path_buf(), sql.to_string());
+    if bounds.len() >= SCAN_BOUNDS_CAPACITY && !bounds.contains_key(&key) {
+        bounds.clear();
+    }
+    bounds.insert(key, bound.clone());
+}
+
+/// Bound a declared statement on the connection whose views it will run against (RFC-0048 §3).
+#[allow(clippy::too_many_arguments)]
+fn named_scan_bound(
+    conn: &Connection,
+    dir: &Path,
+    sql: &str,
+    admission: &NamedAdmission,
+    surveys: bool,
+    wanted: Option<&std::collections::BTreeSet<String>>,
+    defined: &DefinedViews,
+) -> Result<ScanBound> {
+    if let Some(quoted) = &admission.pinned_catalogue {
+        if *quoted != defined.catalogue_hash {
+            return Err(AdmissionRefusal::StaleCatalogue {
+                quoted: quoted.clone(),
+                current: defined.catalogue_hash.clone(),
+            }
+            .into());
+        }
+    }
+    if surveys {
+        return Err(unboundable("it surveys the catalogue"));
+    }
+    let Some(wanted) = wanted else {
+        return Err(unboundable(
+            "the relations it reads could not be determined",
+        ));
+    };
+    let catalogued: std::collections::BTreeSet<String> = defined
+        .tables
+        .keys()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    let authored: std::collections::BTreeMap<String, String> = nest_view_files(dir)
+        .iter()
+        .flat_map(|file| split_sql_statements(&file.sql))
+        .filter_map(|statement| Some((view_name(&statement)?, view_body(&statement)?.to_string())))
+        .collect();
+    for name in wanted {
+        if catalogued.contains(name) {
+            continue;
+        }
+        if let Some(body) = authored.get(name) {
+            // A view that reads files itself is a Parquet scan no catalogue table accounts for.
+            let functions = table_refs_in(conn, body, "TABLE_FUNCTION")
+                .ok_or_else(|| unboundable(format!("view {name} will not parse")))?;
+            if let Some(f) = functions
+                .iter()
+                .find(|f| !ALLOWED_TABLE_FNS.contains(&f.as_str()))
+            {
+                return Err(unboundable(format!("view {name} calls {f}")));
+            }
+            continue;
+        }
+        // Neither a table nor an authored view: a CTE, unless the connection holds a relation by
+        // that name (labels, offchain snapshots, factory children), which has no catalogue bound.
+        if connection_has_relation(conn, name) {
+            return Err(unboundable(format!(
+                "it reads {name}, which the catalogue does not account for"
+            )));
+        }
+    }
+    let plan: String = conn
+        .query_row(&format!("EXPLAIN (FORMAT JSON) {sql}"), [], |row| {
+            row.get(1)
+        })
+        .context("failed to plan query")?;
+    let plan: Value = serde_json::from_str(&plan).map_err(|e| {
+        unboundable(format!(
+            "DuckDB returned a physical plan that is not JSON: {e}"
+        ))
+    })?;
+    let scans = physical_parquet_scans(&plan)?;
+    let tables: std::collections::BTreeMap<String, TableScan> = defined
+        .tables
+        .iter()
+        .filter(|(table, scan)| scan.segments > 0 && wanted.contains(&table.to_ascii_lowercase()))
+        .map(|(table, scan)| (table.clone(), *scan))
+        .collect();
+    let widest = tables.values().map(|scan| scan.bytes).max().unwrap_or(0);
+    if scans > 0 && tables.is_empty() {
+        return Err(unboundable(
+            "a Parquet scan reads no catalogue table it can be charged to",
+        ));
+    }
+    let cold_bytes = widest
+        .checked_mul(scans)
+        .ok_or_else(|| unboundable("the cold bound overflows"))?;
+    Ok(ScanBound {
+        catalogue_hash: defined.catalogue_hash.clone(),
+        scan_operators: scans,
+        cold_bytes,
+        hot_bytes: admission.hot_bytes,
+        cap: admission.cap,
+        tables,
+    })
+}
+
+fn connection_has_relation(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM (SELECT view_name AS n FROM duckdb_views() WHERE NOT internal \
+         UNION ALL SELECT table_name FROM duckdb_tables()) WHERE lower(n) = ?",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(true)
+}
+
+/// Parquet scans in a physical plan. An operator not listed refuses, and so does every operator
+/// that can run its input more than once: a nested-loop or delim join rescans per outer row, and a
+/// recursive CTE has no static scan count at all (RFC-0048 §3 rules 3b to 5).
+fn physical_parquet_scans(plan: &Value) -> Result<u64> {
+    let nodes = plan
+        .as_array()
+        .ok_or_else(|| unboundable("the physical plan is not an operator list"))?;
+    let mut scans = 0_u64;
+    for node in nodes {
+        let name = node
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| unboundable("a physical plan operator has no name"))?;
+        match name.trim() {
+            "READ_PARQUET"
+            | "SEQ_SCAN"
+            | "COLUMN_DATA_SCAN"
+            | "DUMMY_SCAN"
+            | "EMPTY_RESULT"
+            | "RANGE"
+            | "GENERATE_SERIES"
+            | "UNNEST"
+            | "PROJECTION"
+            | "FILTER"
+            | "HASH_JOIN"
+            | "CROSS_PRODUCT"
+            | "PIECEWISE_MERGE_JOIN"
+            | "HASH_GROUP_BY"
+            | "PERFECT_HASH_GROUP_BY"
+            | "UNGROUPED_AGGREGATE"
+            | "SIMPLE_AGGREGATE"
+            | "ORDER_BY"
+            | "TOP_N"
+            | "LIMIT"
+            | "STREAMING_LIMIT"
+            | "LIMIT_PERCENT"
+            | "UNION"
+            | "WINDOW"
+            | "STREAMING_WINDOW"
+            | "CTE"
+            | "CTE_SCAN"
+            | "RESERVOIR_SAMPLE"
+            | "STREAMING_SAMPLE" => {}
+            other => {
+                return Err(unboundable(format!(
+                    "cannot bound physical plan operator {other:?}"
+                )))
+            }
+        }
+        let children = node
+            .get("children")
+            .ok_or_else(|| unboundable("a physical plan operator has no children"))?;
+        scans = scans
+            .checked_add(physical_parquet_scans(children)?)
+            .and_then(|n| n.checked_add(u64::from(name.trim() == "READ_PARQUET")))
+            .ok_or_else(|| unboundable("the physical scan count overflows"))?;
+    }
+    Ok(scans)
+}
 
 /// **The nest-wide corruption sweep.** Which of this nest's tables have sealed segments that will
 /// not bind, whether or not anybody has asked about them.
@@ -452,7 +726,7 @@ pub fn degraded_tables(
 /// Run a read-only query to completion. Only SELECT/WITH statements are accepted - this is a query
 /// surface, not a mutation surface. Unguarded: for trusted, registry-built SQL that must finish.
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
-    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[])?.rows)
+    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[], None)?.rows)
 }
 
 /// Run a trusted read-only query over **only the segments finalized at/below `sealed_through`** (the
@@ -463,14 +737,14 @@ pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
 /// compliance exposure/velocity views. Bounding to the persisted watermark keeps cold (<= watermark)
 /// and hot (everything still in the store) partitioned regardless of crash timing.
 fn query_cold(dir: &Path, sql: &str, sealed_through: u64) -> Result<Vec<Value>> {
-    Ok(run(dir, sql, None, &HotRows::new(), sealed_through, &[])?.rows)
+    Ok(run(dir, sql, None, &HotRows::new(), sealed_through, &[], None)?.rows)
 }
 
 /// Run a read-only query under a resource guard, over the **sealed segments only** - the cold path used
 /// by trusted callers and the `/table` endpoint's cold fill (which merges hot itself). See [`QueryGuard`].
 pub fn query_guarded(dir: &Path, sql: &str, guard: QueryGuard) -> Result<QueryOutput> {
     // Cold-only: `u64::MAX` includes every sealed segment (no hot rows to keep disjoint from).
-    run(dir, sql, Some(guard), &HotRows::new(), u64::MAX, &[])
+    run(dir, sql, Some(guard), &HotRows::new(), u64::MAX, &[], None)
 }
 
 /// Run a guarded read-only query over the sealed segments **and the hot tip** - the public `/sql`
@@ -488,7 +762,29 @@ pub fn query_hot_cold(
     sealed_through: u64,
     declared: &[crate::registry::TableSchema],
 ) -> Result<QueryOutput> {
-    run(dir, sql, Some(guard), hot, sealed_through, declared)
+    run(dir, sql, Some(guard), hot, sealed_through, declared, None)
+}
+
+/// [`query_hot_cold`] for a declared query: refused before evaluation when the plan that would run
+/// cannot be bounded or exceeds `admission.cap` (RFC-0048 item 2).
+pub fn query_named(
+    dir: &Path,
+    sql: &str,
+    guard: QueryGuard,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+    admission: &NamedAdmission,
+) -> Result<QueryOutput> {
+    run(
+        dir,
+        sql,
+        Some(guard),
+        hot,
+        sealed_through,
+        declared,
+        Some(admission),
+    )
 }
 
 /// How one attempt at a query ended.
@@ -587,6 +883,7 @@ fn run(
     hot: &HotRows,
     sealed_through: u64,
     declared: &[crate::registry::TableSchema],
+    named: Option<&NamedAdmission>,
 ) -> Result<QueryOutput> {
     // One deadline for the whole call, computed once - not a fresh `guard.timeout` handed to each
     // `attempt` (#476). Before this, the watchdog only ever bounded a single `attempt`: the first
@@ -605,6 +902,7 @@ fn run(
         &nothing_excluded,
         deadline,
         declared,
+        named,
     );
     // A segment the plan named was gone by execution (#1162). Nothing is corrupt and nothing is
     // missing: a seal replaced the file under the query, and planning again reads the manifest as it
@@ -633,6 +931,7 @@ fn run(
             &nothing_excluded,
             deadline,
             declared,
+            named,
         )? {
             Attempt::Ok(out) => Ok(out),
             Attempt::DiedExecuting { error, .. } => Err(error),
@@ -702,6 +1001,7 @@ fn run(
         &corrupt,
         deadline,
         declared,
+        named,
     )? {
         Attempt::Ok(out) => Ok(out),
         Attempt::DiedExecuting { error, .. } => Err(error),
@@ -729,6 +1029,7 @@ fn attempt(
     excluded: &std::collections::BTreeSet<String>,
     deadline: Option<Instant>,
     declared: &[crate::registry::TableSchema],
+    named: Option<&NamedAdmission>,
 ) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. DuckDB gets the original text.
@@ -800,7 +1101,7 @@ fn attempt(
     }
     let mut slot = slot.expect("just inserted");
     slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
-    let (referenced, degraded_tables, interrupted, outcome, cap) = {
+    let (referenced, degraded_tables, interrupted, outcome, cap, scan) = {
         let conn = &slot.conn;
         let walked = reject_unknown_table_refs(conn, sql)?;
         // No parse means no idea what the statement reaches, and the safe answer to that is "all of
@@ -819,7 +1120,7 @@ fn attempt(
                 .as_ref()
                 .and_then(|r| reachable_tables(conn, dir, r))
         };
-        let degraded_tables = define_views(
+        let defined = define_views_bound(
             conn,
             dir,
             hot,
@@ -828,6 +1129,7 @@ fn attempt(
             declared,
             wanted.as_ref(),
         )?;
+        let degraded_tables = defined.degraded.clone();
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
@@ -872,12 +1174,37 @@ fn attempt(
             (tx, join)
         });
 
+        // RFC-0048 §3's guard: the plan this connection is about to run, with its hot tables loaded,
+        // checked before the statement is evaluated. Under the watchdog, because planning a wide nest
+        // is not free.
+        let scan = named.map(|admission| {
+            let bound = named_scan_bound(
+                conn,
+                dir,
+                sql,
+                admission,
+                surveys,
+                wanted.as_ref(),
+                &defined,
+            )?;
+            remember_scan_bound(dir, sql, &bound);
+            if bound.cold_bytes.saturating_add(bound.hot_bytes) > admission.cap {
+                return Err(AdmissionRefusal::OverCap(bound).into());
+            }
+            Ok(bound)
+        });
+        let evaluate = match &scan {
+            None => true,
+            Some(Ok(_)) => named.is_some_and(|admission| admission.execute),
+            Some(Err(_)) => false,
+        };
+
         #[cfg(test)]
         if let Some(f) = test_remove_after_define().lock().unwrap().remove(dir) {
             std::fs::remove_file(&f).expect("test hook: remove the planned segment");
         }
         let cap = guard.map(|g| g.max_rows);
-        let outcome = collect(conn, sql, cap);
+        let outcome = evaluate.then(|| collect(conn, sql, cap));
 
         // Stop the watchdog before interpreting the result: a value arriving before the deadline makes
         // `recv_timeout` return `Ok`, so it won't interrupt; then join so it can't fire late.
@@ -885,7 +1212,7 @@ fn attempt(
             let _ = tx.send(());
             let _ = join.join();
         }
-        (referenced, degraded_tables, interrupted, outcome, cap)
+        (referenced, degraded_tables, interrupted, outcome, cap, scan)
     };
     if interrupted.load(Ordering::SeqCst) {
         drop(slot);
@@ -893,6 +1220,23 @@ fn attempt(
         retain_duck_cache(duck_cache_lock(), slot);
     }
 
+    let scan = match scan {
+        Some(Err(_)) if interrupted.load(Ordering::SeqCst) => {
+            let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
+            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+        }
+        Some(Err(e)) => return Err(e),
+        Some(Ok(bound)) => Some(bound),
+        None => None,
+    };
+    let Some(outcome) = outcome else {
+        return Ok(Attempt::Ok(QueryOutput {
+            degraded_tables,
+            referenced_tables: referenced,
+            scan_bound: scan,
+            ..Default::default()
+        }));
+    };
     let (mut rows, over_cap) = match outcome {
         Ok(v) => v,
         // #529: the watchdog's `interrupt()` cancels whatever DuckDB phase is currently running, not
@@ -939,6 +1283,7 @@ fn attempt(
         degraded_tables,
         tip_unavailable: false,
         referenced_tables: referenced,
+        scan_bound: scan,
     }))
 }
 
@@ -1586,6 +1931,15 @@ fn reachable_tables(
 /// The base tables a statement reads, lowercased. The security walk collects the same set for the
 /// caller's own query; this is for SQL we hand ourselves, like a view's stored definition.
 fn base_tables_in(conn: &Connection, sql: &str) -> Option<std::collections::BTreeSet<String>> {
+    table_refs_in(conn, sql, "BASE_TABLE")
+}
+
+/// The references of one `kind` (`BASE_TABLE`, `TABLE_FUNCTION`) a statement makes, lowercased.
+fn table_refs_in(
+    conn: &Connection,
+    sql: &str,
+    wanted_kind: &str,
+) -> Option<std::collections::BTreeSet<String>> {
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let ast = conn
         .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
@@ -1598,7 +1952,7 @@ fn base_tables_in(conn: &Connection, sql: &str) -> Option<std::collections::BTre
     }
     let mut out = std::collections::BTreeSet::new();
     walk_table_refs(&v, &mut |kind, name| {
-        if kind == "BASE_TABLE" {
+        if kind == wanted_kind {
             out.insert(name.to_ascii_lowercase());
         }
     });
@@ -2005,8 +2359,29 @@ fn define_views(
     // what a statement reaches. See `reachable_tables` for why this matters (#896).
     wanted: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<std::collections::BTreeSet<String>> {
+    Ok(define_views_bound(conn, dir, hot, sealed_through, excluded, declared, wanted)?.degraded)
+}
+
+/// What [`define_views_bound`] built: the degraded tables, each defined table's sealed segments as
+/// they went into its view, and the catalogue those came from.
+struct DefinedViews {
+    degraded: std::collections::BTreeSet<String>,
+    tables: std::collections::BTreeMap<String, TableScan>,
+    catalogue_hash: Option<String>,
+}
+
+fn define_views_bound(
+    conn: &Connection,
+    dir: &Path,
+    hot: &HotRows,
+    sealed_through: u64,
+    excluded: &std::collections::BTreeSet<String>,
+    declared: &[crate::registry::TableSchema],
+    wanted: Option<&std::collections::BTreeSet<String>>,
+) -> Result<DefinedViews> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let manifest = crate::seal::load_manifest(dir)?;
+    let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
+    let (manifest, catalogue_hash) = crate::seal::load_manifest_with_hash(dir)?;
     let mut schema = schema_columns(dir);
     // #729: the table-name check above (#663) stops here at the table's *existence* - a table already
     // on disk kept exactly the columns `schema.json` had, even when the live registry (a re-fetched ABI,
@@ -2073,7 +2448,7 @@ fn define_views(
     for table in &tables {
         let cols = cols_of(table);
         // Only segments finalized at or below the served watermark (COR-1 disjointness).
-        let sealed_files: Vec<String> = manifest
+        let sealed: Vec<(String, u64)> = manifest
             .tables
             .get(table)
             .map(|segs| {
@@ -2102,8 +2477,8 @@ fn define_views(
                         // by the startup integrity pass, or externally removed). Without this, one
                         // missing file makes `read_parquet` throw and the whole query fail; instead the
                         // table's cold data is reduced, loudly, and queries keep working.
-                        if p.exists() {
-                            Some(format!("'{}'", p.display()))
+                        if let Ok(meta) = std::fs::metadata(&p) {
+                            Some((format!("'{}'", p.display()), meta.len()))
                         } else {
                             // Stays at `warn!`: the usual cause is `verify_and_quarantine` having
                             // already moved this file aside and logged it at `error!` at startup, and
@@ -2119,6 +2494,7 @@ fn define_views(
                     .collect()
             })
             .unwrap_or_default();
+        let sealed_files: Vec<String> = sealed.iter().map(|(file, _)| file.clone()).collect();
         // Only tip rows strictly past the watermark (COR-1 disjointness; belt-and-braces with the
         // atomic seal→prune, which already keeps sealed rows out of hot).
         //
@@ -2205,6 +2581,7 @@ fn define_views(
             continue;
         };
         let Err(e) = conn.execute_batch(&ddl) else {
+            bound.insert(table.clone(), table_scan(&sealed));
             continue;
         };
         // A sealed segment that is present but *unreadable* throws while `read_parquet` binds its
@@ -2214,9 +2591,9 @@ fn define_views(
         // segments that will not bind and rebuild the view from what remains, so one bad file *reduces*
         // the table rather than deleting it. The probe is free on the healthy path - it only runs once
         // the whole-view DDL has already failed.
-        let readable: Vec<String> = sealed_files
+        let readable: Vec<(String, u64)> = sealed
             .iter()
-            .filter(|f| {
+            .filter(|(f, _)| {
                 let probe = format!("SELECT 1 FROM read_parquet([{f}], union_by_name=true) LIMIT 0");
                 match conn.prepare(&probe) {
                     Ok(_) => true,
@@ -2241,12 +2618,32 @@ fn define_views(
             degraded.insert(table.clone());
             continue;
         }
-        if let Some(Err(e)) = view_ddl(&readable).map(|retry| conn.execute_batch(&retry)) {
-            tracing::warn!("view {table} skipped after dropping bad segments: {e}");
-            degraded.insert(table.clone());
+        let readable_files: Vec<String> = readable.iter().map(|(file, _)| file.clone()).collect();
+        match view_ddl(&readable_files).map(|retry| conn.execute_batch(&retry)) {
+            Some(Err(e)) => {
+                tracing::warn!("view {table} skipped after dropping bad segments: {e}");
+                degraded.insert(table.clone());
+            }
+            Some(Ok(())) => {
+                bound.insert(table.clone(), table_scan(&readable));
+            }
+            None => {}
         }
     }
-    Ok(degraded)
+    Ok(DefinedViews {
+        degraded,
+        tables: bound,
+        catalogue_hash,
+    })
+}
+
+fn table_scan(files: &[(String, u64)]) -> TableScan {
+    TableScan {
+        segments: files.len() as u64,
+        bytes: files
+            .iter()
+            .fold(0_u64, |sum, (_, len)| sum.saturating_add(*len)),
+    }
 }
 
 /// The DuckDB column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
@@ -3070,6 +3467,236 @@ template="pool"
         assert_eq!(one["to"], Value::from("0xc"));
         let appr = get_row(dir.path(), 10, 2).unwrap().unwrap();
         assert_eq!(appr["spender"], Value::from("0xd"));
+    }
+
+    fn sealed_bytes(dir: &Path, table: &str) -> u64 {
+        crate::seal::load_manifest(dir).unwrap().tables[table]
+            .iter()
+            .map(|s| {
+                std::fs::metadata(crate::seal::segment_path(dir, &s.file, &s.hash))
+                    .unwrap()
+                    .len()
+            })
+            .sum()
+    }
+
+    /// A small table and a wide one, sealed together.
+    fn two_sealed_tables() -> (tempfile::TempDir, u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rows = vec![
+            r#"{"table":"t__transfer","from":"0xa","to":"0xb","value":"1","block_number":1,"tx_hash":"0xt","log_index":0}"#.to_string(),
+        ];
+        for i in 0..400 {
+            rows.push(format!(
+                r#"{{"table":"t__big","memo":"{}","block_number":1,"tx_hash":"0x{i:x}","log_index":{i}}}"#,
+                "wide ".repeat(40 + i)
+            ));
+        }
+        crate::seal::seal_range(dir.path(), &rows, 1, 1).unwrap();
+        let small = sealed_bytes(dir.path(), "t__transfer");
+        let big = sealed_bytes(dir.path(), "t__big");
+        assert!(
+            big > small * 2,
+            "fixture must separate the tables: {small} vs {big}"
+        );
+        (dir, small, big)
+    }
+
+    fn named(
+        dir: &Path,
+        sql: &str,
+        cap: u64,
+        hot_bytes: u64,
+        execute: bool,
+        pinned_catalogue: Option<Option<String>>,
+    ) -> Result<QueryOutput> {
+        query_named(
+            dir,
+            sql,
+            QueryGuard {
+                timeout: Duration::from_secs(30),
+                max_rows: 100,
+            },
+            &HotRows::new(),
+            u64::MAX,
+            &[],
+            &NamedAdmission {
+                cap,
+                hot_bytes,
+                pinned_catalogue,
+                execute,
+            },
+        )
+    }
+
+    fn refusal(result: Result<QueryOutput>) -> AdmissionRefusal {
+        match result {
+            Ok(out) => panic!("admitted: {:?}", out.scan_bound),
+            Err(e) => match e.downcast::<AdmissionRefusal>() {
+                Ok(refusal) => refusal,
+                Err(other) => panic!("not an admission refusal: {other:#}"),
+            },
+        }
+    }
+
+    #[test]
+    fn a_named_bound_charges_every_parquet_scan_the_widest_reachable_table() {
+        use sha2::Digest;
+        let (dir, small, big) = two_sealed_tables();
+        let bound = |sql: &str| {
+            named(dir.path(), sql, u64::MAX, 0, false, None)
+                .unwrap()
+                .scan_bound
+                .unwrap()
+        };
+
+        let once = bound(r#"SELECT * FROM "t__transfer""#);
+        assert_eq!((once.scan_operators, once.cold_bytes), (1, small));
+        assert_eq!(once.tables.keys().collect::<Vec<_>>(), ["t__transfer"]);
+        let manifest = std::fs::read(dir.path().join("segments/manifest.json")).unwrap();
+        assert_eq!(
+            once.catalogue_hash.as_deref(),
+            Some(hex::encode(sha2::Sha256::digest(&manifest)).as_str())
+        );
+
+        let self_join =
+            bound(r#"SELECT * FROM "t__transfer" a JOIN "t__transfer" b USING (log_index)"#);
+        assert_eq!(
+            (self_join.scan_operators, self_join.cold_bytes),
+            (2, 2 * small),
+            "a self-join reads the table twice and must not be deduplicated"
+        );
+
+        // Neither scan can be charged less than the widest table it might be reading.
+        let across = bound(r#"SELECT * FROM "t__transfer" a JOIN "t__big" b USING (log_index)"#);
+        assert_eq!((across.scan_operators, across.cold_bytes), (2, 2 * big));
+    }
+
+    #[test]
+    fn a_named_query_is_refused_before_it_is_evaluated() {
+        let (dir, small, _) = two_sealed_tables();
+        let tripwire = r#"SELECT error('evaluated') FROM "t__transfer""#;
+        let planned = named(dir.path(), tripwire, u64::MAX, 0, false, None).unwrap();
+        assert!(planned.rows.is_empty() && planned.scan_bound.is_some());
+        let ran = named(dir.path(), tripwire, u64::MAX, 0, true, None).unwrap_err();
+        assert!(format!("{ran:#}").contains("evaluated"), "{ran:#}");
+
+        match refusal(named(dir.path(), tripwire, small - 1, 0, true, None)) {
+            AdmissionRefusal::OverCap(b) => assert_eq!((b.cold_bytes, b.cap), (small, small - 1)),
+            other => panic!("{other}"),
+        }
+        // Exactly at the cap is admitted, cold or hot alike.
+        assert!(named(dir.path(), tripwire, small, 0, false, None).is_ok());
+        // The hot copy spends the same budget: under the cap alone, over it together.
+        match refusal(named(dir.path(), tripwire, small + 10, 11, true, None)) {
+            AdmissionRefusal::OverCap(b) => assert_eq!(b.hot_bytes, 11),
+            other => panic!("{other}"),
+        }
+        assert!(named(dir.path(), tripwire, small + 10, 10, false, None).is_ok());
+
+        let moved = refusal(named(
+            dir.path(),
+            tripwire,
+            u64::MAX,
+            0,
+            true,
+            Some(Some("0".repeat(64))),
+        ));
+        assert!(
+            matches!(moved, AdmissionRefusal::StaleCatalogue { .. }),
+            "{moved}"
+        );
+    }
+
+    #[test]
+    fn a_plan_that_can_rescan_or_is_unrecognised_is_not_bounded() {
+        for name in [
+            "REC_CTE",
+            "NESTED_LOOP_JOIN",
+            "BLOCKWISE_NL_JOIN",
+            "LEFT_DELIM_JOIN",
+            "FUTURE_SCAN",
+        ] {
+            let plan = serde_json::json!([{"name": name, "children": [
+                {"name": "READ_PARQUET", "children": [], "extra_info": {}}
+            ], "extra_info": {}}]);
+            let error = physical_parquet_scans(&plan).unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+        }
+        assert!(physical_parquet_scans(&serde_json::json!({})).is_err());
+        assert!(physical_parquet_scans(&serde_json::json!([{"name": "PROJECTION"}])).is_err());
+
+        // A correlated subquery DuckDB cannot flatten plans as a delim join: one scan per outer row.
+        let (dir, _, _) = two_sealed_tables();
+        let correlated = r#"SELECT * FROM "t__transfer" a WHERE a.log_index =
+            (SELECT max(b.log_index) FROM "t__big" b WHERE b.log_index < a.log_index)"#;
+        match refusal(named(dir.path(), correlated, u64::MAX, 0, false, None)) {
+            AdmissionRefusal::Unboundable(why) => assert!(why.contains("DELIM"), "{why}"),
+            other => panic!("{other}"),
+        }
+    }
+
+    #[test]
+    fn ctes_and_authored_views_are_bounded_and_a_view_that_reads_files_is_not() {
+        let (dir, small, big) = two_sealed_tables();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-wide.sql"),
+            "CREATE VIEW wide AS\nSELECT * FROM \"t__big\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/20-sneaky.sql"),
+            "CREATE VIEW sneaky AS SELECT * FROM read_csv('elsewhere.csv');\n",
+        )
+        .unwrap();
+
+        let cte = named(
+            dir.path(),
+            r#"WITH c AS (SELECT * FROM "t__transfer") SELECT count(*) FROM c x JOIN c y USING (log_index)"#,
+            u64::MAX,
+            0,
+            false,
+            None,
+        )
+        .unwrap()
+        .scan_bound
+        .unwrap();
+        assert!(cte.cold_bytes <= 2 * small, "{cte:?}");
+
+        let view = named(
+            dir.path(),
+            "SELECT memo FROM wide",
+            u64::MAX,
+            0,
+            false,
+            None,
+        )
+        .unwrap()
+        .scan_bound
+        .unwrap();
+        assert_eq!((view.scan_operators, view.cold_bytes), (1, big));
+
+        match refusal(named(
+            dir.path(),
+            "SELECT * FROM sneaky",
+            u64::MAX,
+            0,
+            false,
+            None,
+        )) {
+            AdmissionRefusal::Unboundable(why) => assert!(why.contains("read_csv"), "{why}"),
+            other => panic!("{other}"),
+        }
+    }
+
+    #[test]
+    fn a_named_query_refuses_stacked_sql_before_planning_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist.csv");
+        let sql = format!("SELECT 1; COPY (SELECT 2) TO '{}'", target.display());
+        assert!(named(dir.path(), &sql, u64::MAX, 0, false, None).is_err());
+        assert!(!target.exists());
     }
 
     #[test]

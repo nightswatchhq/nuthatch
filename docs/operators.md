@@ -777,10 +777,13 @@ job:
 | DuckDB memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Product of memory with the permit count is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially |
+| declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |
 
 `/sql` is **read-only and single-statement**: a query must open with `SELECT` or `WITH`, filesystem
 and network table functions are refused, and `;`-stacking a second statement is rejected outright.
-Rejections surface as `400`/`503` and count in `nuthatch_sql_rejections_total`.
+Rejections surface as `400`/`503` and count in `nuthatch_sql_rejections_total`. A declared query
+refused by its scan bound answers `422` and also counts in `nuthatch_named_scan_refusals_total`; the
+bounds of those admitted are the `nuthatch_named_scan_bytes` histogram.
 
 **`/explain` is guarded identically.** It plans caller-supplied SQL without returning rows, but
 planning still materialises the tip, so it carries the same scan cost as the query it is describing
