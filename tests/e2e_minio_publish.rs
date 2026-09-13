@@ -29,7 +29,7 @@
 //!
 //! ```sh
 //! docker run -d -p 9000:9000 -e MINIO_ROOT_USER=nuthatch -e MINIO_ROOT_PASSWORD=nuthatch-minio \
-//!   minio/minio:RELEASE.2025-10-15T17-29-55Z server /data
+//!   quay.io/minio/minio:RELEASE.2025-10-15T17-29-55Z server /data
 //! aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://nuthatch-publish-test
 //! NUTHATCH_MINIO_ENDPOINT=http://127.0.0.1:9000 AWS_ENDPOINT=http://127.0.0.1:9000 \
 //!   AWS_ACCESS_KEY_ID=nuthatch AWS_SECRET_ACCESS_KEY=nuthatch-minio AWS_REGION=us-east-1 \

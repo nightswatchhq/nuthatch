@@ -407,10 +407,12 @@ jobs:
       # no field for that - its `options` are `docker create` flags, not the container's CMD - so
       # this starts MinIO as an ordinary step instead of a service container.
       - name: start MinIO
+        # `minio/minio` was pulled from Docker Hub entirely in late 2025 ("pull access denied,
+        # repository does not exist") - `quay.io/minio/minio` is the current source, same tags.
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
-            minio/minio:RELEASE.2025-10-15T17-29-55Z server /data
+            quay.io/minio/minio:RELEASE.2025-10-15T17-29-55Z server /data
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null && exit 0
             sleep 1
