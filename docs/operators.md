@@ -1054,8 +1054,8 @@ a seal. Credentials are the usual `AWS_*` environment variables, never `nuthatch
 `PutObject`, `GetObject`, `HeadObject` and `ListBucket` on the prefix and not `DeleteObject`, which is
 worth withholding: a credential that cannot delete keeps the mirror append-only by policy. Five
 consecutive failures on the same object set `nuthatch_publish_dead_letter` and slow retries tenfold
-until one succeeds. A runtime directory publishes per mount rather than per process, and refuses
-`--publish-target`.
+until one succeeds. A runtime directory publishes per mount instead, from `[mounts.publish]` in
+`mounts.toml`, and refuses `--publish-target`.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 

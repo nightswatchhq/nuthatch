@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
                 if args.publish_target.is_some() {
                     anyhow::bail!(
                         "--publish-target mirrors a single nest; a runtime directory publishes per \
-                         mount, from a `[publish]` table in mounts.toml (RFC-0052 S2)"
+                         mount, from `[mounts.publish]` in mounts.toml (RFC-0052 S2)"
                     );
                 }
                 runtime::dev(

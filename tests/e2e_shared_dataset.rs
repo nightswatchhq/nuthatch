@@ -55,6 +55,7 @@ fn two_mounts_one_nest(root: &Path) -> String {
         nid: nid.clone(),
         sql: Default::default(),
         queries: Vec::new(),
+        publish: None,
         #[cfg(feature = "counter")]
         counter: None,
     });
@@ -358,6 +359,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
             nid: nid.clone(),
             sql: Default::default(),
             queries: Vec::new(),
+            publish: None,
             #[cfg(feature = "counter")]
             counter: None,
         },
@@ -367,6 +369,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
             nid: nid.clone(),
             sql: Default::default(),
             queries: Vec::new(),
+            publish: None,
             #[cfg(feature = "counter")]
             counter: None,
         },
