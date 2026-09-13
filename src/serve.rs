@@ -2320,8 +2320,15 @@ async fn named_scan(
             if entity.unavailable().is_some() || entity.fault().is_some() {
                 continue;
             }
+            // Refuse on the count before serialising a relation too large to copy.
+            if hot_rows.saturating_add(entity.len() as u64) > max_hot_rows as u64 {
+                return Err(crate::store::HotScanTooLarge { cap: max_hot_rows }.into());
+            }
             let (rows, through) = entity.rows_as_json_with_watermark();
             hot_rows += rows.len() as u64;
+            if hot_rows > max_hot_rows as u64 {
+                return Err(crate::store::HotScanTooLarge { cap: max_hot_rows }.into());
+            }
             hot_bytes = rows
                 .iter()
                 .fold(hot_bytes, |sum, row| sum.saturating_add(json_len(row)));
@@ -4903,10 +4910,17 @@ mod tests {
         assert_eq!(body["rows"][0]["n"], 2, "{body}");
 
         state.sql_max_named_scan_bytes = bytes - 1;
-        let app = router(SharedNest::new(state));
+        let app = router(SharedNest::new(state.clone()));
         let (status, _, body) = call_named(&app, named_request(&[])).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["hot_source_bytes"], bytes, "{body}");
+
+        // They count against the hot-row cap the tip copy respects, too.
+        state.sql_max_named_scan_bytes = bytes;
+        state.sql_max_hot_rows = 1;
+        let app = router(SharedNest::new(state));
+        let (status, _, body) = call_named(&app, named_request(&[])).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     }
 
     #[cfg(feature = "counter")]
