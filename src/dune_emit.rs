@@ -127,8 +127,11 @@ pub fn render(
     sem: &Semantic,
     views: &[String],
 ) -> Result<BTreeMap<String, String>> {
-    if source.is_empty() {
-        bail!("--source must name the Dune namespace the rows were uploaded into");
+    if !is_identifier(source) {
+        bail!(
+            "--source `{source}` must be the plain Dune namespace the rows were uploaded into, \
+             matching ^[a-z0-9_]+$"
+        );
     }
     let mut files = BTreeMap::new();
     let mut emitted: BTreeMap<String, String> = BTreeMap::new();
@@ -168,7 +171,38 @@ fn model_name(nest: &str, chain: &str, t: &TableSchema) -> Result<String> {
             t.alias
         );
     };
-    Ok(format!("{nest}_{chain}_{}_evt_{event}", t.alias).to_lowercase())
+    let nest = identifier_part("nest name", nest, true)?;
+    let chain = identifier_part("chain", chain, true)?;
+    let alias = identifier_part("alias", &t.alias, false)?;
+    let event = identifier_part("event", event, false)?;
+    Ok(format!("{nest}_{chain}_{alias}_evt_{event}"))
+}
+
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A Dune identifier cannot hold a hyphen, so nest names and chains map `-` to `_`. Anything else
+/// outside `[a-z0-9_]` is refused rather than substituted.
+fn identifier_part(what: &str, value: &str, map_hyphens: bool) -> Result<String> {
+    let mut id = value.to_lowercase();
+    if map_hyphens {
+        id = id.replace('-', "_");
+    }
+    if !is_identifier(&id) {
+        bail!(
+            "{what} `{value}` cannot form a Dune identifier: it must match ^[a-z0-9_]+$ once \
+             lowercased{}",
+            if map_hyphens {
+                " and `-` is mapped to `_`"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(id)
 }
 
 fn table_query(model: &str, source: &str, t: &TableSchema, sem: &Semantic) -> Result<String> {
@@ -655,5 +689,48 @@ mod tests {
             assert!(line.starts_with("--"), "{line}");
         }
         assert!(sql.contains("--   amount uint256: a b\n"), "{sql}");
+    }
+
+    #[test]
+    fn hyphens_in_the_nest_name_and_chain_become_underscores() {
+        let t = table(vec![col("amount", "uint256", false)]);
+        let sem = generated(&t);
+        let files = render("V2-Arc", "arc-testnet", "src", &[t], &sem, &[]).unwrap();
+        assert!(
+            files.contains_key("v2_arc_arc_testnet_vault_evt_deposit.sql"),
+            "{:?}",
+            files.keys()
+        );
+    }
+
+    #[test]
+    fn a_nest_name_or_chain_that_cannot_form_an_identifier_is_refused_by_value() {
+        let t = table(vec![col("amount", "uint256", false)]);
+        let sem = generated(&t);
+        for (nest, chain, bad) in [
+            ("v2.arc", "mainnet", "v2.arc"),
+            ("n", "arc testnet", "arc testnet"),
+        ] {
+            let err = render(nest, chain, "src", std::slice::from_ref(&t), &sem, &[]).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(&format!("`{bad}`")) && err.contains("^[a-z0-9_]+$"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_must_be_a_plain_namespace() {
+        let t = table(vec![col("amount", "uint256", false)]);
+        let sem = generated(&t);
+        for bad in ["my-team", "team.schema", ""] {
+            let err = render("n", "mainnet", bad, std::slice::from_ref(&t), &sem, &[]).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(&format!("--source `{bad}`")) && err.contains("^[a-z0-9_]+$"),
+                "{err}"
+            );
+        }
     }
 }

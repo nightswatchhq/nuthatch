@@ -69,3 +69,64 @@ fn dune_emit_output_carries_no_path_from_the_machine_it_ran_on() {
         );
     }
 }
+
+/// RFC-0055 S2 (#1358): every description in `semantic.toml` reaches the query its table became.
+#[test]
+fn dune_emit_carries_every_semantic_description_into_its_query() {
+    let out = tempfile::tempdir().unwrap();
+    let files = emit_into(out.path());
+    let sem = nuthatch::semantic::load(&fixture("nest")).unwrap().unwrap();
+    let readme = String::from_utf8(files["README.md"].clone()).unwrap();
+    // The header is line comments, so multi-line text is compared joined onto one line.
+    let flat = |s: &str| {
+        s.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let mut checked = 0;
+    for (table, ts) in &sem.tables {
+        let from = format!("FROM dune.fixture_ns.{table}\n");
+        let Some(sql) = files
+            .values()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .find(|s| s.ends_with(&from))
+        else {
+            assert!(
+                readme.contains(&format!("| `{table}` |")),
+                "{table} is neither emitted nor listed as not emitted"
+            );
+            continue;
+        };
+        let header: Vec<&str> = sql.lines().take_while(|l| l.starts_with("--")).collect();
+        if !ts.description.is_empty() {
+            let want = format!("-- {}", flat(&ts.description));
+            assert!(header.contains(&want.as_str()), "{table}: missing `{want}`");
+            checked += 1;
+        }
+        if !ts.grain.is_empty() {
+            let want = format!("-- Grain: {}", flat(&ts.grain));
+            assert!(header.contains(&want.as_str()), "{table}: missing `{want}`");
+            checked += 1;
+        }
+        for (col, desc) in &ts.columns {
+            let prefix = format!("--   {col} ");
+            let want = format!(": {}", flat(desc));
+            assert!(
+                header
+                    .iter()
+                    .any(|l| l.starts_with(&prefix) && l.contains(&want)),
+                "{table}.{col}: missing description `{}`",
+                flat(desc)
+            );
+            checked += 1;
+        }
+    }
+    // 4 table descriptions, 3 grains and 16 column descriptions on the emitted tables.
+    assert_eq!(
+        checked, 23,
+        "the fixture's descriptions were not all checked"
+    );
+}
