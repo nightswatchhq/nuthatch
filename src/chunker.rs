@@ -18,6 +18,11 @@ pub const MAX_WINDOW: u64 = 100_000;
 /// Window ceiling for a nest that fetches a header per block (RFC-0036). Four batches of
 /// `MAX_TIMESTAMP_BATCH` (200), so one window is one fan-out wave rather than a hundred.
 pub const HEADER_WINDOW_CAP: u64 = 800;
+/// Window ceiling for a seal-direct backfill that resolves IPFS documents inline. A window's documents
+/// and the rows they become are held until the window is merged, and a 20,000-block Gnosis window held
+/// about 1.2 million typed rows, 7.1 GB RSS, before its first cut (2026-09-13). The QoS oracle posts two
+/// documents a minute, so 400 blocks names about thirteen.
+pub const DOCUMENT_WINDOW_CAP: u64 = 400;
 
 /// A block-window controller that converges on `target` logs per response.
 #[derive(Debug, Clone)]
@@ -100,6 +105,16 @@ impl AdaptiveWindow {
             TARGET_LOGS_PER_RESPONSE,
             MIN_WINDOW,
             HEADER_WINDOW_CAP,
+        )
+    }
+
+    /// The controller for a seal-direct backfill that resolves documents inline; see [`DOCUMENT_WINDOW_CAP`].
+    pub fn for_window_with_documents(initial: u64) -> Self {
+        Self::new(
+            initial.min(DOCUMENT_WINDOW_CAP),
+            TARGET_LOGS_PER_RESPONSE,
+            MIN_WINDOW,
+            DOCUMENT_WINDOW_CAP,
         )
     }
 

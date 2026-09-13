@@ -2804,6 +2804,7 @@ async fn build_nest(
         tables: Arc::new(full_schema(&registry, config)),
         sql_gate,
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
+        sql_max_hot_bytes: serve::SQL_MAX_HOT_BYTES,
         sql_max_named_scan_bytes: serve::SQL_MAX_NAMED_SCAN_BYTES,
         // Every cursor-owning role builds through here; `serve_role` flips it after (#1025).
         cursorless: false,
@@ -3522,8 +3523,9 @@ async fn fetch_body_batch(
 }
 
 /// Outstanding documents at which the tip loop stops committing windows until the resolver catches up.
-/// A QoS payload is about 1.7 MB and 2,500 typed rows; the resolver fetches 8 at a time.
-pub const MAX_OUTSTANDING_DOCUMENTS: u64 = 64;
+/// A QoS payload is about 1.7 MB and 2,500 typed rows; the resolver fetches 8 at a time, so this is two
+/// of its passes, and keeps the hot tip within one seal cut and 40,000 rows of what has resolved.
+pub const MAX_OUTSTANDING_DOCUMENTS: u64 = 16;
 
 fn documents_backlogged(pending: u64) -> bool {
     pending >= MAX_OUTSTANDING_DOCUMENTS
@@ -4406,7 +4408,9 @@ pub async fn backfill_direct_pipelined_with(
     // A blocks nest pays one header request per *block*, so its window ceiling is set by header cost
     // rather than log density (RFC-0036). Without this the zero-log ranges grow widest and demand the
     // most headers - which is how OBIB case 3 rate-limited itself into partial responses.
-    let chunker = std::sync::Arc::new(std::sync::Mutex::new(if registry.blocks() {
+    let chunker = std::sync::Arc::new(std::sync::Mutex::new(if extras.ipfs.is_some() {
+        AdaptiveWindow::for_window_with_documents(window)
+    } else if registry.blocks() {
         AdaptiveWindow::for_window_with_headers(window)
     } else {
         AdaptiveWindow::for_window(window)
@@ -4733,7 +4737,9 @@ pub async fn backfill_direct_factory_with(
     let mut total = 0u64;
     let mut flipped_logged = false;
     // A blocks nest pays per *block*, not per log, so its window ceiling is different (RFC-0036).
-    let mut chunker = if registry.blocks() {
+    let mut chunker = if extras.ipfs.is_some() {
+        AdaptiveWindow::for_window_with_documents(window)
+    } else if registry.blocks() {
         AdaptiveWindow::for_window_with_headers(window)
     } else {
         AdaptiveWindow::for_window(window)
@@ -11489,6 +11495,63 @@ template = "pool"
         assert!(joined
             .expect_err("a pending fetch cannot finish")
             .is_cancelled());
+    }
+
+    /// A seal-direct window holds its documents and their rows until it is merged, so a 20,000-block
+    /// Gnosis window held 1.2 million typed rows, 7.1 GB, before its first cut. A nest resolving
+    /// documents is fetched at most `DOCUMENT_WINDOW_CAP` blocks at a time, whatever `--window` says.
+    #[tokio::test]
+    async fn seal_direct_fetches_a_document_nest_a_capped_window_at_a_time() {
+        let body = r#"{"bucket":1}"#.to_string();
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 0).await;
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        let gateways = vec![gateway];
+        let source = PostSource(vec![(4, qos_post(&cid)), (4_900, qos_post(&cid))]);
+        let widest = std::sync::Mutex::new(0u64);
+        let mut last = 0u64;
+        backfill_direct_pipelined_with(
+            &source,
+            &registry,
+            dir.path(),
+            &[],
+            &[],
+            &[],
+            None,
+            100,
+            0,
+            5_000,
+            20_000,
+            SPAN_REAL,
+            1,
+            DirectExtras {
+                call_registry: Some(&creg),
+                ipfs: Some(&gate),
+                gateways: &gateways,
+            },
+            |_| Ok(()),
+            |reached, _, _| {
+                let mut w = widest.lock().unwrap();
+                *w = (*w).max(reached.saturating_sub(last));
+                last = reached;
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            *widest.lock().unwrap() <= crate::chunker::DOCUMENT_WINDOW_CAP,
+            "a document nest advanced {} blocks in one window, past the {}-block cap",
+            *widest.lock().unwrap(),
+            crate::chunker::DOCUMENT_WINDOW_CAP
+        );
+        handle.abort();
     }
 
     /// `--seal-direct` wrote finalized history without decoding top-level calls or resolving the
