@@ -7,7 +7,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::EmitDuneArgs;
 use crate::config::Config;
@@ -60,8 +60,9 @@ struct OutCol {
 }
 
 pub fn run(args: EmitDuneArgs) -> Result<()> {
-    let files = emit(Path::new(&args.dir), &args.source)?;
     let out = Path::new(&args.out);
+    refuse_output_inside_nest(Path::new(&args.dir), out)?;
+    let files = emit(Path::new(&args.dir), &args.source)?;
     std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
     for (name, body) in &files {
         std::fs::write(out.join(name), body)
@@ -74,6 +75,52 @@ pub fn run(args: EmitDuneArgs) -> Result<()> {
         out.display()
     );
     Ok(())
+}
+
+/// A file written into the nest is collected as an authored input and changes the nest's NID.
+fn refuse_output_inside_nest(dir: &Path, out: &Path) -> Result<()> {
+    let nest = dir
+        .canonicalize()
+        .with_context(|| format!("--dir `{}` must be an existing directory", dir.display()))?;
+    let target = resolve_out(out)?;
+    if target.starts_with(&nest) {
+        bail!(
+            "refusing to write into the nest: --out `{}` resolves to `{}`, which is inside --dir \
+             `{}` (`{}`). Files there would become authored inputs and change the nest's identity; \
+             choose a directory outside the nest",
+            out.display(),
+            target.display(),
+            dir.display(),
+            nest.display()
+        );
+    }
+    Ok(())
+}
+
+/// `--out` usually does not exist yet: canonicalise its deepest existing ancestor, then re-append the
+/// rest, whose `..` segments can only be lexical because nothing below that ancestor exists.
+fn resolve_out(out: &Path) -> Result<PathBuf> {
+    let abs = std::path::absolute(out).with_context(|| format!("resolve {}", out.display()))?;
+    let mut base = abs.as_path();
+    let mut tail = Vec::new();
+    let mut resolved = loop {
+        if let Ok(canonical) = base.canonicalize() {
+            break canonical;
+        }
+        let (Some(parent), Some(last)) = (base.parent(), base.components().next_back()) else {
+            bail!("cannot resolve --out `{}`", out.display());
+        };
+        tail.push(last.as_os_str().to_owned());
+        base = parent;
+    };
+    for part in tail.iter().rev() {
+        if part == ".." {
+            resolved.pop();
+        } else if part != "." {
+            resolved.push(part);
+        }
+    }
+    Ok(resolved)
 }
 
 /// Every output file, keyed by file name, `README.md` included.

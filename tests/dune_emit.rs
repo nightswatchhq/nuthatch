@@ -130,3 +130,108 @@ fn dune_emit_carries_every_semantic_description_into_its_query() {
         "the fixture's descriptions were not all checked"
     );
 }
+
+/// A copy of the fixture nest, so an output check that fails to refuse writes nowhere real.
+fn nest_copy() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let nest = tmp.path().join("nest");
+    copy_tree(&fixture("nest"), &nest);
+    (tmp, nest)
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let path = entry.unwrap().path();
+        let dest = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            copy_tree(&path, &dest);
+        } else {
+            std::fs::copy(&path, &dest).unwrap();
+        }
+    }
+}
+
+fn listing(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path.clone());
+            }
+            out.push(path.strip_prefix(dir).unwrap().to_path_buf());
+        }
+    }
+    out.sort();
+    out
+}
+
+fn emit_to(dir: &Path, out: &Path) -> Result<(), String> {
+    nuthatch::dune_emit::run(nuthatch::cli::EmitDuneArgs {
+        dir: dir.to_string_lossy().to_string(),
+        out: out.to_string_lossy().to_string(),
+        source: "fixture_ns".to_string(),
+    })
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[test]
+fn dune_emit_refuses_an_output_directory_inside_the_nest() {
+    let (tmp, nest) = nest_copy();
+    std::fs::create_dir(tmp.path().join("elsewhere")).unwrap();
+    let before = listing(&nest);
+
+    let mut cases: Vec<(&str, PathBuf, PathBuf)> = vec![
+        ("equal to --dir", nest.clone(), nest.clone()),
+        (
+            "a new subdirectory",
+            nest.clone(),
+            nest.join("dune/queries"),
+        ),
+        (
+            "`..` inside the nest",
+            nest.clone(),
+            nest.join("views/../out"),
+        ),
+        (
+            "`..` from a sibling back into the nest",
+            nest.clone(),
+            tmp.path().join("elsewhere/../nest/out"),
+        ),
+        // On macOS the tempdir is `/var/...` and its canonical form `/private/var/...`.
+        (
+            "--dir canonical, --out through the tempdir as given",
+            nest.canonicalize().unwrap(),
+            nest.join("out"),
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&nest, &link).unwrap();
+        cases.push(("a symlink to the nest", nest.clone(), link.join("out")));
+    }
+
+    for (case, dir, out) in cases {
+        let err = emit_to(&dir, &out).expect_err(case);
+        assert!(
+            err.contains("refusing to write into the nest")
+                && err.contains(&format!("--out `{}`", out.display())),
+            "{case}: {err}"
+        );
+        assert_eq!(listing(&nest), before, "{case}: the nest was written to");
+    }
+}
+
+#[test]
+fn dune_emit_allows_a_directory_beside_the_nest() {
+    let (tmp, nest) = nest_copy();
+    let before = listing(&nest);
+    // Shares the nest's name as a string prefix, which a component-wise comparison must allow.
+    let out = tmp.path().join("nest-dune");
+    emit_to(&nest, &out).unwrap();
+    assert!(out.join("README.md").is_file());
+    assert_eq!(listing(&nest), before, "the nest was written to");
+}
