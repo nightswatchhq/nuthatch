@@ -75,6 +75,7 @@ Measure backfill throughput (events/sec, wall-clock, peak RSS) over a pinned blo
 - `--keep <KEEP>` - Keep the run's data at this path instead of the cache dir that is discarded
 - `--record <RECORD>` - Record every source call this run makes into a tape at `<path>`, alongside the live run (RFC-0039)
 - `--replay <REPLAY>` - Replay a tape recorded by `--record` instead of touching the network (RFC-0039)
+- `--publish-target <PUBLISH_TARGET>` - Publish each run's sealed segments to this target while it indexes (RFC-0052 S2), so the report measures ingestion with a mirror uploading beside it. Each run gets its own prefix
 
 ## `nuthatch bench query`
 
