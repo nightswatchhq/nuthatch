@@ -86,7 +86,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:3.6.1
+  ghcr.io/nightswatchhq/nuthatch:3.7.0
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -123,7 +123,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:3.6.1-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:3.7.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -942,7 +942,7 @@ Get this right in your supervisor and your load balancer:
   that took each one unready** (`stalled`). Per-nest `/<name>/ready` answers only for that nest.
 
   A nest reaches the `stalled` list on exactly the terms its own `/<name>/ready` uses - one function
-  computes both, so the two surfaces cannot disagree. Before 3.6.2 the root consulted the quarantine
+  computes both, so the two surfaces cannot disagree. Before 3.7.0 the root consulted the quarantine
   set alone, and a runtime answered `{"quarantined":[],"ready":true}` while a nest inside it had not
   sealed in two days (#1204). **A 503 here is advice, not a gate:** every healthy nest carries on
   serving reads to whoever asks for it directly, so wiring a supervisor to this endpoint tells it to
