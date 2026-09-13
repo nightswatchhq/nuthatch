@@ -412,7 +412,7 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
-            quay.io/minio/minio:RELEASE.2025-10-15T17-29-55Z server /data
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null && exit 0
             sleep 1
