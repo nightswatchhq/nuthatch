@@ -1,6 +1,6 @@
 # RFC-0045: Offchain data - what Dune actually does, and what nuthatch has already answered twice
 
-- Status: **Stage 1 built.** The file drop (#1215) shipped 2026-09-09. Stage 2, one pull connector
+- Status: **Implemented: stage 1.** The file drop (#1215) shipped 2026-09-09. Stage 2, one pull connector
   for prices (#1216), is open. Tracking #1206.
 - Author: Jenny
 - Date: 2026-08-29

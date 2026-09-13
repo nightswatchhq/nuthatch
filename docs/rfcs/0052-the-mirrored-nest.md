@@ -1,6 +1,6 @@
 # RFC-0052: The mirrored nest - publishing the sealed directory to object storage for external engines
 
-- Status: **In build.** S0 (#1258) and S1 (#1259) shipped 2026-09-12. S2 (#1260) and S1's
+- Status: **Accepted, and being implemented.** Chief put it and its §8 follow-up into the steadfast-siskin sprint on 2026-09-13. S0 (#1258) and S1 (#1259) shipped 2026-09-12. S2 (#1260) and S1's
   real-bucket acceptance (#1343) are in the steadfast-siskin sprint; S3 to S5 (#1261 to #1263)
   follow. Every slice is additive - no query-syntax change, no segment-format change, no new source
   of truth. Tracking #1256.
