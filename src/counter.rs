@@ -1,7 +1,7 @@
 //! The optional x402 counter (RFC-0046 S2).
 //!
-//! It verifies and records locally. Settlement is deliberately absent: that belongs to the separate
-//! S3 back-office process, so neither an RPC nor a facilitator sits between a question and its answer.
+//! It verifies and records locally. Settlement is deliberately outside the nest, in the `settle`
+//! back-office command, so neither an RPC nor a facilitator sits between a question and its answer.
 
 use alloy_primitives::{Address, U256};
 use anyhow::{bail, Context, Result};
@@ -22,7 +22,24 @@ use std::sync::{LazyLock, Mutex};
 pub mod x402;
 
 static AUTHORISATION_LOG: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-const LOG: &str = "authorisations.jsonl";
+pub(crate) const LOG: &str = "authorisations.jsonl";
+/// Compact spent keys the back office leaves after draining the pending log (RFC-0046 S3).
+pub(crate) const SPENT: &str = "spent.jsonl";
+/// Per-payer settled/failed record. A failed row is why the nest stops serving that payer.
+pub(crate) const PAYERS: &str = "payers.jsonl";
+
+/// Stable lock inode shared by the server and settler. Never unlink it: queue replacement must
+/// not let another process lock a different inode for the same logical queue.
+pub(crate) fn lock_queue(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("authorisations.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
 
 /// Operator-owned mount configuration. The price is USDC base units, as a string so TOML cannot
 /// round a 256-bit amount before the verifier sees it.
@@ -59,6 +76,47 @@ impl Config {
             price_base_units,
         })
     }
+}
+
+/// Spent in the pending log, or already drained into `spent.jsonl` by the back office.
+pub(crate) fn nonce_is_spent(
+    dir: &std::path::Path,
+    network: &str,
+    payer: &str,
+    nonce: &str,
+) -> Result<bool, x402::Refusal> {
+    if is_spent(&dir.join(LOG), network, payer, nonce)? {
+        return Ok(true);
+    }
+    is_spent(&dir.join(SPENT), network, payer, nonce)
+}
+
+/// A payer whose promise did not clear is not sold to again (RFC-0046 §5.3).
+pub(crate) fn payer_has_failed(
+    dir: &std::path::Path,
+    network: &str,
+    payer: &str,
+) -> Result<bool, x402::Refusal> {
+    let file = match std::fs::File::open(dir.join(PAYERS)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(x402::Refusal::RecordFailed),
+        Ok(file) => file,
+    };
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return Err(x402::Refusal::RecordFailed);
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("network").and_then(|n| n.as_str()) == Some(network)
+            && v.get("payer").and_then(|n| n.as_str()) == Some(payer)
+            && v.get("outcome").and_then(|n| n.as_str()) == Some("failed")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether this `(network, payer, nonce)` tuple already appears in the durable log.
@@ -115,6 +173,7 @@ pub fn verify_and_record(
     let _guard = AUTHORISATION_LOG
         .lock()
         .expect("authorisation log lock poisoned");
+    let _file_guard = lock_queue(dir).map_err(|_| x402::Refusal::RecordFailed)?;
     let path = dir.join(LOG);
     // **Keyed by (payment domain, payer, nonce), and streamed rather than slurped.**
     //
@@ -136,8 +195,11 @@ pub fn verify_and_record(
         Network::Mainnet => "mainnet",
         Network::Testnet => "testnet",
     };
-    if is_spent(
-        &path,
+    if payer_has_failed(dir, network, &accepted.from.to_string())? {
+        return Err(x402::Refusal::UnreliablePayer);
+    }
+    if nonce_is_spent(
+        dir,
         network,
         &accepted.from.to_string(),
         &accepted.nonce.to_string(),
@@ -309,6 +371,40 @@ mod tests {
             !is_spent(&path, MAINNET, A, N).unwrap(),
             "a mainnet authorisation is independent of the same testnet nonce"
         );
+    }
+
+    #[test]
+    fn a_drained_nonce_stays_spent_from_the_spent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SPENT),
+            format!(
+                "{}\n",
+                serde_json::json!({"network": TESTNET, "payer": A, "nonce": N})
+            ),
+        )
+        .unwrap();
+        assert!(
+            nonce_is_spent(dir.path(), TESTNET, A, N).unwrap(),
+            "the back office drained the pending log; the nest must still refuse the nonce"
+        );
+        assert!(!nonce_is_spent(dir.path(), TESTNET, B, N).unwrap());
+    }
+
+    #[test]
+    fn a_failed_settlement_refuses_that_payer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(PAYERS),
+            format!(
+                "{}\n",
+                serde_json::json!({"network": TESTNET, "payer": A, "nonce": N, "outcome": "failed"})
+            ),
+        )
+        .unwrap();
+        assert!(payer_has_failed(dir.path(), TESTNET, A).unwrap());
+        assert!(!payer_has_failed(dir.path(), TESTNET, B).unwrap());
+        assert!(!payer_has_failed(dir.path(), MAINNET, A).unwrap());
     }
 
     #[test]

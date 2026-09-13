@@ -344,12 +344,21 @@ network = "testnet"                                     # or "mainnet"
 
 A priced mount answers an unpaid request with `402` and a challenge naming the exact terms; a request
 carrying a valid `Payment-Signature` is served. The counter **verifies and records, and settles
-nothing** - draining the recorded authorisations is RFC-0046 S3's job, deliberately outside the
-request path so no facilitator sits between a question and its answer.
+nothing** - `nuthatch settle` drains the recorded authorisations, deliberately outside the request
+path so no facilitator sits between a question and its answer.
 
 Only named queries (`sql = "allowlist"`) can be priced. The authorisation log is
 `authorisations.jsonl` beside the nest, and a nonce is spent per **payer**, so two buyers choosing
 the same nonce do not collide.
+
+**Settling.** `nuthatch settle --dir <nest> --exec <cmd>` hands each pending authorisation to `<cmd>`
+on stdin: exit 0 settled, 2 failed, anything else deferred. `--batch N` hands up to N at a time, one
+JSON line each, and reads one outcome line per row back
+(`{"network","payer","nonce","outcome":"settled"|"failed","detail"}`); a row the command does not
+report stays pending whatever its exit code. Either way the command must be idempotent by network,
+payer and nonce, because a crash can land between settling on-chain and journalling it here. A payer
+whose authorisation failed is refused from then on. Run it on whatever schedule suits the operator;
+`--dry-run` lists the queue and writes nothing.
 
 ### `queries.toml` - the author's ceiling (RFC-0034 phase 2)
 

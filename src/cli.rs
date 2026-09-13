@@ -67,6 +67,12 @@ pub enum Command {
     Schema(SchemaArgs),
     /// Benchmark the indexing pipeline (measure first, optimise second - RFC-0004).
     Bench(BenchArgs),
+    /// Drain recorded authorisations and settle them (RFC-0046 S3).
+    ///
+    /// The nest already served. This is the back office: it reads `authorisations.jsonl`, hands each
+    /// row to `--exec`, and records settled/failed per payer. Rebuild with `--features counter` or
+    /// the command refuses. `--dry-run` lists the queue and writes nothing.
+    Settle(SettleArgs),
 
     // --- SCALED: the docker-compose writer-pool / control-plane topology (RFC-0022). ---
     /// Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane,
@@ -242,6 +248,25 @@ pub struct OffchainDropArgs {
     /// Nest directory containing the offchain namespace.
     #[arg(long, default_value = ".")]
     pub dir: String,
+}
+
+#[derive(Args)]
+pub struct SettleArgs {
+    /// Nest directory holding `authorisations.jsonl`.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Print the pending queue and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Command that receives one authorisation JSON on stdin. Exit 0 settled, 2 failed, anything
+    /// else deferred (row stays pending). Must reconcile retries by network/payer/nonce: a crash
+    /// can occur after external settlement but before the local outcome journal is synced.
+    #[arg(long)]
+    pub exec: Option<String>,
+    /// Hand `--exec` up to this many authorisations per invocation, one JSON line each; it prints one
+    /// outcome line per row it settled or failed, and an unreported row stays pending.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    pub batch: u64,
 }
 
 #[derive(Args)]
