@@ -1,6 +1,8 @@
 # RFC-0044: The subgraph port skill - one subgraph, one nest
 
-- Status: **Proposed - design only.** Needs a freeze decision before any slice starts (§8).
+- Status: **Implemented in part.** S1 (#1210), S2 (#1211) and S5 (#1214) shipped 2026-09-09. S3 (#1212)
+  and S4 (#1213) were closed not planned on 2026-09-12, parked with RFC-0053. Tracker #1205 is
+  closed.
 - Author: Pete (cargopete)
 - Date: 2026-08-26
 - Provenance: the GraphOps 1:1 with Chris Wessels. His words, from the transcript summary:

@@ -1,10 +1,9 @@
 # RFC-0052: The mirrored nest - publishing the sealed directory to object storage for external engines
 
-- Status: **Draft. Design only.** S0 (#1258) answered 2026-09-12 against the tree; remaining
-  slices wait. Proposed as the delivery half of RFC-0047: that RFC makes the sealed directory a
-  contract; this one makes the contract reachable over a network. Every slice is additive - no
-  query-syntax change, no segment-format change, no new source of truth. The freeze question is
-  §9.
+- Status: **Accepted, and being implemented.** Chief put it and its §8 follow-up into the steadfast-siskin sprint on 2026-09-13. S0 (#1258) and S1 (#1259) shipped 2026-09-12. S2 (#1260) and S1's
+  real-bucket acceptance (#1343) are in the steadfast-siskin sprint; S3 to S5 (#1261 to #1263)
+  follow. Every slice is additive - no query-syntax change, no segment-format change, no new source
+  of truth. Tracking #1256.
 - Author: Pete (drafted 2026-09-09). S0 filled the `[VERIFY]` items that gate S1; remaining
   `[VERIFY]` marks (schema.json shape, Dune namespace) stay in §10.
 - Date: 2026-09-09
