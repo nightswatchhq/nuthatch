@@ -69,9 +69,14 @@ freshness figure for a catalogue it did not read.
 
 ## A resolver
 
-For a dataset at `$DATASET`, either a directory or an `s3://` URL, with the AWS CLI and `jq`:
+For a dataset at `$DATASET`, either a directory or an `s3://` URL. It needs bash, `jq`, and
+`sha256sum` (coreutils) or `shasum`; the AWS CLI only for an `s3://` dataset.
 
 ```sh
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
+}
+
 fetch() {
   case "$DATASET" in
     s3://*) aws s3 cp "$DATASET/$1" - ;;
@@ -84,7 +89,7 @@ matched=""
 for _ in 1 2 3; do
   fetch manifest.json > "$tmp/manifest.json"
   fetch publish.json > "$tmp/publish.json"
-  if [ "$(shasum -a 256 < "$tmp/manifest.json" | cut -d' ' -f1)" = \
+  if [ "$(sha256 < "$tmp/manifest.json")" = \
        "$(jq -r .catalogue_sha256 "$tmp/publish.json")" ]; then
     matched=1
     break

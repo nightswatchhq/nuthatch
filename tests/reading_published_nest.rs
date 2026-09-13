@@ -192,7 +192,7 @@ async fn the_pages_resolver_lists_every_segment_in_block_order() {
         .env("DATASET", &dataset)
         .env("TABLE", "usdc__transfer")
         .output()
-        .expect("bash, jq and shasum are needed to run the page's resolver");
+        .expect("bash, jq and sha256sum or shasum are needed to run the page's resolver");
     assert!(
         out.status.success(),
         "the resolver failed: {}",
