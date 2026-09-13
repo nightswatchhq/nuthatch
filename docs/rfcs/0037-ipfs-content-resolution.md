@@ -166,6 +166,43 @@ so every one of them is in that case. And a CID that misses the per-window budge
 all fail, is never attempted again: the out-of-band resolver the budget warning refers to does not
 exist yet.
 
+**Slice 6 - resolution completes.** Built 2026-09-13, unreleased. The per-window budget is gone.
+Documents resolve out of band behind the cursor (`src/ipfs_resolve.rs`), from a work list re-derived
+from the rows already in the hot store: a document's key is a function of its block's rows alone, so
+nothing extra is recorded and a restart loses nothing. A failed fetch, a body cut off mid-read
+included, retries with doubling backoff from 5 seconds to 10 minutes. After 10 failures the document
+is given up on, recorded in store meta under its block and slot with its CID, and counted in
+`nuthatch_nest_ipfs_given_up_total`. Sealing holds below the lowest block with a document neither
+stored nor given up on, so a range never seals short of one that could still arrive, and
+tip-following never waits on a gateway. A document is written only while the row that named it still
+carries the same block hash, in one transaction, so a reorg cannot be followed by a stale document.
+Slots are assigned per block rather than per fetch window, which removes a dependence on `--window`
+from sealed segments.
+
+With it: top-level call rows carry `tx_from`, the transaction sender, and a top-level-calls nest
+indexed before this refuses to start and must be re-indexed. The identity guard and `/sql` provenance
+cover call, `[[ipfs]]` and `[[calls]]` declarations, so an event-less nest no longer claims the hash of
+nothing. `--seal-direct` decodes top-level calls and resolves their documents inline. Block bodies are
+fetched 200 blocks at a time, because a whole 20,000-block Gnosis window of them held 2.3 GB with
+nothing committed.
+
+Measured against Gnosis on 2026-09-13, with the QoS nest's configuration minus `blocks = true` and
+default windows, from block 48,119,000: 678 calls from the one publisher and 678 documents; 2026-09-07
+complete at 288 per topic, 576 of 576, including `QmYTFzn…`, the bucket the budget had lost; killed
+with `kill -9` at 120 resolved and 558 pending, restarted, and finished 2 minutes 59 seconds later
+with nothing lost, given up or unreadable. The first 20,000-block window took about four and a half
+minutes, because bodies come serially at 2.5 to 3.6 seconds per 200-block batch on public RPC. All 678
+documents are stored `verified = false`.
+
+**One limit found and not fixed.** Once the hold released a finalized range holding those 678
+documents, about 1.1 GB of JSON, sealing it reached 3.17 GB of resident memory, past the per-cursor
+budget. Seal cuts are bounded by row count and span, never bytes (`seal_cut`), and `maybe_seal` and
+`seal_range_with_snapshot` hold the whole range at once, parsed. A byte bound on the cut would be
+deterministic, being a property of the rows, but it changes RFC-0028 §4's cut rule, and that is a
+decision to make before building it. Until then a nest whose documents run to megabytes is not fit to
+deploy. The same run did not stop on SIGTERM for 26 seconds and needed `kill -9`; synchronous seal
+work giving an abort nothing to act on is the likely cause, and it is not established.
+
 ## 6. Non-goals
 
 - **Not an IPFS node**, and not a pinning service. Nuthatch fetches and verifies; it does not host,

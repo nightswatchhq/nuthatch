@@ -108,8 +108,10 @@ args = ["{to}"]               # `{column}` takes the row's value; anything else 
 [[ipfs]]                      # optional (RFC-0037) - resolve the documents a column's CIDs name.
                               # Needs `--ipfs <gateway-or-your-own-node>`; also never a config key,
                               # because a gateway is an access path and must not enter the content
-                              # address. Every document is verified against its CID before storage;
-                              # one that will not resolve leaves NO row rather than a wrong one.
+                              # address. Every document is verified against its CID before storage.
+                              # Documents resolve behind the cursor, retried with backoff, and one that
+                              # fails 10 times is given up on (`nuthatch_nest_ipfs_given_up_total`):
+                              # NO row rather than a wrong one, and the range seals once it is decided.
 name = "token_metadata"       # becomes the result table
 on = "nft__uri_set"           # the table whose rows carry the CID
 cid_column = "uri"            # which column. A bare CID, `ipfs://…`, or a full gateway URL all work -

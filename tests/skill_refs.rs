@@ -287,6 +287,12 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
     (
+        // RFC-0037 slice 6. `Head` reads a stored row's table, block and log index back out of the hot
+        // store to plan which documents it names. It is never operator input.
+        "src/ipfs_resolve.rs",
+        "stored hot-store rows read back by the resolver, not nest config",
+    ),
+    (
         // RFC-0053 S0's migration validator. `Operation` is one entry in a **corpus file the
         // caller supplies on the command line** - the queries they want checked - not nest config
         // an operator authors and nothing under `nuthatch.toml` nests it. The operator surface for
