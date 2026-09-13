@@ -1,9 +1,9 @@
 # RFC-0046: x402 at the counter - selling an operator's data to agents without a gated product
 
-- Status: **Accepted in principle, design only.** The §8 governance question was put to Chief on
-  2026-08-30 and answered: **we cross the line deliberately and use x402 wherever it fits.** The
-  2026 feature freeze still applies, so nothing is built in nuthatch this year - but the argument in
-  §8 is settled rather than open, and a future slice does not have to re-open it.
+- Status: **Accepted and built.** The §8 governance question was put to Chief on 2026-08-30 and
+  answered: **we cross the line deliberately and use x402 wherever it fits.** S0 (#1217) and S1
+  (#1218) shipped 2026-09-08, S2 (#1219) 2026-09-09 and S3 (#1220) 2026-09-13. Tracker #1207 is
+  closed.
 - Author: Pete (cargopete)
 - Date: 2026-08-30
 - Depends on: RFC-0045 (which recorded the absence this closes), RFC-0034 (the bounded surface is

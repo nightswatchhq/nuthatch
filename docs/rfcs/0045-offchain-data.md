@@ -1,9 +1,7 @@
 # RFC-0045: Offchain data - what Dune actually does, and what nuthatch has already answered twice
 
-- Status: **Draft. Design only, and not a carve-out.** Under the 2026 feature freeze this is a
-  document to argue with, not work to start. It proposes new capability, so per
-  [CLAUDE.md](../../CLAUDE.md) it is named rather than quietly built, and it stays unbuilt until it
-  appears in that file's carve-out list. It does not start, reorder or unblock any slice.
+- Status: **Stage 1 built.** The file drop (#1215) shipped 2026-09-09. Stage 2, one pull connector
+  for prices (#1216), is open. Tracking #1206.
 - Author: Jenny
 - Date: 2026-08-29
 - Origin: a research report on offchain ingestion (Dune, Goldsky, The Graph, Ponder, Allium,

@@ -1,11 +1,8 @@
 # RFC-0047: Nuthatch and the lakehouse pattern
 
-- Status: **Draft. Design only.** Under the 2026 feature freeze this is a document to argue with,
-  not work to start, until the board takes named slices. The four commitments below are
-  documentation, specification, writer-config, and making existing DuckDB caps operator-visible.
-  That is freeze-compatible in spirit. One item is not: changing the physical Parquet type of
-  256-bit values. That is a segment-format version and is named here rather than smuggled in as
-  "no new features".
+- Status: **Built, except C1b.** C1 (#1221), C2 (#1223), C3 (#1224) and C4 (#1225) shipped
+  2026-09-08. C1b (#1222), the physical Parquet type of 256-bit values, is a segment-format version
+  and stays deliberately deferred. Tracker #1208 is closed.
 - Author: Jenny
 - Date: 2026-09-02
 - Origin: a board draft of this title, read against the tree the same day. §1 records where the
