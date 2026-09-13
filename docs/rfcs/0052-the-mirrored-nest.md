@@ -423,9 +423,12 @@ row-for-row parity gate in §7.
 
 **Trino, and therefore DuneSQL** (nightly, container): Hive connector external table over the
 per-table location, `format = 'PARQUET'`. One detail that would otherwise be found in production:
-the Hive connector maps Parquet columns **by index** unless `hive.parquet.use-column-names=true`
-(or the equivalent session property); a table whose columns drifted across seals (`BTreeSet`
-column order, `reading-segments.md` §Ordering) is silently wrong without it. The recipe sets it
+a table whose columns drifted across seals (`BTreeSet` column order, `reading-segments.md`
+§Ordering) is silently wrong if the Hive connector maps Parquet columns **by index**. Trino 483
+maps by name by default (`hive.parquet.use-column-names=true`, session `hive.parquet_use_column_names`),
+so the risk is a catalog that turns it off, an older Trino, or a fork with a different default;
+the recipe sets it explicitly (amended 2026-09-13, S3: `trino-contract` measured a wrong sum with it
+off and no error). The recipe sets it
 and the test has a drifted table. For Dune specifically: DuneSQL has a native `UINT256` and
 accepts a cast from decimal text `[VERIFY the exact cast]`, which is why the exact-text contract
 is the right thing to have published and why FLBA32 (#1222) is not a prerequisite. Addresses

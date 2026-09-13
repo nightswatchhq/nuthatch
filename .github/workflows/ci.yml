@@ -444,6 +444,96 @@ jobs:
           docker logs minio 2>&1 | tail -n 100 || true
           docker rm -f minio || true
 
+  # RFC-0052 S3 (#1261): Trino's Hive connector over a published prefix must read what local DuckDB
+  # reads, including a table whose columns drifted across seals. Not a required check.
+  trino-contract:
+    name: Trino contract (RFC-0052 S3)
+    runs-on: ubuntu-latest
+    env:
+      MINIO_ROOT_USER: nuthatch
+      MINIO_ROOT_PASSWORD: nuthatch-minio-test
+      AWS_ACCESS_KEY_ID: nuthatch
+      AWS_SECRET_ACCESS_KEY: nuthatch-minio-test
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT: http://127.0.0.1:9000
+      AWS_ALLOW_HTTP: "true"
+      NUTHATCH_MINIO_ENDPOINT: http://127.0.0.1:9000
+      NUTHATCH_MINIO_BUCKET: nuthatch-publish-test
+      NUTHATCH_REQUIRE_MINIO: "1"
+    timeout-minutes: 45
+    steps:
+      - name: record start time
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          key: trino-contract
+      - name: start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::MinIO did not become ready within 30s"
+          docker logs minio || true
+          exit 1
+      - name: point the AWS CLI at MinIO (path-style)
+        run: aws configure set default.s3.addressing_style path
+      - name: create the test bucket
+        run: aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
+      - name: publish the drifted nest and record DuckDB's numbers
+        env:
+          NUTHATCH_TRINO_FIXTURE_OUT: ${{ runner.temp }}/trino-fixture.json
+        run: cargo test --locked --test e2e_trino_contract -- --nocapture
+      # File metastore, kept in the same bucket, so no Hive Metastore service is needed. Trino 483
+      # spells the S3 switch `fs.s3.enabled`; `fs.native-s3.enabled` is its legacy name.
+      - name: start Trino
+        run: |
+          mkdir -p "$RUNNER_TEMP/trino-catalog"
+          cat > "$RUNNER_TEMP/trino-catalog/hive.properties" <<EOF
+          connector.name=hive
+          hive.metastore=file
+          hive.metastore.catalog.dir=s3://$NUTHATCH_MINIO_BUCKET/trino-metastore
+          fs.s3.enabled=true
+          s3.endpoint=$AWS_ENDPOINT
+          s3.region=$AWS_REGION
+          s3.path-style-access=true
+          s3.aws-access-key=$AWS_ACCESS_KEY_ID
+          s3.aws-secret-key=$AWS_SECRET_ACCESS_KEY
+          hive.parquet.use-column-names=true
+          EOF
+          docker run -d --name trino --network host \
+            -v "$RUNNER_TEMP/trino-catalog:/etc/trino/catalog:ro" trinodb/trino:483
+          for _ in $(seq 1 180); do
+            curl -sf http://127.0.0.1:8080/v1/info | jq -e '.starting == false' > /dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::Trino did not finish starting within 180s"
+          docker logs trino || true
+          exit 1
+      - name: Trino over the prefix matches local DuckDB
+        run: scripts/trino-contract.sh "$RUNNER_TEMP/trino-fixture.json"
+      - name: distinguish an expired timeout from a cancel or supersede
+        if: always() && cancelled()
+        run: |
+          if [ -z "${JOB_START_EPOCH:-}" ]; then
+            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 45m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
+            exit 0
+          fi
+          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
+          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 45m timeout-minutes ceiling. Close to 45m: almost certainly an expiry. Well under it: almost certainly a real cancel or supersede."
+      - name: stop Trino and MinIO
+        if: always()
+        run: |
+          docker logs trino 2>&1 | tail -n 100 || true
+          docker logs minio 2>&1 | tail -n 50 || true
+          docker rm -f trino minio || true
+
   fleet:
     name: the compose fleet comes up
     # The compose stack requires its credentials rather than shipping defaults, so CI supplies them
