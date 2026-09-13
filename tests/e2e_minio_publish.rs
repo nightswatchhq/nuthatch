@@ -209,7 +209,9 @@ async fn sync_and_verify_against_a_real_s3_compatible_store() {
     // remote manifest.json is byte-identical to the local one along with everything else the
     // envelope claims (nid, chain_id, tables, schema). This is criterion 1 in full, run through the
     // actual CLI-backing function rather than reimplemented here.
-    verify(nest.path(), &target, true).await.unwrap();
+    verify(nest.path(), &target, true, false).await.unwrap();
+    // `--etag-md5` claims MinIO's ETags are the MD5 of each object; this is where that is checked.
+    verify(nest.path(), &target, false, true).await.unwrap();
 
     // Criterion 1, asserted directly and independently of `verify`'s own comparison: the exact
     // bytes `sync` wrote for the catalogue, fetched back over the wire.

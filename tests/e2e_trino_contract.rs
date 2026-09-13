@@ -273,7 +273,7 @@ async fn publish_a_drifted_nest_and_record_what_trino_must_return() {
 
     let (nest, expected) = sealed_fixture();
     let report = sync(nest.path(), &target, false).await.unwrap();
-    verify(nest.path(), &target, true).await.unwrap();
+    verify(nest.path(), &target, true, false).await.unwrap();
 
     let fixture = serde_json::json!({
         "bucket": bucket,
