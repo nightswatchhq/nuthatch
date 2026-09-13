@@ -43,6 +43,15 @@ noticed it.
 Peak RSS is not higher with the mirror. Uploads stream in 8 MiB parts, one in flight per object
 (`publish::PART_BUFFER`), so `publish_headroom` is `parallelism × 8 MiB`, 16 MiB at the defaults.
 
+## Lag on a live nest
+
+The first S2 criterion fails if publish lag exceeds one seal plus one interval. `nuthatch dev` over the
+same chain with `--backfill 20000 --publish-target <dir> --publish-interval 60s`, with `/metrics`
+sampled every second for 94 s: `nuthatch_publish_sealed_through` equalled `nuthatch_sealed_through`
+at every sample, including across the seal that moved it from 10,800 to 19,800, and
+`nuthatch_publish_lag_blocks` never read above zero. The seal wake-up, not the 60 s interval, is
+what published each segment. That mirror was a local directory, not the throttled store.
+
 ## What this does not cover
 
 A CPU-starved box: eighteen cores leave the publisher's thread uncontended. A large segment: these are
