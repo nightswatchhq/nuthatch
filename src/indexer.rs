@@ -3521,6 +3521,14 @@ async fn fetch_body_batch(
     .await
 }
 
+/// Outstanding documents at which the tip loop stops committing windows until the resolver catches up.
+/// A QoS payload is about 1.7 MB and 2,500 typed rows; the resolver fetches 8 at a time.
+pub const MAX_OUTSTANDING_DOCUMENTS: u64 = 64;
+
+fn documents_backlogged(pending: u64) -> bool {
+    pending >= MAX_OUTSTANDING_DOCUMENTS
+}
+
 /// Blocks of full bodies held at once while decoding top-level calls.
 const TOP_LEVEL_BODY_CHUNK: usize = 200;
 
@@ -6186,6 +6194,14 @@ async fn index_loop(
             // whether or not any block carried an event. At two seconds that is the whole bill of a
             // sparse nest; at five minutes it is a hundredth of it, for the same rows.
             sleep_for(nest.freshness.poll_interval).await;
+            continue;
+        }
+
+        // Documents resolve out of band, and a window committed ahead of them keeps its rows hot and
+        // its seal held until they arrive. Waiting here bounds that backlog, and what sealing and
+        // `/sql` read of it, without changing a single row or cut.
+        if nest.ipfs_gate.is_some() && documents_backlogged(nest.metrics.ipfs_pending()) {
+            sleep_secs(1).await;
             continue;
         }
 
@@ -11350,6 +11366,16 @@ template = "pool"
             [3, 19_876],
             "chunking must not lose a call at either end of the window"
         );
+    }
+
+    /// The tip loop outran resolution on the QoS nest: 90,000 blocks of windows committed while documents
+    /// were still arriving, so a million typed rows sat hot behind a held seal and every `/sql` copied
+    /// them (15.29 GB RSS, 2026-09-13).
+    #[test]
+    fn the_tip_loop_waits_once_documents_back_up() {
+        assert!(!documents_backlogged(MAX_OUTSTANDING_DOCUMENTS - 1));
+        assert!(documents_backlogged(MAX_OUTSTANDING_DOCUMENTS));
+        assert!(documents_backlogged(u64::MAX));
     }
 
     /// Bodies came one 200-block batch at a time, 77.6 blocks/s on rpc.gnosischain.com against the
