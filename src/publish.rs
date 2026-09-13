@@ -6,9 +6,10 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::seal::{self, Manifest, Segment, MANIFEST_FILE};
@@ -19,6 +20,7 @@ pub struct SyncReport {
     pub dataset: String,
     pub sealed_through: Option<u64>,
     pub uploaded: Vec<String>,
+    pub uploaded_bytes: u64,
     pub skipped: usize,
 }
 
@@ -336,6 +338,10 @@ fn open_mirror(target: &str) -> Result<Box<dyn Mirror>> {
             );
         }
     }
+    #[cfg(test)]
+    if let Some(name) = t.strip_prefix("test://") {
+        return tests::test_mirror(name);
+    }
     Ok(Box::new(FsMirror {
         root: PathBuf::from(t),
     }))
@@ -414,6 +420,17 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 /// Reconcile `dir`'s sealed catalogue onto `target/<data_identity>/`.
 pub async fn sync(dir: &Path, target: &str, dry_run: bool) -> Result<SyncReport> {
+    sync_with(dir, target, dry_run, DEFAULT_PARALLELISM, None).await
+}
+
+/// [`sync`] with `parallelism` uploads in flight, reporting progress to `metrics` when given.
+pub async fn sync_with(
+    dir: &Path,
+    target: &str,
+    dry_run: bool,
+    parallelism: usize,
+    metrics: Option<&crate::metrics::NestMetrics>,
+) -> Result<SyncReport> {
     let local_path = dir.join(seal::SEGMENTS_DIR).join(MANIFEST_FILE);
     let local_bytes = match std::fs::read(&local_path) {
         Ok(b) => b,
@@ -453,24 +470,57 @@ pub async fn sync(dir: &Path, target: &str, dry_run: bool) -> Result<SyncReport>
                 .iter()
                 .map(|(t, s)| parquet_key(t, &s.hash))
                 .collect(),
+            uploaded_bytes: 0,
             skipped,
         });
     }
 
-    let mut uploaded = Vec::new();
-    for (table, seg) in &missing {
-        let src = seal::segment_path(dir, &seg.file, &seg.hash);
-        if !src.exists() {
-            bail!(
-                "catalogue names {} but the file is missing at {}",
-                seg.file,
-                src.display()
-            );
-        }
-        let key = prefix(&parquet_key(table, &seg.hash));
-        mirror.put_file(&key, &src).await?;
-        uploaded.push(parquet_key(table, &seg.hash));
+    if let Some(m) = metrics {
+        m.set_publish_pending(missing.len() as u64);
     }
+    let mirror_ref = mirror.as_ref();
+    let attempts: Vec<(String, Result<u64>)> =
+        futures::stream::iter(missing.iter().map(|(table, seg)| {
+            let src = seal::segment_path(dir, &seg.file, &seg.hash);
+            let name = parquet_key(table, &seg.hash);
+            let key = prefix(&name);
+            async move {
+                let upload = async {
+                    let len = match std::fs::metadata(&src) {
+                        Ok(meta) => meta.len(),
+                        Err(_) => bail!(
+                            "catalogue names {} but the file is missing at {}",
+                            seg.file,
+                            src.display()
+                        ),
+                    };
+                    mirror_ref.put_file(&key, &src).await?;
+                    if let Some(m) = metrics {
+                        m.publish_uploaded(len);
+                    }
+                    Ok(len)
+                };
+                (name, upload.await)
+            }
+        }))
+        .buffer_unordered(parallelism.max(1))
+        .collect()
+        .await;
+    let mut parquet = Vec::with_capacity(attempts.len());
+    let mut failed = Vec::new();
+    for (name, attempt) in attempts {
+        match attempt {
+            Ok(len) => parquet.push((name, len)),
+            Err(e) => failed.push((name, e)),
+        }
+    }
+    if !failed.is_empty() {
+        failed.sort_by(|a, b| a.0.cmp(&b.0));
+        return Err(UploadFailures(failed).into());
+    }
+    parquet.sort();
+    let uploaded_bytes = parquet.iter().map(|(_, len)| len).sum();
+    let mut uploaded: Vec<String> = parquet.into_iter().map(|(name, _)| name).collect();
 
     let schema_path = dir.join("schema.json");
     let schema_bytes = std::fs::read(&schema_path).ok();
@@ -518,6 +568,7 @@ pub async fn sync(dir: &Path, target: &str, dry_run: bool) -> Result<SyncReport>
         dataset: data_identity,
         sealed_through,
         uploaded,
+        uploaded_bytes,
         skipped,
     })
 }
@@ -635,12 +686,555 @@ pub async fn run_verify(dir: &Path, target: &str, deep: bool) -> Result<()> {
     Ok(())
 }
 
+/// Objects uploaded at once when nobody said otherwise (RFC-0052 §3.4).
+pub const DEFAULT_PARALLELISM: usize = 2;
+/// Consecutive failures on one object before the mirror reports itself dead-lettered.
+const DEAD_LETTER_AFTER: u32 = 5;
+/// Where a failure outside any one object's upload is counted.
+const CATALOGUE: &str = "catalogue";
+
+/// The objects a pass could not upload, by key. The pass wrote no catalogue.
+#[derive(Debug)]
+pub struct UploadFailures(pub Vec<(String, anyhow::Error)>);
+
+impl std::fmt::Display for UploadFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self.0.iter().map(|(k, _)| k.as_str()).collect();
+        write!(
+            f,
+            "{} object(s) failed to upload: {}",
+            keys.len(),
+            keys.join(", ")
+        )?;
+        if let Some((key, e)) = self.0.first() {
+            write!(f, " ({key}: {e:#})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UploadFailures {}
+
+/// Consecutive failures per object. Every missing object is attempted on every pass that reaches
+/// the uploads, so an object absent from a pass's failures has been published.
+#[derive(Debug, Default)]
+struct Failures(HashMap<String, u32>);
+
+impl Failures {
+    fn succeeded(&mut self) {
+        self.0.clear();
+    }
+
+    /// Counts a failed pass and returns the objects it has just dead-lettered.
+    fn failed(&mut self, e: &anyhow::Error) -> Vec<String> {
+        let failed: Vec<String> = match e.downcast_ref::<UploadFailures>() {
+            Some(UploadFailures(objects)) => objects.iter().map(|(k, _)| k.clone()).collect(),
+            None => vec![CATALOGUE.to_string()],
+        };
+        // A pass that failed before uploading anything says nothing about the objects.
+        if failed != [CATALOGUE] {
+            self.0.retain(|key, _| failed.contains(key));
+        }
+        let mut dead = Vec::new();
+        for key in failed {
+            let count = self.0.entry(key.clone()).or_default();
+            *count += 1;
+            if *count == DEAD_LETTER_AFTER {
+                dead.push(key);
+            }
+        }
+        dead
+    }
+
+    fn dead(&self) -> bool {
+        self.0.values().any(|n| *n >= DEAD_LETTER_AFTER)
+    }
+}
+
+/// How a running nest mirrors itself (RFC-0052 S2). Operator config, never the nest's identity.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub target: String,
+    pub interval: std::time::Duration,
+    pub parallelism: usize,
+}
+
+/// A running mirror. Dropping it stops the reconciler and cancels any upload in flight.
+pub struct Publisher {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+/// Start mirroring `dir`, reporting under `nest`. The reconciler owns a thread and a runtime, so a
+/// slow or blocking store never holds a worker the ingestion loop needs; a seal only signals it.
+pub fn spawn(dir: PathBuf, nest: String, settings: Settings) -> Result<Publisher> {
+    // A zero interval makes `reconcile` sync in a loop. The CLI and `[mounts.publish]` refuse it
+    // already; this holds for every caller that builds `Settings` itself.
+    if settings.interval.is_zero() {
+        bail!("publish interval must be longer than zero");
+    }
+    open_mirror(&settings.target)?;
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(format!("publish-{nest}"))
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(reconcile(dir, nest, settings, stopped)),
+                Err(e) => tracing::error!("publishing {nest} did not start: {e}"),
+            }
+        })
+        .context("starting the publisher thread")?;
+    Ok(Publisher { stop: Some(stop) })
+}
+
+async fn reconcile(
+    dir: PathBuf,
+    nest: String,
+    settings: Settings,
+    mut stopped: tokio::sync::oneshot::Receiver<()>,
+) {
+    let metrics = crate::metrics::METRICS.nest(&nest);
+    metrics.set_publish_enabled();
+    let mut changes = seal::manifest_changes(&dir);
+    let mut failures = Failures::default();
+    loop {
+        let pass = sync_with(
+            &dir,
+            &settings.target,
+            false,
+            settings.parallelism,
+            Some(metrics.as_ref()),
+        );
+        tokio::select! {
+            _ = &mut stopped => return,
+            result = pass => match result {
+                Ok(report) => {
+                    metrics.publish_succeeded(report.sealed_through);
+                    failures.succeeded();
+                }
+                Err(e) => {
+                    let dead = failures.failed(&e);
+                    metrics.publish_failed(failures.dead());
+                    for object in &dead {
+                        tracing::error!(
+                            "publishing {nest}: {object} has failed {DEAD_LETTER_AFTER} times in a \
+                             row; dead-lettered, retrying at a tenth of the rate until it succeeds: {e:#}"
+                        );
+                    }
+                    if dead.is_empty() && !failures.dead() {
+                        tracing::warn!("publishing {nest} failed, will retry: {e:#}");
+                    }
+                }
+            },
+        }
+        let wait = if failures.dead() {
+            settings.interval.saturating_mul(10)
+        } else {
+            settings.interval
+        };
+        // Level-triggered: a missed wake-up costs one interval, never an object.
+        tokio::select! {
+            _ = &mut stopped => return,
+            _ = tokio::time::sleep(wait) => {}
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::{DecodedRow, Value as DecodedValue};
     use crate::seal::{seal_range, test_set_table_floor};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
+
+    type Shared = std::sync::Arc<dyn Mirror>;
+
+    fn test_mirrors() -> &'static std::sync::Mutex<std::collections::HashMap<String, Shared>> {
+        static MIRRORS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Shared>>,
+        > = std::sync::OnceLock::new();
+        MIRRORS.get_or_init(Default::default)
+    }
+
+    pub(super) fn test_mirror(name: &str) -> Result<Box<dyn Mirror>> {
+        let mirror = test_mirrors()
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .with_context(|| format!("no test mirror {name}"))?;
+        Ok(Box::new(Delegate(mirror)))
+    }
+
+    fn install(name: &str, mirror: Shared) -> String {
+        test_mirrors()
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), mirror);
+        format!("test://{name}")
+    }
+
+    struct Delegate(Shared);
+
+    #[async_trait]
+    impl Mirror for Delegate {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn put_file(&self, key: &str, src: &Path) -> Result<()> {
+            self.0.put_file(key, src).await
+        }
+        async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
+            self.0.put_if(key, bytes, expected).await
+        }
+        async fn head_size(&self, key: &str) -> Result<Option<u64>> {
+            self.0.head_size(key).await
+        }
+    }
+
+    /// Blocks its thread outright in `put_file`, as a synchronous call on a slow disk does.
+    struct Blocking;
+
+    #[async_trait]
+    impl Mirror for Blocking {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn put_file(&self, _: &str, _: &Path) -> Result<()> {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        }
+        async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
+            Ok(())
+        }
+        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    struct Failing;
+
+    #[async_trait]
+    impl Mirror for Failing {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn put_file(&self, key: &str, _: &Path) -> Result<()> {
+            bail!("refusing {key}")
+        }
+        async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
+            Ok(())
+        }
+        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct Counting {
+        in_flight: AtomicUsize,
+        most: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Mirror for Counting {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn put_file(&self, _: &str, _: &Path) -> Result<()> {
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(now, SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            Ok(())
+        }
+        async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
+            Ok(())
+        }
+        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn settings(target: String, interval: Duration, parallelism: usize) -> Settings {
+        Settings {
+            target,
+            interval,
+            parallelism,
+        }
+    }
+
+    #[test]
+    fn a_zero_interval_never_starts_a_publisher() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap().to_string();
+        let err = spawn(
+            nest.path().to_path_buf(),
+            "publish-zero".into(),
+            settings(target, Duration::ZERO, 2),
+        )
+        .err()
+        .expect("a zero interval started a publisher");
+        assert!(err.to_string().contains("longer than zero"), "{err}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            std::fs::read_dir(mirror.path()).unwrap().count(),
+            0,
+            "a refused publisher still wrote to its target"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seal_wakes_the_publisher_long_before_its_interval() {
+        let nest = sealed_nest();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap().to_string();
+        let _publisher = spawn(
+            nest.path().to_path_buf(),
+            "publish-wake".into(),
+            settings(target, Duration::from_secs(3600), 2),
+        )
+        .unwrap();
+        let (identity, _, _, _) = identity_of(nest.path()).unwrap();
+        let remote = mirror.path().join(&identity).join(MANIFEST_FILE);
+        let local = nest.path().join(seal::SEGMENTS_DIR).join(MANIFEST_FILE);
+        let matches = || std::fs::read(&remote).ok() == std::fs::read(&local).ok();
+        eventually("the first pass", matches).await;
+        seal_range(nest.path(), &[row(12, 9)], 12, 12)
+            .unwrap()
+            .expect("sealed");
+        eventually("a seal to wake the mirror inside its hour", matches).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocking_store_never_holds_the_callers_runtime() {
+        let nest = sealed_nest();
+        let target = install("blocking", std::sync::Arc::new(Blocking));
+        let _publisher = spawn(
+            nest.path().to_path_buf(),
+            "publish-blocking".into(),
+            settings(target, Duration::from_secs(3600), 1),
+        )
+        .unwrap();
+        // Long enough for the publisher to be inside its five-second put.
+        std::thread::sleep(Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the caller's runtime waited {:?} on the store",
+            started.elapsed()
+        );
+        let started = std::time::Instant::now();
+        seal_range(nest.path(), &[row(12, 9)], 12, 12)
+            .unwrap()
+            .expect("sealed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a seal waited {:?} on the store",
+            started.elapsed()
+        );
+    }
+
+    fn refused(keys: &[&str]) -> anyhow::Error {
+        UploadFailures(
+            keys.iter()
+                .map(|k| (k.to_string(), anyhow::anyhow!("refused")))
+                .collect(),
+        )
+        .into()
+    }
+
+    #[test]
+    fn an_object_failing_beside_others_keeps_its_own_count() {
+        let mut failures = Failures::default();
+        for pass in 1..DEAD_LETTER_AFTER {
+            let keys: &[&str] = if pass % 2 == 0 { &["a", "b"] } else { &["a"] };
+            assert!(failures.failed(&refused(keys)).is_empty());
+        }
+        assert_eq!(
+            failures.failed(&refused(&["a", "b"])),
+            vec!["a".to_string()]
+        );
+        assert!(failures.dead());
+    }
+
+    #[test]
+    fn a_catalogue_failure_neither_resets_nor_counts_an_object() {
+        let mut failures = Failures::default();
+        for _ in 1..DEAD_LETTER_AFTER {
+            failures.failed(&refused(&["a"]));
+        }
+        failures.failed(&anyhow::anyhow!("bucket unreachable"));
+        assert!(!failures.dead());
+        assert_eq!(failures.failed(&refused(&["a"])), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn an_object_absent_from_a_failed_pass_starts_counting_again() {
+        let mut failures = Failures::default();
+        for _ in 1..DEAD_LETTER_AFTER {
+            failures.failed(&refused(&["a"]));
+        }
+        // Every missing object is attempted on each pass, so a pass that failed only `b` uploaded `a`.
+        failures.failed(&refused(&["b"]));
+        assert_eq!(
+            failures.0.get("a"),
+            None,
+            "a kept its count through the pass that uploaded it"
+        );
+        failures.failed(&refused(&["a"]));
+        assert_eq!(failures.0.get("a"), Some(&1));
+        assert!(!failures.dead());
+    }
+
+    #[derive(Default)]
+    struct RefusingFirst {
+        refused: std::sync::Mutex<Option<String>>,
+        stored: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Mirror for RefusingFirst {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn put_file(&self, key: &str, _: &Path) -> Result<()> {
+            let mut refused = self.refused.lock().unwrap();
+            if refused.is_none() {
+                *refused = Some(key.to_string());
+                bail!("refusing {key}");
+            }
+            self.stored.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+        async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
+            Ok(())
+        }
+        async fn head_size(&self, _: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn one_refused_object_does_not_stop_the_others_uploading() {
+        let nest = sealed_nest();
+        seal_range(nest.path(), &[row(12, 9)], 12, 12)
+            .unwrap()
+            .expect("sealed");
+        let mirror = std::sync::Arc::new(RefusingFirst::default());
+        let target = install("refusing-first", mirror.clone());
+        let e = sync_with(nest.path(), &target, false, 1, None)
+            .await
+            .unwrap_err();
+        let UploadFailures(failed) = e.downcast_ref::<UploadFailures>().expect("per object");
+        let refused = mirror.refused.lock().unwrap().clone().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(
+            refused.ends_with(&failed[0].0),
+            "{refused} vs {}",
+            failed[0].0
+        );
+        assert!(
+            !mirror.stored.lock().unwrap().is_empty(),
+            "nothing uploaded after the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_on_one_object_dead_letter_the_mirror() {
+        let nest = sealed_nest();
+        let target = install("failing", std::sync::Arc::new(Failing));
+        let _publisher = spawn(
+            nest.path().to_path_buf(),
+            "publish-failing".into(),
+            settings(target, Duration::from_millis(5), 2),
+        )
+        .unwrap();
+        let metrics = crate::metrics::METRICS.nest("publish-failing");
+        eventually("the mirror to dead-letter", || {
+            metrics.publish_dead_letter()
+        })
+        .await;
+        assert!(
+            metrics.publish_errors() >= u64::from(DEAD_LETTER_AFTER),
+            "{} errors",
+            metrics.publish_errors()
+        );
+        assert!(crate::metrics::METRICS
+            .render()
+            .contains("nuthatch_publish_dead_letter{nest=\"publish-failing\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn uploads_run_in_parallel_up_to_the_bound_and_no_further() {
+        let nest = tempfile::tempdir().unwrap();
+        write_nest(nest.path());
+        test_set_table_floor(nest.path(), 0);
+        for block in 10..14 {
+            seal_range(nest.path(), &[row(block, block)], block, block)
+                .unwrap()
+                .expect("sealed");
+        }
+        let counting = std::sync::Arc::new(Counting::default());
+        let target = install("counting", counting.clone());
+        let report = sync_with(nest.path(), &target, false, 2, None)
+            .await
+            .unwrap();
+        let parquet = report
+            .uploaded
+            .iter()
+            .filter(|k| k.ends_with(".parquet"))
+            .count();
+        assert_eq!(parquet, 4);
+        assert_eq!(counting.most.load(SeqCst), 2);
+    }
 
     fn row(block: u64, value: u64) -> String {
         DecodedRow {

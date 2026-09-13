@@ -122,6 +122,9 @@ async fn start_fe(dir: &std::path::Path, admin: bool) -> (String, tokio::task::J
         listen: listen.clone(),
         hot_store: None,
         admin,
+        publish_target: None,
+        publish_interval: std::time::Duration::from_secs(60),
+        publish_parallelism: 2,
     };
     let task = tokio::spawn(async move {
         // Runs until the process is signalled; the test aborts it instead.

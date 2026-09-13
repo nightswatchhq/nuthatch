@@ -69,6 +69,9 @@ async fn serve_without_hot_store_refuses_a_nest_with_no_store_rather_than_creati
         listen: format!("127.0.0.1:{}", free_port().await),
         hot_store: None,
         admin: false,
+        publish_target: None,
+        publish_interval: std::time::Duration::from_secs(60),
+        publish_parallelism: 2,
     };
     let err = refusal(args).await;
 
@@ -102,6 +105,9 @@ async fn serve_without_hot_store_refuses_a_store_a_live_handle_holds() {
         listen: format!("127.0.0.1:{}", free_port().await),
         hot_store: None,
         admin: false,
+        publish_target: None,
+        publish_interval: std::time::Duration::from_secs(60),
+        publish_parallelism: 2,
     };
     let err = refusal(args).await;
 
@@ -130,6 +136,9 @@ async fn serve_without_hot_store_serves_a_store_the_writer_left_behind() {
         listen: listen.clone(),
         hot_store: None,
         admin: false,
+        publish_target: None,
+        publish_interval: std::time::Duration::from_secs(60),
+        publish_parallelism: 2,
     };
     let task = tokio::spawn(async move {
         let _ = nuthatch::indexer::serve_role(args).await;

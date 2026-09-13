@@ -1177,7 +1177,27 @@ fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     if let Ok(d) = std::fs::File::open(dir) {
         let _ = d.sync_all(); // best-effort dir fsync (unsupported on some platforms)
     }
+    manifest_signal(dir).send_modify(|installs| *installs += 1);
     Ok(())
+}
+
+/// Catalogue installs for one nest directory, so a mirror wakes on a seal without the seal ever
+/// waiting on it (RFC-0052 §3.4). A receiver that misses a bump still sees the latest count.
+pub fn manifest_changes(dir: &Path) -> tokio::sync::watch::Receiver<u64> {
+    manifest_signal(dir).subscribe()
+}
+
+fn manifest_signal(dir: &Path) -> tokio::sync::watch::Sender<u64> {
+    static SIGNALS: OnceLock<Mutex<HashMap<PathBuf, tokio::sync::watch::Sender<u64>>>> =
+        OnceLock::new();
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    SIGNALS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(key)
+        .or_insert_with(|| tokio::sync::watch::channel(0).0)
+        .clone()
 }
 
 fn manifest_path(dir: &Path) -> PathBuf {

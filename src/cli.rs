@@ -165,10 +165,38 @@ pub struct GraphValidateArgs {
     pub nest: String,
 }
 
+/// A zero publish interval would have the mirror reconcile in a loop.
+fn parse_publish_interval(s: &str) -> Result<std::time::Duration, String> {
+    let interval = crate::freshness::parse_span(s)?;
+    if interval.is_zero() {
+        return Err("the publish interval must be at least one second".into());
+    }
+    Ok(interval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn dev_and_serve_refuse_a_zero_publish_interval() {
+        for sub in ["dev", "serve"] {
+            let err = Cli::command()
+                .try_get_matches_from(["nuthatch", sub, "--publish-interval", "0s"])
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{sub}: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("the publish interval must be at least one second"),
+                "{sub}: {err}"
+            );
+        }
+    }
 
     /// The grouping in `src/help.rs::GROUPS` must cover exactly the visible subcommands declared
     /// above - no more (a stale name after a rename/removal), no fewer (a new variant nobody sorted
@@ -1124,6 +1152,18 @@ pub struct ServeArgs {
     /// owns no cursor, so the lifecycle routes it would expose have nothing to act on.
     #[arg(long)]
     pub admin: bool,
+
+    /// Mirror sealed segments to this prefix as they seal (RFC-0052), exactly as on `dev`.
+    #[arg(long, value_name = "TARGET")]
+    pub publish_target: Option<String>,
+
+    /// How often the mirror reconciles when no seal has woken it.
+    #[arg(long, default_value = "60s", value_name = "DURATION", value_parser = parse_publish_interval)]
+    pub publish_interval: std::time::Duration,
+
+    /// Objects the mirror uploads at once.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=16))]
+    pub publish_parallelism: u64,
 }
 
 #[derive(Args)]
@@ -1207,6 +1247,20 @@ pub struct DevArgs {
     /// distance to the tip, not a fault.
     #[arg(long)]
     pub finality_only: bool,
+
+    /// Mirror sealed segments to this prefix as they seal (RFC-0052): a directory, or
+    /// `s3://bucket/prefix` with the usual `AWS_*` env. Absent, nothing is published and no client is
+    /// built. A flag rather than a `nuthatch.toml` field, because a target is not the nest's identity.
+    #[arg(long, value_name = "TARGET")]
+    pub publish_target: Option<String>,
+
+    /// How often the mirror reconciles when no seal has woken it.
+    #[arg(long, default_value = "60s", value_name = "DURATION", value_parser = parse_publish_interval)]
+    pub publish_interval: std::time::Duration,
+
+    /// Objects the mirror uploads at once.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=16))]
+    pub publish_parallelism: u64,
 
     /// Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that
     /// front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN`

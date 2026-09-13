@@ -72,6 +72,16 @@ impl Freshness {
 /// Parse an operator's duration: `2s`, `5m`, `1h`, or bare seconds. Zero is refused - a cursor that
 /// never waits is a busy loop, and the two-second default already means "as fast as sensible".
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let interval = parse_span(s)?;
+    if interval.is_zero() {
+        return Err("the poll interval must be at least one second".into());
+    }
+    Ok(interval)
+}
+
+/// [`parse_duration`]'s units without its zero refusal, for a caller whose zero means something else
+/// and deserves its own message.
+pub fn parse_span(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let (digits, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
         Some(i) => s.split_at(i),
@@ -86,9 +96,6 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         "h" | "hr" | "hrs" => n.checked_mul(3600).ok_or("that interval does not fit")?,
         other => return Err(format!("unknown unit `{other}` in `{s}`; use s, m or h")),
     };
-    if secs == 0 {
-        return Err("the poll interval must be at least one second".into());
-    }
     Ok(Duration::from_secs(secs))
 }
 
@@ -106,6 +113,13 @@ mod tests {
             parse_duration(" 10 min ").unwrap(),
             Duration::from_secs(600)
         );
+    }
+
+    #[test]
+    fn a_span_accepts_zero_and_leaves_the_refusal_to_its_caller() {
+        assert_eq!(parse_span("0s").unwrap(), Duration::ZERO);
+        assert_eq!(parse_span("5m").unwrap(), Duration::from_secs(300));
+        assert!(parse_span("5d").is_err());
     }
 
     #[test]

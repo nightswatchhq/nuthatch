@@ -121,6 +121,9 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--window <WINDOW>` - Override the `eth_getLogs` block-window (the chain default otherwise). For a *sparse* contract over a long backfill - few events across many blocks - a large window (e.g. 50000) turns tens of thousands of near-empty requests into a few, so a from-history backfill finishes in minutes. Keep it under your provider's max block-range for `getLogs` (many allow 100k+ when the result set is small); the concurrent backfill fails the range rather than auto-shrinking it
 - `--poll-interval <POLL_INTERVAL>` - How long a caught-up cursor waits before asking for the tip again (RFC-0040 §3 knob 1). `2s`, `5m`, `1h`, or bare seconds. The default follows the tip as closely as the chain allows and pays for it on every poll - a tip call, a reorg check, a checkpoint and a `finalized` probe per window, whether or not a block carried an event. A nest whose readers refresh on a cron of minutes can wait minutes here and index the same rows for roughly a hundredth of the requests. `/ready` reports the interval and scales its stall threshold to it
 - `--finality-only` - Index only up to the chain's finality boundary, never the unfinalised tip (RFC-0040 §3 knob 2). Nothing indexed can be reorged, so the reorg check is not paid and the hot store holds only rows waiting to seal. `/ready` reports the mode, and `lag_blocks` is then the deliberate distance to the tip, not a fault
+- `--publish-target <PUBLISH_TARGET>` - Mirror sealed segments to this prefix as they seal (RFC-0052): a directory, or `s3://bucket/prefix` with the usual `AWS_*` env. Absent, nothing is published and no client is built. A flag rather than a `nuthatch.toml` field, because a target is not the nest's identity
+- `--publish-interval <PUBLISH_INTERVAL>` - How often the mirror reconciles when no seal has woken it
+- `--publish-parallelism <PUBLISH_PARALLELISM>` - Objects the mirror uploads at once
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN` to be set AND each request to present it as `?token=…` (or it self-disables with a log line)
 
 ## `nuthatch doctor`
@@ -358,6 +361,9 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 - `--listen <LISTEN>` - Address to bind the HTTP API to
 - `--hot-store <HOT_STORE>` - Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires a build with `--features postgres-store`. Omit to serve the nest's local redb instead - but that store must already exist (`serve` never creates or writes to it), and redb's exclusive flock means exactly one process may hold it: local redb does not read-scale a box or share with `dev`, only `--hot-store` does
 - `--admin` - Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node owns no cursor, so the lifecycle routes it would expose have nothing to act on
+- `--publish-target <PUBLISH_TARGET>` - Mirror sealed segments to this prefix as they seal (RFC-0052), exactly as on `dev`
+- `--publish-interval <PUBLISH_INTERVAL>` - How often the mirror reconciles when no seal has woken it
+- `--publish-parallelism <PUBLISH_PARALLELISM>` - Objects the mirror uploads at once
 
 ## `nuthatch settle`
 

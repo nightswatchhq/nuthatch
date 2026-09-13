@@ -314,6 +314,32 @@ willing to answer it, not that it is cheap.
 **This is mount config, not manifest**, so changing it leaves the NID untouched and re-indexes
 nothing - and two tenants sharing one dataset can expose different surfaces over it.
 
+### `[mounts.publish]` - mirroring a mount's dataset (RFC-0052 S2)
+
+A mount can mirror its dataset's sealed segments to a directory or an S3-compatible prefix as they
+seal, for Trino, Snowflake, BigQuery, Databricks or another DuckDB to read as external tables:
+
+```toml
+[[mounts]]
+alias = "usdc"
+nid = "9f2c…"
+
+[mounts.publish]
+target = "s3://my-bucket/nuthatch"   # or a directory; credentials come from the usual AWS_* env
+interval = "60s"                     # optional: reconcile at least this often (a seal wakes it sooner)
+parallelism = 2                      # optional: uploads in flight, 1 to 16
+```
+
+Files land under `<target>/<data identity>/`, one directory per table, then the catalogue, then
+`publish.json`; only non-provisional segments are published, and nothing unsealed ever leaves the
+box. An empty target, an unparseable or zero `interval`, or a `parallelism` outside 1 to 16 is
+**refused at load**. A mount added to a running runtime starts its mirror if its record carries this
+table; unmounting stops it. A solo nest uses `--publish-target` on `dev` or `serve` instead, and a
+runtime directory refuses that flag.
+
+**This is mount config, not manifest**, so adding or changing it moves neither the NID nor the data.
+Two mounts of the same dataset that name the same target publish one copy.
+
 ### `[mounts.counter]` - charging at your own endpoint (RFC-0046 S2)
 
 **Absent from an ordinary build.** The counter is behind the off-by-default `counter` Cargo feature,

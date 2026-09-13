@@ -347,6 +347,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 // deliberate act (RFC-0034), not something a layout change does to them.
                 sql: crate::allowlist::SqlAccess::Open,
                 queries: Vec::new(),
+                publish: None,
                 #[cfg(feature = "counter")]
                 counter: None,
             }),
@@ -364,6 +365,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     nid: nid.clone(),
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
+                    publish: None,
                     #[cfg(feature = "counter")]
                     counter: None,
                 });
@@ -387,6 +389,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     nid: nid.clone(),
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
+                    publish: None,
                     #[cfg(feature = "counter")]
                     counter: None,
                 });
@@ -435,6 +438,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     nid: nid.clone(),
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
+                    publish: None,
                     #[cfg(feature = "counter")]
                     counter: None,
                 });

@@ -135,6 +135,10 @@ pub struct Mount {
     /// The queries this mount answers by name, when `sql = "allowlist"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queries: Vec<crate::allowlist::NamedQuery>,
+    /// Mirror this mount's dataset to a prefix as it seals (RFC-0052 S2). Mount config, so setting it
+    /// moves neither the NID nor the data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<MountPublish>,
     /// Optional x402 price at this operator-owned mount. It exists only in a binary built with the
     /// off-by-default `counter` feature; an ordinary self-hosting build remains unpriced (#1217).
     #[cfg(feature = "counter")]
@@ -149,6 +153,49 @@ impl Mount {
             access: self.sql,
             queries: self.queries.clone(),
         }
+    }
+}
+
+/// `[mounts.publish]`: where and how often a mount's dataset is mirrored (RFC-0052 S2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MountPublish {
+    /// A directory, or `s3://bucket/prefix` with the usual `AWS_*` env.
+    pub target: String,
+    #[serde(default = "default_publish_interval")]
+    pub interval: String,
+    #[serde(default = "default_publish_parallelism")]
+    pub parallelism: usize,
+}
+
+fn default_publish_interval() -> String {
+    "60s".to_string()
+}
+
+fn default_publish_parallelism() -> usize {
+    crate::publish::DEFAULT_PARALLELISM
+}
+
+impl MountPublish {
+    pub fn settings(&self) -> Result<crate::publish::Settings> {
+        if self.target.trim().is_empty() {
+            bail!("publish target is empty");
+        }
+        let interval = crate::freshness::parse_span(&self.interval)
+            .map_err(|e| anyhow::anyhow!("publish interval {:?}: {e}", self.interval))?;
+        if interval.is_zero() {
+            bail!("the publish interval must be at least one second");
+        }
+        if !(1..=16).contains(&self.parallelism) {
+            bail!(
+                "publish parallelism must be between 1 and 16, not {}",
+                self.parallelism
+            );
+        }
+        Ok(crate::publish::Settings {
+            target: self.target.clone(),
+            interval,
+            parallelism: self.parallelism,
+        })
     }
 }
 
@@ -521,6 +568,11 @@ impl MountTable {
                         m.alias
                     );
                 }
+            }
+            if let Some(publish) = &m.publish {
+                publish
+                    .settings()
+                    .with_context(|| format!("mount '{}': invalid [mounts.publish]", m.alias))?;
             }
             if !seen.insert((&m.tenant, &m.alias)) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
@@ -1154,6 +1206,44 @@ pub fn load_mounted(
     Ok(out)
 }
 
+/// A publisher for every mount that declares `[mounts.publish]` (RFC-0052 S2), keyed by route. One
+/// per record: two mounts of one dataset naming one target contend on S1's conditional catalogue put.
+pub fn spawn_publishers(
+    dir: &Path,
+    mounts: &[Mount],
+    multi_tenant: bool,
+) -> Result<Vec<(String, crate::publish::Publisher)>> {
+    let mut out = Vec::new();
+    for m in mounts {
+        if let Some(publish) = &m.publish {
+            out.push(spawn_publisher(dir, m, publish, multi_tenant)?);
+        }
+    }
+    Ok(out)
+}
+
+fn spawn_publisher(
+    dir: &Path,
+    m: &Mount,
+    publish: &MountPublish,
+    multi_tenant: bool,
+) -> Result<(String, crate::publish::Publisher)> {
+    let key = MountRef {
+        tenant: m.tenant.clone(),
+        alias: m.alias.clone(),
+    }
+    .route_key(multi_tenant);
+    let dataset = MountTable::data_dir(dir, &m.nid);
+    // Reported under the dataset's own name, which is where its cursor records `sealed_through`.
+    let nest = Config::load(&dataset)
+        .with_context(|| format!("loading mount '{key}' to publish it"))?
+        .nest
+        .name;
+    let publisher = crate::publish::spawn(dataset, nest, publish.settings()?)
+        .with_context(|| format!("publishing mount '{key}'"))?;
+    Ok((key, publisher))
+}
+
 /// The identity of the dataset serving `route_key`, for the provenance stamp (RFC-0035 §3).
 fn ds_nid_for(datasets: &[Dataset], route_key: &str, multi_tenant: bool) -> Option<Arc<str>> {
     datasets
@@ -1696,6 +1786,7 @@ pub async fn dev(
         state.nid = ds_nid_for(&datasets, key, multi_tenant);
     }
     let all_states = all_states;
+    let publishers = spawn_publishers(&dir, &mounts.mounts, multi_tenant)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
@@ -1723,6 +1814,7 @@ pub async fn dev(
         live,
         states: all_states,
         alert_workers: std::mem::take(&mut alert_workers),
+        publishers,
         lifecycle,
         health: health.clone(),
         roster,
@@ -2027,6 +2119,8 @@ pub struct RuntimeHandles {
     pub states: Vec<(String, crate::serve::AppState)>,
     /// Alert delivery workers keyed by nest - each holds that nest's `Store` clone.
     pub alert_workers: Vec<(String, tokio::task::JoinHandle<()>)>,
+    /// Mirrors keyed by mount route (RFC-0052 S2). Dropping one stops it.
+    pub publishers: Vec<(String, crate::publish::Publisher)>,
     /// Chain -> that cursor's command channel.
     pub lifecycle: std::collections::HashMap<
         String,
@@ -2280,6 +2374,23 @@ impl RuntimeHandles {
         if let Some(worker) = worker {
             self.alert_workers.push((name.to_string(), worker));
         }
+        // The cursor already holds the nest, so a publisher that will not start is reported rather
+        // than unwinding a mount that is otherwise complete.
+        if let Some(record) = self
+            .mount_ctx
+            .mounts
+            .iter()
+            .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+        {
+            if let (Some(publish), Some(_)) = (&record.publish, &nid) {
+                match spawn_publisher(&self.mount_ctx.dir, record, publish, self.multi_tenant) {
+                    Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
+                    Err(e) => {
+                        tracing::error!("mounted '{name}' but its mirror did not start: {e:#}")
+                    }
+                }
+            }
+        }
         self.estimates.insert(name.to_string(), incoming);
         self.states.push((name.to_string(), state));
         // A 2.0 mount gets (or refreshes) its record here, so the persist just below can write it into
@@ -2301,6 +2412,7 @@ impl RuntimeHandles {
                     nid: nid.clone(),
                     sql: Default::default(),
                     queries: Vec::new(),
+                    publish: None,
                     #[cfg(feature = "counter")]
                     counter: None,
                 }),
@@ -2411,6 +2523,7 @@ impl RuntimeHandles {
             // with "Database already open" a few microseconds after the abort.
             let _ = worker.await;
         }
+        self.publishers.retain(|(n, _)| n != name);
 
         // 3. Drop the serving state - the third - and re-compose without it. Requests already in
         //    flight finish against the old composition; new ones 404.
@@ -2441,6 +2554,132 @@ impl RuntimeHandles {
 mod tests {
     use super::*;
     use crate::config::CONFIG_FILE;
+
+    fn mounts_with(publish: &str) -> MountTable {
+        toml::from_str(&format!(
+            "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\n\n\
+             [[mounts]]\nalias = \"usdc\"\nnid = \"{}\"\n{publish}",
+            "a".repeat(64)
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_mount_publish_table_loads_with_defaults_and_a_bad_one_is_refused() {
+        let plain = mounts_with("");
+        assert!(plain.mounts[0].publish.is_none());
+        assert!(!toml::to_string(&plain).unwrap().contains("publish"));
+
+        let table = mounts_with("\n[mounts.publish]\ntarget = \"s3://bucket/prefix\"\n");
+        table.validate_mounts().unwrap();
+        let settings = table.mounts[0]
+            .publish
+            .as_ref()
+            .unwrap()
+            .settings()
+            .unwrap();
+        assert_eq!(settings.target, "s3://bucket/prefix");
+        assert_eq!(settings.interval, std::time::Duration::from_secs(60));
+        assert_eq!(settings.parallelism, crate::publish::DEFAULT_PARALLELISM);
+
+        for bad in [
+            "target = \"\"",
+            "target = \"/m\"\ninterval = \"soon\"",
+            "target = \"/m\"\ninterval = \"0s\"",
+            "target = \"/m\"\nparallelism = 0",
+            "target = \"/m\"\nparallelism = 17",
+        ] {
+            let table = mounts_with(&format!("\n[mounts.publish]\n{bad}\n"));
+            let err = table.validate_mounts().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[mounts.publish]"),
+                "{bad}: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_publishers_mirrors_each_mount_that_asks_and_skips_the_rest() {
+        let root = tempfile::tempdir().unwrap();
+        let nid = "b".repeat(64);
+        let dataset = MountTable::data_dir(root.path(), &nid);
+        std::fs::create_dir_all(dataset.join("abis")).unwrap();
+        std::fs::write(
+            dataset.join(CONFIG_FILE),
+            "[nest]\nname = \"mirrored\"\nchain = \"ethereum\"\nchain_id = 1\n\
+             rpc_urls = [\"http://127.0.0.1:1\"]\nschema_version = 1\n\n\
+             [[contracts]]\nalias = \"usdc\"\n\
+             address = \"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\"\nabi = \"abis/usdc.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dataset.join("abis/usdc.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dataset.join("schema.json"), r#"{"tables":[]}"#).unwrap();
+        crate::seal::test_set_table_floor(&dataset, 0);
+        let row = crate::registry::DecodedRow {
+            table: "usdc__transfer".into(),
+            params: vec![(
+                "value".into(),
+                crate::registry::Value::Word32(
+                    alloy_primitives::U256::from(5u64).to_be_bytes::<32>(),
+                ),
+            )],
+            block_number: 10,
+            block_hash: "0xbh".into(),
+            block_timestamp: 1_700_000_010,
+            timestamps: true,
+            log_index: 0,
+            tx_hash: "0xtx".into(),
+            address: "0xaa".into(),
+        }
+        .to_json()
+        .to_string();
+        crate::seal::seal_range(&dataset, &[row], 10, 10)
+            .unwrap()
+            .expect("sealed");
+
+        let mirror = tempfile::tempdir().unwrap();
+        let mut table = mounts_with("");
+        table.mounts[0].nid = nid.clone();
+        table.mounts[0].publish = Some(MountPublish {
+            target: mirror.path().to_str().unwrap().to_string(),
+            interval: "1h".into(),
+            parallelism: 2,
+        });
+        let mut quiet = table.mounts[0].clone();
+        quiet.alias = "quiet".into();
+        quiet.publish = None;
+        table.mounts.push(quiet);
+
+        let publishers = spawn_publishers(root.path(), &table.mounts, false).unwrap();
+        let keys: Vec<&str> = publishers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["usdc"]);
+
+        let local = std::fs::read(
+            dataset
+                .join(crate::seal::SEGMENTS_DIR)
+                .join("manifest.json"),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let published = std::fs::read_dir(mirror.path()).ok().and_then(|mut dirs| {
+                dirs.next()
+                    .and_then(|d| std::fs::read(d.ok()?.path().join("manifest.json")).ok())
+            });
+            if published.as_deref() == Some(local.as_slice()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mount's dataset was never mirrored"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 
     /// Write a minimal mounts.toml + one nest dir on the given chain.
     fn write_roost(dir: &Path, chain: &str, chain_id: u64, nest_chain: &str, nest_chain_id: u64) {
