@@ -104,7 +104,7 @@ The source columns are `varchar` except the four counters (§4). Citation keys a
 | `block_number`, `log_index` | `bigint` | `cast(c as bigint)` | cannot exceed `bigint` on any chain in scope | D1, D10 |
 | `block_timestamp` | `timestamp`, and `date` | `cast(from_unixtime(c, 'UTC') as timestamp)`; `cast(... as date)` | not documented | D4, S2, D10 |
 | `bytes32` / `address` / `fixed_bytes` / `bytes` / `hash32` | `varbinary` | `from_hex(substr(c, 3))`, stripping the `0x`; never `cast(c as varbinary)`, which encodes the string's bytes | not documented; unverified | D3, T1 |
-| `u64` with `sol_type` up to `uint56`; `i64` | `bigint` | `cast(c as bigint)` | not documented | D2 |
+| `u64` with `sol_type` narrower than `uint64` (Solidity's widths are multiples of 8, so `uint8` to `uint56`); `i64` | `bigint` | `cast(c as bigint)` | not documented | D2 |
 | `u64` with `sol_type` `uint64` | `uint256` | `cast(c as uint256)`, since `uint64` values can exceed `bigint`'s maximum | unverified, below | D1, D2 |
 | `word16` / `word32`, unsigned | `uint256` | `cast(c as uint256)` | unverified, below | D1, D2 |
 | `word16` / `word32`, signed | `int256` | `cast(c as int256)` | unverified, below | D1, D2 |
