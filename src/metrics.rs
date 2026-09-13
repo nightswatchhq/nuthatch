@@ -59,6 +59,10 @@ pub struct NestMetrics {
     reorgs: AtomicU64,
     /// RFC-0037: rows an `[[ipfs]]` declaration reads that named no CID it could use.
     ipfs_unreadable: AtomicU64,
+    /// RFC-0037: documents fetched that nothing could prove against their CID, so no row was written.
+    ipfs_unverified: AtomicU64,
+    /// RFC-0037: documents refused for exceeding the byte, block or depth cap.
+    ipfs_oversize: AtomicU64,
     /// #807: the `--seal-direct` history pass, before the hot cursor exists.
     seal_direct_active: AtomicBool,
     seal_direct_origin: AtomicU64,
@@ -227,6 +231,20 @@ impl NestMetrics {
     pub fn ipfs_unreadable(&self) -> u64 {
         self.ipfs_unreadable.load(Relaxed)
     }
+    pub fn add_ipfs_unverified(&self, n: u64) {
+        self.ipfs_unverified.fetch_add(n, Relaxed);
+        METRICS.add_ipfs_unverified(n);
+    }
+    pub fn ipfs_unverified(&self) -> u64 {
+        self.ipfs_unverified.load(Relaxed)
+    }
+    pub fn add_ipfs_oversize(&self, n: u64) {
+        self.ipfs_oversize.fetch_add(n, Relaxed);
+        METRICS.add_ipfs_oversize(n);
+    }
+    pub fn ipfs_oversize(&self) -> u64 {
+        self.ipfs_oversize.load(Relaxed)
+    }
 
     /// Start a seal-direct history pass. `/ready` reads these instead of treating a zero cursor as
     /// WAITING (#807).
@@ -348,6 +366,8 @@ pub struct Metrics {
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
     ipfs_unreadable: AtomicU64,
+    ipfs_unverified: AtomicU64,
+    ipfs_oversize: AtomicU64,
     alert_outbox_depth: AtomicU64,
     // Serving - the surface an operator bills against.
     http_requests: AtomicU64,
@@ -414,6 +434,8 @@ impl Metrics {
             rows_sealed: AtomicU64::new(0),
             reorgs: AtomicU64::new(0),
             ipfs_unreadable: AtomicU64::new(0),
+            ipfs_unverified: AtomicU64::new(0),
+            ipfs_oversize: AtomicU64::new(0),
             alert_outbox_depth: AtomicU64::new(0),
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
@@ -527,6 +549,12 @@ impl Metrics {
     }
     pub fn add_ipfs_unreadable(&self, n: u64) {
         self.ipfs_unreadable.fetch_add(n, Relaxed);
+    }
+    pub fn add_ipfs_unverified(&self, n: u64) {
+        self.ipfs_unverified.fetch_add(n, Relaxed);
+    }
+    pub fn add_ipfs_oversize(&self, n: u64) {
+        self.ipfs_oversize.fetch_add(n, Relaxed);
     }
     pub fn set_alert_outbox(&self, v: u64) {
         self.alert_outbox_depth.store(v, Relaxed);
@@ -757,6 +785,16 @@ impl Metrics {
             self.ipfs_unreadable.load(Relaxed),
         ));
         s.push_str(&counter(
+            "nuthatch_ipfs_unverified_total",
+            "IPFS documents fetched that could not be proven against their CID, since start.",
+            self.ipfs_unverified.load(Relaxed),
+        ));
+        s.push_str(&counter(
+            "nuthatch_ipfs_oversize_total",
+            "IPFS documents refused for exceeding the byte, block or depth cap, since start.",
+            self.ipfs_oversize.load(Relaxed),
+        ));
+        s.push_str(&counter(
             "nuthatch_http_requests_total",
             "HTTP API requests served since start.",
             self.http_requests.load(Relaxed),
@@ -982,6 +1020,18 @@ impl Metrics {
                 "Rows an [[ipfs]] declaration read that named no usable CID, per nest.",
                 "counter",
                 &|m| m.ipfs_unreadable.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_ipfs_unverified_total",
+                "IPFS documents fetched that could not be proven against their CID, per nest.",
+                "counter",
+                &|m| m.ipfs_unverified.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_ipfs_oversize_total",
+                "IPFS documents refused for exceeding the byte, block or depth cap, per nest.",
+                "counter",
+                &|m| m.ipfs_oversize.load(Relaxed),
             );
             labelled(
                 "nuthatch_nest_reorgs_total",
