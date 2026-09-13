@@ -57,6 +57,8 @@ pub struct NestMetrics {
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
+    /// RFC-0037: rows an `[[ipfs]]` declaration reads that named no CID it could use.
+    ipfs_unreadable: AtomicU64,
     /// #807: the `--seal-direct` history pass, before the hot cursor exists.
     seal_direct_active: AtomicBool,
     seal_direct_origin: AtomicU64,
@@ -218,6 +220,13 @@ impl NestMetrics {
         self.reorgs.fetch_add(1, Relaxed);
         METRICS.inc_reorgs();
     }
+    pub fn add_ipfs_unreadable(&self, n: u64) {
+        self.ipfs_unreadable.fetch_add(n, Relaxed);
+        METRICS.add_ipfs_unreadable(n);
+    }
+    pub fn ipfs_unreadable(&self) -> u64 {
+        self.ipfs_unreadable.load(Relaxed)
+    }
 
     /// Start a seal-direct history pass. `/ready` reads these instead of treating a zero cursor as
     /// WAITING (#807).
@@ -338,6 +347,7 @@ pub struct Metrics {
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
+    ipfs_unreadable: AtomicU64,
     alert_outbox_depth: AtomicU64,
     // Serving - the surface an operator bills against.
     http_requests: AtomicU64,
@@ -403,6 +413,7 @@ impl Metrics {
             rows_decoded: AtomicU64::new(0),
             rows_sealed: AtomicU64::new(0),
             reorgs: AtomicU64::new(0),
+            ipfs_unreadable: AtomicU64::new(0),
             alert_outbox_depth: AtomicU64::new(0),
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
@@ -513,6 +524,9 @@ impl Metrics {
     }
     pub fn inc_reorgs(&self) {
         self.reorgs.fetch_add(1, Relaxed);
+    }
+    pub fn add_ipfs_unreadable(&self, n: u64) {
+        self.ipfs_unreadable.fetch_add(n, Relaxed);
     }
     pub fn set_alert_outbox(&self, v: u64) {
         self.alert_outbox_depth.store(v, Relaxed);
@@ -738,6 +752,11 @@ impl Metrics {
             self.reorgs.load(Relaxed),
         ));
         s.push_str(&counter(
+            "nuthatch_ipfs_unreadable_total",
+            "Rows an [[ipfs]] declaration read that named no usable CID, since start.",
+            self.ipfs_unreadable.load(Relaxed),
+        ));
+        s.push_str(&counter(
             "nuthatch_http_requests_total",
             "HTTP API requests served since start.",
             self.http_requests.load(Relaxed),
@@ -957,6 +976,12 @@ impl Metrics {
                 "Rows sealed to Parquet since start, per nest.",
                 "counter",
                 &|m| m.rows_sealed.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_ipfs_unreadable_total",
+                "Rows an [[ipfs]] declaration read that named no usable CID, per nest.",
+                "counter",
+                &|m| m.ipfs_unreadable.load(Relaxed),
             );
             labelled(
                 "nuthatch_nest_reorgs_total",

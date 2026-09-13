@@ -5352,6 +5352,99 @@ impl NestIngest {
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
+        // RFC-0038 §5: decode **top-level calls** - transactions sent directly to this nest's
+        // contracts. This is what a subgraph's `callHandlers` fire on, and unlike the internal call
+        // tree it needs no node: a transaction is in the block body that ordinary RPC already serves.
+        //
+        // Bounded by the nest's own addresses before decode, so a busy chain costs this nest nothing
+        // it did not ask for.
+        // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
+        // oracle's CIDs arrive as calldata, not as logs.
+        let mut call_rows: Vec<crate::registry::DecodedRow> = Vec::new();
+        if self.top_level_calls {
+            if let Some(creg) = self.call_registry.clone() {
+                let want: Vec<u64> = (next..=to).collect();
+                let bodies = retry_transient(
+                    &format!("block bodies for {} block(s)", want.len()),
+                    BACKFILL_RETRY_BASE,
+                    || async { source.block_bodies(&want).await },
+                )
+                .await?;
+                for b in &want {
+                    let Some(body) = bodies.get(b) else { continue };
+                    let bhash = body
+                        .get("hash")
+                        .and_then(|h| h.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    // The body already carries the header, so the timestamp comes from it rather
+                    // than from a second fetch - and unlike the `timestamps` map it covers blocks
+                    // that emitted no matching log at all, which is most of them.
+                    let ts = body
+                        .get("timestamp")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+                        .unwrap_or(0);
+                    let txs = body.get("transactions").and_then(|t| t.as_array());
+                    for tx in txs.into_iter().flatten() {
+                        // `to` is absent for a contract creation, which is not a call to anything we
+                        // index.
+                        let Some(to_addr) = tx.get("to").and_then(|t| t.as_str()) else {
+                            continue;
+                        };
+                        let lower = to_addr.to_ascii_lowercase();
+                        let Ok(addr) = lower.parse::<alloy_primitives::Address>() else {
+                            continue;
+                        };
+                        // `addresses` is the getLogs filter and holds only contracts with events, so a
+                        // calldata-only contract has to be admitted by the call registry itself.
+                        if !creg.declares(addr)
+                            && !self
+                                .addresses
+                                .iter()
+                                .any(|a| a.eq_ignore_ascii_case(&lower))
+                        {
+                            continue;
+                        }
+                        let input = hex::decode(
+                            tx.get("input")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("0x")
+                                .trim_start_matches("0x"),
+                        )
+                        .unwrap_or_default();
+                        let idx = tx
+                            .get("transactionIndex")
+                            .and_then(|i| i.as_str())
+                            .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
+                            .unwrap_or(0);
+                        let ctx = crate::calldata::CallContext {
+                            block_number: *b,
+                            block_hash: bhash.clone(),
+                            block_timestamp: ts,
+                            tx_hash: tx
+                                .get("hash")
+                                .and_then(|h| h.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            // The reserved band is applied here rather than at storage, so the row's
+                            // own `log_index` is the key it lands under - one number, one meaning.
+                            call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
+                            timestamps: self.registry.timestamps(),
+                        };
+                        call_rows.extend(creg.decode_call(addr, &input, &ctx));
+                    }
+                }
+            }
+        }
+        for row in &call_rows {
+            to_store.push((
+                Store::entity_key(row.block_number, row.log_index),
+                row.to_json().to_string(),
+            ));
+            stored += 1;
+        }
+
         // RFC-0037: resolve the IPFS documents this window's rows point at.
         //
         // Deduped by CID before any fetch, because a CID *is* a content address: a thousand rows
@@ -5367,35 +5460,43 @@ impl NestIngest {
             let mut budget = MAX_FETCHES_PER_WINDOW;
             let mut per_block: std::collections::BTreeMap<u64, Vec<(usize, String)>> =
                 std::collections::BTreeMap::new();
+            let mut unreadable = 0usize;
             for (i, d) in self.ipfs.iter().enumerate() {
                 let col = d.column();
                 let mut seen = std::collections::HashSet::new();
-                let mut src: Vec<&crate::registry::DecodedRow> =
-                    rows.iter().filter(|r| r.table == d.on).collect();
+                let mut src: Vec<&crate::registry::DecodedRow> = rows
+                    .iter()
+                    .chain(&call_rows)
+                    .filter(|r| r.table == d.on)
+                    .collect();
                 src.sort_by_key(|r| (r.block_number, r.log_index));
                 for r in src {
-                    let Some(cid) = r.params.iter().find(|(k, _)| k == col).map(|(_, v)| v) else {
+                    // A row without the column resolves nothing, exactly like one naming no CID, and
+                    // neither used to leave a trace.
+                    let Some(value) = r.params.iter().find(|(k, _)| k == col).map(|(_, v)| v)
+                    else {
+                        unreadable += 1;
                         continue;
                     };
-                    // The column may hold a bare CID, an `ipfs://` URI, a full gateway URL, or a
-                    // raw 32-byte digest - a real subgraph port turned up all four. Only the content
-                    // address is kept: the string comes from a log, so fetching the host it names
-                    // would let whoever emitted the event choose what this process connects to.
-                    //
-                    // Matching on `Value::Str` here is what used to drop the `bytes32` form on the
-                    // floor before the resolver ever saw it, so the match now lives in
-                    // `cid_from_value` where the refusals can be stated once.
-                    let Some(cid) = crate::ipfs::cid_from_value(cid) else {
-                        continue;
-                    };
-                    if !seen.insert(cid.to_string()) {
-                        continue;
+                    // A bare CID, an `ipfs://` URI, a full gateway URL, a raw 32-byte digest, or JSON
+                    // naming one. Only the content address is kept: the value comes from a log or a
+                    // transaction, so fetching the host it names would let its author choose what
+                    // this process connects to.
+                    let (cids, missed) = d.cids_in(value);
+                    unreadable += missed;
+                    for cid in cids {
+                        if seen.insert(cid.clone()) {
+                            per_block.entry(r.block_number).or_default().push((i, cid));
+                        }
                     }
-                    per_block
-                        .entry(r.block_number)
-                        .or_default()
-                        .push((i, cid.to_string()));
                 }
+            }
+            if unreadable > 0 {
+                self.metrics.add_ipfs_unreadable(unreadable as u64);
+                tracing::warn!(
+                    "ipfs: {unreadable} row(s) in {next}..={to} named no usable CID - nothing to \
+                     resolve for them (nuthatch_nest_ipfs_unreadable_total)"
+                );
             }
             for (block, items) in per_block {
                 let hash = retry_transient(
@@ -5451,92 +5552,6 @@ impl NestIngest {
                             "ipfs: {cid} unresolved ({e:#}) - no row written, which is what a \
                              LEFT JOIN reads as 'not yet'"
                         ),
-                    }
-                }
-            }
-        }
-
-        // RFC-0038 §5: decode **top-level calls** - transactions sent directly to this nest's
-        // contracts. This is what a subgraph's `callHandlers` fire on, and unlike the internal call
-        // tree it needs no node: a transaction is in the block body that ordinary RPC already serves.
-        //
-        // Bounded by the nest's own addresses before decode, so a busy chain costs this nest nothing
-        // it did not ask for.
-        if self.top_level_calls {
-            if let Some(creg) = self.call_registry.clone() {
-                let want: Vec<u64> = (next..=to).collect();
-                let bodies = retry_transient(
-                    &format!("block bodies for {} block(s)", want.len()),
-                    BACKFILL_RETRY_BASE,
-                    || async { source.block_bodies(&want).await },
-                )
-                .await?;
-                for b in &want {
-                    let Some(body) = bodies.get(b) else { continue };
-                    let bhash = body
-                        .get("hash")
-                        .and_then(|h| h.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    // The body already carries the header, so the timestamp comes from it rather
-                    // than from a second fetch - and unlike the `timestamps` map it covers blocks
-                    // that emitted no matching log at all, which is most of them.
-                    let ts = body
-                        .get("timestamp")
-                        .and_then(|t| t.as_str())
-                        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
-                        .unwrap_or(0);
-                    let txs = body.get("transactions").and_then(|t| t.as_array());
-                    for tx in txs.into_iter().flatten() {
-                        // `to` is absent for a contract creation, which is not a call to anything we
-                        // index.
-                        let Some(to_addr) = tx.get("to").and_then(|t| t.as_str()) else {
-                            continue;
-                        };
-                        let lower = to_addr.to_ascii_lowercase();
-                        if !self
-                            .addresses
-                            .iter()
-                            .any(|a| a.eq_ignore_ascii_case(&lower))
-                        {
-                            continue;
-                        }
-                        let Ok(addr) = lower.parse::<alloy_primitives::Address>() else {
-                            continue;
-                        };
-                        let input = hex::decode(
-                            tx.get("input")
-                                .and_then(|i| i.as_str())
-                                .unwrap_or("0x")
-                                .trim_start_matches("0x"),
-                        )
-                        .unwrap_or_default();
-                        let idx = tx
-                            .get("transactionIndex")
-                            .and_then(|i| i.as_str())
-                            .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
-                            .unwrap_or(0);
-                        let ctx = crate::calldata::CallContext {
-                            block_number: *b,
-                            block_hash: bhash.clone(),
-                            block_timestamp: ts,
-                            tx_hash: tx
-                                .get("hash")
-                                .and_then(|h| h.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            // The reserved band is applied here rather than at storage, so the row's
-                            // own `log_index` is the key it lands under - one number, one meaning.
-                            call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
-                            timestamps: self.registry.timestamps(),
-                        };
-                        if let Some(row) = creg.decode_call(addr, &input, &ctx) {
-                            to_store.push((
-                                Store::entity_key(row.block_number, row.log_index),
-                                row.to_json().to_string(),
-                            ));
-                            stored += 1;
-                        }
                     }
                 }
             }
@@ -12851,6 +12866,166 @@ template="pool"
             row["block_timestamp"], 1_694_498_816u64,
             "the timestamp comes from the body we already fetched, not a second round trip"
         );
+    }
+
+    /// **RFC-0037 over a call table: the QoS oracle's payload resolves from its calldata.**
+    ///
+    /// Two real `submitQoSPayload(bytes)` inputs from Gnosis block 48,231,985, one per topic, and one
+    /// whose payload is not JSON, read by two declarations over the same column that differ only in
+    /// the topic they match - the QoS nest needs both documents. Each of four faults fails this: admitting only contracts with events
+    /// (the real DataEdge ABI has none, so no call rows), resolving before calls are decoded (no
+    /// document), ignoring `json_match` (both documents in each table), and not counting what could not be read.
+    ///
+    /// The stub serves 300 KiB, past the single-block limit, so the real CID is accepted unverified.
+    /// That is what the live 1.7 MB payloads get too, and the row has to say so.
+    #[tokio::test]
+    async fn a_call_tables_json_payload_resolves_the_document_it_names() {
+        const EDGE: &str = "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f";
+        struct QosSource;
+        #[async_trait::async_trait]
+        impl Source for QosSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _f: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_bodies(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                let tx = |i: u64, input: &str| {
+                    serde_json::json!({
+                        "hash": format!("0x{i:064x}"),
+                        "to": EDGE,
+                        "input": input,
+                        "transactionIndex": format!("0x{i:x}"),
+                    })
+                };
+                Ok(blocks
+                    .iter()
+                    .map(|&b| {
+                        (
+                            b,
+                            serde_json::json!({
+                                "hash": format!("0x{b:064x}"),
+                                "timestamp": "0x65000000",
+                                "transactions": [
+                                    tx(0, "0x53b734470000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000008d7b22746f706963223a2022676174657761795f696e64657865725f617474656d70745f716f735f355f6d696e757465735f70726f645f7633222c202268617368223a2022516d646863565470536a6d43427671674c396d366e617a52733233584245624a367a79676f6a5641716962376f61222c202274696d657374616d70223a20313738393331333430307d00000000000000000000000000000000000000"),
+                                    tx(1, "0x53b734470000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000008a7b22746f706963223a2022676174657761795f71756572795f726573756c745f716f735f355f6d696e757465735f70726f645f7633222c202268617368223a2022516d6379535073397937613477475978437462644e7274396b6a7279636539695967755256653647644b765a7735222c202274696d657374616d70223a20313738393331333430307d00000000000000000000000000000000000000000000"),
+                                    tx(2, "0x53b73447000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000086e6f74206a736f6e000000000000000000000000000000000000000000000000"),
+                                ],
+                            }),
+                        )
+                    })
+                    .collect())
+            }
+        }
+
+        let body: &'static str = Box::leak("x".repeat(300 * 1024).into_boxed_str());
+        let (gateway, handle) = stub_gateway(body).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"qos-oracle-n1\"\nchain = \"gnosis\"\nchain_id = 100\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"data_edge\"\naddress = \"{EDGE}\"\nabi = \"abis/data-edge.json\"\n\n\
+                 [extract]\ntop_level_calls = true\n\n\
+                 [[ipfs]]\nname = \"qos_indexer_payload\"\non = \"data_edge__call_submit_qo_s_payload\"\n\
+                 cid_column = \"_payload\"\ncid_json_path = \"hash\"\n\
+                 json_match = {{ topic = \"gateway_indexer_attempt_qos_5_minutes_prod_v3\" }}\n\n\
+                 [[ipfs]]\nname = \"qos_query_payload\"\non = \"data_edge__call_submit_qo_s_payload\"\n\
+                 cid_column = \"_payload\"\ncid_json_path = \"hash\"\n\
+                 json_match = {{ topic = \"gateway_query_result_qos_5_minutes_prod_v3\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/data-edge.json"),
+            r#"[{"type":"function","name":"submitQoSPayload","inputs":[{"name":"_payload","type":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}]"#,
+        )
+        .unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.ipfs_gateways = vec![gateway];
+
+        let source: Arc<dyn Source> = Arc::new(QosSource);
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .expect("a qos oracle nest must build with no node");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        nest.process_window(source.as_ref(), &[], 4, 4, 100)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let rows: Vec<serde_json::Value> = store
+            .entity_keys()
+            .unwrap()
+            .into_iter()
+            .map(|k| serde_json::from_str(&store.get_entity(&k).unwrap().unwrap()).unwrap())
+            .collect();
+        let calls = rows
+            .iter()
+            .filter(|v| v["table"] == "data_edge__call_submit_qo_s_payload")
+            .count();
+        assert_eq!(
+            calls, 3,
+            "every post is kept as a call row, resolved or not"
+        );
+        for (table, cid) in [
+            (
+                "qos_indexer_payload",
+                "QmdhcVTpSjmCBvqgL9m6nazRs23XBEbJ6zygojVAqib7oa",
+            ),
+            (
+                "qos_query_payload",
+                "QmcySPs9y7a4wGYxCtbdNrt9kjryce9iYguRVe6GdKvZw5",
+            ),
+        ] {
+            let docs: Vec<&serde_json::Value> =
+                rows.iter().filter(|v| v["table"] == table).collect();
+            let cids: Vec<&serde_json::Value> = docs.iter().map(|v| &v["cid"]).collect();
+            assert_eq!(
+                cids,
+                [cid],
+                "{table} wants only the document its own topic names"
+            );
+            assert_eq!(
+                docs[0]["verified"], false,
+                "a multi-block document cannot be proven from its bytes and must not claim it was"
+            );
+        }
+        assert_eq!(
+            crate::metrics::METRICS
+                .nest("qos-oracle-n1")
+                .ipfs_unreadable(),
+            2,
+            "the post whose payload is not JSON is unreadable to both declarations, and counted"
+        );
+        handle.abort();
     }
 
     /// **RFC-0038 §3, end to end: a declaration names an event's parameter.**
