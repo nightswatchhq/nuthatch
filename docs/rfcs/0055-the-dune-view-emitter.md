@@ -1,7 +1,7 @@
 # RFC-0055: The Dune view emitter - generated DuneSQL models over a mirrored nest
 
-**Status:** **Draft - design only.** Written for Chief's acceptance before any code (#1344). It is new
-binary capability, so no slice starts until this is accepted.
+**Status:** **Accepted** by Chief on 2026-09-13 (#1344). New binary capability, built in the slices of §8;
+S0 runs first and gates S1.
 
 **Date:** 2026-09-13
 
