@@ -54,19 +54,19 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "docs/rfcs/0055-the-dune-view-emitter.md",
         "emit",
         3,
-        "RFC-0055 proposes `nuthatch emit dune`; it is a draft, and nothing is built until it is accepted",
+        "RFC-0055 (accepted 2026-09-13) specifies `nuthatch emit dune`; not implemented until S1 (#1357)",
     ),
     (
         "docs/rfcs/0055-the-dune-view-emitter.md",
         "--source",
         1,
-        "RFC-0055 proposes `emit dune --source`, the Dune namespace the rows were loaded into; not built",
+        "RFC-0055 specifies `emit dune --source`, the Dune namespace the rows were loaded into; not implemented until S1 (#1357)",
     ),
     (
         "docs/rfcs/README.md",
         "emit",
         1,
-        "the RFC index row for RFC-0055 names its proposed `nuthatch emit dune`; not built",
+        "the RFC index row for RFC-0055 names its accepted `nuthatch emit dune`; not implemented until S1 (#1357)",
     ),
     (
         "docs/operators.md",
