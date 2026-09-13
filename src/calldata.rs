@@ -330,7 +330,9 @@ pub const TX_FROM_COLUMN: &str = "tx_from";
 fn tx_from_column() -> ColumnSchema {
     ColumnSchema {
         name: TX_FROM_COLUMN.into(),
-        sol_type: "implicit".into(),
+        // Not "implicit": the sender travels as a param, and a row rebuilt from storage keeps only the
+        // columns that are not implicit.
+        sol_type: "address".into(),
         storage: "address".into(),
         indexed: false,
         components: Vec::new(),
@@ -582,6 +584,27 @@ mod tests {
                 t.table
             );
         }
+    }
+
+    /// A call row rebuilt from storage (a restart, an entity seed, a sealed segment read back) must be
+    /// the row that was stored. Declared implicit, the sender column was dropped on the way back in.
+    #[test]
+    fn the_sender_survives_a_row_rebuilt_from_storage() {
+        let r = reg(ERC20, &Extract::default());
+        let row = r
+            .decode_call(addr(1), &transfer_calldata(addr(9), 1), &ctx())
+            .expect("a row");
+        let extract = Extract {
+            top_level_calls: true,
+            ..Extract::default()
+        };
+        let schema = r
+            .schema(&extract)
+            .into_iter()
+            .find(|t| t.table == row.table)
+            .expect("the call table's schema");
+        let rebuilt = DecodedRow::from_stored(&row.to_json(), &schema).unwrap();
+        assert_eq!(rebuilt.params, row.params);
     }
 
     #[test]
