@@ -2774,6 +2774,7 @@ async fn build_nest(
         sql_max_named_scan_bytes: serve::SQL_MAX_NAMED_SCAN_BYTES,
         // Every cursor-owning role builds through here; `serve_role` flips it after (#1025).
         cursorless: false,
+        seal_span,
         // Open by default; `runtime::dev` overlays the mount's surface after the nest is built
         // (RFC-0034). A solo `nuthatch dev` has no mount record and therefore no surface to apply.
         surface: Arc::new(crate::allowlist::Surface::default()),
