@@ -165,6 +165,15 @@ pub struct GraphValidateArgs {
     pub nest: String,
 }
 
+/// A zero publish interval would have the mirror reconcile in a loop.
+fn parse_publish_interval(s: &str) -> Result<std::time::Duration, String> {
+    let interval = crate::freshness::parse_span(s)?;
+    if interval.is_zero() {
+        return Err("the publish interval must be at least one second".into());
+    }
+    Ok(interval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,7 +191,8 @@ mod tests {
                 "{sub}: {err}"
             );
             assert!(
-                err.to_string().contains("at least one second"),
+                err.to_string()
+                    .contains("the publish interval must be at least one second"),
                 "{sub}: {err}"
             );
         }
@@ -1148,7 +1158,7 @@ pub struct ServeArgs {
     pub publish_target: Option<String>,
 
     /// How often the mirror reconciles when no seal has woken it.
-    #[arg(long, default_value = "60s", value_name = "DURATION", value_parser = crate::freshness::parse_duration)]
+    #[arg(long, default_value = "60s", value_name = "DURATION", value_parser = parse_publish_interval)]
     pub publish_interval: std::time::Duration,
 
     /// Objects the mirror uploads at once.
@@ -1245,7 +1255,7 @@ pub struct DevArgs {
     pub publish_target: Option<String>,
 
     /// How often the mirror reconciles when no seal has woken it.
-    #[arg(long, default_value = "60s", value_name = "DURATION", value_parser = crate::freshness::parse_duration)]
+    #[arg(long, default_value = "60s", value_name = "DURATION", value_parser = parse_publish_interval)]
     pub publish_interval: std::time::Duration,
 
     /// Objects the mirror uploads at once.

@@ -180,10 +180,10 @@ impl MountPublish {
         if self.target.trim().is_empty() {
             bail!("publish target is empty");
         }
-        let interval = crate::freshness::parse_duration(&self.interval)
+        let interval = crate::freshness::parse_span(&self.interval)
             .map_err(|e| anyhow::anyhow!("publish interval {:?}: {e}", self.interval))?;
         if interval.is_zero() {
-            bail!("publish interval must be longer than zero");
+            bail!("the publish interval must be at least one second");
         }
         if !(1..=16).contains(&self.parallelism) {
             bail!(
