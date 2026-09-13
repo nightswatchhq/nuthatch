@@ -28,6 +28,7 @@ not to infer work that remains.
 - [Production guide](production.md)
 - [Operator reference](operators.md)
 - [Reading sealed segments without nuthatch](reading-segments.md)
+- [Reading a published nest](reading-published-nest.md)
 - [Release notes](releases/README.md)
 
 ## Dated records
