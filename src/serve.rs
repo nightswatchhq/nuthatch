@@ -108,6 +108,17 @@ pub fn sql_max_concurrency() -> usize {
 }
 /// Wall-clock deadline for a single analytical query; a runaway (e.g. cartesian) is interrupted.
 const SQL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request waits for an analytical permit before it is told the node is busy (#1319).
+///
+/// The permit count still caps what *runs*; this only caps how long a caller waits to be told no.
+/// It exists because a burst is not the same thing as sustained load: the hackathon builder's agent
+/// polled once and then fanned out six follow-ups at once, which against the default two permits
+/// produced 128 rejections of 725 queries on Arc and 139 of 648 on Sepolia - roughly one in five,
+/// every one a client-side retry for a query that would have succeeded milliseconds later.
+///
+/// The wait is charged against [`SQL_TIMEOUT`], so queuing cannot extend a request's total
+/// deadline; a query admitted after 250 ms gets 29.75 s to run rather than a fresh 30.
+const SQL_ADMISSION_WAIT: Duration = Duration::from_millis(250);
 /// Cap on rows materialised from one analytical query - bounds the Rust-side result buffer, which
 /// lives outside DuckDB's own memory limit. Beyond this the result is truncated and flagged.
 const SQL_MAX_ROWS: usize = 50_000;
@@ -2591,19 +2602,30 @@ async fn run_sql_query(
             }
         }
     }
-    // Fail fast when the analytical surface is saturated rather than queue: a backlog of pending
-    // DuckDB queries would itself exhaust memory/threads.
-    let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            METRICS.inc_sql_rejected();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
-            )
-                .into_response();
-        }
-    };
+    // Wait briefly for a permit, then refuse. A backlog of pending DuckDB queries would itself
+    // exhaust memory/threads, so the queue is bounded by time rather than depth: at most
+    // `SQL_ADMISSION_WAIT` of waiting, after which the caller is told the node is busy. The permit
+    // count is unchanged and still decides how many queries run at once (#1319).
+    let admission = std::time::Instant::now();
+    let permit =
+        match tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(&s.sql_gate).acquire_owned())
+            .await
+        {
+            Ok(Ok(p)) => p,
+            // Elapsed, or the semaphore was closed on shutdown. Only a request that actually gets the
+            // 503 is counted; one that waited and was then admitted is an accepted query.
+            _ => {
+                METRICS.inc_sql_rejected();
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
+                )
+                    .into_response();
+            }
+        };
+    // Charged against the query's own deadline, so queuing can never extend the total time a
+    // request occupies the node.
+    let sql_timeout = SQL_TIMEOUT.saturating_sub(admission.elapsed());
     METRICS.inc_sql();
     let dir = s.dir.clone();
     let sql = q.q.clone();
@@ -2666,7 +2688,7 @@ async fn run_sql_query(
             &dir,
             &sql,
             analytics::QueryGuard {
-                timeout: SQL_TIMEOUT,
+                timeout: sql_timeout,
                 max_rows,
             },
             &hot,
@@ -4770,13 +4792,16 @@ mod tests {
         assert_eq!(AppState::from_ref(&shared).address.as_deref(), Some("0xv2"));
     }
 
-    /// When the analytical gate is saturated, `/sql` fails fast with 503 rather than piling on.
+    /// A gate that stays saturated still answers 503 - but only after the bounded wait, not
+    /// immediately (#1319). The permit count is what caps concurrency; the wait only caps how long
+    /// a caller hangs on before being told no.
     #[tokio::test]
-    async fn sql_returns_503_when_gate_saturated() {
+    async fn sql_returns_503_when_gate_stays_saturated() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path(), 1);
-        // Hold the only permit - the gate is now saturated for the duration of the call.
+        // Hold the only permit for the whole call - nothing can free it, so the wait must elapse.
         let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        let started = std::time::Instant::now();
         let resp = sql(
             State(state.clone()),
             Query(SqlQuery {
@@ -4786,8 +4811,44 @@ mod tests {
         )
         .await
         .into_response();
+        let waited = started.elapsed();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Without this the test passes just as well against an immediate refusal, and the whole
+        // change is invisible to it.
+        assert!(
+            waited >= SQL_ADMISSION_WAIT,
+            "refused after {waited:?}, so the request was never queued"
+        );
         drop(held);
+    }
+
+    /// The case the wait exists for: a permit freed while the caller is queued admits it, where
+    /// fail-fast answered 503 for a query that would have run milliseconds later. This is the one
+    /// in five the hackathon nests were bouncing.
+    #[tokio::test]
+    async fn a_permit_freed_during_the_wait_admits_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        // Freed well inside `SQL_ADMISSION_WAIT`, as a burst's first query finishing would free it.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            drop(held);
+        });
+        let resp = sql(
+            State(state.clone()),
+            Query(SqlQuery {
+                q: "SELECT 1319 AS n".into(),
+                max_rows: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a permit freed during the wait should have admitted this query, not refused it"
+        );
     }
 
     /// A multichain runtime runs one cursor per chain, so `/<nest>/ready` must answer from **that
