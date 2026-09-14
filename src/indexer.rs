@@ -50,6 +50,9 @@ const DEFAULT_BACKFILL: u64 = 5_000;
 /// the shared pipeline. The colocated-reth front-end (`nuthatch-node`, RFC-0003) builds an ExEx
 /// `Source` instead and calls [`run`] directly - same core, different tip source.
 pub async fn dev(args: DevArgs) -> Result<()> {
+    // First, before the config is read or a single RPC round trip is made: a malformed `--cors`
+    // value should cost the operator a second, not a chain-id verification.
+    let cors = crate::serve::cors_layer(&args.cors)?;
     let dir = PathBuf::from(&args.dir);
     let mut config = Config::load(&dir)?;
     // RFC-0023 tier 3's archive endpoints. Carried on `Config` because every layer below already
@@ -100,6 +103,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         args.window,
         args.no_admin,
         publish,
+        cors,
     )
     .await
 }
@@ -238,7 +242,9 @@ pub async fn upgrade(
         let mut serve_task = {
             let old_shared = old_shared.clone();
             tokio::spawn(async move {
-                serve::run_two_versions(&listen, old_shared, &new_prefix, new_shared).await
+                // `upgrade` has its own flags and #1318 asks only for `dev` and `serve`, so a
+                // hot upgrade serves without CORS rather than inventing a value nobody passed.
+                serve::run_two_versions(&listen, old_shared, &new_prefix, new_shared, None).await
             })
         };
         let r = tokio::select! {
@@ -252,7 +258,7 @@ pub async fn upgrade(
         // Slice 2b - serve old, index new, atomically flip once caught up, retire old.
         let mut serve_task = {
             let shared = old_shared.clone();
-            tokio::spawn(async move { serve::run_shared(&listen, shared).await })
+            tokio::spawn(async move { serve::run_shared(&listen, shared, None).await })
         };
         let mut catchup_task = {
             let old_store = old_store.clone();
@@ -613,6 +619,7 @@ pub async fn run(
     window_override: Option<u64>,
     no_admin: bool,
     publish: Option<crate::publish::Settings>,
+    cors: Option<tower_http::cors::CorsLayer>,
 ) -> Result<()> {
     // Admin UI (RFC-0010 Part A): on by default on localhost. Off-localhost it needs an explicit token
     // (auth is the operator's gateway's job, but the local UI should never appear unguarded on a public
@@ -643,7 +650,7 @@ pub async fn run(
     // not keep serving stale data as if healthy - a silent failure (deadlock-review finding C1). Select
     // over both: whichever ends first decides the exit, and an indexing error/panic propagates out.
     let result = tokio::select! {
-        r = serve::run(&listen, state) => r,
+        r = serve::run(&listen, state, cors) => r,
         joined = &mut ingest => match joined {
             Ok(inner) => inner,
             Err(e) if e.is_panic() => Err(anyhow::anyhow!("indexing loop panicked")),
@@ -2841,6 +2848,8 @@ async fn build_nest(
 /// onto the trait; until then this is a real limitation rather than a rough edge, and it is why the
 /// compose file mounts the nest directory into the FE.
 pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
+    // As in `dev`: refused before anything is opened, so the error is about the flag and nothing else.
+    let cors = crate::serve::cors_layer(&args.cors)?;
     let dir = PathBuf::from(&args.dir);
     let mut config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (run `nuthatch init` first)", dir.display()))?;
@@ -2944,7 +2953,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
             )
         })
         .transpose()?;
-    serve::run(&args.listen, state).await
+    serve::run(&args.listen, state, cors).await
 }
 
 /// Open the shared hot store an FE serves from.

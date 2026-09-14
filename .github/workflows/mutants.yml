@@ -71,6 +71,24 @@ jobs:
         with:
           # One shared cache across the three jobs - they build the identical baseline.
           shared-key: mutants
+      # SIGBUS from `ld` is the disk, not the code (#1387). All three matrix jobs died the same way
+      # on the 2026-09-14 scheduled run - `collect2: fatal error: ld terminated with signal 7 [Bus
+      # error]` - which is the fault `ci.yml` already carries this exact step for, added after it
+      # was misdiagnosed twice because nothing measured the disk (#464, #639, #733). It was never
+      # applied here.
+      #
+      # This job is the hungriest there is: cargo-mutants rebuilds the tree **per mutant** into its
+      # own temp target dir, on top of the baseline build and the shared cache, so it has less
+      # headroom than the job the step was written for rather than more.
+      #
+      # The `df` lines stay, for the same reason they stay in `ci.yml`: a run that dies for want of
+      # disk must say so in its own log rather than leave the next person inferring it from SIGBUS.
+      - name: reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+            /opt/hostedtoolcache
+          df -h /
       - name: install cargo-mutants
         run: cargo install cargo-mutants --locked
 
@@ -82,6 +100,13 @@ jobs:
         # can tell those two apart; the raw status stays visible in this step's log.
         continue-on-error: true
         run: cargo mutants --no-shuffle -j 2 --file ${{ matrix.file }} -- --lib
+
+      # `if: always()` so the reading survives the failure it explains - the whole point of #733's
+      # trailing `df` in `ci.yml`. Without it, the run that runs out of disk is the one run with no
+      # disk measurement in it.
+      - name: disk after the run
+        if: always()
+        run: df -h /
 
       # **This step can go red, and that is the point** (#768 acceptance criterion 1). A survivor not
       # in the baseline fails the job and names the mutation and the file. So does a run that did not

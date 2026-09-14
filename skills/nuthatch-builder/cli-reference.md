@@ -113,6 +113,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--dir <DIR>` - The directory to run. A `nuthatch.toml` runs that one nest; a `mounts.toml` runs every nest it mounts, one isolated cursor per chain (RFC-0032). One command either way
 - `--fail-fast` - Exit on the first fault instead of quarantining it (RFC-0026 §6). Only meaningful with more than one nest: by default a failed nest or cursor is quarantined and its healthy siblings keep indexing and serving
 - `--listen <LISTEN>` - Address to bind the HTTP API to
+- `--cors <CORS>` - Allow browser front ends on these origins to call this nest directly (repeatable, or `*`)
 - `--ipfs <IPFS>` - IPFS gateway(s) or a local node for resolving declared `[[ipfs]]` documents (repeatable)
 - `--state-rpc <STATE_RPC>` - Archive endpoint(s) for resolving declared `[[calls]]` - RFC-0023 tier 3 (repeatable)
 - `--rpc <RPC>` - Use only these `rpc_urls` at runtime without editing the config (repeatable). Point at your own node
@@ -384,6 +385,7 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 - `--dir <DIR>` - Project directory (must contain a nuthatch.toml)
 - `--listen <LISTEN>` - Address to bind the HTTP API to
 - `--hot-store <HOT_STORE>` - Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires a build with `--features postgres-store`. Omit to serve the nest's local redb instead - but that store must already exist (`serve` never creates or writes to it), and redb's exclusive flock means exactly one process may hold it: local redb does not read-scale a box or share with `dev`, only `--hot-store` does
+- `--cors <CORS>` - Allow browser front ends on these origins to call this nest directly (repeatable, or `*`)
 - `--admin` - Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node owns no cursor, so the lifecycle routes it would expose have nothing to act on
 - `--publish-target <PUBLISH_TARGET>` - Mirror sealed segments to this prefix as they seal (RFC-0052), exactly as on `dev`
 - `--publish-interval <PUBLISH_INTERVAL>` - How often the mirror reconciles when no seal has woken it
