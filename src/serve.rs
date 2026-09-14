@@ -681,38 +681,45 @@ fn check_origin(o: &str) -> Result<()> {
     // example behind its reviewer - a space slipped through twice here already. A host is either a
     // DNS name or a bracketed literal, and the DNS name's alphabet is small and closed, so state it
     // and refuse everything else.
-    let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
-    let legal = if rest.starts_with('[') {
-        // Inside the brackets: hex groups, `:` separators, `.` for an embedded IPv4 tail, and `%`
-        // plus a zone id. Still a closed alphabet, still not a check that the address resolves.
-        host.chars().all(|c| {
-            c.is_ascii_hexdigit() || matches!(c, ':' | '.' | '%') || c.is_ascii_alphanumeric()
-        })
-    } else {
-        host.chars().all(ok)
+    // A zone id lives after `%` and has its own alphabet; keeping it separate is what the fifth
+    // round of this review found missing. Appending `is_ascii_alphanumeric` to the address alphabet
+    // to admit `%eth0` made the whole predicate vacuous - `[zz]` and `[2001:db8::gg]` both passed -
+    // which is the third time this validator has been widened by a term meant to narrow it.
+    let (addr, zone) = match host.split_once('%') {
+        Some((a, z)) => (a, Some(z)),
+        None => (host, None),
     };
-    if !legal {
-        let bad = host
-            .chars()
-            .find(|c| {
-                if rest.starts_with('[') {
-                    false
-                } else {
-                    !ok(*c)
-                }
+    let bad_char = if rest.starts_with('[') {
+        // Inside the brackets: hex groups, `:` separators, and `.` for an embedded IPv4 tail. That
+        // is the whole alphabet - still a shape check, still not a check that the address resolves.
+        addr.chars()
+            .find(|c| !(c.is_ascii_hexdigit() || matches!(c, ':' | '.')))
+            // A zone id is an interface name: alphanumerics and the separators one may carry.
+            .or_else(|| {
+                zone.and_then(|z| {
+                    z.chars()
+                        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+                })
             })
-            .map(|c| {
-                if c == ' ' {
-                    "a space".to_string()
-                } else {
-                    format!("'{c}'")
-                }
-            })
-            .unwrap_or_else(|| "a character".to_string());
+    } else {
+        // A `%` has no meaning outside brackets, so `addr` is the whole host here and `zone` being
+        // `Some` is itself the fault - caught by `%` failing the DNS alphabet below.
+        host.chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    };
+    if let Some(c) = bad_char {
+        let named = if c == ' ' {
+            "a space".to_string()
+        } else {
+            format!("'{c}'")
+        };
         anyhow::bail!(
-            "--cors {o} has {bad} in its host, which an Origin header cannot carry, so it would \
+            "--cors {o} has {named} in its host, which an Origin header cannot carry, so it would \
              match nothing"
         );
+    }
+    if rest.starts_with('[') && zone.is_some_and(str::is_empty) {
+        anyhow::bail!("--cors {o} has an empty zone id after '%'");
     }
     if let Some(p) = port {
         if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
@@ -5227,6 +5234,13 @@ mod tests {
             ("https://app\texample.com", "in its host"),
             ("https://app|example.com", "in its host"),
             ("https://app,example.com", "in its host"),
+            // Jules, fifth round: the bracketed alphabet had an `is_ascii_alphanumeric` term meant
+            // to admit a zone id, which admitted every letter and made the hex check vacuous.
+            ("http://[zz]", "in its host"),
+            ("http://[2001:db8::gg]", "in its host"),
+            ("http://[2001:db8::1%]", "empty zone id"),
+            ("http://[2001:db8::1%et h0]", "a space"),
+            ("https://exam%ple.com", "'%'"),
             ("https://app.example.com:", "port number"),
             ("https://app.example.com:http", "port number"),
         ] {
@@ -5247,6 +5261,8 @@ mod tests {
             vec!["http://[::1]:3000"],
             vec!["http://[::1]"],
             vec!["https://[2001:db8::1]:8443"],
+            vec!["http://[::ffff:192.168.0.1]"],
+            vec!["http://[fe80::1%eth0]:3000"],
         ] {
             let owned: Vec<String> = ok.iter().map(|s| s.to_string()).collect();
             assert!(
