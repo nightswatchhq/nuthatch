@@ -645,9 +645,33 @@ fn check_origin(o: &str) -> Result<()> {
              nothing"
         );
     }
-    let (host, port) = match rest.split_once(':') {
-        Some((h, p)) => (h, Some(p)),
-        None => (rest, None),
+    // A bracketed IPv6 literal is one host, colons and all - `http://[::1]:3000` is a perfectly
+    // ordinary origin a browser will send, and splitting it on the first colon reads the host as
+    // "[" and refuses it for a port it never had (Jules on #1384). A guard nobody can get through
+    // is not a guard, it is a wall.
+    let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
+        let (addr, tail) = inner.split_once(']').ok_or_else(|| {
+            anyhow::anyhow!("--cors {o} opens a bracketed host and never closes it")
+        })?;
+        if addr.is_empty() {
+            anyhow::bail!("--cors {o} names no host");
+        }
+        // Only the shape is checked, not the address: over-validating IPv6 is how the next false
+        // refusal gets written, and a host that does not resolve is the operator's business.
+        match tail {
+            "" => (addr, None),
+            t => match t.strip_prefix(':') {
+                Some(p) => (addr, Some(p)),
+                None => anyhow::bail!(
+                    "--cors {o} has '{t}' after the host, which an Origin never carries"
+                ),
+            },
+        }
+    } else {
+        match rest.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        }
     };
     if host.is_empty() {
         anyhow::bail!("--cors {o} names no host");
@@ -5155,6 +5179,10 @@ mod tests {
             ("https://app.example.com#frag", "fragment"),
             ("https://user:pw@app.example.com", "credentials"),
             ("https://", "names no host"),
+            ("http://[]", "names no host"),
+            ("http://[::1", "never closes it"),
+            ("http://[::1]x", "after the host"),
+            ("http://[::1]:x", "port number"),
             ("https://app.example.com:", "port number"),
             ("https://app.example.com:http", "port number"),
         ] {
@@ -5170,6 +5198,11 @@ mod tests {
             vec!["https://a.example.com", "https://b.example.com"],
             vec!["http://127.0.0.1:8288"],
             vec!["https://sub.domain.example.com:8443"],
+            // IPv6, bracketed, with and without a port - the binary takes IPv6 listen addresses, so
+            // a front end on one is not an exotic case.
+            vec!["http://[::1]:3000"],
+            vec!["http://[::1]"],
+            vec!["https://[2001:db8::1]:8443"],
         ] {
             let owned: Vec<String> = ok.iter().map(|s| s.to_string()).collect();
             assert!(
