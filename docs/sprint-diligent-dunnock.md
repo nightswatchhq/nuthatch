@@ -24,7 +24,8 @@ Chief puts them in when he accepts each RFC.
    Chief accepts it before any code.
 3. **#1359, RFC-0055 S3**: the authored views that translate exactly into DuneSQL, the rest named.
 4. **#1324, cross-nest SQL in a multichain runtime, as an RFC.** The motivating case is the hackathon
-. **The two costs every sprint pays.** #1283, the RPC width test that fails under full-suite load and
+   protocol that creates on Sepolia and settles on Arc. Design only; build slices are filed on acceptance.
+5. **The two costs every sprint pays.** #1283, the RPC width test that fails under full-suite load and
    forces reruns, and #1372, porting `scripts/pr-review.py` off Python under the house rule.
 
 ## Rules
