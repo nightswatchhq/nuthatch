@@ -20,12 +20,12 @@ pub struct Resolved {
 /// source; Blockscout is the second, keyless Etherscan-compatible source on the chains where it
 /// operates; Etherscan is retained for chains Blockscout does not cover and as a final fallback.
 /// `explorer` is an operator-supplied Blockscout root for a chain we have not verified (`--explorer`,
-/// #1322). It is tried after Sourcify and before the built-in list, which by definition does not
-/// cover the chain if the operator had to name one. Used for this invocation only and never written
-/// to the nest, because an ABI source is an access path and must not enter the content address -
-/// the same rule `--ipfs` and `--rpc` follow.
+/// #1322). It is tried after Sourcify and *instead of* the built-in list, which by definition does
+/// not cover the chain if the operator had to name one. Used for this invocation only and never
+/// written to the nest, because an ABI source is an access path and must not enter the content
+/// address - the same rule `--ipfs` and `--rpc` follow.
 pub async fn resolve(chain_id: u64, address: &str, explorer: Option<&str>) -> Result<Resolved> {
-    let sourcify_err = match sourcify(chain_id, address).await {
+    let sourcify_miss = match sourcify(chain_id, address).await {
         Ok((abi, name)) => {
             return Ok(Resolved {
                 abi,
@@ -34,47 +34,65 @@ pub async fn resolve(chain_id: u64, address: &str, explorer: Option<&str>) -> Re
                 contract_name: name,
             })
         }
-        Err(e) => e,
+        Err(e) => format!("Sourcify miss: {e:#}"),
     };
-    let mut explorer_err = None;
-    if let Some(root) = explorer {
-        match blockscout_v2(root, address).await {
-            Ok((abi, name)) => {
-                return Ok(Resolved {
-                    abi,
-                    via: "Blockscout (--explorer)",
-                    fallback_reason: Some(format!("Sourcify miss: {sourcify_err:#}")),
-                    contract_name: name,
-                })
-            }
-            Err(e) => explorer_err = Some(e),
-        }
+    after_sourcify(address, explorer, sourcify_miss, |miss| {
+        built_in(chain_id, address, miss)
+    })
+    .await
+}
+
+/// Everything after a Sourcify miss. **A named explorer's answer stands**: the built-in roots and
+/// Etherscan are reached only when the operator named none. "This contract is not verified" is an
+/// answer, and a far more useful one than a demand for an Etherscan key for a chain Etherscan does
+/// not index (#1322). Falling through to the built-in root on a chain that also has one would be
+/// worse than that: it would hand back a different source's ABI and silently ignore the explorer
+/// the operator asked for (Jules on #1388). `built_in` is a parameter so that ordering is testable
+/// without the network.
+async fn after_sourcify<F, Fut>(
+    address: &str,
+    explorer: Option<&str>,
+    sourcify_miss: String,
+    built_in: F,
+) -> Result<Resolved>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Resolved>>,
+{
+    let Some(root) = explorer else {
+        return built_in(sourcify_miss).await;
+    };
+    match blockscout_v2(root, address).await {
+        Ok((abi, name)) => Ok(Resolved {
+            abi,
+            via: "Blockscout (--explorer)",
+            fallback_reason: Some(sourcify_miss),
+            contract_name: name,
+        }),
+        Err(e) => bail!(
+            "Sourcify had no verified ABI, and the explorer you named could not supply one: \
+             {e:#}\n  Pass --abi path/to.json if you have the ABI, or check the address is \
+             verified on that instance."
+        ),
     }
+}
+
+/// The built-in Blockscout root for `chain_id`, then Etherscan.
+async fn built_in(chain_id: u64, address: &str, sourcify_miss: String) -> Result<Resolved> {
     match blockscout(chain_id, address).await {
         Ok(abi) => Ok(Resolved {
             abi,
             via: "Blockscout",
-            fallback_reason: Some(format!("Sourcify miss: {sourcify_err:#}")),
+            fallback_reason: Some(sourcify_miss),
             contract_name: None,
         }),
         Err(blockscout_err) => {
-            // The operator named an explorer and it answered definitively - "this contract is not
-            // verified" is an answer, and a far more useful one than a demand for an Etherscan key
-            // for a chain Etherscan does not index. Reaching past it to Etherscan would bury the
-            // one source that actually knows (#1322).
-            if let Some(e) = explorer_err {
-                bail!(
-                    "Sourcify had no verified ABI, and the explorer you named could not supply one: \
-                     {e:#}\n  Pass --abi path/to.json if you have the ABI, or check the address is \
-                     verified on that instance."
-                );
-            }
             let abi = etherscan(chain_id, address).await?;
             Ok(Resolved {
                 abi,
                 via: "Etherscan",
                 fallback_reason: Some(format!(
-                    "Sourcify miss: {sourcify_err:#}; Blockscout miss: {blockscout_err:#}"
+                    "{sourcify_miss}; Blockscout miss: {blockscout_err:#}"
                 )),
                 contract_name: None,
             })
@@ -435,6 +453,57 @@ mod tests {
         h.abort();
         assert_eq!(got.0, serde_json::from_str::<Value>(ABI).unwrap());
         assert_eq!(got.1.as_deref(), Some("Token"));
+    }
+
+    /// A named explorer's refusal stands even where a built-in root would have answered (Jules on
+    /// #1388). Falling through would return the built-in ABI and quietly ignore the explorer the
+    /// operator asked for, so the built-in path must not even be asked.
+    #[tokio::test]
+    async fn a_named_explorers_refusal_is_not_overridden_by_the_built_in_root() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let abi: Value = serde_json::from_str(ABI).unwrap();
+        let (root, h) = fake_explorer(json!({"is_verified": false, "abi": abi})).await;
+        let asked = AtomicBool::new(false);
+        let got = after_sourcify("0xabc", Some(&root), "Sourcify miss: test".into(), |miss| {
+            asked.store(true, Ordering::SeqCst);
+            let abi = abi.clone();
+            async move {
+                Ok(Resolved {
+                    abi,
+                    via: "Blockscout",
+                    fallback_reason: Some(miss),
+                    contract_name: None,
+                })
+            }
+        })
+        .await;
+        h.abort();
+        let err = match got {
+            Ok(r) => panic!("{} answered in place of the named explorer", r.via),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("not verified"), "{err}");
+        assert!(
+            !asked.load(Ordering::SeqCst),
+            "the built-in root was asked after the named explorer answered"
+        );
+
+        // And the seam is live: with no explorer named, the built-in path is what answers.
+        let got = after_sourcify(
+            "0xabc",
+            None,
+            "Sourcify miss: test".into(),
+            |miss| async move {
+                Ok(Resolved {
+                    abi: Value::Null,
+                    via: "Blockscout",
+                    fallback_reason: Some(miss),
+                    contract_name: None,
+                })
+            },
+        )
+        .await;
+        assert_eq!(got.map(|r| r.via).ok(), Some("Blockscout"));
     }
 
     /// **The finding the issue is actually about.** On Arc Testnet the contracts turned out to be
