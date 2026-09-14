@@ -283,6 +283,165 @@ async fn key_ordering_survives_the_backend() {
     );
 }
 
+/// The seal cut streams the hot store rather than loading a range (RFC-0028 §4 amendment). Postgres
+/// pages that stream a thousand rows at a time, so the fixture crosses a page boundary more than once,
+/// and an early stop past the first page must stop there on both backends.
+#[tokio::test]
+async fn the_range_scan_pages_and_stops_on_both_backends() {
+    let Some((redb, pg, _dir)) = pair("range_scan") else {
+        return;
+    };
+    // 2,500 rows over 500 blocks, five a block, so pages end mid-block as well as between blocks.
+    let rows: Vec<(String, String)> = (0..500u64)
+        .flat_map(|b| (0..5u64).map(move |i| row("t", b * 7 + 3, i)))
+        .collect();
+    for s in [redb.as_ref(), pg.as_ref()] {
+        s.commit_window(&rows, None, 499 * 7 + 3).unwrap();
+    }
+
+    let scan = |s: &dyn HotStore, from: u64, to: u64, stop_after: usize| {
+        let mut seen: Vec<(u64, String)> = Vec::new();
+        s.scan_entities_in_range(from, to, &mut |block, json| {
+            seen.push((block, json.to_string()));
+            seen.len() < stop_after
+        })
+        .unwrap();
+        seen
+    };
+
+    for s in [redb.as_ref(), pg.as_ref()] {
+        let all = scan(s, 0, u64::MAX, usize::MAX);
+        assert_eq!(
+            all.iter().map(|(_, j)| j.clone()).collect::<Vec<_>>(),
+            s.entities_in_range(0, u64::MAX).unwrap(),
+            "a full scan must visit exactly what entities_in_range returns, in the same order"
+        );
+        for (block, json) in &all {
+            let stated = serde_json::from_str::<serde_json::Value>(json).unwrap()["block_number"]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                *block, stated,
+                "the visitor's block must be the row's block"
+            );
+        }
+    }
+    assert_eq!(
+        scan(redb.as_ref(), 0, u64::MAX, usize::MAX),
+        scan(pg.as_ref(), 0, u64::MAX, usize::MAX)
+    );
+
+    let stopped_redb = scan(redb.as_ref(), 0, u64::MAX, 1_500);
+    let stopped_pg = scan(pg.as_ref(), 0, u64::MAX, 1_500);
+    assert_eq!(
+        stopped_pg.len(),
+        1_500,
+        "Postgres must stop past its first page, not at it"
+    );
+    assert_eq!(stopped_redb, stopped_pg);
+
+    let bounded = scan(pg.as_ref(), 10, 3_000, usize::MAX);
+    assert_eq!(bounded, scan(redb.as_ref(), 10, 3_000, usize::MAX));
+    assert!(
+        bounded.iter().all(|(b, _)| (10..=3_000).contains(b)),
+        "a bounded scan must not include rows outside the range"
+    );
+}
+
+/// Megabyte rows page by bytes on Postgres, a handful at a time rather than a thousand, and still
+/// visit exactly what redb does in the same order, including across an early stop (#1391 review).
+#[tokio::test]
+async fn a_range_scan_of_megabyte_rows_agrees_on_both_backends() {
+    let Some((redb, pg, _dir)) = pair("range_scan_large") else {
+        return;
+    };
+    let pad = "x".repeat(3 * 1024 * 1024);
+    let rows: Vec<(String, String)> = (0..24u64)
+        .map(|b| {
+            (
+                Store::entity_key(b, 0),
+                serde_json::json!({
+                    "table": "doc",
+                    "block_number": b,
+                    "log_index": 0,
+                    "_seq": b << 20,
+                    "value": pad,
+                })
+                .to_string(),
+            )
+        })
+        .collect();
+    for s in [redb.as_ref(), pg.as_ref()] {
+        s.commit_window(&rows, None, 23).unwrap();
+    }
+    let blocks = |s: &dyn HotStore, stop_after: usize| {
+        let mut seen = Vec::new();
+        s.scan_entities_in_range(0, u64::MAX, &mut |block, json| {
+            assert!(json.len() > 3 * 1024 * 1024, "a row must arrive whole");
+            seen.push(block);
+            seen.len() < stop_after
+        })
+        .unwrap();
+        seen
+    };
+    assert_eq!(blocks(pg.as_ref(), usize::MAX), (0..24).collect::<Vec<_>>());
+    assert_eq!(
+        blocks(redb.as_ref(), usize::MAX),
+        blocks(pg.as_ref(), usize::MAX)
+    );
+    assert_eq!(blocks(pg.as_ref(), 7), blocks(redb.as_ref(), 7));
+}
+
+/// Postgres fetches a page whole before visiting any of it, so a page a thousand megabyte rows long was
+/// gigabytes (#1391 review). Rows removed while the scan is under way show what had already been
+/// fetched: a byte-bounded page holds only the first few, so the scan ends where the survivors end.
+#[tokio::test]
+async fn a_postgres_scan_fetches_a_byte_budget_of_megabyte_rows_at_a_time() {
+    let Ok(url) = std::env::var("NUTHATCH_TEST_PG") else {
+        assert!(
+            std::env::var("NUTHATCH_REQUIRE_PG").is_err(),
+            "page_bytes: NUTHATCH_REQUIRE_PG is set but NUTHATCH_TEST_PG is not"
+        );
+        eprintln!("SKIPPED page_bytes: set NUTHATCH_TEST_PG to a Postgres URL");
+        return;
+    };
+    let name = nest_name("page_bytes");
+    let pg = PgStore::connect(&url, &name).unwrap();
+    let other = PgStore::connect(&url, &name).unwrap();
+    let pad = "x".repeat(3 * 1024 * 1024);
+    let rows: Vec<(String, String)> = (0..24u64)
+        .map(|b| {
+            (
+                Store::entity_key(b, 0),
+                serde_json::json!({
+                    "table": "doc",
+                    "block_number": b,
+                    "log_index": 0,
+                    "_seq": b << 20,
+                    "value": pad,
+                })
+                .to_string(),
+            )
+        })
+        .collect();
+    pg.commit_window(&rows, None, 23).unwrap();
+
+    let mut seen = Vec::new();
+    pg.scan_entities_in_range(0, u64::MAX, &mut |block, _| {
+        if seen.is_empty() {
+            other.rollback_to(9).unwrap();
+        }
+        seen.push(block);
+        true
+    })
+    .unwrap();
+    assert_eq!(
+        seen,
+        (0..10).collect::<Vec<_>>(),
+        "a scan that had fetched past its byte budget would still visit rows removed after it began"
+    );
+}
+
 /// The `/sql` RAM guard must refuse on both, or a scaled deployment loses a protection the embedded
 /// one has. Postgres would happily stream the whole tip, which makes this *more* important there.
 #[tokio::test]

@@ -127,6 +127,25 @@ impl Conn {
     }
 }
 
+/// Stored bytes one `scan_entities_in_range` page may bring over, so a scan of megabyte documents
+/// holds a page within the per-cursor budget however many rows share it.
+const SCAN_PAGE_BYTES: i64 = 16 * 1024 * 1024;
+
+/// How many of a page's rows, by stored length, fit `budget`: never fewer than one, or a row larger
+/// than the budget would stall the scan.
+fn rows_within(lengths: &[i64], budget: i64) -> usize {
+    let mut total = 0i64;
+    let mut n = 0;
+    for &len in lengths {
+        if n > 0 && total.saturating_add(len) > budget {
+            break;
+        }
+        total = total.saturating_add(len);
+        n += 1;
+    }
+    n
+}
+
 /// Meta key holding the next outbox sequence number. Must match `store::OUTBOX_SEQ` - the two
 /// backends read the same logical counter, and a nest migrated between them would otherwise restart
 /// its sequence.
@@ -427,6 +446,69 @@ impl HotStore for PgStore {
                 .map(|r| r.get::<_, String>(0))
                 .collect())
         })
+    }
+
+    fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        const PAGE: i64 = 1_000;
+        let hi = format!("{to:012}-999999");
+        let mut after: Option<String> = None;
+        loop {
+            let (lo, op) = match &after {
+                Some(k) => (k.clone(), ">"),
+                None => (format!("{from:012}-000000"), ">="),
+            };
+            // Sizes first, so a page of megabyte documents is cut to `SCAN_PAGE_BYTES` before any
+            // value leaves the server rather than after a thousand of them have.
+            let sizes_sql = format!(
+                "SELECT key, octet_length(value)::bigint FROM \"{}\".entities \
+                 WHERE key {op} $1 AND key <= $2 ORDER BY key LIMIT $3",
+                self.schema
+            );
+            let (size_lo, size_hi) = (lo.clone(), hi.clone());
+            let sizes: Vec<(String, i64)> = self.conn.with(move |c| {
+                Ok(c.query(&sizes_sql, &[&size_lo, &size_hi, &PAGE])?
+                    .into_iter()
+                    .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+                    .collect())
+            })?;
+            let lengths: Vec<i64> = sizes.iter().map(|(_, n)| *n).collect();
+            let take = rows_within(&lengths, SCAN_PAGE_BYTES);
+            if take == 0 {
+                return Ok(());
+            }
+            let last = sizes[take - 1].0.clone();
+            let values_sql = format!(
+                "SELECT key, value FROM \"{}\".entities WHERE key {op} $1 AND key <= $2 \
+                 ORDER BY key LIMIT $3",
+                self.schema
+            );
+            let limit = take as i64;
+            let page: Vec<(String, String)> = self.conn.with(move |c| {
+                Ok(c.query(&values_sql, &[&lo, &last, &limit])?
+                    .into_iter()
+                    .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                    .collect())
+            })?;
+            for (key, value) in &page {
+                let block = key
+                    .get(..12)
+                    .and_then(|b| b.parse::<u64>().ok())
+                    .with_context(|| format!("corrupt entity key {key:?}"))?;
+                if !visit(block, value) {
+                    return Ok(());
+                }
+            }
+            let more = take < sizes.len() || sizes.len() as i64 == PAGE;
+            match page.last() {
+                Some((key, _)) if more => after = Some(key.clone()),
+                _ => return Ok(()),
+            }
+        }
     }
 
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
@@ -959,6 +1041,17 @@ fn prune_in_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page of megabyte documents was fetched a thousand rows at a time before any was visited,
+    /// about 3 GiB for one page of QoS payloads (#1391 review). A page is cut to a byte budget, and
+    /// never to no rows at all.
+    #[test]
+    fn a_scan_page_holds_a_byte_budget_and_never_less_than_one_row() {
+        assert_eq!(rows_within(&[3 << 20; 1_000], 16 << 20), 5);
+        assert_eq!(rows_within(&[64; 1_000], 16 << 20), 1_000);
+        assert_eq!(rows_within(&[64 << 20, 1], 16 << 20), 1);
+        assert_eq!(rows_within(&[], 16 << 20), 0);
+    }
 
     /// Connection strings reach logs and error messages; passwords must not travel with them.
     #[test]

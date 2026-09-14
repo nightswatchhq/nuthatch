@@ -315,6 +315,31 @@ pub trait HotStore: Send + Sync {
         anyhow::bail!("this hot-store backend cannot report a byte-exact query snapshot")
     }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>>;
+    /// Rows in `[from, to]` in chain order, handed to `visit` as `(block, json)` until it returns
+    /// `false`. Choosing a seal cut reads only as far as the cut; this default still loads the range.
+    fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        for json in self.entities_in_range(from, to)? {
+            let block = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|v| match v.get("block_number")? {
+                    serde_json::Value::Number(n) => n.as_u64(),
+                    serde_json::Value::String(s) => s.parse().ok(),
+                    _ => None,
+                })
+                .with_context(|| {
+                    format!("a stored row in {from}..={to} carries no block_number")
+                })?;
+            if !visit(block, &json) {
+                break;
+            }
+        }
+        Ok(())
+    }
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>>;
 
     // ---- cursor & meta ----------------------------------------------------------------------
@@ -411,6 +436,12 @@ pub struct Store {
     /// analytical memo keys on it (#1186): two `/sql` requests separated by no commit read the
     /// same hot rows, and it is this counter rather than a scan of them that says so.
     writes: Arc<std::sync::atomic::AtomicU64>,
+    /// Bytes of the largest `entities_in_range` answer, so a test can hold sealing to reading a cut.
+    #[cfg(test)]
+    pub(crate) largest_range_read: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rows visited by the longest single `scan_entities_in_range`, for the same reason.
+    #[cfg(test)]
+    pub(crate) largest_scan_rows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Does the store at `path` hold indexed rows, as opposed to merely existing?
@@ -537,6 +568,10 @@ impl Store {
             db: Arc::new(db),
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -580,6 +615,10 @@ impl Store {
             db: Arc::new(db),
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -933,7 +972,46 @@ impl Store {
             let (_k, v) = row?;
             out.push(v.value().to_string());
         }
+        #[cfg(test)]
+        self.largest_range_read.fetch_max(
+            out.iter().map(String::len).sum(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         Ok(out)
+    }
+
+    /// [`entities_in_range`](Self::entities_in_range) one row at a time, the block read from the key.
+    pub fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        let lo = format!("{from:012}-000000");
+        let hi = format!("{to:012}-999999");
+        let rtx = self.db.begin_read()?;
+        let t = rtx.open_table(ENTITIES)?;
+        #[cfg(test)]
+        let mut visited = 0usize;
+        for row in t.range(lo.as_str()..=hi.as_str())? {
+            let (k, v) = row?;
+            let key = k.value();
+            let block = key
+                .get(..12)
+                .and_then(|b| b.parse::<u64>().ok())
+                .with_context(|| format!("corrupt entity key {key:?}"))?;
+            #[cfg(test)]
+            {
+                visited += 1;
+            }
+            if !visit(block, v.value()) {
+                break;
+            }
+        }
+        #[cfg(test)]
+        self.largest_scan_rows
+            .fetch_max(visited, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -1314,6 +1392,14 @@ impl HotStore for Store {
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         Store::entities_in_range(self, from, to)
     }
+    fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        Store::scan_entities_in_range(self, from, to, visit)
+    }
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
         Store::sample_entity_keys(self, limit)
     }
@@ -1551,6 +1637,14 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         (**self).entities_in_range(from, to)
+    }
+    fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        (**self).scan_entities_in_range(from, to, visit)
     }
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
         (**self).sample_entity_keys(limit)
