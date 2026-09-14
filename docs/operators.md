@@ -773,7 +773,7 @@ job:
 |---|---|---|
 | statement timeout | 30 s | a runaway (e.g. cartesian) query is interrupted mid-flight |
 | max result rows | 50,000 | the Rust-side result buffer, outside DuckDB's own memory limit |
-| max concurrent queries | 2 | the real DoS multiplier: a semaphore; excess returns `503`. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
+| max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
 | DuckDB memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Product of memory with the permit count is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially |

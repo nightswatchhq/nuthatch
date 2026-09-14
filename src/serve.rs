@@ -4813,10 +4813,11 @@ mod tests {
         .into_response();
         let waited = started.elapsed();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        // Without this the test passes just as well against an immediate refusal, and the whole
-        // change is invisible to it.
+        // A literal floor, deliberately not `SQL_ADMISSION_WAIT`: written against the constant this
+        // assertion still passes when the constant is mutated to zero, which is precisely the
+        // regression it exists to catch. 200 ms sits just under the 250 ms the constant declares.
         assert!(
-            waited >= SQL_ADMISSION_WAIT,
+            waited >= Duration::from_millis(200),
             "refused after {waited:?}, so the request was never queued"
         );
         drop(held);
