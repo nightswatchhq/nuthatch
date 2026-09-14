@@ -614,10 +614,17 @@ fn roost_ready(
 /// named origins - the result is either redundant or a mistake, and there is no reading of it that
 /// is obviously right, so it is refused rather than guessed at.
 ///
-/// Methods are `GET` and `OPTIONS` because the serving surface is read-only; a wider set would
-/// preflight verbs that answer 405 anyway. Request headers are mirrored rather than set to `*`:
-/// equally safe with no credentials, and better supported. The `/sql` guards already bound what a
-/// browser can cost the box, so this grants reach, not resources.
+/// Methods are `GET`, `POST` and `OPTIONS`. **`POST` is not an exception to the read-only surface,
+/// it is part of it**: the RFC-0053 GraphQL routes - `/graphql`, `/subgraphs/id/{id}`,
+/// `/subgraphs/name/{*name}` - take a query in a `POST` body, which is how every GraphQL client on
+/// the web speaks. A `GET`-only list reads as the safe choice and is in fact the broken one: the
+/// browser preflights `Access-Control-Request-Method: POST`, is refused, and never sends the query,
+/// so the flag appears to work everywhere except the surface a front end is most likely to want
+/// (Jules on #1384). Nothing here grants a *write*, because nothing on the router accepts one.
+///
+/// Request headers are mirrored rather than set to `*`: equally safe with no credentials, better
+/// supported, and it is what admits the `content-type: application/json` a GraphQL POST carries. The
+/// `/sql` guards already bound what a browser can cost the box, so this grants reach, not resources.
 pub fn cors_layer(origins: &[String]) -> Result<Option<tower_http::cors::CorsLayer>> {
     use axum::http::{HeaderValue, Method};
     use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
@@ -659,7 +666,7 @@ pub fn cors_layer(origins: &[String]) -> Result<Option<tower_http::cors::CorsLay
     Ok(Some(
         CorsLayer::new()
             .allow_origin(allow)
-            .allow_methods([Method::GET, Method::OPTIONS])
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
             .allow_headers(AllowHeaders::mirror_request()),
     ))
 }
@@ -5001,6 +5008,79 @@ mod tests {
             .unwrap()
             .to_ascii_uppercase();
         assert!(methods.contains("GET"), "preflight allowed {methods}");
+    }
+
+    /// Preflight `path` asking permission for `want_method`, exactly as a browser does before a
+    /// cross-origin request it cannot send speculatively.
+    async fn cors_preflight(
+        state: AppState,
+        origins: &[&str],
+        path: &str,
+        want_method: &str,
+    ) -> (StatusCode, axum::http::HeaderMap) {
+        use tower::ServiceExt;
+        let owned: Vec<String> = origins.iter().map(|s| s.to_string()).collect();
+        let app = match cors_layer(&owned).unwrap() {
+            Some(layer) => router(SharedNest::new(state)).layer(layer),
+            None => router(SharedNest::new(state)),
+        };
+        let req = axum::http::Request::builder()
+            .uri(path)
+            .method("OPTIONS")
+            .header("origin", "https://app.example.com")
+            .header("access-control-request-method", want_method)
+            .header("access-control-request-headers", "content-type")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        (resp.status(), resp.headers().clone())
+    }
+
+    /// **The RFC-0053 GraphQL routes take a `POST` body**, which is how every GraphQL client on the
+    /// web speaks, so a `GET`-only allow-list makes this flag useless for the surface a front end is
+    /// most likely to want. The browser preflights `POST`, is refused, and never sends the query -
+    /// and the failure looks like "CORS is broken" rather than "that method was not allowed".
+    ///
+    /// The first cut of this PR allowed `GET,OPTIONS` on the reasoning that the surface is
+    /// read-only. It is read-only *and* it answers POST; those are not the same statement.
+    #[tokio::test]
+    async fn a_graphql_post_is_preflight_authorised() {
+        for path in ["/graphql", "/subgraphs/id/QmAbc", "/subgraphs/name/a/b"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, headers) = cors_preflight(
+                test_state(tmp.path(), 2),
+                &["https://app.example.com"],
+                path,
+                "POST",
+            )
+            .await;
+            assert!(st.is_success(), "{path} preflight answered {st}");
+            assert_eq!(
+                headers.get("access-control-allow-origin").unwrap(),
+                "https://app.example.com",
+                "{path}"
+            );
+            let methods = headers
+                .get("access-control-allow-methods")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_ascii_uppercase();
+            assert!(
+                methods.contains("POST"),
+                "{path} preflight allowed {methods}, so a browser GraphQL client never sends the \
+                 query"
+            );
+            // The body carries JSON, so the header that names it must survive the preflight too.
+            let allowed = headers
+                .get("access-control-allow-headers")
+                .map(|v| v.to_str().unwrap().to_ascii_lowercase())
+                .unwrap_or_default();
+            assert!(
+                allowed.contains("content-type"),
+                "{path} refused content-type: {allowed}"
+            );
+        }
     }
 
     /// Every one of these refusals exists because the failure it prevents is *silent*: the browser

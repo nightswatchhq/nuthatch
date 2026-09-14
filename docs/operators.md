@@ -808,7 +808,11 @@ nuthatch dev --cors https://app.example.com --cors http://localhost:3000
 nuthatch serve --cors '*'          # any origin; fine for a public read-only nest
 ```
 
-It sets allow-origin, allow-methods `GET,OPTIONS` and allow-headers, and answers preflight. Values
+It sets allow-origin, allow-methods `GET,POST,OPTIONS` and allow-headers, and answers preflight.
+`POST` is there for the GraphQL routes (`/graphql`, `/subgraphs/id/{id}`, `/subgraphs/name/…`),
+which take their query in a body - a `GET`-only list would leave a browser GraphQL client
+preflighting `POST`, being refused, and never sending the query. Nothing on the router accepts a
+write. Values
 must be exact origins **with a scheme and no trailing slash** - `app.example.com` and
 `https://app.example.com/` are both refused at startup, because an `Origin` header never looks like
 either and the browser-side failure is a generic CORS error that tells an operator nothing. A single
