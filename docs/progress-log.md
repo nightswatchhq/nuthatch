@@ -27,6 +27,16 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   seal-direct paths. `maybe_seal` runs once per committed window, so a window's typed rows stay hot until
   its whole range has been fetched: 1,209,792 hot entities, 0 rows sealed and 1.3 GB RSS mid-window, with
   `documents_backlogged` idle because resolution had finished (0 pending). Unfixed here.
+- **2026-09-14 - #1376: a document nest's tip window is capped, and the tip path re-measured.** Jules
+  raised the unbounded tip window above on review. Both tip loops now choose their controller through one
+  `tip_window`, the rule the backfill paths already follow, so a document nest's window holds at
+  `DOCUMENT_WINDOW_CAP` (400 blocks) however few logs it sees; `runtime_index_loop` caps for the most
+  demanding nest on its cursor. Same QoS nest, same start block, tip path to block 48,219,399, release
+  build: peak RSS **1,219,297,280 bytes** with the cap against **1,622,310,912** without it, SIGTERM
+  mid-seal exited in **0.07 s**, and **5,815,234 rows sealed in 560 segments** while it ran, where the
+  uncapped run had sealed none by the same point. Sealing stayed within about 400 blocks of the tip.
+  **Open**: with the hot tip bounded, 1.22 GB is still held, so the peak is not the fetch window; what
+  holds it is not attributed. The runtime cursor's cap has no test of its own.
 - **2026-09-13 - RFC-0028 §4 amended: a seal cut is bounded by bytes; call bodies fetch in parallel;
   an aborted seal stops.** Chief ruled the byte bound on 2026-09-13. A cut is now the earliest of
   20,000 rows, 64 MiB of row JSON (`SEAL_DIRECT_BYTES`) and the span, all read from the rows, so
