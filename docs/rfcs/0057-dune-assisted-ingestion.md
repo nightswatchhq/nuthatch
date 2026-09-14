@@ -48,9 +48,9 @@ Everything below is designed to confirm, refute, or quantify those statements.
 
 | # | Hypothesis | Falsified if |
 |---|---|---|
-| H1 | Full-chain backfill from Dune is infeasible on Analyst: required export volume exceeds monthly allowance by ≥ 100× for every chain Nuthatch supports. | Any supported chain's raw logs+txs for the nest's required range fit in < 4 GB (10 months of allowance). |
+| H1 | Full-chain backfill from Dune is infeasible on Analyst: required export volume exceeds monthly allowance by ≥ 100× for every chain Nuthatch supports. | Any supported chain's raw logs+txs for the nest's required range fit in < 40 GB (100× the monthly allowance). |
 | H2 | A contract-scoped seed backfill (all logs for a fixed contract set) fits in one month's allowance for at least one real nest (candidate: The Graph protocol contracts on Arbitrum One). | Estimated export size > 400 MB for every candidate nest. |
-| H3 | The sparse block index cuts backfill RPC calls for a contract-scoped nest by ≥ 90 % versus range scanning, with Dune cost < 50 credits per nest. | Measured reduction < 90 % or Dune cost > 50 credits. |
+| H3 | The sparse block index cuts backfill RPC calls for a contract-scoped nest whose tables are all log-derived by ≥ 90 % versus range scanning, with Dune cost < 50 credits per nest. | Measured reduction < 90 % or Dune cost > 50 credits. |
 | H4 | Head-following from Dune is worse than RPC on every axis (latency, cost, reorg visibility) and should not be attempted. | A polling scheme exists that stays under 200 credits/mo with p95 latency < 60 s and detects reorgs. |
 | H5 | For full-chain nests, a self-hosted archive node (or a cheaper provider) beats both Alchemy and any Dune hybrid on cost per backfilled block. | Measured cost/block for self-host ≥ Alchemy cost/block after amortizing hardware over 12 months. |
 | H6 | Raw ingestion is (or can be) done once per chain and shared across nests; if it isn't, that duplication dominates the Alchemy bill more than provider pricing does. | Nuthatch already shares raw stores across nests, or duplication accounts for < 20 % of spend. |
@@ -94,6 +94,8 @@ Nest backfills by range-scanning RPC (`eth_getLogs` over windows, `eth_getBlockB
 4. Safety net: because the hint could be stale or wrong, run the NW-RFC-001 range checksum afterwards, and optionally a coarse RPC `eth_getLogs` over any window where Dune returned zero blocks (cheap when the answer really is zero).
 
 Trust: unchanged. Dune only narrows *where* Nuthatch looks. A missed block in the hint shows up as a checksum mismatch.
+
+Scope: the block list comes from `logs` alone, so S1 applies only to a nest whose tables are all log-derived. A block where a watched contract is called, or changes state, without emitting a log is not in the list. A nest that also decodes calldata or traces needs its relevant blocks from `transactions` or `traces` as well, which E4 and E5 do not measure; S1 is not accepted for that class without an experiment that does.
 
 ### S2 - Contract-scoped seed from Dune
 Export the full log set (and optionally tx bodies) for the contract set from Dune, load into a *seed* store, then have Nuthatch *re-fetch and verify* each block from RPC before sealing. This is only worth it if verification is cheaper than fetching cold, which is doubtful, since verification still needs the RPC bytes. Kept as a candidate to measure, expected to lose to S1.
@@ -176,7 +178,7 @@ S3 (adaptive windows) likely also requires an ingestion change; S2 needs a seed-
 | G0 (after E1) | Backfill duplication across nests > 20 % of spend | S6 becomes the priority; Dune work continues but is not the headline saving |
 | G1 (after E2) | H1 confirmed | Close Q1 for full-chain nests permanently; stop entertaining "backfill from Dune" |
 | G2 (after E3) | Seed for the candidate nest < 400 MB | S2 stays on the table for measurement; else S2 closed |
-| G3 (after E4+E5) | ≥ 90 % CU reduction, < 50 credits, no uncaught false negatives | S1 accepted as the standard backfill path for scoped nests; §8 determines whether it needs a separate RFC |
+| G3 (after E4+E5) | ≥ 90 % CU reduction, < 50 credits, no uncaught false negatives | S1 accepted as the standard backfill path for log-derived scoped nests; §8 determines whether it needs a separate RFC |
 | G4 (after E6) | Any kill criterion hit | H4 confirmed; head-following stays RPC forever; never revisit on this plan |
 | G5 (after E7) | Self-host cheaper per block at ≥ 1 full backfill/quarter | Recommend an archive box for full-chain nests; Alchemy retained for head-following and state |
 
@@ -263,3 +265,4 @@ Results are recorded on the tracking issue, #1381, not as files in this repo.
 |---|---|
 | 2026-09-14 | Initial draft |
 | 2026-09-14 | Numbered RFC-0057 in the nuthatch repo (#1381). The 2026 feature freeze ended on 2026-09-08 and carve-outs are retired, so a change an experiment needs is proposed as a separate RFC. Nuthatch indexes EVM chains only, so I11 and E8 ask about Dune's coverage of the chains it supports. Results go on #1381 rather than in repo files. |
+| 2026-09-14 | Review of #1382: H1's falsification threshold now matches its 100× claim (40 GB, not 4 GB), and S1, H3 and G3 are limited to log-derived scoped nests, since a block list from `logs` cannot see calls or state changes that emit nothing. |
