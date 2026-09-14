@@ -11932,7 +11932,7 @@ template = "pool"
         tables.extend(creg.schema(&config.extract));
         let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
         let source = PostSource(vec![(4, qos_post(&bad_cid)), (4, qos_post(&late_cid))]);
-        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true)
+        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, 4)
             .await
             .unwrap();
 
