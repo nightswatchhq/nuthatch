@@ -528,6 +528,16 @@ impl Config {
         for i in &cfg.ipfs {
             i.validate()?;
         }
+        let mut ipfs_tables = std::collections::HashSet::new();
+        for t in cfg
+            .ipfs
+            .iter()
+            .flat_map(|i| std::iter::once(&i.name).chain(i.rows.as_ref().map(|r| &r.table)))
+        {
+            if !ipfs_tables.insert(t) {
+                bail!("[[ipfs]] table `{t}` is declared twice - each document and typed table needs its own name");
+            }
+        }
         cfg.refuse_tip_finality_webhooks()?;
         Ok(cfg)
     }

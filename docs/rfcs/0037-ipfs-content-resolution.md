@@ -242,6 +242,63 @@ on every row written from this build on, rows older builds stored as `false` kee
 re-index either proves them or leaves them out. `init` still accepts an unproven manifest or ABI,
 loudly, as slice 1 decided.
 
+**Slice 8 - typed rows from a proven document.** Built 2026-09-13, unreleased. The QoS nest's daily
+rollups parsed each indexer-attempt document (1.7 to 1.9 MB of JSON, about 2,500 elements) with
+`from_json` and `unnest` at query time. One day of `qos_indexer_daily` measured 3.86 GB at peak, and
+`nuthatch serve` refused the views at its 2 GiB ceiling. A document can now be exploded once, at
+resolution, into a table of typed rows that views and sealed segments read as columns:
+
+```toml
+[[ipfs]]
+name = "qos_indexer_payload"
+on = "data_edge__call_submit_qo_s_payload"
+cid_column = "_payload"
+cid_json_path = "hash"
+json_match = { topic = "gateway_indexer_attempt_qos_5_minutes_prod_v3" }
+
+[ipfs.rows]
+table = "qos_indexer_attempt"
+max_rows = 4096
+keep_content = false
+columns = [
+  { name = "indexer_wallet", type = "address" },
+  { name = "start_epoch", type = "u64" },
+  { name = "query_count", type = "number" },
+]
+```
+
+- **One row per element.** An array is its elements, an object is one. Each row carries `cid`,
+  `document_log_index`, `source_log_index` (the row that named the document) and `element`, then the
+  declared columns, named for their top-level keys. Undeclared keys are not stored.
+- **Types.** `string`, `u64`, `i64`, `bool`, `address` (stored in one spelling) and `number`, which
+  keeps a JSON number as its decimal text so no float or rounding is chosen at ingest; a view casts it.
+  An absent or null `string` or `number` is empty text, which a view reads as NULL. The other types
+  have no honest empty value, so their absence refuses the document.
+- **Refused whole.** A document with more elements than `max_rows`, or an element that does not fit
+  its column, writes no document row and no typed rows, is given up on as slice 6 records it, and counts
+  in `nuthatch_nest_ipfs_rows_refused_total`. Rows from part of a document would roll up as though the
+  rest had never been served. The refusal follows from the bytes alone, so every operator refuses the
+  same document.
+- **Keys follow the plan.** With typed rows declared, a block's documents take `625_000..=625_999`
+  and their rows `626_000..=749_999`. Each document is allotted its declaration's `max_rows` in slot
+  order, whether or not the documents before it resolve, so a row's key never depends on which gateway
+  answered first. A document whose allotment would run past the band is refused before any fetch.
+- **Written together.** The document row and its typed rows land in one transaction, still conditional
+  on the naming row's block hash (`put_entities_if_named`), so no reader sees a document without its
+  rows and a reorg cannot be followed by either.
+- **Identity.** `rows` enters the declaration hash only when present, length-prefixed like slice 5's
+  keys, so every nest declared before it keeps its address.
+- **`keep_content = false`** stores the document row with empty `content`. The CID still names the
+  bytes the rows came from; re-fetching and re-verifying them is always possible.
+
+**Why the rollups are views and not entities.** RFC-0041 entities bind against the decoded event
+registry (`Binding::bind` reads `registry.schema()`), which holds no call or `[[ipfs]]` tables, and
+their circuits are fed from the ingest path, while resolved documents and their rows are written out of
+band by the resolver. Making an entity over typed rows means binding to the full table set and feeding
+the circuit from the resolver's writes, with reorg retractions for rows that arrive after their block
+was admitted. That is not a small change and is not in this slice. Views over typed columns are, and
+the serving measurements below are what decides whether they are enough.
+
 ## 6. Non-goals
 
 - **Not an IPFS node**, and not a pinning service. Nuthatch fetches and verifies; it does not host,

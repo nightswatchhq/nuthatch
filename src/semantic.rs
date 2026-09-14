@@ -224,7 +224,26 @@ pub fn generate(schema: &[TableSchema], nest_name: &str, chain: &str) -> Semanti
             columns.insert(col.name.clone(), desc);
         }
         let footguns = derive_footguns(t);
+        // `[[ipfs]]` tables are Call-kind with no selector; seeding them as `[[calls]]` results told an
+        // agent a typed-rows table was "one row per sampled block".
+        let has = |name: &str| t.columns.iter().any(|c| c.name == name);
+        let ipfs_document =
+            t.selector.is_empty() && has("cid") && has("content") && has("verified");
+        let ipfs_rows = t.selector.is_empty() && has("document_log_index") && has("element");
         let (description, grain) = match t.kind {
+            crate::registry::TableKind::Call if ipfs_rows => (
+                format!(
+                    "Typed rows from the proven IPFS documents an `[[ipfs]]` declaration resolves, one per \
+                     element, written with their document. {SEEDED}"
+                ),
+                "one row per element of a proven document".to_string(),
+            ),
+            crate::registry::TableKind::Call if ipfs_document => (
+                format!(
+                    "IPFS documents an `[[ipfs]]` declaration resolved, each proven against its CID. {SEEDED}"
+                ),
+                "one row per document a block's rows name".to_string(),
+            ),
             crate::registry::TableKind::Call => (
                 format!(
                     "Result of the `{}` call (selector `{}`). {SEEDED}",
@@ -706,6 +725,38 @@ mod tests {
     /// #539: the seeded description used to read "The `enabled` bool parameter" - a promise that it
     /// *is* a SQL boolean. It is exact text `'true'`/`'false'`, so the seeded text (the one every
     /// column gets, edited or not) must say so and give the working comparison.
+    /// `[[ipfs]]` tables are Call-kind with no selector. Seeded as `[[calls]]` results, a typed-rows table
+    /// told an agent it held "one row per sampled block this declaration fires at".
+    #[test]
+    fn ipfs_tables_are_not_seeded_as_call_results() {
+        let decl = crate::ipfs::IpfsDecl {
+            name: "docs".into(),
+            on: "nft__uri_set".into(),
+            cid_column: "uri".into(),
+            cid_json_path: None,
+            json_match: Default::default(),
+            rows: Some(crate::ipfs::IpfsRows {
+                table: "docs_rows".into(),
+                max_rows: 8,
+                keep_content: true,
+                columns: vec![crate::ipfs::RowColumn {
+                    name: "n".into(),
+                    ty: crate::ipfs::RowType::U64,
+                }],
+            }),
+        };
+        let seeded = generate(&crate::ipfs::schema(&[decl], true), "n", "mainnet");
+        assert_eq!(
+            seeded.tables["docs_rows"].grain,
+            "one row per element of a proven document"
+        );
+        assert_eq!(
+            seeded.tables["docs"].grain,
+            "one row per document a block's rows name"
+        );
+        assert!(!seeded.tables["docs"].description.contains("selector"));
+    }
+
     #[test]
     fn a_call_table_is_not_seeded_as_an_empty_event() {
         let table = TableSchema {
