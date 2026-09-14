@@ -131,6 +131,24 @@ json_match = { topic = "gateway_indexer_attempt_qos_5_minutes_prod_v3" }
                               # whose every block hashes to its CID. Otherwise NO row, counted in
                               # `nuthatch_nest_ipfs_unverified_total`, or `_oversize_total` past
                               # 16 MiB, 4,096 blocks or 16 levels.
+[ipfs.rows]                   # optional (RFC-0037 slice 8): explode each proven JSON document into
+                              # typed rows, so views read columns instead of parsing megabytes of JSON.
+table = "qos_indexer_attempt" # the typed table. Every row also carries `cid`, `document_log_index`,
+                              # `source_log_index` and `element`.
+max_rows = 4096               # most elements one document may have; also the key room it is allotted.
+                              # A block holds 124,000 typed rows in all. A document that does not fit
+                              # is refused before any fetch.
+keep_content = false          # default true; false stores the document row with empty `content`
+columns = [                   # one per top-level key: name = the key, type = string | number | u64 |
+                              # i64 | bool | address. `number` keeps the decimal text (cast it in a
+                              # view); an absent string or number is "", any other absent type refuses.
+  { name = "indexer_wallet", type = "address" },
+  { name = "query_count", type = "number" },
+]
+                              # A document whose elements do not fit is refused WHOLE: no document row,
+                              # no typed rows, given up on and counted in
+                              # `nuthatch_nest_ipfs_rows_refused_total`. Enters the identity only when
+                              # declared.
 
 [extract]                     # optional
 top_level_calls = true        # decode transactions sent directly to this nest's contracts - what a

@@ -28,6 +28,16 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   28 payloads, where the old build wrote one of each. **Watch**: 1.86 GiB is under the 2 GB budget by
   little, and what holds it is not isolated; the faster fetch drew one rate-limited timestamp batch from
   the two public endpoints, narrowed and retried. Mutation-proven: 7 of 7 caught.
+- **2026-09-13 - RFC-0037 slice 8: a proven IPFS document can become typed rows.** `[ipfs.rows]` explodes
+  a proven JSON document into one typed row per element at resolution, in a table of its own, written in the
+  same transaction as the document and still conditional on the naming row. Keys follow the plan: a block's
+  documents take `625_000..=625_999`, their rows `626_000..=749_999`, each document allotted its `max_rows` in
+  slot order, so a key never depends on which gateway answered first. A document that does not fit its
+  declared columns is refused whole and counted in `nuthatch_nest_ipfs_rows_refused_total`; `keep_content =
+  false` drops the raw JSON. The declaration enters identity only when present. Motive: the QoS nest's daily
+  rollups parsed megabytes of JSON per query, one day at 3.86 GB peak. Rollups over typed rows stay views:
+  RFC-0041 entities bind only decoded event tables and are fed from ingest, not from the resolver. Also:
+  `[[ipfs]]` tables are no longer seeded in `semantic.toml` as `[[calls]]` results.
 - **2026-09-13 - RFC-0037 slice 6: every document resolves, or is given up on in the open.** The
   per-window budget is gone: documents resolve out of band, re-derived from the hot store, with retry
   and backoff (a body cut off mid-read included), a recorded give-up after 10 failures, and sealing

@@ -11780,6 +11780,89 @@ template = "pool"
         handle.abort();
     }
 
+    /// RFC-0037 slice 8. A proven document lands with its typed rows in one write, and one whose content
+    /// does not fit the declaration is given up on rather than stored half typed.
+    #[tokio::test]
+    async fn a_documents_typed_rows_are_stored_with_it_or_not_at_all() {
+        let good = r#"[{"query_count":2364,"chain":"base"},{"query_count":7,"chain":"mainnet"}]"#
+            .to_string();
+        let bad = r#"[{"query_count":"many","chain":"base"}]"#.to_string();
+        let good_cid = crate::cid::cid_v0_for(good.as_bytes());
+        let bad_cid = crate::cid::cid_v0_for(bad.as_bytes());
+        let (gateway, _requests, handle) = content_gateway(
+            std::collections::HashMap::from([(good_cid.clone(), good), (bad_cid.clone(), bad)]),
+            0,
+        )
+        .await;
+        let dir = qos_typed_rows_nest();
+        let posts = vec![(4, qos_post(&good_cid)), (5, qos_post(&bad_cid))];
+        let (mut nest, state, source) = qos_nest_with(dir.path(), gateway, posts).await;
+        nest.process_window(source.as_ref(), &[], 4, 5, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        let gateways = nest.ipfs_gateways.clone();
+        drop(nest);
+        drop(state);
+
+        let store: Arc<dyn crate::store::HotStore> =
+            Arc::new(Store::open(&dir.path().join(DB_FILE)).unwrap());
+        let metrics = Arc::new(crate::metrics::NestMetrics::default());
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            store.clone(),
+            gate,
+            gateways,
+            true,
+            metrics.clone(),
+            fast_policy(3),
+        );
+        assert_eq!(
+            resolve_all(&mut resolver).await,
+            0,
+            "both documents are decided"
+        );
+
+        let rows_at = |block: u64, table: &str| -> Vec<serde_json::Value> {
+            store
+                .entities_in_range(block, block)
+                .unwrap()
+                .iter()
+                .map(|e| serde_json::from_str::<serde_json::Value>(e).unwrap())
+                .filter(|v| v["table"] == table)
+                .collect()
+        };
+        let documents = rows_at(4, "qos_payload");
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0]["content"], "",
+            "keep_content = false stores the document without its bytes"
+        );
+        let typed = rows_at(4, "qos_attempt");
+        assert_eq!(
+            typed
+                .iter()
+                .map(|r| (
+                    r["log_index"].as_u64().unwrap(),
+                    r["query_count"].as_u64().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [(626_000, 2364), (626_001, 7)]
+        );
+        assert!(
+            rows_at(5, "qos_payload").is_empty() && rows_at(5, "qos_attempt").is_empty(),
+            "a document that does not fit writes neither itself nor any row"
+        );
+        assert_eq!(metrics.ipfs_resolved(), 1);
+        assert_eq!(metrics.ipfs_rows_refused(), 1);
+        assert_eq!(
+            metrics.ipfs_given_up(),
+            1,
+            "a refused document is given up on, so its range can seal"
+        );
+        handle.abort();
+    }
+
     /// A gateway that hung up mid-body left its document unresolved for good: the 2026-09-07 00:10
     /// indexer-attempt bucket was lost that way, and shifted 49 of 56 indexers' daily figures. A body
     /// cut short is a failed fetch like any other, and is tried again.
@@ -11993,6 +12076,26 @@ template = "pool"
     const QOS_EDGE_ABI: &str = r#"[{"type":"function","name":"submitQoSPayload","inputs":[{"name":"_payload","type":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}]"#;
 
     /// An event-less DataEdge nest resolving one oracle topic.
+    fn qos_typed_rows_nest() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"qos-typed-rows\"\nchain = \"gnosis\"\nchain_id = 100\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"data_edge\"\naddress = \"{QOS_EDGE}\"\nabi = \"abis/data-edge.json\"\n\n\
+                 [extract]\ntop_level_calls = true\n\n\
+                 [[ipfs]]\nname = \"qos_payload\"\non = \"data_edge__call_submit_qo_s_payload\"\n\
+                 cid_column = \"_payload\"\ncid_json_path = \"hash\"\njson_match = {{ topic = \"t\" }}\n\n\
+                 [ipfs.rows]\ntable = \"qos_attempt\"\nmax_rows = 8\nkeep_content = false\n\
+                 columns = [{{ name = \"query_count\", type = \"u64\" }}, {{ name = \"chain\", type = \"string\" }}]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("abis/data-edge.json"), QOS_EDGE_ABI).unwrap();
+        dir
+    }
+
     fn qos_topic_nest(topic: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("abis")).unwrap();

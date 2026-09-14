@@ -314,6 +314,14 @@ pub trait HotStore: Send + Sync {
         source_key: &str,
         block_hash: &str,
     ) -> Result<bool>;
+    /// [`HotStore::put_entity_if_named`] for rows that stand or fall together: a document and the typed
+    /// rows it explodes into (RFC-0037 slice 8), so a reader never sees one without the other.
+    fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool>;
     fn get_entity(&self, key: &str) -> Result<Option<String>>;
     fn count(&self) -> Result<u64>;
     fn recent(&self, limit: usize) -> Result<Vec<String>>;
@@ -784,6 +792,20 @@ impl Store {
         source_key: &str,
         block_hash: &str,
     ) -> Result<bool> {
+        self.put_entities_if_named(
+            &[(key.to_string(), json.to_string())],
+            source_key,
+            block_hash,
+        )
+    }
+
+    /// See [`HotStore::put_entities_if_named`].
+    pub fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
         let named = {
@@ -792,7 +814,9 @@ impl Store {
                 .get(source_key)?
                 .is_some_and(|v| row_block_hash(v.value()).as_deref() == Some(block_hash));
             if named {
-                t.insert(key, json)?;
+                for (key, json) in entries {
+                    t.insert(key.as_str(), json.as_str())?;
+                }
             }
             named
         };
@@ -1433,6 +1457,14 @@ impl HotStore for Store {
     ) -> Result<bool> {
         Store::put_entity_if_named(self, key, json, source_key, block_hash)
     }
+    fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        Store::put_entities_if_named(self, entries, source_key, block_hash)
+    }
     fn get_entity(&self, key: &str) -> Result<Option<String>> {
         Store::get_entity(self, key)
     }
@@ -1687,6 +1719,14 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
         block_hash: &str,
     ) -> Result<bool> {
         (**self).put_entity_if_named(key, json, source_key, block_hash)
+    }
+    fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        (**self).put_entities_if_named(entries, source_key, block_hash)
     }
     fn get_entity(&self, key: &str) -> Result<Option<String>> {
         (**self).get_entity(key)

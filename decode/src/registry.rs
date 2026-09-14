@@ -275,7 +275,7 @@ pub const CALL_ROW_LOG_INDEX_BASE: u64 = 500_000;
 /// | Range | Rows |
 /// |---|---|
 /// | `500_000..=624_999` | pinned `eth_call` results ([`CALL_ROW_LOG_INDEX_BASE`]) |
-/// | `625_000..=749_999` | resolved IPFS documents ([`IPFS_ROW_LOG_INDEX_BASE`]) |
+/// | `625_000..=749_999` | resolved IPFS documents ([`IPFS_ROW_LOG_INDEX_BASE`]), and when a declaration explodes them into typed rows, documents in `625_000..=625_999` and their rows in `626_000..=749_999` ([`IPFS_DOCUMENT_ROW_LOG_INDEX_BASE`]) |
 /// | `750_000..=999_998` | decoded top-level calls (here) |
 /// | `999_999` | the block row ([`BLOCK_ROW_LOG_INDEX`]) |
 ///
@@ -288,6 +288,18 @@ pub const TX_CALL_ROW_LOG_INDEX_BASE: u64 = 750_000;
 /// A resolved document descends from no log: it is the content behind a CID some row referenced. Same
 /// reasoning as its neighbours, and the same band.
 pub const IPFS_ROW_LOG_INDEX_BASE: u64 = 625_000;
+
+/// Documents a block may hold once any declaration explodes documents into typed rows (RFC-0037 slice
+/// 8). Their rows need the rest of the IPFS band, so the documents give up all but its first thousand.
+pub const IPFS_DOCUMENT_SLOTS: u64 = 1_000;
+
+/// The first `log_index` of a document's typed rows. Each document is allotted its declaration's
+/// `max_rows` from here, in slot order, so a row's key follows from the plan and never from which
+/// documents happened to resolve first.
+pub const IPFS_DOCUMENT_ROW_LOG_INDEX_BASE: u64 = IPFS_ROW_LOG_INDEX_BASE + IPFS_DOCUMENT_SLOTS;
+
+/// The last `log_index` typed rows may take: the call band starts at the next one.
+pub const IPFS_DOCUMENT_ROW_LOG_INDEX_END: u64 = TX_CALL_ROW_LOG_INDEX_BASE - 1;
 
 /// A serializable table schema (per-event table + its columns).
 ///

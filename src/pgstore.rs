@@ -301,9 +301,22 @@ impl HotStore for PgStore {
         source_key: &str,
         block_hash: &str,
     ) -> Result<bool> {
+        self.put_entities_if_named(
+            &[(key.to_string(), json.to_string())],
+            source_key,
+            block_hash,
+        )
+    }
+
+    fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
         let schema = self.schema.clone();
         let held = self.held_fence();
-        let (key, json) = (key.to_string(), json.to_string());
+        let entries = entries.to_vec();
         let (source_key, block_hash) = (source_key.to_string(), block_hash.to_string());
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
@@ -323,7 +336,9 @@ impl HotStore for PgStore {
                 "INSERT INTO \"{schema}\".entities (key, value) VALUES ($1, $2) \
                  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
             );
-            tx.execute(&ins, &[&key, &json])?;
+            for (key, json) in &entries {
+                tx.execute(&ins, &[key, json])?;
+            }
             tx.commit()?;
             Ok(true)
         })
