@@ -1848,7 +1848,12 @@ async fn runtime_index_loop(
         }
     }
 
-    let mut chunker = AdaptiveWindow::for_window(window);
+    // The cursor is shared, so its window is capped for the most demanding nest on it.
+    let mut chunker = tip_window(
+        nests.iter().flatten().any(|n| n.ipfs_gate.is_some()),
+        nests.iter().flatten().any(|n| n.registry.blocks()),
+        window,
+    );
     let mut poll_failures = 0u32;
     // One dial per cursor (RFC-0040). Every nest on it was mounted by the same operator flags, so
     // they agree; if they ever did not, the cursor is as fresh as its most demanding nest needs.
@@ -2827,6 +2832,7 @@ async fn build_nest(
         sql_gate,
         sql_queued: Default::default(),
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
+        sql_max_hot_bytes: serve::SQL_MAX_HOT_BYTES,
         sql_max_named_scan_bytes: serve::SQL_MAX_NAMED_SCAN_BYTES,
         // Every cursor-owning role builds through here; `serve_role` flips it after (#1025).
         cursorless: false,
@@ -3472,7 +3478,16 @@ impl DirectExtras<'_> {
     ) -> Result<()> {
         if let Some(creg) = self.call_registry {
             rows.extend(
-                decode_top_level_calls(source, creg, addresses, from, to, timestamps).await?,
+                decode_top_level_calls(
+                    source,
+                    creg,
+                    addresses,
+                    from,
+                    to,
+                    timestamps,
+                    call_body_concurrency(),
+                )
+                .await?,
             );
         }
         if let Some(gate) = self.ipfs {
@@ -3513,25 +3528,107 @@ async fn decode_top_level_calls(
     from: u64,
     to: u64,
     timestamps: bool,
+    fanout: usize,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
+    use futures::stream::StreamExt;
     let mut call_rows = Vec::new();
     let want: Vec<u64> = (from..=to).collect();
     // Fetched and decoded a chunk at a time. Every full body of a 20,000-block Gnosis window held at
     // once reached 2.3 GB with nothing committed (measured 2026-09-13), past the per-cursor budget.
     for chunk in want.chunks(TOP_LEVEL_BODY_CHUNK) {
-        let bodies = retry_transient(
-            &format!("block bodies for {} block(s)", chunk.len()),
-            BACKFILL_RETRY_BASE,
-            || async { source.block_bodies(chunk).await },
-        )
-        .await?;
+        // Collected before streaming, as `RpcClient::blocks_with` does: a closure building the future
+        // inside the stream is not provably `Send` to the spawned ingest task.
+        let fetches: Vec<_> = chunk
+            .chunks(TOP_LEVEL_BODY_BATCH)
+            .map(|batch| fetch_body_batch(source, batch))
+            .collect();
+        let batches: Vec<Result<std::collections::HashMap<u64, serde_json::Value>>> =
+            futures::stream::iter(fetches)
+                .buffered(fanout.max(1))
+                .collect()
+                .await;
+        let mut bodies = std::collections::HashMap::with_capacity(chunk.len());
+        for batch in batches {
+            bodies.extend(batch?);
+        }
         decode_bodies(creg, addresses, chunk, &bodies, timestamps, &mut call_rows)?;
     }
     Ok(call_rows)
 }
 
+async fn fetch_body_batch(
+    source: &dyn Source,
+    batch: &[u64],
+) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+    retry_transient(
+        &format!("block bodies for {} block(s)", batch.len()),
+        BACKFILL_RETRY_BASE,
+        || async { source.block_bodies(batch).await },
+    )
+    .await
+}
+
+/// Outstanding documents at which the tip loop stops committing windows until the resolver catches up.
+/// A QoS payload is about 1.7 MB and 2,500 typed rows; the resolver fetches 8 at a time, so this is two
+/// of its passes, and keeps the hot tip within one seal cut and 40,000 rows of what has resolved.
+pub const MAX_OUTSTANDING_DOCUMENTS: u64 = 16;
+
+fn documents_backlogged(pending: u64) -> bool {
+    pending >= MAX_OUTSTANDING_DOCUMENTS
+}
+
+/// The window controller for a tip loop, by the same rule the backfill paths use. A document nest's
+/// rows stay hot until its window commits and seals, so its window is capped however few logs it sees.
+fn tip_window(documents: bool, headers: bool, window: u64) -> AdaptiveWindow {
+    if documents {
+        AdaptiveWindow::for_window_with_documents(window)
+    } else if headers {
+        AdaptiveWindow::for_window_with_headers(window)
+    } else {
+        AdaptiveWindow::for_window(window)
+    }
+}
+
 /// Blocks of full bodies held at once while decoding top-level calls.
 const TOP_LEVEL_BODY_CHUNK: usize = 200;
+
+/// Blocks per `eth_getBlockByNumber` batch within a chunk.
+const TOP_LEVEL_BODY_BATCH: usize = 20;
+
+/// Body batches in flight at once. Measured on rpc.gnosischain.com (2026-09-13), 20-body batches:
+/// 34 blocks/s serially, 114 at four, 145 at eight.
+pub const CALL_BODY_CONCURRENCY: usize = 4;
+
+/// A chunk holds ten batches, so more would buy nothing.
+pub const CALL_BODY_CONCURRENCY_CEILING: usize = TOP_LEVEL_BODY_CHUNK / TOP_LEVEL_BODY_BATCH;
+
+/// [`CALL_BODY_CONCURRENCY`] unless `NUTHATCH_CALL_BODY_CONCURRENCY` overrides, read once. Composes
+/// with `--concurrency` on the seal-direct path, where each window fetches its own bodies.
+pub fn call_body_concurrency() -> usize {
+    static FANOUT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FANOUT.get_or_init(|| match std::env::var("NUTHATCH_CALL_BODY_CONCURRENCY") {
+        Err(_) => CALL_BODY_CONCURRENCY,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) | Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    default = CALL_BODY_CONCURRENCY,
+                    "NUTHATCH_CALL_BODY_CONCURRENCY is not a positive integer; using the default"
+                );
+                CALL_BODY_CONCURRENCY
+            }
+            Ok(n) if n > CALL_BODY_CONCURRENCY_CEILING => {
+                tracing::warn!(
+                    requested = n,
+                    ceiling = CALL_BODY_CONCURRENCY_CEILING,
+                    "NUTHATCH_CALL_BODY_CONCURRENCY above the ceiling; clamping"
+                );
+                CALL_BODY_CONCURRENCY_CEILING
+            }
+            Ok(n) => n,
+        },
+    })
+}
 
 fn decode_bodies(
     creg: &crate::calldata::CallRegistry,
@@ -4369,7 +4466,9 @@ pub async fn backfill_direct_pipelined_with(
     // A blocks nest pays one header request per *block*, so its window ceiling is set by header cost
     // rather than log density (RFC-0036). Without this the zero-log ranges grow widest and demand the
     // most headers - which is how OBIB case 3 rate-limited itself into partial responses.
-    let chunker = std::sync::Arc::new(std::sync::Mutex::new(if registry.blocks() {
+    let chunker = std::sync::Arc::new(std::sync::Mutex::new(if extras.ipfs.is_some() {
+        AdaptiveWindow::for_window_with_documents(window)
+    } else if registry.blocks() {
         AdaptiveWindow::for_window_with_headers(window)
     } else {
         AdaptiveWindow::for_window(window)
@@ -4696,7 +4795,9 @@ pub async fn backfill_direct_factory_with(
     let mut total = 0u64;
     let mut flipped_logged = false;
     // A blocks nest pays per *block*, not per log, so its window ceiling is different (RFC-0036).
-    let mut chunker = if registry.blocks() {
+    let mut chunker = if extras.ipfs.is_some() {
+        AdaptiveWindow::for_window_with_documents(window)
+    } else if registry.blocks() {
         AdaptiveWindow::for_window_with_headers(window)
     } else {
         AdaptiveWindow::for_window(window)
@@ -5810,6 +5911,7 @@ impl NestIngest {
                     next,
                     to,
                     self.registry.timestamps(),
+                    call_body_concurrency(),
                 )
                 .await?;
             }
@@ -6078,11 +6180,7 @@ async fn index_loop(
     // hundred thousand headers in one window - trading a getLogs pathology for the header fan-out
     // pathology RFC-0036 exists to prevent. Capped, `observed(0)` settles at `HEADER_WINDOW_CAP`, which
     // is the intended steady state for a nest whose windows are all zero-log by construction.
-    let mut chunker = if nest.registry.blocks() {
-        AdaptiveWindow::for_window_with_headers(window)
-    } else {
-        AdaptiveWindow::for_window(window)
-    };
+    let mut chunker = tip_window(nest.ipfs_gate.is_some(), nest.registry.blocks(), window);
     // Live catch-up feedback (RFC-0015 slice 3): a single progress line while the hot loop chases
     // the tip for the *first* time, ending on a crisp "caught up". `None` until there's actually a
     // backlog to report; `caught_up` latches after the first catch-up so steady-state tip-following
@@ -6159,6 +6257,14 @@ async fn index_loop(
             // whether or not any block carried an event. At two seconds that is the whole bill of a
             // sparse nest; at five minutes it is a hundredth of it, for the same rows.
             sleep_for(nest.freshness.poll_interval).await;
+            continue;
+        }
+
+        // Documents resolve out of band, and a window committed ahead of them keeps its rows hot and
+        // its seal held until they arrive. Waiting here bounds that backlog, and what sealing and
+        // `/sql` read of it, without changing a single row or cut.
+        if nest.ipfs_gate.is_some() && documents_backlogged(nest.metrics.ipfs_pending()) {
+            sleep_secs(1).await;
             continue;
         }
 
@@ -6611,6 +6717,8 @@ async fn maybe_seal(
             }
         }
         from = cut + 1;
+        // Sealing is synchronous; yielding between segments lets an aborted ingest stop here.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -7910,6 +8018,83 @@ mod tests {
             largest < SEAL_DIRECT_BYTES + row + 1_024,
             "maybe_seal read {largest} bytes of rows at once against a {range_bytes}-byte range; a cut \
              is at most SEAL_DIRECT_BYTES and one row"
+        );
+    }
+
+    /// SIGTERM stopped the API and the ingest kept sealing for 26 s (qos-live/run3.log, 2026-09-13).
+    /// An abort lands only when a task pends, and in runtime shutdown the seal loop's `block_hash`
+    /// reads fail at once, so a seal under way ran every cut in one poll. This source never pends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_seal_stops_at_the_next_segment() {
+        struct HoldsFirstCut {
+            asked: std::sync::Mutex<Option<std::sync::mpsc::Sender<u64>>>,
+            go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        #[async_trait::async_trait]
+        impl Source for HoldsFirstCut {
+            async fn tip(&self) -> Result<u64> {
+                Ok(0)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                if let Some(asked) = self.asked.lock().unwrap().take() {
+                    asked.send(n).unwrap();
+                    // Holds the worker without pending, as a seal already under way does.
+                    self.go.lock().unwrap().recv().unwrap();
+                }
+                Ok(Some(format!("{n:064x}")))
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+        let n = SEAL_DIRECT_BATCH as u64 * 3;
+        load_rows(&store, n);
+        let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let source = HoldsFirstCut {
+            asked: std::sync::Mutex::new(Some(asked_tx)),
+            go: std::sync::Mutex::new(go_rx),
+        };
+        let (dir, sealer) = (tmp.path().to_path_buf(), store.clone());
+        let task = tokio::spawn(async move {
+            let metrics = crate::metrics::NestMetrics::default();
+            maybe_seal(
+                &dir,
+                sealer.as_ref(),
+                &source,
+                n - 1,
+                None,
+                &metrics,
+                SPAN_OFF,
+            )
+            .await
+        });
+        let first_cut = tokio::task::spawn_blocking(move || asked_rx.recv().unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        go_tx.send(()).unwrap();
+        assert!(
+            task.await
+                .expect_err("the seal ran to the end")
+                .is_cancelled(),
+            "the seal must end cancelled"
+        );
+        assert_eq!(
+            store
+                .get_meta(SEALED_THROUGH_KEY)
+                .unwrap()
+                .map(|s| s.parse::<u64>().unwrap()),
+            Some(first_cut),
+            "an aborted seal must stop after the segment it was writing, not run every cut"
         );
     }
 
@@ -11272,19 +11457,226 @@ template = "pool"
             posts: PostSource(vec![(3, qos_post(&cid)), (19_876, qos_post(&cid))]),
             widest: std::sync::atomic::AtomicUsize::new(0),
         };
-        let rows = decode_top_level_calls(&source, &creg, &[], 0, 19_999, true)
+        let rows = decode_top_level_calls(&source, &creg, &[], 0, 19_999, true, 4)
             .await
             .unwrap();
         assert_eq!(
             source.widest.load(std::sync::atomic::Ordering::SeqCst),
-            TOP_LEVEL_BODY_CHUNK,
-            "a window must be fetched a chunk of bodies at a time"
+            TOP_LEVEL_BODY_BATCH,
+            "a window must be fetched a batch of bodies at a time"
         );
         assert_eq!(
             rows.iter().map(|r| r.block_number).collect::<Vec<_>>(),
             [3, 19_876],
             "chunking must not lose a call at either end of the window"
         );
+    }
+
+    /// The tip loop outran resolution on the QoS nest: 90,000 blocks of windows committed while documents
+    /// were still arriving, so a million typed rows sat hot behind a held seal and every `/sql` copied
+    /// them (15.29 GB RSS, 2026-09-13).
+    #[test]
+    fn the_tip_loop_waits_once_documents_back_up() {
+        assert!(!documents_backlogged(MAX_OUTSTANDING_DOCUMENTS - 1));
+        assert!(documents_backlogged(MAX_OUTSTANDING_DOCUMENTS));
+        assert!(documents_backlogged(u64::MAX));
+    }
+
+    /// The tip loop's window had no document branch, so an event-less QoS nest grew it to 80,000 blocks
+    /// and held 1,209,792 typed rows hot, none sealed, before the window committed (#1376 review). A
+    /// document nest's tip window is capped as its seal-direct window is, however many empty windows.
+    #[test]
+    fn a_document_nests_tip_window_is_capped_however_few_logs_it_sees() {
+        let widest = |documents: bool, headers: bool| {
+            let mut w = tip_window(documents, headers, 20_000);
+            let mut most = w.window();
+            for _ in 0..32 {
+                w.observed(0);
+                most = most.max(w.window());
+            }
+            most
+        };
+        assert!(widest(true, false) <= crate::chunker::DOCUMENT_WINDOW_CAP);
+        assert!(
+            widest(true, true) <= crate::chunker::DOCUMENT_WINDOW_CAP,
+            "documents take precedence over headers"
+        );
+        assert!(widest(false, true) <= crate::chunker::HEADER_WINDOW_CAP);
+        assert!(
+            widest(false, false) > crate::chunker::HEADER_WINDOW_CAP,
+            "premise: an event nest's window still grows past both caps"
+        );
+    }
+
+    /// Bodies came one 200-block batch at a time, 77.6 blocks/s on rpc.gnosischain.com against the
+    /// 145 the endpoint serves to eight parallel batches (2026-09-13). The batches in a chunk overlap
+    /// now, up to the fan-out and never past it, and the calls still come back in chain order.
+    #[tokio::test]
+    async fn top_level_call_bodies_are_fetched_in_parallel_batches() {
+        struct InFlight {
+            posts: PostSource,
+            now: std::sync::atomic::AtomicUsize,
+            peak: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Source for InFlight {
+            async fn tip(&self) -> Result<u64> {
+                self.posts.tip().await
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                self.posts.block_hash(n).await
+            }
+            async fn logs(
+                &self,
+                f: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                self.posts.logs(f, from, to).await
+            }
+            async fn block_bodies(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                use std::sync::atomic::Ordering::SeqCst;
+                let now = self.now.fetch_add(1, SeqCst) + 1;
+                self.peak.fetch_max(now, SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                self.now.fetch_sub(1, SeqCst);
+                self.posts.block_bodies(blocks).await
+            }
+        }
+
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let cid = crate::cid::cid_v0_for(b"one post");
+        for fanout in [1, 4] {
+            let source = InFlight {
+                posts: PostSource(vec![
+                    (17, qos_post(&cid)),
+                    (95, qos_post(&cid)),
+                    (388, qos_post(&cid)),
+                ]),
+                now: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let rows = decode_top_level_calls(&source, &creg, &[], 0, 399, true, fanout)
+                .await
+                .unwrap();
+            assert_eq!(
+                source.peak.load(std::sync::atomic::Ordering::SeqCst),
+                fanout,
+                "body batches in flight must reach the fan-out and not pass it"
+            );
+            assert_eq!(
+                rows.iter().map(|r| r.block_number).collect::<Vec<_>>(),
+                [17, 95, 388],
+                "overlapping batches must still decode in chain order"
+            );
+        }
+    }
+
+    /// The other half of SIGTERM: an ingest pending on a body fetch stops when aborted.
+    #[tokio::test]
+    async fn an_aborted_fetch_stops_while_its_bodies_are_pending() {
+        struct Never;
+        #[async_trait::async_trait]
+        impl Source for Never {
+            async fn tip(&self) -> Result<u64> {
+                Ok(0)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(Some(format!("{n:064x}")))
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+            async fn block_bodies(
+                &self,
+                _blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                std::future::pending().await
+            }
+        }
+
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let task = tokio::spawn(async move {
+            decode_top_level_calls(&Never, &creg, &[], 0, 399, true, 4).await
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("an aborted fetch must stop");
+        assert!(joined
+            .expect_err("a pending fetch cannot finish")
+            .is_cancelled());
+    }
+
+    /// A seal-direct window holds its documents and their rows until it is merged, so a 20,000-block
+    /// Gnosis window held 1.2 million typed rows, 7.1 GB, before its first cut. A nest resolving
+    /// documents is fetched at most `DOCUMENT_WINDOW_CAP` blocks at a time, whatever `--window` says.
+    #[tokio::test]
+    async fn seal_direct_fetches_a_document_nest_a_capped_window_at_a_time() {
+        let body = r#"{"bucket":1}"#.to_string();
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 0).await;
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        let gateways = vec![gateway];
+        let source = PostSource(vec![(4, qos_post(&cid)), (4_900, qos_post(&cid))]);
+        let widest = std::sync::Mutex::new(0u64);
+        let mut last = 0u64;
+        backfill_direct_pipelined_with(
+            &source,
+            &registry,
+            dir.path(),
+            &[],
+            &[],
+            &[],
+            None,
+            100,
+            0,
+            5_000,
+            20_000,
+            SPAN_REAL,
+            1,
+            DirectExtras {
+                call_registry: Some(&creg),
+                ipfs: Some(&gate),
+                gateways: &gateways,
+                metrics: None,
+            },
+            |_| Ok(()),
+            |reached, _, _| {
+                let mut w = widest.lock().unwrap();
+                *w = (*w).max(reached.saturating_sub(last));
+                last = reached;
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            *widest.lock().unwrap() <= crate::chunker::DOCUMENT_WINDOW_CAP,
+            "a document nest advanced {} blocks in one window, past the {}-block cap",
+            *widest.lock().unwrap(),
+            crate::chunker::DOCUMENT_WINDOW_CAP
+        );
+        handle.abort();
     }
 
     /// `--seal-direct` wrote finalized history without decoding top-level calls or resolving the
@@ -11380,7 +11772,7 @@ template = "pool"
             tables.extend(creg.schema(&config.extract));
             let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
             let source = PostSource(vec![(4, qos_post(&cid))]);
-            let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true)
+            let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, 4)
                 .await
                 .unwrap();
 
@@ -11570,7 +11962,7 @@ template = "pool"
         tables.extend(creg.schema(&config.extract));
         let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
         let source = PostSource(vec![(4, qos_post(&bad_cid)), (4, qos_post(&late_cid))]);
-        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true)
+        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, 4)
             .await
             .unwrap();
 

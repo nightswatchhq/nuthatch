@@ -528,6 +528,7 @@ SQL surfaces). Full key reference:
 |---|---|
 | `NUTHATCH_ADMIN_TOKEN` | required for the admin UI when bound off-localhost; presented as `?token=` (and, from the next release, `Authorization: Bearer`) |
 | `NUTHATCH_SQL_MEMO_BYTES` | ceiling on the analytical memo's remembered rows, in serialized bytes (default 64 MiB; `0` turns it off). See *The analytical memo* under capacity and sizing. |
+| `NUTHATCH_CALL_BODY_CONCURRENCY` | block-body batches (20 blocks each) fetched at once for `top_level_calls` (default 4, ceiling 10). Memory stays one 200-block chunk of bodies whatever the value. On `--seal-direct` it multiplies with `--concurrency`, since each window fetches its own bodies. |
 
 **Runtime flags that matter operationally** (`dev` and `bench backfill`):
 

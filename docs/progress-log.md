@@ -13,6 +13,45 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-09-14 - #1376 measured again, on its merged head, with the review fixes in.** Merged #1375's review
+  fixes (block 0 held below an outstanding document; `--seal-direct` counting an unproven document as the
+  resolver does), #1391's scan that stops at a known span end, and its Postgres range scan that fetches a
+  16 MiB byte budget of rows rather than a thousand documents. QoS nest on `pete/qos-nest-typed-rows`,
+  Gnosis from block 48,119,000, `--ipfs https://ipfs.thegraph.com/ipfs/`, release build, `/usr/bin/time -l`.
+  **`--seal-direct`**: peak RSS **434,388,992 bytes**, SIGTERM during the seal exited in **0.14 s** with 25
+  segments written. **Tip path**: peak RSS **1,622,310,912 bytes**, SIGTERM during the seal exited in **0.3 s** with 14 segments written. The 1,998,815,232 bytes recorded above was measured before the typed-rows nest config and these fixes,
+  so the two are not a like-for-like pair.
+  **Open, found by this run: the tip path is not bounded for a document nest.** Its window controller
+  (`index_loop`, `AdaptiveWindow::for_window`) has no document branch, so on an event-less nest the window
+  grows toward `MAX_WINDOW` (80,000 blocks when measured); `DOCUMENT_WINDOW_CAP` applies only to the two
+  seal-direct paths. `maybe_seal` runs once per committed window, so a window's typed rows stay hot until
+  its whole range has been fetched: 1,209,792 hot entities, 0 rows sealed and 1.3 GB RSS mid-window, with
+  `documents_backlogged` idle because resolution had finished (0 pending). Unfixed here.
+- **2026-09-14 - #1376: a document nest's tip window is capped, and the tip path re-measured.** Jules
+  raised the unbounded tip window above on review. Both tip loops now choose their controller through one
+  `tip_window`, the rule the backfill paths already follow, so a document nest's window holds at
+  `DOCUMENT_WINDOW_CAP` (400 blocks) however few logs it sees; `runtime_index_loop` caps for the most
+  demanding nest on its cursor. Same QoS nest, same start block, tip path to block 48,219,399, release
+  build: peak RSS **1,219,297,280 bytes** with the cap against **1,622,310,912** without it, SIGTERM
+  mid-seal exited in **0.07 s**, and **5,815,234 rows sealed in 560 segments** while it ran, where the
+  uncapped run had sealed none by the same point. Sealing stayed within about 400 blocks of the tip.
+  **Open**: with the hot tip bounded, 1.22 GB is still held, so the peak is not the fetch window; what
+  holds it is not attributed. The runtime cursor's cap has no test of its own.
+- **2026-09-13 - RFC-0028 §4 amended: a seal cut is bounded by bytes; call bodies fetch in parallel;
+  an aborted seal stops.** Chief ruled the byte bound on 2026-09-13. A cut is now the earliest of
+  20,000 rows, 64 MiB of row JSON (`SEAL_DIRECT_BYTES`) and the span, all read from the rows, so
+  segments still do not depend on `--window`; a provisional segment is final past 16 MiB; the tip path
+  chooses a cut with a streaming scan and reads only `[from, cut]`. Event nests cut where they always
+  did. Block bodies for `top_level_calls` come in 20-block batches, 4 at once
+  (`NUTHATCH_CALL_BODY_CONCURRENCY`, ceiling 10). `maybe_seal` yields between segments, so an aborted
+  ingest stops at the next one: a SIGTERM that kept a seal running 26 s had caught it with nothing left
+  to pend, since shutdown RPC calls fail at once. **Measured on Gnosis**, the QoS nest without
+  `blocks = true` from 48,119,000, release builds, same config: peak RSS **11,352,539,136 bytes before,
+  1,998,815,232 after** (`/usr/bin/time -l`); 100,000 blocks at **79.7 blocks/s before, 138.6 after**;
+  SIGTERM during the seal exited in 0.35 s. The document tables sealed as 25 and 24 segments of about
+  28 payloads, where the old build wrote one of each. **Watch**: 1.86 GiB is under the 2 GB budget by
+  little, and what holds it is not isolated; the faster fetch drew one rate-limited timestamp batch from
+  the two public endpoints, narrowed and retried. Mutation-proven: 7 of 7 caught.
 - **2026-09-13 - RFC-0037 slice 8: a proven IPFS document can become typed rows.** `[ipfs.rows]` explodes
   a proven JSON document into one typed row per element at resolution, in a table of its own, written in the
   same transaction as the document and still conditional on the naming row. Keys follow the plan: a block's

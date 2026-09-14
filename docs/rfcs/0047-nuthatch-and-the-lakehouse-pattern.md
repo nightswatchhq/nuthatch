@@ -221,7 +221,7 @@ footer audit on a real nest (the #889 method). Any deviation is a writer-config 
 | Page checksums | enabled | cheap, segments are forever |
 | Dictionary | on, fall back on near-unique 32-byte columns | defaults waste space on hashes |
 | Sort | `(block_number, tx_index, log_index)` where those columns exist | dominant predicate; must match the catalogue promise |
-| Row group size | not a 128 MiB target | we seal on a row threshold at a data-chosen block boundary (`SEAL_DIRECT_BATCH`). One group per seal is the current shape. Changing it is a second decision, priced against #889's per-file cost, not copied from a lakehouse cookbook |
+| Row group size | not a 128 MiB target | we seal on a row or byte threshold at a data-chosen block boundary (`SEAL_DIRECT_BATCH`, and since 2026-09-13 `SEAL_DIRECT_BYTES`, RFC-0028 §4 amendment). One group per seal is the current shape. Changing it is a second decision, priced against #889's per-file cost, not copied from a lakehouse cookbook |
 
 Each proposed change is a new-seal-only writer-config fix. None rewrites history.
 

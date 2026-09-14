@@ -835,6 +835,24 @@ fn test_remove_after_define() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
     HOOK.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Runs once, right after a plan has read the manifest: the window a fold landing mid-plan hits.
+#[cfg(test)]
+type AfterManifestRead = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+fn test_after_manifest_read() -> &'static Mutex<HashMap<PathBuf, AfterManifestRead>> {
+    static HOOK: OnceLock<Mutex<HashMap<PathBuf, AfterManifestRead>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_after_manifest_read(dir: &Path, f: AfterManifestRead) {
+    test_after_manifest_read()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), f);
+}
+
 #[cfg(test)]
 pub(crate) fn test_set_remove_after_define(dir: &Path, file: Option<PathBuf>) {
     let mut m = test_remove_after_define().lock().unwrap();
@@ -855,7 +873,83 @@ pub(crate) fn test_set_remove_after_define(dir: &Path, file: Option<PathBuf>) {
 /// ("No files found that match the pattern") or at execution ("Cannot open file"), always naming a
 /// path under the segments directory; nothing else on this surface produces either wording with that
 /// path in it.
+/// Interrupt handles of the DuckDB statements running now, so a shutdown can stop them rather than
+/// drain behind them.
+type LiveHandles = Mutex<Vec<(u64, PathBuf, Arc<duckdb::InterruptHandle>)>>;
+
+fn live_queries() -> &'static LiveHandles {
+    static LIVE: OnceLock<LiveHandles> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static LIVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct LiveQuery(u64);
+
+impl LiveQuery {
+    fn register(dir: &Path, handle: Arc<duckdb::InterruptHandle>) -> LiveQuery {
+        let id = LIVE_SEQ.fetch_add(1, Ordering::SeqCst);
+        live_queries()
+            .lock()
+            .unwrap()
+            .push((id, dir.to_path_buf(), handle.clone()));
+        // A statement that starts after the signal must not run to completion either.
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            handle.interrupt();
+        }
+        LiveQuery(id)
+    }
+}
+
+impl Drop for LiveQuery {
+    fn drop(&mut self) {
+        live_queries()
+            .lock()
+            .unwrap()
+            .retain(|(id, _, _)| *id != self.0);
+    }
+}
+
+/// Stop every running statement and refuse to let new ones run. Called from the shutdown signal, before
+/// the server drains in-flight requests: a `/sql` still executing kept SIGTERM waiting 5.63 s.
+pub fn interrupt_for_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    for (_, _, handle) in live_queries().lock().unwrap().iter() {
+        handle.interrupt();
+    }
+}
+
+/// [`interrupt_for_shutdown`] for one dataset and without the latch, so a test cannot stop another
+/// test's statements.
+#[cfg(test)]
+fn interrupt_live_in(dir: &Path) {
+    for (_, d, handle) in live_queries().lock().unwrap().iter() {
+        if d == dir {
+            handle.interrupt();
+        }
+    }
+}
+
+/// A planned segment was missing because the catalogue changed after the plan read it.
+#[derive(Debug)]
+struct SegmentSetChanged;
+
+impl std::fmt::Display for SegmentSetChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the sealed segment set changed while this query was being planned; it was not answered \
+             from a partial set",
+        )
+    }
+}
+
+impl std::error::Error for SegmentSetChanged {}
+
 fn segment_vanished(e: &anyhow::Error) -> bool {
+    if e.chain().any(|c| c.is::<SegmentSetChanged>()) {
+        return true;
+    }
     let text = format!("{e:#}");
     let marker = format!("/{}/", crate::seal::SEGMENTS_DIR);
     text.contains(&marker)
@@ -892,6 +986,9 @@ fn run(
     // budget in query execution alone, plus whatever the sweep cost. Sharing one deadline across both
     // attempts and the sweep makes `guard.timeout` the actual wall-clock ceiling on the whole call.
     let deadline = guard.map(|g| Instant::now() + g.timeout);
+    // Held across both attempts and the collect, so no file a plan named is deleted by a fold
+    // before the rows are read (`seal::ReadLease`).
+    let _lease = crate::seal::read_lease(dir);
     let nothing_excluded = std::collections::BTreeSet::new();
     let first = attempt(
         dir,
@@ -1204,6 +1301,7 @@ fn attempt(
             std::fs::remove_file(&f).expect("test hook: remove the planned segment");
         }
         let cap = guard.map(|g| g.max_rows);
+        let _live = LiveQuery::register(dir, conn.interrupt_handle());
         let outcome = evaluate.then(|| collect(conn, sql, cap));
 
         // Stop the watchdog before interpreting the result: a value arriving before the deadline makes
@@ -2382,6 +2480,11 @@ fn define_views_bound(
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
     let (manifest, catalogue_hash) = crate::seal::load_manifest_with_hash(dir)?;
+    let mut overtaken = false;
+    #[cfg(test)]
+    if let Some(f) = test_after_manifest_read().lock().unwrap().remove(dir) {
+        f();
+    }
     let mut schema = schema_columns(dir);
     // #729: the table-name check above (#663) stops here at the table's *existence* - a table already
     // on disk kept exactly the columns `schema.json` had, even when the live registry (a re-fetched ABI,
@@ -2479,6 +2582,11 @@ fn define_views_bound(
                         // table's cold data is reduced, loudly, and queries keep working.
                         if let Ok(meta) = std::fs::metadata(&p) {
                             Some((format!("'{}'", p.display()), meta.len()))
+                        } else if crate::seal::catalogue_hash(dir).ok().flatten() != catalogue_hash {
+                            // Gone because the catalogue moved under this plan, not because it was
+                            // quarantined: reducing would answer short, so the plan is redone.
+                            overtaken = true;
+                            None
                         } else {
                             // Stays at `warn!`: the usual cause is `verify_and_quarantine` having
                             // already moved this file aside and logged it at `error!` at startup, and
@@ -2629,6 +2737,9 @@ fn define_views_bound(
             }
             None => {}
         }
+    }
+    if overtaken {
+        return Err(SegmentSetChanged.into());
     }
     Ok(DefinedViews {
         degraded,
@@ -3760,6 +3871,203 @@ template="pool"
         // existing missing-file behaviour; on a live nest it would instead see the folded segment.
         assert_eq!(n[0]["n"], Value::from(1u64));
         test_set_remove_after_define(dir.path(), None);
+    }
+
+    fn fold_row(b: u64) -> String {
+        format!(
+            r#"{{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"1","block_number":{b},"tx_hash":"0xt","log_index":0}}"#
+        )
+    }
+
+    fn only_provisional(dir: &Path) -> PathBuf {
+        let manifest = crate::seal::load_manifest(dir).unwrap();
+        let segs = &manifest.tables["usdc__transfer"];
+        assert_eq!(segs.len(), 1, "one provisional segment");
+        assert!(
+            segs[0].provisional,
+            "the fixture must be under the table floor, so a seal folds it"
+        );
+        crate::seal::segment_path(dir, &segs[0].file, &segs[0].hash)
+    }
+
+    fn count(dir: &Path) -> QueryOutput {
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(30),
+            max_rows: 10,
+        };
+        query_guarded(dir, r#"SELECT count(*) AS n FROM "usdc__transfer""#, guard).unwrap()
+    }
+
+    /// N4a's live run: a `/sql` read planned against the manifest, a seal folded the provisional
+    /// segment and deleted the file the plan named, and the read found it missing, logged "cold data
+    /// reduced" and answered short. The fold lands here right after the plan read the manifest. The
+    /// plan's lease must keep the replaced file on disk until its rows are read, then release it.
+    #[test]
+    fn a_fold_after_the_plan_read_the_manifest_is_answered_from_the_plans_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (10..13).map(fold_row).collect();
+        crate::seal::seal_range(dir.path(), &rows, 10, 12).unwrap();
+        let replaced = only_provisional(dir.path());
+
+        let fold_dir = dir.path().to_path_buf();
+        test_set_after_manifest_read(
+            dir.path(),
+            Box::new(move || {
+                let more: Vec<String> = (13..15).map(fold_row).collect();
+                crate::seal::seal_range(&fold_dir, &more, 13, 14).unwrap();
+            }),
+        );
+        let out = count(dir.path());
+        assert!(
+            out.degraded_tables.is_empty(),
+            "a fold under a plan must not reduce the table: {:?}",
+            out.degraded_tables
+        );
+        assert_eq!(
+            out.rows[0]["n"],
+            Value::from(3u64),
+            "the plan read the manifest before the fold, so it answers from that segment set, whole"
+        );
+        assert!(
+            !replaced.exists(),
+            "the replaced file must be deleted once no plan can still read it"
+        );
+        assert_eq!(count(dir.path()).rows[0]["n"], Value::from(5u64));
+    }
+
+    /// The second line of defence, for a file removed by something a lease cannot hold back: missing,
+    /// with the catalogue changed since the plan read it, is a plan overtaken rather than a
+    /// quarantined segment, and the query plans again instead of answering from what is left.
+    #[test]
+    fn a_planned_segment_gone_with_the_catalogue_moved_is_replanned_not_reduced() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (10..13).map(fold_row).collect();
+        crate::seal::seal_range(dir.path(), &rows, 10, 12).unwrap();
+        let replaced = only_provisional(dir.path());
+
+        let fold_dir = dir.path().to_path_buf();
+        test_set_after_manifest_read(
+            dir.path(),
+            Box::new(move || {
+                let more: Vec<String> = (13..15).map(fold_row).collect();
+                crate::seal::seal_range(&fold_dir, &more, 13, 14).unwrap();
+                std::fs::remove_file(&replaced).unwrap();
+            }),
+        );
+        let out = count(dir.path());
+        assert!(
+            out.degraded_tables.is_empty(),
+            "an overtaken plan must be redone, not reduced: {:?}",
+            out.degraded_tables
+        );
+        assert_eq!(out.rows[0]["n"], Value::from(5u64));
+    }
+
+    /// SIGTERM waited 5.63 s behind a `/sql` still executing: the server drains in-flight requests, and
+    /// nothing stopped the statement. A running statement must end when the live queries are interrupted.
+    #[test]
+    fn a_running_query_stops_when_live_queries_are_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (0..2_000u64).map(fold_row).collect();
+        crate::seal::seal_range(dir.path(), &rows, 0, 1_999).unwrap();
+        let path = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = query(
+                &path,
+                r#"SELECT count(*) AS n FROM "usdc__transfer" a, "usdc__transfer" b, "usdc__transfer" c"#,
+            );
+            let _ = tx.send(r.is_err());
+        });
+        let started = Instant::now();
+        while !live_queries()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, d, _)| d == dir.path())
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the query never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        interrupt_live_in(dir.path());
+        let failed = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("an interrupted statement must stop, not run eight billion rows to the end");
+        assert!(failed, "an interrupted statement must fail, not answer");
+    }
+
+    /// The same race without a hook: readers query while a writer folds, one row at a time. No answer
+    /// may be short of the rows committed before its query began, none may be flagged reduced, and no
+    /// retired file may outlive the last reader.
+    #[test]
+    fn readers_racing_folds_never_answer_short_and_leave_no_file_behind() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::seal_range(dir.path(), &[fold_row(0)], 0, 0).unwrap();
+        let committed = Arc::new(AtomicU64::new(1));
+        let done = Arc::new(AtomicBool::new(false));
+        const FOLDS: u64 = 120;
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (dir, committed, done) =
+                    (dir.path().to_path_buf(), committed.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut answered = 0u64;
+                    while !done.load(Ordering::SeqCst) {
+                        let before = committed.load(Ordering::SeqCst);
+                        let out = count(&dir);
+                        assert!(
+                            out.degraded_tables.is_empty(),
+                            "a read racing a fold was reduced: {:?}",
+                            out.degraded_tables
+                        );
+                        let n = out.rows[0]["n"].as_u64().unwrap();
+                        assert!(
+                            n >= before,
+                            "a read answered {n} rows with {before} committed before it began"
+                        );
+                        answered += 1;
+                    }
+                    answered
+                })
+            })
+            .collect();
+
+        for b in 1..=FOLDS {
+            crate::seal::seal_range(dir.path(), &[fold_row(b)], b, b).unwrap();
+            committed.store(b + 1, Ordering::SeqCst);
+        }
+        done.store(true, Ordering::SeqCst);
+        let answered: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(
+            answered > FOLDS,
+            "the readers must have raced the folds, not trailed them"
+        );
+
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let named: std::collections::BTreeSet<String> = manifest
+            .tables
+            .values()
+            .flatten()
+            .map(|s| s.file.clone())
+            .collect();
+        let on_disk: std::collections::BTreeSet<String> =
+            std::fs::read_dir(dir.path().join(crate::seal::SEGMENTS_DIR))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.ends_with(".parquet"))
+                .collect();
+        assert_eq!(
+            on_disk, named,
+            "retired files must be deleted once their readers are done"
+        );
+        assert_eq!(count(dir.path()).rows[0]["n"], Value::from(FOLDS + 1));
     }
 
     /// An unconfigured process still opens DuckDB at today's 512 MB / 2 threads. Raising the permit

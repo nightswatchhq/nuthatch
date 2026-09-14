@@ -327,10 +327,106 @@ pub fn seal_range_with_snapshot(
 
     manifest.manifest_version = MANIFEST_VERSION;
     save_manifest(dir, &manifest)?;
-    // The manifest is installed and fsynced; nothing references these any more. A failure here is
-    // a stray file, which is disk and not data, so it is logged rather than returned: the seal
-    // itself has already happened.
-    for old in folded_away {
+    // The new manifest no longer names these, but a reader holding a lease from before it was
+    // installed may still be about to open one; see `retire`.
+    retire(dir, folded_away);
+    Ok(Some(summary))
+}
+
+/// Readers of each dataset's segments, and the files a fold replaced that must outlive them.
+///
+/// A `/sql` read plans against the manifest and opens the files it names later, when DuckDB executes.
+/// A fold that deleted the replaced file as soon as its new manifest was installed could land in
+/// between, and the read then found a planned segment missing and answered short. A reader holds a
+/// [`ReadLease`] from before it reads the manifest until its rows are collected; a replaced file is
+/// deleted only once no lease that could have planned against the old manifest is still held.
+#[derive(Default)]
+struct Leases {
+    /// Bumped by every retirement. A lease records the epoch it was taken in.
+    epoch: u64,
+    /// Open leases per epoch.
+    readers: BTreeMap<u64, usize>,
+    /// Replaced files with the epoch they were retired in.
+    retired: Vec<(u64, PathBuf)>,
+}
+
+fn leases() -> &'static Mutex<HashMap<PathBuf, Leases>> {
+    static LEASES: OnceLock<Mutex<HashMap<PathBuf, Leases>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One key per dataset however a caller spelled its path.
+fn lease_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Holds `dir`'s segment set for the lifetime of the value. Take it before reading the manifest.
+pub struct ReadLease {
+    key: PathBuf,
+    epoch: u64,
+}
+
+pub fn read_lease(dir: &Path) -> ReadLease {
+    let key = lease_key(dir);
+    let mut all = leases().lock().unwrap();
+    let state = all.entry(key.clone()).or_default();
+    *state.readers.entry(state.epoch).or_insert(0) += 1;
+    ReadLease {
+        key,
+        epoch: state.epoch,
+    }
+}
+
+impl Drop for ReadLease {
+    fn drop(&mut self) {
+        let doomed = {
+            let mut all = leases().lock().unwrap();
+            let Some(state) = all.get_mut(&self.key) else {
+                return;
+            };
+            if let Some(n) = state.readers.get_mut(&self.epoch) {
+                *n -= 1;
+                if *n == 0 {
+                    state.readers.remove(&self.epoch);
+                }
+            }
+            releasable(state)
+        };
+        remove_retired(doomed);
+    }
+}
+
+/// Hand replaced files to the lease registry. Called after the manifest that stops naming them is
+/// installed, so a lease taken after this call reads that manifest and never plans against them.
+fn retire(dir: &Path, files: Vec<PathBuf>) {
+    if files.is_empty() {
+        return;
+    }
+    let doomed = {
+        let mut all = leases().lock().unwrap();
+        let state = all.entry(lease_key(dir)).or_default();
+        let epoch = state.epoch;
+        state.epoch += 1;
+        state.retired.extend(files.into_iter().map(|f| (epoch, f)));
+        releasable(state)
+    };
+    remove_retired(doomed);
+}
+
+/// Retired files no open lease can still be reading: those retired before the oldest open lease was
+/// taken, or all of them when none is open.
+fn releasable(state: &mut Leases) -> Vec<PathBuf> {
+    let oldest = state.readers.keys().next().copied();
+    let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.retired)
+        .into_iter()
+        .partition(|(retired_in, _)| oldest.is_none_or(|o| o > *retired_in));
+    state.retired = kept;
+    done.into_iter().map(|(_, f)| f).collect()
+}
+
+/// A failure here is a stray file, which is disk and not data: logged, never returned.
+fn remove_retired(files: Vec<PathBuf>) {
+    for old in files {
         if let Err(e) = std::fs::remove_file(&old) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(
@@ -340,7 +436,6 @@ pub fn seal_range_with_snapshot(
             }
         }
     }
-    Ok(Some(summary))
 }
 
 /// A segment's rows back as the JSON objects `rows_to_batch` was given, so a provisional segment
