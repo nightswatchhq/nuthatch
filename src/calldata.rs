@@ -813,13 +813,14 @@ mod tests {
     }
 
     /// A named tuple argument is stored as an object and an unnamed one as an array, so they hash
-    /// apart (#1364), while a tuple-free surface keeps its v3.6.1 hash. That literal is the v3.6.1
-    /// line format, `f|alias|contract|selector|signature|name:type,...`, hashed by hand.
+    /// apart (#1364), while a tuple-free surface keeps its line format. That literal is the v3.6.1
+    /// line format, `f|alias|contract|selector|signature|name:type,...`, plus the `implicit|tx_from`
+    /// line every call table's sender column added, hashed by hand.
     #[test]
     fn a_named_tuple_argument_moves_the_hash_and_nothing_else_does() {
         assert_eq!(
             hex::encode(reg(ERC20, &Extract::default()).hash()),
-            "fc780503e494c575b6968ac98b681f1b0c5ab230522d02c4c43790f3746b79af"
+            "9a93fa9e219f876f560e24aae134240413cedd1b9aff67229d46cda8b88f39fd"
         );
         let place = |a: &str, b: &str| {
             format!(
