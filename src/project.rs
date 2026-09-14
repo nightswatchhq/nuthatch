@@ -2650,6 +2650,7 @@ dataSources:
             .to_string_lossy()
             .into_owned();
         let args = InitArgs {
+            explorer: None,
             addresses: vec![],
             from: None,
             from_subgraph: Some(source.clone()),
