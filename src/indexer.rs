@@ -50,6 +50,9 @@ const DEFAULT_BACKFILL: u64 = 5_000;
 /// the shared pipeline. The colocated-reth front-end (`nuthatch-node`, RFC-0003) builds an ExEx
 /// `Source` instead and calls [`run`] directly - same core, different tip source.
 pub async fn dev(args: DevArgs) -> Result<()> {
+    // First, before the config is read or a single RPC round trip is made: a malformed `--cors`
+    // value should cost the operator a second, not a chain-id verification.
+    let cors = crate::serve::cors_layer(&args.cors)?;
     let dir = PathBuf::from(&args.dir);
     let mut config = Config::load(&dir)?;
     // RFC-0023 tier 3's archive endpoints. Carried on `Config` because every layer below already
@@ -89,9 +92,6 @@ pub async fn dev(args: DevArgs) -> Result<()> {
             interval: args.publish_interval,
             parallelism: args.publish_parallelism as usize,
         });
-    // Built here rather than at the bind: a malformed `--cors` value should stop the process
-    // before a single block is indexed, not after.
-    let cors = crate::serve::cors_layer(&args.cors)?;
     run(
         source,
         dir,
@@ -2831,6 +2831,8 @@ async fn build_nest(
 /// onto the trait; until then this is a real limitation rather than a rough edge, and it is why the
 /// compose file mounts the nest directory into the FE.
 pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
+    // As in `dev`: refused before anything is opened, so the error is about the flag and nothing else.
+    let cors = crate::serve::cors_layer(&args.cors)?;
     let dir = PathBuf::from(&args.dir);
     let mut config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (run `nuthatch init` first)", dir.display()))?;
@@ -2934,7 +2936,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
             )
         })
         .transpose()?;
-    serve::run(&args.listen, state, crate::serve::cors_layer(&args.cors)?).await
+    serve::run(&args.listen, state, cors).await
 }
 
 /// Open the shared hot store an FE serves from.

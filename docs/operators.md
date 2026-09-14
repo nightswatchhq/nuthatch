@@ -798,6 +798,27 @@ comparison is constant-time. `--no-admin` removes the routes entirely rather tha
 **`/metrics` and `/health` are unauthenticated by design.** Scope them to your internal network at the
 gateway if you do not want them public.
 
+**Browser front ends: `--cors` (#1318).** By default a nest sends no `Access-Control-Allow-Origin`,
+so a page served from another origin cannot call it at all, and the only answer was a reverse proxy
+or routing through your own server. Both are correct and both are a wall for anyone who just wants a
+page to read a nest. `dev` and `serve` take `--cors <ORIGIN>`, repeatable:
+
+```bash
+nuthatch dev --cors https://app.example.com --cors http://localhost:3000
+nuthatch serve --cors '*'          # any origin; fine for a public read-only nest
+```
+
+It sets allow-origin, allow-methods `GET,OPTIONS` and allow-headers, and answers preflight. Values
+must be exact origins **with a scheme and no trailing slash** - `app.example.com` and
+`https://app.example.com/` are both refused at startup, because an `Origin` header never looks like
+either and the browser-side failure is a generic CORS error that tells an operator nothing. A single
+`*` may not be combined with named origins.
+
+**What it does not do.** It grants reach, not resources: every guard in the table above still
+applies, and the flag adds no authentication. A nest on a public bind with `--cors '*'` is a public
+read-only API, which may be exactly what you want - decide that deliberately. Omit the flag and
+nothing about the nest changes.
+
 **Run it unprivileged.** A dedicated service user, `0700` on the nest directory, `MemoryMax` set to
 the cursor budget. The binary needs outbound network to your RPC endpoints and webhook sinks, nothing
 else.
