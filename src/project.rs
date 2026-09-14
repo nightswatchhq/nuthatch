@@ -848,6 +848,7 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
     if !config.calls.is_empty() {
         schema.extend(crate::calls::schema(&config.calls, registry.timestamps()));
     }
+    crate::indexer::refuse_duplicate_tables(&schema)?;
     let hash = decode_identity(dir, config, &registry)?;
     std::fs::write(
         dir.join("schema.json"),

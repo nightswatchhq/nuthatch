@@ -2303,6 +2303,23 @@ pub fn full_schema(
     tables
 }
 
+/// Refuse a composed schema in which two sources declare one table. Config validation sees only its own
+/// declarations, not the event and call tables the ABIs produce, so a `[[ipfs]]` or `[ipfs.rows]` name
+/// can land on one of those; its rows would then be read with the other table's columns.
+pub fn refuse_duplicate_tables(tables: &[crate::registry::TableSchema]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for t in tables {
+        if !seen.insert(t.table.as_str()) {
+            anyhow::bail!(
+                "table `{}` is declared twice in this nest - an `[[ipfs]]` name, an `[ipfs.rows]` \
+                 table, a `[[calls]]` name and every event and call table must each be unique",
+                t.table
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Build one nest's runtime state *without* starting the tip loop: open its store, build its decode
 /// registry + IVM views, run the warm-restart rebuilds, and assemble both the [`NestIngest`] the
 /// ingestion loop drives and the [`serve::AppState`] the API serves - the two sharing the same view
@@ -2668,6 +2685,7 @@ async fn build_nest(
         if let Some(calls) = &call_registry {
             tables.extend(calls.schema(&config.extract));
         }
+        refuse_duplicate_tables(&tables)?;
         crate::ipfs_resolve::Gate::new(&config.ipfs, &tables)
     };
 
@@ -11956,6 +11974,48 @@ template = "pool"
         );
         assert_eq!(metrics.ipfs_given_up(), 2);
         handle.abort();
+    }
+
+    /// Config validation compared `[[ipfs]]` names only with each other, so an `[ipfs.rows]` table named
+    /// after the nest's own call table was accepted and the composed schema carried that table twice
+    /// (#1375 review). The nest now refuses to build, and `schema.json` refuses to be written.
+    #[tokio::test]
+    async fn a_typed_table_named_like_an_existing_table_is_refused() {
+        let dir = qos_typed_rows_nest();
+        let path = dir.path().join(crate::config::CONFIG_FILE);
+        let cfg = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            cfg.contains("table = \"qos_attempt\""),
+            "premise: the fixture names its typed table"
+        );
+        std::fs::write(
+            &path,
+            cfg.replace(
+                "table = \"qos_attempt\"",
+                "table = \"data_edge__call_submit_qo_s_payload\"",
+            ),
+        )
+        .unwrap();
+        let config =
+            Config::load(dir.path()).expect("the collision is not visible to config alone");
+        let source: Arc<dyn Source> = Arc::new(PostSource(vec![]));
+        let err = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .err()
+        .expect("a nest whose typed table collides with its call table must not build");
+        assert!(
+            format!("{err:#}").contains("`data_edge__call_submit_qo_s_payload` is declared twice"),
+            "{err:#}"
+        );
     }
 
     /// A gateway that hung up mid-body left its document unresolved for good: the 2026-09-07 00:10
