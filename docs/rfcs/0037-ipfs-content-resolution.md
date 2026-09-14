@@ -167,7 +167,7 @@ to 1.9 MB, so every one of them was in that case. Slice 7 closes that. And a CID
 per-window budget, or whose gateways all fail, is never attempted again: the out-of-band resolver the
 budget warning refers to does not exist yet. Slice 6 builds it.
 
-**Slice 6 - resolution completes.** Built 2026-09-13, unreleased. The per-window budget is gone.
+**Slice 6 - resolution completes.** Built 2026-09-13, shipped v3.8.0. The per-window budget is gone.
 Documents resolve out of band behind the cursor (`src/ipfs_resolve.rs`), from a work list re-derived
 from the rows already in the hot store: a document's key is a function of its block's rows alone, so
 nothing extra is recorded and a restart loses nothing. A failed fetch, a body cut off mid-read
@@ -242,7 +242,7 @@ on every row written from this build on, rows older builds stored as `false` kee
 re-index either proves them or leaves them out. `init` still accepts an unproven manifest or ABI,
 loudly, as slice 1 decided.
 
-**Slice 8 - typed rows from a proven document.** Built 2026-09-13, unreleased. The QoS nest's daily
+**Slice 8 - typed rows from a proven document.** Built 2026-09-13, shipped v3.8.0. The QoS nest's daily
 rollups parsed each indexer-attempt document (1.7 to 1.9 MB of JSON, about 2,500 elements) with
 `from_json` and `unnest` at query time. One day of `qos_indexer_daily` measured 3.86 GB at peak, and
 `nuthatch serve` refused the views at its 2 GiB ceiling. A document can now be exploded once, at
