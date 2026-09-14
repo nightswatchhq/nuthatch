@@ -1517,7 +1517,11 @@ pub async fn dev(
     no_admin: bool,
     fail_fast: bool,
     freshness: crate::freshness::Freshness,
+    cors: Vec<String>,
 ) -> Result<()> {
+    // Before the mount table is even read: a malformed origin should fail the command, not the
+    // fifteenth minute of a backfill.
+    let cors = crate::serve::cors_layer(&cors)?;
     let mounts = MountTable::load(&dir)?;
     if mounts.mount_refs().is_empty() {
         anyhow::bail!(
@@ -1843,7 +1847,7 @@ pub async fn dev(
         admin_token.clone(),
     ));
     let result = tokio::select! {
-        r = crate::serve::bind_and_serve(&listen, service) => r,
+        r = crate::serve::bind_and_serve(&listen, service, cors) => r,
         r = supervise_cursors(&mut ingests, &health, fail_fast) => r,
     };
     for (_, h) in &ingests {

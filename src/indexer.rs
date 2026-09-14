@@ -89,6 +89,9 @@ pub async fn dev(args: DevArgs) -> Result<()> {
             interval: args.publish_interval,
             parallelism: args.publish_parallelism as usize,
         });
+    // Built here rather than at the bind: a malformed `--cors` value should stop the process
+    // before a single block is indexed, not after.
+    let cors = crate::serve::cors_layer(&args.cors)?;
     run(
         source,
         dir,
@@ -100,6 +103,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         args.window,
         args.no_admin,
         publish,
+        cors,
     )
     .await
 }
@@ -238,7 +242,9 @@ pub async fn upgrade(
         let mut serve_task = {
             let old_shared = old_shared.clone();
             tokio::spawn(async move {
-                serve::run_two_versions(&listen, old_shared, &new_prefix, new_shared).await
+                // `upgrade` has its own flags and #1318 asks only for `dev` and `serve`, so a
+                // hot upgrade serves without CORS rather than inventing a value nobody passed.
+                serve::run_two_versions(&listen, old_shared, &new_prefix, new_shared, None).await
             })
         };
         let r = tokio::select! {
@@ -252,7 +258,7 @@ pub async fn upgrade(
         // Slice 2b - serve old, index new, atomically flip once caught up, retire old.
         let mut serve_task = {
             let shared = old_shared.clone();
-            tokio::spawn(async move { serve::run_shared(&listen, shared).await })
+            tokio::spawn(async move { serve::run_shared(&listen, shared, None).await })
         };
         let mut catchup_task = {
             let old_store = old_store.clone();
@@ -613,6 +619,7 @@ pub async fn run(
     window_override: Option<u64>,
     no_admin: bool,
     publish: Option<crate::publish::Settings>,
+    cors: Option<tower_http::cors::CorsLayer>,
 ) -> Result<()> {
     // Admin UI (RFC-0010 Part A): on by default on localhost. Off-localhost it needs an explicit token
     // (auth is the operator's gateway's job, but the local UI should never appear unguarded on a public
@@ -643,7 +650,7 @@ pub async fn run(
     // not keep serving stale data as if healthy - a silent failure (deadlock-review finding C1). Select
     // over both: whichever ends first decides the exit, and an indexing error/panic propagates out.
     let result = tokio::select! {
-        r = serve::run(&listen, state) => r,
+        r = serve::run(&listen, state, cors) => r,
         joined = &mut ingest => match joined {
             Ok(inner) => inner,
             Err(e) if e.is_panic() => Err(anyhow::anyhow!("indexing loop panicked")),
@@ -2927,7 +2934,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
             )
         })
         .transpose()?;
-    serve::run(&args.listen, state).await
+    serve::run(&args.listen, state, crate::serve::cors_layer(&args.cors)?).await
 }
 
 /// Open the shared hot store an FE serves from.

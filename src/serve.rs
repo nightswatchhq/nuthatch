@@ -325,14 +325,22 @@ pub fn router(backing: SharedNest) -> Router {
     .with_state(backing)
 }
 
-pub async fn run(listen: &str, state: AppState) -> Result<()> {
-    run_shared(listen, SharedNest::new(state)).await
+pub async fn run(
+    listen: &str,
+    state: AppState,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Result<()> {
+    run_shared(listen, SharedNest::new(state), cors).await
 }
 
 /// Serve a caller-held [`SharedNest`] - the variant a hot upgrade uses so it can keep the handle and
 /// atomically flip the backing (RFC-0020 slice 2b) while serving stays up on the same listener.
-pub async fn run_shared(listen: &str, shared: SharedNest) -> Result<()> {
-    bind_and_serve(listen, router(shared)).await
+pub async fn run_shared(
+    listen: &str,
+    shared: SharedNest,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Result<()> {
+    bind_and_serve(listen, router(shared), cors).await
 }
 
 /// Serve **two versions** of a nest on distinct endpoints behind one listener (RFC-0020 slice 3, the
@@ -346,8 +354,9 @@ pub async fn run_two_versions(
     old: SharedNest,
     new_prefix: &str,
     new: SharedNest,
+    cors: Option<tower_http::cors::CorsLayer>,
 ) -> Result<()> {
-    bind_and_serve(listen, two_version_router(old, new_prefix, new)).await
+    bind_and_serve(listen, two_version_router(old, new_prefix, new), cors).await
 }
 
 /// The two-version app (RFC-0020 slice 3): old at the root, wrapped in a `Deprecation`/`Link` layer;
@@ -384,9 +393,10 @@ pub async fn run_runtime(
     roster: serde_json::Value,
     nests: Vec<(String, AppState)>,
     health: Arc<crate::health::RuntimeHealth>,
+    cors: Option<tower_http::cors::CorsLayer>,
 ) -> Result<()> {
     let live = LiveRuntime::new(compose_runtime(roster, nests, health));
-    bind_and_serve(listen, live.service()).await
+    bind_and_serve(listen, live.service(), cors).await
 }
 
 /// Compose the runtime's routes for a given nest set: the root endpoints plus every nest nested under
@@ -592,8 +602,81 @@ fn roost_ready(
     (code, Json(body))
 }
 
+/// Build the CORS layer for `--cors` (#1318), or `None` when the flag was not given.
+///
+/// **Off by default, and that is the whole point of the shape.** A nest sends no
+/// `Access-Control-Allow-Origin` unless an operator asks for one, so nothing about the default
+/// surface changes and deleting this feature would cost a self-hoster nothing. What it replaces is
+/// the README's honest but unhelpful advice to put a reverse proxy in front, which is a wall for
+/// someone with a weekend.
+///
+/// `*` allows any origin; otherwise each value is matched exactly. `*` may not be combined with
+/// named origins - the result is either redundant or a mistake, and there is no reading of it that
+/// is obviously right, so it is refused rather than guessed at.
+///
+/// Methods are `GET` and `OPTIONS` because the serving surface is read-only; a wider set would
+/// preflight verbs that answer 405 anyway. Request headers are mirrored rather than set to `*`:
+/// equally safe with no credentials, and better supported. The `/sql` guards already bound what a
+/// browser can cost the box, so this grants reach, not resources.
+pub fn cors_layer(origins: &[String]) -> Result<Option<tower_http::cors::CorsLayer>> {
+    use axum::http::{HeaderValue, Method};
+    use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
+
+    if origins.is_empty() {
+        return Ok(None);
+    }
+    let wildcard = origins.iter().any(|o| o == "*");
+    if wildcard && origins.len() > 1 {
+        anyhow::bail!(
+            "--cors * cannot be combined with named origins (got: {})",
+            origins.join(", ")
+        );
+    }
+    let allow = if wildcard {
+        AllowOrigin::any()
+    } else {
+        let mut parsed = Vec::with_capacity(origins.len());
+        for o in origins {
+            // Both of these refusals exist because the failure they prevent is silent: a value that
+            // cannot match any `Origin` header produces a browser error that reads as "CORS is
+            // broken" rather than "that value was wrong", and the operator has no way to tell.
+            if !(o.starts_with("http://") || o.starts_with("https://")) {
+                anyhow::bail!("--cors {o} is not an origin: it needs a scheme, e.g. https://{o}");
+            }
+            if o.ends_with('/') {
+                anyhow::bail!(
+                    "--cors {o} has a trailing slash, and an Origin header never does, so it would \
+                     match nothing"
+                );
+            }
+            parsed.push(
+                o.parse::<HeaderValue>()
+                    .with_context(|| format!("--cors {o} is not a valid header value"))?,
+            );
+        }
+        AllowOrigin::list(parsed)
+    };
+    Ok(Some(
+        CorsLayer::new()
+            .allow_origin(allow)
+            .allow_methods([Method::GET, Method::OPTIONS])
+            .allow_headers(AllowHeaders::mirror_request()),
+    ))
+}
+
 /// Bind `listen` and serve `app` until a shutdown signal - the shared tail of [`run`]/[`run_runtime`].
-pub async fn bind_and_serve(listen: &str, app: Router) -> Result<()> {
+///
+/// `cors` is [`cors_layer`]'s result: `None` leaves the app exactly as it was composed, which is
+/// what every caller that has not been given `--cors` passes.
+pub async fn bind_and_serve(
+    listen: &str,
+    app: Router,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Result<()> {
+    let app = match cors {
+        Some(layer) => app.layer(layer),
+        None => app,
+    };
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind {listen}"))?;
@@ -4788,6 +4871,171 @@ mod tests {
         .into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         drop(held);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `--cors` (#1318). Driven through the real `router()` with the layer applied exactly as
+    // `bind_and_serve` applies it, not through a hand-built app: three fixtures in this file's
+    // history proved a handler and never the wiring, and this is a flag whose entire content is
+    // wiring.
+    // ---------------------------------------------------------------------------------------
+
+    /// Drive one request through `router()` with `origins` configured, returning the response
+    /// headers - `None` for the `Origin` header means an ordinary same-origin-ish request.
+    async fn cors_get(
+        state: AppState,
+        origins: &[&str],
+        method: &str,
+        origin: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap) {
+        use tower::ServiceExt;
+        let owned: Vec<String> = origins.iter().map(|s| s.to_string()).collect();
+        let app = match cors_layer(&owned).unwrap() {
+            Some(layer) => router(SharedNest::new(state)).layer(layer),
+            None => router(SharedNest::new(state)),
+        };
+        let mut req = axum::http::Request::builder().uri("/tables").method(method);
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+            if method == "OPTIONS" {
+                req = req.header("access-control-request-method", "GET");
+            }
+        }
+        let resp = app
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        (resp.status(), resp.headers().clone())
+    }
+
+    /// The deletion test the sprint rules ask of every optional feature: with the flag absent the
+    /// binary is byte-for-byte the nest it was, and a self-hoster who never heard of `--cors` loses
+    /// nothing and gains no header.
+    #[tokio::test]
+    async fn without_the_flag_a_nest_sends_no_cors_headers() {
+        assert!(
+            cors_layer(&[]).unwrap().is_none(),
+            "no --cors must compose no layer at all, not a permissive one"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, headers) = cors_get(
+            test_state(tmp.path(), 2),
+            &[],
+            "GET",
+            Some("https://app.example.com"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(
+            headers.get("access-control-allow-origin").is_none(),
+            "a default nest answered a cross-origin request with {headers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_origin_is_allowed_for_any_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, headers) = cors_get(
+            test_state(tmp.path(), 2),
+            &["*"],
+            "GET",
+            Some("https://anything.example"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            headers.get("access-control-allow-origin").unwrap(),
+            "*",
+            "--cors '*' must allow the caller"
+        );
+    }
+
+    /// A named origin is a real restriction, not decoration: the origin that was named gets the
+    /// header and one that was not gets nothing, which is the only thing making `--cors` anything
+    /// other than a synonym for `*`.
+    #[tokio::test]
+    async fn a_named_origin_allows_only_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = "https://app.example.com";
+        let (st, headers) =
+            cors_get(test_state(tmp.path(), 2), &[allowed], "GET", Some(allowed)).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), allowed);
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let (st, headers) = cors_get(
+            test_state(tmp2.path(), 2),
+            &[allowed],
+            "GET",
+            Some("https://evil.example.com"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(
+            headers.get("access-control-allow-origin").is_none(),
+            "an origin that was not named was allowed anyway: {headers:?}"
+        );
+    }
+
+    /// A browser sends `OPTIONS` before the real call; if that is not answered the front end never
+    /// makes the request at all, so the flag would look broken while every GET worked in curl.
+    #[tokio::test]
+    async fn a_preflight_is_answered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, headers) = cors_get(
+            test_state(tmp.path(), 2),
+            &["*"],
+            "OPTIONS",
+            Some("https://anything.example"),
+        )
+        .await;
+        assert!(
+            st.is_success(),
+            "preflight answered {st}, so a browser would never send the GET"
+        );
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        let methods = headers
+            .get("access-control-allow-methods")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_uppercase();
+        assert!(methods.contains("GET"), "preflight allowed {methods}");
+    }
+
+    /// Every one of these refusals exists because the failure it prevents is *silent*: the browser
+    /// reports a generic CORS error and the operator cannot tell a wrong value from a broken flag.
+    #[test]
+    fn an_origin_that_could_never_match_is_refused_at_startup() {
+        let err = |v: &[&str]| {
+            cors_layer(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .expect_err("should have been refused")
+                .to_string()
+        };
+        assert!(
+            err(&["app.example.com"]).contains("needs a scheme"),
+            "{}",
+            err(&["app.example.com"])
+        );
+        assert!(
+            err(&["https://app.example.com/"]).contains("trailing slash"),
+            "{}",
+            err(&["https://app.example.com/"])
+        );
+        let mixed = err(&["*", "https://app.example.com"]);
+        assert!(mixed.contains("cannot be combined"), "{mixed}");
+        // And the values that are fine stay fine, or the guard above is just a wall.
+        for ok in [
+            vec!["*"],
+            vec!["http://localhost:3000"],
+            vec!["https://a.example.com", "https://b.example.com"],
+        ] {
+            let owned: Vec<String> = ok.iter().map(|s| s.to_string()).collect();
+            assert!(
+                cors_layer(&owned).unwrap().is_some(),
+                "{ok:?} should have been accepted"
+            );
+        }
     }
 
     /// A multichain runtime runs one cursor per chain, so `/<nest>/ready` must answer from **that
