@@ -376,6 +376,18 @@ fn is_over_cap(e: &anyhow::Error) -> bool {
     e.is::<crate::cid::OverCap>()
 }
 
+/// Count a failed fetch the same way on every path, returning whether it was over the caps.
+fn count_failure(metrics: &crate::metrics::NestMetrics, e: &anyhow::Error) -> bool {
+    if e.is::<Unproven>() {
+        metrics.add_ipfs_unverified(1);
+    }
+    let over_cap = is_over_cap(e);
+    if over_cap {
+        metrics.add_ipfs_oversize(1);
+    }
+    over_cap
+}
+
 struct Work {
     planned: Planned,
     failures: u32,
@@ -556,13 +568,7 @@ impl Resolver {
                     let Some(w) = self.work.get_mut(&key) else {
                         continue;
                     };
-                    if e.is::<Unproven>() {
-                        self.metrics.add_ipfs_unverified(1);
-                    }
-                    let over_cap = is_over_cap(&e);
-                    if over_cap {
-                        self.metrics.add_ipfs_oversize(1);
-                    }
+                    let over_cap = count_failure(&self.metrics, &e);
                     w.failures += 1;
                     if over_cap || w.failures >= self.policy.attempts {
                         tracing::warn!(
@@ -642,6 +648,7 @@ pub async fn resolve_inline(
     policy: &Policy,
     rows: &[DecodedRow],
     timestamps: bool,
+    metrics: &crate::metrics::NestMetrics,
 ) -> (Vec<DecodedRow>, usize) {
     let mut by_block: BTreeMap<u64, Vec<&DecodedRow>> = BTreeMap::new();
     for r in rows
@@ -676,7 +683,7 @@ pub async fn resolve_inline(
                     Ok(content) => return (p, Some(content)),
                     Err(e) => {
                         failures += 1;
-                        if is_over_cap(&e) || failures >= policy.attempts {
+                        if count_failure(metrics, &e) || failures >= policy.attempts {
                             tracing::warn!(
                                 "ipfs: gave up on {} (block {}) after {failures} failed fetches: {e:#}",
                                 p.cid,
@@ -708,6 +715,7 @@ pub async fn resolve_inline(
             None => given_up += 1,
         }
     }
+    metrics.add_ipfs_given_up(given_up as u64);
     out.sort_by_key(|r| (r.block_number, r.log_index));
     (out, given_up)
 }

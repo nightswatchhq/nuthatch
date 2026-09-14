@@ -1,0 +1,61 @@
+schema_version = 1
+
+[nest]
+description = "Golden fixture for the Dune emitter."
+
+[table.vault__transfer]
+description = "ERC-20 transfers of the vault share token."
+grain = "one row per Transfer event"
+
+[table.vault__transfer.columns]
+from = "Sender of the shares."
+to = "Receiver of the shares."
+value = "Shares moved, in base units."
+
+[table.vault__transfer.footguns]
+reserved_words = ["from", "to"]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.pool__swap]
+description = """Swaps against the pool.
+Signed amounts are from the pool's side."""
+grain = "one row per Swap event"
+
+[table.pool__swap.columns]
+amount0 = "Token0 delta, signed."
+liquidity = "In-range liquidity after the swap."
+delta = "Signed 128-bit delta."
+sqrtPriceX96 = "Square root price, Q64.96."
+tick = "Tick after the swap."
+fee = "Pool fee in hundredths of a bip."
+deadline = "Unix deadline."
+
+[table.pool__swap.footguns]
+reserved_words = ["offset"]
+big_ints = ["amount0", "liquidity", "delta", "sqrtPriceX96"]
+overflows_dec = ["amount0", "sqrtPriceX96"]
+
+[table.registry__record_set]
+description = "A record was set."
+grain = "one row per RecordSet event"
+
+[table.registry__record_set.columns]
+label = "The record label."
+node = "Namehash of the record."
+data = "Raw record payload."
+name = "Display name."
+enabled = "Whether the record resolves."
+meta = "Owner and expiry, as JSON."
+
+[table.registry__record_set.footguns]
+bools = ["enabled"]
+
+[table.vault__paused]
+description = "The vault was paused."
+
+[table.total_supply]
+description = "Result of totalSupply()."
+
+[table.total_supply.footguns]
+bools = ["reverted"]

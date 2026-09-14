@@ -342,6 +342,31 @@ pub trait HotStore: Send + Sync {
         anyhow::bail!("this hot-store backend cannot report a byte-exact query snapshot")
     }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>>;
+    /// Rows in `[from, to]` in chain order, handed to `visit` as `(block, json)` until it returns
+    /// `false`. Choosing a seal cut reads only as far as the cut; this default still loads the range.
+    fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        for json in self.entities_in_range(from, to)? {
+            let block = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|v| match v.get("block_number")? {
+                    serde_json::Value::Number(n) => n.as_u64(),
+                    serde_json::Value::String(s) => s.parse().ok(),
+                    _ => None,
+                })
+                .with_context(|| {
+                    format!("a stored row in {from}..={to} carries no block_number")
+                })?;
+            if !visit(block, &json) {
+                break;
+            }
+        }
+        Ok(())
+    }
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>>;
 
     // ---- cursor & meta ----------------------------------------------------------------------
@@ -438,6 +463,12 @@ pub struct Store {
     /// analytical memo keys on it (#1186): two `/sql` requests separated by no commit read the
     /// same hot rows, and it is this counter rather than a scan of them that says so.
     writes: Arc<std::sync::atomic::AtomicU64>,
+    /// Bytes of the largest `entities_in_range` answer, so a test can hold sealing to reading a cut.
+    #[cfg(test)]
+    pub(crate) largest_range_read: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rows visited by the longest single `scan_entities_in_range`, for the same reason.
+    #[cfg(test)]
+    pub(crate) largest_scan_rows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Does the store at `path` hold indexed rows, as opposed to merely existing?
@@ -461,6 +492,49 @@ pub struct Store {
 ///
 /// Errors are returned rather than folded into `false`: an unreadable store is not an empty one, and
 /// the caller is the only one who knows which way to be wrong about it.
+/// The meta key under which a store records the decode registry it was indexed by.
+///
+/// Lives here rather than in `indexer` because it is a property of the store's meta table, and two
+/// spellings of one key is exactly the drift that [`recorded_registry_hash`] exists to close.
+pub const REGISTRY_KEY: &str = "registry_hash";
+/// Which formula [`REGISTRY_KEY`] was recorded under. Absent means the event registry alone; present
+/// means the full decode identity, which also covers call, `[[ipfs]]` and `[[calls]]` declarations.
+pub const IDENTITY_FORMULA_KEY: &str = "identity_formula";
+pub const IDENTITY_FORMULA: &str = "2";
+
+/// The formula this store recorded its registry hash under, read without creating anything.
+pub fn recorded_identity_formula(path: &Path) -> Result<Option<String>> {
+    let db = builder()
+        .open(path)
+        .with_context(|| format!("failed to open redb (non-creating) at {}", path.display()))?;
+    let rtx = db.begin_read()?;
+    let meta = rtx.open_table(META)?;
+    Ok(meta
+        .get(IDENTITY_FORMULA_KEY)?
+        .map(|v| v.value().to_string()))
+}
+
+/// The registry hash this store **recorded at indexing time**, read without creating anything.
+///
+/// `Ok(None)` means the store exists and has no recorded hash - a fresh store, or one written by a
+/// build from before the identity check (#653). An `Err` means the store could not be read at all:
+/// absent, corrupt, or locked by a live cursor.
+///
+/// This is the fact `adoptable` was missing (#1369). It was deciding a candidate's identity by
+/// re-running `build_manifest` over the candidate's files **with the running binary**, so a binary
+/// that changed how a column decodes - and moved the hash with it - recomputed an old dataset to the
+/// *new* identity and adopted it. `guard_registry_identity` then refused the adopted store at start,
+/// so nothing mixed was ever served, but the one chance to adopt had been spent and the mount was
+/// left holding a store it could never start from: #408's stuck shape through a different door.
+pub fn recorded_registry_hash(path: &Path) -> Result<Option<String>> {
+    let db = builder()
+        .open(path)
+        .with_context(|| format!("failed to open redb (non-creating) at {}", path.display()))?;
+    let rtx = db.begin_read()?;
+    let meta = rtx.open_table(META)?;
+    Ok(meta.get(REGISTRY_KEY)?.map(|v| v.value().to_string()))
+}
+
 pub fn store_holds_rows(path: &Path) -> Result<bool> {
     let db = builder()
         .open(path)
@@ -537,6 +611,10 @@ impl Store {
             db: Arc::new(db),
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -580,6 +658,10 @@ impl Store {
             db: Arc::new(db),
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -977,7 +1059,46 @@ impl Store {
             let (_k, v) = row?;
             out.push(v.value().to_string());
         }
+        #[cfg(test)]
+        self.largest_range_read.fetch_max(
+            out.iter().map(String::len).sum(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         Ok(out)
+    }
+
+    /// [`entities_in_range`](Self::entities_in_range) one row at a time, the block read from the key.
+    pub fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        let lo = format!("{from:012}-000000");
+        let hi = format!("{to:012}-999999");
+        let rtx = self.db.begin_read()?;
+        let t = rtx.open_table(ENTITIES)?;
+        #[cfg(test)]
+        let mut visited = 0usize;
+        for row in t.range(lo.as_str()..=hi.as_str())? {
+            let (k, v) = row?;
+            let key = k.value();
+            let block = key
+                .get(..12)
+                .and_then(|b| b.parse::<u64>().ok())
+                .with_context(|| format!("corrupt entity key {key:?}"))?;
+            #[cfg(test)]
+            {
+                visited += 1;
+            }
+            if !visit(block, v.value()) {
+                break;
+            }
+        }
+        #[cfg(test)]
+        self.largest_scan_rows
+            .fetch_max(visited, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -1375,6 +1496,14 @@ impl HotStore for Store {
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         Store::entities_in_range(self, from, to)
     }
+    fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        Store::scan_entities_in_range(self, from, to, visit)
+    }
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
         Store::sample_entity_keys(self, limit)
     }
@@ -1629,6 +1758,14 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         (**self).entities_in_range(from, to)
+    }
+    fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        (**self).scan_entities_in_range(from, to, visit)
     }
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
         (**self).sample_entity_keys(limit)

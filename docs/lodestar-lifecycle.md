@@ -210,6 +210,12 @@ permits partly occupied by the dashboard. A refusal is `503 server busy: too man
 queries`, returned in **1.7-3.2 ms**: `try_acquire_owned`, so a caller past the limit is refused
 immediately rather than queued. That is deliberate self-protection.
 
+> **Superseded as of #1319, and the figures above stand as measured.** The immediate refusal was
+> right about the danger and wrong about the shape of the load: a burst is not sustained pressure.
+> A request now waits up to 250 ms for a permit before it is told the node is busy, so the refusal
+> latency quoted here no longer describes the binary. What the wait does not change is the permit
+> count, which is still the only thing deciding how many queries run at once.
+
 **Under ordinary dashboard load alone, refusals are zero.** The allocations nest admitted **380
 queries in 70 minutes with no rejections at all**. Refusals appear the moment a second independent
 caller arrives, and an earlier figure on this page of 159 refused against 381 admitted was measured

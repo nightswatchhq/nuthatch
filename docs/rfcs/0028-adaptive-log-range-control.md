@@ -136,6 +136,32 @@ threshold, seal up to the **block at which the threshold was crossed**, retainin
 for the next segment. "Cumulative rows by block" is a property of the chain, so the flush point is
 identical however the range was fetched. Blocks are never split across segments.
 
+### §4 amendment (2026-09-13): a byte bound beside the row bound
+
+**Ruled by Chief on 2026-09-13.** A cut was bounded by rows (`SEAL_DIRECT_BATCH`, 20,000) and by span
+(#1199), never by bytes, and sealing read the whole finalized range to choose it. Rows that carry
+documents made that the dominant cost: on the QoS oracle nest (RFC-0037), a range of 678 megabyte
+payloads reached 3.17 GB RSS, and 1,342 of them reached 11.35 GB (`/usr/bin/time -l`, release build
+at `289a08a1`), past the 2 GB per-cursor budget in both cases.
+
+- **Byte cut.** A cut is also taken at the block whose row carries the held rows' JSON past
+  `SEAL_DIRECT_BYTES` (64 MiB), the earliest of row, byte and span cuts winning. "Cumulative bytes by
+  block" is as much a property of the rows as cumulative rows by block, so the ruling above holds:
+  two operators produce identical segments however the range was fetched.
+- **A constant, not a knob.** Segment boundaries decide segment bytes. A setting an operator could
+  change would give two operators different segments over identical rows, which is the failure this
+  section exists to end. It is a release property, like the row threshold.
+- **Nothing sealed before changes.** A table whose rows average under about 3.3 KB reaches 20,000 rows
+  before 64 MiB, so event nests cut exactly where they did. Existing segments are untouched either way:
+  cuts are only ever taken over rows not yet sealed.
+- **Provisional segments.** The #1150 floor folds a table's segment into its next cut while it holds
+  fewer than 1,000 rows, rewriting the whole file each time. Megabyte rows never reach 1,000 at a cut,
+  so a segment is also final once its rows hold `SEAL_TABLE_BYTES_FLOOR` (16 MiB) of JSON. Measured on
+  row JSON rather than Parquet bytes, for the reason the row floor gives.
+- **Bounded read.** The tip path chooses a cut with a streaming scan of the hot store
+  (`HotStore::scan_entities_in_range`) that stops as soon as the cut is known, then reads only
+  `[from, cut]`. Sealing never holds more than one cut's rows.
+
 ## 5. Non-goals
 
 - Rebuilding the chunker. It works; this widens what it recognises and makes its output deterministic.

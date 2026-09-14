@@ -185,6 +185,18 @@ jobs:
                        | select(.body | contains("<!-- pr-review:luna -->")) | .body' \
             > pr.prior_reviews || : > pr.prior_reviews
 
+          # Maintainers' replies since the last review, and the base branch's bodies of the functions
+          # the diff calls. Without them Jules re-raised findings a cited reply or an untouched callee
+          # already disproved (#1349, #1368). The script treats the diff and comments as data only.
+          if ! gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[]' > pr.comments.jsonl ||
+             ! gh api --paginate "repos/$REPO/pulls/$PR/comments" --jq '.[]' > pr.review_comments.jsonl; then
+            echo "::error::could not fetch the pull request's comments; refusing to review without the replies"
+            exit 1
+          fi
+          bash scripts/jules-context.sh --diff pr.diff --comments pr.comments.jsonl \
+            --review-comments pr.review_comments.jsonl \
+            --replies-out pr.author_replies --callee-out pr.callee_context
+
           payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
             '{name:"Jules approval",head_sha:($sha | rtrimstr("\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
           check_id="$(GH_TOKEN="$JULES_TOKEN" gh api --method POST "repos/$REPO/check-runs" --input - --jq '.id' <<<"$payload")"
@@ -236,6 +248,7 @@ jobs:
               --body-file pr.body --commits-file pr.commits --base-file pr.base \
               --base-commits-file pr.base_commits --base-range "$(cat pr.base_range)" \
               --own-files-file pr.own_files --prior-reviews-file pr.prior_reviews \
+              --author-replies-file pr.author_replies --callee-context-file pr.callee_context \
               --json > review.json; then
             {
               echo '<!-- pr-review:luna -->'
