@@ -142,7 +142,14 @@ function render(s){
   $('#lag').textContent = lag===null ? '-' : fmt(lag)+' blk';
   const g = STAT_KEYS.filter(([k]) => k in s).map(([k,label]) =>
     `<div class="stat"><div class="k">${label}</div><div class="v">${fmt(s[k])}</div></div>`).join('');
-  $('#stats').innerHTML = g + `<div class="stat"><div class="k">views</div><div class="v" style="font-size:12px">${(s.views||[]).join('<br>')||'-'}</div></div>`;
+  $('#stats').innerHTML = g + `<div class="stat"><div class="k">views</div><div class="v" style="font-size:12px">${(s.views||[]).join('<br>')||'-'}</div></div>` + publishStat(s.publish);
+}
+// RFC-0052: only a nest that mirrors itself carries `publish`.
+function publishStat(p){
+  if(!p) return '';
+  const last = p.last_success_unixtime ? fmt(Math.max(0, Math.round(Date.now()/1000 - p.last_success_unixtime)))+'s ago' : 'never';
+  const lag = p.dead_letter ? `<span style="color:var(--bad)">dead-lettered</span>` : `lag ${fmt(p.lag_blocks)} blk`;
+  return `<div class="stat" style="grid-column: span 2"><div class="k">publish</div><div class="v" style="font-size:12px">${esc(p.target)}<br>${lag}<br>last success ${last}</div></div>`;
 }
 async function poll(){
   try { render(await api('/')); } catch(e){ $('#dot').classList.remove('live'); }

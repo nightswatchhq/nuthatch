@@ -24,6 +24,9 @@ pub struct NestMetrics {
     sealed_through: AtomicU64,
     /// RFC-0052 S2: set once this nest mirrors itself, so only publishing nests render the series.
     publish_enabled: AtomicBool,
+    publish_target: Mutex<Option<String>>,
+    /// Unix seconds of the last pass that succeeded, `0` until one has.
+    publish_last_success: AtomicU64,
     publish_sealed_through: AtomicU64,
     publish_pending: AtomicU64,
     publish_bytes: AtomicU64,
@@ -183,8 +186,24 @@ impl NestMetrics {
         }
         METRICS.set_sealed_through(v);
     }
-    pub fn set_publish_enabled(&self) {
+    pub fn set_publish_enabled(&self, target: &str) {
+        *self.publish_target.lock().unwrap() = Some(target.to_string());
         self.publish_enabled.store(true, Relaxed);
+    }
+    /// Where this nest mirrors to, `None` when it does not publish.
+    pub fn publish_target(&self) -> Option<String> {
+        self.publish_target.lock().unwrap().clone()
+    }
+    pub fn publish_sealed_through(&self) -> u64 {
+        self.publish_sealed_through.load(Relaxed)
+    }
+    pub fn publish_lag_blocks(&self) -> u64 {
+        self.sealed_through
+            .load(Relaxed)
+            .saturating_sub(self.publish_sealed_through.load(Relaxed))
+    }
+    pub fn publish_last_success(&self) -> u64 {
+        self.publish_last_success.load(Relaxed)
     }
     pub fn set_publish_pending(&self, segments: u64) {
         self.publish_pending.store(segments, Relaxed);
@@ -201,6 +220,7 @@ impl NestMetrics {
         }
         self.publish_pending.store(0, Relaxed);
         self.publish_dead_letter.store(false, Relaxed);
+        self.publish_last_success.store(now_unix(), Relaxed);
     }
     pub fn publish_failed(&self, dead_letter: bool) {
         self.publish_errors.fetch_add(1, Relaxed);
@@ -208,6 +228,9 @@ impl NestMetrics {
     }
     pub fn publish_errors(&self) -> u64 {
         self.publish_errors.load(Relaxed)
+    }
+    pub fn publish_bytes(&self) -> u64 {
+        self.publish_bytes.load(Relaxed)
     }
     pub fn publish_dead_letter(&self) -> bool {
         self.publish_dead_letter.load(Relaxed)
@@ -467,6 +490,11 @@ impl Metrics {
         let h = Arc::new(NestMetrics::default());
         map.insert(name.to_string(), h.clone());
         h
+    }
+
+    /// [`Metrics::nest`] without registering a nest nobody has reported under.
+    pub fn nest_if_known(&self, name: &str) -> Option<Arc<NestMetrics>> {
+        self.per_nest.lock().unwrap().get(name).cloned()
     }
 
     /// Remove a departed nest's series and its storage paths. Its handle may live briefly in an
@@ -1087,11 +1115,7 @@ impl Metrics {
                     "nuthatch_publish_lag_blocks",
                     "Blocks sealed locally and not yet published.",
                     "gauge",
-                    &|m| {
-                        m.sealed_through
-                            .load(Relaxed)
-                            .saturating_sub(m.publish_sealed_through.load(Relaxed))
-                    },
+                    &|m| m.publish_lag_blocks(),
                 );
                 series(
                     "nuthatch_publish_pending_segments",

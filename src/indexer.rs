@@ -40,7 +40,7 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// The decode registry that produced this store's rows (#653). Not the same question as
 /// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
 /// configuration, which is what a nest's content address is a statement about.
-const REGISTRY_KEY: &str = "registry_hash";
+use crate::store::REGISTRY_KEY;
 const SEALED_THROUGH_KEY: &str = "sealed_through";
 const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
@@ -2784,6 +2784,7 @@ async fn build_nest(
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(full_schema(&registry, config)),
         sql_gate,
+        sql_queued: Default::default(),
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
         sql_max_named_scan_bytes: serve::SQL_MAX_NAMED_SCAN_BYTES,
         // Every cursor-owning role builds through here; `serve_role` flips it after (#1025).
