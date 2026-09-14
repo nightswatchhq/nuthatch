@@ -179,7 +179,7 @@ S3 (adaptive windows) likely also requires an ingestion change; S2 needs a seed-
 | Gate | Condition | Outcome |
 |---|---|---|
 | G0 (after E1) | Backfill duplication across nests > 20 % of spend | S6 becomes the priority; Dune work continues but is not the headline saving |
-| G1 (after E2) | H1 confirmed | Close Q1 for full-chain nests permanently; stop entertaining "backfill from Dune" |
+| G1 (after E2 and E8) | H1 confirmed for every supported chain Dune covers (E2), with every supported chain Dune does not cover recorded as such (E8), since a chain with no Dune tables cannot be backfilled from Dune either | Close Q1 for full-chain nests permanently; stop entertaining "backfill from Dune" |
 | G2 (after E3) | Seed for the candidate nest < 400 MB | S2 stays on the table for measurement; else S2 is closed for that nest, and reopens for another nest only on its own E3 measurement |
 | G3 (after E4+E5) | ≥ 90 % CU reduction, < 50 credits, and no uncaught false negatives, on both E4 contract sets (the Graph candidate and the less sparse second set) | S1 accepted as the standard backfill path for log-derived scoped nests; §8 determines whether it needs a separate RFC |
 | G4 (after E6) | Dune is worse than the RPC baseline on both axes of E6's comparison (p95 lag and $/month) | H4 confirmed; head-following stays RPC forever; never revisit on this plan. Otherwise H4 is falsified: head-following still stays RPC, and the axis where Dune was no worse goes into the memo as the only ground for revisiting |
@@ -276,3 +276,4 @@ Results are recorded on the tracking issue, #1381, not as files in this repo.
 | 2026-09-14 | Review of #1382: H3 is stated in CUs, the unit E4 measures and G3 gates, since S1 can make more calls while spending fewer CUs. Reorg visibility leaves H4 and G4: a 24 h window with no reorg compares nothing, and a revised Dune row is not a reorg boundary. The self-host cost in §10 is divided by the blocks in a backfill, so both sides of H5 and G5 are dollars per block. |
 | 2026-09-14 | Review of #1382: H5 is narrowed to self-host against Alchemy, which is all E7 and G5 measure. A cheaper provider (S5) is dropped from it for the same reason: nothing prices one. The Dune hybrid it also named is H1 and G1's question for full-chain nests, not H5's. |
 | 2026-09-14 | Review of #1382: H2 and G2 are narrowed to the one candidate E3 measures. One nest over 400 MB cannot show that no nest fits, so a failed candidate closes S2 for that nest only. |
+| 2026-09-14 | Review of #1382: G1 waits for E8 as well as E2, so H1's claim about every supported chain covers the chains Dune has no tables for, rather than silently leaving them out. |
