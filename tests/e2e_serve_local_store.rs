@@ -65,6 +65,7 @@ async fn serve_without_hot_store_refuses_a_nest_with_no_store_rather_than_creati
     );
 
     let args = ServeArgs {
+        cors: Vec::new(),
         dir: dir.path().to_string_lossy().into_owned(),
         listen: format!("127.0.0.1:{}", free_port().await),
         hot_store: None,
@@ -101,6 +102,7 @@ async fn serve_without_hot_store_refuses_a_store_a_live_handle_holds() {
     assert!(db_path.exists(), "premise: the writer's store now exists");
 
     let args = ServeArgs {
+        cors: Vec::new(),
         dir: dir.path().to_string_lossy().into_owned(),
         listen: format!("127.0.0.1:{}", free_port().await),
         hot_store: None,
@@ -132,6 +134,7 @@ async fn serve_without_hot_store_serves_a_store_the_writer_left_behind() {
     let port = free_port().await;
     let listen = format!("127.0.0.1:{port}");
     let args = ServeArgs {
+        cors: Vec::new(),
         dir: dir.path().to_string_lossy().into_owned(),
         listen: listen.clone(),
         hot_store: None,
