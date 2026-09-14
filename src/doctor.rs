@@ -44,6 +44,20 @@ use crate::source::Source;
 /// halved for headroom. It is one cross-endpoint data point, not a universal ceiling.
 const RANGE_ONLY_WINDOW_CAP: u64 = 320;
 
+/// Spans tried, widest first, when sampling for a contract to probe with (#1323).
+///
+/// A *descending* ladder rather than one constant, because the right sample size is a property of
+/// the chain and there is no value that suits both ends. Measured on 2026-09-14: an unfiltered
+/// 25-block sample on Gnosis returns 1,461 logs quite happily, while Base refuses 10 blocks with
+/// "backend response too large" and answers 5 with 5,116. A fixed 25 would simply have found
+/// nothing on Base, which is exactly the silent floor this change exists to remove.
+///
+/// One block is kept as the last rung because it is still a perfectly good sample - 810 logs on
+/// Base, 74 on Gnosis - and finding *a* busy contract is all this needs to do.
+///
+/// At most one request per rung, and the first that answers wins, so the usual cost is one call.
+const DISCOVERY_SPANS: [u64; 5] = [25, 10, 5, 2, 1];
+
 /// What one endpoint can actually do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
@@ -93,16 +107,22 @@ impl Probe {
         })
     }
 
+    /// The `getLogs` finding on its own, so the re-probe in `run()` can repeat exactly this line
+    /// and nothing else - and cannot drift from what [`report`] prints (#1323).
+    pub fn window_line(&self) -> String {
+        match self.max_window {
+            Some(w) => format!(
+                "  getLogs window   up to {w} blocks (recommend --window {})\n",
+                self.recommended_window().unwrap_or(1)
+            ),
+            None => "  getLogs window   FAILED - no probe succeeded\n".to_string(),
+        }
+    }
+
     /// One line per finding, in the order an operator cares about.
     pub fn report(&self) -> String {
         let mut out = String::new();
-        match self.max_window {
-            Some(w) => out.push_str(&format!(
-                "  getLogs window   up to {w} blocks (recommend --window {})\n",
-                self.recommended_window().unwrap_or(1)
-            )),
-            None => out.push_str("  getLogs window   FAILED - no probe succeeded\n"),
-        }
+        out.push_str(&self.window_line());
         match self.max_batch {
             Some(n) if n >= 20 => out.push_str(&format!("  JSON-RPC batch   {n}+ (fine)\n")),
             Some(n) => out.push_str(&format!(
@@ -137,6 +157,49 @@ impl Probe {
             "notes": self.notes,
         })
     }
+}
+
+/// Pick a busy contract to run a filtered probe against, when the operator gave none (#1323).
+///
+/// `doctor` without an address measures a range-only `getLogs`, which never meets a result-count cap
+/// and is therefore a **floor**, not a forecast. On Arc Testnet that floor recommended `--window 80`
+/// where the same endpoint answered 20,000 blocks once filtered. The report already said to re-probe
+/// with `--address`, and the smaller number still went into a README, because the first number is
+/// the one on the screen. So `doctor` finds an address itself rather than asking.
+///
+/// The sample is the unfiltered firehose over [`DISCOVERY_SPAN`] blocks, issued through
+/// [`RpcClient::get_logs`] rather than a [`crate::source::LogFilter`]: that type's refusal to build
+/// a match-everything filter (#432) guards the *ingestion* path and should stay exactly as strict as
+/// it is. This one deliberate exception is visible here and nowhere else.
+///
+/// Returns the address and how many of the sampled logs it emitted. `None` is an ordinary answer -
+/// a quiet chain, or an endpoint that refuses the unfiltered request - and is reported as "could not
+/// find one", never as a failure.
+async fn discover_probe_address(rpc: &RpcClient, tip: u64) -> Option<(String, usize)> {
+    // The same offset the width probe uses: at the tip an endpoint may refuse for reorg reasons
+    // rather than width, and a sample that fails for the wrong reason is worse than no sample.
+    let to = tip.saturating_sub(100);
+    let mut logs = Vec::new();
+    for span in DISCOVERY_SPANS {
+        let from = to.saturating_sub(span.saturating_sub(1));
+        // A refusal here is ordinary - a dense chain, or a provider that will not serve unfiltered
+        // logs at all - so it narrows the sample rather than ending the attempt.
+        if let Ok(got) = rpc.get_logs(&[], &[], from, to).await {
+            if !got.is_empty() {
+                logs = got;
+                break;
+            }
+        }
+    }
+    let mut tally: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for l in &logs {
+        *tally.entry(l.address.to_ascii_lowercase()).or_default() += 1;
+    }
+    // Ties broken on the address, so two runs over the same window recommend the same thing. A
+    // report an operator cannot reproduce is a report they cannot check.
+    tally
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
 }
 
 /// Probe `url`. Never fails on a bad endpoint - a broken endpoint is the *finding*, not an error.
@@ -469,14 +532,78 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
             .and_then(|r| r.split('/').next())
             .unwrap_or(url);
         let p = probe(url, &addresses).await?;
+        // Nothing given and nothing declared: the number above is the raw block-range limit, which
+        // #1323 measured understating a real endpoint by 250x. Find a contract on this chain and
+        // measure what a nest would actually see, rather than telling the operator to do it and
+        // watching the floor get written down anyway.
+        let discovered = if addresses.is_empty() {
+            match RpcClient::new(vec![url.to_string()]) {
+                Ok(rpc) => match rpc.block_number().await {
+                    Ok(tip) => match discover_probe_address(&rpc, tip).await {
+                        Some((addr, seen)) => probe(url, std::slice::from_ref(&addr))
+                            .await
+                            .ok()
+                            .map(|fp| (addr, seen, fp)),
+                        None => None,
+                    },
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         if args.json {
-            json_rows.push(p.to_json(host));
+            let mut row = p.to_json(host);
+            if let (Some(obj), Some((addr, seen, fp))) = (row.as_object_mut(), discovered.as_ref())
+            {
+                // Added alongside the existing keys, never replacing them: the live-endpoints gate
+                // reads `max_window` off this object (#716) and must keep seeing what it saw.
+                obj.insert("discovered_address".into(), json!(addr));
+                obj.insert("discovered_logs_sampled".into(), json!(seen));
+                obj.insert("discovered_max_window".into(), json!(fp.max_window));
+                obj.insert(
+                    "discovered_recommended_window".into(),
+                    json!(fp.recommended_window()),
+                );
+            }
+            json_rows.push(row);
         } else {
             println!("{host}");
             print!("{}", p.report());
+            if let Some((addr, seen, fp)) = discovered.as_ref() {
+                println!();
+                // Only the window line is repeated: batch size and archive depth are properties
+                // of the endpoint, identical in both probes, and printing them twice buries the
+                // one number that changed.
+                println!("  That window is a FLOOR - with no --address it sees the block-range");
+                println!(
+                    "  limit and never a result-count cap. Re-probed against a real contract:"
+                );
+                println!("    {addr}");
+                println!("    (busiest in a short unfiltered sample, {seen} of its logs)");
+                println!("  {}", fp.window_line().trim_start());
+                match fp.recommended_window() {
+                    Some(w) => println!(
+                        "  Use --window {w} for a nest of similar density, or --address <your \
+                         contract>"
+                    ),
+                    None => println!(
+                        "  Even filtered, no probe succeeded. Use --address <your contract>"
+                    ),
+                }
+                println!("  to measure your own.");
+            }
             println!();
         }
-        if let Some(w) = p.recommended_window() {
+        // The filtered figure is the one a nest can act on, so it is the one that feeds the
+        // across-endpoints recommendation. Where nothing was discovered, the floor still stands.
+        let actionable = discovered
+            .as_ref()
+            .and_then(|(_, _, fp)| fp.recommended_window())
+            .or_else(|| p.recommended_window());
+        if let Some(w) = actionable {
             worst_window = Some(worst_window.map_or(w, |c: u64| c.min(w)));
         }
     }
@@ -733,6 +860,209 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // #1323: finding a probe address rather than telling the operator to.
+    // ---------------------------------------------------------------------------------------
+
+    /// A provider that answers the unfiltered sample with `logs` - each entry an emitting address,
+    /// repeated as many times as it emitted. Separate from [`filter_capturing_rpc`], which answers
+    /// every `eth_getLogs` with `[]` and so can say nothing about which address is busiest.
+    async fn log_serving_rpc(logs: &[&str]) -> (String, tokio::task::JoinHandle<()>) {
+        log_serving_rpc_capped(logs, u64::MAX).await
+    }
+
+    /// As above, but refusing any unfiltered sample wider than `max_span` - which is Base, measured
+    /// on 2026-09-14: it answers 5 blocks with 5,116 logs and refuses 10 as "backend response too
+    /// large".
+    async fn log_serving_rpc_capped(
+        logs: &[&str],
+        max_span: u64,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::Value;
+
+        let rows: Vec<Value> = logs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                json!({
+                    "address": a,
+                    "topics": ["0x00"],
+                    "data": "0x",
+                    "blockNumber": format!("0x{:x}", 0x100000 - 100 - (i as u64 % 10)),
+                    "blockHash": format!("0x{:064x}", 1),
+                    "transactionHash": format!("0x{:064x}", i + 1),
+                    "logIndex": format!("0x{i:x}"),
+                })
+            })
+            .collect();
+
+        #[derive(Clone)]
+        struct St {
+            rows: std::sync::Arc<Vec<Value>>,
+            max_span: u64,
+        }
+
+        fn hex_u64(v: Option<&Value>) -> Option<u64> {
+            u64::from_str_radix(v?.as_str()?.trim_start_matches("0x"), 16).ok()
+        }
+
+        async fn handler(State(st): State<St>, Json(req): Json<Value>) -> Json<Value> {
+            if req.as_array().is_some() {
+                return Json(json!([]));
+            }
+            match req.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "eth_blockNumber" => Json(json!({"jsonrpc":"2.0","id":1,"result":"0x100000"})),
+                // Only the *unfiltered* request gets rows: an address-filtered probe is a different
+                // question, and answering it from this pile would make the test agree with itself.
+                "eth_getLogs" => {
+                    let f = req
+                        .get("params")
+                        .and_then(|p| p.as_array())
+                        .and_then(|a| a.first());
+                    let filtered = f
+                        .map(|f| f.get("address").is_some() || f.get("topics").is_some())
+                        .unwrap_or(false);
+                    let span = f
+                        .and_then(|f| {
+                            Some(
+                                hex_u64(f.get("toBlock"))?
+                                    .saturating_sub(hex_u64(f.get("fromBlock"))?)
+                                    + 1,
+                            )
+                        })
+                        .unwrap_or(1);
+                    // The dense-chain refusal, which is what the ladder exists to climb down.
+                    if !filtered && span > st.max_span {
+                        return Json(json!({
+                            "jsonrpc":"2.0","id":1,
+                            "error":{"code":-32000,"message":"backend response too large"}
+                        }));
+                    }
+                    let result = if filtered { json!([]) } else { json!(*st.rows) };
+                    Json(json!({"jsonrpc":"2.0","id":1,"result": result}))
+                }
+                _ => Json(json!({"jsonrpc":"2.0","id":1,"result":"0x0"})),
+            }
+        }
+
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler))
+            .with_state(St {
+                rows: std::sync::Arc::new(rows),
+                max_span,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// A chain too dense for the widest sample still yields one. Measured on Base: 25 and 10 blocks
+    /// are refused, 5 answers. A single fixed span would simply have found nothing there and printed
+    /// the range-only floor, which is the whole failure #1323 is about.
+    #[tokio::test]
+    async fn a_sample_too_wide_for_the_chain_narrows_until_it_answers() {
+        let (url, handle) = log_serving_rpc_capped(
+            &[
+                "0xdddddddddddddddddddddddddddddddddddddddd",
+                "0xdddddddddddddddddddddddddddddddddddddddd",
+                "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            ],
+            5,
+        )
+        .await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let found = discover_probe_address(&rpc, 0x100000).await;
+        handle.abort();
+        assert_eq!(
+            found,
+            Some(("0xdddddddddddddddddddddddddddddddddddddddd".to_string(), 2)),
+            "the ladder gave up instead of narrowing to a span the endpoint would serve"
+        );
+    }
+
+    /// The busiest contract in the sample is the one probed with - not the first seen, which is what
+    /// a naive tally returns and what would make the recommendation depend on log ordering.
+    #[tokio::test]
+    async fn the_busiest_contract_in_the_sample_is_the_one_chosen() {
+        let (url, handle) = log_serving_rpc(&[
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])
+        .await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let found = discover_probe_address(&rpc, 0x100000).await;
+        handle.abort();
+        assert_eq!(
+            found,
+            Some(("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(), 3)),
+            "the first address seen was chosen over the busiest one"
+        );
+    }
+
+    /// One contract written two ways is one contract. Providers are inconsistent about EIP-55
+    /// checksumming, and a case-sensitive tally would split a busy address in half and hand back a
+    /// quieter one - with a count that understates it, which is the figure the report prints.
+    #[tokio::test]
+    async fn the_same_address_in_two_casings_is_tallied_once() {
+        let (url, handle) = log_serving_rpc(&[
+            "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])
+        .await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let found = discover_probe_address(&rpc, 0x100000).await;
+        handle.abort();
+        assert_eq!(
+            found,
+            Some(("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), 2)),
+            "a checksummed and a lowercase spelling of one address were counted as two"
+        );
+    }
+
+    /// A tie must break the same way every run. A report an operator cannot reproduce is a report
+    /// they cannot check, and `HashMap` iteration order would otherwise decide it.
+    #[tokio::test]
+    async fn a_tie_is_broken_deterministically() {
+        let mut chosen = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let (url, handle) = log_serving_rpc(&[
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "0xcccccccccccccccccccccccccccccccccccccccc",
+            ])
+            .await;
+            let rpc = RpcClient::new(vec![url]).unwrap();
+            chosen.insert(discover_probe_address(&rpc, 0x100000).await);
+            handle.abort();
+        }
+        assert_eq!(
+            chosen.len(),
+            1,
+            "eight runs over an identical window chose {chosen:?}"
+        );
+    }
+
+    /// A quiet chain is an ordinary answer, not a failure: `doctor` falls back to reporting the
+    /// range-only floor rather than erroring, so the command still works where there is nothing to
+    /// find.
+    #[tokio::test]
+    async fn an_empty_window_finds_nothing_rather_than_failing() {
+        let (url, handle) = log_serving_rpc(&[]).await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let found = discover_probe_address(&rpc, 0x100000).await;
+        handle.abort();
+        assert_eq!(found, None);
     }
 
     /// #432: an empty address list AND an empty topic0 list is not a width probe - it is a request
