@@ -13,13 +13,22 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-09-14 - #1376's tip-path comparison corrected, and the capped tip run measured on the merged head.**
+  The #1376 entry below set the capped tip run against an uncapped **1,622,310,912 bytes**. That uncapped
+  run stopped at block 48,138,999, a fifth of the capped run's range, so its peak is a lower bound, and
+  "the uncapped run had sealed none by the same point" does not follow from it. The two are not a pair.
+  The capped run, re-measured on the merged head, same QoS nest and start block, release build,
+  `/usr/bin/time -l`: peak RSS **1,027,293,184 bytes**, peak memory footprint **369,935,608 bytes**,
+  SIGTERM exited in **0.05 s**, **5,836,883 rows sealed in 562 segments**, sealed through 48,219,405
+  against a last block of 48,219,799, the window held at 400, and IPFS 3,399 resolved, 14 pending,
+  0 unverified. **Open**: about 1 GB of RSS against a 370 MB peak footprint, not yet attributed.
 - **2026-09-14 - #1376 measured again, on its merged head, with the review fixes in.** Merged #1375's review
   fixes (block 0 held below an outstanding document; `--seal-direct` counting an unproven document as the
   resolver does), #1391's scan that stops at a known span end, and its Postgres range scan that fetches a
   16 MiB byte budget of rows rather than a thousand documents. QoS nest on `pete/qos-nest-typed-rows`,
   Gnosis from block 48,119,000, `--ipfs https://ipfs.thegraph.com/ipfs/`, release build, `/usr/bin/time -l`.
   **`--seal-direct`**: peak RSS **434,388,992 bytes**, SIGTERM during the seal exited in **0.14 s** with 25
-  segments written. **Tip path**: peak RSS **1,622,310,912 bytes**, SIGTERM during the seal exited in **0.3 s** with 14 segments written. The 1,998,815,232 bytes recorded above was measured before the typed-rows nest config and these fixes,
+  segments written. **Tip path**: peak RSS **1,622,310,912 bytes**, SIGTERM during the seal exited in **0.3 s** with 14 segments written, stopping at block 48,138,999. The 1,998,815,232 bytes recorded above was measured before the typed-rows nest config and these fixes,
   so the two are not a like-for-like pair.
   **Open, found by this run: the tip path is not bounded for a document nest.** Its window controller
   (`index_loop`, `AdaptiveWindow::for_window`) has no document branch, so on an event-less nest the window
@@ -32,9 +41,10 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   `tip_window`, the rule the backfill paths already follow, so a document nest's window holds at
   `DOCUMENT_WINDOW_CAP` (400 blocks) however few logs it sees; `runtime_index_loop` caps for the most
   demanding nest on its cursor. Same QoS nest, same start block, tip path to block 48,219,399, release
-  build: peak RSS **1,219,297,280 bytes** with the cap against **1,622,310,912** without it, SIGTERM
-  mid-seal exited in **0.07 s**, and **5,815,234 rows sealed in 560 segments** while it ran, where the
-  uncapped run had sealed none by the same point. Sealing stayed within about 400 blocks of the tip.
+  build: peak RSS **1,219,297,280 bytes** with the cap, SIGTERM mid-seal exited in **0.07 s**, and
+  **5,815,234 rows sealed in 560 segments** while it ran. (As first written this set the peak against the
+  uncapped run's 1,622,310,912 and said that run had sealed none by the same point; it stopped at
+  48,138,999, so neither holds. Corrected above.) Sealing stayed within about 400 blocks of the tip.
   **Open**: with the hot tip bounded, 1.22 GB is still held, so the peak is not the fetch window; what
   holds it is not attributed. The runtime cursor's cap has no test of its own.
 - **2026-09-13 - RFC-0028 §4 amended: a seal cut is bounded by bytes; call bodies fetch in parallel;

@@ -86,7 +86,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:3.7.0
+  ghcr.io/nightswatchhq/nuthatch:3.8.0
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -123,7 +123,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:3.7.0-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:3.8.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -526,7 +526,7 @@ SQL surfaces). Full key reference:
 
 | Variable | Purpose |
 |---|---|
-| `NUTHATCH_ADMIN_TOKEN` | required for the admin UI when bound off-localhost; presented as `?token=` (and, from the next release, `Authorization: Bearer`) |
+| `NUTHATCH_ADMIN_TOKEN` | required for the admin UI when bound off-localhost; presented as `?token=` or `Authorization: Bearer` |
 | `NUTHATCH_SQL_MEMO_BYTES` | ceiling on the analytical memo's remembered rows, in serialized bytes (default 64 MiB; `0` turns it off). See *The analytical memo* under capacity and sizing. |
 | `NUTHATCH_CALL_BODY_CONCURRENCY` | block-body batches (20 blocks each) fetched at once for `top_level_calls` (default 4, ceiling 10). Memory stays one 200-block chunk of bodies whatever the value. On `--seal-direct` it multiplies with `--concurrency`, since each window fetches its own bodies. |
 
