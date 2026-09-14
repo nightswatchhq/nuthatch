@@ -47,11 +47,50 @@ pub const DEFAULT_IPFS_GATEWAYS: &[&str] = &[
     "https://gateway.pinata.cloud/ipfs/",
 ];
 
-/// One ABI referenced by a manifest, pinned by CID.
+/// Where a manifest's ABI actually lives (#1321).
+///
+/// A *deployed* subgraph pins every ABI by CID, because that is what `graph deploy` produces. A
+/// subgraph **repository** - the thing a builder has before they deploy, and exactly when a nest is
+/// most useful to them - references its ABIs as `file: ./abis/Token.json` instead. Both are ordinary
+/// manifests; only one of them was fetchable before this.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AbiLink {
+    /// `file: { "/": "/ipfs/<cid>" }`. Content-addressed, so it can be fetched from anywhere.
+    Cid(String),
+    /// `file: ./abis/Token.json`. Relative to the manifest's own directory, and meaningful **only**
+    /// when the manifest itself came from disk - see [`ManifestHome`].
+    Path(String),
+}
+
+impl AbiLink {
+    /// How to name this link in a message an operator reads.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Cid(c) => c,
+            Self::Path(p) => p,
+        }
+    }
+}
+
+/// One ABI referenced by a manifest.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AbiRef {
     pub name: String,
-    pub cid: String,
+    pub link: AbiLink,
+}
+
+/// Where a manifest was read from, which is what decides whether a `file:` reference means anything.
+///
+/// This is the same rule [`Origin`] already enforces for URLs, applied to the filesystem. A manifest
+/// fetched from a public gateway is a document a stranger wrote; letting it name a local path would
+/// let them read files off the operator's machine, which is a worse version of the fetch-a-URL
+/// problem `Origin::Manifest` exists to refuse.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManifestHome {
+    /// Fetched over IPFS or HTTP. A `file:` reference is refused, loudly.
+    Remote,
+    /// Read from disk. A `file:` reference resolves inside this directory and nowhere else.
+    Local(std::path::PathBuf),
 }
 
 /// A `dataSources[]` or `templates[]` entry, reduced to what a nest needs.
@@ -226,6 +265,74 @@ pub fn candidate_urls(source: &str, gateways: &[String], origin: Origin) -> Resu
     Ok(gateways.iter().map(|g| format!("{g}{cid}")).collect())
 }
 
+/// Read a manifest, from disk when `source` names a file that exists and over IPFS otherwise.
+///
+/// Returning the [`ManifestHome`] alongside the text is the point: every later decision about a
+/// `file:` ABI reference turns on where the manifest came from, and threading that as a value rather
+/// than re-deriving it means the two cannot drift apart.
+///
+/// **Disk wins only if the path actually exists.** A CID cannot be a path and a path cannot be a
+/// CID, so there is no ambiguity to resolve - but checking existence rather than shape means a
+/// mistyped path falls through to the gateway and gets the old "not a CID or URL" error, which names
+/// the real problem.
+pub async fn read_manifest(source: &str, gateways: &[String]) -> Result<(String, ManifestHome)> {
+    let as_path = std::path::Path::new(source);
+    if as_path.is_file() {
+        let text = std::fs::read_to_string(as_path)
+            .with_context(|| format!("cannot read the manifest at {source}"))?;
+        // The parent of the manifest, canonicalised once here so every later comparison is against a
+        // real path rather than one carrying `..` or a symlink that would compare unequal.
+        let home = as_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .canonicalize()
+            .with_context(|| format!("cannot resolve the directory holding {source}"))?;
+        return Ok((text, ManifestHome::Local(home)));
+    }
+    let text = fetch_ipfs(source, gateways, Origin::Operator).await?;
+    Ok((text, ManifestHome::Remote))
+}
+
+/// Resolve a manifest's `file:` ABI reference against the directory the manifest came from (#1321).
+///
+/// Two refusals, and both matter for the same reason `Origin::Manifest` refuses a URL: the manifest
+/// is a document, and a document must not be able to choose what this process reads.
+///
+/// - A **remote** manifest has no directory, so a `file:` reference is refused outright. Honouring
+///   one would let whoever published the CID name a path on the operator's machine, which is the
+///   fetch-a-URL problem with the blast radius pointing inward instead of outward.
+/// - A **local** manifest's reference must stay inside its own directory. `../../../../etc/passwd`
+///   is the obvious shape; a symlink pointing out of the tree is the one that is not obvious, which
+///   is why both sides are canonicalised before they are compared rather than the string being
+///   inspected for `..`.
+pub fn resolve_abi_path(home: &ManifestHome, rel: &str) -> Result<std::path::PathBuf> {
+    let dir = match home {
+        ManifestHome::Remote => bail!(
+            "this manifest references an ABI as a local file (`{rel}`), but it was fetched rather \
+             than read from disk. Refusing - a fetched manifest naming a path on your machine is a \
+             manifest choosing what this process reads. Pass the repository's subgraph.yaml as a \
+             path if you have it, or use a deployed CID."
+        ),
+        ManifestHome::Local(d) => d,
+    };
+    let joined = dir.join(rel);
+    let full = joined.canonicalize().with_context(|| {
+        format!(
+            "the manifest references `{rel}`, which is not there - expected {}",
+            joined.display()
+        )
+    })?;
+    if !full.starts_with(dir) {
+        bail!(
+            "the manifest references `{rel}`, which resolves to {} - outside the manifest's own \
+             directory ({}). Refusing: a manifest may name its own files and no others.",
+            full.display(),
+            dir.display()
+        );
+    }
+    Ok(full)
+}
+
 /// Fetch a document, trying each gateway until one answers. Gateways fail
 /// often and individually, so a single failure is never fatal; only running
 /// out of them is, and then we say which ones we tried.
@@ -362,6 +469,20 @@ fn link_cid(y: &Yaml) -> Option<String> {
     )
 }
 
+/// A `mapping.abis[].file`, in either of the two forms a manifest may carry (#1321).
+///
+/// Before this, the plain-string form returned `None` and the surrounding `filter_map` **dropped the
+/// entry entirely** - so a repository manifest did not merely fail to import, it imported with its
+/// ABIs silently missing. Returning the path instead makes the two forms two cases rather than one
+/// case and one hole.
+fn abi_link(y: &Yaml) -> Option<AbiLink> {
+    if let Some(cid) = link_cid(y) {
+        return Some(AbiLink::Cid(cid));
+    }
+    let path = as_str(y)?;
+    (!path.trim().is_empty()).then(|| AbiLink::Path(path.trim().to_string()))
+}
+
 /// Make a manifest-supplied string safe to print, and bounded.
 ///
 /// The import's report is the deliverable as much as the config is - an operator reads it to
@@ -399,7 +520,7 @@ fn parse_source(y: &Yaml) -> ManifestSource {
                 .filter_map(|e| {
                     Some(AbiRef {
                         name: sanitise(&get_str(e, "name")?),
-                        cid: get(e, "file").and_then(link_cid)?,
+                        link: get(e, "file").and_then(abi_link)?,
                     })
                 })
                 .collect()
@@ -801,6 +922,164 @@ pub fn event_name(signature: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    // ---------------------------------------------------------------------------------------
+    // #1321: a repository manifest read from disk, with `file:` ABI references.
+    // ---------------------------------------------------------------------------------------
+
+    /// A subgraph repository: `subgraph.yaml` beside an `abis/` directory, which is the shape a
+    /// builder has *before* they deploy - and exactly when a nest is most useful to them.
+    #[cfg(test)]
+    fn repo_fixture() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("abis")).unwrap();
+        std::fs::write(
+            d.path().join("abis/Token.json"),
+            r#"[{"type":"event","name":"T"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("subgraph.yaml"),
+            "dataSources:\n  - kind: ethereum/contract\n    name: Token\n    network: mainnet\n\
+             \n    source:\n      address: '0x0000000000000000000000000000000000000001'\n\
+             \n      abi: Token\n    mapping:\n      abis:\n        - name: Token\n\
+             \n          file: ./abis/Token.json\n",
+        )
+        .unwrap();
+        d
+    }
+
+    /// The plain-string `file:` form parses as a path rather than vanishing.
+    ///
+    /// It used to return `None` from `link_cid` and be dropped by the surrounding `filter_map`, so a
+    /// repository manifest did not fail to import - it imported with its ABIs silently absent, which
+    /// is the worse of the two.
+    #[test]
+    fn a_repository_manifest_keeps_its_file_abi_references() {
+        let d = repo_fixture();
+        let text = std::fs::read_to_string(d.path().join("subgraph.yaml")).unwrap();
+        let man = parse_manifest(&text).unwrap();
+        assert_eq!(
+            man.data_sources[0].abis,
+            vec![AbiRef {
+                name: "Token".into(),
+                link: AbiLink::Path("./abis/Token.json".into()),
+            }],
+            "the file: entry was dropped instead of parsed"
+        );
+    }
+
+    /// Both forms still parse, so adding the second did not cost the first.
+    #[test]
+    fn a_deployed_manifest_still_pins_by_cid() {
+        let man = parse_manifest(
+            "dataSources:\n  - kind: ethereum/contract\n    name: T\n    network: mainnet\n\
+             \n    source:\n      address: '0x01'\n    mapping:\n      abis:\n\
+             \n        - name: T\n          file:\n            /: /ipfs/QmAbc123\n",
+        )
+        .unwrap();
+        assert_eq!(
+            man.data_sources[0].abis[0].link,
+            AbiLink::Cid("QmAbc123".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manifest_that_exists_on_disk_is_read_from_disk() {
+        let d = repo_fixture();
+        let path = d.path().join("subgraph.yaml");
+        let (text, home) = read_manifest(path.to_str().unwrap(), &[]).await.unwrap();
+        assert!(text.contains("dataSources"));
+        match home {
+            ManifestHome::Local(dir) => assert_eq!(dir, d.path().canonicalize().unwrap()),
+            ManifestHome::Remote => panic!("a file that exists was fetched instead of read"),
+        }
+        // And it resolves its own ABI.
+        let got = resolve_abi_path(
+            &ManifestHome::Local(d.path().canonicalize().unwrap()),
+            "./abis/Token.json",
+        )
+        .unwrap();
+        assert!(got.ends_with("abis/Token.json"), "{}", got.display());
+    }
+
+    /// **A fetched manifest may not name a local file.** Same rule as `Origin::Manifest` refusing a
+    /// URL, pointed the other way: honouring it would let whoever published the CID choose what this
+    /// process reads off the operator's machine.
+    #[test]
+    fn a_remote_manifest_cannot_reference_a_local_file() {
+        let err = resolve_abi_path(&ManifestHome::Remote, "./abis/Token.json")
+            .expect_err("a fetched manifest has no directory to resolve against");
+        let msg = err.to_string();
+        assert!(msg.contains("fetched rather than read from disk"), "{msg}");
+    }
+
+    /// And a local manifest may name its own files and no others. `..` is the obvious shape; a
+    /// symlink out of the tree is the one that is not, which is why both sides are canonicalised
+    /// rather than the string being inspected for dots.
+    #[test]
+    fn a_local_manifest_cannot_reach_outside_its_own_directory() {
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("secret.json"), "[]").unwrap();
+        let inner = outer.path().join("repo");
+        std::fs::create_dir_all(inner.join("abis")).unwrap();
+        std::fs::write(inner.join("abis/Token.json"), "[]").unwrap();
+        let home = ManifestHome::Local(inner.canonicalize().unwrap());
+
+        let err =
+            resolve_abi_path(&home, "../secret.json").expect_err("a traversal must not resolve");
+        assert!(
+            err.to_string()
+                .contains("outside the manifest's own directory"),
+            "{err}"
+        );
+
+        // And the legitimate one still works, or the guard is a wall.
+        assert!(resolve_abi_path(&home, "./abis/Token.json").is_ok());
+    }
+
+    /// The escape a `..` check does not see, in its own test rather than after the `..` assertion.
+    ///
+    /// Kept separate deliberately: run together, a mutation removing the canonicalisation and one
+    /// removing the containment check both die on the **first** assertion, so one test would prove
+    /// one thing twice and the symlink case would never be exercised at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_tree_is_not_a_way_around_the_guard() {
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("secret.json"), "[]").unwrap();
+        let inner = outer.path().join("repo");
+        std::fs::create_dir_all(inner.join("abis")).unwrap();
+        let home = ManifestHome::Local(inner.canonicalize().unwrap());
+
+        std::os::unix::fs::symlink(
+            outer.path().join("secret.json"),
+            inner.join("abis/escape.json"),
+        )
+        .unwrap();
+        // No `..` anywhere, every component inside the tree. Only resolving the link tells them
+        // apart, which is why the path is canonicalised rather than inspected.
+        let err = resolve_abi_path(&home, "./abis/escape.json")
+            .expect_err("a symlink out of the tree must not resolve");
+        assert!(
+            err.to_string()
+                .contains("outside the manifest's own directory"),
+            "{err}"
+        );
+    }
+
+    /// A path that is not there falls through to the gateways and gets the old error, which names
+    /// the real problem - a mistyped path is not a CID either.
+    #[tokio::test]
+    async fn a_path_that_does_not_exist_is_not_silently_treated_as_a_cid() {
+        let err = read_manifest(
+            "./no/such/subgraph.yaml",
+            &["https://example.invalid/".into()],
+        )
+        .await
+        .expect_err("neither a file nor a CID");
+        assert!(err.to_string().contains("not a CID or URL"), "{err}");
+    }
+
     use super::*;
 
     const MANIFEST: &str = r#"
@@ -871,7 +1150,7 @@ templates:
         );
         assert_eq!(ds.start_block, Some(447_059_876));
         assert_eq!(
-            ds.own_abi().unwrap().cid,
+            ds.own_abi().unwrap().link.as_str(),
             "Qmco6j6G3fpC1VVoBFFYjTY6hvJxUxUrtaqgFCftA6RW4s"
         );
     }
@@ -1080,7 +1359,7 @@ dataSources:
         - event: Transfer(address,address,uint256)
 "#;
         let man = parse_manifest(m).unwrap();
-        let link = &man.data_sources[0].abis[0].cid;
+        let link = man.data_sources[0].abis[0].link.as_str();
         let err = candidate_urls(link, &["https://gw/".into()], Origin::Manifest)
             .expect_err("a manifest link that is a URL must be refused");
         let err = format!("{err:#}");
