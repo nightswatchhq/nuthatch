@@ -348,6 +348,100 @@ async fn the_range_scan_pages_and_stops_on_both_backends() {
     );
 }
 
+/// Megabyte rows page by bytes on Postgres, a handful at a time rather than a thousand, and still
+/// visit exactly what redb does in the same order, including across an early stop (#1391 review).
+#[tokio::test]
+async fn a_range_scan_of_megabyte_rows_agrees_on_both_backends() {
+    let Some((redb, pg, _dir)) = pair("range_scan_large") else {
+        return;
+    };
+    let pad = "x".repeat(3 * 1024 * 1024);
+    let rows: Vec<(String, String)> = (0..24u64)
+        .map(|b| {
+            (
+                Store::entity_key(b, 0),
+                serde_json::json!({
+                    "table": "doc",
+                    "block_number": b,
+                    "log_index": 0,
+                    "_seq": b << 20,
+                    "value": pad,
+                })
+                .to_string(),
+            )
+        })
+        .collect();
+    for s in [redb.as_ref(), pg.as_ref()] {
+        s.commit_window(&rows, None, 23).unwrap();
+    }
+    let blocks = |s: &dyn HotStore, stop_after: usize| {
+        let mut seen = Vec::new();
+        s.scan_entities_in_range(0, u64::MAX, &mut |block, json| {
+            assert!(json.len() > 3 * 1024 * 1024, "a row must arrive whole");
+            seen.push(block);
+            seen.len() < stop_after
+        })
+        .unwrap();
+        seen
+    };
+    assert_eq!(blocks(pg.as_ref(), usize::MAX), (0..24).collect::<Vec<_>>());
+    assert_eq!(
+        blocks(redb.as_ref(), usize::MAX),
+        blocks(pg.as_ref(), usize::MAX)
+    );
+    assert_eq!(blocks(pg.as_ref(), 7), blocks(redb.as_ref(), 7));
+}
+
+/// Postgres fetches a page whole before visiting any of it, so a page a thousand megabyte rows long was
+/// gigabytes (#1391 review). Rows removed while the scan is under way show what had already been
+/// fetched: a byte-bounded page holds only the first few, so the scan ends where the survivors end.
+#[tokio::test]
+async fn a_postgres_scan_fetches_a_byte_budget_of_megabyte_rows_at_a_time() {
+    let Ok(url) = std::env::var("NUTHATCH_TEST_PG") else {
+        assert!(
+            std::env::var("NUTHATCH_REQUIRE_PG").is_err(),
+            "page_bytes: NUTHATCH_REQUIRE_PG is set but NUTHATCH_TEST_PG is not"
+        );
+        eprintln!("SKIPPED page_bytes: set NUTHATCH_TEST_PG to a Postgres URL");
+        return;
+    };
+    let name = nest_name("page_bytes");
+    let pg = PgStore::connect(&url, &name).unwrap();
+    let other = PgStore::connect(&url, &name).unwrap();
+    let pad = "x".repeat(3 * 1024 * 1024);
+    let rows: Vec<(String, String)> = (0..24u64)
+        .map(|b| {
+            (
+                Store::entity_key(b, 0),
+                serde_json::json!({
+                    "table": "doc",
+                    "block_number": b,
+                    "log_index": 0,
+                    "_seq": b << 20,
+                    "value": pad,
+                })
+                .to_string(),
+            )
+        })
+        .collect();
+    pg.commit_window(&rows, None, 23).unwrap();
+
+    let mut seen = Vec::new();
+    pg.scan_entities_in_range(0, u64::MAX, &mut |block, _| {
+        if seen.is_empty() {
+            other.rollback_to(9).unwrap();
+        }
+        seen.push(block);
+        true
+    })
+    .unwrap();
+    assert_eq!(
+        seen,
+        (0..10).collect::<Vec<_>>(),
+        "a scan that had fetched past its byte budget would still visit rows removed after it began"
+    );
+}
+
 /// The `/sql` RAM guard must refuse on both, or a scaled deployment loses a protection the embedded
 /// one has. Postgres would happily stream the whole tip, which makes this *more* important there.
 #[tokio::test]
