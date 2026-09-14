@@ -73,6 +73,9 @@ ed25519-dalek = "2"
 getrandom = "0.3"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
+# `cors` only. Already in the tree via reqwest, so this adds a feature rather than a crate, and CORS
+# is not worth hand-rolling: getting `Vary: Origin` wrong poisons a shared cache (#1318).
+tower-http = { version = "0.6", features = ["cors"] }
 anyhow = "1"
 libc = "0.2"
 tracing = "0.1"

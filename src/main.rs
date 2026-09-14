@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
                         poll_interval: args.poll_interval,
                         finality_only: args.finality_only,
                     },
+                    args.cors,
                 )
                 .await
             } else {
