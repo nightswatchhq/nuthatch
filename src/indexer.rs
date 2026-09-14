@@ -3094,7 +3094,7 @@ fn take_sealable(
     let frontier = hold_from.saturating_sub(1).min(range_to);
     let mut scan = CutScan::new(frontier, seal_span);
     for r in &buf[..eligible] {
-        if !scan.push(r.2.len(), || r.0) {
+        if !scan.push_at(r.2.len(), r.0) {
             break;
         }
     }
@@ -3114,8 +3114,9 @@ fn take_sealable(
 /// All three are anchored on the oldest held row, so they are properties of the data and both paths,
 /// seeing the same rows, cut at the same blocks. Taking the earliest is what makes them agree: a
 /// backfill holding the whole history would otherwise reach a size cut inside a range the tip path
-/// had already cut on span. Rows past the span end are still counted; they can only cross a size
-/// threshold at a block the span cut already precedes.
+/// had already cut on span. A row past a known span end cannot move the cut, since it could only cross
+/// a size threshold at a block the span cut already precedes, so a scan holding each row's block stops
+/// there ([`CutScan::push_at`]) rather than reading a sparse range to its ceiling.
 struct CutScan {
     frontier: u64,
     seal_span: u64,
@@ -3158,6 +3159,17 @@ impl CutScan {
             return false;
         }
         true
+    }
+
+    /// [`push`](Self::push) for a caller that already holds the row's block, stopping at the first row
+    /// past a span end already known.
+    fn push_at(&mut self, json_len: usize, block: u64) -> bool {
+        if let Some(end) = self.first.and_then(|f| self.span_end(f)) {
+            if block > end {
+                return false;
+            }
+        }
+        self.push(json_len, || block)
     }
 
     fn span_end(&self, first: u64) -> Option<u64> {
@@ -6244,7 +6256,7 @@ async fn maybe_seal(
         // measured on 678 QoS payloads, 2026-09-13), and the cut needs a block and a length per row.
         let mut scan = CutScan::new(ceiling, seal_span);
         store.scan_entities_in_range(from, ceiling, &mut |block, json| {
-            scan.push(json.len(), || block)
+            scan.push_at(json.len(), block)
         })?;
         // **Advance across a leading stretch that carries no rows, before deciding anything.**
         //
@@ -7642,6 +7654,46 @@ mod tests {
             largest < SEAL_DIRECT_BYTES + row + 1_024,
             "maybe_seal read {largest} bytes of rows at once against a {range_bytes}-byte range; a cut \
              is at most SEAL_DIRECT_BYTES and one row"
+        );
+    }
+
+    /// A span cut known from the first row ended nothing: the scan read on to the ceiling looking for a
+    /// size cut that could only land later, so a sparse range was read whole (#1376 review).
+    #[tokio::test]
+    async fn a_sparse_range_is_read_only_to_its_span_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let span = 100u64;
+        let far = 2_000u64;
+        let entities: Vec<(String, String)> = std::iter::once(0)
+            .chain(1_000..1_000 + far)
+            .map(|b| (Store::entity_key(b, 0), doc_json(b, 0, 64)))
+            .collect();
+        let ceiling = 1_000 + far - 1;
+        store
+            .commit_window(&entities, Some((ceiling, "aa")), ceiling)
+            .unwrap();
+
+        let metrics = crate::metrics::NestMetrics::default();
+        maybe_seal(tmp.path(), &store, &HashOnly, ceiling, None, &metrics, span)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_meta(SEALED_THROUGH_KEY)
+                .unwrap()
+                .and_then(|v| v.parse::<u64>().ok()),
+            Some(ceiling),
+            "every span of the range seals"
+        );
+        let widest = store
+            .largest_scan_rows
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            widest <= span as usize + 1,
+            "one scan visited {widest} rows; a span cut is known from the first row, so no scan \
+             should read past its span end plus the row that shows it"
         );
     }
 

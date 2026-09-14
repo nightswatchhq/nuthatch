@@ -439,6 +439,9 @@ pub struct Store {
     /// Bytes of the largest `entities_in_range` answer, so a test can hold sealing to reading a cut.
     #[cfg(test)]
     pub(crate) largest_range_read: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rows visited by the longest single `scan_entities_in_range`, for the same reason.
+    #[cfg(test)]
+    pub(crate) largest_scan_rows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Does the store at `path` hold indexed rows, as opposed to merely existing?
@@ -567,6 +570,8 @@ impl Store {
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -612,6 +617,8 @@ impl Store {
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -984,6 +991,8 @@ impl Store {
         let hi = format!("{to:012}-999999");
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
+        #[cfg(test)]
+        let mut visited = 0usize;
         for row in t.range(lo.as_str()..=hi.as_str())? {
             let (k, v) = row?;
             let key = k.value();
@@ -991,10 +1000,17 @@ impl Store {
                 .get(..12)
                 .and_then(|b| b.parse::<u64>().ok())
                 .with_context(|| format!("corrupt entity key {key:?}"))?;
+            #[cfg(test)]
+            {
+                visited += 1;
+            }
             if !visit(block, v.value()) {
                 break;
             }
         }
+        #[cfg(test)]
+        self.largest_scan_rows
+            .fetch_max(visited, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
