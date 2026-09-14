@@ -11364,43 +11364,46 @@ template = "pool"
     /// for one failure (#1375 review).
     #[tokio::test]
     async fn seal_direct_counts_an_unproven_document_as_the_resolver_does() {
-        let file: String = (0..600 * 1024)
-            .map(|i| (b'a' + (i * 7 % 26) as u8) as char)
-            .collect();
-        let (cid, _) = crate::cid::dag_for_tests(file.as_bytes(), 100_000);
-        let (gateway, _requests, handle) =
-            content_gateway(std::collections::HashMap::from([(cid.clone(), file)]), 0).await;
-        let dir = qos_topic_nest("t");
-        let config = Config::load(dir.path()).unwrap();
-        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
-        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
-        let mut tables = full_schema(&registry, &config);
-        tables.extend(creg.schema(&config.extract));
-        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
-        let source = PostSource(vec![(4, qos_post(&cid))]);
-        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true)
-            .await
-            .unwrap();
+        // Past one default chunk the bytes come back unproven; under it every gateway is refused.
+        for len in [600 * 1024, 200 * 1024] {
+            let file: String = (0..len)
+                .map(|i| (b'a' + (i * 7 % 26) as u8) as char)
+                .collect();
+            let (cid, _) = crate::cid::dag_for_tests(file.as_bytes(), 100_000);
+            let (gateway, _requests, handle) =
+                content_gateway(std::collections::HashMap::from([(cid.clone(), file)]), 0).await;
+            let dir = qos_topic_nest("t");
+            let config = Config::load(dir.path()).unwrap();
+            let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+            let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+            let mut tables = full_schema(&registry, &config);
+            tables.extend(creg.schema(&config.extract));
+            let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+            let source = PostSource(vec![(4, qos_post(&cid))]);
+            let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true)
+                .await
+                .unwrap();
 
-        let metrics = crate::metrics::NestMetrics::default();
-        let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
-            &gate,
-            &[gateway],
-            &fast_policy(2),
-            &rows,
-            true,
-            &metrics,
-        )
-        .await;
-        assert!(docs.is_empty(), "a document nothing proved is not a row");
-        assert_eq!(given_up, 1);
-        assert_eq!(
-            metrics.ipfs_unverified(),
-            2,
-            "each fetch of a document nothing proved is counted, as the resolver counts it"
-        );
-        assert_eq!(metrics.ipfs_given_up(), 1);
-        handle.abort();
+            let metrics = crate::metrics::NestMetrics::default();
+            let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
+                &gate,
+                &[gateway],
+                &fast_policy(2),
+                &rows,
+                true,
+                &metrics,
+            )
+            .await;
+            assert!(docs.is_empty(), "a document nothing proved is not a row");
+            assert_eq!(given_up, 1);
+            assert_eq!(
+                metrics.ipfs_unverified(),
+                2,
+                "each fetch of a {len}-byte document nothing proved is counted, as the resolver counts it"
+            );
+            assert_eq!(metrics.ipfs_given_up(), 1);
+            handle.abort();
+        }
     }
 
     /// RFC-0037 §3. A window fetched at most 64 documents and never came back for the rest, which at
