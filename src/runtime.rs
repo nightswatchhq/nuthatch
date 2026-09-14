@@ -855,7 +855,40 @@ pub fn adoptable(
         let Ok(m) = crate::blob::build_manifest(dir, None) else {
             return false;
         };
-        m.registry_hash == want.registry_hash && m.data_identity() == want.data_identity()
+        if m.registry_hash != want.registry_hash || m.data_identity() != want.data_identity() {
+            return false;
+        }
+        // And what the candidate **recorded when it was indexed**, not only what its files recompute
+        // to now (#1369). The two differ exactly when the running binary changed how something
+        // decodes and moved the registry hash with it: the old dataset then recomputes to the new
+        // identity and passes every check above, while the hash inside its store still names the old
+        // one. `guard_registry_identity` refuses that store at start, so nothing mixed is served -
+        // but the adoption has been spent, and the mount is left holding a store it can never start
+        // from and never adopts again. A recomputed identity is the running binary's opinion; the
+        // recorded one is what actually wrote the rows.
+        //
+        // Read the same way `guard_registry_identity` reads it, and treated the same way
+        // `Adopting::From` treats an unreadable store: absent or unreadable disqualifies the
+        // candidate, because the cost of being wrong here is a mount an operator must clear by hand
+        // and the cost of being cautious is a re-index.
+        match crate::store::recorded_registry_hash(&dir.join(crate::config::DB_FILE)) {
+            Ok(Some(recorded)) => recorded == want.registry_hash,
+            Ok(None) => {
+                tracing::debug!(
+                    "{} recomputes to the wanted identity but records no registry hash; not \
+                     adopting from it",
+                    dir.display()
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "cannot read the recorded registry hash at {}, so not adopting from it: {err:#}",
+                    dir.display()
+                );
+                false
+            }
+        }
     })
 }
 
@@ -939,9 +972,28 @@ pub fn holds_data(dir: &Path, side: Adopting) -> bool {
 /// lives, and the caller is about to copy the file.
 #[cfg(test)]
 pub fn seed_history(dir: &Path, head: u64) {
+    // The hash a real dataset would have recorded: at indexing time `guard_registry_identity` writes
+    // whatever the binary computed from these same inputs. Writing only `last_block` left a fixture
+    // that held rows and claimed no identity, which is a dataset that cannot exist in production -
+    // and it is the reason #1369 could sit in `adoptable` unnoticed.
+    let want = crate::blob::build_manifest(dir, None)
+        .expect("a history fixture must sit on a readable dataset")
+        .registry_hash;
+    seed_history_recording(dir, head, &want);
+}
+
+/// [`seed_history`], but recording a registry hash of the caller's choosing.
+///
+/// The divergence #1369 is about: a dataset whose files recompute to one identity under the running
+/// binary while its store records another, which is what a decode change does to history indexed
+/// before it.
+#[cfg(test)]
+pub fn seed_history_recording(dir: &Path, head: u64, registry_hash: &str) {
     let s = crate::store::Store::open(&dir.join(crate::config::DB_FILE))
         .expect("a store fixture must be creatable");
     s.set_meta("last_block", &head.to_string()).unwrap();
+    s.set_meta(crate::store::REGISTRY_KEY, registry_hash)
+        .unwrap();
 }
 
 /// What [`seed_history`] wrote, read back through a real open - `None` if there is no store, or
@@ -2925,6 +2977,98 @@ mod tests {
             !dest.join(crate::config::DB_FILE).exists(),
             "and nothing must have been copied into it"
         );
+    }
+
+    /// #1369's acceptance: a candidate whose **files recompute** to the wanted identity but whose
+    /// **store recorded** a different one must not be adopted.
+    ///
+    /// That divergence is what a decode change does. `#1364` moved a named tuple's object shape, so
+    /// history indexed by the old binary recomputes under the new one to the new registry hash and
+    /// passes every check `adoptable` used to make - while the hash inside its store still names the
+    /// binary that actually wrote the rows. `guard_registry_identity` catches it at start, so nothing
+    /// mixed is ever served, but by then the single adoption is spent and the mount holds a store it
+    /// can neither start from nor replace. The operator has to empty it by hand.
+    ///
+    /// The fixture makes the divergence directly rather than by shipping two binaries: an otherwise
+    /// perfectly adoptable dataset that recorded somebody else's hash.
+    #[test]
+    fn a_candidate_recording_a_different_registry_hash_is_not_adoptable() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        let src = MountTable::data_dir(root, &old);
+
+        // Everything about this dataset is adoptable except the one fact the old check never read.
+        let real = crate::blob::build_manifest(&src, None)
+            .unwrap()
+            .registry_hash;
+        let stale = format!("{:0>64}", "dead");
+        assert_ne!(real, stale, "premise: the recorded hash must differ");
+        seed_history_recording(&src, 4242, &stale);
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+
+        // The premise the whole issue rests on: under the old rule this candidate passed.
+        let m = crate::blob::build_manifest(&dest, None).unwrap();
+        let recomputed = crate::blob::build_manifest(&src, None).unwrap();
+        assert_eq!(
+            (recomputed.registry_hash.clone(), recomputed.data_identity()),
+            (m.registry_hash.clone(), m.data_identity()),
+            "premise: the candidate's files must recompute to the wanted identity, or this test \
+             proves nothing about the recorded hash"
+        );
+
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "a dataset whose store records a different registry hash must not be adopted - the \
+             adoption is spent and the mount can never start"
+        );
+        assert!(
+            !dest.join(crate::config::DB_FILE).exists(),
+            "and nothing must have been copied into it, so it indexes from scratch"
+        );
+    }
+
+    /// The other half of #1369's fix: a candidate that records **no** registry hash is skipped too.
+    ///
+    /// It is the same answer `Adopting::From` gives an unreadable store, for the same reason. A
+    /// store predating the identity check (#653) has rows and no recorded hash, so nothing can say
+    /// which binary wrote them; `guard_registry_identity` will adopt a hash for it on start and warn
+    /// that it was recorded rather than verified. Copying such a store into a fresh mount would
+    /// launder that unverified claim into a new identity and spend the adoption on it. A re-index
+    /// costs time; this costs an operator a directory they must empty by hand.
+    #[test]
+    fn a_candidate_recording_no_registry_hash_is_not_adoptable() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        let src = MountTable::data_dir(root, &old);
+
+        // Deliberately the pre-#653 shape: rows, no recorded identity.
+        {
+            let s = crate::store::Store::open(&src.join(crate::config::DB_FILE)).unwrap();
+            s.set_meta("last_block", "4242").unwrap();
+        }
+        assert_eq!(
+            crate::store::recorded_registry_hash(&src.join(crate::config::DB_FILE)).unwrap(),
+            None,
+            "premise: this fixture must record no hash at all"
+        );
+        assert!(
+            holds_data(&src, Adopting::From),
+            "premise: it must otherwise be a live candidate, or the skip proves nothing"
+        );
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+        assert_eq!(
+            adopt_dataset(root, &dest, &new).unwrap(),
+            None,
+            "a dataset that records no registry hash must not be adopted"
+        );
+        assert!(!dest.join(crate::config::DB_FILE).exists());
     }
 
     /// Adoption is all-or-nothing, and a half-copied one is the failure this guards.

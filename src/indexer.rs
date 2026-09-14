@@ -40,7 +40,7 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// The decode registry that produced this store's rows (#653). Not the same question as
 /// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
 /// configuration, which is what a nest's content address is a statement about.
-const REGISTRY_KEY: &str = "registry_hash";
+use crate::store::REGISTRY_KEY;
 const SEALED_THROUGH_KEY: &str = "sealed_through";
 const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
