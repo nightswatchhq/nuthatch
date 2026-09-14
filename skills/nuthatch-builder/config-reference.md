@@ -124,9 +124,11 @@ json_match = { topic = "gateway_indexer_attempt_qos_5_minutes_prod_v3" }
                               # optional, needs `cid_json_path`: resolve only the objects whose string
                               # fields equal these, before any fetch. Both keys enter the nest identity.
                               # A row naming no usable CID writes nothing and counts in
-                              # `nuthatch_nest_ipfs_unreadable_total`. Documents over 256 KiB are
-                              # stored `verified = false`: a multi-block UnixFS root cannot be
-                              # re-derived from the bytes alone.
+                              # `nuthatch_nest_ipfs_unreadable_total`. A document is stored only once
+                              # proven: re-encoded in Kubo's default layout, or reassembled from a CAR
+                              # whose every block hashes to its CID. Otherwise NO row, counted in
+                              # `nuthatch_nest_ipfs_unverified_total`, or `_oversize_total` past
+                              # 16 MiB, 4,096 blocks or 16 levels.
 
 [extract]                     # optional
 top_level_calls = true        # decode transactions sent directly to this nest's contracts - what a

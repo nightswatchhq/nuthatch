@@ -5532,23 +5532,24 @@ impl NestIngest {
                         break;
                     }
                     budget -= 1;
-                    match crate::subgraph_import::fetch_ipfs(
+                    match crate::subgraph_import::fetch_ipfs_proven(
                         &cid,
                         &self.ipfs_gateways,
                         crate::subgraph_import::Origin::Manifest,
                     )
                     .await
                     {
-                        Ok(content) => {
-                            // `fetch_ipfs` only returns a body that verified, or one it warned about
-                            // as too large for single-block re-encoding. Record which, so a consumer
-                            // can tell a proven document from an accepted-unverified one.
-                            let verified = content.len() <= 256 * 1024;
+                        Ok(crate::subgraph_import::Fetched {
+                            body: content,
+                            proof: crate::subgraph_import::Proof::Verified,
+                        }) => {
+                            // Only a proven document becomes a row, so every row written from here on
+                            // says `verified = true`; rows older builds stored UNVERIFIED keep `false`.
                             let row = crate::ipfs::to_row(
                                 &self.ipfs[i].name,
                                 &cid,
                                 &content,
-                                verified,
+                                true,
                                 slot,
                                 &ctx,
                             );
@@ -5557,6 +5558,23 @@ impl NestIngest {
                                 row.to_json().to_string(),
                             ));
                             stored += 1;
+                        }
+                        Ok(crate::subgraph_import::Fetched {
+                            proof: crate::subgraph_import::Proof::Unproven(why),
+                            ..
+                        }) => {
+                            self.metrics.add_ipfs_unverified(1);
+                            tracing::warn!(
+                                "ipfs: {cid} fetched but not proven ({why}) - no row written \
+                                 (nuthatch_nest_ipfs_unverified_total)"
+                            );
+                        }
+                        Err(e) if e.is::<crate::cid::OverCap>() => {
+                            self.metrics.add_ipfs_oversize(1);
+                            tracing::warn!(
+                                "ipfs: {cid} refused ({e:#}) - no row written \
+                                 (nuthatch_nest_ipfs_oversize_total)"
+                            );
                         }
                         Err(e) => tracing::warn!(
                             "ipfs: {cid} unresolved ({e:#}) - no row written, which is what a \
@@ -12886,8 +12904,9 @@ template="pool"
     /// (the real DataEdge ABI has none, so no call rows), resolving before calls are decoded (no
     /// document), ignoring `json_match` (both documents in each table), and not counting what could not be read.
     ///
-    /// The stub serves 300 KiB, past the single-block limit, so the real CID is accepted unverified.
-    /// That is what the live 1.7 MB payloads get too, and the row has to say so.
+    /// The stub serves 300 KiB that the real CIDs do not name, so neither document is proven and
+    /// neither becomes a row. Each declaration still fetches exactly its own topic's CID once, which
+    /// the unverified count shows: ignoring `json_match` would make it four, resolving too early zero.
     #[tokio::test]
     async fn a_call_tables_json_payload_resolves_the_document_it_names() {
         const EDGE: &str = "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f";
@@ -13005,33 +13024,20 @@ template="pool"
             calls, 3,
             "every post is kept as a call row, resolved or not"
         );
-        for (table, cid) in [
-            (
-                "qos_indexer_payload",
-                "QmdhcVTpSjmCBvqgL9m6nazRs23XBEbJ6zygojVAqib7oa",
-            ),
-            (
-                "qos_query_payload",
-                "QmcySPs9y7a4wGYxCtbdNrt9kjryce9iYguRVe6GdKvZw5",
-            ),
-        ] {
-            let docs: Vec<&serde_json::Value> =
-                rows.iter().filter(|v| v["table"] == table).collect();
-            let cids: Vec<&serde_json::Value> = docs.iter().map(|v| &v["cid"]).collect();
-            assert_eq!(
-                cids,
-                [cid],
-                "{table} wants only the document its own topic names"
-            );
-            assert_eq!(
-                docs[0]["verified"], false,
-                "a multi-block document cannot be proven from its bytes and must not claim it was"
-            );
-        }
+        assert!(
+            !rows
+                .iter()
+                .any(|v| v["table"] == "qos_indexer_payload" || v["table"] == "qos_query_payload"),
+            "a document nothing proved must not become a row: {rows:?}"
+        );
+        let metrics = crate::metrics::METRICS.nest("qos-oracle-n1");
         assert_eq!(
-            crate::metrics::METRICS
-                .nest("qos-oracle-n1")
-                .ipfs_unreadable(),
+            metrics.ipfs_unverified(),
+            2,
+            "each declaration fetches only the document its own topic names, once"
+        );
+        assert_eq!(
+            metrics.ipfs_unreadable(),
             2,
             "the post whose payload is not JSON is unreadable to both declarations, and counted"
         );

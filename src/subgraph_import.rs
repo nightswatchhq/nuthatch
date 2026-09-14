@@ -14,9 +14,9 @@
 //! would have been vendored as the nest's manifest, because the only check was that the body was
 //! non-empty.
 //!
-//! The one gap left is stated where it happens rather than hidden: a file over the 256 KiB default
-//! chunk size is multi-block, its root holds links rather than data, and re-encoding cannot
-//! reproduce it. Those are accepted with a loud UNVERIFIED warning, never silently.
+//! A multi-block file is proven by re-encoding it in Kubo's default layout, or from a CAR of its
+//! blocks (RFC-0037 slice 6). One that neither proves is accepted here with a loud UNVERIFIED
+//! warning, never silently; a nest's resolver refuses it instead.
 //!
 //! What the manifest **cannot** tell us is which template a factory creates:
 //! that lives in the mapping WASM, as a `Template.create(address)` call. So
@@ -265,6 +265,20 @@ pub fn candidate_urls(source: &str, gateways: &[String], origin: Origin) -> Resu
     Ok(gateways.iter().map(|g| format!("{g}{cid}")).collect())
 }
 
+/// Whether a fetched document was proven to be the one its CID names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Proof {
+    Verified,
+    /// Fetched but not proven: an operator's URL, which names a location rather than a content, or a
+    /// file that neither its bytes nor its blocks could prove. The reason says which.
+    Unproven(String),
+}
+
+pub struct Fetched {
+    pub body: String,
+    pub proof: Proof,
+}
+
 /// Read a manifest, from disk when `source` names a file that exists and over IPFS otherwise.
 ///
 /// Returning the [`ManifestHome`] alongside the text is the point: every later decision about a
@@ -336,17 +350,46 @@ pub fn resolve_abi_path(home: &ManifestHome, rel: &str) -> Result<std::path::Pat
 /// Fetch a document, trying each gateway until one answers. Gateways fail
 /// often and individually, so a single failure is never fatal; only running
 /// out of them is, and then we say which ones we tried.
+///
+/// An unproven document is accepted loudly, which suits `init` vendoring an operator's manifest. A
+/// nest's resolver calls [`fetch_ipfs_proven`] instead, and stores only what verified.
 pub async fn fetch_ipfs(source: &str, gateways: &[String], origin: Origin) -> Result<String> {
+    let fetched = fetch_ipfs_proven(source, gateways, origin).await?;
+    if let (Proof::Unproven(why), Some(_)) = (&fetched.proof, cid_of(source)) {
+        tracing::warn!(
+            "{source}: {} bytes accepted UNVERIFIED ({why})",
+            fetched.body.len()
+        );
+    }
+    Ok(fetched.body)
+}
+
+/// [`fetch_ipfs`], saying whether the document was proven.
+///
+/// The file bytes come first, proven by re-encoding. When they cannot be, or every gateway sent
+/// something else, the blocks are asked for as a CAR and each is checked against the CID naming it.
+/// A document over the caps is refused with [`crate::cid::OverCap`].
+pub async fn fetch_ipfs_proven(
+    source: &str,
+    gateways: &[String],
+    origin: Origin,
+) -> Result<Fetched> {
     let urls = candidate_urls(source, gateways, origin)?;
     // The CID the document must hash to. `None` only for an operator-supplied URL, which addresses a
     // location rather than a content, and therefore commits to nothing we can check.
-    let expect = cid_of(source).and_then(|c| crate::cid::Cid::parse(&c).ok());
+    let named = cid_of(source);
+    let expect = named
+        .as_deref()
+        .and_then(|c| crate::cid::Cid::parse(c).ok());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("failed to build HTTP client")?;
 
     let mut failures = Vec::new();
+    let mut unproven = None;
+    let mut answered = false;
+    let mut over_cap = None;
     for url in &urls {
         let body = match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => match read_capped(resp).await {
@@ -356,6 +399,9 @@ pub async fn fetch_ipfs(source: &str, gateways: &[String], origin: Origin) -> Re
                     continue;
                 }
                 Err(e) => {
+                    if e.is::<crate::cid::OverCap>() {
+                        over_cap = Some(e.to_string());
+                    }
                     failures.push(format!("{url}: {e}"));
                     continue;
                 }
@@ -374,28 +420,91 @@ pub async fn fetch_ipfs(source: &str, gateways: &[String], origin: Origin) -> Re
         // believed - and gateways really do answer 200 with prose like "Unable to retrieve content
         // within timeout period", which would have been vendored into the nest as its manifest.
         let Some(cid) = expect.as_ref() else {
-            return Ok(body);
+            return Ok(Fetched {
+                body,
+                proof: Proof::Unproven("an operator's URL names a location, not a content".into()),
+            });
         };
+        answered = true;
         match crate::cid::verify(cid, body.as_bytes()) {
-            Ok(()) => return Ok(body),
-            Err(e) if body.len() > 256 * 1024 => {
-                // Over the default chunk size, so re-encoding cannot reproduce a multi-block root.
-                // Unverifiable is not tampered, and refusing a legitimately large ABI would be worse
-                // than saying so - but it is said loudly, once, naming the document.
-                tracing::warn!(
-                    "{source}: {} bytes could not be verified against its CID ({e}). Accepting \
-                     UNVERIFIED - the content is too large for single-block re-encoding.",
-                    body.len()
-                );
-                return Ok(body);
+            Ok(()) => {
+                return Ok(Fetched {
+                    body,
+                    proof: Proof::Verified,
+                })
+            }
+            Err(e) if e.is::<crate::cid::Unprovable>() => {
+                failures.push(format!("{url}: {e}"));
+                unproven.get_or_insert((body, e.to_string()));
             }
             Err(e) => failures.push(format!("{url}: {e}")),
         }
+    }
+
+    // Only a gateway that answered is worth asking for blocks: one that failed outright has no CAR.
+    if let (Some(cid), Some(name), true) = (expect.as_ref(), named.as_deref(), answered) {
+        for url in gateways.iter().filter_map(|g| car_url(g, name)) {
+            match fetch_car(&client, &url, cid).await {
+                Ok(body) => {
+                    return Ok(Fetched {
+                        body,
+                        proof: Proof::Verified,
+                    })
+                }
+                Err(e) => {
+                    if e.is::<crate::cid::OverCap>() {
+                        over_cap = Some(e.to_string());
+                    }
+                    failures.push(format!("{url}: {e:#}"));
+                }
+            }
+        }
+    }
+    if let Some(why) = over_cap {
+        return Err(crate::cid::OverCap(format!("'{source}' refused: {why}")).into());
+    }
+    if let Some((body, why)) = unproven {
+        return Ok(Fetched {
+            body,
+            proof: Proof::Unproven(why),
+        });
     }
     Err(anyhow!(
         "could not fetch '{source}' from any gateway:\n  {}",
         failures.join("\n  ")
     ))
+}
+
+/// The trustless CAR form of a path gateway (`https://host/ipfs/`), per the IPFS trustless gateway
+/// spec. A Kubo RPC prefix (`…/api/v0/cat?arg=`) has no such form and is skipped.
+fn car_url(gateway: &str, cid: &str) -> Option<String> {
+    (!gateway.contains('?')).then(|| format!("{gateway}{cid}?format=car"))
+}
+
+/// A CAR's worth of room over the file cap, for the block framing around the bytes.
+const MAX_CAR_BYTES: usize = MAX_FETCH_BYTES + MAX_FETCH_BYTES / 16;
+
+async fn fetch_car(client: &reqwest::Client, url: &str, cid: &crate::cid::Cid) -> Result<String> {
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.ipld.car")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("HTTP {}", resp.status());
+    }
+    // The Graph's path gateway ignores `format=car` and sends the file, which proves nothing.
+    let is_car = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/vnd.ipld.car"));
+    if !is_car {
+        bail!("answered without a CAR");
+    }
+    let car = read_capped_bytes(resp, MAX_CAR_BYTES).await?;
+    let content = crate::cid::content_from_car(cid, &car, &crate::cid::CAPS)?;
+    String::from_utf8(content).context("the verified document is not UTF-8")
 }
 
 /// The CID a source names, if it names one. An `http(s)` URL does not.
@@ -423,20 +532,26 @@ const MAX_FETCH_BYTES: usize = 16 * 1024 * 1024;
 
 /// Read a response body, refusing past [`MAX_FETCH_BYTES`] rather than buffering whatever arrives.
 async fn read_capped(resp: reqwest::Response) -> Result<String> {
+    String::from_utf8(read_capped_bytes(resp, MAX_FETCH_BYTES).await?)
+        .context("response is not UTF-8")
+}
+
+async fn read_capped_bytes(resp: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
     use futures::StreamExt;
     let mut out: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading response body")?;
-        if out.len() + chunk.len() > MAX_FETCH_BYTES {
-            bail!(
+        if out.len() + chunk.len() > cap {
+            return Err(crate::cid::OverCap(format!(
                 "response exceeds {} MiB - refusing to buffer it",
-                MAX_FETCH_BYTES / 1024 / 1024
-            );
+                cap / 1024 / 1024
+            ))
+            .into());
         }
         out.extend_from_slice(&chunk);
     }
-    String::from_utf8(out).context("response is not UTF-8")
+    Ok(out)
 }
 
 // ── Parsing ──────────────────────────────────────────────────────────────
@@ -1081,6 +1196,158 @@ mod tests {
     }
 
     use super::*;
+
+    /// A gateway serving `file` for a plain request and `car` for `?format=car`. Without a CAR it
+    /// answers `?format=car` with the file under a JSON type, which is what The Graph's does.
+    async fn trustless_gateway(
+        file: Vec<u8>,
+        car: Option<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::header, response::IntoResponse, routing::get, Router};
+        let app = Router::new().route(
+            "/ipfs/{cid}",
+            get(move |uri: axum::http::Uri| {
+                let (file, car) = (file.clone(), car.clone());
+                async move {
+                    match (uri.query(), car) {
+                        (Some("format=car"), Some(car)) => (
+                            [(header::CONTENT_TYPE, "application/vnd.ipld.car; version=1")],
+                            car,
+                        )
+                            .into_response(),
+                        _ => ([(header::CONTENT_TYPE, "application/json")], file).into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/ipfs/"), handle)
+    }
+
+    fn document(n: usize) -> Vec<u8> {
+        (0..n).map(|i| b'a' + (i * 7 % 26) as u8).collect()
+    }
+
+    const LARGE: usize = 600 * 1024;
+
+    #[tokio::test]
+    async fn a_large_document_in_kubos_default_layout_is_proven_from_its_file_bytes() {
+        let file = document(LARGE);
+        let (cid, _) = crate::cid::dag_for_tests(&file, crate::cid::DEFAULT_CHUNK);
+        let (gateway, handle) = trustless_gateway(file.clone(), None).await;
+        let got = fetch_ipfs_proven(&cid, &[gateway], Origin::Manifest)
+            .await
+            .unwrap();
+        assert_eq!(got.proof, Proof::Verified);
+        assert_eq!(got.body.as_bytes(), file);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_document_in_another_layout_is_proven_from_its_blocks() {
+        let file = document(LARGE);
+        let (cid, car) = crate::cid::dag_for_tests(&file, 100_000);
+        let (gateway, handle) = trustless_gateway(file.clone(), Some(car)).await;
+        let got = fetch_ipfs_proven(&cid, &[gateway], Origin::Manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.proof,
+            Proof::Verified,
+            "the blocks prove what re-encoding cannot"
+        );
+        assert_eq!(got.body.as_bytes(), file);
+        handle.abort();
+    }
+
+    /// Under one default chunk a body can still be a multi-block file cut smaller: 200 KiB in 100 KiB
+    /// leaves re-encodes to nothing, and only its blocks prove it (#1373 review).
+    #[tokio::test]
+    async fn a_small_document_in_another_layout_is_proven_from_its_blocks() {
+        let file = document(200 * 1024);
+        let (cid, car) = crate::cid::dag_for_tests(&file, 100 * 1024);
+        let (gateway, handle) = trustless_gateway(file.clone(), Some(car)).await;
+        let got = fetch_ipfs_proven(&cid, &[gateway], Origin::Manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.proof,
+            Proof::Verified,
+            "a small file cut into smaller leaves is proven by its blocks"
+        );
+        assert_eq!(got.body.as_bytes(), file);
+        handle.abort();
+    }
+
+    /// The same small file with no blocks to prove it is refused, not accepted unproven: under one
+    /// default chunk a body that does not re-encode is far likelier a gateway's error page than a file
+    /// cut small, and `init` vendors whatever this accepts.
+    #[tokio::test]
+    async fn a_small_document_that_neither_re_encodes_nor_has_blocks_is_refused() {
+        let file = document(200 * 1024);
+        let (cid, _) = crate::cid::dag_for_tests(&file, 100 * 1024);
+        let (gateway, handle) = trustless_gateway(file, None).await;
+        let gateways = [gateway];
+        assert!(
+            fetch_ipfs_proven(&cid, &gateways, Origin::Manifest)
+                .await
+                .is_err(),
+            "a small body proven by nothing must be refused"
+        );
+        assert!(fetch_ipfs(&cid, &gateways, Origin::Manifest).await.is_err());
+        handle.abort();
+    }
+
+    /// A gateway that answers `?format=car` with the file has proven nothing: the document comes back
+    /// unproven, and `init`'s `fetch_ipfs` still accepts it loudly.
+    #[tokio::test]
+    async fn a_gateway_without_a_car_leaves_another_layout_unproven() {
+        let file = document(LARGE);
+        let (cid, _) = crate::cid::dag_for_tests(&file, 100_000);
+        let (gateway, handle) = trustless_gateway(file.clone(), None).await;
+        let gateways = [gateway];
+        let got = fetch_ipfs_proven(&cid, &gateways, Origin::Manifest)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&got.proof, Proof::Unproven(why) if why.contains("UNVERIFIED")),
+            "{:?}",
+            got.proof
+        );
+        let accepted = fetch_ipfs(&cid, &gateways, Origin::Manifest).await.unwrap();
+        assert_eq!(accepted.as_bytes(), file);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_car_with_a_tampered_block_is_not_proof() {
+        let file = document(LARGE);
+        let (cid, mut car) = crate::cid::dag_for_tests(&file, 100_000);
+        let last = car.len() - 1;
+        car[last] ^= 1;
+        let (gateway, handle) = trustless_gateway(file, Some(car)).await;
+        let got = fetch_ipfs_proven(&cid, &[gateway], Origin::Manifest)
+            .await
+            .unwrap();
+        assert!(matches!(got.proof, Proof::Unproven(_)), "{:?}", got.proof);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_document_over_the_cap_is_refused_as_over_cap() {
+        let cid = crate::cid::cid_v0_for(b"anything");
+        let (gateway, handle) = trustless_gateway(document(MAX_FETCH_BYTES + 1), None).await;
+        let err = fetch_ipfs_proven(&cid, &[gateway], Origin::Manifest)
+            .await
+            .err()
+            .expect("an oversize body must be refused");
+        assert!(err.is::<crate::cid::OverCap>(), "{err:#}");
+        handle.abort();
+    }
 
     const MANIFEST: &str = r#"
 specVersion: 0.0.9

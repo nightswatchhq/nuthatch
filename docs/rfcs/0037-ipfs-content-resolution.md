@@ -1,6 +1,8 @@
 # RFC-0037: IPFS content resolution - a verified, content-addressed side table
 
-**Status:** **Accepted, slices 1-5 built.** Slice 5 (2026-09-13): a CID inside JSON, from an event
+**Status:** **Accepted, slices 1-6 built.** Slice 6 (2026-09-13): multi-block documents are verified,
+by re-encoding in Kubo's default layout or from their blocks, and an unproven document writes no row;
+see §5. Slice 5 (2026-09-13): a CID inside JSON, from an event
 column or a top-level call's calldata, with a topic filter; see §5. Slices 1-4 (2026-08-19). Slice 1 (verification) and slices 2-3
 (declared resolution) shipped in PR #645; slice 4 is `--ipfs`, which takes a local node URL as readily
 as a gateway, so an operator can already take every third party out of the path. **One limit stands:**
@@ -160,11 +162,47 @@ per topic), 37.8 MB, 0 unreadable. The declaration hash moves the decode identit
 (`src/project.rs`); the runtime identity guard and `/sql` provenance still hash the event registry
 alone, which for an event-less nest is the hash of nothing.
 
-Two limits are named rather than fixed. A document over 256 KiB is stored `verified = false`, because
-a multi-block UnixFS root cannot be re-derived from the bytes; the oracle's payloads are 0.6 to 1.9 MB,
-so every one of them is in that case. And a CID that misses the per-window budget, or whose gateways
-all fail, is never attempted again: the out-of-band resolver the budget warning refers to does not
-exist yet.
+Two limits were named rather than fixed. A document over 256 KiB was stored `verified = false`,
+because a multi-block UnixFS root could not be re-derived from its bytes; the oracle's payloads are 0.6
+to 1.9 MB, so every one of them was in that case. Slice 6 closes that. And a CID that misses the
+per-window budget, or whose gateways all fail, is never attempted again: the out-of-band resolver the
+budget warning refers to does not exist yet.
+
+**Slice 6 - multi-block documents are verified, and an unproven one writes no row.** Slice 5's live run
+verified 0 of 36 oracle payloads. Two ways now prove a file past 256 KiB:
+
+- **Re-encoding in Kubo's default layout.** The bytes are cut into 256 KiB leaves (dag-pb, or raw under
+  CIDv1) and built into a balanced tree of at most 174 links, as `ipfs add` does by default, and the
+  root is hashed. No gateway cooperation and no extra request. It is anchored to the network rather
+  than to our own encoder: a real 152-byte oracle root block re-encodes byte for byte from its own
+  links, a real leaf fixes the chunk size, and Kubo's empty-file CID (`QmbFMke1…`) holds, which also
+  corrected the single-block encoder (Kubo omits an empty Data field). All 4,025 oracle payloads
+  fetched for 2026-09-06 to 2026-09-12 verify this way.
+- **Blocks, when re-encoding cannot.** A file imported another way is asked for as a CAR
+  (`?format=car`, the trustless gateway form). Every block is hashed against the CID naming it before
+  the DAG is walked, from the root we asked for and never from the roots the header claims; each
+  child's bytes are checked against its parent's `blocksizes` and each node's total against its
+  `filesize`. Caps of 16 MiB of file, 4,096 blocks and block visits, and 16 levels bound a hostile
+  DAG; past them the document is refused and counted in `nuthatch_nest_ipfs_oversize_total`.
+
+Which trustless forms real endpoints serve, measured on 2026-09-13 with two oracle CIDs: The Graph's
+path gateway ignores `?format=raw` and `?format=car` and returns the file in 0.1 to 0.2 s, and its Kubo
+RPC `block/get` and `dag/export` answer 403; Pinata serves raw blocks in 4 to 6 s each and whole CARs in
+5 to 6 s; `ipfs.io` and `trustless-gateway.link` timed out at 60 s. Re-encoding is therefore the path
+that works everywhere, and the CAR the fallback where a gateway offers one.
+
+Verified live on 2026-09-13 by re-running slice 5's scratch nest from block 48,231,452 to the tip at
+48,232,905: 50 documents resolved, 50 verified (25 per topic, 52.0 MB), 0 unverified, 0 oversize. The
+36 inside slice 5's range are the same 36 it had stored unverified. Re-encoding costs no request, so
+the per-window fetch budget is unchanged for documents in the default layout; the CAR costs one more
+request per offering gateway, and only for a document re-encoding cannot prove.
+
+**Policy.** A nest's resolver stores only proven documents. An unproven one writes no row and counts in
+`nuthatch_nest_ipfs_unverified_total`, which is §2's rule: unverified IPFS is an HTTP enricher and does
+not feed canonical state. The `verified` column stays, so no schema or identity changes; it is `true`
+on every row written from this build on, rows older builds stored as `false` keep that value, and a
+re-index either proves them or leaves them out. `init` still accepts an unproven manifest or ABI,
+loudly, as slice 1 decided.
 
 ## 6. Non-goals
 
