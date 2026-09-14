@@ -112,9 +112,19 @@ async fn blockscout_v2(root: &str, address: &str) -> Result<(Value, Option<Strin
     let body: Value = resp.json().await.with_context(|| {
         format!("{base} did not answer with JSON; is it a Blockscout instance?")
     })?;
-    // Explicitly, and before looking at `abi`: an unverified contract can still carry a null `abi`,
-    // and "no ABI field" would report as a parse problem rather than as the finding it is.
-    if body.get("is_verified").and_then(Value::as_bool) == Some(false) {
+    // **Verified must be asserted, not merely not-denied** (Jules on #1388). Rejecting only an
+    // explicit `false` accepts a body with the field missing, or carrying the string `"false"`, or
+    // any other JSON that happens to hold an array under `abi` - which is exactly how a wrong
+    // endpoint gets its ABI vendored into a nest while this function claims to be using
+    // Blockscout's verification signal. Requiring `true` is the same allowlist-not-denylist move
+    // the CORS validator needed three rounds to learn.
+    //
+    // Safe to require, measured 2026-09-14 rather than assumed: `eth.`, `base.` and
+    // `gnosis.blockscout.com` all answer a verified contract with a real JSON boolean `true`, and a
+    // v2 instance answers 404 for an unverified one (`testnet.arcscan.app`) rather than omitting
+    // the field. Checked before `abi`, so an unverified contract reports as unverified rather than
+    // as a parse problem.
+    if body.get("is_verified").and_then(Value::as_bool) != Some(true) {
         bail!("{address} is not verified on {base}");
     }
     let abi = body
@@ -433,20 +443,33 @@ mod tests {
     /// and an actionable one; a demand for a key that would not have helped is not.
     #[tokio::test]
     async fn an_unverified_contract_is_reported_as_unverified() {
-        let (root, h) = fake_explorer(json!({"is_verified": false, "abi": null})).await;
-        let err = blockscout_v2(&root, "0xabc")
-            .await
-            .expect_err("an unverified contract has no ABI to give");
-        h.abort();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not verified"),
-            "an unverified contract was reported as: {msg}"
-        );
-        assert!(
-            !msg.contains("ETHERSCAN"),
-            "and must not send the operator after a key that would not help: {msg}"
-        );
+        let abi: Value = serde_json::from_str(ABI).unwrap();
+        // Every shape that is not an explicit boolean `true`, each one carrying a perfectly good
+        // ABI array - which is the case that matters, because a body with no ABI would be refused
+        // by the next check anyway and would prove nothing about this one (Jules on #1388).
+        for body in [
+            json!({"is_verified": false, "abi": null}),
+            json!({"is_verified": false, "abi": abi}),
+            json!({"abi": abi}),
+            json!({"is_verified": "true", "abi": abi}),
+            json!({"is_verified": 1, "abi": abi}),
+            json!({"is_verified": null, "abi": abi}),
+        ] {
+            let (root, h) = fake_explorer(body.clone()).await;
+            let err = blockscout_v2(&root, "0xabc")
+                .await
+                .expect_err("a body that does not assert verification has no ABI to give")
+                .to_string();
+            h.abort();
+            assert!(
+                err.contains("not verified"),
+                "{body} was reported as: {err}"
+            );
+            assert!(
+                !err.contains("ETHERSCAN"),
+                "and must not send the operator after a key that would not help: {err}"
+            );
+        }
     }
 
     /// A body that says verified but carries no usable ABI is refused rather than passed on.
@@ -457,11 +480,13 @@ mod tests {
     /// the nest and fail much later, at decode, where the cause is no longer visible.
     #[tokio::test]
     async fn a_verified_answer_with_no_usable_abi_is_refused() {
+        // All explicitly verified: the point is a body that *asserts* verification and still has
+        // no usable ABI. Bodies that do not assert it are the other test's business now.
         for body in [
             json!({"is_verified": true, "abi": null}),
             json!({"is_verified": true, "abi": "[{\"type\":\"event\"}]"}),
-            json!({"abi": null}),
-            json!({}),
+            json!({"is_verified": true}),
+            json!({"is_verified": true, "abi": {}}),
         ] {
             let (root, h) = fake_explorer(body.clone()).await;
             let got = blockscout_v2(&root, "0xabc").await;
