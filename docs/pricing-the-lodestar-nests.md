@@ -109,7 +109,9 @@ Phase 0 would cost. **At most one query out of 42.** The rule is affordable on t
 
 The ceiling is not the price. It is throughput.
 
-`/sql` admits `NUTHATCH_SQL_MAX_CONCURRENCY` queries and refuses the rest in under 3 ms. The default
+`/sql` admits `NUTHATCH_SQL_MAX_CONCURRENCY` queries and refuses the rest in under 3 ms (measured on
+3.5.1; since #1319 a refusal takes up to 250 ms, because the request waits for a permit first - the
+admitted count below is unaffected, since the permit count is unchanged). The default
 is 2; this deployment sets **4**, measured by firing ten at once over three rounds and being admitted
 nine times. Latencies on 3.5.1 run **0.08 s to 6.1 s**, mean about 2 seconds across the sampled
 views. Four permits at two seconds is roughly **2 queries per second, or 5 M a month**, and every

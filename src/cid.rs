@@ -283,7 +283,10 @@ impl std::error::Error for OverCap {}
 ///
 /// `Ok(())` means verified. An [`Unprovable`] error means **not verified**, which is not the same as
 /// "wrong": a file imported with a non-default layout cannot be re-encoded, and only its blocks can
-/// prove it. Any other error means the bytes are not the document.
+/// prove it. Any other error means the bytes are not the document *as re-encoded*: a dag-pb body under
+/// one default chunk may still be a file cut into smaller blocks, which is why
+/// [`fetch_ipfs_proven`](crate::subgraph_import::fetch_ipfs_proven) asks for the blocks after any
+/// mismatch and refuses only when they do not prove it either.
 pub fn verify(cid: &Cid, content: &[u8]) -> Result<()> {
     if cid.hash_code != MH_SHA2_256 {
         bail!(
@@ -330,8 +333,9 @@ pub fn verify(cid: &Cid, content: &[u8]) -> Result<()> {
         .into());
     }
     bail!(
-        "content does not match its CID: expected sha2-256 {}. The gateway returned a different \
-         document from the one asked for.",
+        "content does not re-encode to its CID: expected sha2-256 {}. Either the gateway returned a \
+         different document, or the file was cut into smaller blocks than one default chunk, which \
+         only its blocks can prove.",
         hex::encode(&cid.digest)
     )
 }
@@ -780,8 +784,8 @@ mod tests {
                 .expect_err("an arbitrary body must not verify as the document")
                 .to_string();
             assert!(
-                err.contains("does not match its CID"),
-                "say plainly that it is the wrong document: {err}"
+                err.contains("does not re-encode to its CID"),
+                "say plainly that it is not the document as re-encoded: {err}"
             );
         }
     }

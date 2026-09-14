@@ -4229,7 +4229,7 @@ dependencies = [
 
 [[package]]
 name = "nuthatch"
-version = "3.6.1"
+version = "3.7.0"
 dependencies = [
  "Inflector",
  "alloy-dyn-abi",
@@ -4253,6 +4253,7 @@ dependencies = [
  "hex",
  "k256",
  "libc",
+ "md-5 0.10.6",
  "num-bigint",
  "nuthatch-decode",
  "object_store",

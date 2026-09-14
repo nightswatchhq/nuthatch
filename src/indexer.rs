@@ -40,10 +40,7 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// The decode registry that produced this store's rows (#653). Not the same question as
 /// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
 /// configuration, which is what a nest's content address is a statement about.
-const REGISTRY_KEY: &str = "registry_hash";
-/// Which formula `REGISTRY_KEY` was recorded under. Absent means the event registry alone.
-const IDENTITY_FORMULA_KEY: &str = "identity_formula";
-const IDENTITY_FORMULA: &str = "2";
+use crate::store::{IDENTITY_FORMULA, IDENTITY_FORMULA_KEY, REGISTRY_KEY};
 const SEALED_THROUGH_KEY: &str = "sealed_through";
 const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
@@ -2803,6 +2800,7 @@ async fn build_nest(
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(full_schema(&registry, config)),
         sql_gate,
+        sql_queued: Default::default(),
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
         sql_max_hot_bytes: serve::SQL_MAX_HOT_BYTES,
         sql_max_named_scan_bytes: serve::SQL_MAX_NAMED_SCAN_BYTES,
@@ -3113,7 +3111,7 @@ fn take_sealable(
     let frontier = hold_from.saturating_sub(1).min(range_to);
     let mut scan = CutScan::new(frontier, seal_span);
     for r in &buf[..eligible] {
-        if !scan.push(r.2.len(), || r.0) {
+        if !scan.push_at(r.2.len(), r.0) {
             break;
         }
     }
@@ -3133,8 +3131,9 @@ fn take_sealable(
 /// All three are anchored on the oldest held row, so they are properties of the data and both paths,
 /// seeing the same rows, cut at the same blocks. Taking the earliest is what makes them agree: a
 /// backfill holding the whole history would otherwise reach a size cut inside a range the tip path
-/// had already cut on span. Rows past the span end are still counted; they can only cross a size
-/// threshold at a block the span cut already precedes.
+/// had already cut on span. A row past a known span end cannot move the cut, since it could only cross
+/// a size threshold at a block the span cut already precedes, so a scan holding each row's block stops
+/// there ([`CutScan::push_at`]) rather than reading a sparse range to its ceiling.
 struct CutScan {
     frontier: u64,
     seal_span: u64,
@@ -3177,6 +3176,17 @@ impl CutScan {
             return false;
         }
         true
+    }
+
+    /// [`push`](Self::push) for a caller that already holds the row's block, stopping at the first row
+    /// past a span end already known.
+    fn push_at(&mut self, json_len: usize, block: u64) -> bool {
+        if let Some(end) = self.first.and_then(|f| self.span_end(f)) {
+            if block > end {
+                return false;
+            }
+        }
+        self.push(json_len, || block)
     }
 
     fn span_end(&self, first: u64) -> Option<u64> {
@@ -3419,6 +3429,8 @@ pub struct DirectExtras<'a> {
     pub call_registry: Option<&'a crate::calldata::CallRegistry>,
     pub ipfs: Option<&'a crate::ipfs_resolve::Gate>,
     pub gateways: &'a [String],
+    /// Where a document's failures are counted; `None` counts into a throwaway, as a bench does.
+    pub metrics: Option<&'a crate::metrics::NestMetrics>,
 }
 
 impl DirectExtras<'_> {
@@ -3447,12 +3459,14 @@ impl DirectExtras<'_> {
             );
         }
         if let Some(gate) = self.ipfs {
+            let unobserved = crate::metrics::NestMetrics::default();
             let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
                 gate,
                 self.gateways,
                 &crate::ipfs_resolve::Policy::default(),
                 rows,
                 timestamps,
+                self.metrics.unwrap_or(&unobserved),
             )
             .await;
             if given_up > 0 {
@@ -5214,6 +5228,7 @@ impl NestIngest {
                     },
                     ipfs: self.ipfs_gate.as_deref(),
                     gateways: &self.ipfs_gateways,
+                    metrics: Some(&self.metrics),
                 };
                 let sealed = if let Some(fs) = self.factory.as_deref() {
                     if concurrency > 1 {
@@ -6021,9 +6036,11 @@ impl NestIngest {
             Finality::Depth(_) => None,
         };
         let finalized_through = seal_ceiling(self.finality, tip, finalized_tag);
-        let finalized_through = match &self.ipfs_gate {
+        let Some(finalized_through) = (match &self.ipfs_gate {
             Some(gate) => hold_for_documents(self.store.as_ref(), gate, finalized_through)?,
-            None => finalized_through,
+            None => Some(finalized_through),
+        }) else {
+            return Ok(Some(stored));
         };
 
         // Seal any newly-finalized range to an immutable Parquet segment, stamping the
@@ -6490,7 +6507,8 @@ fn block_number_of(json: &str) -> Option<u64> {
 }
 
 /// The block a finalized range may seal through while documents it names are outstanding
-/// (RFC-0037 §3): one below the lowest block holding one, or `finalized_through` when none is.
+/// (RFC-0037 §3): one below the lowest block holding one, `finalized_through` when none is, and `None`
+/// when that block is block 0, where "one below" does not exist and nothing may seal.
 ///
 /// Read in chunks from the watermark up and stopped at the first outstanding document, which is
 /// normally near the watermark, so a long run of resolved documents above it is not reloaded per window.
@@ -6498,7 +6516,7 @@ fn hold_for_documents(
     store: &dyn crate::store::HotStore,
     gate: &crate::ipfs_resolve::Gate,
     finalized_through: u64,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     const CHUNK: u64 = 256;
     let mut lo = match store.get_meta(SEALED_THROUGH_KEY)? {
         Some(v) => v.parse::<u64>().context("corrupt sealed_through")? + 1,
@@ -6508,14 +6526,14 @@ fn hold_for_documents(
         let hi = lo.saturating_add(CHUNK - 1).min(finalized_through);
         let entities = store.entities_in_range(lo, hi)?;
         if let Some(pending) = gate.lowest_pending(store, &entities)? {
-            return Ok(pending.saturating_sub(1));
+            return Ok(pending.checked_sub(1));
         }
         if hi == u64::MAX {
             break;
         }
         lo = hi + 1;
     }
-    Ok(finalized_through)
+    Ok(Some(finalized_through))
 }
 
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
@@ -6560,7 +6578,7 @@ async fn maybe_seal(
         // measured on 678 QoS payloads, 2026-09-13), and the cut needs a block and a length per row.
         let mut scan = CutScan::new(ceiling, seal_span);
         store.scan_entities_in_range(from, ceiling, &mut |block, json| {
-            scan.push(json.len(), || block)
+            scan.push_at(json.len(), block)
         })?;
         // **Advance across a leading stretch that carries no rows, before deciding anything.**
         //
@@ -8037,6 +8055,46 @@ mod tests {
                 .map(|s| s.parse::<u64>().unwrap()),
             Some(first_cut),
             "an aborted seal must stop after the segment it was writing, not run every cut"
+        );
+    }
+
+    /// A span cut known from the first row ended nothing: the scan read on to the ceiling looking for a
+    /// size cut that could only land later, so a sparse range was read whole (#1376 review).
+    #[tokio::test]
+    async fn a_sparse_range_is_read_only_to_its_span_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let span = 100u64;
+        let far = 2_000u64;
+        let entities: Vec<(String, String)> = std::iter::once(0)
+            .chain(1_000..1_000 + far)
+            .map(|b| (Store::entity_key(b, 0), doc_json(b, 0, 64)))
+            .collect();
+        let ceiling = 1_000 + far - 1;
+        store
+            .commit_window(&entities, Some((ceiling, "aa")), ceiling)
+            .unwrap();
+
+        let metrics = crate::metrics::NestMetrics::default();
+        maybe_seal(tmp.path(), &store, &HashOnly, ceiling, None, &metrics, span)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_meta(SEALED_THROUGH_KEY)
+                .unwrap()
+                .and_then(|v| v.parse::<u64>().ok()),
+            Some(ceiling),
+            "every span of the range seals"
+        );
+        let widest = store
+            .largest_scan_rows
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            widest <= span as usize + 1,
+            "one scan visited {widest} rows; a span cut is known from the first row, so no scan \
+             should read past its span end plus the row that shows it"
         );
     }
 
@@ -11535,6 +11593,7 @@ template = "pool"
                 call_registry: Some(&creg),
                 ipfs: Some(&gate),
                 gateways: &gateways,
+                metrics: None,
             },
             |_| Ok(()),
             |reached, _, _| {
@@ -11590,6 +11649,7 @@ template = "pool"
                 call_registry: Some(&creg),
                 ipfs: Some(&gate),
                 gateways: &gateways,
+                metrics: None,
             },
             |_| Ok(()),
             |_, _, _| {},
@@ -11622,6 +11682,50 @@ template = "pool"
             1,
             "the document it names must be sealed beside it"
         );
+        handle.abort();
+    }
+
+    /// The out-of-band resolver counted a fetched document nothing proved, and the one it gave up on;
+    /// `--seal-direct`'s inline resolver counted neither, so the two paths reported different facts
+    /// for one failure (#1375 review).
+    #[tokio::test]
+    async fn seal_direct_counts_an_unproven_document_as_the_resolver_does() {
+        let file: String = (0..600 * 1024)
+            .map(|i| (b'a' + (i * 7 % 26) as u8) as char)
+            .collect();
+        let (cid, _) = crate::cid::dag_for_tests(file.as_bytes(), 100_000);
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), file)]), 0).await;
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        let source = PostSource(vec![(4, qos_post(&cid))]);
+        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, 4)
+            .await
+            .unwrap();
+
+        let metrics = crate::metrics::NestMetrics::default();
+        let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
+            &gate,
+            &[gateway],
+            &fast_policy(2),
+            &rows,
+            true,
+            &metrics,
+        )
+        .await;
+        assert!(docs.is_empty(), "a document nothing proved is not a row");
+        assert_eq!(given_up, 1);
+        assert_eq!(
+            metrics.ipfs_unverified(),
+            2,
+            "each fetch of a document nothing proved is counted, as the resolver counts it"
+        );
+        assert_eq!(metrics.ipfs_given_up(), 1);
         handle.abort();
     }
 
@@ -11748,7 +11852,7 @@ template = "pool"
         let gate = nest.ipfs_gate.clone().expect("a gate");
         assert_eq!(
             hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
-            3
+            Some(3)
         );
 
         let metrics = Arc::new(crate::metrics::NestMetrics::default());
@@ -11773,10 +11877,42 @@ template = "pool"
         );
         assert_eq!(
             hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
-            9_000,
+            Some(9_000),
             "a document given up on no longer holds its range"
         );
         drop(resolver);
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// The hold returned one below the lowest outstanding document, which for a document at block 0 is
+    /// block 0 itself, so its range sealed without it (#1374 review).
+    #[tokio::test]
+    async fn a_document_outstanding_at_block_zero_holds_block_zero() {
+        let cid = crate::cid::cid_v0_for(b"no gateway holds this either");
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::new(), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(0, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        for b in [0, 1] {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        assert_eq!(
+            nest.store.get_meta(SEALED_THROUGH_KEY).unwrap(),
+            None,
+            "block 0 sealed while the document it names was outstanding"
+        );
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            None
+        );
         drop(nest);
         drop(state);
         handle.abort();

@@ -86,7 +86,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:3.6.1
+  ghcr.io/nightswatchhq/nuthatch:3.7.0
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -123,7 +123,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:3.6.1-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:3.7.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -774,7 +774,8 @@ job:
 |---|---|---|
 | statement timeout | 30 s | a runaway (e.g. cartesian) query is interrupted mid-flight |
 | max result rows | 50,000 | the Rust-side result buffer, outside DuckDB's own memory limit |
-| max concurrent queries | 2 | the real DoS multiplier: a semaphore; excess returns `503`. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
+| max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
+| max queued queries | 256 per nest | the bound that makes the wait above safe: it caps how *many* requests may be parked waiting, where the 250 ms caps how *long* each one waits. Without it a burst parks arrival-rate × 250 ms requests before any time out. Past the cap a request is refused immediately, as every over-limit request was before the wait existed. A parked request holds only its query string (≤ 16 KiB), so the worst case is roughly 4 MB per nest |
 | DuckDB memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Product of memory with the permit count is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially |
@@ -949,7 +950,7 @@ Get this right in your supervisor and your load balancer:
   that took each one unready** (`stalled`). Per-nest `/<name>/ready` answers only for that nest.
 
   A nest reaches the `stalled` list on exactly the terms its own `/<name>/ready` uses - one function
-  computes both, so the two surfaces cannot disagree. Before 3.6.2 the root consulted the quarantine
+  computes both, so the two surfaces cannot disagree. Before 3.7.0 the root consulted the quarantine
   set alone, and a runtime answered `{"quarantined":[],"ready":true}` while a nest inside it had not
   sealed in two days (#1204). **A 503 here is advice, not a gate:** every healthy nest carries on
   serving reads to whoever asks for it directly, so wiring a supervisor to this endpoint tells it to
@@ -1057,12 +1058,44 @@ s3://bucket/prefix>` copies every non-provisional segment and the catalogue unde
 `dev` and `serve` do it continuously with `--publish-target`: a pass at start, one after every seal,
 and one every `--publish-interval` (60 s) otherwise, with `--publish-parallelism` uploads in flight
 (2). The publisher runs on its own thread, so a slow or unreachable bucket delays the mirror and never
-a seal. Credentials are the usual `AWS_*` environment variables, never `nuthatch.toml`. It needs
-`PutObject`, `GetObject`, `HeadObject` and `ListBucket` on the prefix and not `DeleteObject`, which is
-worth withholding: a credential that cannot delete keeps the mirror append-only by policy. Five
-consecutive failures on the same object set `nuthatch_publish_dead_letter` and slow retries tenfold
-until one succeeds. A runtime directory publishes per mount instead, from `[mounts.publish]` in
-`mounts.toml`, and refuses `--publish-target`.
+a seal. Credentials are the usual `AWS_*` environment variables, never `nuthatch.toml`. The policy
+is `s3:PutObject`, `s3:GetObject` and `s3:AbortMultipartUpload` on the prefix (HEAD is authorised
+by `GetObject`) and `s3:ListBucket` on the bucket for that prefix, without which a missing object
+answers 403 rather than 404. Segments upload in 8 MiB parts, so without `AbortMultipartUpload` a
+failed upload leaves its parts billable until a lifecycle rule removes them. Do not grant `s3:DeleteObject`: a credential that cannot delete cannot take a published
+segment away, so the mirror is append-only by policy rather than by promise. It can still overwrite
+a key, which is what `doctor --publish` below catches, and bucket versioning makes that recoverable.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::my-bucket/nuthatch/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-bucket",
+      "Condition": { "StringLike": { "s3:prefix": "nuthatch/*" } }
+    }
+  ]
+}
+```
+
+Five consecutive failures on the same object set `nuthatch_publish_dead_letter` and slow retries
+tenfold until one succeeds. A runtime directory publishes per mount instead, from `[mounts.publish]`
+in `mounts.toml`, and refuses `--publish-target`. `nuthatch publish status --target <target>` prints
+the target, local and remote `sealed_through`, and the segments and bytes still to upload, and writes
+nothing. `nuthatch doctor --publish <target>` checks every object against the local segment, so an
+object replaced by hand fails it even at the same size: a filesystem mirror is hashed, and a bucket's
+ETags are compared only with `--publish-etag-md5` (`--etag-md5` on `publish verify`), which is right
+when the store's ETag is the MD5 of the object, as on AWS S3 without SSE-KMS or SSE-C and on MinIO.
+Without it a bucket fails closed as not content-checked, and on any other store
+`nuthatch publish verify --deep`, which downloads and re-hashes, is the check. `/_admin/` shows each
+publishing nest's target, lag and last success.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 
