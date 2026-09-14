@@ -602,6 +602,64 @@ fn roost_ready(
     (code, Json(body))
 }
 
+/// Is `o` a value an `Origin` header could actually carry (#1318)?
+///
+/// An origin is `scheme://host[:port]` and nothing else - no path, no query, no fragment, no
+/// userinfo, no trailing slash. Anything wider is accepted by a laxer check, matches nothing at
+/// request time, and surfaces as a generic browser CORS error that says nothing about which value
+/// was wrong (Jules on #1384, who found `https://app.example.com/path` sailing through a check that
+/// only looked at the scheme and the last character).
+///
+/// Deliberately not `url::Url`: that crate is optional here, gated behind the `object-store`
+/// feature, and this must refuse the same values in every build. An origin is also a far narrower
+/// grammar than a URL, so parsing it as one would accept more than it should.
+fn check_origin(o: &str) -> Result<()> {
+    let rest = o
+        .strip_prefix("https://")
+        .or_else(|| o.strip_prefix("http://"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("--cors {o} is not an origin: it needs a scheme, e.g. https://{o}")
+        })?;
+    // `rest`, not `o`: a bare `https://` ends with a slash but its fault is the missing host, and
+    // reporting the wrong one sends the operator to fix something that was never wrong.
+    if rest.ends_with('/') {
+        anyhow::bail!(
+            "--cors {o} has a trailing slash, and an Origin header never does, so it would match \
+             nothing"
+        );
+    }
+    if let Some(bad) = rest.chars().find(|c| matches!(c, '/' | '?' | '#')) {
+        anyhow::bail!(
+            "--cors {o} carries a {} after the host, and an Origin header is only \
+             scheme://host[:port], so it would match nothing. Use the origin alone.",
+            match bad {
+                '/' => "path",
+                '?' => "query",
+                _ => "fragment",
+            }
+        );
+    }
+    if rest.contains('@') {
+        anyhow::bail!(
+            "--cors {o} carries credentials, which an Origin header never does, so it would match \
+             nothing"
+        );
+    }
+    let (host, port) = match rest.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    if host.is_empty() {
+        anyhow::bail!("--cors {o} names no host");
+    }
+    if let Some(p) = port {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            anyhow::bail!("--cors {o} has '{p}' where a port number should be");
+        }
+    }
+    Ok(())
+}
+
 /// Build the CORS layer for `--cors` (#1318), or `None` when the flag was not given.
 ///
 /// **Off by default, and that is the whole point of the shape.** A nest sends no
@@ -644,18 +702,10 @@ pub fn cors_layer(origins: &[String]) -> Result<Option<tower_http::cors::CorsLay
     } else {
         let mut parsed = Vec::with_capacity(origins.len());
         for o in origins {
-            // Both of these refusals exist because the failure they prevent is silent: a value that
-            // cannot match any `Origin` header produces a browser error that reads as "CORS is
-            // broken" rather than "that value was wrong", and the operator has no way to tell.
-            if !(o.starts_with("http://") || o.starts_with("https://")) {
-                anyhow::bail!("--cors {o} is not an origin: it needs a scheme, e.g. https://{o}");
-            }
-            if o.ends_with('/') {
-                anyhow::bail!(
-                    "--cors {o} has a trailing slash, and an Origin header never does, so it would \
-                     match nothing"
-                );
-            }
+            // Every refusal here exists because the failure it prevents is silent: a value that
+            // cannot match any `Origin` header produces a browser error reading "CORS is broken"
+            // rather than "that value was wrong", and the operator has no way to tell which.
+            check_origin(o)?;
             parsed.push(
                 o.parse::<HeaderValue>()
                     .with_context(|| format!("--cors {o} is not a valid header value"))?,
@@ -5092,16 +5142,25 @@ mod tests {
                 .expect_err("should have been refused")
                 .to_string()
         };
-        assert!(
-            err(&["app.example.com"]).contains("needs a scheme"),
-            "{}",
-            err(&["app.example.com"])
-        );
-        assert!(
-            err(&["https://app.example.com/"]).contains("trailing slash"),
-            "{}",
-            err(&["https://app.example.com/"])
-        );
+        // Each pair is (value, the word the message must carry) - the message has to name what is
+        // wrong, or the operator is back to guessing which of their origins the browser dislikes.
+        for (value, word) in [
+            ("app.example.com", "needs a scheme"),
+            ("ftp://app.example.com", "needs a scheme"),
+            ("https://app.example.com/", "trailing slash"),
+            // Jules on #1384: these passed a check that looked only at the scheme and the last
+            // character, then matched nothing at request time.
+            ("https://app.example.com/path", "path"),
+            ("https://app.example.com?x=1", "query"),
+            ("https://app.example.com#frag", "fragment"),
+            ("https://user:pw@app.example.com", "credentials"),
+            ("https://", "names no host"),
+            ("https://app.example.com:", "port number"),
+            ("https://app.example.com:http", "port number"),
+        ] {
+            let got = err(&[value]);
+            assert!(got.contains(word), "{value} was refused as: {got}");
+        }
         let mixed = err(&["*", "https://app.example.com"]);
         assert!(mixed.contains("cannot be combined"), "{mixed}");
         // And the values that are fine stay fine, or the guard above is just a wall.
@@ -5109,6 +5168,8 @@ mod tests {
             vec!["*"],
             vec!["http://localhost:3000"],
             vec!["https://a.example.com", "https://b.example.com"],
+            vec!["http://127.0.0.1:8288"],
+            vec!["https://sub.domain.example.com:8443"],
         ] {
             let owned: Vec<String> = ok.iter().map(|s| s.to_string()).collect();
             assert!(

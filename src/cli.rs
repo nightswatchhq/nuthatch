@@ -1201,9 +1201,16 @@ pub struct ServeArgs {
     /// Off by default: without it a nest sends no `Access-Control-Allow-Origin`, and a page on
     /// another origin cannot call it at all - the standing advice was a reverse proxy, which is a
     /// wall for anyone with a weekend rather than a deployment. Sets allow-origin, allow-methods
-    /// `GET,OPTIONS` and allow-headers, and answers preflight. Values are exact origins with a
-    /// scheme (`https://app.example.com`), or a single `*` for any. Not a `nuthatch.toml` field:
-    /// who may call a nest is an access-path decision and must not enter its content address.
+    /// `GET,POST,OPTIONS` and allow-headers, and answers preflight. `POST` is there for the GraphQL
+    /// routes, which take their query in a body; nothing on the router accepts a write.
+    ///
+    /// Values are exact origins - `scheme://host[:port]` and nothing more, such as
+    /// `https://app.example.com` or `http://localhost:3000` - or a single `*` for any. A path,
+    /// query, fragment or trailing slash is refused at startup, because an `Origin` header never
+    /// carries one and the value would silently match nothing.
+    ///
+    /// Not a `nuthatch.toml` field: who may call a nest is an access-path decision and must not
+    /// enter its content address.
     #[arg(long = "cors", value_name = "ORIGIN")]
     pub cors: Vec<String>,
 
@@ -1247,9 +1254,16 @@ pub struct DevArgs {
     /// Off by default: without it a nest sends no `Access-Control-Allow-Origin`, and a page on
     /// another origin cannot call it at all - the standing advice was a reverse proxy, which is a
     /// wall for anyone with a weekend rather than a deployment. Sets allow-origin, allow-methods
-    /// `GET,OPTIONS` and allow-headers, and answers preflight. Values are exact origins with a
-    /// scheme (`https://app.example.com`), or a single `*` for any. Not a `nuthatch.toml` field:
-    /// who may call a nest is an access-path decision and must not enter its content address.
+    /// `GET,POST,OPTIONS` and allow-headers, and answers preflight. `POST` is there for the GraphQL
+    /// routes, which take their query in a body; nothing on the router accepts a write.
+    ///
+    /// Values are exact origins - `scheme://host[:port]` and nothing more, such as
+    /// `https://app.example.com` or `http://localhost:3000` - or a single `*` for any. A path,
+    /// query, fragment or trailing slash is refused at startup, because an `Origin` header never
+    /// carries one and the value would silently match nothing.
+    ///
+    /// Not a `nuthatch.toml` field: who may call a nest is an access-path decision and must not
+    /// enter its content address.
     #[arg(long = "cors", value_name = "ORIGIN")]
     pub cors: Vec<String>,
 
