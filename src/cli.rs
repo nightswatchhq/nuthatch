@@ -987,6 +987,18 @@ pub struct TransformArgs {
 
 #[derive(Args)]
 pub struct InitArgs {
+    /// Blockscout instance to resolve ABIs from, for a chain with no keyless root we have verified.
+    ///
+    /// The site origin, e.g. `https://testnet.arcscan.app` - the v2 API path is appended. Tried
+    /// after Sourcify and before the built-in list, and when it answers definitively (including
+    /// "not verified") that answer stands rather than falling through to a demand for an
+    /// `ETHERSCAN_API_KEY` on a chain Etherscan does not index.
+    ///
+    /// Used for this invocation only and never written to the nest: an ABI source is an access
+    /// path, and must not enter the content address.
+    #[arg(long, value_name = "URL")]
+    pub explorer: Option<String>,
+
     /// One or more contract addresses to index, e.g. 0xA0b8…eB48 (USDC). Omit when using `--from`.
     #[arg(num_args = 0..)]
     pub addresses: Vec<String>,
@@ -1073,6 +1085,18 @@ pub struct InitArgs {
 
 #[derive(Args)]
 pub struct AddArgs {
+    /// Blockscout instance to resolve ABIs from, for a chain with no keyless root we have verified.
+    ///
+    /// The site origin, e.g. `https://testnet.arcscan.app` - the v2 API path is appended. Tried
+    /// after Sourcify and before the built-in list, and when it answers definitively (including
+    /// "not verified") that answer stands rather than falling through to a demand for an
+    /// `ETHERSCAN_API_KEY` on a chain Etherscan does not index.
+    ///
+    /// Used for this invocation only and never written to the nest: an ABI source is an access
+    /// path, and must not enter the content address.
+    #[arg(long, value_name = "URL")]
+    pub explorer: Option<String>,
+
     /// One or more contract addresses to add to the nest, e.g. 0xC02a…6Cc2 (WETH).
     #[arg(num_args = 1..)]
     pub addresses: Vec<String>,
