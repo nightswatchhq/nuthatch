@@ -197,6 +197,15 @@ impl CallRegistry {
         self.scope.is_empty() || self.scope.contains(&to)
     }
 
+    /// Does this nest declare a function on `to`? The event registry cannot answer that for a contract
+    /// whose ABI has no events, and a calldata-only contract (a DataEdge) is exactly that shape.
+    pub fn declares(&self, to: Address) -> bool {
+        self.by_selector
+            .values()
+            .flatten()
+            .any(|d| d.contract == to)
+    }
+
     pub fn tables(&self) -> Vec<&CallDecoder> {
         let mut all: Vec<&CallDecoder> = self.by_selector.values().flatten().collect();
         all.sort_by(|a, b| a.table.cmp(&b.table));

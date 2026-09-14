@@ -13,6 +13,19 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-09-13 - RFC-0037 slice 5: a CID inside JSON, from calldata.** `[[ipfs]]` takes
+  `cid_json_path` and `json_match`, so a nest can resolve the documents Edge & Node's QoS oracle names
+  in `submitQoSPayload(bytes)` on Gnosis. Three faults stood in the way and are fixed with it: IPFS
+  resolution ran before top-level calls were decoded, the call filter admitted only contracts with
+  events (the DataEdge ABI has none), and a row naming no CID left no trace (now
+  `nuthatch_nest_ipfs_unreadable_total`). **Verified live against Gnosis, not a stub**: blocks
+  48,231,452 to 48,232,456, 36 calls decoded, 36 documents resolved (18 per topic, two declarations
+  over one column), 37.8 MB fetched from `ipfs.thegraph.com` at about 1.2 s each, 60,460 JSON rows
+  inside them, 0 unreadable. **0 of 36 verified**: every payload is 0.53 to 1.68 MB, past the
+  single-block limit, so each is stored `verified = false`. The hot store held them in 55 MB on disk;
+  nothing sealed in that span. Not yet: a document that misses the 64-fetch window budget or whose
+  gateways fail is never attempted again, and `--seal-direct` does not decode top-level calls or
+  resolve IPFS at all.
 - **2026-08-20 to 2026-09-09 - catch-up entry, reconciled retrospectively (2026-09-09).** The log went
   quiet for three weeks across nineteen tags and one major - v2.6.1 through v3.6.1 - and 104 merges.
   **This is the third time**, and the entry above already carries the lesson from the second, so it is

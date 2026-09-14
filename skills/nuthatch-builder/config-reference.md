@@ -114,6 +114,19 @@ name = "token_metadata"       # becomes the result table
 on = "nft__uri_set"           # the table whose rows carry the CID
 cid_column = "uri"            # which column. A bare CID, `ipfs://…`, or a full gateway URL all work -
                               # only the content address is kept, never the host.
+[[ipfs]]                      # the CID inside JSON rather than the whole column (RFC-0037 slice 5)
+name = "qos_payload"
+on = "data_edge__call_submit_qo_s_payload"   # a top-level call table works as well as an event table
+cid_column = "_payload"       # a string, or `bytes` that are UTF-8, holding JSON
+cid_json_path = "hash"        # ONE top-level key naming the CID. An object names one document, an
+                              # array one per element.
+json_match = { topic = "gateway_indexer_attempt_qos_5_minutes_prod_v3" }
+                              # optional, needs `cid_json_path`: resolve only the objects whose string
+                              # fields equal these, before any fetch. Both keys enter the nest identity.
+                              # A row naming no usable CID writes nothing and counts in
+                              # `nuthatch_nest_ipfs_unreadable_total`. Documents over 256 KiB are
+                              # stored `verified = false`: a multi-block UnixFS root cannot be
+                              # re-derived from the bytes alone.
 
 [extract]                     # optional
 top_level_calls = true        # decode transactions sent directly to this nest's contracts - what a

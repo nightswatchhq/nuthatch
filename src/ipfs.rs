@@ -30,6 +30,7 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 /// A nest's declaration that a column holds CIDs worth resolving.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,6 +42,14 @@ pub struct IpfsDecl {
     /// The column holding the CID. `{column}` or a bare column name; both are accepted because a
     /// CID column is never a literal, so there is nothing for the braces to disambiguate.
     pub cid_column: String,
+    /// The column holds JSON that names the CID under this top-level key, rather than the CID itself.
+    /// Edge & Node's QoS oracle posts `{"topic", "hash", "timestamp"}` as a `bytes` calldata argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid_json_path: Option<String>,
+    /// Resolve only the JSON objects whose string fields equal these values. Declining is declared
+    /// intent rather than a failure, so it happens before a fetch and is not counted as unreadable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub json_match: BTreeMap<String, String>,
 }
 
 impl IpfsDecl {
@@ -71,7 +80,78 @@ impl IpfsDecl {
                 self.on
             );
         }
+        let key_ok =
+            |k: &str| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if let Some(key) = &self.cid_json_path {
+            if !key_ok(key) {
+                bail!(
+                    "ipfs `{}`: `cid_json_path` is one top-level JSON key ([A-Za-z0-9_]), not a path \
+                     expression - got {key:?}",
+                    self.name
+                );
+            }
+        }
+        if !self.json_match.is_empty() && self.cid_json_path.is_none() {
+            bail!(
+                "ipfs `{}`: `json_match` filters JSON documents, so it needs `cid_json_path`",
+                self.name
+            );
+        }
+        if let Some(k) = self.json_match.keys().find(|k| !key_ok(k)) {
+            bail!(
+                "ipfs `{}`: `json_match` keys are top-level JSON keys ([A-Za-z0-9_]) - got {k:?}",
+                self.name
+            );
+        }
         Ok(())
+    }
+
+    /// Every CID one column value names under this declaration, and how many it should have named and
+    /// did not.
+    ///
+    /// Without `cid_json_path` that is at most one, exactly as before. With it the value is JSON (a
+    /// string, or bytes that are UTF-8): an object names one document and an array one per element.
+    /// The second number exists because a declaration that parses and then resolves nothing is the
+    /// failure RFC-0037 §5 names, and a skipped row used to leave no trace at all.
+    pub fn cids_in(&self, v: &crate::registry::Value) -> (Vec<String>, usize) {
+        use crate::registry::Value;
+        let Some(key) = self.cid_json_path.as_deref() else {
+            return match cid_from_value(v) {
+                Some(cid) => (vec![cid.into_owned()], 0),
+                None => (Vec::new(), 1),
+            };
+        };
+        let text = match v {
+            Value::Str(s) => Some(s.as_str()),
+            Value::Bytes(b) => std::str::from_utf8(b).ok(),
+            _ => None,
+        };
+        let Some(doc) = text.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()) else {
+            return (Vec::new(), 1);
+        };
+        let elements: Vec<&serde_json::Value> = match &doc {
+            serde_json::Value::Array(a) => a.iter().collect(),
+            other => vec![other],
+        };
+        let (mut cids, mut unreadable) = (Vec::new(), 0);
+        for e in elements {
+            let Some(obj) = e.as_object() else {
+                unreadable += 1;
+                continue;
+            };
+            let wanted = self
+                .json_match
+                .iter()
+                .all(|(k, want)| obj.get(k).and_then(|x| x.as_str()) == Some(want.as_str()));
+            if !wanted {
+                continue;
+            }
+            match obj.get(key).and_then(|c| c.as_str()).and_then(cid_from_any) {
+                Some(cid) => cids.push(cid.to_string()),
+                None => unreadable += 1,
+            }
+        }
+        (cids, unreadable)
     }
 
     /// The column name, with `{}` stripped if the operator wrote them.
@@ -245,6 +325,15 @@ pub fn decl_hash(decls: &[IpfsDecl]) -> [u8; 32] {
         h.update(d.on.as_bytes());
         h.update(b"\x1f");
         h.update(d.column().as_bytes());
+        // Only when set, so every nest declared before these keys keeps its content address. Length
+        // prefixed because a `json_match` value is arbitrary text and may contain any separator.
+        if let Some(key) = &d.cid_json_path {
+            for part in std::iter::once(key).chain(d.json_match.iter().flat_map(|(k, v)| [k, v])) {
+                h.update(b"\x1f");
+                h.update((part.len() as u64).to_be_bytes());
+                h.update(part.as_bytes());
+            }
+        }
         h.update(b"\x1e");
     }
     h.finalize().into()
@@ -296,6 +385,8 @@ mod tests {
             name: "meta".into(),
             on: "nft__uri_set".into(),
             cid_column: "{uri}".into(),
+            cid_json_path: None,
+            json_match: BTreeMap::new(),
         };
         assert!(d.validate().is_ok());
         assert_eq!(
@@ -377,5 +468,154 @@ mod tests {
         }
         assert_eq!(cid_from_value(&Value::Str("not a cid".into())), None);
         assert_eq!(cid_from_value(&Value::U64(42)), None);
+    }
+
+    /// A real `submitQoSPayload(bytes)` input, Gnosis tx `0xd977169c…8030` in block 48,231,985, as
+    /// Edge & Node's QoS oracle posted it on 2026-09-13.
+    const QOS_CALLDATA: &str = "53b734470000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000008d7b22746f706963223a2022676174657761795f696e64657865725f617474656d70745f716f735f355f6d696e757465735f70726f645f7633222c202268617368223a2022516d646863565470536a6d43427671674c396d366e617a52733233584245624a367a79676f6a5641716962376f61222c202274696d657374616d70223a20313738393331333430307d00000000000000000000000000000000000000";
+    const QOS_CID: &str = "QmdhcVTpSjmCBvqgL9m6nazRs23XBEbJ6zygojVAqib7oa";
+    const QOS_TOPIC: &str = "gateway_indexer_attempt_qos_5_minutes_prod_v3";
+
+    fn qos_decl(json_match: &[(&str, &str)]) -> IpfsDecl {
+        IpfsDecl {
+            name: "qos_payload".into(),
+            on: "data_edge__call_submit_qo_s_payload".into(),
+            cid_column: "_payload".into(),
+            cid_json_path: Some("hash".into()),
+            json_match: json_match
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// The `bytes` argument of the real calldata, cut out by its own ABI offset and length rather than
+    /// re-typed, so the fixture is the bytes the decoder hands the resolver.
+    fn qos_payload_bytes() -> Vec<u8> {
+        let input = hex::decode(QOS_CALLDATA).unwrap();
+        let args = &input[4..];
+        let offset = usize::from_be_bytes(args[24..32].try_into().unwrap());
+        let len = usize::from_be_bytes(args[offset + 24..offset + 32].try_into().unwrap());
+        args[offset + 32..offset + 32 + len].to_vec()
+    }
+
+    /// **The QoS oracle's CID is inside JSON, and `cid_from_value` never saw it.** A 141-byte payload
+    /// is neither a string nor a 32-byte digest, so the plain declaration counts one unreadable row
+    /// and resolves nothing, which is what every such nest silently did before.
+    #[test]
+    fn the_qos_oracle_calldata_names_its_payload_through_cid_json_path() {
+        use crate::registry::Value;
+        let bytes = qos_payload_bytes();
+        assert_eq!(bytes.len(), 141);
+
+        let plain = IpfsDecl {
+            cid_json_path: None,
+            ..qos_decl(&[])
+        };
+        assert_eq!(plain.cids_in(&Value::Bytes(bytes.clone())), (vec![], 1));
+
+        let d = qos_decl(&[("topic", QOS_TOPIC)]);
+        assert_eq!(
+            d.cids_in(&Value::Bytes(bytes.clone())),
+            (vec![QOS_CID.to_string()], 0)
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            d.cids_in(&Value::Str(text)),
+            (vec![QOS_CID.to_string()], 0),
+            "a string column holding the same JSON must read the same"
+        );
+    }
+
+    /// An array names one document per element, `json_match` declines the rest before any fetch, and
+    /// what cannot be read is counted rather than dropped.
+    #[test]
+    fn json_match_declines_what_it_does_not_match_and_counts_what_it_cannot_read() {
+        use crate::registry::Value;
+        let other = "QmcySPs9y7a4wGYxCtbdNrt9kjryce9iYguRVe6GdKvZw5";
+        let array = format!(
+            r#"[{{"topic":"{QOS_TOPIC}","hash":"{QOS_CID}"}},
+               {{"topic":"gateway_query_result_qos_5_minutes_prod_v3","hash":"{other}"}},
+               {{"topic":"{QOS_TOPIC}"}},
+               "not an object"]"#
+        );
+        let d = qos_decl(&[("topic", QOS_TOPIC)]);
+        assert_eq!(
+            d.cids_in(&Value::Str(array.clone())),
+            (vec![QOS_CID.to_string()], 2),
+            "the query-result element is declined, the keyless and non-object elements are unreadable"
+        );
+        assert_eq!(
+            qos_decl(&[]).cids_in(&Value::Str(array)),
+            (vec![QOS_CID.to_string(), other.to_string()], 2),
+            "with no json_match every element that names a CID is wanted"
+        );
+        for bad in [
+            Value::Str("not json".into()),
+            Value::Bytes(vec![0xff, 0xfe]),
+            Value::U64(7),
+        ] {
+            assert_eq!(
+                d.cids_in(&bad),
+                (vec![], 1),
+                "{bad:?} names nothing and must say so"
+            );
+        }
+    }
+
+    #[test]
+    fn cid_json_path_is_a_key_and_json_match_needs_it() {
+        assert!(qos_decl(&[("topic", QOS_TOPIC)]).validate().is_ok());
+        for path in ["", "payload.hash", "$.hash", "items[0]"] {
+            let d = IpfsDecl {
+                cid_json_path: Some(path.into()),
+                ..qos_decl(&[])
+            };
+            assert!(
+                d.validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("one top-level JSON key"),
+                "{path:?} must be refused, not quietly matched against nothing"
+            );
+        }
+        let d = IpfsDecl {
+            cid_json_path: None,
+            ..qos_decl(&[("topic", QOS_TOPIC)])
+        };
+        assert!(d
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("needs `cid_json_path`"));
+    }
+
+    /// Every nest declared before these keys existed must keep its content address, and the new keys
+    /// must move it when they are set. Written against the layout the hash had before, not against
+    /// `decl_hash` itself, so an unconditional append cannot pass.
+    #[test]
+    fn the_json_keys_enter_the_identity_only_when_set() {
+        use sha2::{Digest, Sha256};
+        let plain = IpfsDecl {
+            cid_json_path: None,
+            ..qos_decl(&[])
+        };
+        let mut h = Sha256::new();
+        h.update(b"qos_payload\x1fdata_edge__call_submit_qo_s_payload\x1f_payload\x1e");
+        let before: [u8; 32] = h.finalize().into();
+        assert_eq!(decl_hash(std::slice::from_ref(&plain)), before);
+
+        let json = qos_decl(&[]);
+        let matched = qos_decl(&[("topic", QOS_TOPIC)]);
+        let other = qos_decl(&[("topic", "gateway_query_result_qos_5_minutes_prod_v3")]);
+        let ids = [plain, json, matched, other].map(|d| decl_hash(&[d]));
+        for i in 0..ids.len() {
+            for j in i + 1..ids.len() {
+                assert_ne!(
+                    ids[i], ids[j],
+                    "declarations {i} and {j} must be different nests"
+                );
+            }
+        }
     }
 }

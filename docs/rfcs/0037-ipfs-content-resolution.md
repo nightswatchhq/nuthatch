@@ -1,6 +1,7 @@
 # RFC-0037: IPFS content resolution - a verified, content-addressed side table
 
-**Status:** **Accepted, slices 1-4 built** (2026-08-19). Slice 1 (verification) and slices 2-3
+**Status:** **Accepted, slices 1-5 built.** Slice 5 (2026-09-13): a CID inside JSON, from an event
+column or a top-level call's calldata, with a topic filter; see §5. Slices 1-4 (2026-08-19). Slice 1 (verification) and slices 2-3
 (declared resolution) shipped in PR #645; slice 4 is `--ipfs`, which takes a local node URL as readily
 as a gateway, so an operator can already take every third party out of the path. **One limit stands:**
 resolution runs inline under a 64-fetch-per-window budget rather than out of band behind the cursor as
@@ -134,6 +135,36 @@ resolved behind finality and sealed with the segments.
 because "four public gateways" is a third-party data dependency in everything but name, and
 non-negotiable 3 does not have an exception for content addressing. Gateways stay the convenience
 default; they must not be the only door.
+
+**Slice 5 - a CID inside JSON, and a call table as the source.** Edge & Node's QoS oracle posts
+`submitQoSPayload(bytes)` to a DataEdge on Gnosis, and the argument is JSON:
+`{"topic": ..., "hash": <CID>, "timestamp": ...}`. `cid_from_value` accepted a string or exactly 32
+bytes, so every such row was skipped and nothing said so. `[[ipfs]]` now takes `cid_json_path` (one
+top-level key; an object names one document, an array one per element) and `json_match` (string
+equality on top-level fields, applied before any fetch). Both enter the declaration hash only when set,
+so no existing nest changes identity. Two declarations may read the same column with different
+matches, which is how one nest keeps both oracle topics apart.
+
+Three faults were found on the way and fixed in the same slice, because each one alone makes the
+oracle nest resolve nothing:
+
+- Top-level calls were decoded after IPFS resolution and never offered to it, so `on` could not name a
+  call table.
+- The top-level call filter used the `eth_getLogs` address list, which holds only contracts with
+  events. A calldata-only contract (the DataEdge ABI has none) produced no call rows.
+- A row whose declared column named no CID, or was missing, left no trace. It now counts in
+  `nuthatch_nest_ipfs_unreadable_total`.
+
+Verified live on 2026-09-13 over Gnosis blocks 48,231,452 to 48,232,456: 36 calls, 36 documents (18
+per topic), 37.8 MB, 0 unreadable. The declaration hash moves the decode identity in `schema.json`
+(`src/project.rs`); the runtime identity guard and `/sql` provenance still hash the event registry
+alone, which for an event-less nest is the hash of nothing.
+
+Two limits are named rather than fixed. A document over 256 KiB is stored `verified = false`, because
+a multi-block UnixFS root cannot be re-derived from the bytes; the oracle's payloads are 0.6 to 1.9 MB,
+so every one of them is in that case. And a CID that misses the per-window budget, or whose gateways
+all fail, is never attempted again: the out-of-band resolver the budget warning refers to does not
+exist yet.
 
 ## 6. Non-goals
 
