@@ -2784,6 +2784,7 @@ async fn build_nest(
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(full_schema(&registry, config)),
         sql_gate,
+        sql_queued: Default::default(),
         sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
         sql_max_named_scan_bytes: serve::SQL_MAX_NAMED_SCAN_BYTES,
         // Every cursor-owning role builds through here; `serve_role` flips it after (#1025).
