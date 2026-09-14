@@ -135,6 +135,8 @@ struct Run {
     /// sha256 of the tape this run recorded or replayed (RFC-0039), so a published number names the
     /// exact bytes it came from. `None` on a live run.
     fixture_content_address: Option<String>,
+    /// Bytes the mirror had uploaded when ingestion finished; `None` without `--publish-target`.
+    published_bytes: Option<u64>,
 }
 
 /// The published artifact: medians across runs plus the pinned inputs and provenance.
@@ -228,6 +230,12 @@ pub struct BenchReport {
     /// something* - and loses only "how many bytes went over a wire".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replayed: bool,
+    /// Where each run mirrored its seals (RFC-0052 S2), and the median bytes uploaded by the time
+    /// ingestion finished. A run that published nothing measured nothing about publishing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_bytes: Option<u64>,
 }
 
 /// The endpoint's host, with any credentials stripped.
@@ -527,10 +535,11 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
             run,
             keep.as_deref(),
             &tape_mode,
+            args.publish_target.as_deref().map(|t| (dir.as_path(), t)),
         )
         .await?;
         println!(
-            "  run {run}/{}: {} events in {:.1}s = {:.0} ev/s, peak {} MB, {} rpc req{}{}",
+            "  run {run}/{}: {} events in {:.1}s = {:.0} ev/s, peak {} MB, {} rpc req{}{}{}",
             args.runs,
             r.events,
             r.wall_clock_s,
@@ -546,6 +555,10 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
                 String::new()
             } else {
                 format!(", {} call row(s) resolved", r.calls_resolved)
+            },
+            match r.published_bytes {
+                Some(b) => format!(", {b} bytes published"),
+                None => String::new(),
             }
         );
         runs.push(r);
@@ -585,6 +598,12 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         provider: report_provider(&tape_mode, &rpc_urls),
         fixture_content_address: runs.first().and_then(|r| r.fixture_content_address.clone()),
         replayed: matches!(tape_mode, TapeMode::Replay(_)),
+        publish_target: args.publish_target.clone(),
+        published_bytes: runs
+            .iter()
+            .map(|r| r.published_bytes)
+            .collect::<Option<Vec<_>>>()
+            .map(|b| median_u64(b.into_iter())),
         hardware: hardware_summary(),
         work_backing: work_backing_of(keep.as_deref().unwrap_or(&default_bench_work(0))),
     };
@@ -966,6 +985,7 @@ async fn one_run(
     run: usize,
     keep: Option<&std::path::Path>,
     tape: &TapeMode<'_>,
+    publish: Option<(&std::path::Path, &str)>,
 ) -> Result<Run> {
     let bench_source = match tape {
         TapeMode::Live => BenchSource::Live(RpcClient::new(rpc_urls.to_vec())?),
@@ -999,6 +1019,30 @@ async fn one_run(
     };
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
+    // The mirror names its prefix from the nest's inputs, so they are copied beside the data. Each
+    // run publishes under its own prefix, or run 2 would find run 1's objects and upload nothing.
+    let publisher = match publish {
+        Some((nest, target)) => {
+            for src in crate::blob::collect_files(nest, None)? {
+                let dst = work.join(src.strip_prefix(nest)?);
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&src, &dst)?;
+            }
+            let name = format!("bench-publish-{}-{run}", std::process::id());
+            let settings = crate::publish::Settings {
+                target: format!("{}/{name}", target.trim_end_matches('/')),
+                interval: std::time::Duration::from_secs(60),
+                parallelism: crate::publish::DEFAULT_PARALLELISM,
+            };
+            Some((
+                crate::publish::spawn(work.clone(), name.clone(), settings)?,
+                name,
+            ))
+        }
+        None => None,
+    };
 
     let rss = RssSampler::start();
     let start = Instant::now();
@@ -1102,6 +1146,11 @@ async fn one_run(
     };
     let wall_clock_s = start.elapsed().as_secs_f64();
     let peak_rss_mb = rss.stop();
+    let published_bytes = publisher.map(|(publisher, name)| {
+        let bytes = crate::metrics::METRICS.nest(&name).publish_bytes();
+        drop(publisher);
+        bytes
+    });
     // Read before the directory is torn down below: `calls_resolved` is the count of rows sealed
     // under each declared call's own table (#725) - the seal-direct paths write those to Parquet the
     // same as event rows, so the manifest already has the number, no new bookkeeping needed. A nest
@@ -1172,6 +1221,7 @@ async fn one_run(
         fixture_content_address,
         children: children.len() as u64,
         calls_resolved,
+        published_bytes,
     })
 }
 
@@ -2090,6 +2140,7 @@ abi = "abis/c.json"
             1,
             Some(record_dir.path()),
             &TapeMode::Record(&tape_path),
+            None,
         )
         .await
         .unwrap();
@@ -2139,6 +2190,7 @@ abi = "abis/c.json"
             2,
             Some(kept.path()),
             &TapeMode::Replay(&tape_path),
+            None,
         )
         .await;
 
@@ -2204,6 +2256,7 @@ abi = "abis/c.json"
             1,
             Some(recorded_dir.path()),
             &TapeMode::Record(&tape_path),
+            None,
         )
         .await
         .unwrap();
@@ -2239,6 +2292,7 @@ abi = "abis/c.json"
             2,
             Some(replayed_dir.path()),
             &TapeMode::Replay(&tape_path),
+            None,
         )
         .await
         .unwrap();
@@ -2285,6 +2339,7 @@ abi = "abis/c.json"
             3,
             Some(again_dir.path()),
             &TapeMode::Replay(&tape_path),
+            None,
         )
         .await
         .unwrap();
@@ -2343,6 +2398,7 @@ abi = "abis/c.json"
                 1,
                 Some(fixed_dir.path()),
                 &TapeMode::Live,
+                None,
             )
             .await
             .unwrap();
@@ -2368,6 +2424,7 @@ abi = "abis/c.json"
                 1,
                 Some(adaptive_dir.path()),
                 &TapeMode::Live,
+                None,
             )
             .await
             .unwrap();
@@ -2525,6 +2582,7 @@ abi = "abis/c.json"
             1,
             Some(work.path()),
             &TapeMode::Live,
+            None,
         )
         .await
         .unwrap();
@@ -2613,6 +2671,7 @@ abi = "abis/c.json"
                     1,
                     Some(&work),
                     &TapeMode::Live,
+                    None,
                 )
                 .await
                 .unwrap()

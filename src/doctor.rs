@@ -373,6 +373,29 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
         }
     }
 
+    let mut publish_bad = false;
+    if let Some(target) = &args.publish {
+        println!("publish    {target}");
+        match crate::publish::verify(dir, target, false, args.publish_etag_md5).await {
+            Ok(n) => println!("  {n} object(s) match the local segments"),
+            Err(e) => {
+                println!("  FAILED {e:#}");
+                publish_bad = true;
+            }
+        }
+        println!();
+        // A mirror check is a question about the bucket, not the endpoints.
+        if args.rpc.is_empty() {
+            if catalogue_bad {
+                anyhow::bail!("catalogue disagrees with the files");
+            }
+            if publish_bad {
+                anyhow::bail!("the mirror at {target} disagrees with this nest");
+            }
+            return Ok(());
+        }
+    }
+
     // Derived only when `--dir` supplies the endpoints and the operator gave no explicit
     // `--address`: the nest already declares its contracts, so there is no reason to fall back to
     // the range-only probe - which #644 measured as understating the real window by up to 256x -
@@ -497,6 +520,9 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
     }
     if catalogue_bad {
         anyhow::bail!("catalogue disagrees with the files");
+    }
+    if publish_bad {
+        anyhow::bail!("the mirror disagrees with this nest");
     }
     Ok(())
 }
@@ -819,6 +845,8 @@ abi = "abis/busiest.json"
             address: None,
             json: false,
             catalogue: false,
+            publish: None,
+            publish_etag_md5: false,
         })
         .await
         .unwrap();
@@ -884,6 +912,8 @@ abi = "abis/second.json"
             address: None,
             json: false,
             catalogue: false,
+            publish: None,
+            publish_etag_md5: false,
         })
         .await
         .unwrap();
@@ -923,6 +953,8 @@ abi = "abis/second.json"
             address: None,
             json: true,
             catalogue: true,
+            publish: None,
+            publish_etag_md5: false,
         })
         .await
         .unwrap();

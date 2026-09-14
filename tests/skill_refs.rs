@@ -358,6 +358,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "src/authored_entity_spike.rs",
         "RFC-0041 sealed measurement tapes and DBSP fixture data, not nest config",
     ),
+    (
+        "src/dune_emit.rs",
+        "reads the generated `schema.json` back, not operator config",
+    ),
 ];
 
 /// Keys that are deliberately absent from the reference, each with the reason it is absent.

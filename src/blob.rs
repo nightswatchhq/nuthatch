@@ -114,7 +114,7 @@ const NID_GENERATOR_SENTINEL: &str = "<not-part-of-identity>";
 
 /// Recursively collect the authored input files under `root`, relative-pathed and sorted, skipping the
 /// [`EXCLUDE`] set (and `skip`, e.g. the output dir when it sits inside the nest). Deterministic order.
-fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

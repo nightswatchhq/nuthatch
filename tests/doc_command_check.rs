@@ -40,12 +40,6 @@ fn repo_root() -> PathBuf {
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "docs/rfcs/0052-the-mirrored-nest.md",
-        "status",
-        1,
-        "RFC-0052 S4's `nuthatch publish status`; S1 ships sync and verify only",
-    ),
-    (
-        "docs/rfcs/0052-the-mirrored-nest.md",
         "--from-mirror",
         1,
         "RFC-0052 §8 names a future cold-start follow-on and explicitly says it needs its own RFC",

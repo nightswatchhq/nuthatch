@@ -113,6 +113,8 @@ pub enum Command {
     Offchain(OffchainArgs),
     /// Mirror sealed segments to an object-store prefix (RFC-0052).
     Publish(PublishArgs),
+    /// Write another engine's SQL over a nest's tables, offline and deterministically (RFC-0055).
+    Emit(EmitArgs),
     /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
     Nest(NestArgs),
     /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
@@ -307,8 +309,21 @@ pub struct PublishArgs {
 pub enum PublishWhat {
     /// Reconcile this nest's sealed catalogue onto a prefix (RFC-0052 S1).
     Sync(PublishSyncArgs),
-    /// HEAD every published file against the local catalogue.
+    /// Check every published file's size and ETag against the local segment.
     Verify(PublishVerifyArgs),
+    /// Where this nest publishes, how far each side is sealed, and what is still to upload. Writes
+    /// nothing.
+    Status(PublishStatusArgs),
+}
+
+#[derive(Args)]
+pub struct PublishStatusArgs {
+    /// The prefix `publish sync` writes to.
+    #[arg(long)]
+    pub target: String,
+    /// Nest directory.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
 }
 
 #[derive(Args)]
@@ -335,6 +350,34 @@ pub struct PublishVerifyArgs {
     /// Re-download and re-hash every object.
     #[arg(long)]
     pub deep: bool,
+    /// For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use --deep otherwise.
+    #[arg(long)]
+    pub etag_md5: bool,
+}
+
+#[derive(Args)]
+pub struct EmitArgs {
+    #[command(subcommand)]
+    pub what: EmitWhat,
+}
+
+#[derive(Subcommand)]
+pub enum EmitWhat {
+    /// One DuneSQL query per event table, casting each column to its DuneSQL type (RFC-0055 S1).
+    Dune(EmitDuneArgs),
+}
+
+#[derive(Args)]
+pub struct EmitDuneArgs {
+    /// Nest directory. Read only.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Directory the `.sql` files and `README.md` are written to.
+    #[arg(long)]
+    pub out: String,
+    /// The Dune namespace the rows were uploaded into; queries read `dune.<source>.<table>`.
+    #[arg(long)]
+    pub source: String,
 }
 
 #[derive(Args)]
@@ -867,6 +910,11 @@ pub struct BackfillBenchArgs {
     /// quietly invents data is worse than no rig.
     #[arg(long, conflicts_with_all = ["record", "rpc", "state_rpc"])]
     pub replay: Option<String>,
+
+    /// Publish each run's sealed segments to this target while it indexes (RFC-0052 S2), so the
+    /// report measures ingestion with a mirror uploading beside it. Each run gets its own prefix.
+    #[arg(long, value_name = "URL", conflicts_with = "keep")]
+    pub publish_target: Option<String>,
 }
 
 #[derive(Args)]
@@ -1295,4 +1343,13 @@ pub struct DoctorArgs {
     /// stdout is the catalogue check only, so the live-endpoints gate is unchanged.
     #[arg(long)]
     pub catalogue: bool,
+
+    /// Check the mirror of the nest in `--dir` at this target, as `publish verify` does without
+    /// `--deep`. Exit 1 if an object is missing, differs, or cannot be content-checked.
+    #[arg(long, value_name = "TARGET", conflicts_with = "json")]
+    pub publish: Option<String>,
+
+    /// For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use `publish verify --deep` otherwise.
+    #[arg(long, requires = "publish")]
+    pub publish_etag_md5: bool,
 }

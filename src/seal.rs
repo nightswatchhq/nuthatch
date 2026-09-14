@@ -145,6 +145,12 @@ pub struct Segment {
 /// do not.
 pub const SEAL_TABLE_FLOOR: usize = 1_000;
 
+/// Row JSON at which a table's segment is final however few rows it holds (RFC-0028 §4, amended
+/// 2026-09-13). A table of megabyte documents never reaches [`SEAL_TABLE_FLOOR`] at a cut, and every
+/// fold re-reads and rewrites the whole provisional file. Measured on row JSON, not Parquet bytes, for
+/// the reason the row floor gives.
+pub const SEAL_TABLE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
+
 /// The floor `seal_range` applies for `dir`: the constant, unless a test has set otherwise.
 fn table_floor(dir: &Path) -> usize {
     #[cfg(test)]
@@ -275,7 +281,8 @@ pub fn seal_range_with_snapshot(
                 (all, prev.from_block, bytes, hash, Some(prev))
             }
         };
-        let provisional = rows.len() < table_floor(dir);
+        let provisional = rows.len() < table_floor(dir)
+            && rows.iter().map(|v| v.to_string().len()).sum::<usize>() < SEAL_TABLE_BYTES_FLOOR;
         let file = format!("{table}-{hash}.parquet");
 
         // Write once, into the shared store when this dataset belongs to a runtime (RFC-0033 §11a).
@@ -2100,6 +2107,27 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// Megabyte rows never reach the row floor at a cut, so every fold re-read and rewrote the whole
+    /// provisional file, and the fold grew until it was the memory problem the byte cut exists to end.
+    #[test]
+    fn a_table_of_documents_is_final_under_the_row_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = "x".repeat(1024 * 1024);
+        let rows: Vec<String> = (0..20u64)
+            .map(|b| {
+                format!(r#"{{"table":"t__doc","block_number":{b},"log_index":0,"doc":"{doc}"}}"#)
+            })
+            .collect();
+        assert!(rows.len() < SEAL_TABLE_FLOOR);
+        seal_range(dir.path(), &rows, 0, 19).unwrap().unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "t__doc");
+        assert!(
+            !seg.provisional,
+            "20 MiB of rows is past SEAL_TABLE_BYTES_FLOOR, so the segment must be final however few \
+             rows it holds"
+        );
     }
 
     #[test]

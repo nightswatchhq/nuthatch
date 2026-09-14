@@ -1,0 +1,11 @@
+[nest]
+name = "Fixture-Nest"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["http://127.0.0.1:1"]
+
+[[contracts]]
+alias = "vault"
+address = "0x00000000000000000000000000000000000000aa"
+start_block = 1
+abi = "abis/vault.json"

@@ -75,6 +75,7 @@ Measure backfill throughput (events/sec, wall-clock, peak RSS) over a pinned blo
 - `--keep <KEEP>` - Keep the run's data at this path instead of the cache dir that is discarded
 - `--record <RECORD>` - Record every source call this run makes into a tape at `<path>`, alongside the live run (RFC-0039)
 - `--replay <REPLAY>` - Replay a tape recorded by `--record` instead of touching the network (RFC-0039)
+- `--publish-target <PUBLISH_TARGET>` - Publish each run's sealed segments to this target while it indexes (RFC-0052 S2), so the report measures ingestion with a mirror uploading beside it. Each run gets its own prefix
 
 ## `nuthatch bench query`
 
@@ -135,6 +136,21 @@ Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width,
 - `--address <ADDRESS>` - Probe `eth_getLogs` width filtered to this address, rather than unfiltered. Closer to what a real nest asks for, and some endpoints cap an unfiltered query harder than a filtered one
 - `--json` - Print one JSON object per endpoint on stdout (no prose). The live-endpoints gate keys on these fields, not on the wording of the human report (#716)
 - `--catalogue` - Check the segment catalogue in `--dir`: every entry's file exists and hashes. Does not quarantine (that is startup). Exit 1 if anything disagrees. With `--json` and no `--rpc`, stdout is the catalogue check only, so the live-endpoints gate is unchanged
+- `--publish <PUBLISH>` - Check the mirror of the nest in `--dir` at this target, as `publish verify` does without `--deep`. Exit 1 if an object is missing, differs, or cannot be content-checked
+- `--publish-etag-md5` - For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use `publish verify --deep` otherwise
+
+## `nuthatch emit`
+
+Write another engine's SQL over a nest's tables, offline and deterministically (RFC-0055)
+
+
+## `nuthatch emit dune`
+
+One DuneSQL query per event table, casting each column to its DuneSQL type (RFC-0055 S1)
+
+- `--dir <DIR>` - Nest directory. Read only
+- `--out <OUT>` - Directory the `.sql` files and `README.md` are written to
+- `--source <SOURCE>` - The Dune namespace the rows were uploaded into; queries read `dune.<source>.<table>`
 
 ## `nuthatch init`
 
@@ -304,6 +320,13 @@ Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5)
 Mirror sealed segments to an object-store prefix (RFC-0052)
 
 
+## `nuthatch publish status`
+
+Where this nest publishes, how far each side is sealed, and what is still to upload. Writes nothing
+
+- `--target <TARGET>` - The prefix `publish sync` writes to
+- `--dir <DIR>` - Nest directory
+
 ## `nuthatch publish sync`
 
 Reconcile this nest's sealed catalogue onto a prefix (RFC-0052 S1)
@@ -314,11 +337,12 @@ Reconcile this nest's sealed catalogue onto a prefix (RFC-0052 S1)
 
 ## `nuthatch publish verify`
 
-HEAD every published file against the local catalogue
+Check every published file's size and ETag against the local segment
 
 - `--target <TARGET>` - The prefix `publish sync` wrote to
 - `--dir <DIR>` - Nest directory
 - `--deep` - Re-download and re-hash every object
+- `--etag-md5` - For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use --deep otherwise
 
 ## `nuthatch recipe`
 
