@@ -13,6 +13,20 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-09-14 - #1376 measured again, on its merged head, with the review fixes in.** Merged #1375's review
+  fixes (block 0 held below an outstanding document; `--seal-direct` counting an unproven document as the
+  resolver does), #1391's scan that stops at a known span end, and its Postgres range scan that fetches a
+  16 MiB byte budget of rows rather than a thousand documents. QoS nest on `pete/qos-nest-typed-rows`,
+  Gnosis from block 48,119,000, `--ipfs https://ipfs.thegraph.com/ipfs/`, release build, `/usr/bin/time -l`.
+  **`--seal-direct`**: peak RSS **434,388,992 bytes**, SIGTERM during the seal exited in **0.14 s** with 25
+  segments written. **Tip path**: peak RSS **1,622,310,912 bytes**, SIGTERM during the seal exited in **0.3 s** with 14 segments written. The 1,998,815,232 bytes recorded above was measured before the typed-rows nest config and these fixes,
+  so the two are not a like-for-like pair.
+  **Open, found by this run: the tip path is not bounded for a document nest.** Its window controller
+  (`index_loop`, `AdaptiveWindow::for_window`) has no document branch, so on an event-less nest the window
+  grows toward `MAX_WINDOW` (80,000 blocks when measured); `DOCUMENT_WINDOW_CAP` applies only to the two
+  seal-direct paths. `maybe_seal` runs once per committed window, so a window's typed rows stay hot until
+  its whole range has been fetched: 1,209,792 hot entities, 0 rows sealed and 1.3 GB RSS mid-window, with
+  `documents_backlogged` idle because resolution had finished (0 pending). Unfixed here.
 - **2026-09-13 - RFC-0028 §4 amended: a seal cut is bounded by bytes; call bodies fetch in parallel;
   an aborted seal stops.** Chief ruled the byte bound on 2026-09-13. A cut is now the earliest of
   20,000 rows, 64 MiB of row JSON (`SEAL_DIRECT_BYTES`) and the span, all read from the rows, so
