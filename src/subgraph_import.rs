@@ -985,6 +985,44 @@ mod tests {
         handle.abort();
     }
 
+    /// Under one default chunk a body can still be a multi-block file cut smaller: 200 KiB in 100 KiB
+    /// leaves re-encodes to nothing, and only its blocks prove it (#1373 review).
+    #[tokio::test]
+    async fn a_small_document_in_another_layout_is_proven_from_its_blocks() {
+        let file = document(200 * 1024);
+        let (cid, car) = crate::cid::dag_for_tests(&file, 100 * 1024);
+        let (gateway, handle) = trustless_gateway(file.clone(), Some(car)).await;
+        let got = fetch_ipfs_proven(&cid, &[gateway], Origin::Manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.proof,
+            Proof::Verified,
+            "a small file cut into smaller leaves is proven by its blocks"
+        );
+        assert_eq!(got.body.as_bytes(), file);
+        handle.abort();
+    }
+
+    /// The same small file with no blocks to prove it is refused, not accepted unproven: under one
+    /// default chunk a body that does not re-encode is far likelier a gateway's error page than a file
+    /// cut small, and `init` vendors whatever this accepts.
+    #[tokio::test]
+    async fn a_small_document_that_neither_re_encodes_nor_has_blocks_is_refused() {
+        let file = document(200 * 1024);
+        let (cid, _) = crate::cid::dag_for_tests(&file, 100 * 1024);
+        let (gateway, handle) = trustless_gateway(file, None).await;
+        let gateways = [gateway];
+        assert!(
+            fetch_ipfs_proven(&cid, &gateways, Origin::Manifest)
+                .await
+                .is_err(),
+            "a small body proven by nothing must be refused"
+        );
+        assert!(fetch_ipfs(&cid, &gateways, Origin::Manifest).await.is_err());
+        handle.abort();
+    }
+
     /// A gateway that answers `?format=car` with the file has proven nothing: the document comes back
     /// unproven, and `init`'s `fetch_ipfs` still accepts it loudly.
     #[tokio::test]
