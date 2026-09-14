@@ -118,6 +118,7 @@ async fn start_fe(dir: &std::path::Path, admin: bool) -> (String, tokio::task::J
     let port = free_port().await;
     let listen = format!("[0:0:0:0:0:0:0:1]:{port}");
     let args = ServeArgs {
+        cors: Vec::new(),
         dir: dir.to_string_lossy().into_owned(),
         listen: listen.clone(),
         hot_store: None,
