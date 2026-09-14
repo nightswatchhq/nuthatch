@@ -313,6 +313,56 @@ impl HotStore for PgStore {
         self.put_kv("entities", key, json)
     }
 
+    fn put_entity_if_named(
+        &self,
+        key: &str,
+        json: &str,
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        self.put_entities_if_named(
+            &[(key.to_string(), json.to_string())],
+            source_key,
+            block_hash,
+        )
+    }
+
+    fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        let schema = self.schema.clone();
+        let held = self.held_fence();
+        let entries = entries.to_vec();
+        let (source_key, block_hash) = (source_key.to_string(), block_hash.to_string());
+        self.conn.with(move |c| {
+            let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
+            // `FOR UPDATE` so a rollback of the naming row waits for this decision rather than racing it.
+            let read = format!("SELECT value FROM \"{schema}\".entities WHERE key = $1 FOR UPDATE");
+            let named = tx
+                .query_opt(&read, &[&source_key])?
+                .map(|r| r.get::<_, String>(0))
+                .is_some_and(|v| {
+                    crate::store::row_block_hash(&v).as_deref() == Some(block_hash.as_str())
+                });
+            if !named {
+                return Ok(false);
+            }
+            let ins = format!(
+                "INSERT INTO \"{schema}\".entities (key, value) VALUES ($1, $2) \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+            );
+            for (key, json) in &entries {
+                tx.execute(&ins, &[key, json])?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
     fn get_entity(&self, key: &str) -> Result<Option<String>> {
         self.get_kv("entities", key)
     }

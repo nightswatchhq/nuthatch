@@ -62,10 +62,16 @@ pub struct NestMetrics {
     reorgs: AtomicU64,
     /// RFC-0037: rows an `[[ipfs]]` declaration reads that named no CID it could use.
     ipfs_unreadable: AtomicU64,
+    /// RFC-0037 §3: documents named and neither stored nor given up on, at the resolver's last pass.
+    ipfs_pending: AtomicU64,
+    ipfs_resolved: AtomicU64,
+    ipfs_given_up: AtomicU64,
     /// RFC-0037: documents fetched that nothing could prove against their CID, so no row was written.
     ipfs_unverified: AtomicU64,
     /// RFC-0037: documents refused for exceeding the byte, block or depth cap.
     ipfs_oversize: AtomicU64,
+    /// RFC-0037 slice 8: proven documents whose content does not fit their declared typed rows.
+    ipfs_rows_refused: AtomicU64,
     /// #807: the `--seal-direct` history pass, before the hot cursor exists.
     seal_direct_active: AtomicBool,
     seal_direct_origin: AtomicU64,
@@ -254,6 +260,26 @@ impl NestMetrics {
     pub fn ipfs_unreadable(&self) -> u64 {
         self.ipfs_unreadable.load(Relaxed)
     }
+    pub fn set_ipfs_pending(&self, n: u64) {
+        self.ipfs_pending.store(n, Relaxed);
+    }
+    pub fn ipfs_pending(&self) -> u64 {
+        self.ipfs_pending.load(Relaxed)
+    }
+    pub fn add_ipfs_resolved(&self, n: u64) {
+        self.ipfs_resolved.fetch_add(n, Relaxed);
+        METRICS.add_ipfs_resolved(n);
+    }
+    pub fn ipfs_resolved(&self) -> u64 {
+        self.ipfs_resolved.load(Relaxed)
+    }
+    pub fn add_ipfs_given_up(&self, n: u64) {
+        self.ipfs_given_up.fetch_add(n, Relaxed);
+        METRICS.add_ipfs_given_up(n);
+    }
+    pub fn ipfs_given_up(&self) -> u64 {
+        self.ipfs_given_up.load(Relaxed)
+    }
     pub fn add_ipfs_unverified(&self, n: u64) {
         self.ipfs_unverified.fetch_add(n, Relaxed);
         METRICS.add_ipfs_unverified(n);
@@ -267,6 +293,13 @@ impl NestMetrics {
     }
     pub fn ipfs_oversize(&self) -> u64 {
         self.ipfs_oversize.load(Relaxed)
+    }
+    pub fn add_ipfs_rows_refused(&self, n: u64) {
+        self.ipfs_rows_refused.fetch_add(n, Relaxed);
+        METRICS.add_ipfs_rows_refused(n);
+    }
+    pub fn ipfs_rows_refused(&self) -> u64 {
+        self.ipfs_rows_refused.load(Relaxed)
     }
 
     /// Start a seal-direct history pass. `/ready` reads these instead of treating a zero cursor as
@@ -389,8 +422,11 @@ pub struct Metrics {
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
     ipfs_unreadable: AtomicU64,
+    ipfs_resolved: AtomicU64,
+    ipfs_given_up: AtomicU64,
     ipfs_unverified: AtomicU64,
     ipfs_oversize: AtomicU64,
+    ipfs_rows_refused: AtomicU64,
     alert_outbox_depth: AtomicU64,
     // Serving - the surface an operator bills against.
     http_requests: AtomicU64,
@@ -457,8 +493,11 @@ impl Metrics {
             rows_sealed: AtomicU64::new(0),
             reorgs: AtomicU64::new(0),
             ipfs_unreadable: AtomicU64::new(0),
+            ipfs_resolved: AtomicU64::new(0),
+            ipfs_given_up: AtomicU64::new(0),
             ipfs_unverified: AtomicU64::new(0),
             ipfs_oversize: AtomicU64::new(0),
+            ipfs_rows_refused: AtomicU64::new(0),
             alert_outbox_depth: AtomicU64::new(0),
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
@@ -578,11 +617,20 @@ impl Metrics {
     pub fn add_ipfs_unreadable(&self, n: u64) {
         self.ipfs_unreadable.fetch_add(n, Relaxed);
     }
+    pub fn add_ipfs_resolved(&self, n: u64) {
+        self.ipfs_resolved.fetch_add(n, Relaxed);
+    }
+    pub fn add_ipfs_given_up(&self, n: u64) {
+        self.ipfs_given_up.fetch_add(n, Relaxed);
+    }
     pub fn add_ipfs_unverified(&self, n: u64) {
         self.ipfs_unverified.fetch_add(n, Relaxed);
     }
     pub fn add_ipfs_oversize(&self, n: u64) {
         self.ipfs_oversize.fetch_add(n, Relaxed);
+    }
+    pub fn add_ipfs_rows_refused(&self, n: u64) {
+        self.ipfs_rows_refused.fetch_add(n, Relaxed);
     }
     pub fn set_alert_outbox(&self, v: u64) {
         self.alert_outbox_depth.store(v, Relaxed);
@@ -813,6 +861,16 @@ impl Metrics {
             self.ipfs_unreadable.load(Relaxed),
         ));
         s.push_str(&counter(
+            "nuthatch_ipfs_resolved_total",
+            "Documents an [[ipfs]] declaration named that were fetched and stored, since start.",
+            self.ipfs_resolved.load(Relaxed),
+        ));
+        s.push_str(&counter(
+            "nuthatch_ipfs_given_up_total",
+            "Documents given up on after every retry failed, since start. Their ranges seal without them.",
+            self.ipfs_given_up.load(Relaxed),
+        ));
+        s.push_str(&counter(
             "nuthatch_ipfs_unverified_total",
             "IPFS documents fetched that could not be proven against their CID, since start.",
             self.ipfs_unverified.load(Relaxed),
@@ -821,6 +879,11 @@ impl Metrics {
             "nuthatch_ipfs_oversize_total",
             "IPFS documents refused for exceeding the byte, block or depth cap, since start.",
             self.ipfs_oversize.load(Relaxed),
+        ));
+        s.push_str(&counter(
+            "nuthatch_ipfs_rows_refused_total",
+            "Proven IPFS documents whose content did not fit their declared typed rows, since start.",
+            self.ipfs_rows_refused.load(Relaxed),
         ));
         s.push_str(&counter(
             "nuthatch_http_requests_total",
@@ -1050,6 +1113,24 @@ impl Metrics {
                 &|m| m.ipfs_unreadable.load(Relaxed),
             );
             labelled(
+                "nuthatch_nest_ipfs_pending",
+                "Documents named and neither stored nor given up on, per nest. Sealing holds below the lowest.",
+                "gauge",
+                &|m| m.ipfs_pending.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_ipfs_resolved_total",
+                "Documents fetched and stored since start, per nest.",
+                "counter",
+                &|m| m.ipfs_resolved.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_ipfs_given_up_total",
+                "Documents given up on after every retry failed, since start, per nest.",
+                "counter",
+                &|m| m.ipfs_given_up.load(Relaxed),
+            );
+            labelled(
                 "nuthatch_nest_ipfs_unverified_total",
                 "IPFS documents fetched that could not be proven against their CID, per nest.",
                 "counter",
@@ -1060,6 +1141,12 @@ impl Metrics {
                 "IPFS documents refused for exceeding the byte, block or depth cap, per nest.",
                 "counter",
                 &|m| m.ipfs_oversize.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_ipfs_rows_refused_total",
+                "Proven IPFS documents whose content did not fit their declared typed rows, per nest.",
+                "counter",
+                &|m| m.ipfs_rows_refused.load(Relaxed),
             );
             labelled(
                 "nuthatch_nest_reorgs_total",

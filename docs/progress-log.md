@@ -13,7 +13,31 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
-- **2026-09-13 - RFC-0037 slice 6: multi-block IPFS documents are verified.** Slice 5 verified 0 of 36
+- **2026-09-13 - RFC-0037 slice 8: a proven IPFS document can become typed rows.** `[ipfs.rows]` explodes
+  a proven JSON document into one typed row per element at resolution, in a table of its own, written in the
+  same transaction as the document and still conditional on the naming row. Keys follow the plan: a block's
+  documents take `625_000..=625_999`, their rows `626_000..=749_999`, each document allotted its `max_rows` in
+  slot order, so a key never depends on which gateway answered first. A document that does not fit its
+  declared columns is refused whole and counted in `nuthatch_nest_ipfs_rows_refused_total`; `keep_content =
+  false` drops the raw JSON. The declaration enters identity only when present. Motive: the QoS nest's daily
+  rollups parsed megabytes of JSON per query, one day at 3.86 GB peak. Rollups over typed rows stay views:
+  RFC-0041 entities bind only decoded event tables and are fed from ingest, not from the resolver. Also:
+  `[[ipfs]]` tables are no longer seeded in `semantic.toml` as `[[calls]]` results.
+- **2026-09-13 - RFC-0037 slice 6: every document resolves, or is given up on in the open.** The
+  per-window budget is gone: documents resolve out of band, re-derived from the hot store, with retry
+  and backoff (a body cut off mid-read included), a recorded give-up after 10 failures, and sealing
+  held below any document still outstanding. Call rows carry `tx_from`; the identity guard and `/sql`
+  provenance cover call and `[[ipfs]]` declarations; `--seal-direct` decodes top-level calls and
+  resolves their documents; block bodies come 200 blocks at a time. **Migration**: a nest with
+  `top_level_calls` indexed before this refuses to start, because its call rows lack `tx_from`;
+  re-index it. **Verified live against Gnosis**, the QoS nest without `blocks = true` at default
+  windows from 48,119,000: 678 calls, 678 documents, 2026-09-07 whole at 288 per topic with the
+  formerly lost `QmYTFzn…` among them; `kill -9` at 120 resolved and 558 pending, restarted, done 2
+  minutes 59 seconds later with nothing lost. Before chunking, the first 20,000-block window held 2.3
+  GB of block bodies with nothing committed; after, about 300 MB. **Not fixed**: sealing the released
+  range of 678 megabyte documents in one cut reached 3.17 GB, past the per-cursor budget, because cuts
+  are bounded by rows and span, never bytes. Do not deploy a megabyte-document nest on this build.
+- **2026-09-13 - RFC-0037 slice 7: multi-block IPFS documents are verified.** Slice 5 verified 0 of 36
   oracle payloads, because a file past 256 KiB was re-encoded as a single block. It is now re-encoded
   in Kubo's default layout (256 KiB leaves, a balanced tree of 174 links) or, failing that,
   reassembled from a CAR whose every block is hashed against its CID, with `blocksizes`, `filesize`

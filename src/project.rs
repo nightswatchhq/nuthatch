@@ -843,38 +843,58 @@ fn write_abi(dir: &Path, alias: &str, abi: &serde_json::Value) -> Result<()> {
     .with_context(|| format!("failed to write abis/{alias}.json"))
 }
 
+/// The decode identity a nest's rows are produced under: the event registry folded with every other
+/// declared source of rows, in a fixed order.
+///
+/// `schema.json`, the store's identity guard and query provenance all read this one function. The
+/// guard and provenance used to hash the event registry alone, so an event-less nest (a calldata-only
+/// DataEdge) claimed `e3b0c442…`, the hash of nothing, and changing an `[[ipfs]]` or `[[calls]]`
+/// declaration went unnoticed by a store that had already indexed under the old one.
+pub fn decode_identity(
+    dir: &Path,
+    config: &Config,
+    registry: &crate::registry::DecodeRegistry,
+) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let fold = |hash: [u8; 32], part: [u8; 32]| -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(hash);
+        h.update(part);
+        h.finalize().into()
+    };
+    let mut hash = registry.hash();
+    // RFC-0014: two nests differing only in what they extract must not claim one decode version.
+    if config.extract.decodes_calls() {
+        hash = fold(
+            hash,
+            crate::calldata::CallRegistry::from_nest(dir, config)?.hash(),
+        );
+    }
+    if !config.ipfs.is_empty() {
+        hash = fold(hash, crate::ipfs::decl_hash(&config.ipfs));
+    }
+    // RFC-0023 tier 3: a declared read is a table too, and moves the identity for the same reason.
+    if !config.calls.is_empty() {
+        hash = fold(hash, crate::calls::decl_hash(&config.calls));
+    }
+    Ok(hash)
+}
+
 fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result<usize> {
     let registry = crate::registry::from_nest(dir, config)?;
     let mut schema = registry.schema();
-    // RFC-0014: a nest that declares `[extract]` also declares call/state tables. The decode identity
-    // folds in the call surface, so two nests differing only in what they extract are not mistaken for
-    // the same decode version - the hash is what segment reuse and `check` compare.
-    let mut hash = registry.hash();
     if config.extract.decodes_calls() {
         let calls = crate::calldata::CallRegistry::from_nest(dir, config)?;
         schema.extend(calls.schema(&config.extract));
-        let mut h = <sha2::Sha256 as sha2::Digest>::new();
-        sha2::Digest::update(&mut h, hash);
-        sha2::Digest::update(&mut h, calls.hash());
-        hash = <sha2::Sha256 as sha2::Digest>::finalize(h).into();
     }
-    // RFC-0023 tier 3: a declared `[[calls]]` read is a table too, and it moves the decode identity
-    // for the same reason `[extract]` does - two nests differing only in what they read must not be
-    // mistaken for the same decode version by segment reuse.
     if !config.ipfs.is_empty() {
         schema.extend(crate::ipfs::schema(&config.ipfs, registry.timestamps()));
-        let mut h = <sha2::Sha256 as sha2::Digest>::new();
-        sha2::Digest::update(&mut h, hash);
-        sha2::Digest::update(&mut h, crate::ipfs::decl_hash(&config.ipfs));
-        hash = <sha2::Sha256 as sha2::Digest>::finalize(h).into();
     }
     if !config.calls.is_empty() {
         schema.extend(crate::calls::schema(&config.calls, registry.timestamps()));
-        let mut h = <sha2::Sha256 as sha2::Digest>::new();
-        sha2::Digest::update(&mut h, hash);
-        sha2::Digest::update(&mut h, crate::calls::decl_hash(&config.calls));
-        hash = <sha2::Sha256 as sha2::Digest>::finalize(h).into();
     }
+    crate::indexer::refuse_duplicate_tables(&schema)?;
+    let hash = decode_identity(dir, config, &registry)?;
     std::fs::write(
         dir.join("schema.json"),
         serde_json::to_string_pretty(&serde_json::json!({

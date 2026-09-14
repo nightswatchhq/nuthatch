@@ -871,8 +871,15 @@ pub fn adoptable(
         // `Adopting::From` treats an unreadable store: absent or unreadable disqualifies the
         // candidate, because the cost of being wrong here is a mount an operator must clear by hand
         // and the cost of being cautious is a re-index.
-        match crate::store::recorded_registry_hash(&dir.join(crate::config::DB_FILE)) {
-            Ok(Some(recorded)) => recorded == want.registry_hash,
+        // A store stamped under the full decode identity records that identity, not the event
+        // registry's hash the manifest carries, so it is compared with what the guard would write.
+        let db = dir.join(crate::config::DB_FILE);
+        match crate::store::recorded_registry_hash(&db) {
+            Ok(Some(recorded)) => match crate::store::recorded_identity_formula(&db) {
+                Ok(None) => recorded == want.registry_hash,
+                Ok(Some(_)) => decode_identity_of(dir).is_some_and(|id| recorded == id),
+                Err(_) => false,
+            },
             Ok(None) => {
                 tracing::debug!(
                     "{} recomputes to the wanted identity but records no registry hash; not \
@@ -890,6 +897,16 @@ pub fn adoptable(
             }
         }
     })
+}
+
+/// The full decode identity the running binary computes for a dataset's inputs, as
+/// `guard_registry_identity` records it. `None` when the inputs cannot be read, which disqualifies.
+fn decode_identity_of(dir: &Path) -> Option<String> {
+    let config = Config::load(dir).ok()?;
+    let registry = crate::registry::from_nest(dir, &config).ok()?;
+    crate::project::decode_identity(dir, &config, &registry)
+        .ok()
+        .map(hex::encode)
 }
 
 /// Which side of an adoption is asking [`holds_data`].
@@ -3073,6 +3090,44 @@ mod tests {
             "a dataset that records no registry hash must not be adopted"
         );
         assert!(!dest.join(crate::config::DB_FILE).exists());
+    }
+
+    /// A store indexed under the full decode identity records that identity, which for a nest
+    /// declaring `[[ipfs]]` or `[[calls]]` is not the event registry's hash the manifest carries.
+    /// Comparing it with the manifest's hash alone refused every such dataset its adoption.
+    #[test]
+    fn a_candidate_recorded_under_the_full_decode_identity_is_adoptable() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let old = migrated_nest(root, "usdc");
+        let src = MountTable::data_dir(root, &old);
+        let mut cfg = std::fs::read_to_string(src.join(CONFIG_FILE)).unwrap();
+        cfg.push_str("\n[[ipfs]]\nname = \"doc\"\non = \"t__uri_set\"\ncid_column = \"uri\"\n");
+        std::fs::write(src.join(CONFIG_FILE), cfg).unwrap();
+
+        let events = crate::blob::build_manifest(&src, None)
+            .unwrap()
+            .registry_hash;
+        let full = decode_identity_of(&src).expect("the inputs are readable");
+        assert_ne!(
+            events, full,
+            "premise: an [[ipfs]] declaration must move the decode identity off the event hash"
+        );
+        seed_history_recording(&src, 4242, &full);
+        crate::store::Store::open(&src.join(crate::config::DB_FILE))
+            .unwrap()
+            .set_meta(
+                crate::store::IDENTITY_FORMULA_KEY,
+                crate::store::IDENTITY_FORMULA,
+            )
+            .unwrap();
+
+        let new = cosmetic_sibling(root, &old);
+        let dest = MountTable::data_dir(root, &new);
+        assert!(
+            adopt_dataset(root, &dest, &new).unwrap().is_some(),
+            "a dataset recording the identity its inputs imply must be adopted"
+        );
     }
 
     /// Adoption is all-or-nothing, and a half-copied one is the failure this guards.

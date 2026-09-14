@@ -40,7 +40,7 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// The decode registry that produced this store's rows (#653). Not the same question as
 /// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
 /// configuration, which is what a nest's content address is a statement about.
-use crate::store::REGISTRY_KEY;
+use crate::store::{IDENTITY_FORMULA, IDENTITY_FORMULA_KEY, REGISTRY_KEY};
 const SEALED_THROUGH_KEY: &str = "sealed_through";
 const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
@@ -2305,6 +2305,23 @@ pub fn full_schema(
     tables
 }
 
+/// Refuse a composed schema in which two sources declare one table. Config validation sees only its own
+/// declarations, not the event and call tables the ABIs produce, so a `[[ipfs]]` or `[ipfs.rows]` name
+/// can land on one of those; its rows would then be read with the other table's columns.
+pub fn refuse_duplicate_tables(tables: &[crate::registry::TableSchema]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for t in tables {
+        if !seen.insert(t.table.as_str()) {
+            anyhow::bail!(
+                "table `{}` is declared twice in this nest - an `[[ipfs]]` name, an `[ipfs.rows]` \
+                 table, a `[[calls]]` name and every event and call table must each be unique",
+                t.table
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Build one nest's runtime state *without* starting the tip loop: open its store, build its decode
 /// registry + IVM views, run the warm-restart rebuilds, and assemble both the [`NestIngest`] the
 /// ingestion loop drives and the [`serve::AppState`] the API serves - the two sharing the same view
@@ -2416,8 +2433,14 @@ async fn build_nest(
         }
     }
     let registry = Arc::new(crate::registry::from_nest(&dir, config)?);
+    let identity = hex::encode(crate::project::decode_identity(&dir, config, &registry)?);
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
-    guard_registry_identity(store.as_ref(), &hex::encode(registry.hash()))?;
+    guard_registry_identity(
+        store.as_ref(),
+        &identity,
+        &hex::encode(registry.hash()),
+        config.extract.top_level_calls,
+    )?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
@@ -2562,7 +2585,7 @@ async fn build_nest(
         registry.skipped_anonymous(),
         finality,
         window,
-        &hex::encode(registry.hash())[..12],
+        &identity[..12],
     );
 
     // Governed semantic layer (RFC-0016): if `semantic.toml` describes a table/column the registry
@@ -2658,6 +2681,16 @@ async fn build_nest(
         None
     };
 
+    // A declaration may read a call table, so the gate sees those columns as well as the event ones.
+    let ipfs_gate = {
+        let mut tables = full_schema(&registry, config);
+        if let Some(calls) = &call_registry {
+            tables.extend(calls.schema(&config.extract));
+        }
+        refuse_duplicate_tables(&tables)?;
+        crate::ipfs_resolve::Gate::new(&config.ipfs, &tables)
+    };
+
     let state_rpc = if config.state_rpc_urls.is_empty() {
         if !config.calls.is_empty() && config.read_only_role {
             // #1167: `serve` resolves nothing; the call tables it serves were sealed by `dev`.
@@ -2737,7 +2770,8 @@ async fn build_nest(
         addresses,
         topic0s,
         start_block,
-        ipfs: config.ipfs.clone(),
+        ipfs_gate,
+        ipfs_resolver: None,
         ipfs_gateways: if config.ipfs_gateways.is_empty() {
             crate::subgraph_import::DEFAULT_IPFS_GATEWAYS
                 .iter()
@@ -2760,7 +2794,7 @@ async fn build_nest(
         "name": config.nest.name,
         "chain": config.nest.chain,
         "chain_id": config.nest.chain_id,
-        "registry_hash": format!("0x{}", hex::encode(registry.hash())),
+        "registry_hash": format!("0x{identity}"),
         "table_count": registry.tables().len(),
         "contracts": config.contracts.iter()
             .map(|c| serde_json::json!({ "alias": c.alias, "address": c.address })).collect::<Vec<_>>(),
@@ -3255,12 +3289,48 @@ const FACTORY_FLIP_THRESHOLD: usize = 500;
 ///
 /// Same reasoning as the `--seal-direct` refusal for declared calls (RFC-0038 §6e): a run that
 /// quietly produces a table with no rows is worse than a run that refuses.
-fn guard_registry_identity(store: &dyn crate::store::HotStore, registry_hash: &str) -> Result<()> {
+///
+/// `legacy_hash` is the event registry's hash alone, which is what this guard recorded before it
+/// covered call, `[[ipfs]]` and `[[calls]]` declarations. A store stamped under that formula and
+/// matching it is adopted onto the full identity once, and recorded as such.
+fn guard_registry_identity(
+    store: &dyn crate::store::HotStore,
+    registry_hash: &str,
+    legacy_hash: &str,
+    top_level_calls: bool,
+) -> Result<()> {
+    let formula = store.get_meta(IDENTITY_FORMULA_KEY)?;
     match store.get_meta(REGISTRY_KEY)? {
-        Some(found) if found != registry_hash => anyhow::bail!(
+        Some(found) if found == registry_hash => {
+            if formula.is_none() {
+                store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
+            }
+            Ok(())
+        }
+        Some(found) if formula.is_none() && found == legacy_hash => {
+            // Every call row has carried `tx_from` since this formula; rows written before it do
+            // not, so adopting would serve a column that is absent from the data it describes.
+            if top_level_calls && store.get_meta(LAST_BLOCK_KEY)?.is_some() {
+                anyhow::bail!(
+                    "this nest decodes top-level calls, and its stored call rows predate the \
+                     `tx_from` column every call table now carries.\n\n\
+                     Re-index from scratch to adopt it (remove `nuthatch.redb` and `segments/`), or \
+                     keep serving this data with the nuthatch build that indexed it."
+                );
+            }
+            tracing::warn!(
+                "adopting decode identity 0x{registry_hash} for a store recorded under the event \
+                 registry alone (0x{found}). Its event decode is verified; its call, [[ipfs]] and \
+                 [[calls]] declarations were never checked by this guard, so if they changed since \
+                 the data was written, re-index it."
+            );
+            store.set_meta(REGISTRY_KEY, registry_hash)?;
+            store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
+            Ok(())
+        }
+        Some(found) => anyhow::bail!(
             "this nest's stored data was indexed by a different decode registry.\n\n               stored:  0x{found}\n  config:  0x{registry_hash}\n\n             The registry hash covers every contract, event and column this nest decodes, so a              difference means `nuthatch.toml` or an ABI changed after the data was written.              Continuing would serve old rows under a new content address, and any table added by the              change would read as empty rather than as absent.\n\n             Re-index from scratch to adopt the new configuration (remove `nuthatch.redb` and              `segments/`), or restore the previous configuration to keep serving this data. A nest              whose identity changed is a different nest - that is what content addressing means."
         ),
-        Some(_) => Ok(()),
         None => {
             // Absent means one of two things and they must not be conflated: a fresh store, or a
             // store written by a build from before this guard existed. Refusing the second would
@@ -3273,6 +3343,7 @@ fn guard_registry_identity(store: &dyn crate::store::HotStore, registry_hash: &s
                 );
             }
             store.set_meta(REGISTRY_KEY, registry_hash)?;
+            store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
             Ok(())
         }
     }
@@ -3376,6 +3447,172 @@ fn apply_row_timestamps(
 /// `pub(crate)` for `bench.rs`, whose hot-store arm is a private reimplementation of this loop and
 /// resolved nothing at all until #743 - the same "the harness measures a workload `dev` does not
 /// run" failure as #224 and #725, on the arm `bench backfill` takes when given no path flag.
+/// What a seal-direct pass decodes beyond events: top-level calls, and the `[[ipfs]]` documents rows
+/// name. Both were skipped by these paths without a word, so a calldata-only nest backfilled that way
+/// sealed nothing.
+#[derive(Clone, Copy, Default)]
+pub struct DirectExtras<'a> {
+    pub call_registry: Option<&'a crate::calldata::CallRegistry>,
+    pub ipfs: Option<&'a crate::ipfs_resolve::Gate>,
+    pub gateways: &'a [String],
+    /// Where a document's failures are counted; `None` counts into a throwaway, as a bench does.
+    pub metrics: Option<&'a crate::metrics::NestMetrics>,
+}
+
+impl DirectExtras<'_> {
+    /// Top-level calls and resolved documents for `from..=to`, merged into `rows` in canonical order.
+    async fn extend(
+        &self,
+        source: &dyn Source,
+        addresses: &[String],
+        rows: &mut Vec<crate::registry::DecodedRow>,
+        from: u64,
+        to: u64,
+        timestamps: bool,
+    ) -> Result<()> {
+        if let Some(creg) = self.call_registry {
+            rows.extend(
+                decode_top_level_calls(source, creg, addresses, from, to, timestamps).await?,
+            );
+        }
+        if let Some(gate) = self.ipfs {
+            let unobserved = crate::metrics::NestMetrics::default();
+            let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
+                gate,
+                self.gateways,
+                &crate::ipfs_resolve::Policy::default(),
+                rows,
+                timestamps,
+                self.metrics.unwrap_or(&unobserved),
+            )
+            .await;
+            if given_up > 0 {
+                tracing::warn!(
+                    "seal-direct {from}..={to}: gave up on {given_up} ipfs document(s) after every \
+                     retry; they are absent from the sealed segment"
+                );
+            }
+            rows.extend(docs);
+        }
+        rows.sort_by_key(|r| (r.block_number, r.log_index));
+        Ok(())
+    }
+}
+
+/// Top-level calls to this nest's contracts in `from..=to` (RFC-0038 §5): transactions sent directly to
+/// them, which is what a subgraph's `callHandlers` fire on. Unlike the internal call tree this needs no
+/// node, since a transaction is in the block body ordinary RPC serves. The tip path and the seal-direct
+/// paths both decode through here, so a segment is the same whichever path wrote it.
+///
+/// Bounded by the nest's own contracts before decode, so a busy chain costs this nest nothing it did
+/// not ask for.
+async fn decode_top_level_calls(
+    source: &dyn Source,
+    creg: &crate::calldata::CallRegistry,
+    addresses: &[String],
+    from: u64,
+    to: u64,
+    timestamps: bool,
+) -> Result<Vec<crate::registry::DecodedRow>> {
+    let mut call_rows = Vec::new();
+    let want: Vec<u64> = (from..=to).collect();
+    // Fetched and decoded a chunk at a time. Every full body of a 20,000-block Gnosis window held at
+    // once reached 2.3 GB with nothing committed (measured 2026-09-13), past the per-cursor budget.
+    for chunk in want.chunks(TOP_LEVEL_BODY_CHUNK) {
+        let bodies = retry_transient(
+            &format!("block bodies for {} block(s)", chunk.len()),
+            BACKFILL_RETRY_BASE,
+            || async { source.block_bodies(chunk).await },
+        )
+        .await?;
+        decode_bodies(creg, addresses, chunk, &bodies, timestamps, &mut call_rows)?;
+    }
+    Ok(call_rows)
+}
+
+/// Blocks of full bodies held at once while decoding top-level calls.
+const TOP_LEVEL_BODY_CHUNK: usize = 200;
+
+fn decode_bodies(
+    creg: &crate::calldata::CallRegistry,
+    addresses: &[String],
+    want: &[u64],
+    bodies: &std::collections::HashMap<u64, serde_json::Value>,
+    timestamps: bool,
+    call_rows: &mut Vec<crate::registry::DecodedRow>,
+) -> Result<()> {
+    for b in want {
+        let Some(body) = bodies.get(b) else { continue };
+        let bhash = body
+            .get("hash")
+            .and_then(|h| h.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // The body already carries the header, so the timestamp comes from it rather than from a
+        // second fetch - and it covers blocks that emitted no matching log at all, which is most.
+        let ts = body
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        let txs = body.get("transactions").and_then(|t| t.as_array());
+        for tx in txs.into_iter().flatten() {
+            // `to` is absent for a contract creation, which is not a call to anything we index.
+            let Some(to_addr) = tx.get("to").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let lower = to_addr.to_ascii_lowercase();
+            let Ok(addr) = lower.parse::<alloy_primitives::Address>() else {
+                continue;
+            };
+            // `addresses` is the getLogs filter and holds only contracts with events, so a
+            // calldata-only contract has to be admitted by the call registry itself.
+            if !creg.declares(addr) && !addresses.iter().any(|a| a.eq_ignore_ascii_case(&lower)) {
+                continue;
+            }
+            let input = hex::decode(
+                tx.get("input")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("0x")
+                    .trim_start_matches("0x"),
+            )
+            .unwrap_or_default();
+            let idx = tx
+                .get("transactionIndex")
+                .and_then(|i| i.as_str())
+                .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            let Some(tx_from) = tx
+                .get("from")
+                .and_then(|f| f.as_str())
+                .and_then(|f| f.parse::<alloy_primitives::Address>().ok())
+            else {
+                anyhow::bail!(
+                    "block {b}: a transaction to {lower} carries no readable `from`. Every call row \
+                     records its sender, and inventing one would be worse than stopping."
+                );
+            };
+            let ctx = crate::calldata::CallContext {
+                block_number: *b,
+                block_hash: bhash.clone(),
+                block_timestamp: ts,
+                tx_hash: tx
+                    .get("hash")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                tx_from,
+                // The reserved band is applied here rather than at storage, so the row's own
+                // `log_index` is the key it lands under - one number, one meaning.
+                call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
+                timestamps,
+            };
+            call_rows.extend(creg.decode_call(addr, &input, &ctx));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_calls_for_window(
     source: &dyn Source,
@@ -4055,10 +4292,51 @@ pub async fn backfill_direct_pipelined(
     from: u64,
     to: u64,
     window: u64,
+    seal_span: u64,
+    concurrency: usize,
+    on_seal: impl FnMut(u64) -> Result<()>,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> Result<u64> {
+    backfill_direct_pipelined_with(
+        source,
+        registry,
+        dir,
+        addresses,
+        topic0s,
+        calls,
+        state_rpc,
+        chain_id,
+        from,
+        to,
+        window,
+        seal_span,
+        concurrency,
+        DirectExtras::default(),
+        on_seal,
+        on_progress,
+    )
+    .await
+}
+
+/// [`backfill_direct_pipelined`], also decoding what `extras` declares.
+#[allow(clippy::too_many_arguments)]
+pub async fn backfill_direct_pipelined_with(
+    source: &dyn Source,
+    registry: &DecodeRegistry,
+    dir: &std::path::Path,
+    addresses: &[String],
+    topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&crate::rpc::RpcClient>,
+    chain_id: u64,
+    from: u64,
+    to: u64,
+    window: u64,
     // The chain's `seal_span` (#1199), passed to `take_sealable` so the backfill and the tip
     // path cut at the same boundaries. See `chains::Chain::seal_span`.
     seal_span: u64,
     concurrency: usize,
+    extras: DirectExtras<'_>,
     // Called after each segment seals, with the highest block now durably sealed - the caller
     // persists it as a resume watermark so a mid-backfill failure resumes here instead of restarting
     // from `from` (which would re-fetch, and on an adaptive path re-seal, already-sealed ranges).
@@ -4220,6 +4498,16 @@ pub async fn backfill_direct_pipelined(
                 rows.extend(call_rows);
                 rows.sort_by_key(|r| (r.block_number, r.log_index));
             }
+            extras
+                .extend(
+                    source,
+                    addresses,
+                    &mut rows,
+                    fetch_from,
+                    w_to,
+                    registry.timestamps(),
+                )
+                .await?;
             // Carry each row's block so the consumer can seal on a data-determined boundary
             // (RFC-0028 §4) instead of at whichever window filled the buffer.
             let mut json: Vec<SealRow> = rows
@@ -4339,10 +4627,53 @@ pub async fn backfill_direct_factory(
     from: u64,
     to: u64,
     window: u64,
+    seal_span: u64,
+    force_topic0: bool,
+    on_seal: impl FnMut(u64) -> Result<()>,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> Result<u64> {
+    backfill_direct_factory_with(
+        source,
+        registry,
+        factory,
+        children,
+        dir,
+        topic0s,
+        calls,
+        state_rpc,
+        chain_id,
+        from,
+        to,
+        window,
+        seal_span,
+        force_topic0,
+        DirectExtras::default(),
+        on_seal,
+        on_progress,
+    )
+    .await
+}
+
+/// [`backfill_direct_factory`], also decoding what `extras` declares.
+#[allow(clippy::too_many_arguments)]
+pub async fn backfill_direct_factory_with(
+    source: &dyn Source,
+    registry: &DecodeRegistry,
+    factory: &FactorySet,
+    children: &mut ChildRegistry,
+    dir: &std::path::Path,
+    topic0s: &[String],
+    calls: &[crate::calls::CallDecl],
+    state_rpc: Option<&crate::rpc::RpcClient>,
+    chain_id: u64,
+    from: u64,
+    to: u64,
+    window: u64,
     // The chain's `seal_span` (#1199), passed to `take_sealable` so the backfill and the tip
     // path cut at the same boundaries. See `chains::Chain::seal_span`.
     seal_span: u64,
     force_topic0: bool,
+    extras: DirectExtras<'_>,
     // Resume watermark callback - see [`backfill_direct_pipelined`]. The factory path uses an adaptive
     // window (non-deterministic boundaries), so resuming from the last sealed block instead of `from`
     // is what prevents a re-run from re-sealing overlapping ranges under new hashes (duplicate data).
@@ -4559,6 +4890,16 @@ pub async fn backfill_direct_factory(
             rows.extend(call_rows);
             rows.sort_by_key(|r| (r.block_number, r.log_index));
         }
+        extras
+            .extend(
+                source,
+                &base,
+                &mut rows,
+                fetch_from,
+                chunk_to,
+                registry.timestamps(),
+            )
+            .await?;
         let row_count = merge_window_rows(
             &mut buf,
             fetch_from,
@@ -4682,8 +5023,11 @@ pub struct NestIngest {
     /// `None`. Used only by [`prepare`]'s cold-start origin computation.
     start_block: Option<u64>,
     /// RFC-0037: declared IPFS resolutions, in config order - which fixes each row's slot in the
-    /// reserved band and therefore its key.
-    ipfs: Vec<crate::ipfs::IpfsDecl>,
+    /// reserved band and therefore its key. `None` for a nest that declares none.
+    ipfs_gate: Option<Arc<crate::ipfs_resolve::Gate>>,
+    /// The out-of-band resolver for those declarations, started by [`NestIngest::prepare`]. Dropped
+    /// with the nest, which aborts it and releases its handle on the store.
+    ipfs_resolver: Option<crate::ipfs_resolve::Running>,
     /// The gateways (or local node) declared resolutions are fetched through. Never part of the
     /// nest's identity: a gateway is an access path, and content addressing is what makes two
     /// operators' answers comparable regardless of which one they used.
@@ -4819,6 +5163,16 @@ impl NestIngest {
                 // the child-event bulk is inherently ordered until the step-5 topic0-flip makes filters
                 // version-independent, so pipelining below the flip buys little (RFC-0009 §3 risk note). A
                 // static nest uses the pipelined path as before.
+                let extras = DirectExtras {
+                    call_registry: if self.top_level_calls {
+                        self.call_registry.as_deref()
+                    } else {
+                        None
+                    },
+                    ipfs: self.ipfs_gate.as_deref(),
+                    gateways: &self.ipfs_gateways,
+                    metrics: Some(&self.metrics),
+                };
                 let sealed = if let Some(fs) = self.factory.as_deref() {
                     if concurrency > 1 {
                         tracing::info!(
@@ -4828,7 +5182,7 @@ impl NestIngest {
                     tracing::info!(
                         "seal-direct factory backfill: {resume_from}..={finalized_through} (tip {tip}, sequential two-pass)…"
                     );
-                    backfill_direct_factory(
+                    backfill_direct_factory_with(
                         source,
                         &self.registry,
                         fs,
@@ -4843,6 +5197,7 @@ impl NestIngest {
                         window,
                         self.seal_span,
                         fs.force_topic0(),
+                        extras,
                         on_seal,
                         |blk, n, window| {
                             note_seal_direct_progress(&metrics, blk, window);
@@ -4854,7 +5209,7 @@ impl NestIngest {
                     tracing::info!(
                         "seal-direct backfill: {resume_from}..={finalized_through} (tip {tip}, {concurrency}-way)…"
                     );
-                    backfill_direct_pipelined(
+                    backfill_direct_pipelined_with(
                         source,
                         &self.registry,
                         &self.dir,
@@ -4868,6 +5223,7 @@ impl NestIngest {
                         window,
                         self.seal_span,
                         concurrency,
+                        extras,
                         on_seal,
                         |blk, n, window| {
                             note_seal_direct_progress(&metrics, blk, window);
@@ -4932,7 +5288,28 @@ impl NestIngest {
                 start
             }
         };
+        self.start_ipfs_resolver();
         Ok(next)
+    }
+
+    /// Start resolving this nest's `[[ipfs]]` documents out of band, once.
+    fn start_ipfs_resolver(&mut self) {
+        if self.ipfs_resolver.is_some() {
+            return;
+        }
+        let Some(gate) = self.ipfs_gate.clone() else {
+            return;
+        };
+        self.ipfs_resolver = Some(crate::ipfs_resolve::spawn(
+            crate::ipfs_resolve::Resolver::new(
+                self.store.clone(),
+                gate,
+                self.ipfs_gateways.clone(),
+                self.registry.timestamps(),
+                self.metrics.clone(),
+                crate::ipfs_resolve::Policy::default(),
+            ),
+        ));
     }
 
     /// Does this log belong to this nest? Two demux modes, mirroring the two nest kinds:
@@ -5421,89 +5798,20 @@ impl NestIngest {
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
-        // RFC-0038 §5: decode **top-level calls** - transactions sent directly to this nest's
-        // contracts. This is what a subgraph's `callHandlers` fire on, and unlike the internal call
-        // tree it needs no node: a transaction is in the block body that ordinary RPC already serves.
-        //
-        // Bounded by the nest's own addresses before decode, so a busy chain costs this nest nothing
-        // it did not ask for.
         // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
         // oracle's CIDs arrive as calldata, not as logs.
         let mut call_rows: Vec<crate::registry::DecodedRow> = Vec::new();
         if self.top_level_calls {
             if let Some(creg) = self.call_registry.clone() {
-                let want: Vec<u64> = (next..=to).collect();
-                let bodies = retry_transient(
-                    &format!("block bodies for {} block(s)", want.len()),
-                    BACKFILL_RETRY_BASE,
-                    || async { source.block_bodies(&want).await },
+                call_rows = decode_top_level_calls(
+                    source,
+                    &creg,
+                    &self.addresses,
+                    next,
+                    to,
+                    self.registry.timestamps(),
                 )
                 .await?;
-                for b in &want {
-                    let Some(body) = bodies.get(b) else { continue };
-                    let bhash = body
-                        .get("hash")
-                        .and_then(|h| h.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    // The body already carries the header, so the timestamp comes from it rather
-                    // than from a second fetch - and unlike the `timestamps` map it covers blocks
-                    // that emitted no matching log at all, which is most of them.
-                    let ts = body
-                        .get("timestamp")
-                        .and_then(|t| t.as_str())
-                        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
-                        .unwrap_or(0);
-                    let txs = body.get("transactions").and_then(|t| t.as_array());
-                    for tx in txs.into_iter().flatten() {
-                        // `to` is absent for a contract creation, which is not a call to anything we
-                        // index.
-                        let Some(to_addr) = tx.get("to").and_then(|t| t.as_str()) else {
-                            continue;
-                        };
-                        let lower = to_addr.to_ascii_lowercase();
-                        let Ok(addr) = lower.parse::<alloy_primitives::Address>() else {
-                            continue;
-                        };
-                        // `addresses` is the getLogs filter and holds only contracts with events, so a
-                        // calldata-only contract has to be admitted by the call registry itself.
-                        if !creg.declares(addr)
-                            && !self
-                                .addresses
-                                .iter()
-                                .any(|a| a.eq_ignore_ascii_case(&lower))
-                        {
-                            continue;
-                        }
-                        let input = hex::decode(
-                            tx.get("input")
-                                .and_then(|i| i.as_str())
-                                .unwrap_or("0x")
-                                .trim_start_matches("0x"),
-                        )
-                        .unwrap_or_default();
-                        let idx = tx
-                            .get("transactionIndex")
-                            .and_then(|i| i.as_str())
-                            .and_then(|i| u64::from_str_radix(i.trim_start_matches("0x"), 16).ok())
-                            .unwrap_or(0);
-                        let ctx = crate::calldata::CallContext {
-                            block_number: *b,
-                            block_hash: bhash.clone(),
-                            block_timestamp: ts,
-                            tx_hash: tx
-                                .get("hash")
-                                .and_then(|h| h.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            // The reserved band is applied here rather than at storage, so the row's
-                            // own `log_index` is the key it lands under - one number, one meaning.
-                            call_index: crate::registry::TX_CALL_ROW_LOG_INDEX_BASE + idx,
-                            timestamps: self.registry.timestamps(),
-                        };
-                        call_rows.extend(creg.decode_call(addr, &input, &ctx));
-                    }
-                }
             }
         }
         for row in &call_rows {
@@ -5514,133 +5822,18 @@ impl NestIngest {
             stored += 1;
         }
 
-        // RFC-0037: resolve the IPFS documents this window's rows point at.
-        //
-        // Deduped by CID before any fetch, because a CID *is* a content address: a thousand rows
-        // naming the same document are one fetch and one row. Every body is verified against its CID
-        // before it is stored (`crate::cid`), so a gateway answering HTTP 200 with prose - which they
-        // really do - cannot become a nest's data.
-        //
-        // Bounded, and failure is absence rather than error: an unresolved document simply has no
-        // row, which is what the `LEFT JOIN` shape expects. Tip-following must never wait on a
-        // gateway indefinitely.
-        if !self.ipfs.is_empty() {
-            const MAX_FETCHES_PER_WINDOW: usize = 64;
-            let mut budget = MAX_FETCHES_PER_WINDOW;
-            let mut per_block: std::collections::BTreeMap<u64, Vec<(usize, String)>> =
-                std::collections::BTreeMap::new();
-            let mut unreadable = 0usize;
-            for (i, d) in self.ipfs.iter().enumerate() {
-                let col = d.column();
-                let mut seen = std::collections::HashSet::new();
-                let mut src: Vec<&crate::registry::DecodedRow> = rows
-                    .iter()
-                    .chain(&call_rows)
-                    .filter(|r| r.table == d.on)
-                    .collect();
-                src.sort_by_key(|r| (r.block_number, r.log_index));
-                for r in src {
-                    // A row without the column resolves nothing, exactly like one naming no CID, and
-                    // neither used to leave a trace.
-                    let Some(value) = r.params.iter().find(|(k, _)| k == col).map(|(_, v)| v)
-                    else {
-                        unreadable += 1;
-                        continue;
-                    };
-                    // A bare CID, an `ipfs://` URI, a full gateway URL, a raw 32-byte digest, or JSON
-                    // naming one. Only the content address is kept: the value comes from a log or a
-                    // transaction, so fetching the host it names would let its author choose what
-                    // this process connects to.
-                    let (cids, missed) = d.cids_in(value);
-                    unreadable += missed;
-                    for cid in cids {
-                        if seen.insert(cid.clone()) {
-                            per_block.entry(r.block_number).or_default().push((i, cid));
-                        }
-                    }
-                }
-            }
+        // RFC-0037 §3: the documents these rows name are fetched out of band (`ipfs_resolve`), never
+        // here, and sealing below waits for them. What the tip path still owns is saying so when a row
+        // names nothing that could be resolved.
+        if let Some(gate) = &self.ipfs_gate {
+            let named: Vec<&crate::registry::DecodedRow> = rows.iter().chain(&call_rows).collect();
+            let unreadable = crate::ipfs_resolve::unreadable(gate.decls(), &named);
             if unreadable > 0 {
                 self.metrics.add_ipfs_unreadable(unreadable as u64);
                 tracing::warn!(
                     "ipfs: {unreadable} row(s) in {next}..={to} named no usable CID - nothing to \
                      resolve for them (nuthatch_nest_ipfs_unreadable_total)"
                 );
-            }
-            for (block, items) in per_block {
-                let hash = retry_transient(
-                    &format!("block hash for {block}"),
-                    BACKFILL_RETRY_BASE,
-                    || async { source.block_hash(block).await },
-                )
-                .await?
-                .unwrap_or_default();
-                let ctx = crate::ipfs::BlockCtx {
-                    number: block,
-                    hash: &hash,
-                    timestamp: timestamps.get(&block).copied().unwrap_or(0),
-                    timestamps: self.registry.timestamps(),
-                };
-                for (slot, (i, cid)) in items.into_iter().enumerate() {
-                    if budget == 0 {
-                        tracing::warn!(
-                            "ipfs: window {next}..={to} hit the {MAX_FETCHES_PER_WINDOW}-fetch \
-                             budget; the remaining documents stay unresolved and will be retried \
-                             when a resolver runs out of band (RFC-0037)"
-                        );
-                        break;
-                    }
-                    budget -= 1;
-                    match crate::subgraph_import::fetch_ipfs_proven(
-                        &cid,
-                        &self.ipfs_gateways,
-                        crate::subgraph_import::Origin::Manifest,
-                    )
-                    .await
-                    {
-                        Ok(crate::subgraph_import::Fetched {
-                            body: content,
-                            proof: crate::subgraph_import::Proof::Verified,
-                        }) => {
-                            // Only a proven document becomes a row, so every row written from here on
-                            // says `verified = true`; rows older builds stored UNVERIFIED keep `false`.
-                            let row = crate::ipfs::to_row(
-                                &self.ipfs[i].name,
-                                &cid,
-                                &content,
-                                true,
-                                slot,
-                                &ctx,
-                            );
-                            to_store.push((
-                                Store::entity_key(row.block_number, row.log_index),
-                                row.to_json().to_string(),
-                            ));
-                            stored += 1;
-                        }
-                        Ok(crate::subgraph_import::Fetched {
-                            proof: crate::subgraph_import::Proof::Unproven(why),
-                            ..
-                        }) => {
-                            self.metrics.add_ipfs_unverified(1);
-                            tracing::warn!(
-                                "ipfs: {cid} fetched but not proven ({why}) - no row written \
-                                 (nuthatch_nest_ipfs_unverified_total)"
-                            );
-                        }
-                        Err(e) if e.is::<crate::cid::OverCap>() => {
-                            self.metrics.add_ipfs_oversize(1);
-                            tracing::warn!(
-                                "ipfs: {cid} refused ({e:#}) - no row written \
-                                 (nuthatch_nest_ipfs_oversize_total)"
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            "ipfs: {cid} unresolved ({e:#}) - no row written, which is what a \
-                             LEFT JOIN reads as 'not yet'"
-                        ),
-                    }
-                }
             }
         }
 
@@ -5785,6 +5978,12 @@ impl NestIngest {
             Finality::Depth(_) => None,
         };
         let finalized_through = seal_ceiling(self.finality, tip, finalized_tag);
+        let Some(finalized_through) = (match &self.ipfs_gate {
+            Some(gate) => hold_for_documents(self.store.as_ref(), gate, finalized_through)?,
+            None => Some(finalized_through),
+        }) else {
+            return Ok(Some(stored));
+        };
 
         // Seal any newly-finalized range to an immutable Parquet segment, stamping the
         // discovered-child registry snapshot for a factory nest (RFC-0009 step 4).
@@ -6239,6 +6438,36 @@ fn block_number_of(json: &str) -> Option<u64> {
         serde_json::Value::String(s) => s.parse().ok(),
         _ => None,
     }
+}
+
+/// The block a finalized range may seal through while documents it names are outstanding
+/// (RFC-0037 §3): one below the lowest block holding one, `finalized_through` when none is, and `None`
+/// when that block is block 0, where "one below" does not exist and nothing may seal.
+///
+/// Read in chunks from the watermark up and stopped at the first outstanding document, which is
+/// normally near the watermark, so a long run of resolved documents above it is not reloaded per window.
+fn hold_for_documents(
+    store: &dyn crate::store::HotStore,
+    gate: &crate::ipfs_resolve::Gate,
+    finalized_through: u64,
+) -> Result<Option<u64>> {
+    const CHUNK: u64 = 256;
+    let mut lo = match store.get_meta(SEALED_THROUGH_KEY)? {
+        Some(v) => v.parse::<u64>().context("corrupt sealed_through")? + 1,
+        None => 0,
+    };
+    while lo <= finalized_through {
+        let hi = lo.saturating_add(CHUNK - 1).min(finalized_through);
+        let entities = store.entities_in_range(lo, hi)?;
+        if let Some(pending) = gate.lowest_pending(store, &entities)? {
+            return Ok(pending.checked_sub(1));
+        }
+        if hi == u64::MAX {
+            break;
+        }
+        lo = hi + 1;
+    }
+    Ok(Some(finalized_through))
 }
 
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
@@ -10811,28 +11040,34 @@ template = "pool"
         logs: Vec<crate::rpc::Log>,
     }
 
-    /// A source whose `block_hash` fails a fixed number of times before answering - a transport blip
-    /// with a known end, which is what a provider dropping a connection actually looks like.
-    struct FlakySource {
-        logs: Vec<crate::rpc::Log>,
-        fails_left: std::sync::Mutex<usize>,
-        calls: std::sync::atomic::AtomicUsize,
+    /// ABI-encode `submitQoSPayload(bytes)` around a JSON payload.
+    fn submit_calldata(payload: &str) -> String {
+        let b = payload.as_bytes();
+        let mut padded = b.to_vec();
+        padded.resize(b.len().div_ceil(32) * 32, 0);
+        format!(
+            "0x53b73447{:064x}{:064x}{}",
+            32,
+            b.len(),
+            hex::encode(padded)
+        )
     }
 
+    fn qos_post(cid: &str) -> String {
+        submit_calldata(&format!(
+            r#"{{"topic": "t", "hash": "{cid}", "timestamp": 1789313400}}"#
+        ))
+    }
+
+    /// A Gnosis source whose only transactions are DataEdge posts, as `(block, calldata)`.
+    struct PostSource(Vec<(u64, String)>);
+
     #[async_trait::async_trait]
-    impl Source for FlakySource {
+    impl Source for PostSource {
         async fn tip(&self) -> Result<u64> {
-            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+            Ok(10_000)
         }
         async fn block_hash(&self, n: u64) -> Result<Option<String>> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut left = self.fails_left.lock().unwrap();
-            if *left > 0 {
-                *left -= 1;
-                anyhow::bail!("transport error: error sending request for url (mock)");
-            }
-            // Must agree with the hash the fixture logs carry, or the window reads as a reorg and is
-            // discarded - which looks exactly like the bug under test and is not it.
             Ok(Some(format!("0x{n:064x}")))
         }
         async fn logs(
@@ -10841,57 +11076,704 @@ template = "pool"
             _from: u64,
             _to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
-            Ok(self.logs.clone())
+            Ok(Vec::new())
+        }
+        async fn block_bodies(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    let txs: Vec<serde_json::Value> = self
+                        .0
+                        .iter()
+                        .filter(|(at, _)| *at == b)
+                        .enumerate()
+                        .map(|(i, (_, input))| {
+                            serde_json::json!({
+                                "hash": format!("0x{b:032x}{i:032x}"),
+                                "from": "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce",
+                                "to": QOS_EDGE,
+                                "input": input,
+                                "transactionIndex": format!("0x{i:x}"),
+                            })
+                        })
+                        .collect();
+                    let body = serde_json::json!({
+                        "hash": format!("0x{b:064x}"),
+                        "timestamp": "0x65000000",
+                        "transactions": txs,
+                    });
+                    (b, body)
+                })
+                .collect())
         }
     }
 
-    /// #651. A transport blip during a window must be retried, not kill the nest.
-    ///
-    /// Driven through `process_window` with a **flaky `Source`** and a healthy gateway, because the
-    /// bug was never in `retry_transient` - that helper's own unit tests all passed while a 454M-block
-    /// backfill was dying eight hours in at 87.6% on one dropped connection. The bug was a call site
-    /// that did not use it, so only a test that exercises the call site can see it.
-    ///
-    /// Proven by mutation: restore the bare `?` on the IPFS path's `block_hash` fetch and this fails,
-    /// while every other test in the suite stays green.
-    // NOT `start_paused`: this drives a real HTTP request at the stub gateway, and a paused clock
-    // auto-advances past it so the fetch never completes. Three retries at a 250ms base is ~1.75s.
-    #[tokio::test]
-    async fn a_flaky_source_mid_window_is_retried_rather_than_killing_the_nest() {
-        const DOC: &str = r#"{"n":1}"#;
-        let (gateway, handle) = stub_gateway(DOC).await;
-        let cid = crate::cid::cid_v0_for(DOC.as_bytes());
-        let dir = tempfile::tempdir().unwrap();
-
-        let flaky = Arc::new(FlakySource {
-            logs: Vec::new(),
-            fails_left: std::sync::Mutex::new(3),
-            calls: std::sync::atomic::AtomicUsize::new(0),
+    /// A gateway serving each document at its own CID over plain HTTP. The first `cut_off` requests get
+    /// half the body under the full `Content-Length` and a hang-up, which is how a gateway fails
+    /// mid-read. A CID it does not hold is a 404.
+    async fn content_gateway(
+        docs: std::collections::HashMap<String, String>,
+        cut_off: usize,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let docs = Arc::new(docs);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let docs = docs.clone();
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let Ok(len) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..len]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or_default();
+                    let cid = path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .split('?')
+                        .next()
+                        .unwrap_or_default();
+                    let reply = match docs.get(cid) {
+                        Some(body) => {
+                            let sent = if n < cut_off {
+                                &body[..body.len() / 2]
+                            } else {
+                                body.as_str()
+                            };
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sent}",
+                                body.len()
+                            )
+                        }
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string(),
+                    };
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
         });
-        let probe = flaky.clone();
+        (format!("http://{addr}/ipfs/"), requests, handle)
+    }
 
-        // No `expect` needed here - `run_ipfs_nest_with_source` unwraps the window itself, so a
-        // propagated transport error panics and fails this test, which is precisely the regression.
-        let rows = run_ipfs_nest_with_source(dir.path(), gateway, &cid, flaky).await;
-        handle.abort();
+    fn fast_policy(attempts: u32) -> crate::ipfs_resolve::Policy {
+        crate::ipfs_resolve::Policy {
+            concurrency: 8,
+            first_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(4),
+            attempts,
+            rescan_every: std::time::Duration::from_secs(600),
+            idle_poll: std::time::Duration::from_millis(1),
+        }
+    }
 
+    async fn qos_nest_with(
+        dir: &std::path::Path,
+        gateway: String,
+        posts: Vec<(u64, String)>,
+    ) -> (NestIngest, serve::AppState, Arc<dyn Source>) {
+        let mut config = Config::load(dir).unwrap();
+        config.ipfs_gateways = vec![gateway];
+        let source: Arc<dyn Source> = Arc::new(PostSource(posts));
+        let (nest, state, worker, _w) = build_nest(
+            &source,
+            dir.to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .expect("a qos nest builds");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        (nest, state, source)
+    }
+
+    /// Step a resolver until nothing is outstanding, or give up waiting. Returns what is left.
+    async fn resolve_all(resolver: &mut crate::ipfs_resolve::Resolver) -> usize {
+        let mut left = usize::MAX;
+        for _ in 0..500 {
+            left = resolver.step().await.unwrap();
+            if left == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        left
+    }
+
+    fn stored_documents(store: &dyn crate::store::HotStore, block: u64) -> Vec<serde_json::Value> {
+        store
+            .entities_in_range(block, block)
+            .unwrap()
+            .iter()
+            .map(|e| serde_json::from_str::<serde_json::Value>(e).unwrap())
+            .filter(|v| v["table"] == "qos_payload")
+            .collect()
+    }
+
+    /// A 20,000-block window fetched every full block body before decoding one, and on Gnosis that held
+    /// 2.3 GB with nothing committed. Bodies come a chunk at a time now, so memory follows the chunk and
+    /// not the window, and every call in the window is still decoded.
+    #[tokio::test]
+    async fn top_level_calls_hold_one_chunk_of_block_bodies_at_a_time() {
+        struct Widest {
+            posts: PostSource,
+            widest: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Source for Widest {
+            async fn tip(&self) -> Result<u64> {
+                self.posts.tip().await
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                self.posts.block_hash(n).await
+            }
+            async fn logs(
+                &self,
+                f: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                self.posts.logs(f, from, to).await
+            }
+            async fn block_bodies(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                self.widest
+                    .fetch_max(blocks.len(), std::sync::atomic::Ordering::SeqCst);
+                self.posts.block_bodies(blocks).await
+            }
+        }
+
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let cid = crate::cid::cid_v0_for(b"one post");
+        let source = Widest {
+            posts: PostSource(vec![(3, qos_post(&cid)), (19_876, qos_post(&cid))]),
+            widest: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let rows = decode_top_level_calls(&source, &creg, &[], 0, 19_999, true)
+            .await
+            .unwrap();
         assert_eq!(
-            rows.iter()
-                .filter(|(_, v)| v["table"] == "token_metadata")
-                .count(),
-            1,
-            "the document must still be resolved and stored after the blips, got {rows:?}"
+            source.widest.load(std::sync::atomic::Ordering::SeqCst),
+            TOP_LEVEL_BODY_CHUNK,
+            "a window must be fetched a chunk of bodies at a time"
         );
-        // The premise: the failures must actually have happened, or this passed on the happy path.
         assert_eq!(
-            *probe.fails_left.lock().unwrap(),
+            rows.iter().map(|r| r.block_number).collect::<Vec<_>>(),
+            [3, 19_876],
+            "chunking must not lose a call at either end of the window"
+        );
+    }
+
+    /// `--seal-direct` wrote finalized history without decoding top-level calls or resolving the
+    /// documents they name, so a QoS nest backfilled that way sealed nothing and said nothing.
+    #[tokio::test]
+    async fn seal_direct_seals_the_calls_and_documents_the_hot_path_would() {
+        let body = r#"{"bucket":1}"#.to_string();
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 0).await;
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        let gateways = vec![gateway];
+        let source = PostSource(vec![(4, qos_post(&cid))]);
+
+        backfill_direct_pipelined_with(
+            &source,
+            &registry,
+            dir.path(),
+            &[],
+            &[],
+            &[],
+            None,
+            100,
             0,
-            "all three transient failures must have been consumed"
+            10,
+            1_000,
+            SPAN_REAL,
+            1,
+            DirectExtras {
+                call_registry: Some(&creg),
+                ipfs: Some(&gate),
+                gateways: &gateways,
+                metrics: None,
+            },
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        let sealed = |table: &str| {
+            let schema = tables.iter().find(|t| t.table == table).unwrap();
+            crate::seal::read_table_rows(dir.path(), schema).unwrap()
+        };
+        let calls = sealed("data_edge__call_submit_qo_s_payload");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the post must be a call row in the sealed segment"
         );
         assert!(
-            probe.calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
-            "block_hash must have been retried past the failures"
+            calls[0]
+                .params
+                .iter()
+                .any(|(k, v)| k == crate::calldata::TX_FROM_COLUMN
+                    && v.to_json() == "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce"),
+            "the sealed call row must carry its sender: {:?}",
+            calls[0].params
         );
+        let docs = sealed("qos_payload");
+        assert_eq!(
+            docs.len(),
+            1,
+            "the document it names must be sealed beside it"
+        );
+        handle.abort();
+    }
+
+    /// The out-of-band resolver counted a fetched document nothing proved, and the one it gave up on;
+    /// `--seal-direct`'s inline resolver counted neither, so the two paths reported different facts
+    /// for one failure (#1375 review).
+    #[tokio::test]
+    async fn seal_direct_counts_an_unproven_document_as_the_resolver_does() {
+        // Past one default chunk the bytes come back unproven; under it every gateway is refused.
+        for len in [600 * 1024, 200 * 1024] {
+            let file: String = (0..len)
+                .map(|i| (b'a' + (i * 7 % 26) as u8) as char)
+                .collect();
+            let (cid, _) = crate::cid::dag_for_tests(file.as_bytes(), 100_000);
+            let (gateway, _requests, handle) =
+                content_gateway(std::collections::HashMap::from([(cid.clone(), file)]), 0).await;
+            let dir = qos_topic_nest("t");
+            let config = Config::load(dir.path()).unwrap();
+            let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+            let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+            let mut tables = full_schema(&registry, &config);
+            tables.extend(creg.schema(&config.extract));
+            let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+            let source = PostSource(vec![(4, qos_post(&cid))]);
+            let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true)
+                .await
+                .unwrap();
+
+            let metrics = crate::metrics::NestMetrics::default();
+            let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
+                &gate,
+                &[gateway],
+                &fast_policy(2),
+                &rows,
+                true,
+                &metrics,
+            )
+            .await;
+            assert!(docs.is_empty(), "a document nothing proved is not a row");
+            assert_eq!(given_up, 1);
+            assert_eq!(
+                metrics.ipfs_unverified(),
+                2,
+                "each fetch of a {len}-byte document nothing proved is counted, as the resolver counts it"
+            );
+            assert_eq!(metrics.ipfs_given_up(), 1);
+            handle.abort();
+        }
+    }
+
+    /// RFC-0037 §3. A window fetched at most 64 documents and never came back for the rest, which at
+    /// Gnosis's default window lost most of a backfill. Every document is resolved now, and the work
+    /// list is derived from the store rather than held by the process, so a restart between the window
+    /// and the fetch loses nothing.
+    #[tokio::test]
+    async fn every_document_a_window_names_is_resolved_across_a_restart() {
+        let docs: std::collections::HashMap<String, String> = (0..100)
+            .map(|i| {
+                let body = format!(r#"{{"bucket":{i}}}"#);
+                (crate::cid::cid_v0_for(body.as_bytes()), body)
+            })
+            .collect();
+        let posts = docs.keys().map(|cid| (4, qos_post(cid))).collect();
+        let (gateway, _requests, handle) = content_gateway(docs, 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) = qos_nest_with(dir.path(), gateway, posts).await;
+        nest.process_window(source.as_ref(), &[], 4, 4, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        let gateways = nest.ipfs_gateways.clone();
+        drop(nest);
+        drop(state);
+
+        let store: Arc<dyn crate::store::HotStore> =
+            Arc::new(Store::open(&dir.path().join(DB_FILE)).unwrap());
+        let metrics = Arc::new(crate::metrics::NestMetrics::default());
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            store.clone(),
+            gate,
+            gateways,
+            true,
+            metrics.clone(),
+            fast_policy(3),
+        );
+        assert_eq!(
+            resolve_all(&mut resolver).await,
+            0,
+            "nothing may be left outstanding"
+        );
+        assert_eq!(
+            stored_documents(store.as_ref(), 4).len(),
+            100,
+            "every document the window named, not the first 64"
+        );
+        assert_eq!(metrics.ipfs_resolved(), 100);
+        assert_eq!(metrics.ipfs_pending(), 0);
+        handle.abort();
+    }
+
+    /// RFC-0037 slice 8. A proven document lands with its typed rows in one write, and one whose content
+    /// does not fit the declaration is given up on rather than stored half typed.
+    #[tokio::test]
+    async fn a_documents_typed_rows_are_stored_with_it_or_not_at_all() {
+        let good = r#"[{"query_count":2364,"chain":"base"},{"query_count":7,"chain":"mainnet"}]"#
+            .to_string();
+        let bad = r#"[{"query_count":"many","chain":"base"}]"#.to_string();
+        let good_cid = crate::cid::cid_v0_for(good.as_bytes());
+        let bad_cid = crate::cid::cid_v0_for(bad.as_bytes());
+        let (gateway, _requests, handle) = content_gateway(
+            std::collections::HashMap::from([(good_cid.clone(), good), (bad_cid.clone(), bad)]),
+            0,
+        )
+        .await;
+        let dir = qos_typed_rows_nest();
+        let posts = vec![(4, qos_post(&good_cid)), (5, qos_post(&bad_cid))];
+        let (mut nest, state, source) = qos_nest_with(dir.path(), gateway, posts).await;
+        nest.process_window(source.as_ref(), &[], 4, 5, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        let gateways = nest.ipfs_gateways.clone();
+        drop(nest);
+        drop(state);
+
+        let store: Arc<dyn crate::store::HotStore> =
+            Arc::new(Store::open(&dir.path().join(DB_FILE)).unwrap());
+        let metrics = Arc::new(crate::metrics::NestMetrics::default());
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            store.clone(),
+            gate,
+            gateways,
+            true,
+            metrics.clone(),
+            fast_policy(3),
+        );
+        assert_eq!(
+            resolve_all(&mut resolver).await,
+            0,
+            "both documents are decided"
+        );
+
+        let rows_at = |block: u64, table: &str| -> Vec<serde_json::Value> {
+            store
+                .entities_in_range(block, block)
+                .unwrap()
+                .iter()
+                .map(|e| serde_json::from_str::<serde_json::Value>(e).unwrap())
+                .filter(|v| v["table"] == table)
+                .collect()
+        };
+        let documents = rows_at(4, "qos_payload");
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0]["content"], "",
+            "keep_content = false stores the document without its bytes"
+        );
+        let typed = rows_at(4, "qos_attempt");
+        assert_eq!(
+            typed
+                .iter()
+                .map(|r| (
+                    r["log_index"].as_u64().unwrap(),
+                    r["query_count"].as_u64().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [(626_000, 2364), (626_001, 7)]
+        );
+        assert!(
+            rows_at(5, "qos_payload").is_empty() && rows_at(5, "qos_attempt").is_empty(),
+            "a document that does not fit writes neither itself nor any row"
+        );
+        assert_eq!(metrics.ipfs_resolved(), 1);
+        assert_eq!(metrics.ipfs_rows_refused(), 1);
+        assert_eq!(
+            metrics.ipfs_given_up(),
+            1,
+            "a refused document is given up on, so its range can seal"
+        );
+        handle.abort();
+    }
+
+    /// The out-of-band resolver counted a document whose typed rows were refused, and one with no room
+    /// left in its block; `--seal-direct`'s inline resolver only gave them up, so the two paths
+    /// reported different `nuthatch_nest_ipfs_rows_refused_total` for one failure (#1375 review).
+    #[tokio::test]
+    async fn seal_direct_counts_refused_typed_rows_as_the_resolver_does() {
+        let bad = r#"[{"query_count":"many","chain":"base"}]"#.to_string();
+        let bad_cid = crate::cid::cid_v0_for(bad.as_bytes());
+        let late = r#"[{"query_count":1,"chain":"base"}]"#.to_string();
+        let late_cid = crate::cid::cid_v0_for(late.as_bytes());
+        let (gateway, _requests, handle) = content_gateway(
+            std::collections::HashMap::from([(bad_cid.clone(), bad), (late_cid.clone(), late)]),
+            0,
+        )
+        .await;
+        let dir = qos_typed_rows_nest();
+        let path = dir.path().join(crate::config::CONFIG_FILE);
+        let cfg = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            cfg.contains("max_rows = 8"),
+            "premise: the fixture declares max_rows"
+        );
+        std::fs::write(&path, cfg.replace("max_rows = 8", "max_rows = 100000")).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        let source = PostSource(vec![(4, qos_post(&bad_cid)), (4, qos_post(&late_cid))]);
+        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true)
+            .await
+            .unwrap();
+
+        let metrics = crate::metrics::NestMetrics::default();
+        let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
+            &gate,
+            &[gateway],
+            &fast_policy(2),
+            &rows,
+            true,
+            &metrics,
+        )
+        .await;
+        assert!(docs.is_empty(), "neither document may become rows");
+        assert_eq!(given_up, 2);
+        assert_eq!(
+            metrics.ipfs_rows_refused(),
+            2,
+            "one refused on its content and one with no room in its block, each counted as the \
+             out-of-band resolver counts them"
+        );
+        assert_eq!(metrics.ipfs_given_up(), 2);
+        handle.abort();
+    }
+
+    /// Config validation compared `[[ipfs]]` names only with each other, so an `[ipfs.rows]` table named
+    /// after the nest's own call table was accepted and the composed schema carried that table twice
+    /// (#1375 review). The nest now refuses to build, and `schema.json` refuses to be written.
+    #[tokio::test]
+    async fn a_typed_table_named_like_an_existing_table_is_refused() {
+        let dir = qos_typed_rows_nest();
+        let path = dir.path().join(crate::config::CONFIG_FILE);
+        let cfg = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            cfg.contains("table = \"qos_attempt\""),
+            "premise: the fixture names its typed table"
+        );
+        std::fs::write(
+            &path,
+            cfg.replace(
+                "table = \"qos_attempt\"",
+                "table = \"data_edge__call_submit_qo_s_payload\"",
+            ),
+        )
+        .unwrap();
+        let config =
+            Config::load(dir.path()).expect("the collision is not visible to config alone");
+        let source: Arc<dyn Source> = Arc::new(PostSource(vec![]));
+        let err = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .err()
+        .expect("a nest whose typed table collides with its call table must not build");
+        assert!(
+            format!("{err:#}").contains("`data_edge__call_submit_qo_s_payload` is declared twice"),
+            "{err:#}"
+        );
+    }
+
+    /// A gateway that hung up mid-body left its document unresolved for good: the 2026-09-07 00:10
+    /// indexer-attempt bucket was lost that way, and shifted 49 of 56 indexers' daily figures. A body
+    /// cut short is a failed fetch like any other, and is tried again.
+    #[tokio::test]
+    async fn a_document_cut_off_mid_read_is_fetched_again() {
+        let body = "x".repeat(4096);
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 1).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(4, qos_post(&cid))]).await;
+        nest.process_window(source.as_ref(), &[], 4, 4, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            nest.store.clone(),
+            nest.ipfs_gate.clone().expect("a gate"),
+            nest.ipfs_gateways.clone(),
+            true,
+            Arc::new(crate::metrics::NestMetrics::default()),
+            fast_policy(3),
+        );
+        assert_eq!(resolve_all(&mut resolver).await, 0);
+        assert!(
+            requests.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "premise: the first response was cut off, so a second must have been asked for"
+        );
+        let stored = stored_documents(nest.store.as_ref(), 4);
+        assert_eq!(
+            stored.len(),
+            1,
+            "the document must be stored once it is served whole"
+        );
+        assert_eq!(stored[0]["cid"], cid);
+        drop(resolver);
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// A range waits for the documents it names, in the window's own seal and not only in the resolver,
+    /// until each is stored or given up on. One no gateway serves is given up on after the policy's
+    /// attempts: recorded under its block and slot, counted, and no longer holding the range back.
+    #[tokio::test]
+    async fn sealing_waits_for_a_document_until_it_is_resolved_or_given_up_on() {
+        let cid = crate::cid::cid_v0_for(b"no gateway holds this");
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::new(), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(4, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        for b in [4, 5] {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        let sealed = nest
+            .store
+            .get_meta(SEALED_THROUGH_KEY)
+            .unwrap()
+            .and_then(|v| v.parse::<u64>().ok());
+        assert!(
+            sealed.is_none_or(|s| s < 4),
+            "a window sealed past an outstanding document: sealed through {sealed:?}"
+        );
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            Some(3)
+        );
+
+        let metrics = Arc::new(crate::metrics::NestMetrics::default());
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            nest.store.clone(),
+            gate.clone(),
+            nest.ipfs_gateways.clone(),
+            true,
+            metrics.clone(),
+            fast_policy(2),
+        );
+        assert_eq!(resolve_all(&mut resolver).await, 0);
+        assert_eq!(metrics.ipfs_given_up(), 1);
+        let plan = gate.plan_stored(&nest.store.entities_in_range(4, 4).unwrap());
+        assert_eq!(
+            nest.store
+                .get_meta(&crate::ipfs_resolve::gave_up_key(&plan[&4].0[0]))
+                .unwrap()
+                .as_deref(),
+            Some(cid.as_str()),
+            "giving up must be recorded, or a restart would hold the range again"
+        );
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            Some(9_000),
+            "a document given up on no longer holds its range"
+        );
+        drop(resolver);
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// The hold returned one below the lowest outstanding document, which for a document at block 0 is
+    /// block 0 itself, so its range sealed without it (#1374 review).
+    #[tokio::test]
+    async fn a_document_outstanding_at_block_zero_holds_block_zero() {
+        let cid = crate::cid::cid_v0_for(b"no gateway holds this either");
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::new(), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(0, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        for b in [0, 1] {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        assert_eq!(
+            nest.store.get_meta(SEALED_THROUGH_KEY).unwrap(),
+            None,
+            "block 0 sealed while the document it names was outstanding"
+        );
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            None
+        );
+        drop(nest);
+        drop(state);
+        handle.abort();
     }
 
     /// #653. A store must not serve rows under a registry that did not produce them.
@@ -10904,7 +11786,7 @@ template = "pool"
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
 
         // 1. Fresh store: adopts, and records what it adopted.
-        guard_registry_identity(&store, "aaaa").expect("a fresh store adopts");
+        guard_registry_identity(&store, "aaaa", "aaaa", false).expect("a fresh store adopts");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("aaaa"),
@@ -10912,11 +11794,12 @@ template = "pool"
         );
 
         // 2. Same registry: still fine.
-        guard_registry_identity(&store, "aaaa").expect("an unchanged registry must be accepted");
+        guard_registry_identity(&store, "aaaa", "aaaa", false)
+            .expect("an unchanged registry must be accepted");
 
         // 3. Different registry: refused, and the message must name both hashes - a refusal that
         //    does not say what changed sends the operator to the source to find out.
-        let err = guard_registry_identity(&store, "bbbb")
+        let err = guard_registry_identity(&store, "bbbb", "bbbb", false)
             .expect_err("a changed registry must be refused, not adopted");
         let msg = format!("{err:#}");
         assert!(msg.contains("aaaa"), "must name the stored hash: {msg}");
@@ -10934,14 +11817,140 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "12345").unwrap();
         assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
 
-        guard_registry_identity(&store, "cccc").expect("an older store must not be refused");
+        guard_registry_identity(&store, "cccc", "cccc", false)
+            .expect("an older store must not be refused");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("cccc")
         );
         // And having adopted, it is now held to it.
-        guard_registry_identity(&store, "dddd")
+        guard_registry_identity(&store, "dddd", "dddd", false)
             .expect_err("once adopted, a later change must be refused");
+    }
+
+    /// Call rows written before `tx_from` do not have it. Adopting such a store onto the new identity
+    /// would serve a column its data does not contain, so it is refused; an empty one is not.
+    #[test]
+    fn a_top_level_calls_store_from_before_the_sender_column_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta(REGISTRY_KEY, "events").unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
+        let err = guard_registry_identity(&store, "full", "events", true)
+            .expect_err("indexed call rows without a sender must not be adopted");
+        assert!(format!("{err:#}").contains("tx_from"), "{err:#}");
+
+        let empty = tempfile::tempdir().unwrap();
+        let empty = Store::open(&empty.path().join("t.redb")).unwrap();
+        empty.set_meta(REGISTRY_KEY, "events").unwrap();
+        guard_registry_identity(&empty, "full", "events", true)
+            .expect("a store that never indexed a call has nothing to re-index");
+    }
+
+    const QOS_EDGE: &str = "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f";
+    const QOS_EDGE_ABI: &str = r#"[{"type":"function","name":"submitQoSPayload","inputs":[{"name":"_payload","type":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}]"#;
+
+    /// An event-less DataEdge nest resolving one oracle topic.
+    fn qos_typed_rows_nest() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"qos-typed-rows\"\nchain = \"gnosis\"\nchain_id = 100\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"data_edge\"\naddress = \"{QOS_EDGE}\"\nabi = \"abis/data-edge.json\"\n\n\
+                 [extract]\ntop_level_calls = true\n\n\
+                 [[ipfs]]\nname = \"qos_payload\"\non = \"data_edge__call_submit_qo_s_payload\"\n\
+                 cid_column = \"_payload\"\ncid_json_path = \"hash\"\njson_match = {{ topic = \"t\" }}\n\n\
+                 [ipfs.rows]\ntable = \"qos_attempt\"\nmax_rows = 8\nkeep_content = false\n\
+                 columns = [{{ name = \"query_count\", type = \"u64\" }}, {{ name = \"chain\", type = \"string\" }}]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("abis/data-edge.json"), QOS_EDGE_ABI).unwrap();
+        dir
+    }
+
+    fn qos_topic_nest(topic: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"qos-identity\"\nchain = \"gnosis\"\nchain_id = 100\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"data_edge\"\naddress = \"{QOS_EDGE}\"\nabi = \"abis/data-edge.json\"\n\n\
+                 [extract]\ntop_level_calls = true\n\n\
+                 [[ipfs]]\nname = \"qos_payload\"\non = \"data_edge__call_submit_qo_s_payload\"\n\
+                 cid_column = \"_payload\"\ncid_json_path = \"hash\"\njson_match = {{ topic = \"{topic}\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("abis/data-edge.json"), QOS_EDGE_ABI).unwrap();
+        dir
+    }
+
+    /// The guard and provenance hashed the event registry alone, so a calldata-only nest claimed the
+    /// hash of nothing and an `[[ipfs]]` change sailed past a store indexed under the old declaration.
+    #[test]
+    fn a_calldata_only_nest_is_held_to_its_ipfs_declarations() {
+        let identity = |d: &std::path::Path| {
+            let c = Config::load(d).unwrap();
+            let r = crate::registry::from_nest(d, &c).unwrap();
+            (
+                hex::encode(crate::project::decode_identity(d, &c, &r).unwrap()),
+                hex::encode(r.hash()),
+            )
+        };
+        let indexer = qos_topic_nest("gateway_indexer_attempt_qos_5_minutes_prod_v3");
+        let query = qos_topic_nest("gateway_query_result_qos_5_minutes_prod_v3");
+        let (a, a_events) = identity(indexer.path());
+        let (b, b_events) = identity(query.path());
+
+        let nothing = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b""));
+        assert_eq!(
+            a_events, nothing,
+            "premise: the event registry of this nest is empty"
+        );
+        assert_ne!(
+            a, nothing,
+            "a calldata-only nest must not claim the hash of nothing"
+        );
+        assert_ne!(
+            a, b,
+            "a different json_match is a different decode identity"
+        );
+
+        let store = Store::open(&indexer.path().join("t.redb")).unwrap();
+        guard_registry_identity(&store, &a, &a_events, true).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
+        guard_registry_identity(&store, &b, &b_events, true)
+            .expect_err("a store indexed under one [[ipfs]] declaration must refuse another");
+    }
+
+    /// Stores written before the guard covered calls and `[[ipfs]]` recorded the event hash alone.
+    /// They adopt the full identity once; after that, the event hash matching is no longer a pass,
+    /// or adding an `[[ipfs]]` declaration to an indexed nest would be adopted silently.
+    #[test]
+    fn a_store_recorded_under_the_event_registry_alone_adopts_the_full_identity_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "100").unwrap();
+        store.set_meta(REGISTRY_KEY, "events").unwrap();
+
+        guard_registry_identity(&store, "full", "events", false)
+            .expect("a store matching the old formula adopts the new one");
+        assert_eq!(
+            store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
+            Some("full")
+        );
+
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh = Store::open(&fresh.path().join("t.redb")).unwrap();
+        guard_registry_identity(&fresh, "events", "events", false).unwrap();
+        fresh.set_meta(LAST_BLOCK_KEY, "100").unwrap();
+        guard_registry_identity(&fresh, "events+ipfs", "events", false).expect_err(
+            "a store recorded under the full formula must refuse a declaration added afterwards",
+        );
     }
 
     #[async_trait::async_trait]
@@ -12876,6 +13885,18 @@ template="pool"
             .await
             .unwrap()
             .expect("the window must commit");
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            nest.store.clone(),
+            nest.ipfs_gate
+                .clone()
+                .expect("a nest declaring [[ipfs]] has a gate"),
+            nest.ipfs_gateways.clone(),
+            nest.registry.timestamps(),
+            nest.metrics.clone(),
+            crate::ipfs_resolve::Policy::default(),
+        );
+        resolver.step().await.unwrap();
+        drop(resolver);
         drop(nest);
         drop(state);
 
@@ -13019,6 +14040,7 @@ template="pool"
                                     // A call to the contract this nest indexes: `ping()`.
                                     {
                                         "hash": "0xaa",
+                                        "from": "0x2222222222222222222222222222222222222222",
                                         "to": "0x1111111111111111111111111111111111111111",
                                         "input": "0x5c36b186",
                                         "transactionIndex": "0x0"
@@ -13160,6 +14182,7 @@ template="pool"
                 let tx = |i: u64, input: &str| {
                     serde_json::json!({
                         "hash": format!("0x{i:064x}"),
+                        "from": "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce",
                         "to": EDGE,
                         "input": input,
                         "transactionIndex": format!("0x{i:x}"),
@@ -13228,10 +14251,31 @@ template="pool"
         if let Some(w) = worker {
             w.abort();
         }
+        assert_ne!(
+            state.nest_info["registry_hash"],
+            format!("0x{}", hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b""))),
+            "provenance must carry this nest's decode identity, not the hash of its empty event registry"
+        );
         nest.process_window(source.as_ref(), &[], 4, 4, 100)
             .await
             .unwrap()
             .expect("the window must commit");
+        let mut resolver = crate::ipfs_resolve::Resolver::new(
+            nest.store.clone(),
+            nest.ipfs_gate
+                .clone()
+                .expect("a nest declaring [[ipfs]] has a gate"),
+            nest.ipfs_gateways.clone(),
+            nest.registry.timestamps(),
+            nest.metrics.clone(),
+            crate::ipfs_resolve::Policy::default(),
+        );
+        assert_eq!(
+            resolver.step().await.unwrap(),
+            2,
+            "a document nothing proved is retried, not stored and not forgotten"
+        );
+        drop(resolver);
         drop(nest);
         drop(state);
 
@@ -13249,6 +14293,12 @@ template="pool"
         assert_eq!(
             calls, 3,
             "every post is kept as a call row, resolved or not"
+        );
+        assert!(
+            rows.iter()
+                .filter(|v| v["table"] == "data_edge__call_submit_qo_s_payload")
+                .all(|v| v["tx_from"] == "0x8cbbe43f97f80efa6ba0a95f3d544e03f84db0ce"),
+            "a call row must name the publisher that sent it"
         );
         assert!(
             !rows

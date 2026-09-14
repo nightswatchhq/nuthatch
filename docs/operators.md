@@ -918,7 +918,7 @@ per-nest series below.
 |---|---|
 | `nuthatch_tip_height`, `nuthatch_last_block`, `nuthatch_tip_lag_blocks` | is it keeping up |
 | `nuthatch_sealed_through` | cold-layer watermark |
-| `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total` | ingestion |
+| `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_resolved_total`, `nuthatch_ipfs_given_up_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total`, `nuthatch_ipfs_rows_refused_total` | ingestion |
 | `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total` | serving |
 | `nuthatch_sql_memo_hits_total`, `nuthatch_sql_memo_misses_total`, `nuthatch_sql_memo_bytes` | the analytical memo (#1186): how many `/sql` answers were remembered rather than computed, and what it holds |
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
@@ -934,8 +934,12 @@ Per-nest series, labelled `{nest="…"}` - the ones that make co-tenancy operabl
 `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`,
 `nuthatch_nest_ipfs_unreadable_total` (rows an `[[ipfs]]` declaration read that named no usable CID),
+`nuthatch_nest_ipfs_pending` (documents named and neither stored nor given up on; sealing holds below
+the lowest), `nuthatch_nest_ipfs_resolved_total`, `nuthatch_nest_ipfs_given_up_total`,
 `nuthatch_nest_ipfs_unverified_total` (documents fetched that nothing proved against their CID, so no
 row), `nuthatch_nest_ipfs_oversize_total` (documents refused past the byte, block or depth cap),
+`nuthatch_nest_ipfs_rows_refused_total` (proven documents whose content did not fit their declared typed
+rows, so neither the document nor any row was written),
 `nuthatch_nest_seal_direct_fetched`,
 `nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_health` (1 indexing / 0 quarantined),
 `nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.

@@ -112,6 +112,15 @@ const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 /// The value is `hash`, or `hash\tunix_seconds` once a timestamp is known (#1289).
 const BLOCKS: TableDefinition<&str, &str> = TableDefinition::new("blocks");
 
+/// The `block_hash` a stored row JSON carries.
+pub(crate) fn row_block_hash(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get("block_hash")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// A tab cannot appear in a block hash, so a hash-only value from before #1289 still round-trips.
 pub(crate) fn encode_block_record(hash: &str, timestamp: Option<u64>) -> String {
     match timestamp {
@@ -295,6 +304,24 @@ pub trait HotStore: Send + Sync {
 
     // ---- entities ---------------------------------------------------------------------------
     fn put_entity(&self, key: &str, json: &str) -> Result<()>;
+    /// Write `json` at `key` only while `source_key` holds a row from the block `block_hash` names, as
+    /// one transaction. For a writer outside the ingest loop, so a document for a row a reorg rolled
+    /// back cannot land after the rollback. Returns whether it wrote.
+    fn put_entity_if_named(
+        &self,
+        key: &str,
+        json: &str,
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool>;
+    /// [`HotStore::put_entity_if_named`] for rows that stand or fall together: a document and the typed
+    /// rows it explodes into (RFC-0037 slice 8), so a reader never sees one without the other.
+    fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool>;
     fn get_entity(&self, key: &str) -> Result<Option<String>>;
     fn count(&self) -> Result<u64>;
     fn recent(&self, limit: usize) -> Result<Vec<String>>;
@@ -470,6 +497,22 @@ pub struct Store {
 /// Lives here rather than in `indexer` because it is a property of the store's meta table, and two
 /// spellings of one key is exactly the drift that [`recorded_registry_hash`] exists to close.
 pub const REGISTRY_KEY: &str = "registry_hash";
+/// Which formula [`REGISTRY_KEY`] was recorded under. Absent means the event registry alone; present
+/// means the full decode identity, which also covers call, `[[ipfs]]` and `[[calls]]` declarations.
+pub const IDENTITY_FORMULA_KEY: &str = "identity_formula";
+pub const IDENTITY_FORMULA: &str = "2";
+
+/// The formula this store recorded its registry hash under, read without creating anything.
+pub fn recorded_identity_formula(path: &Path) -> Result<Option<String>> {
+    let db = builder()
+        .open(path)
+        .with_context(|| format!("failed to open redb (non-creating) at {}", path.display()))?;
+    let rtx = db.begin_read()?;
+    let meta = rtx.open_table(META)?;
+    Ok(meta
+        .get(IDENTITY_FORMULA_KEY)?
+        .map(|v| v.value().to_string()))
+}
 
 /// The registry hash this store **recorded at indexing time**, read without creating anything.
 ///
@@ -739,6 +782,50 @@ impl Store {
         }
         self.commit(wtx)?;
         Ok(())
+    }
+
+    /// See [`HotStore::put_entity_if_named`].
+    pub fn put_entity_if_named(
+        &self,
+        key: &str,
+        json: &str,
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        self.put_entities_if_named(
+            &[(key.to_string(), json.to_string())],
+            source_key,
+            block_hash,
+        )
+    }
+
+    /// See [`HotStore::put_entities_if_named`].
+    pub fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
+        let named = {
+            let mut t = wtx.open_table(ENTITIES)?;
+            let named = t
+                .get(source_key)?
+                .is_some_and(|v| row_block_hash(v.value()).as_deref() == Some(block_hash));
+            if named {
+                for (key, json) in entries {
+                    t.insert(key.as_str(), json.as_str())?;
+                }
+            }
+            named
+        };
+        if named {
+            self.commit(wtx)?;
+        } else {
+            wtx.abort()?;
+        }
+        Ok(named)
     }
 
     /// Commit a whole window's writes in ONE transaction (PERF-2): every decoded row + annotation, the
@@ -1361,6 +1448,23 @@ impl HotStore for Store {
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
         Store::put_entity(self, key, json)
     }
+    fn put_entity_if_named(
+        &self,
+        key: &str,
+        json: &str,
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        Store::put_entity_if_named(self, key, json, source_key, block_hash)
+    }
+    fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        Store::put_entities_if_named(self, entries, source_key, block_hash)
+    }
     fn get_entity(&self, key: &str) -> Result<Option<String>> {
         Store::get_entity(self, key)
     }
@@ -1606,6 +1710,23 @@ fn unix_now() -> i64 {
 impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
         (**self).put_entity(key, json)
+    }
+    fn put_entity_if_named(
+        &self,
+        key: &str,
+        json: &str,
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        (**self).put_entity_if_named(key, json, source_key, block_hash)
+    }
+    fn put_entities_if_named(
+        &self,
+        entries: &[(String, String)],
+        source_key: &str,
+        block_hash: &str,
+    ) -> Result<bool> {
+        (**self).put_entities_if_named(entries, source_key, block_hash)
     }
     fn get_entity(&self, key: &str) -> Result<Option<String>> {
         (**self).get_entity(key)

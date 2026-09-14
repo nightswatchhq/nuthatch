@@ -1,13 +1,12 @@
 # RFC-0037: IPFS content resolution - a verified, content-addressed side table
 
-**Status:** **Accepted, slices 1-6 built.** Slice 6 (2026-09-13): multi-block documents are verified,
+**Status:** **Accepted, slices 1-7 built.** Slice 7 (2026-09-13): multi-block documents are verified,
 by re-encoding in Kubo's default layout or from their blocks, and an unproven document writes no row;
-see §5. Slice 5 (2026-09-13): a CID inside JSON, from an event
+see §5. Slice 6 (2026-09-13): resolution completes out of band, with retry, a recorded give-up and a
+seal hold; see §5. Slice 5 (2026-09-13): a CID inside JSON, from an event
 column or a top-level call's calldata, with a topic filter; see §5. Slices 1-4 (2026-08-19). Slice 1 (verification) and slices 2-3
 (declared resolution) shipped in PR #645; slice 4 is `--ipfs`, which takes a local node URL as readily
-as a gateway, so an operator can already take every third party out of the path. **One limit stands:**
-resolution runs inline under a 64-fetch-per-window budget rather than out of band behind the cursor as
-§3 asks - that wants a queue and a worker and is the remaining work. Depends on 0001 (decode registry and vendored ABIs),
+as a gateway, so an operator can already take every third party out of the path. Depends on 0001 (decode registry and vendored ABIs),
 0023 §3 (the pinned-call cache whose machinery this reuses rather than duplicates), 0013 §3 (sealed
 segments the resolved documents spill into). Adjacent: 0024 (the sibling "irreducible residue" engine).
 Corrects an implication in `src/subgraph_import.rs`. Blocks: subgraph ports whose entities are
@@ -164,11 +163,48 @@ alone, which for an event-less nest is the hash of nothing.
 
 Two limits were named rather than fixed. A document over 256 KiB was stored `verified = false`,
 because a multi-block UnixFS root could not be re-derived from its bytes; the oracle's payloads are 0.6
-to 1.9 MB, so every one of them was in that case. Slice 6 closes that. And a CID that misses the
+to 1.9 MB, so every one of them was in that case. Slice 7 closes that. And a CID that misses the
 per-window budget, or whose gateways all fail, is never attempted again: the out-of-band resolver the
-budget warning refers to does not exist yet.
+budget warning refers to does not exist yet. Slice 6 builds it.
 
-**Slice 6 - multi-block documents are verified, and an unproven one writes no row.** Slice 5's live run
+**Slice 6 - resolution completes.** Built 2026-09-13, unreleased. The per-window budget is gone.
+Documents resolve out of band behind the cursor (`src/ipfs_resolve.rs`), from a work list re-derived
+from the rows already in the hot store: a document's key is a function of its block's rows alone, so
+nothing extra is recorded and a restart loses nothing. A failed fetch, a body cut off mid-read
+included, retries with doubling backoff from 5 seconds to 10 minutes. After 10 failures the document
+is given up on, recorded in store meta under its block and slot with its CID, and counted in
+`nuthatch_nest_ipfs_given_up_total`. Sealing holds below the lowest block with a document neither
+stored nor given up on, so a range never seals short of one that could still arrive, and
+tip-following never waits on a gateway. A document is written only while the row that named it still
+carries the same block hash, in one transaction, so a reorg cannot be followed by a stale document.
+Slots are assigned per block rather than per fetch window, which removes a dependence on `--window`
+from sealed segments.
+
+With it: top-level call rows carry `tx_from`, the transaction sender, and a top-level-calls nest
+indexed before this refuses to start and must be re-indexed. The identity guard and `/sql` provenance
+cover call, `[[ipfs]]` and `[[calls]]` declarations, so an event-less nest no longer claims the hash of
+nothing. `--seal-direct` decodes top-level calls and resolves their documents inline. Block bodies are
+fetched 200 blocks at a time, because a whole 20,000-block Gnosis window of them held 2.3 GB with
+nothing committed.
+
+Measured against Gnosis on 2026-09-13, with the QoS nest's configuration minus `blocks = true` and
+default windows, from block 48,119,000: 678 calls from the one publisher and 678 documents; 2026-09-07
+complete at 288 per topic, 576 of 576, including `QmYTFzn…`, the bucket the budget had lost; killed
+with `kill -9` at 120 resolved and 558 pending, restarted, and finished 2 minutes 59 seconds later
+with nothing lost, given up or unreadable. The first 20,000-block window took about four and a half
+minutes, because bodies come serially at 2.5 to 3.6 seconds per 200-block batch on public RPC. All 678
+were stored `verified = false`, because slice 7 was not yet in that build.
+
+**One limit found and not fixed.** Once the hold released a finalized range holding those 678
+documents, about 1.1 GB of JSON, sealing it reached 3.17 GB of resident memory, past the per-cursor
+budget. Seal cuts are bounded by row count and span, never bytes (`seal_cut`), and `maybe_seal` and
+`seal_range_with_snapshot` hold the whole range at once, parsed. A byte bound on the cut would be
+deterministic, being a property of the rows, but it changes RFC-0028 §4's cut rule, and that is a
+decision to make before building it. Until then a nest whose documents run to megabytes is not fit to
+deploy. The same run did not stop on SIGTERM for 26 seconds and needed `kill -9`; synchronous seal
+work giving an abort nothing to act on is the likely cause, and it is not established.
+
+**Slice 7 - multi-block documents are verified, and an unproven one writes no row.** Slice 5's live run
 verified 0 of 36 oracle payloads. Two ways now prove a file past 256 KiB:
 
 - **Re-encoding in Kubo's default layout.** The bytes are cut into 256 KiB leaves (dag-pb, or raw under
@@ -194,15 +230,74 @@ that works everywhere, and the CAR the fallback where a gateway offers one.
 Verified live on 2026-09-13 by re-running slice 5's scratch nest from block 48,231,452 to the tip at
 48,232,905: 50 documents resolved, 50 verified (25 per topic, 52.0 MB), 0 unverified, 0 oversize. The
 36 inside slice 5's range are the same 36 it had stored unverified. Re-encoding costs no request, so
-the per-window fetch budget is unchanged for documents in the default layout; the CAR costs one more
-request per offering gateway, and only for a document re-encoding cannot prove.
+a document in the default layout still costs one fetch; the CAR costs one more request per offering
+gateway, and only for a document re-encoding cannot prove.
 
-**Policy.** A nest's resolver stores only proven documents. An unproven one writes no row and counts in
-`nuthatch_nest_ipfs_unverified_total`, which is §2's rule: unverified IPFS is an HTTP enricher and does
+**Policy.** A nest's resolver stores only proven documents. An unproven fetch writes no row, counts in
+`nuthatch_nest_ipfs_unverified_total` and is retried on slice 6's policy, since a gateway that serves
+the blocks may answer later; a document over a cap is given up on at once, being the same size from
+every gateway. That is §2's rule: unverified IPFS is an HTTP enricher and does
 not feed canonical state. The `verified` column stays, so no schema or identity changes; it is `true`
 on every row written from this build on, rows older builds stored as `false` keep that value, and a
 re-index either proves them or leaves them out. `init` still accepts an unproven manifest or ABI,
 loudly, as slice 1 decided.
+
+**Slice 8 - typed rows from a proven document.** Built 2026-09-13, unreleased. The QoS nest's daily
+rollups parsed each indexer-attempt document (1.7 to 1.9 MB of JSON, about 2,500 elements) with
+`from_json` and `unnest` at query time. One day of `qos_indexer_daily` measured 3.86 GB at peak, and
+`nuthatch serve` refused the views at its 2 GiB ceiling. A document can now be exploded once, at
+resolution, into a table of typed rows that views and sealed segments read as columns:
+
+```toml
+[[ipfs]]
+name = "qos_indexer_payload"
+on = "data_edge__call_submit_qo_s_payload"
+cid_column = "_payload"
+cid_json_path = "hash"
+json_match = { topic = "gateway_indexer_attempt_qos_5_minutes_prod_v3" }
+
+[ipfs.rows]
+table = "qos_indexer_attempt"
+max_rows = 4096
+keep_content = false
+columns = [
+  { name = "indexer_wallet", type = "address" },
+  { name = "start_epoch", type = "u64" },
+  { name = "query_count", type = "number" },
+]
+```
+
+- **One row per element.** An array is its elements, an object is one. Each row carries `cid`,
+  `document_log_index`, `source_log_index` (the row that named the document) and `element`, then the
+  declared columns, named for their top-level keys. Undeclared keys are not stored.
+- **Types.** `string`, `u64`, `i64`, `bool`, `address` (stored in one spelling) and `number`, which
+  keeps a JSON number as its decimal text so no float or rounding is chosen at ingest; a view casts it.
+  An absent or null `string` or `number` is empty text, which a view reads as NULL. The other types
+  have no honest empty value, so their absence refuses the document.
+- **Refused whole.** A document with more elements than `max_rows`, or an element that does not fit
+  its column, writes no document row and no typed rows, is given up on as slice 6 records it, and counts
+  in `nuthatch_nest_ipfs_rows_refused_total`. Rows from part of a document would roll up as though the
+  rest had never been served. The refusal follows from the bytes alone, so every operator refuses the
+  same document.
+- **Keys follow the plan.** With typed rows declared, a block's documents take `625_000..=625_999`
+  and their rows `626_000..=749_999`. Each document is allotted its declaration's `max_rows` in slot
+  order, whether or not the documents before it resolve, so a row's key never depends on which gateway
+  answered first. A document whose allotment would run past the band is refused before any fetch.
+- **Written together.** The document row and its typed rows land in one transaction, still conditional
+  on the naming row's block hash (`put_entities_if_named`), so no reader sees a document without its
+  rows and a reorg cannot be followed by either.
+- **Identity.** `rows` enters the declaration hash only when present, length-prefixed like slice 5's
+  keys, so every nest declared before it keeps its address.
+- **`keep_content = false`** stores the document row with empty `content`. The CID still names the
+  bytes the rows came from; re-fetching and re-verifying them is always possible.
+
+**Why the rollups are views and not entities.** RFC-0041 entities bind against the decoded event
+registry (`Binding::bind` reads `registry.schema()`), which holds no call or `[[ipfs]]` tables, and
+their circuits are fed from the ingest path, while resolved documents and their rows are written out of
+band by the resolver. Making an entity over typed rows means binding to the full table set and feeding
+the circuit from the resolver's writes, with reorg retractions for rows that arrive after their block
+was admitted. That is not a small change and is not in this slice. Views over typed columns are, and
+the serving measurements below are what decides whether they are enough.
 
 ## 6. Non-goals
 

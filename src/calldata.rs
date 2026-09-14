@@ -171,6 +171,17 @@ impl CallRegistry {
             }
             register_functions(&mut by_selector, alias, *address, abi, &allow);
         }
+        if let Some(d) = by_selector
+            .values()
+            .flatten()
+            .find(|d| d.columns.iter().any(|c| c.name == TX_FROM_COLUMN))
+        {
+            return Err(anyhow!(
+                "`{}` has an argument named `{TX_FROM_COLUMN}`, which every call table already \
+                 carries as the transaction sender. Two columns of one name cannot both be stored.",
+                d.signature
+            ));
+        }
         let hash = registry_hash(&by_selector);
         Ok(CallRegistry {
             by_selector,
@@ -287,6 +298,7 @@ impl CallRegistry {
                     indexed: false,
                     components: c.components.clone(),
                 }));
+                columns.push(tx_from_column());
                 TableSchema {
                     table: d.table.clone(),
                     alias: d.alias.clone(),
@@ -312,12 +324,30 @@ impl CallRegistry {
     }
 }
 
+/// The implicit column carrying a call row's transaction sender.
+pub const TX_FROM_COLUMN: &str = "tx_from";
+
+fn tx_from_column() -> ColumnSchema {
+    ColumnSchema {
+        name: TX_FROM_COLUMN.into(),
+        // Not "implicit": the sender travels as a param, and a row rebuilt from storage keeps only the
+        // columns that are not implicit.
+        sol_type: "address".into(),
+        storage: "address".into(),
+        indexed: false,
+        components: Vec::new(),
+    }
+}
+
 /// Context every call row shares - the block/transaction it belongs to.
 pub struct CallContext {
     pub block_number: u64,
     pub block_hash: String,
     pub block_timestamp: u64,
     pub tx_hash: String,
+    /// The transaction's sender. A DataEdge accepts posts from anyone, so without it a nest cannot tell
+    /// the publisher's rows from a stranger's.
+    pub tx_from: Address,
     /// Position of this call in a deterministic depth-first walk of the block's call tree. Plays the
     /// part `log_index` plays for events: a stable per-block ordinal that makes the row addressable
     /// and re-executable.
@@ -335,7 +365,11 @@ pub struct CallContext {
 }
 
 impl CallContext {
-    fn row(&self, table: String, params: Vec<(String, Value)>, to: Address) -> DecodedRow {
+    fn row(&self, table: String, mut params: Vec<(String, Value)>, to: Address) -> DecodedRow {
+        params.push((
+            TX_FROM_COLUMN.to_string(),
+            Value::Address(self.tx_from.into_array()),
+        ));
         DecodedRow {
             table,
             params,
@@ -421,6 +455,8 @@ fn registry_hash(by_selector: &HashMap<[u8; 4], Vec<CallDecoder>>) -> [u8; 32] {
             )
         })
         .collect();
+    // The sender column changed every call table's shape, so it has to change the identity too.
+    lines.push(format!("implicit|{TX_FROM_COLUMN}"));
     lines.sort();
     let mut h = Sha256::new();
     for l in &lines {
@@ -446,6 +482,7 @@ fn raw_calls_schema(timestamps: bool) -> TableSchema {
         indexed: false,
         components: Vec::new(),
     });
+    columns.push(tx_from_column());
     TableSchema {
         table: RAW_CALLS_TABLE.into(),
         alias: String::new(),
@@ -519,8 +556,74 @@ mod tests {
             block_timestamp: 1_700_000_000,
             timestamps: true,
             tx_hash: "0xtt".into(),
+            tx_from: addr(7),
             call_index: 3,
         }
+    }
+
+    /// The sender is on every call row, decoded or raw, and the schema says so. A DataEdge takes posts
+    /// from anyone; without this a nest cannot keep the publisher apart from whoever else writes to it.
+    #[test]
+    fn every_call_row_names_its_sender_and_the_schema_declares_it() {
+        let r = reg(ERC20, &Extract::default());
+        let sender = (
+            TX_FROM_COLUMN.to_string(),
+            Value::Address(addr(7).into_array()),
+        );
+        let decoded = r
+            .decode_call(addr(1), &transfer_calldata(addr(9), 1), &ctx())
+            .expect("a row");
+        assert_eq!(decoded.params.last(), Some(&sender));
+        let raw = r
+            .decode_call(addr(1), &[0xde, 0xad, 0xbe, 0xef], &ctx())
+            .expect("a raw row");
+        assert_eq!(raw.table, RAW_CALLS_TABLE);
+        assert_eq!(raw.params.last(), Some(&sender));
+
+        let extract = Extract {
+            top_level_calls: true,
+            ..Extract::default()
+        };
+        for t in r.schema(&extract) {
+            assert!(
+                t.columns.iter().any(|c| c.name == TX_FROM_COLUMN),
+                "{} must declare the column its rows carry",
+                t.table
+            );
+        }
+    }
+
+    /// A call row rebuilt from storage (a restart, an entity seed, a sealed segment read back) must be
+    /// the row that was stored. Declared implicit, the sender column was dropped on the way back in.
+    #[test]
+    fn the_sender_survives_a_row_rebuilt_from_storage() {
+        let r = reg(ERC20, &Extract::default());
+        let row = r
+            .decode_call(addr(1), &transfer_calldata(addr(9), 1), &ctx())
+            .expect("a row");
+        let extract = Extract {
+            top_level_calls: true,
+            ..Extract::default()
+        };
+        let schema = r
+            .schema(&extract)
+            .into_iter()
+            .find(|t| t.table == row.table)
+            .expect("the call table's schema");
+        let rebuilt = DecodedRow::from_stored(&row.to_json(), &schema).unwrap();
+        assert_eq!(rebuilt.params, row.params);
+    }
+
+    #[test]
+    fn an_argument_named_like_the_sender_column_is_refused() {
+        let abi: JsonAbi = serde_json::from_str(
+            r#"[{"type":"function","name":"post","inputs":[{"name":"tx_from","type":"address"}],"outputs":[],"stateMutability":"nonpayable"}]"#,
+        )
+        .unwrap();
+        let err = CallRegistry::build(vec![("edge".into(), addr(1), abi)], &Extract::default())
+            .err()
+            .expect("a colliding argument must be refused, not silently shadowed");
+        assert!(format!("{err:#}").contains("tx_from"), "{err:#}");
     }
 
     /// `transfer(address,uint256)` = 0xa9059cbb, the most-checked selector in Ethereum.
@@ -542,7 +645,7 @@ mod tests {
             .decode_call(addr(1), &transfer_calldata(addr(9), 1234), &ctx())
             .expect("a row");
         assert_eq!(row.table, "tok__call_transfer");
-        assert_eq!(row.params.len(), 2);
+        assert_eq!(row.params.len(), 3, "two arguments and the sender");
         assert_eq!(row.params[0].0, "to");
         assert_eq!(row.params[0].1, Value::Address(addr(9).into_array()));
         // uint256 is a `Word32`, exactly as it is for an event param - the two decode paths must
@@ -710,13 +813,14 @@ mod tests {
     }
 
     /// A named tuple argument is stored as an object and an unnamed one as an array, so they hash
-    /// apart (#1364), while a tuple-free surface keeps its v3.6.1 hash. That literal is the v3.6.1
-    /// line format, `f|alias|contract|selector|signature|name:type,...`, hashed by hand.
+    /// apart (#1364), while a tuple-free surface keeps its line format. That literal is the v3.6.1
+    /// line format, `f|alias|contract|selector|signature|name:type,...`, plus the `implicit|tx_from`
+    /// line every call table's sender column added, hashed by hand.
     #[test]
     fn a_named_tuple_argument_moves_the_hash_and_nothing_else_does() {
         assert_eq!(
             hex::encode(reg(ERC20, &Extract::default()).hash()),
-            "fc780503e494c575b6968ac98b681f1b0c5ab230522d02c4c43790f3746b79af"
+            "9a93fa9e219f876f560e24aae134240413cedd1b9aff67229d46cda8b88f39fd"
         );
         let place = |a: &str, b: &str| {
             format!(
