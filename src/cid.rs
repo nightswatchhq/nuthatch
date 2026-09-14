@@ -784,8 +784,8 @@ mod tests {
                 .expect_err("an arbitrary body must not verify as the document")
                 .to_string();
             assert!(
-                err.contains("does not match its CID"),
-                "say plainly that it is the wrong document: {err}"
+                err.contains("does not re-encode to its CID"),
+                "say plainly that it is not the document as re-encoded: {err}"
             );
         }
     }
