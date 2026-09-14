@@ -357,16 +357,18 @@ impl std::fmt::Display for Unproven {
 impl std::error::Error for Unproven {}
 
 async fn fetch(cid: &str, gateways: &[String]) -> Result<String> {
-    use crate::subgraph_import::{fetch_ipfs_proven, Fetched, Origin, Proof};
-    match fetch_ipfs_proven(cid, gateways, Origin::Manifest).await? {
-        Fetched {
+    use crate::subgraph_import::{fetch_ipfs_proven, Fetched, NothingProved, Origin, Proof};
+    match fetch_ipfs_proven(cid, gateways, Origin::Manifest).await {
+        Ok(Fetched {
             body,
             proof: Proof::Verified,
-        } => Ok(body),
-        Fetched {
+        }) => Ok(body),
+        Ok(Fetched {
             proof: Proof::Unproven(why),
             ..
-        } => Err(Unproven(why).into()),
+        }) => Err(Unproven(why).into()),
+        Err(e) if e.is::<NothingProved>() => Err(Unproven(e.to_string()).into()),
+        Err(e) => Err(e),
     }
 }
 

@@ -279,6 +279,19 @@ pub struct Fetched {
     pub proof: Proof,
 }
 
+/// Every gateway that answered sent bytes nothing proved, and none large enough to be taken unproven.
+/// `init` refuses it; a resolver counts it as unverified.
+#[derive(Debug)]
+pub struct NothingProved(pub String);
+
+impl std::fmt::Display for NothingProved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NothingProved {}
+
 /// Read a manifest, from disk when `source` names a file that exists and over IPFS otherwise.
 ///
 /// Returning the [`ManifestHome`] alongside the text is the point: every later decision about a
@@ -469,9 +482,15 @@ pub async fn fetch_ipfs_proven(
             proof: Proof::Unproven(why),
         });
     }
+    let failures = failures.join("\n  ");
+    if answered {
+        return Err(NothingProved(format!(
+            "nothing proved '{source}' from any gateway that answered:\n  {failures}"
+        ))
+        .into());
+    }
     Err(anyhow!(
-        "could not fetch '{source}' from any gateway:\n  {}",
-        failures.join("\n  ")
+        "could not fetch '{source}' from any gateway:\n  {failures}"
     ))
 }
 
@@ -1292,11 +1311,10 @@ mod tests {
         let (cid, _) = crate::cid::dag_for_tests(&file, 100 * 1024);
         let (gateway, handle) = trustless_gateway(file, None).await;
         let gateways = [gateway];
+        let refused = fetch_ipfs_proven(&cid, &gateways, Origin::Manifest).await;
         assert!(
-            fetch_ipfs_proven(&cid, &gateways, Origin::Manifest)
-                .await
-                .is_err(),
-            "a small body proven by nothing must be refused"
+            matches!(&refused, Err(e) if e.is::<NothingProved>()),
+            "a small body proven by nothing must be refused as unproven, not as unfetched"
         );
         assert!(fetch_ipfs(&cid, &gateways, Origin::Manifest).await.is_err());
         handle.abort();

@@ -12,6 +12,7 @@ Every subcommand and flag the `nuthatch` binary exposes. Regenerate with `nuthat
 
 Add another contract to an existing nest - resolve its ABI and grow the config, no re-init
 
+- `--explorer <EXPLORER>` - Blockscout instance to resolve ABIs from, for a chain with no keyless root we have verified
 - `<ADDRESSES>` - One or more contract addresses to add to the nest, e.g. 0xC02a…6Cc2 (WETH)
 - `--alias <ALIAS>` - Optional aliases, one per address in order (comma-separated). When omitted, the alias is the contract name from the ABI (`DelegationManager` → `delegation_manager`), falling back to the next free c<N> slot only when no usable name is present
 - `--abi <ABI>` - Use these local ABI file(s) instead of resolving from Sourcify/Etherscan, one per address in order (comma-separated; an empty entry resolves that address normally). Same proxy escape hatch as `init --abi`
@@ -157,6 +158,7 @@ One DuneSQL query per event table, casting each column to its DuneSQL type (RFC-
 
 Scaffold an indexer for a contract: resolve its ABI and write a project here
 
+- `--explorer <EXPLORER>` - Blockscout instance to resolve ABIs from, for a chain with no keyless root we have verified
 - `<ADDRESSES>` - One or more contract addresses to index, e.g. 0xA0b8…eB48 (USDC). Omit when using `--from`
 - `--from <FROM>` - Initialise from a published nest instead of addresses: a git URL or a local directory. The nest is self-contained (ABIs vendored), so nothing is resolved - just cloned/copied + validated
 - `--from-subgraph <FROM_SUBGRAPH>` - Scaffold from a Graph Protocol subgraph manifest: an IPFS CID (`QmVPhL…`, `ipfs://QmVPhL…`) or a URL to a `subgraph.yaml`. Maps `dataSources` → `[[contracts]]` and `templates` → `[[templates]]`, vendors every ABI from its pinned CID, and carries `startBlock` across
