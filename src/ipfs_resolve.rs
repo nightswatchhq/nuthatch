@@ -670,6 +670,7 @@ pub async fn resolve_inline(
                     p.block,
                     p.slot
                 );
+                metrics.add_ipfs_rows_refused(1);
                 given_up += 1;
             }
             !p.over_band
@@ -710,6 +711,7 @@ pub async fn resolve_inline(
                     p.cid,
                     p.block
                 );
+                metrics.add_ipfs_rows_refused(1);
                 given_up += 1;
             }
             None => given_up += 1,

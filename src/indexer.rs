@@ -11510,6 +11510,62 @@ template = "pool"
         handle.abort();
     }
 
+    /// The out-of-band resolver counted a document whose typed rows were refused, and one with no room
+    /// left in its block; `--seal-direct`'s inline resolver only gave them up, so the two paths
+    /// reported different `nuthatch_nest_ipfs_rows_refused_total` for one failure (#1375 review).
+    #[tokio::test]
+    async fn seal_direct_counts_refused_typed_rows_as_the_resolver_does() {
+        let bad = r#"[{"query_count":"many","chain":"base"}]"#.to_string();
+        let bad_cid = crate::cid::cid_v0_for(bad.as_bytes());
+        let late = r#"[{"query_count":1,"chain":"base"}]"#.to_string();
+        let late_cid = crate::cid::cid_v0_for(late.as_bytes());
+        let (gateway, _requests, handle) = content_gateway(
+            std::collections::HashMap::from([(bad_cid.clone(), bad), (late_cid.clone(), late)]),
+            0,
+        )
+        .await;
+        let dir = qos_typed_rows_nest();
+        let path = dir.path().join(crate::config::CONFIG_FILE);
+        let cfg = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            cfg.contains("max_rows = 8"),
+            "premise: the fixture declares max_rows"
+        );
+        std::fs::write(&path, cfg.replace("max_rows = 8", "max_rows = 100000")).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        let source = PostSource(vec![(4, qos_post(&bad_cid)), (4, qos_post(&late_cid))]);
+        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true)
+            .await
+            .unwrap();
+
+        let metrics = crate::metrics::NestMetrics::default();
+        let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
+            &gate,
+            &[gateway],
+            &fast_policy(2),
+            &rows,
+            true,
+            &metrics,
+        )
+        .await;
+        assert!(docs.is_empty(), "neither document may become rows");
+        assert_eq!(given_up, 2);
+        assert_eq!(
+            metrics.ipfs_rows_refused(),
+            2,
+            "one refused on its content and one with no room in its block, each counted as the \
+             out-of-band resolver counts them"
+        );
+        assert_eq!(metrics.ipfs_given_up(), 2);
+        handle.abort();
+    }
+
     /// A gateway that hung up mid-body left its document unresolved for good: the 2026-09-07 00:10
     /// indexer-attempt bucket was lost that way, and shifted 49 of 56 indexers' daily figures. A body
     /// cut short is a failed fetch like any other, and is tried again.
