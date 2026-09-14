@@ -138,7 +138,8 @@ Each experiment lists its Dune credit budget. Total research budget: **600 credi
 - Compute: relevant blocks / total blocks in range.
 - Estimate RPC calls under S0 (range scan with Nuthatch's current window size) vs S1 (per-block fetch of relevant blocks + zero-check windows). Convert to Alchemy CUs using the per-method CU costs from E1.
 - Output: % reduction in CUs, Dune credits consumed, and the crossover point (what fraction of blocks must be relevant before S1 stops paying).
-- Credits: ≤ 200 (block list export is the only meaningful cost).
+- Repeat all of the above on a second, less sparse log-derived contract set (e.g. a DEX router), so G3 is not decided on one convenient nest.
+- Credits: ≤ 200 per contract set (block list export is the only meaningful cost).
 
 ### E5 - Hint correctness (H3 safety)
 - Take the E4 block list. Independently, run Nuthatch's existing S0 backfill on a 100k-block sub-range (or use an existing sealed segment) and diff the set of blocks with relevant logs.
@@ -178,7 +179,7 @@ S3 (adaptive windows) likely also requires an ingestion change; S2 needs a seed-
 | G0 (after E1) | Backfill duplication across nests > 20 % of spend | S6 becomes the priority; Dune work continues but is not the headline saving |
 | G1 (after E2) | H1 confirmed | Close Q1 for full-chain nests permanently; stop entertaining "backfill from Dune" |
 | G2 (after E3) | Seed for the candidate nest < 400 MB | S2 stays on the table for measurement; else S2 closed |
-| G3 (after E4+E5) | ≥ 90 % CU reduction, < 50 credits, no uncaught false negatives | S1 accepted as the standard backfill path for log-derived scoped nests; §8 determines whether it needs a separate RFC |
+| G3 (after E4+E5) | ≥ 90 % CU reduction, < 50 credits, and no uncaught false negatives, on both E4 contract sets (the Graph candidate and the less sparse second set) | S1 accepted as the standard backfill path for log-derived scoped nests; §8 determines whether it needs a separate RFC |
 | G4 (after E6) | Any kill criterion hit | H4 confirmed; head-following stays RPC forever; never revisit on this plan |
 | G5 (after E7) | Self-host cheaper per block at ≥ 1 full backfill/quarter | Recommend an archive box for full-chain nests; Alchemy retained for head-following and state |
 
@@ -227,7 +228,7 @@ $_selfhost         = (box $/mo · 12 + snapshot/egress) / backfills_per_year
 | Risk | Mitigation |
 |---|---|
 | Blowing the research budget on E4/E6 | Hard caps in each experiment; E6 aborts at 100 credits |
-| Concluding "S1 works" from one convenient nest | E4 on a second, less sparse contract set (e.g. a DEX router) before G3 |
+| Concluding "S1 works" from one convenient nest | E4 runs on a second, less sparse contract set (e.g. a DEX router), and G3 requires both |
 | Hint staleness at the tail (Dune indexing lag) | S1 only hints for ranges older than 24 h; the tail is always range-scanned from RPC |
 | Scope creep: turning research into a Nuthatch change | §8 gate; any change ships as a separate RFC |
 | Dune schema changes mid-research | Pin table names in the experiment notes; re-verify before each run |
@@ -239,7 +240,7 @@ Results are recorded on the tracking issue, #1381, not as files in this repo.
 - [ ] E1 Alchemy inventory table
 - [ ] E2 full-chain sizing table
 - [ ] E3 seed sizing for the Graph-on-Arbitrum nest
-- [ ] E4 sparse index savings + crossover `r*`
+- [ ] E4 sparse index savings + crossover `r*`, on both contract sets
 - [ ] E5 hint correctness diff
 - [ ] E6 head-following kill log
 - [ ] E7 self-host vs Alchemy comparison
@@ -266,3 +267,4 @@ Results are recorded on the tracking issue, #1381, not as files in this repo.
 | 2026-09-14 | Initial draft |
 | 2026-09-14 | Numbered RFC-0057 in the nuthatch repo (#1381). The 2026 feature freeze ended on 2026-09-08 and carve-outs are retired, so a change an experiment needs is proposed as a separate RFC. Nuthatch indexes EVM chains only, so I11 and E8 ask about Dune's coverage of the chains it supports. Results go on #1381 rather than in repo files. |
 | 2026-09-14 | Review of #1382: H1's falsification threshold now matches its 100× claim (40 GB, not 4 GB), and S1, H3 and G3 are limited to log-derived scoped nests, since a block list from `logs` cannot see calls or state changes that emit nothing. |
+| 2026-09-14 | Review of #1382: the second, less sparse contract set moves from a §12 mitigation into E4 and G3's condition, so S1 is not accepted on one sparse nest. E4 is capped at 200 credits per set; the experiments total 545 against the 600 budget. |
