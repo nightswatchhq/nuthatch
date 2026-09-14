@@ -792,7 +792,14 @@ async fn fetch_and_vendor_abi(
     // gateway load by a factor the manifest chooses. Each source still gets its own file, because
     // the alias is what the config points at. A local path caches on the same key for the same
     // reason: one read, one parse, however many sources name it.
-    let key = abi_ref.link.as_str().to_string();
+    // The rendered string is not an identity: a repository can quite legitimately contain a
+    // `file: Qm...` beside a deployed reference to `/ipfs/Qm...`. Those are different sources,
+    // even though the human-facing spelling is the same. Collapsing them here vendors whichever
+    // happened to be visited first for both declarations.
+    let key = match &abi_ref.link {
+        AbiLink::Cid(cid) => format!("cid:{cid}"),
+        AbiLink::Path(path) => format!("path:{path}"),
+    };
     if let Some(cached) = fetched.get(&key) {
         write_abi(dir, alias, cached)?;
         return Ok(cached.clone());
@@ -2677,6 +2684,71 @@ dataSources:
         assert!(
             vendored.contains("Transfer"),
             "the vendored ABI is not the repository's: {vendored}"
+        );
+    }
+
+    /// A local repository may have a file whose name is also a CID. The two links render to the
+    /// same string, but one is disk content and the other is content addressed: sharing their
+    /// cache entry silently vendors the first ABI for both (#1321).
+    #[tokio::test]
+    async fn a_path_and_a_cid_with_the_same_spelling_do_not_share_an_abi_cache_entry() {
+        use crate::subgraph_import::{AbiLink, AbiRef, ManifestHome};
+
+        let remote = r#"[{"type":"event","name":"Remote","inputs":[]}]"#;
+        let cid = crate::cid::cid_v0_for(remote.as_bytes());
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(&cid),
+            r#"[{"type":"event","name":"Local","inputs":[]}]"#,
+        )
+        .unwrap();
+        let path: &'static str = Box::leak(format!("/{cid}").into_boxed_str());
+        let (gateway, handle) =
+            fake_gateway(vec![(path, Box::leak(remote.to_string().into_boxed_str()))]).await;
+
+        let nest = tempfile::tempdir().unwrap();
+        std::fs::create_dir(nest.path().join("abis")).unwrap();
+        let mut notes = Vec::new();
+        let mut fetched = std::collections::BTreeMap::new();
+        let home = ManifestHome::Local(repo.path().to_path_buf());
+        let gateways = vec![format!("{gateway}/")];
+
+        fetch_and_vendor_abi(
+            nest.path(),
+            "local",
+            &AbiRef {
+                name: "local".into(),
+                link: AbiLink::Path(cid.clone()),
+            },
+            &gateways,
+            &home,
+            &mut notes,
+            &mut fetched,
+        )
+        .await
+        .unwrap();
+        fetch_and_vendor_abi(
+            nest.path(),
+            "remote",
+            &AbiRef {
+                name: "remote".into(),
+                link: AbiLink::Cid(cid),
+            },
+            &gateways,
+            &home,
+            &mut notes,
+            &mut fetched,
+        )
+        .await
+        .unwrap();
+        handle.abort();
+
+        let local = std::fs::read_to_string(nest.path().join("abis/local.json")).unwrap();
+        let remote = std::fs::read_to_string(nest.path().join("abis/remote.json")).unwrap();
+        assert!(local.contains("Local"), "local ABI was replaced: {local}");
+        assert!(
+            remote.contains("Remote"),
+            "CID ABI reused the path cache entry: {remote}"
         );
     }
 
