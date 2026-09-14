@@ -71,7 +71,8 @@ pub async fn init(args: InitArgs) -> Result<()> {
             }
             None => {
                 println!("→ resolving ABI for {address} on {}…", chain.name);
-                let resolved = resolve_abi(&rpc, chain.chain_id, address).await?;
+                let resolved =
+                    resolve_abi(&rpc, chain.chain_id, address, args.explorer.as_deref()).await?;
                 (
                     resolved.abi,
                     resolved.implementation,
@@ -242,7 +243,8 @@ pub async fn add(args: AddArgs) -> Result<()> {
             }
             None => {
                 println!("→ resolving ABI for {address} on {}…", chain.name);
-                let resolved = resolve_abi(&rpc, chain.chain_id, address).await?;
+                let resolved =
+                    resolve_abi(&rpc, chain.chain_id, address, args.explorer.as_deref()).await?;
                 (
                     resolved.abi,
                     resolved.implementation,
@@ -1125,10 +1127,15 @@ struct ResolvedAbi {
     contract_name: Option<String>,
 }
 
-async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<ResolvedAbi> {
+async fn resolve_abi(
+    rpc: &RpcClient,
+    chain_id: u64,
+    address: &str,
+    explorer: Option<&str>,
+) -> Result<ResolvedAbi> {
     if let Some(implementation) = resolve_implementation(rpc, address).await {
         println!("  · proxy → implementation {implementation}");
-        if let Ok(resolved) = abi::resolve(chain_id, &implementation).await {
+        if let Ok(resolved) = abi::resolve(chain_id, &implementation, explorer).await {
             print_abi_resolved(&resolved);
             return Ok(ResolvedAbi {
                 abi: resolved.abi,
@@ -1138,7 +1145,7 @@ async fn resolve_abi(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<Re
         }
         println!("  · implementation ABI unresolved; using the proxy's own ABI");
     }
-    let resolved = abi::resolve(chain_id, address).await?;
+    let resolved = abi::resolve(chain_id, address, explorer).await?;
     print_abi_resolved(&resolved);
     Ok(ResolvedAbi {
         abi: resolved.abi,
@@ -2777,6 +2784,7 @@ dataSources:
         let dir = tempfile::tempdir().unwrap();
         let source = format!("{gateway}/manifest.yaml");
         let mut args = InitArgs {
+            explorer: None,
             addresses: vec![],
             from: None,
             from_subgraph: Some(source.clone()),
