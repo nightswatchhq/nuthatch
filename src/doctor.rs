@@ -44,6 +44,45 @@ use crate::source::Source;
 /// halved for headroom. It is one cross-endpoint data point, not a universal ceiling.
 const RANGE_ONLY_WINDOW_CAP: u64 = 320;
 
+/// Spans tried, **narrowest first**, when sampling for a contract to probe with (#1323).
+///
+/// The order is the safety property, not a preference. This is the one unfiltered `eth_getLogs` in
+/// the binary, and nothing bounds how large a provider's answer to it may be - so the first request
+/// is the smallest one that could possibly work, and the ladder widens only when the sample already
+/// in hand says the next rung is affordable (Jules on #1385). Asking for the widest window first and
+/// narrowing on refusal, which is what the first cut did, relies on the provider to refuse - and a
+/// provider that cheerfully answers is exactly the case that hurts.
+///
+/// One block is a perfectly good sample where there is anything to see: measured on 2026-09-14, an
+/// unfiltered single block returns 810 logs on Base and 74 on Gnosis. Widening is for chains quiet
+/// enough that one block shows too little, and on those the wider request is cheap by construction.
+///
+/// Cost in practice: one request on a busy chain, two on a quiet one, three where there is almost
+/// nothing to find.
+const DISCOVERY_SPANS: [u64; 3] = [1, 5, 25];
+
+/// The most of one unfiltered answer [`sample_addresses`] will ever hold, in bytes.
+///
+/// The ladder decides what to *ask* for; this decides how much of the answer may exist in this
+/// process, and the two are different guarantees. A narrow first rung makes an oversized answer
+/// unlikely; only this makes it impossible, and "unlikely" is not a bound (Jules on #1385).
+///
+/// 8 MiB is generous against every measurement taken here - the largest sample seen was Base's
+/// 5,116 logs in 5 blocks, well under it - and small enough that a provider having a very strange
+/// day cannot turn a diagnostic into an out-of-memory.
+const DISCOVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Enough sampled logs to rank contracts by activity. Past this a wider sample cannot change the
+/// answer, so it is not worth the request or the memory.
+const DISCOVERY_ENOUGH: usize = 200;
+
+/// Projected log count above which the ladder will not widen, whatever the provider would allow.
+///
+/// Log density is roughly stable block to block, so logs-per-block times the next span is a fair
+/// forecast of what the next request returns. Refusing on that forecast is the difference between
+/// bounding this by evidence and bounding it by hope that the endpoint says no.
+const DISCOVERY_BUDGET: usize = 20_000;
+
 /// What one endpoint can actually do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
@@ -93,16 +132,22 @@ impl Probe {
         })
     }
 
+    /// The `getLogs` finding on its own, so the re-probe in `run()` can repeat exactly this line
+    /// and nothing else - and cannot drift from what [`report`] prints (#1323).
+    pub fn window_line(&self) -> String {
+        match self.max_window {
+            Some(w) => format!(
+                "  getLogs window   up to {w} blocks (recommend --window {})\n",
+                self.recommended_window().unwrap_or(1)
+            ),
+            None => "  getLogs window   FAILED - no probe succeeded\n".to_string(),
+        }
+    }
+
     /// One line per finding, in the order an operator cares about.
     pub fn report(&self) -> String {
         let mut out = String::new();
-        match self.max_window {
-            Some(w) => out.push_str(&format!(
-                "  getLogs window   up to {w} blocks (recommend --window {})\n",
-                self.recommended_window().unwrap_or(1)
-            )),
-            None => out.push_str("  getLogs window   FAILED - no probe succeeded\n"),
-        }
+        out.push_str(&self.window_line());
         match self.max_batch {
             Some(n) if n >= 20 => out.push_str(&format!("  JSON-RPC batch   {n}+ (fine)\n")),
             Some(n) => out.push_str(&format!(
@@ -137,6 +182,114 @@ impl Probe {
             "notes": self.notes,
         })
     }
+}
+
+/// Pick a busy contract to run a filtered probe against, when the operator gave none (#1323).
+///
+/// `doctor` without an address measures a range-only `getLogs`, which never meets a result-count cap
+/// and is therefore a **floor**, not a forecast. On Arc Testnet that floor recommended `--window 80`
+/// where the same endpoint answered 20,000 blocks once filtered. The report already said to re-probe
+/// with `--address`, and the smaller number still went into a README, because the first number is
+/// the one on the screen. So `doctor` finds an address itself rather than asking.
+///
+/// The sample is the unfiltered firehose over [`DISCOVERY_SPAN`] blocks, issued through
+/// [`RpcClient::get_logs`] rather than a [`crate::source::LogFilter`]: that type's refusal to build
+/// a match-everything filter (#432) guards the *ingestion* path and should stay exactly as strict as
+/// it is. This one deliberate exception is visible here and nowhere else.
+///
+/// Returns the address and how many of the sampled logs it emitted. `None` is an ordinary answer -
+/// a quiet chain, or an endpoint that refuses the unfiltered request - and is reported as "could not
+/// find one", never as a failure.
+/// The emitting addresses of one unfiltered `eth_getLogs`, refusing to hold more than
+/// [`DISCOVERY_MAX_BYTES`] of the answer.
+///
+/// **Deliberately its own transport rather than [`RpcClient::get_logs`], and deliberately not a
+/// bounded variant added to that client.** Every other RPC call nuthatch makes is *filtered*, so the
+/// request itself bounds the answer and no reader needs a cap; adding a bounded-read method to the
+/// shared client would put a footgun beside every caller that does not need one. This is the only
+/// unfiltered request in the binary, so the bound lives beside it.
+///
+/// The body is read chunk by chunk and abandoned the moment it passes the cap, so an oversized
+/// answer is never assembled - which is the difference between bounding the request and bounding the
+/// response. Only `address` is read out; discovery never needs a log's topics, data or hashes, so no
+/// `Log` is constructed at all.
+async fn sample_addresses(url: &str, from: u64, to: u64) -> Result<Vec<String>> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+        "params": [{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}")}],
+    });
+    let mut resp = http.post(url).json(&body).send().await?;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > DISCOVERY_MAX_BYTES {
+            anyhow::bail!(
+                "unfiltered eth_getLogs over blocks {from}-{to} exceeded {DISCOVERY_MAX_BYTES} \
+                 bytes; abandoning the sample rather than holding it"
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let v: Value = serde_json::from_slice(&buf)?;
+    if let Some(e) = v.get("error") {
+        anyhow::bail!("rpc error: {e}");
+    }
+    let arr = v
+        .get("result")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| anyhow::anyhow!("eth_getLogs did not return an array"))?;
+    Ok(arr
+        .iter()
+        .filter_map(|l| l.get("address")?.as_str().map(str::to_string))
+        .collect())
+}
+
+async fn discover_probe_address(url: &str, tip: u64) -> Option<(String, usize)> {
+    // The same offset the width probe uses: at the tip an endpoint may refuse for reorg reasons
+    // rather than width, and a sample that fails for the wrong reason is worse than no sample.
+    let to = tip.saturating_sub(100);
+    let mut sample: Vec<String> = Vec::new();
+    let mut sampled_span = 0u64;
+    for span in DISCOVERY_SPANS {
+        if !sample.is_empty() {
+            // Enough to rank by: a wider sample cannot change which contract is busiest by enough
+            // to matter, so it is not worth the request.
+            if sample.len() >= DISCOVERY_ENOUGH {
+                break;
+            }
+            // Widen only on what the previous rung actually measured. `sampled_span` is non-zero
+            // whenever `sample` is, so the division is safe.
+            let projected = sample.len().saturating_mul(span as usize) / sampled_span as usize;
+            if projected > DISCOVERY_BUDGET {
+                break;
+            }
+        }
+        let from = to.saturating_sub(span.saturating_sub(1));
+        match sample_addresses(url, from, to).await {
+            // An empty answer is a quiet stretch, not a refusal: widen and look again.
+            Ok(got) => {
+                sampled_span = span;
+                if !got.is_empty() {
+                    sample = got;
+                }
+            }
+            // A refusal ends the ladder either way - and that includes the byte cap, which is
+            // deliberately a refusal rather than a truncation: half a sample would rank contracts
+            // by whichever happened to be serialised first, which is not a measurement of anything.
+            Err(_) => break,
+        }
+    }
+    let mut tally: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for a in &sample {
+        *tally.entry(a.to_ascii_lowercase()).or_default() += 1;
+    }
+    // Ties broken on the address, so two runs over the same window recommend the same thing. A
+    // report an operator cannot reproduce is a report they cannot check.
+    tally
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
 }
 
 /// Probe `url`. Never fails on a bad endpoint - a broken endpoint is the *finding*, not an error.
@@ -469,14 +622,78 @@ pub async fn run(args: crate::cli::DoctorArgs) -> Result<()> {
             .and_then(|r| r.split('/').next())
             .unwrap_or(url);
         let p = probe(url, &addresses).await?;
+        // Nothing given and nothing declared: the number above is the raw block-range limit, which
+        // #1323 measured understating a real endpoint by 250x. Find a contract on this chain and
+        // measure what a nest would actually see, rather than telling the operator to do it and
+        // watching the floor get written down anyway.
+        let discovered = if addresses.is_empty() {
+            match RpcClient::new(vec![url.to_string()]) {
+                Ok(rpc) => match rpc.block_number().await {
+                    Ok(tip) => match discover_probe_address(url, tip).await {
+                        Some((addr, seen)) => probe(url, std::slice::from_ref(&addr))
+                            .await
+                            .ok()
+                            .map(|fp| (addr, seen, fp)),
+                        None => None,
+                    },
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         if args.json {
-            json_rows.push(p.to_json(host));
+            let mut row = p.to_json(host);
+            if let (Some(obj), Some((addr, seen, fp))) = (row.as_object_mut(), discovered.as_ref())
+            {
+                // Added alongside the existing keys, never replacing them: the live-endpoints gate
+                // reads `max_window` off this object (#716) and must keep seeing what it saw.
+                obj.insert("discovered_address".into(), json!(addr));
+                obj.insert("discovered_logs_sampled".into(), json!(seen));
+                obj.insert("discovered_max_window".into(), json!(fp.max_window));
+                obj.insert(
+                    "discovered_recommended_window".into(),
+                    json!(fp.recommended_window()),
+                );
+            }
+            json_rows.push(row);
         } else {
             println!("{host}");
             print!("{}", p.report());
+            if let Some((addr, seen, fp)) = discovered.as_ref() {
+                println!();
+                // Only the window line is repeated: batch size and archive depth are properties
+                // of the endpoint, identical in both probes, and printing them twice buries the
+                // one number that changed.
+                println!("  That window is a FLOOR - with no --address it sees the block-range");
+                println!(
+                    "  limit and never a result-count cap. Re-probed against a real contract:"
+                );
+                println!("    {addr}");
+                println!("    (busiest in a short unfiltered sample, {seen} of its logs)");
+                println!("  {}", fp.window_line().trim_start());
+                match fp.recommended_window() {
+                    Some(w) => println!(
+                        "  Use --window {w} for a nest of similar density, or --address <your \
+                         contract>"
+                    ),
+                    None => println!(
+                        "  Even filtered, no probe succeeded. Use --address <your contract>"
+                    ),
+                }
+                println!("  to measure your own.");
+            }
             println!();
         }
-        if let Some(w) = p.recommended_window() {
+        // The filtered figure is the one a nest can act on, so it is the one that feeds the
+        // across-endpoints recommendation. Where nothing was discovered, the floor still stands.
+        let actionable = discovered
+            .as_ref()
+            .and_then(|(_, _, fp)| fp.recommended_window())
+            .or_else(|| p.recommended_window());
+        if let Some(w) = actionable {
             worst_window = Some(worst_window.map_or(w, |c: u64| c.min(w)));
         }
     }
@@ -733,6 +950,342 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // #1323: finding a probe address rather than telling the operator to.
+    // ---------------------------------------------------------------------------------------
+
+    /// A provider that answers the unfiltered sample with `logs` - each entry an emitting address,
+    /// repeated as many times as it emitted. Separate from [`filter_capturing_rpc`], which answers
+    /// every `eth_getLogs` with `[]` and so can say nothing about which address is busiest.
+    async fn log_serving_rpc(logs: &[&str]) -> (String, tokio::task::JoinHandle<()>) {
+        log_serving_rpc_capped(logs, u64::MAX).await
+    }
+
+    /// As above, but refusing any unfiltered sample wider than `max_span` - which is Base, measured
+    /// on 2026-09-14: it answers 5 blocks with 5,116 logs and refuses 10 as "backend response too
+    /// large".
+    async fn log_serving_rpc_capped(
+        logs: &[&str],
+        max_span: u64,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        log_serving_rpc_recording(logs, max_span, Default::default()).await
+    }
+
+    /// As above, and recording every **unfiltered** span asked for, in order. The order is the
+    /// safety property #1385 turned on, so it has to be assertable.
+    async fn log_serving_rpc_recording(
+        logs: &[&str],
+        max_span: u64,
+        spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::Value;
+
+        let rows: Vec<Value> = logs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                json!({
+                    "address": a,
+                    "topics": ["0x00"],
+                    "data": "0x",
+                    "blockNumber": format!("0x{:x}", 0x100000 - 100 - (i as u64 % 10)),
+                    "blockHash": format!("0x{:064x}", 1),
+                    "transactionHash": format!("0x{:064x}", i + 1),
+                    "logIndex": format!("0x{i:x}"),
+                })
+            })
+            .collect();
+
+        #[derive(Clone)]
+        struct St {
+            rows: std::sync::Arc<Vec<Value>>,
+            max_span: u64,
+            spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+        }
+
+        fn hex_u64(v: Option<&Value>) -> Option<u64> {
+            u64::from_str_radix(v?.as_str()?.trim_start_matches("0x"), 16).ok()
+        }
+
+        async fn handler(State(st): State<St>, Json(req): Json<Value>) -> Json<Value> {
+            if req.as_array().is_some() {
+                return Json(json!([]));
+            }
+            match req.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "eth_blockNumber" => Json(json!({"jsonrpc":"2.0","id":1,"result":"0x100000"})),
+                // Only the *unfiltered* request gets rows: an address-filtered probe is a different
+                // question, and answering it from this pile would make the test agree with itself.
+                "eth_getLogs" => {
+                    let f = req
+                        .get("params")
+                        .and_then(|p| p.as_array())
+                        .and_then(|a| a.first());
+                    let filtered = f
+                        .map(|f| f.get("address").is_some() || f.get("topics").is_some())
+                        .unwrap_or(false);
+                    let span = f
+                        .and_then(|f| {
+                            Some(
+                                hex_u64(f.get("toBlock"))?
+                                    .saturating_sub(hex_u64(f.get("fromBlock"))?)
+                                    + 1,
+                            )
+                        })
+                        .unwrap_or(1);
+                    if !filtered {
+                        st.spans.lock().unwrap().push(span);
+                    }
+                    // The dense-chain refusal a provider may or may not give; the ladder must be
+                    // safe whether or not it does.
+                    if !filtered && span > st.max_span {
+                        return Json(json!({
+                            "jsonrpc":"2.0","id":1,
+                            "error":{"code":-32000,"message":"backend response too large"}
+                        }));
+                    }
+                    let result = if filtered { json!([]) } else { json!(*st.rows) };
+                    Json(json!({"jsonrpc":"2.0","id":1,"result": result}))
+                }
+                _ => Json(json!({"jsonrpc":"2.0","id":1,"result":"0x0"})),
+            }
+        }
+
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler))
+            .with_state(St {
+                rows: std::sync::Arc::new(rows),
+                max_span,
+                spans,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// **The first unfiltered request is the narrowest one**, which is the whole of #1385's fix.
+    ///
+    /// This is the only unfiltered `eth_getLogs` in the binary and nothing bounds how large an
+    /// answer to it may be, so the safety cannot rest on the provider refusing: a provider that
+    /// cheerfully answers a wide firehose is precisely the case that hurts. The first cut asked
+    /// widest-first and narrowed on refusal, which is bounded by hope. This asserts the order.
+    #[tokio::test]
+    async fn the_first_unfiltered_sample_is_the_narrowest() {
+        let spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
+        let (url, handle) = log_serving_rpc_recording(
+            &["0xdddddddddddddddddddddddddddddddddddddddd"; 250],
+            u64::MAX,
+            spans.clone(),
+        )
+        .await;
+        let found = discover_probe_address(&url, 0x100000).await;
+        handle.abort();
+
+        let asked = spans.lock().unwrap().clone();
+        assert_eq!(
+            asked.first().copied(),
+            Some(1),
+            "the first unfiltered request asked for {asked:?} blocks - a wide one goes out before \
+             anything is known about the chain's density"
+        );
+        // 250 logs clears DISCOVERY_ENOUGH, so a busy chain costs exactly one request and the
+        // widest rung is never asked for at all.
+        assert_eq!(
+            asked.len(),
+            1,
+            "a sample that already answers the question asked again: {asked:?}"
+        );
+        assert_eq!(found.map(|(_, n)| n), Some(250));
+    }
+
+    /// A chain quiet enough to need a wider sample gets one - the ladder must widen, or it only
+    /// ever works where one block happens to be enough.
+    #[tokio::test]
+    async fn a_quiet_chain_widens_until_the_sample_says_something() {
+        let spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
+        let (url, handle) = log_serving_rpc_recording(
+            &[
+                "0xdddddddddddddddddddddddddddddddddddddddd",
+                "0xdddddddddddddddddddddddddddddddddddddddd",
+                "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            ],
+            u64::MAX,
+            spans.clone(),
+        )
+        .await;
+        let found = discover_probe_address(&url, 0x100000).await;
+        handle.abort();
+
+        let asked = spans.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![1, 5, 25],
+            "three logs is far under DISCOVERY_ENOUGH, so every rung should have been tried"
+        );
+        assert_eq!(
+            found,
+            Some(("0xdddddddddddddddddddddddddddddddddddddddd".to_string(), 2)),
+            "widening found nothing, so a quiet chain still gets only the range-only floor"
+        );
+    }
+
+    /// A provider that refuses the unfiltered request outright ends the ladder at the first rung,
+    /// rather than trying four more times against an endpoint that has already said no. Measured:
+    /// `ethereum-rpc.publicnode.com` answers "Please specify an address in your request".
+    #[tokio::test]
+    async fn a_provider_that_refuses_unfiltered_logs_is_asked_once() {
+        let spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
+        let (url, handle) = log_serving_rpc_recording(
+            &["0xdddddddddddddddddddddddddddddddddddddddd"],
+            0, // refuses every span, including one block
+            spans.clone(),
+        )
+        .await;
+        let found = discover_probe_address(&url, 0x100000).await;
+        handle.abort();
+
+        assert_eq!(found, None, "a refusal is not a discovery");
+        assert_eq!(
+            spans.lock().unwrap().len(),
+            1,
+            "the ladder kept asking an endpoint that had already refused"
+        );
+    }
+
+    /// The busiest contract in the sample is the one probed with - not the first seen, which is what
+    /// a naive tally returns and what would make the recommendation depend on log ordering.
+    #[tokio::test]
+    async fn the_busiest_contract_in_the_sample_is_the_one_chosen() {
+        let (url, handle) = log_serving_rpc(&[
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])
+        .await;
+        let found = discover_probe_address(&url, 0x100000).await;
+        handle.abort();
+        assert_eq!(
+            found,
+            Some(("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(), 3)),
+            "the first address seen was chosen over the busiest one"
+        );
+    }
+
+    /// One contract written two ways is one contract. Providers are inconsistent about EIP-55
+    /// checksumming, and a case-sensitive tally would split a busy address in half and hand back a
+    /// quieter one - with a count that understates it, which is the figure the report prints.
+    #[tokio::test]
+    async fn the_same_address_in_two_casings_is_tallied_once() {
+        let (url, handle) = log_serving_rpc(&[
+            "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])
+        .await;
+        let found = discover_probe_address(&url, 0x100000).await;
+        handle.abort();
+        assert_eq!(
+            found,
+            Some(("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), 2)),
+            "a checksummed and a lowercase spelling of one address were counted as two"
+        );
+    }
+
+    /// A tie must break the same way every run. A report an operator cannot reproduce is a report
+    /// they cannot check, and `HashMap` iteration order would otherwise decide it.
+    #[tokio::test]
+    async fn a_tie_is_broken_deterministically() {
+        let mut chosen = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let (url, handle) = log_serving_rpc(&[
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "0xcccccccccccccccccccccccccccccccccccccccc",
+            ])
+            .await;
+            chosen.insert(discover_probe_address(&url, 0x100000).await);
+            handle.abort();
+        }
+        assert_eq!(
+            chosen.len(),
+            1,
+            "eight runs over an identical window chose {chosen:?}"
+        );
+    }
+
+    /// **An oversized answer is refused before it is assembled**, which is the bound the ladder is
+    /// not (Jules on #1385). The ladder makes a huge response unlikely by asking for one block
+    /// first; only this makes it impossible, and a provider is free to answer one block with
+    /// anything it likes.
+    ///
+    /// Refused rather than truncated, deliberately: half a sample would rank contracts by whichever
+    /// happened to be serialised first, which is not a measurement of anything.
+    #[tokio::test]
+    async fn an_oversized_unfiltered_answer_is_refused_not_held() {
+        use axum::{routing::post, Json, Router};
+
+        // One block, and a body comfortably over the cap - the shape a ladder cannot protect
+        // against, because it is already asking for the smallest window there is.
+        async fn flood() -> Json<serde_json::Value> {
+            let rows: Vec<serde_json::Value> = (0..60_000)
+                .map(|i| {
+                    json!({
+                        "address": format!("0x{i:040x}"),
+                        "topics": [format!("0x{:064x}", i)],
+                        "data": format!("0x{}", "ab".repeat(64)),
+                        "blockNumber": "0x1",
+                        "blockHash": format!("0x{:064x}", 1),
+                        "transactionHash": format!("0x{:064x}", i),
+                        "logIndex": format!("0x{i:x}"),
+                    })
+                })
+                .collect();
+            Json(json!({"jsonrpc":"2.0","id":1,"result": rows}))
+        }
+
+        let app = Router::new()
+            .route("/", post(flood))
+            .route("/{*rest}", post(flood));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}/");
+
+        let err = sample_addresses(&url, 1, 1)
+            .await
+            .expect_err("an answer over the cap must be refused");
+        handle.abort();
+        assert!(
+            err.to_string().contains("exceeded"),
+            "refused for the wrong reason: {err:#}"
+        );
+
+        // And nothing partial survives it: the caller gets an error, not a short sample.
+        assert!(
+            !err.to_string().contains("truncat"),
+            "the cap must refuse, not truncate: {err:#}"
+        );
+    }
+
+    /// A quiet chain is an ordinary answer, not a failure: `doctor` falls back to reporting the
+    /// range-only floor rather than erroring, so the command still works where there is nothing to
+    /// find.
+    #[tokio::test]
+    async fn an_empty_window_finds_nothing_rather_than_failing() {
+        let (url, handle) = log_serving_rpc(&[]).await;
+        let found = discover_probe_address(&url, 0x100000).await;
+        handle.abort();
+        assert_eq!(found, None);
     }
 
     /// #432: an empty address list AND an empty topic0 list is not a width probe - it is a request

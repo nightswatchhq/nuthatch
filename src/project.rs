@@ -424,9 +424,19 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         args.ipfs.clone()
     };
 
-    println!("→ fetching subgraph manifest {source}…");
-    // The operator typed this one, so it may be a URL.
-    let raw = sg::fetch_ipfs(source, &gateways, sg::Origin::Operator).await?;
+    // A path that exists is read from disk; anything else goes to the gateways (#1321). The home it
+    // returns is threaded to every ABI read, because whether a `file:` reference means anything is a
+    // property of where the manifest came from, not of the reference.
+    let (raw, home) = sg::read_manifest(source, &gateways).await?;
+    match &home {
+        sg::ManifestHome::Local(dir) => {
+            println!(
+                "→ reading subgraph manifest {source} (local, ABIs resolve under {})…",
+                dir.display()
+            )
+        }
+        sg::ManifestHome::Remote => println!("→ fetching subgraph manifest {source}…"),
+    }
     let manifest = sg::parse_manifest(&raw)?;
 
     let network = manifest.network()?;
@@ -510,9 +520,16 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         }
 
         let alias = sg::dedupe_alias(&sg::to_alias(&ds.name), &mut taken);
-        let abi_json =
-            fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes, &mut fetched)
-                .await?;
+        let abi_json = fetch_and_vendor_abi(
+            &dir,
+            &alias,
+            &abi_ref,
+            &gateways,
+            &home,
+            &mut notes,
+            &mut fetched,
+        )
+        .await?;
         address_params.extend(sg::address_params(&alias, &abi_json));
 
         // Carry the manifest's event allowlist: a subgraph that handles only
@@ -594,9 +611,16 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             continue;
         };
         let alias = sg::dedupe_alias(&sg::to_alias(&t.name), &mut taken);
-        let abi_json =
-            fetch_and_vendor_abi(&dir, &alias, &abi_ref, &gateways, &mut notes, &mut fetched)
-                .await?;
+        let abi_json = fetch_and_vendor_abi(
+            &dir,
+            &alias,
+            &abi_ref,
+            &gateways,
+            &home,
+            &mut notes,
+            &mut fetched,
+        )
+        .await?;
         // Both the entry and its ABI path must use the *settled* alias. Recomputing
         // `to_alias(&t.name)` here would name the file the template was never written to:
         // a dataSource `Vault` plus a template `Vault` — the canonical factory shape — makes
@@ -757,27 +781,46 @@ async fn fetch_and_vendor_abi(
     alias: &str,
     abi_ref: &crate::subgraph_import::AbiRef,
     gateways: &[String],
+    home: &crate::subgraph_import::ManifestHome,
     notes: &mut Vec<String>,
     fetched: &mut std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value> {
-    // One CID, one download. Sharing an ABI across dataSources is the normal shape - every
-    // proxy in a beacon codebase pins the same implementation ABI - and re-fetching it per
-    // source multiplies gateway load by a factor the manifest chooses. Each source still gets
-    // its own file, because the alias is what the config points at.
-    if let Some(cached) = fetched.get(&abi_ref.cid) {
+    use crate::subgraph_import::{AbiLink, Origin};
+
+    // One link, one read. Sharing an ABI across dataSources is the normal shape - every proxy in a
+    // beacon codebase pins the same implementation ABI - and re-fetching it per source multiplies
+    // gateway load by a factor the manifest chooses. Each source still gets its own file, because
+    // the alias is what the config points at. A local path caches on the same key for the same
+    // reason: one read, one parse, however many sources name it.
+    // The rendered string is not an identity: a repository can quite legitimately contain a
+    // `file: Qm...` beside a deployed reference to `/ipfs/Qm...`. Those are different sources,
+    // even though the human-facing spelling is the same. Collapsing them here vendors whichever
+    // happened to be visited first for both declarations.
+    let key = match &abi_ref.link {
+        AbiLink::Cid(cid) => format!("cid:{cid}"),
+        AbiLink::Path(path) => format!("path:{path}"),
+    };
+    if let Some(cached) = fetched.get(&key) {
         write_abi(dir, alias, cached)?;
         return Ok(cached.clone());
     }
-    // From the manifest, so CID only - see `subgraph_import::Origin`.
-    let raw = crate::subgraph_import::fetch_ipfs(
-        &abi_ref.cid,
-        gateways,
-        crate::subgraph_import::Origin::Manifest,
-    )
-    .await
-    .with_context(|| format!("fetching ABI `{}` ({})", abi_ref.name, abi_ref.cid))?;
+    let raw = match &abi_ref.link {
+        // From the manifest, so CID only - see `subgraph_import::Origin`.
+        AbiLink::Cid(cid) => crate::subgraph_import::fetch_ipfs(cid, gateways, Origin::Manifest)
+            .await
+            .with_context(|| format!("fetching ABI `{}` ({cid})", abi_ref.name))?,
+        // A repository manifest (#1321). `resolve_abi_path` refuses a remote manifest outright and
+        // refuses a local one that reaches outside its own directory.
+        AbiLink::Path(rel) => {
+            let path = crate::subgraph_import::resolve_abi_path(home, rel)
+                .with_context(|| format!("resolving ABI `{}`", abi_ref.name))?;
+            std::fs::read_to_string(&path).with_context(|| {
+                format!("reading ABI `{}` from {}", abi_ref.name, path.display())
+            })?
+        }
+    };
     let parsed: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("ABI `{}` ({}) is not JSON", abi_ref.name, abi_ref.cid))?;
+        .with_context(|| format!("ABI `{}` ({key}) is not JSON", abi_ref.name))?;
     if !parsed.is_array() {
         notes.push(format!(
             "ABI `{}` is not a JSON array - vendored as-is, but the registry may reject it",
@@ -785,7 +828,7 @@ async fn fetch_and_vendor_abi(
         ));
     }
     write_abi(dir, alias, &parsed)?;
-    fetched.insert(abi_ref.cid.clone(), parsed.clone());
+    fetched.insert(key, parsed.clone());
     Ok(parsed)
 }
 
@@ -2577,6 +2620,157 @@ dataSources:
         {"name":"from","type":"address","indexed":true},
         {"name":"to","type":"address","indexed":true},
         {"name":"value","type":"uint256","indexed":false}]}]"#;
+
+    /// **The whole of #1321, end to end**: a subgraph *repository* - `subgraph.yaml` beside
+    /// `abis/*.json`, which is what a builder has before they deploy - scaffolds a working nest
+    /// from a path, with no CID and no gateway anywhere in the run.
+    ///
+    /// It is deliberately not a unit test of the resolver: the resolver already has its own, and
+    /// three fixtures in this repo's history proved a handler and never the wiring. This drives
+    /// `init_from_subgraph`, which is what the operator types.
+    #[tokio::test]
+    async fn a_subgraph_repository_scaffolds_from_a_path_with_no_gateway() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("abis")).unwrap();
+        std::fs::write(repo.path().join("abis/Pool.json"), POOL_ABI).unwrap();
+        std::fs::write(
+            repo.path().join("subgraph.yaml"),
+            r#"
+specVersion: 0.0.5
+dataSources:
+  - kind: ethereum
+    name: Pool
+    network: mainnet
+    source:
+      abi: Pool
+      address: "0x0000000000000000000000000000000000000001"
+      startBlock: 1234
+    mapping:
+      abis:
+        - name: Pool
+          file: ./abis/Pool.json
+      eventHandlers:
+        - event: Transfer(indexed address,indexed address,uint256)
+          handler: handleTransfer
+"#,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = repo
+            .path()
+            .join("subgraph.yaml")
+            .to_string_lossy()
+            .into_owned();
+        let args = InitArgs {
+            addresses: vec![],
+            from: None,
+            from_subgraph: Some(source.clone()),
+            // Deliberately an unreachable gateway: if anything in this path touches IPFS, the test
+            // fails rather than quietly succeeding through a network it should never have used.
+            ipfs: vec!["http://127.0.0.1:1/never/".into()],
+            alias: vec![],
+            abi: vec![],
+            start_block: vec![],
+            chain: None,
+            rpc: vec![],
+            dir: dir.path().to_string_lossy().into_owned(),
+            no_timestamps: false,
+        };
+
+        init_from_subgraph(&source, &args)
+            .await
+            .expect("a repository manifest is the whole input a nest needs");
+
+        let config = Config::load(dir.path()).unwrap();
+        // `mainnet` is the canonical name in `chains.rs`; `ethereum` is one of its aliases.
+        assert_eq!(config.nest.chain, "mainnet");
+        assert_eq!(config.nest.chain_id, 1);
+        assert_eq!(
+            config.contracts.len(),
+            1,
+            "the dataSource must have become a contract"
+        );
+        // The issue says startBlock, the event allowlist and the handler notes carry over unchanged.
+        assert_eq!(config.contracts[0].start_block, Some(1234));
+
+        // And the ABI was vendored from disk, not invented or silently skipped - which is what the
+        // old `filter_map` did to a `file:` entry.
+        let vendored = std::fs::read_to_string(
+            dir.path()
+                .join(format!("abis/{}.json", config.contracts[0].alias)),
+        )
+        .expect("the ABI must have been vendored");
+        assert!(
+            vendored.contains("Transfer"),
+            "the vendored ABI is not the repository's: {vendored}"
+        );
+    }
+
+    /// A local repository may have a file whose name is also a CID. The two links render to the
+    /// same string, but one is disk content and the other is content addressed: sharing their
+    /// cache entry silently vendors the first ABI for both (#1321).
+    #[tokio::test]
+    async fn a_path_and_a_cid_with_the_same_spelling_do_not_share_an_abi_cache_entry() {
+        use crate::subgraph_import::{AbiLink, AbiRef, ManifestHome};
+
+        let remote = r#"[{"type":"event","name":"Remote","inputs":[]}]"#;
+        let cid = crate::cid::cid_v0_for(remote.as_bytes());
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(&cid),
+            r#"[{"type":"event","name":"Local","inputs":[]}]"#,
+        )
+        .unwrap();
+        let path: &'static str = Box::leak(format!("/{cid}").into_boxed_str());
+        let (gateway, handle) =
+            fake_gateway(vec![(path, Box::leak(remote.to_string().into_boxed_str()))]).await;
+
+        let nest = tempfile::tempdir().unwrap();
+        std::fs::create_dir(nest.path().join("abis")).unwrap();
+        let mut notes = Vec::new();
+        let mut fetched = std::collections::BTreeMap::new();
+        let home = ManifestHome::Local(repo.path().to_path_buf());
+        let gateways = vec![format!("{gateway}/")];
+
+        fetch_and_vendor_abi(
+            nest.path(),
+            "local",
+            &AbiRef {
+                name: "local".into(),
+                link: AbiLink::Path(cid.clone()),
+            },
+            &gateways,
+            &home,
+            &mut notes,
+            &mut fetched,
+        )
+        .await
+        .unwrap();
+        fetch_and_vendor_abi(
+            nest.path(),
+            "remote",
+            &AbiRef {
+                name: "remote".into(),
+                link: AbiLink::Cid(cid),
+            },
+            &gateways,
+            &home,
+            &mut notes,
+            &mut fetched,
+        )
+        .await
+        .unwrap();
+        handle.abort();
+
+        let local = std::fs::read_to_string(nest.path().join("abis/local.json")).unwrap();
+        let remote = std::fs::read_to_string(nest.path().join("abis/remote.json")).unwrap();
+        assert!(local.contains("Local"), "local ABI was replaced: {local}");
+        assert!(
+            remote.contains("Remote"),
+            "CID ABI reused the path cache entry: {remote}"
+        );
+    }
 
     #[tokio::test]
     async fn from_subgraph_recommendation_is_followable_end_to_end() {
