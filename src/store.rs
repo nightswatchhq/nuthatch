@@ -453,6 +453,49 @@ pub struct Store {
 ///
 /// Errors are returned rather than folded into `false`: an unreadable store is not an empty one, and
 /// the caller is the only one who knows which way to be wrong about it.
+/// The meta key under which a store records the decode registry it was indexed by.
+///
+/// Lives here rather than in `indexer` because it is a property of the store's meta table, and two
+/// spellings of one key is exactly the drift that [`recorded_registry_hash`] exists to close.
+pub const REGISTRY_KEY: &str = "registry_hash";
+/// Which formula [`REGISTRY_KEY`] was recorded under. Absent means the event registry alone; present
+/// means the full decode identity, which also covers call, `[[ipfs]]` and `[[calls]]` declarations.
+pub const IDENTITY_FORMULA_KEY: &str = "identity_formula";
+pub const IDENTITY_FORMULA: &str = "2";
+
+/// The formula this store recorded its registry hash under, read without creating anything.
+pub fn recorded_identity_formula(path: &Path) -> Result<Option<String>> {
+    let db = builder()
+        .open(path)
+        .with_context(|| format!("failed to open redb (non-creating) at {}", path.display()))?;
+    let rtx = db.begin_read()?;
+    let meta = rtx.open_table(META)?;
+    Ok(meta
+        .get(IDENTITY_FORMULA_KEY)?
+        .map(|v| v.value().to_string()))
+}
+
+/// The registry hash this store **recorded at indexing time**, read without creating anything.
+///
+/// `Ok(None)` means the store exists and has no recorded hash - a fresh store, or one written by a
+/// build from before the identity check (#653). An `Err` means the store could not be read at all:
+/// absent, corrupt, or locked by a live cursor.
+///
+/// This is the fact `adoptable` was missing (#1369). It was deciding a candidate's identity by
+/// re-running `build_manifest` over the candidate's files **with the running binary**, so a binary
+/// that changed how a column decodes - and moved the hash with it - recomputed an old dataset to the
+/// *new* identity and adopted it. `guard_registry_identity` then refused the adopted store at start,
+/// so nothing mixed was ever served, but the one chance to adopt had been spent and the mount was
+/// left holding a store it could never start from: #408's stuck shape through a different door.
+pub fn recorded_registry_hash(path: &Path) -> Result<Option<String>> {
+    let db = builder()
+        .open(path)
+        .with_context(|| format!("failed to open redb (non-creating) at {}", path.display()))?;
+    let rtx = db.begin_read()?;
+    let meta = rtx.open_table(META)?;
+    Ok(meta.get(REGISTRY_KEY)?.map(|v| v.value().to_string()))
+}
+
 pub fn store_holds_rows(path: &Path) -> Result<bool> {
     let db = builder()
         .open(path)

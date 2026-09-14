@@ -1,0 +1,108 @@
+{
+  "registry_hash": "0x00",
+  "tables": [
+    {
+      "alias": "vault",
+      "table": "vault__transfer",
+      "event": "Transfer(address,address,uint256)",
+      "topic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+      "columns": [
+        {"indexed": false, "name": "block_number", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "block_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "block_timestamp", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "tx_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "log_index", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "address", "sol_type": "implicit", "storage": "address"},
+        {"indexed": false, "name": "_seq", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": true, "name": "from", "sol_type": "address", "storage": "address"},
+        {"indexed": true, "name": "to", "sol_type": "address", "storage": "address"},
+        {"indexed": false, "name": "value", "sol_type": "uint256", "storage": "word32"}
+      ]
+    },
+    {
+      "alias": "pool",
+      "table": "pool__swap",
+      "event": "Swap(int256,uint128,int128,uint160,int24,uint24,uint64,int64)",
+      "topic0": "0x01",
+      "columns": [
+        {"indexed": false, "name": "block_number", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "block_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "block_timestamp", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "tx_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "log_index", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "address", "sol_type": "implicit", "storage": "address"},
+        {"indexed": false, "name": "_seq", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "amount0", "sol_type": "int256", "storage": "word32"},
+        {"indexed": false, "name": "liquidity", "sol_type": "uint128", "storage": "word16"},
+        {"indexed": false, "name": "delta", "sol_type": "int128", "storage": "word16"},
+        {"indexed": false, "name": "sqrtPriceX96", "sol_type": "uint160", "storage": "word32"},
+        {"indexed": false, "name": "tick", "sol_type": "int24", "storage": "i64"},
+        {"indexed": false, "name": "fee", "sol_type": "uint24", "storage": "u64"},
+        {"indexed": false, "name": "deadline", "sol_type": "uint64", "storage": "u64"},
+        {"indexed": false, "name": "offset", "sol_type": "int64", "storage": "i64"}
+      ]
+    },
+    {
+      "alias": "registry",
+      "table": "registry__record_set",
+      "event": "RecordSet(string,bytes32,bytes,string,bool,(address,uint256))",
+      "topic0": "0x02",
+      "columns": [
+        {"indexed": false, "name": "block_number", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "block_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "block_timestamp", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "tx_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "log_index", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "address", "sol_type": "implicit", "storage": "address"},
+        {"indexed": false, "name": "_seq", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": true, "name": "label", "sol_type": "string", "storage": "hash32"},
+        {"indexed": false, "name": "node", "sol_type": "bytes32", "storage": "fixed_bytes"},
+        {"indexed": false, "name": "data", "sol_type": "bytes", "storage": "bytes"},
+        {"indexed": false, "name": "name", "sol_type": "string", "storage": "string"},
+        {"indexed": false, "name": "enabled", "sol_type": "bool", "storage": "bool"},
+        {
+          "indexed": false, "name": "meta", "sol_type": "tuple", "storage": "json",
+          "components": [
+            {"name": "owner", "sol_type": "address", "storage": "address"},
+            {"name": "expiry", "sol_type": "uint256", "storage": "word32"}
+          ]
+        }
+      ]
+    },
+    {
+      "alias": "vault",
+      "table": "vault__paused",
+      "event": "Paused(address)",
+      "topic0": "0x03",
+      "columns": [
+        {"indexed": false, "name": "block_number", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "block_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "block_timestamp", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "tx_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "log_index", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "address", "sol_type": "implicit", "storage": "address"},
+        {"indexed": false, "name": "_seq", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "account", "sol_type": "address", "storage": "address"}
+      ]
+    },
+    {
+      "alias": "total_supply",
+      "kind": "call",
+      "selector": "0x18160ddd",
+      "table": "total_supply",
+      "columns": [
+        {"indexed": false, "name": "block_number", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "block_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "block_timestamp", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "tx_hash", "sol_type": "implicit", "storage": "bytes32"},
+        {"indexed": false, "name": "log_index", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "address", "sol_type": "implicit", "storage": "address"},
+        {"indexed": false, "name": "_seq", "sol_type": "implicit", "storage": "u64"},
+        {"indexed": false, "name": "calldata", "sol_type": "bytes", "storage": "bytes"},
+        {"indexed": false, "name": "result", "sol_type": "bytes", "storage": "bytes"},
+        {"indexed": false, "name": "reverted", "sol_type": "bool", "storage": "bool"},
+        {"indexed": false, "name": "content_address", "sol_type": "bytes32", "storage": "hash32"}
+      ]
+    }
+  ]
+}

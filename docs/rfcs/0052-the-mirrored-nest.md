@@ -359,10 +359,15 @@ tables      = ["*"]                        # or an explicit list
   both identities. The table lives in `mounts.toml` (per mount) or on the CLI
   (`--publish-target`, same pattern as `--state-rpc` / `--ipfs`). A solo nest has no
   `mounts.toml`, so the flag is the solo path.
-- **Minimal IAM, and it is a feature.** The publisher needs `PutObject`, `GetObject`,
-  `HeadObject`, `ListBucket` on the prefix. It does not need `DeleteObject`, and the docs
-  recommend not granting it: a credential that cannot delete makes the mirror immutable by
-  policy, which is the property the consumer is being sold.
+- **Minimal IAM, and it is a feature.** The publisher needs `s3:PutObject`, `s3:GetObject` and
+  `s3:AbortMultipartUpload` on the prefix, and `s3:ListBucket` on the bucket with an `s3:prefix`
+  condition. HEAD is authorised by `GetObject`; there is no `HeadObject` action. Without
+  `ListBucket` a missing key answers 403 rather than 404 and the first `sync` fails. Uploads are
+  multipart (S2), so without `AbortMultipartUpload` a failed upload leaves billable parts until a
+  lifecycle rule removes them. It does not need `DeleteObject`, and the docs recommend not
+  granting it: a credential that cannot delete makes the mirror **append-only** by policy. It does
+  not make it immutable, since `PutObject` can still overwrite a key; `doctor --publish` is what
+  catches an overwrite (amended 2026-09-13, S4).
 - **Public or private is the operator's call.** A public bucket is a public dataset. The docs
   say so in the same voice RFC-0019 uses for private nests, and `publish status` prints the
   target so nobody mirrors a private nest to the wrong prefix by accident.
@@ -372,9 +377,13 @@ tables      = ["*"]                        # or an explicit list
 - `nuthatch publish sync [--target …] [--dry-run]` - one reconciliation, exits non-zero on any
   failed put or a refused catalogue put. Backfill and repair are this command.
 - `nuthatch publish status` - target, local `sealed_through`, remote `sealed_through`, pending
-  segments and bytes, last error.
-- `nuthatch publish verify [--deep]` - walk the remote catalogue; HEAD every file (size,
-  checksum where the store returns it); `--deep` downloads and re-hashes. The remote twin of
+  segments and bytes, and any fault it can see itself (a missing local file, a corrupt remote
+  `publish.json`). It is a separate process, so it cannot report a running publisher's last
+  error; the admin row carries that publisher's dead-letter state (amended 2026-09-13, S4).
+- `nuthatch publish verify [--deep]` - walk the remote catalogue; HEAD every file and compare its
+  ETag with the one S3 would give the local file (MD5, or the MD5 of 8 MiB part MD5s); a store
+  whose ETag is not content-derived fails as unverifiable rather than passing; `--deep` downloads
+  and re-hashes. The remote twin of
   RFC-0047's `doctor` catalogue check, and `doctor` gains a `--publish` that runs the shallow
   form.
 - Metrics, in the RFC-0010 naming: `nuthatch_publish_sealed_through`, `nuthatch_publish_lag_blocks`
@@ -449,8 +458,10 @@ schemaEvolutionMode => 'addNewColumns')`; `try_cast(c AS DECIMAL(38,0))`.
 **Dune, the ingestion side.** What the Data Foundation pipeline needs from a third-party
 producer is a stable prefix of Parquet, a catalogue to know what is complete, and no reorgs to
 handle. This RFC produces exactly that and stops. How Dune registers such a prefix into a
-namespace is Dune's mechanism, to be confirmed internally (`[VERIFY]`); the RFC commits to the
-producer contract, not to the consumer's import path. Datashare is the opposite direction
+namespace was left as `[VERIFY]`. Public sources answer it (RFC-0055 §4, read 2026-09-13): there is no
+public way to register an object-storage prefix or read Parquet in place. The public route is copying
+rows in through the uploads create and insert API, which is §8's row-insert sidecar. The RFC still
+commits to the producer contract, not to the consumer's import path. Datashare is the opposite direction
 (Dune → warehouses) and is not relevant.
 
 ## §6 - Drawbacks

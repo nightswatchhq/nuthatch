@@ -450,6 +450,23 @@ who need more - none of it in the way of the happy path:
   bucket's auth. Self-hosted-first: the registry is decoupled and never mandatory - a self-built bundle
   and `load <file|dir>` need no registry at all. S3/MinIO/R2 is built in - configure it with the usual
   `AWS_*` env (`AWS_ENDPOINT` for non-AWS), verified live against Hetzner Object Storage.
+- **Mirror a nest to a bucket** ([RFC-0052](docs/rfcs/0052-the-mirrored-nest.md)). `nuthatch publish
+  sync --target s3://bucket/prefix` copies a nest's sealed Parquet segments, its catalogue and a
+  provenance envelope to any S3-compatible bucket or a directory, and `dev --publish-target` keeps
+  the mirror current as segments seal, uploading in streamed parts so ingestion does not wait on the
+  bucket. The mirror is keyed by the nest's data identity, not its NID: an edit that moves the NID but not
+  the data identity, which is the cosmetic case "Safe upgrades" below describes, keeps publishing to
+  the same dataset, and any edit that changes what is decoded forks a new one.
+  `publish status` says what is still to upload, `publish verify` checks every object against the
+  local segment (`--deep` re-downloads and re-hashes), and `doctor --publish` puts the mirror in a
+  health check. Reading it needs no nuthatch: DuckDB, Trino or anything that reads Parquet, as
+  [Reading a published nest](docs/reading-published-nest.md) describes.
+- **Dune queries for a nest** ([RFC-0055](docs/rfcs/0055-the-dune-view-emitter.md)). `nuthatch emit
+  dune --dir <nest> --out <dir> --source <namespace>` writes one DuneSQL query per event table,
+  casting every column to its DuneSQL type: 256-bit values to `uint256`/`int256`, addresses and
+  hashes to `varbinary`, block timestamps to `timestamp`. It is offline and deterministic and writes
+  nothing into the nest. Getting the rows into Dune is yours to arrange; the queries read
+  `dune.<source>.<table>`.
 - **Safe upgrades - no resync tax** (RFC-0020, RFC-0033). Updating a nest is not a subgraph-style
   genesis resync, and in 2.0 it needs no command to remember. The **runtime** classifies the update
   when a nest's identity changes: *compatible* (additive only) is applied, *breaking* (a
