@@ -50,8 +50,8 @@ Everything below is designed to confirm, refute, or quantify those statements.
 |---|---|---|
 | H1 | Full-chain backfill from Dune is infeasible on Analyst: required export volume exceeds monthly allowance by ≥ 100× for every chain Nuthatch supports. | Any supported chain's raw logs+txs for the nest's required range fit in < 40 GB (100× the monthly allowance). |
 | H2 | A contract-scoped seed backfill (all logs for a fixed contract set) fits in one month's allowance for at least one real nest (candidate: The Graph protocol contracts on Arbitrum One). | Estimated export size > 400 MB for every candidate nest. |
-| H3 | The sparse block index cuts backfill RPC calls for a contract-scoped nest whose tables are all log-derived by ≥ 90 % versus range scanning, with Dune cost < 50 credits per nest. | Measured reduction < 90 % or Dune cost > 50 credits. |
-| H4 | Head-following from Dune is worse than RPC on every axis (latency, cost, reorg visibility) and should not be attempted. | E6 finds Dune no worse than the RPC baseline, measured on the same contract set over the same window, on at least one axis: p95 lag behind head, $ per month, or reorgs observed. |
+| H3 | The sparse block index cuts backfill Alchemy CUs for a contract-scoped nest whose tables are all log-derived by ≥ 90 % versus range scanning, with Dune cost < 50 credits per nest. CUs, not calls, because S1 may make more calls than S0 while spending far fewer CUs, and CUs are what is billed. | Measured CU reduction < 90 % or Dune cost > 50 credits. |
+| H4 | Head-following from Dune is worse than RPC on latency and on cost, and should not be attempted. Reorg visibility is not part of the claim E6 tests: Dune exposes no parent-hash boundary (§2), and a 24 h window on Arbitrum will very likely contain no reorg, in which case both sources report none and nothing has been compared. | E6 finds Dune no worse than the RPC baseline, measured on the same contract set over the same window, on p95 lag behind head or on $ per month. |
 | H5 | For full-chain nests, a self-hosted archive node (or a cheaper provider) beats both Alchemy and any Dune hybrid on cost per backfilled block. | Measured cost/block for self-host ≥ Alchemy cost/block after amortizing hardware over 12 months. |
 | H6 | Raw ingestion is (or can be) done once per chain and shared across nests; if it isn't, that duplication dominates the Alchemy bill more than provider pricing does. | Nuthatch already shares raw stores across nests, or duplication accounts for < 20 % of spend. |
 
@@ -147,9 +147,9 @@ Each experiment lists its Dune credit budget. Total research budget: **600 credi
 - Credits: 0 (reuses E4 output).
 
 ### E6 - Head-following from Dune (H4, expected to fail fast)
-- Poll a narrow "logs for contract set in last N minutes" query every 5 minutes for 24 h; measure lag vs RPC head, credits/day, and behaviour across any reorg that occurs (Arbitrum reorgs are rare; simulate awareness by checking whether Dune ever *revises* a returned row).
-- RPC baseline, same contract set, same window: the p95 lag of Nuthatch's own RPC head-following (its tip-lag metric), its monthly cost from E1's head-following CUs × `A_price`, and the reorgs it observed through the parent-hash chain. Dune's cost is converted with `D_price` (§10) so both costs are in dollars.
-- Output: one row per axis (p95 lag, $/month, reorgs observed) with the Dune figure, the RPC figure, and which is worse. This table, not the kill criterion, decides H4.
+- Poll a narrow "logs for contract set in last N minutes" query every 5 minutes for 24 h; measure lag vs RPC head and credits/day. Record any row Dune revises after returning it, as a note for the memo; a revision is not a reorg boundary, and it is not an axis of the comparison.
+- RPC baseline, same contract set, same window: the p95 lag of Nuthatch's own RPC head-following (its tip-lag metric) and its monthly cost from E1's head-following CUs × `A_price`. Dune's cost is converted with `D_price` (§10) so both costs are in dollars.
+- Output: one row per axis (p95 lag, $/month) with the Dune figure, the RPC figure, and which is worse. This table, not the kill criterion, decides H4.
 - Kill criterion: stop the moment projected monthly credits exceed 200 or p95 lag exceeds 60 s. This is a budget cap: an abort ends polling, and the comparison is made on the data gathered up to it. Expect to stop within hours.
 - Credits: ≤ 100 (hard cap; abort at 100).
 
@@ -182,7 +182,7 @@ S3 (adaptive windows) likely also requires an ingestion change; S2 needs a seed-
 | G1 (after E2) | H1 confirmed | Close Q1 for full-chain nests permanently; stop entertaining "backfill from Dune" |
 | G2 (after E3) | Seed for the candidate nest < 400 MB | S2 stays on the table for measurement; else S2 closed |
 | G3 (after E4+E5) | ≥ 90 % CU reduction, < 50 credits, and no uncaught false negatives, on both E4 contract sets (the Graph candidate and the less sparse second set) | S1 accepted as the standard backfill path for log-derived scoped nests; §8 determines whether it needs a separate RFC |
-| G4 (after E6) | Dune is worse than the RPC baseline on all three axes of E6's comparison | H4 confirmed; head-following stays RPC forever; never revisit on this plan. Otherwise H4 is falsified: head-following still stays RPC, and the axis where Dune was no worse goes into the memo as the only ground for revisiting |
+| G4 (after E6) | Dune is worse than the RPC baseline on both axes of E6's comparison (p95 lag and $/month) | H4 confirmed; head-following stays RPC forever; never revisit on this plan. Otherwise H4 is falsified: head-following still stays RPC, and the axis where Dune was no worse goes into the memo as the only ground for revisiting |
 | G5 (after E7) | Self-host cheaper per block at ≥ 1 full backfill/quarter | Recommend an archive box for full-chain nests; Alchemy retained for head-following and state |
 
 Final output of this RFC: a one-page **decision memo** (§13) stating, per nest class (full-chain vs scoped), the recommended source for each concern I1–I11, with the measured numbers.
@@ -216,9 +216,10 @@ Savings are entirely in the first term of CU_S0, the range scan, so S1 is only i
 
 Full-chain nest (S0 vs S4):
 ```
-$_alchemy_backfill = B · Σ A_cu(per-block methods) · A_price / 1e6
-$_selfhost         = (box $/mo · 12 + snapshot/egress) / backfills_per_year
+$_alchemy_per_block  = Σ A_cu(per-block methods) · A_price / 1e6
+$_selfhost_per_block = (box $/mo · 12 + snapshot/egress) / (backfills_per_year · B)
 ```
+Both are dollars per backfilled block, which is the unit H5 and G5 compare.
 
 ## 11. Out-of-budget alternatives (for the record)
 
@@ -272,3 +273,4 @@ Results are recorded on the tracking issue, #1381, not as files in this repo.
 | 2026-09-14 | Review of #1382: H1's falsification threshold now matches its 100× claim (40 GB, not 4 GB), and S1, H3 and G3 are limited to log-derived scoped nests, since a block list from `logs` cannot see calls or state changes that emit nothing. |
 | 2026-09-14 | Review of #1382: the second, less sparse contract set moves from a §12 mitigation into E4 and G3's condition, so S1 is not accepted on one sparse nest. E4 is capped at 200 credits per set; the experiments total 545 against the 600 budget. |
 | 2026-09-14 | Review of #1382: H4 and G4 compare Dune with an RPC baseline measured on the same contract set and window, axis by axis, instead of against absolute thresholds that could pass while Dune was cheaper or faster than RPC. E6's kill criterion stays, as a budget cap that ends polling rather than a verdict. |
+| 2026-09-14 | Review of #1382: H3 is stated in CUs, the unit E4 measures and G3 gates, since S1 can make more calls while spending fewer CUs. Reorg visibility leaves H4 and G4: a 24 h window with no reorg compares nothing, and a revised Dune row is not a reorg boundary. The self-host cost in §10 is divided by the blocks in a backfill, so both sides of H5 and G5 are dollars per block. |
