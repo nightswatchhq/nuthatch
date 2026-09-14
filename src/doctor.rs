@@ -44,19 +44,33 @@ use crate::source::Source;
 /// halved for headroom. It is one cross-endpoint data point, not a universal ceiling.
 const RANGE_ONLY_WINDOW_CAP: u64 = 320;
 
-/// Spans tried, widest first, when sampling for a contract to probe with (#1323).
+/// Spans tried, **narrowest first**, when sampling for a contract to probe with (#1323).
 ///
-/// A *descending* ladder rather than one constant, because the right sample size is a property of
-/// the chain and there is no value that suits both ends. Measured on 2026-09-14: an unfiltered
-/// 25-block sample on Gnosis returns 1,461 logs quite happily, while Base refuses 10 blocks with
-/// "backend response too large" and answers 5 with 5,116. A fixed 25 would simply have found
-/// nothing on Base, which is exactly the silent floor this change exists to remove.
+/// The order is the safety property, not a preference. This is the one unfiltered `eth_getLogs` in
+/// the binary, and nothing bounds how large a provider's answer to it may be - so the first request
+/// is the smallest one that could possibly work, and the ladder widens only when the sample already
+/// in hand says the next rung is affordable (Jules on #1385). Asking for the widest window first and
+/// narrowing on refusal, which is what the first cut did, relies on the provider to refuse - and a
+/// provider that cheerfully answers is exactly the case that hurts.
 ///
-/// One block is kept as the last rung because it is still a perfectly good sample - 810 logs on
-/// Base, 74 on Gnosis - and finding *a* busy contract is all this needs to do.
+/// One block is a perfectly good sample where there is anything to see: measured on 2026-09-14, an
+/// unfiltered single block returns 810 logs on Base and 74 on Gnosis. Widening is for chains quiet
+/// enough that one block shows too little, and on those the wider request is cheap by construction.
 ///
-/// At most one request per rung, and the first that answers wins, so the usual cost is one call.
-const DISCOVERY_SPANS: [u64; 5] = [25, 10, 5, 2, 1];
+/// Cost in practice: one request on a busy chain, two on a quiet one, three where there is almost
+/// nothing to find.
+const DISCOVERY_SPANS: [u64; 3] = [1, 5, 25];
+
+/// Enough sampled logs to rank contracts by activity. Past this a wider sample cannot change the
+/// answer, so it is not worth the request or the memory.
+const DISCOVERY_ENOUGH: usize = 200;
+
+/// Projected log count above which the ladder will not widen, whatever the provider would allow.
+///
+/// Log density is roughly stable block to block, so logs-per-block times the next span is a fair
+/// forecast of what the next request returns. Refusing on that forecast is the difference between
+/// bounding this by evidence and bounding it by hope that the endpoint says no.
+const DISCOVERY_BUDGET: usize = 20_000;
 
 /// What one endpoint can actually do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,15 +194,33 @@ async fn discover_probe_address(rpc: &RpcClient, tip: u64) -> Option<(String, us
     // rather than width, and a sample that fails for the wrong reason is worse than no sample.
     let to = tip.saturating_sub(100);
     let mut logs = Vec::new();
+    let mut sampled_span = 0u64;
     for span in DISCOVERY_SPANS {
-        let from = to.saturating_sub(span.saturating_sub(1));
-        // A refusal here is ordinary - a dense chain, or a provider that will not serve unfiltered
-        // logs at all - so it narrows the sample rather than ending the attempt.
-        if let Ok(got) = rpc.get_logs(&[], &[], from, to).await {
-            if !got.is_empty() {
-                logs = got;
+        if !logs.is_empty() {
+            // Enough to rank by. A wider sample cannot change which contract is busiest by enough
+            // to matter, and this is the only place in `doctor` that holds an unbounded response.
+            if logs.len() >= DISCOVERY_ENOUGH {
                 break;
             }
+            // Widen only on what the previous rung actually measured. `sampled_span` is non-zero
+            // whenever `logs` is, so the division is safe.
+            let projected = logs.len().saturating_mul(span as usize) / sampled_span as usize;
+            if projected > DISCOVERY_BUDGET {
+                break;
+            }
+        }
+        let from = to.saturating_sub(span.saturating_sub(1));
+        match rpc.get_logs(&[], &[], from, to).await {
+            // An empty answer is a quiet stretch, not a refusal: widen and look again.
+            Ok(got) => {
+                sampled_span = span;
+                if !got.is_empty() {
+                    logs = got;
+                }
+            }
+            // A refusal ends the ladder either way. At the first rung the provider will not serve
+            // unfiltered logs at all; at a later one, whatever is already in hand is the sample.
+            Err(_) => break,
         }
     }
     let mut tally: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -880,6 +912,16 @@ mod tests {
         logs: &[&str],
         max_span: u64,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        log_serving_rpc_recording(logs, max_span, Default::default()).await
+    }
+
+    /// As above, and recording every **unfiltered** span asked for, in order. The order is the
+    /// safety property #1385 turned on, so it has to be assertable.
+    async fn log_serving_rpc_recording(
+        logs: &[&str],
+        max_span: u64,
+        spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{extract::State, routing::post, Json, Router};
         use serde_json::Value;
 
@@ -903,6 +945,7 @@ mod tests {
         struct St {
             rows: std::sync::Arc<Vec<Value>>,
             max_span: u64,
+            spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
         }
 
         fn hex_u64(v: Option<&Value>) -> Option<u64> {
@@ -934,7 +977,11 @@ mod tests {
                             )
                         })
                         .unwrap_or(1);
-                    // The dense-chain refusal, which is what the ladder exists to climb down.
+                    if !filtered {
+                        st.spans.lock().unwrap().push(span);
+                    }
+                    // The dense-chain refusal a provider may or may not give; the ladder must be
+                    // safe whether or not it does.
                     if !filtered && span > st.max_span {
                         return Json(json!({
                             "jsonrpc":"2.0","id":1,
@@ -954,6 +1001,7 @@ mod tests {
             .with_state(St {
                 rows: std::sync::Arc::new(rows),
                 max_span,
+                spans,
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -963,27 +1011,95 @@ mod tests {
         (format!("http://{addr}/"), handle)
     }
 
-    /// A chain too dense for the widest sample still yields one. Measured on Base: 25 and 10 blocks
-    /// are refused, 5 answers. A single fixed span would simply have found nothing there and printed
-    /// the range-only floor, which is the whole failure #1323 is about.
+    /// **The first unfiltered request is the narrowest one**, which is the whole of #1385's fix.
+    ///
+    /// This is the only unfiltered `eth_getLogs` in the binary and nothing bounds how large an
+    /// answer to it may be, so the safety cannot rest on the provider refusing: a provider that
+    /// cheerfully answers a wide firehose is precisely the case that hurts. The first cut asked
+    /// widest-first and narrowed on refusal, which is bounded by hope. This asserts the order.
     #[tokio::test]
-    async fn a_sample_too_wide_for_the_chain_narrows_until_it_answers() {
-        let (url, handle) = log_serving_rpc_capped(
-            &[
-                "0xdddddddddddddddddddddddddddddddddddddddd",
-                "0xdddddddddddddddddddddddddddddddddddddddd",
-                "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            ],
-            5,
+    async fn the_first_unfiltered_sample_is_the_narrowest() {
+        let spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
+        let (url, handle) = log_serving_rpc_recording(
+            &["0xdddddddddddddddddddddddddddddddddddddddd"; 250],
+            u64::MAX,
+            spans.clone(),
         )
         .await;
         let rpc = RpcClient::new(vec![url]).unwrap();
         let found = discover_probe_address(&rpc, 0x100000).await;
         handle.abort();
+
+        let asked = spans.lock().unwrap().clone();
+        assert_eq!(
+            asked.first().copied(),
+            Some(1),
+            "the first unfiltered request asked for {asked:?} blocks - a wide one goes out before \
+             anything is known about the chain's density"
+        );
+        // 250 logs clears DISCOVERY_ENOUGH, so a busy chain costs exactly one request and the
+        // widest rung is never asked for at all.
+        assert_eq!(
+            asked.len(),
+            1,
+            "a sample that already answers the question asked again: {asked:?}"
+        );
+        assert_eq!(found.map(|(_, n)| n), Some(250));
+    }
+
+    /// A chain quiet enough to need a wider sample gets one - the ladder must widen, or it only
+    /// ever works where one block happens to be enough.
+    #[tokio::test]
+    async fn a_quiet_chain_widens_until_the_sample_says_something() {
+        let spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
+        let (url, handle) = log_serving_rpc_recording(
+            &[
+                "0xdddddddddddddddddddddddddddddddddddddddd",
+                "0xdddddddddddddddddddddddddddddddddddddddd",
+                "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            ],
+            u64::MAX,
+            spans.clone(),
+        )
+        .await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let found = discover_probe_address(&rpc, 0x100000).await;
+        handle.abort();
+
+        let asked = spans.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![1, 5, 25],
+            "three logs is far under DISCOVERY_ENOUGH, so every rung should have been tried"
+        );
         assert_eq!(
             found,
             Some(("0xdddddddddddddddddddddddddddddddddddddddd".to_string(), 2)),
-            "the ladder gave up instead of narrowing to a span the endpoint would serve"
+            "widening found nothing, so a quiet chain still gets only the range-only floor"
+        );
+    }
+
+    /// A provider that refuses the unfiltered request outright ends the ladder at the first rung,
+    /// rather than trying four more times against an endpoint that has already said no. Measured:
+    /// `ethereum-rpc.publicnode.com` answers "Please specify an address in your request".
+    #[tokio::test]
+    async fn a_provider_that_refuses_unfiltered_logs_is_asked_once() {
+        let spans: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
+        let (url, handle) = log_serving_rpc_recording(
+            &["0xdddddddddddddddddddddddddddddddddddddddd"],
+            0, // refuses every span, including one block
+            spans.clone(),
+        )
+        .await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let found = discover_probe_address(&rpc, 0x100000).await;
+        handle.abort();
+
+        assert_eq!(found, None, "a refusal is not a discovery");
+        assert_eq!(
+            spans.lock().unwrap().len(),
+            1,
+            "the ladder kept asking an endpoint that had already refused"
         );
     }
 
