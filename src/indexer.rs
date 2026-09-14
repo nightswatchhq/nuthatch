@@ -5889,9 +5889,11 @@ impl NestIngest {
             Finality::Depth(_) => None,
         };
         let finalized_through = seal_ceiling(self.finality, tip, finalized_tag);
-        let finalized_through = match &self.ipfs_gate {
+        let Some(finalized_through) = (match &self.ipfs_gate {
             Some(gate) => hold_for_documents(self.store.as_ref(), gate, finalized_through)?,
-            None => finalized_through,
+            None => Some(finalized_through),
+        }) else {
+            return Ok(Some(stored));
         };
 
         // Seal any newly-finalized range to an immutable Parquet segment, stamping the
@@ -6346,7 +6348,8 @@ fn block_number_of(json: &str) -> Option<u64> {
 }
 
 /// The block a finalized range may seal through while documents it names are outstanding
-/// (RFC-0037 §3): one below the lowest block holding one, or `finalized_through` when none is.
+/// (RFC-0037 §3): one below the lowest block holding one, `finalized_through` when none is, and `None`
+/// when that block is block 0, where "one below" does not exist and nothing may seal.
 ///
 /// Read in chunks from the watermark up and stopped at the first outstanding document, which is
 /// normally near the watermark, so a long run of resolved documents above it is not reloaded per window.
@@ -6354,7 +6357,7 @@ fn hold_for_documents(
     store: &dyn crate::store::HotStore,
     gate: &crate::ipfs_resolve::Gate,
     finalized_through: u64,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     const CHUNK: u64 = 256;
     let mut lo = match store.get_meta(SEALED_THROUGH_KEY)? {
         Some(v) => v.parse::<u64>().context("corrupt sealed_through")? + 1,
@@ -6364,14 +6367,14 @@ fn hold_for_documents(
         let hi = lo.saturating_add(CHUNK - 1).min(finalized_through);
         let entities = store.entities_in_range(lo, hi)?;
         if let Some(pending) = gate.lowest_pending(store, &entities)? {
-            return Ok(pending.saturating_sub(1));
+            return Ok(pending.checked_sub(1));
         }
         if hi == u64::MAX {
             break;
         }
         lo = hi + 1;
     }
-    Ok(finalized_through)
+    Ok(Some(finalized_through))
 }
 
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
@@ -11222,7 +11225,7 @@ template = "pool"
         let gate = nest.ipfs_gate.clone().expect("a gate");
         assert_eq!(
             hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
-            3
+            Some(3)
         );
 
         let metrics = Arc::new(crate::metrics::NestMetrics::default());
@@ -11247,10 +11250,42 @@ template = "pool"
         );
         assert_eq!(
             hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
-            9_000,
+            Some(9_000),
             "a document given up on no longer holds its range"
         );
         drop(resolver);
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// The hold returned one below the lowest outstanding document, which for a document at block 0 is
+    /// block 0 itself, so its range sealed without it (#1374 review).
+    #[tokio::test]
+    async fn a_document_outstanding_at_block_zero_holds_block_zero() {
+        let cid = crate::cid::cid_v0_for(b"no gateway holds this either");
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::new(), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(0, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        for b in [0, 1] {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        assert_eq!(
+            nest.store.get_meta(SEALED_THROUGH_KEY).unwrap(),
+            None,
+            "block 0 sealed while the document it names was outstanding"
+        );
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            None
+        );
         drop(nest);
         drop(state);
         handle.abort();
