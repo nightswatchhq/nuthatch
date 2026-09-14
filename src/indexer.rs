@@ -1841,7 +1841,12 @@ async fn runtime_index_loop(
         }
     }
 
-    let mut chunker = AdaptiveWindow::for_window(window);
+    // The cursor is shared, so its window is capped for the most demanding nest on it.
+    let mut chunker = tip_window(
+        nests.iter().flatten().any(|n| n.ipfs_gate.is_some()),
+        nests.iter().flatten().any(|n| n.registry.blocks()),
+        window,
+    );
     let mut poll_failures = 0u32;
     // One dial per cursor (RFC-0040). Every nest on it was mounted by the same operator flags, so
     // they agree; if they ever did not, the cursor is as fresh as its most demanding nest needs.
@@ -3543,6 +3548,18 @@ pub const MAX_OUTSTANDING_DOCUMENTS: u64 = 16;
 
 fn documents_backlogged(pending: u64) -> bool {
     pending >= MAX_OUTSTANDING_DOCUMENTS
+}
+
+/// The window controller for a tip loop, by the same rule the backfill paths use. A document nest's
+/// rows stay hot until its window commits and seals, so its window is capped however few logs it sees.
+fn tip_window(documents: bool, headers: bool, window: u64) -> AdaptiveWindow {
+    if documents {
+        AdaptiveWindow::for_window_with_documents(window)
+    } else if headers {
+        AdaptiveWindow::for_window_with_headers(window)
+    } else {
+        AdaptiveWindow::for_window(window)
+    }
 }
 
 /// Blocks of full bodies held at once while decoding top-level calls.
@@ -6136,11 +6153,7 @@ async fn index_loop(
     // hundred thousand headers in one window - trading a getLogs pathology for the header fan-out
     // pathology RFC-0036 exists to prevent. Capped, `observed(0)` settles at `HEADER_WINDOW_CAP`, which
     // is the intended steady state for a nest whose windows are all zero-log by construction.
-    let mut chunker = if nest.registry.blocks() {
-        AdaptiveWindow::for_window_with_headers(window)
-    } else {
-        AdaptiveWindow::for_window(window)
-    };
+    let mut chunker = tip_window(nest.ipfs_gate.is_some(), nest.registry.blocks(), window);
     // Live catch-up feedback (RFC-0015 slice 3): a single progress line while the hot loop chases
     // the tip for the *first* time, ending on a crisp "caught up". `None` until there's actually a
     // backlog to report; `caught_up` latches after the first catch-up so steady-state tip-following
@@ -11440,6 +11453,32 @@ template = "pool"
         assert!(!documents_backlogged(MAX_OUTSTANDING_DOCUMENTS - 1));
         assert!(documents_backlogged(MAX_OUTSTANDING_DOCUMENTS));
         assert!(documents_backlogged(u64::MAX));
+    }
+
+    /// The tip loop's window had no document branch, so an event-less QoS nest grew it to 80,000 blocks
+    /// and held 1,209,792 typed rows hot, none sealed, before the window committed (#1376 review). A
+    /// document nest's tip window is capped as its seal-direct window is, however many empty windows.
+    #[test]
+    fn a_document_nests_tip_window_is_capped_however_few_logs_it_sees() {
+        let widest = |documents: bool, headers: bool| {
+            let mut w = tip_window(documents, headers, 20_000);
+            let mut most = w.window();
+            for _ in 0..32 {
+                w.observed(0);
+                most = most.max(w.window());
+            }
+            most
+        };
+        assert!(widest(true, false) <= crate::chunker::DOCUMENT_WINDOW_CAP);
+        assert!(
+            widest(true, true) <= crate::chunker::DOCUMENT_WINDOW_CAP,
+            "documents take precedence over headers"
+        );
+        assert!(widest(false, true) <= crate::chunker::HEADER_WINDOW_CAP);
+        assert!(
+            widest(false, false) > crate::chunker::HEADER_WINDOW_CAP,
+            "premise: an event nest's window still grows past both caps"
+        );
     }
 
     /// Bodies came one 200-block batch at a time, 77.6 blocks/s on rpc.gnosischain.com against the
