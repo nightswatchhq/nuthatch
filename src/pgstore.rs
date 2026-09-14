@@ -464,6 +464,48 @@ impl HotStore for PgStore {
         })
     }
 
+    fn scan_entities_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        visit: &mut dyn FnMut(u64, &str) -> bool,
+    ) -> Result<()> {
+        const PAGE: i64 = 1_000;
+        let hi = format!("{to:012}-999999");
+        let mut after: Option<String> = None;
+        loop {
+            let (lo, op) = match &after {
+                Some(k) => (k.clone(), ">"),
+                None => (format!("{from:012}-000000"), ">="),
+            };
+            let sql = format!(
+                "SELECT key, value FROM \"{}\".entities WHERE key {op} $1 AND key <= $2 \
+                 ORDER BY key LIMIT $3",
+                self.schema
+            );
+            let hi = hi.clone();
+            let page: Vec<(String, String)> = self.conn.with(move |c| {
+                Ok(c.query(&sql, &[&lo, &hi, &PAGE])?
+                    .into_iter()
+                    .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                    .collect())
+            })?;
+            for (key, value) in &page {
+                let block = key
+                    .get(..12)
+                    .and_then(|b| b.parse::<u64>().ok())
+                    .with_context(|| format!("corrupt entity key {key:?}"))?;
+                if !visit(block, value) {
+                    return Ok(());
+                }
+            }
+            match page.last() {
+                Some((key, _)) if page.len() as i64 == PAGE => after = Some(key.clone()),
+                _ => return Ok(()),
+            }
+        }
+    }
+
     fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
         let sql = format!(
             "SELECT key FROM \"{}\".entities ORDER BY key LIMIT $1",

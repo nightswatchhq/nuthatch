@@ -2974,6 +2974,12 @@ fn shorten_store(url: &str) -> &str {
 /// finalized range to the same threshold without duplicating the number.
 pub const SEAL_DIRECT_BATCH: usize = 20_000;
 
+/// Bytes of row JSON at which both seal paths cut a segment, beside the row threshold and the span
+/// (RFC-0028 §4, amended 2026-09-13). A constant, not a knob: a boundary an operator could move would
+/// give two operators different segments over identical rows. Rows averaging under ~3.3 KB reach the
+/// row threshold first, so event nests cut where they always did; rows carrying documents cut here.
+pub const SEAL_DIRECT_BYTES: usize = 64 * 1024 * 1024;
+
 /// How many blocks at the end of every fetched window are asked for **again** with the next one
 /// (#1144, RFC-0049 §1).
 ///
@@ -3102,44 +3108,97 @@ fn take_sealable(
     // the rows went missing behind it. Caught by `authoring_eval_board`, which indexes exactly that
     // chain. The frontier is the highest block that is both final and inside the range being sealed.
     let frontier = hold_from.saturating_sub(1).min(range_to);
-    let cut_block = seal_cut(buf[0].0, eligible, |i| Some(buf[i].0), frontier, seal_span)?;
+    let mut scan = CutScan::new(frontier, seal_span);
+    for r in &buf[..eligible] {
+        if !scan.push_at(r.2.len(), r.0) {
+            break;
+        }
+    }
+    let cut_block = scan.cut()?;
     let n = buf.partition_point(|r| r.0 <= cut_block);
     let rows = buf.drain(..n).map(|(_, _, j)| j).collect();
     Some((rows, cut_block))
 }
 
-/// The shared cut rule for both seal paths: the earlier of the row threshold and the span bound.
+/// The shared cut rule for both seal paths, fed one row at a time in chain order so a caller stops
+/// reading once the cut is known. The cut is the earliest of:
 ///
-/// - `first` is the block of the oldest held row, `eligible` how many held rows are final, `block_at`
-///   reads the block of the *i*th held row, and `frontier` the highest block that is final.
-/// - **Row cut**, unchanged: the block carrying the buffer past `SEAL_DIRECT_BATCH` (RFC-0028 §4).
-/// - **Span cut** (#1199): `first + seal_span - 1`, once the frontier has reached it.
+/// - **Row cut**: the block carrying the rows past [`SEAL_DIRECT_BATCH`] (RFC-0028 §4).
+/// - **Byte cut**: the block carrying the rows' JSON past [`SEAL_DIRECT_BYTES`].
+/// - **Span cut** (#1199): `first + seal_span - 1`, once `frontier` has reached it.
 ///
-/// The span is anchored on the **oldest held row**, not on the previous watermark. That keeps it a
-/// property of the data, exactly like the row cut - so the two seal paths, which see the same rows
-/// and make the same earlier cuts, compute the same boundary - and it can never land before the
-/// first row, so a span cut never produces an empty segment.
-///
-/// Taking the **earlier** of the two is what makes the paths agree. A backfill has the whole history
-/// in hand and would otherwise reach the row threshold inside a window the tip path had already cut
-/// on span, and the same range would seal into different segments depending on which path got there.
-fn seal_cut(
-    first: u64,
-    eligible: usize,
-    block_at: impl Fn(usize) -> Option<u64>,
+/// All three are anchored on the oldest held row, so they are properties of the data and both paths,
+/// seeing the same rows, cut at the same blocks. Taking the earliest is what makes them agree: a
+/// backfill holding the whole history would otherwise reach a size cut inside a range the tip path
+/// had already cut on span. A row past a known span end cannot move the cut, since it could only cross
+/// a size threshold at a block the span cut already precedes, so a scan holding each row's block stops
+/// there ([`CutScan::push_at`]) rather than reading a sparse range to its ceiling.
+struct CutScan {
     frontier: u64,
     seal_span: u64,
-) -> Option<u64> {
-    let row_cut = (eligible >= SEAL_DIRECT_BATCH)
-        .then(|| block_at(SEAL_DIRECT_BATCH - 1))
-        .flatten();
-    let span_end = first.saturating_add(seal_span.saturating_sub(1));
-    let span_cut = (seal_span > 0 && frontier >= span_end).then_some(span_end);
-    match (row_cut, span_cut) {
-        (Some(r), Some(s)) => Some(r.min(s)),
-        (Some(r), None) => Some(r),
-        (None, Some(s)) => Some(s),
-        (None, None) => None,
+    first: Option<u64>,
+    rows: usize,
+    bytes: usize,
+    size_cut: Option<u64>,
+}
+
+impl CutScan {
+    fn new(frontier: u64, seal_span: u64) -> Self {
+        Self {
+            frontier,
+            seal_span,
+            first: None,
+            rows: 0,
+            bytes: 0,
+            size_cut: None,
+        }
+    }
+
+    /// The next row; `false` once no later row can move the cut. `block` is read only for the first
+    /// row and the row that crosses a threshold.
+    fn push(&mut self, json_len: usize, block: impl FnOnce() -> u64) -> bool {
+        if self.size_cut.is_some() {
+            return false;
+        }
+        let mut block = Some(block);
+        let mut read = || (block.take().expect("a row's block is read once"))();
+        let mut this = None;
+        if self.first.is_none() {
+            let b = read();
+            this = Some(b);
+            self.first = Some(b);
+        }
+        self.rows += 1;
+        self.bytes = self.bytes.saturating_add(json_len);
+        if self.rows >= SEAL_DIRECT_BATCH || self.bytes >= SEAL_DIRECT_BYTES {
+            self.size_cut = Some(this.unwrap_or_else(read));
+            return false;
+        }
+        true
+    }
+
+    /// [`push`](Self::push) for a caller that already holds the row's block, stopping at the first row
+    /// past a span end already known.
+    fn push_at(&mut self, json_len: usize, block: u64) -> bool {
+        if let Some(end) = self.first.and_then(|f| self.span_end(f)) {
+            if block > end {
+                return false;
+            }
+        }
+        self.push(json_len, || block)
+    }
+
+    fn span_end(&self, first: u64) -> Option<u64> {
+        let end = first.saturating_add(self.seal_span.saturating_sub(1));
+        (self.seal_span > 0 && self.frontier >= end).then_some(end)
+    }
+
+    fn cut(&self) -> Option<u64> {
+        let span_cut = self.span_end(self.first?);
+        match (self.size_cut, span_cut) {
+            (Some(s), Some(e)) => Some(s.min(e)),
+            (s, e) => s.or(e),
+        }
     }
 }
 
@@ -6320,22 +6379,26 @@ fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64
 
 /// Block at which the tip path should cut a segment, or `None` to keep holding in the hot store.
 ///
-/// Same rule as [`take_sealable`], via the same [`seal_cut`]: the earlier of the `SEAL_DIRECT_BATCH`
-/// row threshold and the chain's `seal_span`. The cut is a function of the rows, not of when
-/// finality advanced, so two operators whose tips move on different schedules still produce
+/// Same rule as [`take_sealable`], via the same [`CutScan`]. The cut is a function of the rows, not
+/// of when finality advanced, so two operators whose tips move on different schedules still produce
 /// identical segments (#1067, #1199). A range with no rows is `None` as well; the caller advances
-/// the watermark in that case because there is nothing to batch.
+/// the watermark in that case because there is nothing to batch. [`maybe_seal`] runs the same scan
+/// over the store without loading the range.
+#[cfg(test)]
 fn tip_seal_cut(entities: &[String], ceiling: u64, seal_span: u64) -> Option<u64> {
-    let first = block_number_of(entities.first()?)?;
-    seal_cut(
-        first,
-        entities.len(),
-        |i| block_number_of(&entities[i]),
-        ceiling,
-        seal_span,
-    )
+    let mut scan = CutScan::new(ceiling, seal_span);
+    for json in entities {
+        let pushed = scan.push(json.len(), || {
+            block_number_of(json).expect("a test row carries its block_number")
+        });
+        if !pushed {
+            break;
+        }
+    }
+    scan.cut()
 }
 
+#[cfg(test)]
 fn block_number_of(json: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     match v.get("block_number")? {
@@ -6413,7 +6476,12 @@ async fn maybe_seal(
         if ceiling < from {
             return Ok(());
         }
-        let mut entities = store.entities_in_range(from, ceiling)?;
+        // Read only as far as the cut: a finalized range of documents is gigabytes (3.17 GB RSS
+        // measured on 678 QoS payloads, 2026-09-13), and the cut needs a block and a length per row.
+        let mut scan = CutScan::new(ceiling, seal_span);
+        store.scan_entities_in_range(from, ceiling, &mut |block, json| {
+            scan.push_at(json.len(), block)
+        })?;
         // **Advance across a leading stretch that carries no rows, before deciding anything.**
         //
         // Without this the span bound is `first_held_row + seal_span`, not `watermark + seal_span`,
@@ -6428,7 +6496,7 @@ async fn maybe_seal(
         // which is vacuously true of a range holding no rows. The checkpoint is pinned for the same
         // reason the empty arm pins one: a later reorg walk must not skip past the watermark to an
         // older sparse checkpoint and trip the finality guard on a block it never touched (#461).
-        if let Some(first) = entities.first().and_then(|j| block_number_of(j)) {
+        if let Some(first) = scan.first {
             if first > from {
                 if let Ok(Some(hash)) = source.block_hash(first - 1).await {
                     store.set_block_hash(first - 1, &hash)?;
@@ -6442,11 +6510,10 @@ async fn maybe_seal(
                     first - 1
                 );
                 from = first;
-                entities = store.entities_in_range(from, ceiling)?;
             }
         }
-        let cut = match tip_seal_cut(&entities, ceiling, seal_span) {
-            None if entities.is_empty() => {
+        let cut = match scan.cut() {
+            None if scan.first.is_none() => {
                 // Finalized range with no transfers - just advance the watermark. Pinning a
                 // checkpoint at the new watermark is what stops a later reorg from walking past it
                 // to an older surviving checkpoint and tripping the finality guard on a block the
@@ -6475,7 +6542,7 @@ async fn maybe_seal(
                     store.set_block_hash(ceiling, &hash)?;
                 }
                 tracing::debug!(
-                    rows = entities.len(),
+                    rows = scan.rows,
                     threshold = SEAL_DIRECT_BATCH,
                     from,
                     ceiling,
@@ -7523,6 +7590,76 @@ mod tests {
         );
     }
 
+    fn doc_json(block: u64, i: u64, size: usize) -> String {
+        let doc = "x".repeat(size);
+        format!(r#"{{"table":"t__doc","block_number":{block},"log_index":{i},"doc":"{doc}"}}"#)
+    }
+
+    /// A row carrying a document is megabytes, so a range of them never reached the row threshold and
+    /// was sealed whole: 678 QoS payloads, about 1.1 GB of JSON, 3.17 GB RSS (2026-09-13).
+    #[test]
+    fn rows_carrying_documents_are_cut_by_bytes() {
+        let json: Vec<String> = (0..100u64).map(|b| doc_json(b, 0, 1024 * 1024)).collect();
+        assert!(json.len() < SEAL_DIRECT_BATCH);
+        let mut sum = 0;
+        let expected = json
+            .iter()
+            .position(|j| {
+                sum += j.len();
+                sum >= SEAL_DIRECT_BYTES
+            })
+            .expect("the corpus must cross the byte threshold") as u64;
+
+        assert_eq!(
+            tip_seal_cut(&json, 99, SPAN_OFF),
+            Some(expected),
+            "the tip path must cut at the block whose row carries the range past SEAL_DIRECT_BYTES"
+        );
+        let mut buf: Vec<SealRow> = json
+            .iter()
+            .enumerate()
+            .map(|(b, j)| (b as u64, 0, j.clone()))
+            .collect();
+        let (sealed, cut) = take_sealable(&mut buf, u64::MAX, 99, SPAN_OFF)
+            .expect("the backfill path must cut a range this large");
+        assert_eq!(cut, expected, "tip and backfill disagree on the byte cut");
+        assert!(
+            sealed.iter().map(String::len).sum::<usize>() < SEAL_DIRECT_BYTES + json[0].len(),
+            "a byte cut sealed more than the threshold and one row"
+        );
+    }
+
+    /// The byte cut is a property of the rows, like the row cut, so it must not move with the window.
+    #[test]
+    fn a_byte_cut_is_the_same_however_the_range_was_fetched() {
+        let mut rows: Vec<SealRow> = Vec::new();
+        for b in 0..240u64 {
+            for i in 0..(b % 2 + 1) {
+                let size = 200_000 + ((b * 7_919 + i) % 500_000) as usize;
+                rows.push((b, i, doc_json(b, i, size)));
+            }
+        }
+        assert!(rows.iter().map(|r| r.2.len()).sum::<usize>() > 2 * SEAL_DIRECT_BYTES);
+        let shape = |run: SealRun| -> (Vec<(u64, usize)>, usize) {
+            (
+                run.0.iter().map(|(r, cut)| (*cut, r.len())).collect(),
+                run.1.len(),
+            )
+        };
+        let one = shape(seal_through_windows(&rows, 239, 1));
+        assert!(
+            one.0.len() >= 2,
+            "the corpus must cut on bytes more than once, or this compares nothing"
+        );
+        for window in [7, 64, 1_000] {
+            assert_eq!(
+                shape(seal_through_windows(&rows, 239, window)),
+                one,
+                "byte cuts at window {window} differ from window 1"
+            );
+        }
+    }
+
     /// #1199: **the span cut must never reach past the range being sealed.**
     ///
     /// `tail_hold` returns `u64::MAX` on the final pass to mean "nothing held back". Taking that as
@@ -7692,6 +7829,95 @@ mod tests {
             Some(pinned.as_str()),
             "a held finalized range must still pin a checkpoint at the ceiling, or a later \
              reorg walks past it to an older sparse checkpoint (#461 / #1067)"
+        );
+    }
+
+    /// `maybe_seal` read the whole finalized range to choose a cut and then read the cut again, so a
+    /// range of documents was held in memory entire: 3.17 GB RSS on 678 QoS payloads, 11.35 GB on
+    /// 1,342 (2026-09-13). It may now hold one cut and no more, however long the range.
+    #[tokio::test]
+    async fn maybe_seal_reads_a_cut_and_never_the_whole_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let n = 160u64;
+        let row = 512 * 1024;
+        let entities: Vec<(String, String)> = (0..n)
+            .map(|b| (Store::entity_key(b, 0), doc_json(b, 0, row)))
+            .collect();
+        let range_bytes: usize = entities.iter().map(|(_, j)| j.len()).sum();
+        assert!(range_bytes > SEAL_DIRECT_BYTES + 8 * row);
+        store
+            .commit_window(&entities, Some((n - 1, "aa")), n - 1)
+            .unwrap();
+        drop(entities);
+
+        let metrics = crate::metrics::NestMetrics::default();
+        maybe_seal(
+            tmp.path(),
+            &store,
+            &HashOnly,
+            n - 1,
+            None,
+            &metrics,
+            SPAN_OFF,
+        )
+        .await
+        .unwrap();
+
+        let sealed = store
+            .get_meta(SEALED_THROUGH_KEY)
+            .unwrap()
+            .expect("the range crossed the byte threshold, so it must have cut")
+            .parse::<u64>()
+            .unwrap();
+        assert!(sealed < n - 1, "one cut's worth sealed and the rest held");
+        let largest = store
+            .largest_range_read
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            largest < SEAL_DIRECT_BYTES + row + 1_024,
+            "maybe_seal read {largest} bytes of rows at once against a {range_bytes}-byte range; a cut \
+             is at most SEAL_DIRECT_BYTES and one row"
+        );
+    }
+
+    /// A span cut known from the first row ended nothing: the scan read on to the ceiling looking for a
+    /// size cut that could only land later, so a sparse range was read whole (#1376 review).
+    #[tokio::test]
+    async fn a_sparse_range_is_read_only_to_its_span_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let span = 100u64;
+        let far = 2_000u64;
+        let entities: Vec<(String, String)> = std::iter::once(0)
+            .chain(1_000..1_000 + far)
+            .map(|b| (Store::entity_key(b, 0), doc_json(b, 0, 64)))
+            .collect();
+        let ceiling = 1_000 + far - 1;
+        store
+            .commit_window(&entities, Some((ceiling, "aa")), ceiling)
+            .unwrap();
+
+        let metrics = crate::metrics::NestMetrics::default();
+        maybe_seal(tmp.path(), &store, &HashOnly, ceiling, None, &metrics, span)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_meta(SEALED_THROUGH_KEY)
+                .unwrap()
+                .and_then(|v| v.parse::<u64>().ok()),
+            Some(ceiling),
+            "every span of the range seals"
+        );
+        let widest = store
+            .largest_scan_rows
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            widest <= span as usize + 1,
+            "one scan visited {widest} rows; a span cut is known from the first row, so no scan \
+             should read past its span end plus the row that shows it"
         );
     }
 
