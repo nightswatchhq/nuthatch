@@ -676,6 +676,44 @@ fn check_origin(o: &str) -> Result<()> {
     if host.is_empty() {
         anyhow::bail!("--cors {o} names no host");
     }
+    // **An allowlist, not a list of forbidden characters** (Jules on #1384, third round on this
+    // validator). Enumerating what is banned is how a guard over a growing vocabulary stays one
+    // example behind its reviewer - a space slipped through twice here already. A host is either a
+    // DNS name or a bracketed literal, and the DNS name's alphabet is small and closed, so state it
+    // and refuse everything else.
+    let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+    let legal = if rest.starts_with('[') {
+        // Inside the brackets: hex groups, `:` separators, `.` for an embedded IPv4 tail, and `%`
+        // plus a zone id. Still a closed alphabet, still not a check that the address resolves.
+        host.chars().all(|c| {
+            c.is_ascii_hexdigit() || matches!(c, ':' | '.' | '%') || c.is_ascii_alphanumeric()
+        })
+    } else {
+        host.chars().all(ok)
+    };
+    if !legal {
+        let bad = host
+            .chars()
+            .find(|c| {
+                if rest.starts_with('[') {
+                    false
+                } else {
+                    !ok(*c)
+                }
+            })
+            .map(|c| {
+                if c == ' ' {
+                    "a space".to_string()
+                } else {
+                    format!("'{c}'")
+                }
+            })
+            .unwrap_or_else(|| "a character".to_string());
+        anyhow::bail!(
+            "--cors {o} has {bad} in its host, which an Origin header cannot carry, so it would \
+             match nothing"
+        );
+    }
     if let Some(p) = port {
         if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
             anyhow::bail!("--cors {o} has '{p}' where a port number should be");
@@ -5183,6 +5221,12 @@ mod tests {
             ("http://[::1", "never closes it"),
             ("http://[::1]x", "after the host"),
             ("http://[::1]:x", "port number"),
+            // Jules, third round: a denylist of bad characters stays one example behind. These are
+            // the ones that got through before the alphabet was stated as an allowlist.
+            ("https://app example.com", "a space"),
+            ("https://app\texample.com", "in its host"),
+            ("https://app|example.com", "in its host"),
+            ("https://app,example.com", "in its host"),
             ("https://app.example.com:", "port number"),
             ("https://app.example.com:http", "port number"),
         ] {
