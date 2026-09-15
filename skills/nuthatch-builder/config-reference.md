@@ -112,8 +112,10 @@ args = ["{to}"]               # `{column}` takes the row's value; anything else 
                               # Documents resolve behind the cursor, retried with backoff, and one that
                               # fails 10 times is given up on (`nuthatch_nest_ipfs_given_up_total`):
                               # NO row rather than a wrong one, and the range seals once it is decided.
-                              # Under `--seal-direct` one is also given up on after 5 minutes. Every
-                              # retry is a warn line and counts in `nuthatch_nest_ipfs_retries_total`.
+                              # Under `--seal-direct` one is also given up on after
+                              # `--ipfs-window-deadline` (default 5m, `0` for none), and is then absent
+                              # from the sealed segment. Every retry is a warn line and counts in
+                              # `nuthatch_nest_ipfs_retries_total`.
 name = "token_metadata"       # becomes the result table
 on = "nft__uri_set"           # the table whose rows carry the CID
 cid_column = "uri"            # which column. A bare CID, `ipfs://…`, or a full gateway URL all work -

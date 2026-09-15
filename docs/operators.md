@@ -1001,11 +1001,15 @@ single RPC endpoint the pass runs one window at a time whatever `--concurrency` 
 of the whole runtime, and `capped_by` then reads `single_rpc_endpoint` (#1399). Add a second endpoint
 to get the concurrency you asked for.
 
-**One IPFS document holds a seal-direct window for at most five minutes.** A window seals only once
-every document it names is fetched or given up on. A failed fetch is tried again with a timeout of 30,
-then 60, then 120 seconds, each retry a warn line and a count in `nuthatch_nest_ipfs_retries_total`.
-Under `--seal-direct` a document not fetched within five minutes is given up on, logged and counted as
-before, and is absent from the sealed segment. A second `--ipfs` gateway is the remedy for a gateway
+**One IPFS document holds a seal-direct window for at most five minutes by default.** A window seals
+only once every document it names is fetched or given up on. A failed fetch is tried again with a
+timeout of 30, then 60, then 120 seconds, each retry a warn line and a count in
+`nuthatch_nest_ipfs_retries_total`. Under `--seal-direct` a document not fetched within
+`--ipfs-window-deadline` (default `300s`) is given up on, logged and counted as before. It is then
+absent from the sealed segment, and nothing fetches it again (#1410). That is the trade the flag sets:
+raise it, or pass `0` to give up only once all ten attempts have failed, if you would rather a window
+wait than seal without a document. `/ready` reports the setting as
+`seal_direct_ipfs_window_deadline_secs`, `0` meaning none. A second `--ipfs` gateway is the remedy for a gateway
 that stalls on some documents: on 2026-09-15 The Graph's gateway stopped two QoS documents after 256
 to 320 KiB, and Pinata served them whole in 4.6 and 6.1 s.
 

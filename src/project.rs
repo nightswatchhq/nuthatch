@@ -122,6 +122,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
         state_rpc_urls: Vec::new(),
         read_only_role: false,
         freshness: Default::default(),
+        ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {
@@ -689,6 +690,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         state_rpc_urls: Vec::new(),
         read_only_role: false,
         freshness: Default::default(),
+        ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {

@@ -55,15 +55,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     let cors = crate::serve::cors_layer(&args.cors)?;
     let dir = PathBuf::from(&args.dir);
     let mut config = Config::load(&dir)?;
-    // RFC-0023 tier 3's archive endpoints. Carried on `Config` because every layer below already
-    // takes `&Config`, and `#[serde(skip)]` keeps them out of `nuthatch.toml` and so out of the NID.
-    config.state_rpc_urls = args.state_rpc.clone();
-    config.ipfs_gateways = args.ipfs.clone();
-    // The freshness dial (RFC-0040) rides the same way: an operator's cadence is not the nest's identity.
-    config.freshness = crate::freshness::Freshness {
-        poll_interval: args.poll_interval,
-        finality_only: args.finality_only,
-    };
+    apply_dev_args(&mut config, &args);
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
     // touching the nest's config on disk.
@@ -104,6 +96,20 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     .await
 }
 
+/// `dev`'s run-time settings, carried on `Config` because every layer below already takes `&Config`.
+/// Each is `#[serde(skip)]`, which keeps it out of `nuthatch.toml` and so out of the NID.
+fn apply_dev_args(config: &mut Config, args: &DevArgs) {
+    // RFC-0023 tier 3's archive endpoints.
+    config.state_rpc_urls = args.state_rpc.clone();
+    config.ipfs_gateways = args.ipfs.clone();
+    // The freshness dial (RFC-0040): an operator's cadence is not the nest's identity.
+    config.freshness = crate::freshness::Freshness {
+        poll_interval: args.poll_interval,
+        finality_only: args.finality_only,
+    };
+    config.ipfs_window_deadline = args.ipfs_window_deadline;
+}
+
 /// Interpret a finished background task's join result: a clean `Ok(())`, an indexing/serving error, or
 /// a panic/cancellation - labelled for the operator (deadlock-review C1: a dead task must surface, never
 /// be served over).
@@ -137,11 +143,14 @@ pub async fn upgrade(
     rpc_override: Vec<String>,
     seal_direct: bool,
     concurrency: usize,
+    ipfs_window_deadline: std::time::Duration,
     window: Option<u64>,
     no_admin: bool,
 ) -> Result<()> {
-    let old_config = Config::load(&old_dir)?;
-    let new_config = Config::load(&new_dir)?;
+    let mut old_config = Config::load(&old_dir)?;
+    let mut new_config = Config::load(&new_dir)?;
+    old_config.ipfs_window_deadline = ipfs_window_deadline;
+    new_config.ipfs_window_deadline = ipfs_window_deadline;
 
     let verdict = crate::lifecycle::classify_paths(&old_dir, &new_dir)?;
     let breaking = verdict.verdict == crate::lifecycle::Verdict::Breaking;
@@ -2749,6 +2758,7 @@ async fn build_nest(
         seal_span,
         metrics: {
             let m = METRICS.nest(&config.nest.name);
+            m.set_ipfs_window_deadline(config.ipfs_window_deadline);
             m.set_storage_paths(
                 dir.join(crate::config::DB_FILE),
                 crate::seal::shared_store(&dir)
@@ -2786,6 +2796,7 @@ async fn build_nest(
         } else {
             config.ipfs_gateways.clone()
         },
+        ipfs_window_deadline: config.ipfs_window_deadline,
         top_level_calls: config.extract.top_level_calls,
         call_registry: call_registry.clone(),
         chain_id: config.nest.chain_id,
@@ -3457,13 +3468,27 @@ fn apply_row_timestamps(
 /// What a seal-direct pass decodes beyond events: top-level calls, and the `[[ipfs]]` documents rows
 /// name. Both were skipped by these paths without a word, so a calldata-only nest backfilled that way
 /// sealed nothing.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct DirectExtras<'a> {
     pub call_registry: Option<&'a crate::calldata::CallRegistry>,
     pub ipfs: Option<&'a crate::ipfs_resolve::Gate>,
     pub gateways: &'a [String],
     /// Where a document's failures are counted; `None` counts into a throwaway, as a bench does.
     pub metrics: Option<&'a crate::metrics::NestMetrics>,
+    /// How long a document is tried before its window seals without it (`--ipfs-window-deadline`).
+    pub ipfs_policy: crate::ipfs_resolve::Policy,
+}
+
+impl Default for DirectExtras<'_> {
+    fn default() -> Self {
+        DirectExtras {
+            call_registry: None,
+            ipfs: None,
+            gateways: &[],
+            metrics: None,
+            ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
+        }
+    }
 }
 
 impl DirectExtras<'_> {
@@ -3496,7 +3521,7 @@ impl DirectExtras<'_> {
             let (docs, given_up) = crate::ipfs_resolve::resolve_inline(
                 gate,
                 self.gateways,
-                &crate::ipfs_resolve::Policy::seal_direct(),
+                &self.ipfs_policy,
                 rows,
                 timestamps,
                 self.metrics.unwrap_or(&unobserved),
@@ -5188,9 +5213,16 @@ pub struct NestIngest {
     /// The freshness dial (RFC-0040): the poll interval and whether the cursor stops at finality.
     /// Operator setting, never identity - see `Config::freshness`.
     freshness: crate::freshness::Freshness,
+    /// `--ipfs-window-deadline` (#1399), what [`NestIngest::seal_direct_policy`] is built from.
+    ipfs_window_deadline: std::time::Duration,
 }
 
 impl NestIngest {
+    /// The policy a seal-direct pass resolves its documents on.
+    fn seal_direct_policy(&self) -> crate::ipfs_resolve::Policy {
+        crate::ipfs_resolve::Policy::seal_direct_within(self.ipfs_window_deadline)
+    }
+
     /// Run the one-time preamble before the tip loop, then return the block to begin tip-following
     /// from. Initialises webhook cursors, rebuilds the discovered-child registry on a warm restart,
     /// runs the `--seal-direct` phase-0 backfill on a cold start, and computes the cold-start `next`.
@@ -5305,6 +5337,12 @@ impl NestIngest {
                     ipfs: self.ipfs_gate.as_deref(),
                     gateways: &self.ipfs_gateways,
                     metrics: Some(&self.metrics),
+                    ipfs_policy: self.seal_direct_policy(),
+                };
+                let deadline = match (&self.ipfs_gate, extras.ipfs_policy.deadline) {
+                    (None, _) => String::new(),
+                    (Some(_), Some(d)) => format!(", ipfs documents given up on after {d:?}"),
+                    (Some(_), None) => ", no ipfs window deadline".to_string(),
                 };
                 let sealed = if let Some(fs) = self.factory.as_deref() {
                     if concurrency > 1 {
@@ -5313,7 +5351,7 @@ impl NestIngest {
                         );
                     }
                     tracing::info!(
-                        "seal-direct factory backfill: {resume_from}..={finalized_through} (tip {tip}, sequential two-pass)…"
+                        "seal-direct factory backfill: {resume_from}..={finalized_through} (tip {tip}, sequential two-pass{deadline})…"
                     );
                     backfill_direct_factory_with(
                         source,
@@ -5346,7 +5384,7 @@ impl NestIngest {
                         _ => String::new(),
                     };
                     tracing::info!(
-                        "seal-direct backfill: {resume_from}..={finalized_through} (tip {tip}, {concurrency}-way{capped})…"
+                        "seal-direct backfill: {resume_from}..={finalized_through} (tip {tip}, {concurrency}-way{capped}{deadline})…"
                     );
                     backfill_direct_pipelined_with(
                         source,
@@ -11759,6 +11797,7 @@ template = "pool"
                 ipfs: Some(&gate),
                 gateways: &gateways,
                 metrics: None,
+                ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
             },
             |_| Ok(()),
             |reached, _, _| {
@@ -11815,6 +11854,7 @@ template = "pool"
                 ipfs: Some(&gate),
                 gateways: &gateways,
                 metrics: None,
+                ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
             },
             |_| Ok(()),
             |_, _, _| {},
@@ -12176,6 +12216,94 @@ template = "pool"
         drop(nest);
         drop(state);
         handle.abort();
+    }
+
+    /// #1399: `dev --ipfs-window-deadline` reaches the policy a seal-direct pass resolves documents on,
+    /// and the value `/ready` reports.
+    #[tokio::test]
+    async fn dev_ipfs_window_deadline_reaches_the_seal_direct_policy() {
+        use clap::Parser as _;
+        for (flag, want) in [
+            ("0", None),
+            ("5m", Some(std::time::Duration::from_secs(300))),
+        ] {
+            let dir = qos_topic_nest("t");
+            let argv = ["nuthatch", "dev", "--ipfs-window-deadline", flag];
+            let crate::cli::Command::Dev(args) =
+                crate::cli::Cli::try_parse_from(argv).unwrap().command
+            else {
+                unreachable!()
+            };
+            let mut config = Config::load(dir.path()).unwrap();
+            apply_dev_args(&mut config, &args);
+            config.nest.name = format!("window-deadline-{flag}");
+            let source: Arc<dyn Source> = Arc::new(PostSource(Vec::new()));
+            let (nest, _state, worker, _w) = build_nest(
+                &source,
+                dir.path().to_path_buf(),
+                &config,
+                None,
+                false,
+                None,
+                None,
+                serve::new_sql_gate(),
+            )
+            .await
+            .unwrap();
+            if let Some(w) = worker {
+                w.abort();
+            }
+            assert_eq!(nest.seal_direct_policy().deadline, want, "{flag}");
+            assert_eq!(
+                METRICS.nest(&config.nest.name).ipfs_window_deadline(),
+                Some(want.map_or(0, |d| d.as_secs())),
+                "{flag}"
+            );
+        }
+    }
+
+    /// #1399: a seal-direct pass resolves on the nest's `--ipfs-window-deadline`. With the default
+    /// policy instead, a gateway that never answers holds the first window for a 30 s timeout at least.
+    #[tokio::test]
+    async fn a_seal_direct_pass_gives_up_on_a_document_at_the_nests_deadline() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cid = crate::cid::cid_v0_for(b"never served");
+        let dir = qos_topic_nest("t");
+        let mut config = Config::load(dir.path()).unwrap();
+        config.ipfs_gateways = vec![format!("http://{}/ipfs/", silent.local_addr().unwrap())];
+        config.ipfs_window_deadline = std::time::Duration::from_secs(1);
+        config.nest.name = "window-deadline-prepare".into();
+        let source: Arc<dyn Source> = Arc::new(PostSource(vec![(4, qos_post(&cid))]));
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+        let pass = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            nest.prepare(source.as_ref(), Some(9_996), true, 1, 100),
+        )
+        .await
+        .expect("the pass held its window past the nest's one-second deadline");
+        pass.unwrap();
+        assert_eq!(
+            METRICS.nest("window-deadline-prepare").ipfs_given_up(),
+            1,
+            "the one document the pass named is given up on"
+        );
+        drop(nest);
+        drop(state);
+        drop(silent);
     }
 
     /// A range waits for the documents it names, in the window's own seal and not only in the resolver,

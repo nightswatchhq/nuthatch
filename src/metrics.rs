@@ -77,6 +77,8 @@ pub struct NestMetrics {
     /// #1399: the `--concurrency` asked for and the one the seal-direct pass runs at. `0` until recorded.
     seal_direct_concurrency_requested: AtomicU64,
     seal_direct_concurrency: AtomicU64,
+    /// #1399: `--ipfs-window-deadline` in seconds plus one, so `0` is not recorded and `1` is no deadline.
+    ipfs_window_deadline: AtomicU64,
     /// #807: the `--seal-direct` history pass, before the hot cursor exists.
     seal_direct_active: AtomicBool,
     seal_direct_origin: AtomicU64,
@@ -325,6 +327,15 @@ impl NestMetrics {
         let requested = self.seal_direct_concurrency_requested.load(Relaxed);
         (requested != 0).then(|| (requested, self.seal_direct_concurrency.load(Relaxed)))
     }
+    pub fn set_ipfs_window_deadline(&self, deadline: std::time::Duration) {
+        self.ipfs_window_deadline
+            .store(deadline.as_secs().saturating_add(1), Relaxed);
+        METRICS.set_ipfs_window_deadline(deadline);
+    }
+    /// Seconds, `0` for no deadline, or `None` before a nest has recorded it.
+    pub fn ipfs_window_deadline(&self) -> Option<u64> {
+        self.ipfs_window_deadline.load(Relaxed).checked_sub(1)
+    }
 
     /// Start a seal-direct history pass. `/ready` reads these instead of treating a zero cursor as
     /// WAITING (#807).
@@ -454,6 +465,7 @@ pub struct Metrics {
     ipfs_retries: AtomicU64,
     seal_direct_concurrency_requested: AtomicU64,
     seal_direct_concurrency: AtomicU64,
+    ipfs_window_deadline: AtomicU64,
     alert_outbox_depth: AtomicU64,
     // Serving - the surface an operator bills against.
     http_requests: AtomicU64,
@@ -528,6 +540,7 @@ impl Metrics {
             ipfs_retries: AtomicU64::new(0),
             seal_direct_concurrency_requested: AtomicU64::new(0),
             seal_direct_concurrency: AtomicU64::new(0),
+            ipfs_window_deadline: AtomicU64::new(0),
             alert_outbox_depth: AtomicU64::new(0),
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
@@ -674,6 +687,13 @@ impl Metrics {
     pub fn seal_direct_concurrency(&self) -> Option<(u64, u64)> {
         let requested = self.seal_direct_concurrency_requested.load(Relaxed);
         (requested != 0).then(|| (requested, self.seal_direct_concurrency.load(Relaxed)))
+    }
+    pub fn set_ipfs_window_deadline(&self, deadline: std::time::Duration) {
+        self.ipfs_window_deadline
+            .store(deadline.as_secs().saturating_add(1), Relaxed);
+    }
+    pub fn ipfs_window_deadline(&self) -> Option<u64> {
+        self.ipfs_window_deadline.load(Relaxed).checked_sub(1)
     }
     pub fn set_alert_outbox(&self, v: u64) {
         self.alert_outbox_depth.store(v, Relaxed);

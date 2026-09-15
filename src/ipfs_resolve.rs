@@ -343,14 +343,28 @@ impl Default for Policy {
     }
 }
 
+/// The default `--ipfs-window-deadline` (#1399).
+pub const WINDOW_DEADLINE: Duration = Duration::from_secs(300);
+
+/// [`WINDOW_DEADLINE`], for a config that was loaded rather than given the flag.
+pub fn window_deadline() -> Duration {
+    WINDOW_DEADLINE
+}
+
 impl Policy {
     /// For a path whose window cannot seal until every document in it is decided (#1399). Attempts at
     /// 30, 60 and 120 s and their waits fit inside the five minutes; fast failures get all ten attempts.
     pub fn seal_direct() -> Self {
+        Self::seal_direct_within(WINDOW_DEADLINE)
+    }
+
+    /// [`Policy::seal_direct`] with an operator's `--ipfs-window-deadline`. Zero is no deadline: a
+    /// document is given up on only once its attempts run out.
+    pub fn seal_direct_within(deadline: Duration) -> Self {
         Policy {
             first_backoff: Duration::from_secs(2),
             max_backoff: Duration::from_secs(30),
-            deadline: Some(Duration::from_secs(300)),
+            deadline: (!deadline.is_zero()).then_some(deadline),
             ..Policy::default()
         }
     }
@@ -1150,18 +1164,7 @@ mod tests {
     /// and left out exactly as one that ran out of attempts.
     #[tokio::test]
     async fn a_gateway_that_stalls_mid_body_holds_a_document_no_longer_than_its_deadline() {
-        use axum::response::IntoResponse;
-        let body = "x".repeat(64 * 1024);
-        let cid = crate::cid::cid_v0_for(body.as_bytes());
-        let (gateway, _requests, server) = stand_in(move |_| {
-            let half = body[..body.len() / 2].to_string();
-            async move {
-                let stalls = futures::stream::once(async move { Ok::<_, std::io::Error>(half) })
-                    .chain(futures::stream::pending());
-                axum::body::Body::from_stream(stalls).into_response()
-            }
-        })
-        .await;
+        let (cid, gateway, _requests, server) = stalls_mid_body().await;
         let metrics = NestMetrics::default();
         let policy = quick(100, 800, Some(Duration::from_secs(1)));
         assert!(
@@ -1179,6 +1182,55 @@ mod tests {
         assert_eq!(given_up, 1);
         assert_eq!(metrics.ipfs_given_up(), 1);
         assert!(metrics.ipfs_retries() >= 1, "the first attempt is retried");
+        server.abort();
+    }
+
+    /// A gateway that answers 200 for a document, sends half of it and never the rest.
+    async fn stalls_mid_body() -> (
+        String,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::response::IntoResponse;
+        let body = "x".repeat(64 * 1024);
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, requests, server) = stand_in(move |_| {
+            let half = body[..body.len() / 2].to_string();
+            async move {
+                let stalls = futures::stream::once(async move { Ok::<_, std::io::Error>(half) })
+                    .chain(futures::stream::pending());
+                axum::body::Body::from_stream(stalls).into_response()
+            }
+        })
+        .await;
+        (cid, gateway, requests, server)
+    }
+
+    /// `--ipfs-window-deadline 0` (#1399): a document that never arrives is given up on only once its
+    /// attempts run out, as it was before a seal-direct window had a deadline.
+    #[tokio::test]
+    async fn a_zero_window_deadline_gives_up_only_after_every_attempt() {
+        let (cid, gateway, requests, server) = stalls_mid_body().await;
+        let metrics = NestMetrics::default();
+        let policy = Policy {
+            attempts: 4,
+            first_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            first_timeout: Duration::from_millis(50),
+            max_timeout: Duration::from_millis(100),
+            ..Policy::seal_direct_within(Duration::ZERO)
+        };
+        let (rows, given_up) = resolve_one(gateway, &cid, &policy, &metrics).await;
+        assert!(rows.is_empty());
+        assert_eq!(given_up, 1);
+        assert_eq!(metrics.ipfs_given_up(), 1);
+        assert_eq!(
+            metrics.ipfs_retries(),
+            3,
+            "every attempt but the last is retried"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 4);
         server.abort();
     }
 

@@ -200,6 +200,26 @@ mod tests {
         }
     }
 
+    /// #1399: the seal-direct document deadline takes `--poll-interval`'s durations, and `0` for none.
+    #[test]
+    fn dev_parses_an_ipfs_window_deadline() {
+        let deadline = |flag: &[&str]| {
+            let argv = ["nuthatch", "dev"].iter().chain(flag);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::Dev(args) => args.ipfs_window_deadline,
+                _ => unreachable!(),
+            }
+        };
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(deadline(&[]), crate::ipfs_resolve::WINDOW_DEADLINE);
+        assert_eq!(deadline(&["--ipfs-window-deadline", "300s"]), secs(300));
+        assert_eq!(deadline(&["--ipfs-window-deadline", "5m"]), secs(300));
+        assert_eq!(deadline(&["--ipfs-window-deadline", "0"]), secs(0));
+        assert!(
+            Cli::try_parse_from(["nuthatch", "dev", "--ipfs-window-deadline", "soon"]).is_err()
+        );
+    }
+
     /// The grouping in `src/help.rs::GROUPS` must cover exactly the visible subcommands declared
     /// above - no more (a stale name after a rename/removal), no fewer (a new variant nobody sorted
     /// into a heading, which would otherwise fall through render_top_level_help's "unheaded" bucket
@@ -1331,6 +1351,13 @@ pub struct DevArgs {
     /// Try 8-16 against your own node; keep low on rate-limited public RPC.
     #[arg(long, default_value_t = 1)]
     pub concurrency: usize,
+
+    /// How long a `--seal-direct` backfill waits for one `[[ipfs]]` document before giving up on it so
+    /// its window can seal. `300s`, `5m`, or bare seconds; `0` waits until its attempts run out. A
+    /// document given up on is absent from the sealed segment and is not fetched again (#1410), so an
+    /// operator with one gateway who would rather wait can raise this or turn it off.
+    #[arg(long, default_value = "300s", value_name = "DURATION", value_parser = crate::freshness::parse_span)]
+    pub ipfs_window_deadline: std::time::Duration,
 
     /// Override the `eth_getLogs` block-window (the chain default otherwise). For a *sparse* contract
     /// over a long backfill - few events across many blocks - a large window (e.g. 50000) turns tens

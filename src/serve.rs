@@ -1407,6 +1407,7 @@ pub(crate) struct NestReadiness {
     pub seal_direct_target: u64,
     pub seal_direct_fetched: u64,
     pub seal_direct_concurrency: Option<(u64, u64)>,
+    pub ipfs_window_deadline: Option<u64>,
     pub fetch_window: u64,
     pub entities: Value,
 }
@@ -1465,6 +1466,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
                     m.seal_direct_fetched(),
                     m.fetch_window(),
                     m.seal_direct_concurrency(),
+                    m.ipfs_window_deadline(),
                 ),
             ),
             None => (
@@ -1484,6 +1486,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
                     METRICS.seal_direct_fetched(),
                     METRICS.fetch_window(),
                     METRICS.seal_direct_concurrency(),
+                    METRICS.ipfs_window_deadline(),
                 ),
             ),
         };
@@ -1496,6 +1499,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
         seal_direct_fetched,
         fetch_window,
         seal_direct_concurrency,
+        ipfs_window_deadline,
     ) = seal_direct;
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
@@ -1595,6 +1599,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
         seal_direct_target,
         seal_direct_fetched,
         seal_direct_concurrency,
+        ipfs_window_deadline,
         fetch_window,
         entities,
     }
@@ -1650,6 +1655,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         seal_direct_target,
         seal_direct_fetched,
         seal_direct_concurrency,
+        ipfs_window_deadline,
         fetch_window,
         entities,
     } = nest_readiness(&s);
@@ -1716,6 +1722,13 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             "effective": effective,
             "capped_by": (effective < requested).then_some("single_rpc_endpoint"),
         })),
+        // How long a seal-direct window waits for one ipfs document, `0` for no limit. A document
+        // given up on is absent from the sealed segment (#1410), so this is the operator's trade.
+        "seal_direct_ipfs_window_deadline_secs": if s.cursorless {
+            serde_json::Value::Null
+        } else {
+            ipfs_window_deadline.into()
+        },
         "seal_direct_stalled": seal_stalled,
         // The tip path's verdict, reported beside the backfill's so an operator can tell which term
         // took the nest unready without reading this source (#1199).
@@ -4646,6 +4659,36 @@ mod tests {
             let (_code, body) = get(router, &format!("/{name}/ready")).await;
             let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
             assert_eq!(json["seal_direct_concurrency"], want, "{name}: {json}");
+        }
+    }
+
+    /// #1399: `--ipfs-window-deadline` is on `/ready`, `0` for none and null before a nest records it.
+    #[tokio::test]
+    async fn ready_reports_the_ipfs_window_deadline() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("default-window-deadline", Some(300), json!(300)),
+            ("no-window-deadline", Some(0), json!(0)),
+            ("unrecorded-window-deadline", None, Value::Null),
+        ];
+        for (name, recorded, want) in cases {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+            let health = Arc::new(crate::health::RuntimeHealth::new());
+            let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+            let router = compose_runtime(roster, nests, health);
+            if let Some(secs) = recorded {
+                METRICS
+                    .nest(name)
+                    .set_ipfs_window_deadline(std::time::Duration::from_secs(secs));
+            }
+            let (_code, body) = get(router, &format!("/{name}/ready")).await;
+            let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+            assert_eq!(
+                json["seal_direct_ipfs_window_deadline_secs"], want,
+                "{name}: {json}"
+            );
         }
     }
 

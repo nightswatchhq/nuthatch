@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
                     args.backfill,
                     args.seal_direct,
                     args.concurrency,
+                    args.ipfs_window_deadline,
                     args.window,
                     args.no_admin,
                     args.fail_fast,
