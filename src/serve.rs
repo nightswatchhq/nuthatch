@@ -1406,6 +1406,7 @@ pub(crate) struct NestReadiness {
     pub seal_direct_completed: u64,
     pub seal_direct_target: u64,
     pub seal_direct_fetched: u64,
+    pub seal_direct_concurrency: Option<(u64, u64)>,
     pub fetch_window: u64,
     pub entities: Value,
 }
@@ -1463,6 +1464,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
                     m.last_seal_progress(),
                     m.seal_direct_fetched(),
                     m.fetch_window(),
+                    m.seal_direct_concurrency(),
                 ),
             ),
             None => (
@@ -1481,6 +1483,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
                     METRICS.last_seal_progress(),
                     METRICS.seal_direct_fetched(),
                     METRICS.fetch_window(),
+                    METRICS.seal_direct_concurrency(),
                 ),
             ),
         };
@@ -1492,6 +1495,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
         last_seal_progress,
         seal_direct_fetched,
         fetch_window,
+        seal_direct_concurrency,
     ) = seal_direct;
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
@@ -1590,6 +1594,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
         seal_direct_completed,
         seal_direct_target,
         seal_direct_fetched,
+        seal_direct_concurrency,
         fetch_window,
         entities,
     }
@@ -1644,6 +1649,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         seal_direct_completed,
         seal_direct_target,
         seal_direct_fetched,
+        seal_direct_concurrency,
         fetch_window,
         entities,
     } = nest_readiness(&s);
@@ -1703,6 +1709,13 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         // after a rate-limited hour is visible here, not only in its ETA.
         "fetch_window_blocks": fetch_window,
         "seal_direct_target": seal_direct_target,
+        // #1399: one `--rpc` quietly runs the pass a window at a time, which a startup warning alone
+        // did not make visible. Null when no seal-direct pass recorded it.
+        "seal_direct_concurrency": seal_direct_concurrency.map(|(requested, effective)| json!({
+            "requested": requested,
+            "effective": effective,
+            "capped_by": (effective < requested).then_some("single_rpc_endpoint"),
+        })),
         "seal_direct_stalled": seal_stalled,
         // The tip path's verdict, reported beside the backfill's so an operator can tell which term
         // took the nest unready without reading this source (#1199).
@@ -4598,6 +4611,42 @@ mod tests {
             json!(false),
             "the seal-direct fields describe a pass that never started, and always did"
         );
+    }
+
+    /// #1399: with one `--rpc`, `--seal-direct --concurrency 6` ran one window at a time, and the only
+    /// sign was a startup warning, noticed after a restart.
+    #[tokio::test]
+    async fn ready_says_when_the_seal_direct_concurrency_was_capped() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "capped-seal-direct",
+                Some((6, 1)),
+                json!({"requested": 6, "effective": 1, "capped_by": "single_rpc_endpoint"}),
+            ),
+            (
+                "parallel-seal-direct",
+                Some((6, 6)),
+                json!({"requested": 6, "effective": 6, "capped_by": null}),
+            ),
+            ("no-seal-direct", None, Value::Null),
+        ];
+        for (name, recorded, want) in cases {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+            let health = Arc::new(crate::health::RuntimeHealth::new());
+            let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+            let router = compose_runtime(roster, nests, health);
+            if let Some((requested, effective)) = recorded {
+                METRICS
+                    .nest(name)
+                    .set_seal_direct_concurrency(requested, effective);
+            }
+            let (_code, body) = get(router, &format!("/{name}/ready")).await;
+            let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+            assert_eq!(json["seal_direct_concurrency"], want, "{name}: {json}");
+        }
     }
 
     /// #1199 ask 2: a tip-path seal that has stopped advancing must stop reporting ready.

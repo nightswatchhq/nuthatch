@@ -1722,7 +1722,13 @@ pub async fn dev(
                 group.endpoint.chain
             );
         }
-        let concurrency = indexer::safe_backfill_concurrency(rpc_urls.len(), concurrency);
+        let names: Vec<&str> = group
+            .nests
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        let concurrency =
+            indexer::backfill_concurrency_for(rpc_urls.len(), concurrency, seal_direct, &names);
 
         // Per-cursor footprint budget (RFC-0021): this chain's nests must fit ≤ max_rss.
         let mut cursor_mb = 0u64;
