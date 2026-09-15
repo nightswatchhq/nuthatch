@@ -338,6 +338,24 @@ async fn a_hot_mount_is_held_to_the_single_endpoint_concurrency_cap() {
             serde_json::json!(300),
             "{name}: {ready}"
         );
+
+        // #1420 on the hot-mount path: the mounted nest reports its NID, and its store records what
+        // its data covers.
+        let nest = body_json(&handles.live, &format!("/{name}/nest")).await;
+        assert!(nest["nid"].is_string(), "{name}: {nest}");
+        let (_, state) = handles
+            .states
+            .iter()
+            .find(|(n, _)| n == name)
+            .expect("mounted");
+        assert!(
+            state
+                .store
+                .get_meta(nuthatch::store::COVERAGE_KEY)
+                .unwrap()
+                .is_some(),
+            "{name}: the mounted nest's store records what it covers"
+        );
     }
 }
 
@@ -484,6 +502,26 @@ async fn a_nest_whose_route_differs_from_its_name_is_measured_and_unmounted_by_r
     assert!(
         !series.contains(&format!("nest=\"{route}-nest\"")),
         "a series is still labelled by the nest's own name"
+    );
+
+    // #1420 on the runtime path: the route's nest reports its identities, and its store records what
+    // its data covers.
+    let nest = body_json(&handles.live, &format!("/{route}/nest")).await;
+    let manifest = nuthatch::blob::build_manifest(nest_dir.path(), None).unwrap();
+    assert_eq!(nest["nid"], serde_json::json!(manifest.nid()), "{nest}");
+    assert_eq!(
+        nest["data_identity"],
+        serde_json::json!(manifest.data_identity()),
+        "{nest}"
+    );
+    assert!(
+        handles.states[0]
+            .1
+            .store
+            .get_meta(nuthatch::store::COVERAGE_KEY)
+            .unwrap()
+            .is_some(),
+        "the runtime nest's store records what it covers"
     );
 
     handles.unmount(route).await.expect("unmount");
