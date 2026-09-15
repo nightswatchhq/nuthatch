@@ -1149,6 +1149,16 @@ impl nuthatch::store::HotStore for HotScanFails {
     fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
         self.0.set_meta(key, value)
     }
+    fn meta_with_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.0.meta_with_prefix(prefix, limit)
+    }
+    fn count_meta_with_prefix(&self, prefix: &str) -> anyhow::Result<u64> {
+        self.0.count_meta_with_prefix(prefix)
+    }
     fn indexed_head(&self) -> anyhow::Result<Option<u64>> {
         self.0.indexed_head()
     }

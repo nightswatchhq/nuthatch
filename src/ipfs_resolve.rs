@@ -120,14 +120,84 @@ pub fn unreadable(decls: &[IpfsDecl], rows: &[&DecodedRow]) -> usize {
     missed
 }
 
-/// The meta key recording that a document was given up on. Its value is the CID, so a reorg that puts a
-/// different document in the same slot is not mistaken for the one abandoned.
+/// Where both resolving paths record a document given up on, one key per block and slot.
+pub const GAVE_UP_PREFIX: &str = "ipfs_gave_up:";
+
+/// The meta key recording that a document was given up on. Its record names the CID, so a reorg that
+/// puts a different document in the same slot is not mistaken for the one abandoned.
 pub fn gave_up_key(p: &Planned) -> String {
-    format!("ipfs_gave_up:{:012}:{}", p.block, p.slot)
+    gave_up_key_at(p.block, p.slot)
+}
+
+fn gave_up_key_at(block: u64, slot: usize) -> String {
+    format!("{GAVE_UP_PREFIX}{block:012}:{slot}")
+}
+
+/// A document given up on, as either path records it (#1410). Its range sealed without it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GaveUp {
+    pub cid: String,
+    pub block: u64,
+    pub slot: usize,
+    /// `None` on a record an earlier build wrote as the bare CID, which kept nothing else.
+    pub declaration: Option<String>,
+    pub error: Option<String>,
+    /// Unix seconds.
+    pub at: Option<u64>,
+}
+
+impl GaveUp {
+    fn new(gate: &Gate, p: &Planned, error: String) -> GaveUp {
+        GaveUp {
+            cid: p.cid.clone(),
+            block: p.block,
+            slot: p.slot,
+            declaration: Some(gate.decls[p.decl].name.clone()),
+            error: Some(error),
+            at: Some(crate::metrics::now_unix()),
+        }
+    }
+
+    /// A stored record, including the bare CID a build before #1410 wrote with its block and slot in the key.
+    pub fn parse(key: &str, value: &str) -> Option<GaveUp> {
+        if let Ok(record) = serde_json::from_str::<GaveUp>(value) {
+            return Some(record);
+        }
+        let (block, slot) = key.strip_prefix(GAVE_UP_PREFIX)?.split_once(':')?;
+        Some(GaveUp {
+            cid: value.to_string(),
+            block: block.parse().ok()?,
+            slot: slot.parse().ok()?,
+            declaration: None,
+            error: None,
+            at: None,
+        })
+    }
+}
+
+fn recorded(store: &dyn HotStore, block: u64, slot: usize, cid: &str) -> Result<bool> {
+    let key = gave_up_key_at(block, slot);
+    Ok(store
+        .get_meta(&key)?
+        .and_then(|v| GaveUp::parse(&key, &v))
+        .is_some_and(|r| r.cid == cid))
 }
 
 fn gave_up(store: &dyn HotStore, p: &Planned) -> Result<bool> {
-    Ok(store.get_meta(&gave_up_key(p))?.as_deref() == Some(p.cid.as_str()))
+    recorded(store, p.block, p.slot, &p.cid)
+}
+
+/// Record a document given up on unless it already is, since a refetched tail or a restart gives the same
+/// document up again and the first record is the one worth keeping. Returns whether it wrote.
+pub fn record_gave_up(store: &dyn HotStore, record: &GaveUp) -> Result<bool> {
+    if recorded(store, record.block, record.slot, &record.cid)? {
+        return Ok(false);
+    }
+    store.set_meta(
+        &gave_up_key_at(record.block, record.slot),
+        &serde_json::to_string(record)?,
+    )?;
+    Ok(true)
 }
 
 /// A nest's declarations, with what planning needs to read them back out of stored rows.
@@ -601,7 +671,7 @@ impl Resolver {
                 p.slot
             );
             self.metrics.add_ipfs_rows_refused(1);
-            self.give_up(&p)?;
+            self.give_up(&p, NO_ROOM.to_string())?;
         }
         let now = Instant::now();
         let due: Vec<(Planned, u32, Duration)> = self
@@ -657,7 +727,7 @@ impl Resolver {
                             p.block
                         );
                         self.metrics.add_ipfs_rows_refused(1);
-                        self.give_up(&p)?;
+                        self.give_up(&p, format!("proven, but {refused}"))?;
                     }
                 },
                 Err(e) => {
@@ -684,7 +754,7 @@ impl Resolver {
                             p.block,
                             failures
                         );
-                        self.give_up(&p)?;
+                        self.give_up(&p, format!("{e:#}"))?;
                     }
                 }
             }
@@ -693,8 +763,8 @@ impl Resolver {
         Ok(self.work.len())
     }
 
-    fn give_up(&mut self, p: &Planned) -> Result<()> {
-        self.store.set_meta(&gave_up_key(p), &p.cid)?;
+    fn give_up(&mut self, p: &Planned, error: String) -> Result<()> {
+        record_gave_up(self.store.as_ref(), &GaveUp::new(&self.gate, p, error))?;
         self.metrics.add_ipfs_given_up(1);
         self.work.remove(&(p.block, p.slot));
         Ok(())
@@ -736,9 +806,12 @@ pub fn spawn(resolver: Resolver) -> Running {
     Running(tokio::spawn(resolver.run()))
 }
 
+/// Why a document is given up on without a fetch when its block has no room left for its typed rows.
+const NO_ROOM: &str = "the block has no room left for its typed rows";
+
 /// Every document `rows` name, fetched now, for a path that seals as it goes and cannot come back for a
 /// document later. Retries on `policy`, whose deadline bounds how long one document holds the window;
-/// the second value counts the documents that exhausted it and are absent from what is returned.
+/// the second value is the documents given up on, absent from what is returned, in block order.
 pub async fn resolve_inline(
     gate: &Gate,
     gateways: &[String],
@@ -746,7 +819,7 @@ pub async fn resolve_inline(
     rows: &[DecodedRow],
     timestamps: bool,
     metrics: &crate::metrics::NestMetrics,
-) -> (Vec<DecodedRow>, usize) {
+) -> (Vec<DecodedRow>, Vec<GaveUp>) {
     let mut by_block: BTreeMap<u64, Vec<&DecodedRow>> = BTreeMap::new();
     for r in rows
         .iter()
@@ -754,75 +827,76 @@ pub async fn resolve_inline(
     {
         by_block.entry(r.block_number).or_default().push(r);
     }
-    let mut given_up = 0;
+    let mut given_up = Vec::new();
     let planned: Vec<Planned> = by_block
         .values()
         .flat_map(|rs| plan_block(&gate.decls, rs))
         .filter(|p| {
             if p.over_band {
                 tracing::warn!(
-                    "ipfs: gave up on {} (block {}, slot {}) without a fetch: the block has no room \
-                     left for its typed rows",
+                    "ipfs: gave up on {} (block {}, slot {}) without a fetch: {NO_ROOM}",
                     p.cid,
                     p.block,
                     p.slot
                 );
                 metrics.add_ipfs_rows_refused(1);
-                given_up += 1;
+                given_up.push(GaveUp::new(gate, p, NO_ROOM.to_string()));
             }
             !p.over_band
         })
         .collect();
-    let results: Vec<(Planned, Option<String>)> = futures::stream::iter(planned)
-        .map(|p| async move {
-            let started = Instant::now();
-            let mut failures = 0;
-            loop {
-                match attempt(&p.cid, gateways, policy, failures, started.elapsed()).await {
-                    Ok(content) => return (p, Some(content)),
-                    Err(e) => {
-                        failures += 1;
-                        let retry = if count_failure(metrics, &e) {
-                            None
-                        } else {
-                            policy.retry_in(failures, started.elapsed())
-                        };
-                        let Some(wait) = retry else {
-                            tracing::warn!(
-                                "ipfs: gave up on {} (block {}) after {failures} failed fetches: {e:#}",
-                                p.cid,
-                                p.block
-                            );
-                            return (p, None);
-                        };
-                        note_retry(metrics, &p, failures, wait, &e);
-                        tokio::time::sleep(wait).await;
+    let results: Vec<(Planned, std::result::Result<String, String>)> =
+        futures::stream::iter(planned)
+            .map(|p| async move {
+                let started = Instant::now();
+                let mut failures = 0;
+                loop {
+                    match attempt(&p.cid, gateways, policy, failures, started.elapsed()).await {
+                        Ok(content) => return (p, Ok(content)),
+                        Err(e) => {
+                            failures += 1;
+                            let retry = if count_failure(metrics, &e) {
+                                None
+                            } else {
+                                policy.retry_in(failures, started.elapsed())
+                            };
+                            let Some(wait) = retry else {
+                                tracing::warn!(
+                            "ipfs: gave up on {} (block {}) after {failures} failed fetches: {e:#}",
+                            p.cid,
+                            p.block
+                        );
+                                return (p, Err(format!("{e:#}")));
+                            };
+                            note_retry(metrics, &p, failures, wait, &e);
+                            tokio::time::sleep(wait).await;
+                        }
                     }
                 }
-            }
-        })
-        .buffer_unordered(policy.concurrency.max(1))
-        .collect()
-        .await;
+            })
+            .buffer_unordered(policy.concurrency.max(1))
+            .collect()
+            .await;
 
     let mut out = Vec::new();
-    for (p, content) in results {
-        match content.map(|c| gate.document_rows(&p, &c, timestamps)) {
-            Some(Ok(rows)) => out.extend(rows),
-            Some(Err(refused)) => {
+    for (p, fetched) in results {
+        match fetched.map(|c| gate.document_rows(&p, &c, timestamps)) {
+            Ok(Ok(rows)) => out.extend(rows),
+            Ok(Err(refused)) => {
                 tracing::warn!(
                     "ipfs: gave up on {} (block {}): proven, but {refused}",
                     p.cid,
                     p.block
                 );
                 metrics.add_ipfs_rows_refused(1);
-                given_up += 1;
+                given_up.push(GaveUp::new(gate, &p, format!("proven, but {refused}")));
             }
-            None => given_up += 1,
+            Err(error) => given_up.push(GaveUp::new(gate, &p, error)),
         }
     }
-    metrics.add_ipfs_given_up(given_up as u64);
+    metrics.add_ipfs_given_up(given_up.len() as u64);
     out.sort_by_key(|r| (r.block_number, r.log_index));
+    given_up.sort_by_key(|g| (g.block, g.slot));
     (out, given_up)
 }
 
@@ -1042,7 +1116,7 @@ mod tests {
         )
         .await;
         assert!(rows.is_empty());
-        assert_eq!(given_up, 1);
+        assert_eq!(given_up.len(), 1);
         assert_eq!(metrics.ipfs_rows_refused(), 1);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(metrics.ipfs_retries(), 0);
@@ -1093,7 +1167,7 @@ mod tests {
         cid: &str,
         policy: &Policy,
         metrics: &NestMetrics,
-    ) -> (Vec<DecodedRow>, usize) {
+    ) -> (Vec<DecodedRow>, Vec<GaveUp>) {
         let gate = Gate::new(&[uri_decl()], &[table("nft__uri_set", "uri", "string")]).unwrap();
         resolve_inline(
             &gate,
@@ -1123,7 +1197,7 @@ mod tests {
         let (rows, given_up) =
             resolve_one(gateway, &cid, &quick(1_000, 1_000, None), &metrics).await;
         assert_eq!(
-            (rows.len(), given_up),
+            (rows.len(), given_up.len()),
             (1, 0),
             "served on the second attempt"
         );
@@ -1147,7 +1221,7 @@ mod tests {
         let metrics = NestMetrics::default();
         let (rows, given_up) = resolve_one(gateway, &cid, &quick(50, 2_000, None), &metrics).await;
         assert_eq!(
-            (rows.len(), given_up),
+            (rows.len(), given_up.len()),
             (1, 0),
             "served once a timeout outlasted the gateway"
         );
@@ -1179,7 +1253,7 @@ mod tests {
         let held = started.elapsed();
         assert!(held < Duration::from_secs(3), "held for {held:?}");
         assert!(rows.is_empty());
-        assert_eq!(given_up, 1);
+        assert_eq!(given_up.len(), 1);
         assert_eq!(metrics.ipfs_given_up(), 1);
         assert!(metrics.ipfs_retries() >= 1, "the first attempt is retried");
         server.abort();
@@ -1223,7 +1297,7 @@ mod tests {
         };
         let (rows, given_up) = resolve_one(gateway, &cid, &policy, &metrics).await;
         assert!(rows.is_empty());
-        assert_eq!(given_up, 1);
+        assert_eq!(given_up.len(), 1);
         assert_eq!(metrics.ipfs_given_up(), 1);
         assert_eq!(
             metrics.ipfs_retries(),
@@ -1249,7 +1323,7 @@ mod tests {
         };
         let (rows, given_up) = resolve_one(gateway, &cid, &policy, &metrics).await;
         assert!(rows.is_empty());
-        assert_eq!(given_up, 1);
+        assert_eq!(given_up.len(), 1);
         assert_eq!(metrics.ipfs_given_up(), 1);
         assert_eq!(metrics.ipfs_unverified(), 3);
         assert_eq!(
@@ -1293,6 +1367,46 @@ mod tests {
         );
         assert_eq!(resolver.retry_in(9, secs(86_400)), Some(secs(600)));
         assert_eq!(resolver.timeout(0), crate::subgraph_import::FETCH_TIMEOUT);
+    }
+
+    /// #1410: a document given up on again, by a refetched tail or a restart, keeps its first record, and
+    /// a different document a reorg put in the same slot replaces it. A bare CID an earlier build wrote
+    /// still counts as given up.
+    #[test]
+    fn a_document_given_up_on_twice_is_recorded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let gate = Gate::new(&[uri_decl()], &[table("nft__uri_set", "uri", "string")]).unwrap();
+        let row = uri_row(10, 0, CID);
+        let p = plan_block(gate.decls(), &[&row]).remove(0);
+        assert!(record_gave_up(&store, &GaveUp::new(&gate, &p, "first".into())).unwrap());
+        assert!(!record_gave_up(&store, &GaveUp::new(&gate, &p, "second".into())).unwrap());
+        let listed = store.meta_with_prefix(GAVE_UP_PREFIX, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        let record = GaveUp::parse(&listed[0].0, &listed[0].1).unwrap();
+        assert_eq!(
+            (
+                record.cid.as_str(),
+                record.block,
+                record.declaration.as_deref(),
+                record.error.as_deref()
+            ),
+            (CID, 10, Some("token_metadata"), Some("first"))
+        );
+        assert!(gave_up(&store, &p).unwrap());
+
+        let reorged = Planned {
+            cid: crate::cid::cid_v0_for(b"another document"),
+            ..p.clone()
+        };
+        assert!(!gave_up(&store, &reorged).unwrap());
+        assert!(record_gave_up(&store, &GaveUp::new(&gate, &reorged, "third".into())).unwrap());
+
+        store.set_meta(&gave_up_key(&p), CID).unwrap();
+        assert!(
+            gave_up(&store, &p).unwrap(),
+            "a bare CID an earlier build wrote still counts"
+        );
     }
 
     /// Room for typed rows is allotted by slot from the plan alone. Keys assigned as documents arrived

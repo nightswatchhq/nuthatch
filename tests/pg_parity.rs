@@ -186,6 +186,24 @@ async fn the_two_backends_agree_through_an_indexing_lifecycle() {
         "a missing key must be None on both, not empty-string on one"
     );
 
+    // A prefix read, in key order. `_` in the prefix is a LIKE wildcard, so a near-miss key must not match.
+    for s in both {
+        s.set_meta("ipfs_gave_up:000000000010:1", "b").unwrap();
+        s.set_meta("ipfs_gave_up:000000000004:0", "a").unwrap();
+        s.set_meta("ipfsXgave_up:000000000001:0", "near miss")
+            .unwrap();
+    }
+    assert_eq!(
+        redb.meta_with_prefix("ipfs_gave_up:", 10).unwrap(),
+        pg.meta_with_prefix("ipfs_gave_up:", 10).unwrap()
+    );
+    assert_eq!(
+        pg.meta_with_prefix("ipfs_gave_up:", 1).unwrap(),
+        [("ipfs_gave_up:000000000004:0".to_string(), "a".to_string())]
+    );
+    assert_eq!(redb.count_meta_with_prefix("ipfs_gave_up:").unwrap(), 2);
+    assert_eq!(pg.count_meta_with_prefix("ipfs_gave_up:").unwrap(), 2);
+
     // A reorg. The single most important thing to get identical: it deletes data.
     let (ra, rb) = (redb.rollback_to(5).unwrap(), pg.rollback_to(5).unwrap());
     assert_eq!(ra, rb, "rollback must remove the same number of entities");
