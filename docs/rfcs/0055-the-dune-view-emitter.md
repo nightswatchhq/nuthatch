@@ -215,9 +215,18 @@ What this means for the emitter:
   the value they hash.
 - **`json` columns stay text.** Typing a tuple's fields needs each component's ABI type, and that is a
   later slice if asked for, not a guess now.
-- **Authored views (`views/*.sql`) are not translated in v1.** They are DuckDB SQL over the nest's own
-  `_dec` companions, which do not exist on the Dune side. Each is listed in the output `README.md` as
-  not emitted, with the reason.
+- **Authored views (`views/*.sql`) are translated only where the translation is exact (S3, #1359).**
+  DuckDB's own parser reads each view, and the query is rendered again from an allowlist of constructs
+  that return the same result in DuckDB and in Trino. It reads the uploaded tables, whose columns hold
+  the nest's own text (§4), and projects `_dec` and `_overflow` with the expression the nest's views
+  use, so it answers over the uploaded rows what the nest's view answers, less the unsealed tip. A view
+  that uses anything else is listed in `README.md` with the construct named: `/` (integer division in
+  Trino, a double in DuckDB), `avg` (a decimal in Trino, a double in DuckDB), a floating-point literal,
+  `GROUP BY ALL`, `QUALIFY`, `DISTINCT ON`, a window function, `*` or an unaliased expression in its
+  output, a table function, or a call, block or state table. A view that reads a refused view is refused
+  too. One divergence is outside any allowlist: DuckDB answers a decimal sum past 38 digits (measured),
+  while Trino's decimal arithmetic raises on overflow (documented, not yet run), so such a query fails
+  on Dune rather than returning a different number.
 - **A `storage` value outside §3.1 fails the run** and names the column. A new `StorageKind` extends the
   map deliberately.
 - **A disagreement between `storage` and the footguns fails the run**, for example a `word32` column

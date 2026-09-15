@@ -49,6 +49,7 @@ tail_columns='"table" varchar, tx_hash varchar, value varchar'
 declare -A ddl=(
   [usdc__transfer]="$columns, $tail_columns"
   [usdc__drift]="$columns, sender varchar, $tail_columns"
+  [usdc__wide]="$columns, $tail_columns"
 )
 
 trino --execute "CREATE SCHEMA IF NOT EXISTS hive.nuthatch"
@@ -73,6 +74,23 @@ for table in $(jq -r '.tables | keys[]' "$fixture"); do
   printf '%s\n  duckdb (local): %s\n  trino (prefix): %s\n' "$table" "$want" "$got"
   if [ "$got" != "$want" ]; then
     echo "::error::$table: Trino returned [$got], local DuckDB [$want] (count, sum, count(sender))"
+    failed=1
+  fi
+done
+
+# RFC-0055 S3 (#1359): each view `emit dune` translated, pointed at this catalogue, must return the
+# rows the nest's own DuckDB view returned. A fixture that carries no views fails rather than passes.
+[ "$(jq '.views // {} | length' "$fixture")" -gt 0 ] || { echo "::error::the fixture carries no translated views"; exit 1; }
+for view in $(jq -r '.views | keys[]' "$fixture"); do
+  want=$(jq -r --arg v "$view" '.views[$v].lines[]' "$fixture")
+  if ! got=$(trino --execute "$(jq -er --arg v "$view" '.views[$v].trino_sql' "$fixture")" | LC_ALL=C sort); then
+    echo "::error::view $view: Trino refused the translated query"
+    failed=1
+    continue
+  fi
+  printf '%s\n  duckdb (nest view):\n%s\n  trino (translated):\n%s\n' "$view" "$want" "$got"
+  if [ "$got" != "$want" ]; then
+    echo "::error::view $view: Trino and the nest's own DuckDB view returned different rows"
     failed=1
   fi
 done
