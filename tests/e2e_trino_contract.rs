@@ -54,8 +54,8 @@ GROUP BY value_overflow;
 
 CREATE VIEW top_blocks AS
 SELECT lower(address) AS contract, block_number AS block, value_dec AS amount
-FROM usdc__transfer
-WHERE NOT value_overflow AND value_dec > 1.5
+FROM usdc__wide
+WHERE NOT value_overflow AND value_dec < 3000
 ORDER BY value_dec DESC, block_number ASC
 LIMIT 3;
 
@@ -68,7 +68,7 @@ CREATE VIEW sender_kinds AS
 WITH marked AS (
     SELECT CASE WHEN sender IS NULL THEN 'none' ELSE 'some' END AS kind, block_number, value_dec
     FROM usdc__drift
-    WHERE block_number BETWEEN 10 AND 2009 AND tx_hash LIKE '0x%' AND log_index IN (0, 1)
+    WHERE block_number BETWEEN 10 AND 1509 AND tx_hash LIKE '0x%' AND log_index IN (0, 1)
 )
 SELECT m.kind AS kind, count(*) AS n, sum(m.value_dec) AS total, max(t.last_block) AS last_block
 FROM marked m CROSS JOIN transfer_totals t
@@ -82,8 +82,8 @@ SELECT coalesce(max(sender), 'no sender') AS any_sender,
        count(*) FILTER (WHERE sender IS NOT NULL) AS with_sender,
        CAST(sum(- value_dec) AS VARCHAR) AS negated,
        'rows:' || CAST(count(*) AS VARCHAR) AS label,
-       (SELECT count(*) FROM usdc__transfer WHERE log_index NOT IN (5, 6)) AS transfers,
-       EXISTS (SELECT 1 FROM transfer_totals WHERE transfers > 0) AS has_totals
+       (SELECT count(*) FROM usdc__transfer WHERE block_number NOT IN (10, 11, 12)) AS transfers,
+       EXISTS (SELECT 1 FROM transfer_totals WHERE transfers > 5000) AS has_totals
 FROM usdc__drift;
 "#;
 
