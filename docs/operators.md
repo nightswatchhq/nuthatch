@@ -1151,6 +1151,16 @@ publishing nest's target, lag and last success.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 
+**Copying a stopped nest to another machine.** Copy the whole directory and start it there. Startup
+checks the copy against what its store was indexed under and refuses a store whose data no longer
+matches `nuthatch.toml` (#1420): a changed decode (an event, column or `[[ipfs]]` declaration), a
+changed `block_timestamps`, or a change to what the data covers, which is the chain, each contract's
+address and start block, the factories and the extraction settings. Refused, the store is left
+untouched: restore the setting, or remove `nuthatch.redb` and `segments/` to re-index. RPC endpoints
+and the nest's name are deliberately not checked, because they cannot change a stored row, so point
+the copy at its own endpoints freely. They still move the NID and the data identity, which hash
+`nuthatch.toml` as written; `/` and `/nest` show both for a running nest.
+
 **Segment identity across versions.** A segment's hash covers the Parquet file bytes, which include
 the `created_by` string stamped by the arrow-rs build. Same binary means identical bytes and identical
 hashes, so re-running a backfill or running the same release on two boxes produces byte-identical,

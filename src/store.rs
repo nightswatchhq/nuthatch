@@ -504,6 +504,9 @@ pub const REGISTRY_KEY: &str = "registry_hash";
 /// means the full decode identity, which also covers call, `[[ipfs]]` and `[[calls]]` declarations.
 pub const IDENTITY_FORMULA_KEY: &str = "identity_formula";
 pub const IDENTITY_FORMULA: &str = "2";
+/// What the store's data covers beyond its decode, as JSON: chain, contracts and their start blocks,
+/// factories, extraction (#1420).
+pub const COVERAGE_KEY: &str = "indexed_coverage";
 
 /// The formula this store recorded its registry hash under, read without creating anything.
 pub fn recorded_identity_formula(path: &Path) -> Result<Option<String>> {

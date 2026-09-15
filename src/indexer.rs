@@ -2450,13 +2450,18 @@ async fn build_nest(
     }
     let registry = Arc::new(crate::registry::from_nest(&dir, config)?);
     let identity = hex::encode(crate::project::decode_identity(&dir, config, &registry)?);
-    guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps)?;
+    // Only the ingestion owner records what a store was indexed under. A `serve` role or query FE reads a
+    // store it does not own, so it compares and refuses a mismatch but never writes (#1423 review).
+    let owner = !config.read_only_role;
+    guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps, owner)?;
     guard_registry_identity(
         store.as_ref(),
         &identity,
         &hex::encode(registry.hash()),
         config.extract.top_level_calls,
+        owner,
     )?;
+    guard_coverage(store.as_ref(), config, owner)?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
@@ -2812,10 +2817,15 @@ async fn build_nest(
     // here, not permanent - see `serve::poll_stalled`.
     nest.metrics.mark_started();
 
+    // No command printed a single nest's NID (#1420). Computed from the inputs as they are now; `None`
+    // only for a directory `blob` cannot read.
+    let manifest = crate::blob::build_manifest(&dir, None).ok();
     let nest_info = serde_json::json!({
         "name": config.nest.name,
         "chain": config.nest.chain,
         "chain_id": config.nest.chain_id,
+        "nid": manifest.as_ref().map(|m| m.nid()),
+        "data_identity": manifest.as_ref().map(|m| m.data_identity()),
         "registry_hash": format!("0x{identity}"),
         "table_count": registry.tables().len(),
         "contracts": config.contracts.iter()
@@ -3334,11 +3344,12 @@ fn guard_registry_identity(
     registry_hash: &str,
     legacy_hash: &str,
     top_level_calls: bool,
+    owner: bool,
 ) -> Result<()> {
     let formula = store.get_meta(IDENTITY_FORMULA_KEY)?;
     match store.get_meta(REGISTRY_KEY)? {
         Some(found) if found == registry_hash => {
-            if formula.is_none() {
+            if owner && formula.is_none() {
                 store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
             }
             Ok(())
@@ -3354,6 +3365,9 @@ fn guard_registry_identity(
                      keep serving this data with the nuthatch build that indexed it."
                 );
             }
+            if !owner {
+                return Ok(());
+            }
             tracing::warn!(
                 "adopting decode identity 0x{registry_hash} for a store recorded under the event \
                  registry alone (0x{found}). Its event decode is verified; its call, [[ipfs]] and \
@@ -3367,6 +3381,7 @@ fn guard_registry_identity(
         Some(found) => anyhow::bail!(
             "this nest's stored data was indexed by a different decode registry.\n\n               stored:  0x{found}\n  config:  0x{registry_hash}\n\n             The registry hash covers every contract, event and column this nest decodes, so a              difference means `nuthatch.toml` or an ABI changed after the data was written.              Continuing would serve old rows under a new content address, and any table added by the              change would read as empty rather than as absent.\n\n             Re-index from scratch to adopt the new configuration (remove `nuthatch.redb` and              `segments/`), or restore the previous configuration to keep serving this data. A nest              whose identity changed is a different nest - that is what content addressing means."
         ),
+        None if !owner => Ok(()),
         None => {
             // Absent means one of two things and they must not be conflated: a fresh store, or a
             // store written by a build from before this guard existed. Refusing the second would
@@ -3385,7 +3400,140 @@ fn guard_registry_identity(
     }
 }
 
-fn guard_timestamp_policy(store: &dyn crate::store::HotStore, declared: bool) -> Result<()> {
+/// Bumped whenever [`coverage`] records more, so a store recorded under an earlier version is
+/// re-recorded rather than refused.
+const COVERAGE_VERSION: u64 = 1;
+
+/// What a store's data covers beyond its decode (#1420). None of the chain, a contract's start block or
+/// a factory's start is in the registry hash, so a copied store started under a moved `start_block` and
+/// served its old range. RPC endpoints and the nest's name stay out: they cannot change a stored row.
+/// Sorted, so reordering `nuthatch.toml` is not a change.
+fn coverage(config: &Config) -> serde_json::Value {
+    let mut contracts: Vec<_> = config
+        .contracts
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "alias": c.alias,
+                "address": c.address.to_lowercase(),
+                "start_block": c.start_block,
+            })
+        })
+        .collect();
+    contracts.sort_by_key(|c| c["alias"].to_string());
+    let mut factories: Vec<_> = config
+        .factories
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "watch": f.watch,
+                "event": f.event,
+                "child_param": f.child_param,
+                "template": f.template,
+                "start": f.start,
+            })
+        })
+        .collect();
+    factories.sort_by_key(|f| f.to_string());
+    let e = &config.extract;
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    serde_json::json!({
+        "v": COVERAGE_VERSION,
+        "chain": config.nest.chain,
+        "chain_id": config.nest.chain_id,
+        "contracts": contracts,
+        "factories": factories,
+        "extract": {
+            "blocks": e.blocks,
+            "traces": e.traces,
+            "top_level_calls": e.top_level_calls,
+            "state": e.state,
+            "contracts": sorted(&e.contracts),
+            "selectors": sorted(&e.selectors),
+        },
+    })
+}
+
+/// Each part of `config` that differs from `stored`, one per line, a contract named by its alias.
+fn coverage_changes(stored: &serde_json::Value, config: &serde_json::Value) -> Vec<String> {
+    let show = |v: Option<&serde_json::Value>| v.map_or("absent".to_string(), |v| v.to_string());
+    let mut out: Vec<String> = ["chain", "chain_id", "factories", "extract"]
+        .into_iter()
+        .filter(|k| stored[k] != config[k])
+        .map(|k| format!("  {k}: stored {}, config {}", stored[k], config[k]))
+        .collect();
+    let by_alias = |v: &serde_json::Value| {
+        v["contracts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| {
+                (
+                    c["alias"].as_str().unwrap_or_default().to_string(),
+                    c.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let (was, now) = (by_alias(stored), by_alias(config));
+    let aliases: std::collections::BTreeSet<&String> = was.keys().chain(now.keys()).collect();
+    for alias in aliases {
+        let (w, n) = (was.get(alias), now.get(alias));
+        if w != n {
+            out.push(format!(
+                "  contract `{alias}`: stored {}, config {}",
+                show(w),
+                show(n)
+            ));
+        }
+    }
+    out
+}
+
+/// Refuse to serve a store under a `nuthatch.toml` that now covers other blocks or contracts (#1420).
+///
+/// The `owner` records a fresh store, and one written before this check, which is said to be recorded
+/// rather than verified, so an upgrade never refuses a store. It re-records one recorded under another
+/// [`COVERAGE_VERSION`] or holding no data yet, and never rewrites a match. A reader only compares.
+fn guard_coverage(store: &dyn crate::store::HotStore, config: &Config, owner: bool) -> Result<()> {
+    let want = coverage(config);
+    let holds_data = store.get_meta(LAST_BLOCK_KEY)?.is_some() || store.sealed_through() > 0;
+    let recorded = store
+        .get_meta(crate::store::COVERAGE_KEY)?
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok());
+    match recorded {
+        Some(found) if found == want => return Ok(()),
+        Some(found) if holds_data && found["v"] == want["v"] => anyhow::bail!(
+            "this nest's stored data covers something nuthatch.toml no longer declares:\n\n{}\n\n\
+             The chain, each contract's address and start block, the factories and the extraction \
+             settings decide which blocks and rows a store holds, so a difference means `nuthatch.toml` \
+             changed what this data covers after it was written. Continuing would serve rows indexed \
+             over one range under a configuration that claims another.\n\n\
+             Re-index from scratch to adopt the new configuration (remove `nuthatch.redb` and \
+             `segments/`), or restore the previous configuration to keep serving this data. RPC \
+             endpoints and the nest's name are not part of this check and may change freely.",
+            coverage_changes(&found, &want).join("\n")
+        ),
+        _ if !owner => return Ok(()),
+        None if holds_data => tracing::warn!(
+            "recording what this store covers for a store written before that was checked (#1420) - \
+             it was recorded, not verified. If a contract's address or start block has changed since \
+             it was indexed, re-index it."
+        ),
+        _ => {}
+    }
+    store.set_meta(crate::store::COVERAGE_KEY, &want.to_string())
+}
+
+fn guard_timestamp_policy(
+    store: &dyn crate::store::HotStore,
+    declared: bool,
+    owner: bool,
+) -> Result<()> {
     let want = if declared { "1" } else { "0" };
     match store.get_meta(TIMESTAMPS_KEY)? {
         Some(found) if found != want => {
@@ -3413,7 +3561,9 @@ fn guard_timestamp_policy(store: &dyn crate::store::HotStore, declared: bool) ->
             // change its mind silently, so record what it actually has rather than what it now says.
             let has_indexed = store.get_meta(LAST_BLOCK_KEY)?.is_some();
             let actual = if has_indexed && !declared { "1" } else { want };
-            store.set_meta(TIMESTAMPS_KEY, actual)?;
+            if owner {
+                store.set_meta(TIMESTAMPS_KEY, actual)?;
+            }
             if actual != want {
                 anyhow::bail!(
                     "this nest has already indexed with `block_timestamp`, so it cannot switch to \
@@ -12693,7 +12843,7 @@ template = "pool"
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
 
         // 1. Fresh store: adopts, and records what it adopted.
-        guard_registry_identity(&store, "aaaa", "aaaa", false).expect("a fresh store adopts");
+        guard_registry_identity(&store, "aaaa", "aaaa", false, true).expect("a fresh store adopts");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("aaaa"),
@@ -12701,12 +12851,12 @@ template = "pool"
         );
 
         // 2. Same registry: still fine.
-        guard_registry_identity(&store, "aaaa", "aaaa", false)
+        guard_registry_identity(&store, "aaaa", "aaaa", false, true)
             .expect("an unchanged registry must be accepted");
 
         // 3. Different registry: refused, and the message must name both hashes - a refusal that
         //    does not say what changed sends the operator to the source to find out.
-        let err = guard_registry_identity(&store, "bbbb", "bbbb", false)
+        let err = guard_registry_identity(&store, "bbbb", "bbbb", false, true)
             .expect_err("a changed registry must be refused, not adopted");
         let msg = format!("{err:#}");
         assert!(msg.contains("aaaa"), "must name the stored hash: {msg}");
@@ -12724,14 +12874,14 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "12345").unwrap();
         assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
 
-        guard_registry_identity(&store, "cccc", "cccc", false)
+        guard_registry_identity(&store, "cccc", "cccc", false, true)
             .expect("an older store must not be refused");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("cccc")
         );
         // And having adopted, it is now held to it.
-        guard_registry_identity(&store, "dddd", "dddd", false)
+        guard_registry_identity(&store, "dddd", "dddd", false, true)
             .expect_err("once adopted, a later change must be refused");
     }
 
@@ -12743,15 +12893,343 @@ template = "pool"
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         store.set_meta(REGISTRY_KEY, "events").unwrap();
         store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
-        let err = guard_registry_identity(&store, "full", "events", true)
+        let err = guard_registry_identity(&store, "full", "events", true, true)
             .expect_err("indexed call rows without a sender must not be adopted");
         assert!(format!("{err:#}").contains("tx_from"), "{err:#}");
 
         let empty = tempfile::tempdir().unwrap();
         let empty = Store::open(&empty.path().join("t.redb")).unwrap();
         empty.set_meta(REGISTRY_KEY, "events").unwrap();
-        guard_registry_identity(&empty, "full", "events", true)
+        guard_registry_identity(&empty, "full", "events", true, true)
             .expect("a store that never indexed a call has nothing to re-index");
+    }
+
+    const COVERAGE_ABI: &str = r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#;
+
+    /// `nuthatch.toml` for a one-contract nest, with the fields #1420 is about spelled out.
+    fn coverage_toml(name: &str, rpc: &str, address: &str, start_block: u64) -> String {
+        format!(
+            "[nest]\nname = \"{name}\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = [\"{rpc}\"]\n\n[[contracts]]\nalias = \"t\"\naddress = \"{address}\"\n\
+             abi = \"abis/t.json\"\nstart_block = {start_block}\n"
+        )
+    }
+
+    fn covering(name: &str, rpc: &str, address: &str, start_block: u64) -> Config {
+        toml::from_str(&coverage_toml(name, rpc, address, start_block)).unwrap()
+    }
+
+    const ADDRESS: &str = "0x00000000000000000000000000000000000000aa";
+
+    /// #1420: a store is held to what its data covers, and not to its endpoints or its name.
+    #[test]
+    fn a_store_is_held_to_what_its_data_covers_and_not_to_its_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 100), true)
+            .expect("a fresh store records");
+        store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+
+        guard_coverage(&store, &covering("renamed", "http://b", ADDRESS, 100), true)
+            .expect("the name and the endpoints cannot change a stored row");
+        guard_coverage(
+            &store,
+            &covering("n", "http://a", &ADDRESS.to_uppercase(), 100),
+            true,
+        )
+        .expect("an address's case is not a different contract");
+
+        let err = guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101), true)
+            .expect_err("a moved start block is a different range");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("contract `t`")
+                && msg.contains("\"start_block\":100")
+                && msg.contains("\"start_block\":101"),
+            "the refusal names what moved: {msg}"
+        );
+        let mut elsewhere = covering("n", "http://a", ADDRESS, 100);
+        elsewhere.nest.chain_id = 8453;
+        let err =
+            guard_coverage(&store, &elsewhere, true).expect_err("another chain is other data");
+        assert!(
+            format!("{err:#}").contains("chain_id: stored 42161, config 8453"),
+            "{err:#}"
+        );
+    }
+
+    /// #1420: an upgrade must not refuse the stores it finds. One written before the check records what
+    /// it covers and starts; so does one recorded under an earlier version, and one that holds no data.
+    #[test]
+    fn a_store_from_before_the_coverage_check_records_rather_than_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 100), true)
+            .expect("an older store starts");
+        assert!(store
+            .get_meta(crate::store::COVERAGE_KEY)
+            .unwrap()
+            .is_some());
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101), true)
+            .expect_err("once recorded, a later change is refused");
+
+        store
+            .set_meta(crate::store::COVERAGE_KEY, r#"{"v":0,"chain":"somewhere"}"#)
+            .unwrap();
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101), true)
+            .expect("a record from an earlier version is re-recorded");
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101), true).unwrap();
+
+        let empty = tempfile::tempdir().unwrap();
+        let empty = Store::open(&empty.path().join("t.redb")).unwrap();
+        guard_coverage(&empty, &covering("n", "http://a", ADDRESS, 100), true).unwrap();
+        guard_coverage(&empty, &covering("n", "http://a", ADDRESS, 101), true)
+            .expect("a store with no data has nothing to contradict");
+    }
+
+    /// #1420, as found: a stopped nest copied elsewhere started under an edited `start_block` and served
+    /// its old data. The copy is refused for that and starts under new endpoints or a new name, and `/nest`
+    /// and `/` show the NID and data identity nothing else printed.
+    #[tokio::test]
+    async fn a_copied_store_is_refused_under_a_moved_start_block_and_starts_under_new_endpoints() {
+        use tower::ServiceExt as _;
+        let original = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(original.path().join("abis")).unwrap();
+        std::fs::write(original.path().join("abis/t.json"), COVERAGE_ABI).unwrap();
+        std::fs::write(
+            original.path().join(crate::config::CONFIG_FILE),
+            coverage_toml("copied", "http://a", ADDRESS, 100),
+        )
+        .unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let build = |dir: std::path::PathBuf| {
+            let source = source.clone();
+            async move {
+                let config = Config::load(&dir).unwrap();
+                let built = build_nest(
+                    &source,
+                    dir,
+                    &config,
+                    None,
+                    false,
+                    None,
+                    None,
+                    serve::new_sql_gate(),
+                )
+                .await;
+                built.map(|(nest, state, worker, _)| {
+                    if let Some(w) = worker {
+                        w.abort();
+                    }
+                    (nest, state)
+                })
+            }
+        };
+
+        let (nest, state) = build(original.path().to_path_buf()).await.unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+        let manifest = crate::blob::build_manifest(original.path(), None).unwrap();
+        for uri in ["/nest", "/"] {
+            let res = serve::router(serve::SharedNest::new(state.clone()))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["nid"],
+                serde_json::json!(manifest.nid()),
+                "{uri}: {json}"
+            );
+            assert_eq!(
+                json["data_identity"],
+                serde_json::json!(manifest.data_identity()),
+                "{uri}: {json}"
+            );
+        }
+        drop(nest);
+        drop(state);
+
+        let copy = |toml: String| {
+            let to = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(to.path().join("abis")).unwrap();
+            std::fs::write(to.path().join("abis/t.json"), COVERAGE_ABI).unwrap();
+            std::fs::write(to.path().join(crate::config::CONFIG_FILE), toml).unwrap();
+            std::fs::copy(
+                original.path().join(crate::config::DB_FILE),
+                to.path().join(crate::config::DB_FILE),
+            )
+            .unwrap();
+            to
+        };
+
+        let moved = copy(coverage_toml("copied", "http://a", ADDRESS, 101));
+        let err = build(moved.path().to_path_buf())
+            .await
+            .err()
+            .expect("a copy under a moved start block must be refused");
+        assert!(
+            format!("{err:#}").contains("covers something nuthatch.toml no longer declares"),
+            "{err:#}"
+        );
+
+        for toml in [
+            coverage_toml("copied", "http://elsewhere", ADDRESS, 100),
+            coverage_toml("renamed", "http://a", ADDRESS, 100),
+        ] {
+            let started = copy(toml);
+            let (nest, state) = build(started.path().to_path_buf())
+                .await
+                .expect("new endpoints or a new name must not refuse the copy");
+            drop(nest);
+            drop(state);
+        }
+    }
+
+    /// #1423 review: a `serve` role or query FE reads a store it does not own. It refuses a mismatch it can
+    /// prove, and otherwise starts without writing, even over a store no build has recorded.
+    #[test]
+    fn a_reader_compares_what_a_store_was_indexed_under_but_never_records_it() {
+        use crate::store::HotStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+        let config = covering("n", "http://a", ADDRESS, 100);
+        let untouched = store.write_generation();
+        guard_timestamp_policy(&store, true, false).unwrap();
+        guard_registry_identity(&store, "aaaa", "aaaa", false, false).unwrap();
+        guard_coverage(&store, &config, false).unwrap();
+        assert_eq!(
+            store.write_generation(),
+            untouched,
+            "a reader wrote to a store it does not own"
+        );
+        for key in [crate::store::COVERAGE_KEY, REGISTRY_KEY, TIMESTAMPS_KEY] {
+            assert_eq!(store.get_meta(key).unwrap(), None, "{key}");
+        }
+
+        guard_coverage(&store, &config, true).unwrap();
+        guard_registry_identity(&store, "aaaa", "aaaa", false, true).unwrap();
+        guard_timestamp_policy(&store, true, true).unwrap();
+        let recorded = store.write_generation();
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101), false)
+            .expect_err("a reader refuses a coverage mismatch it can prove");
+        guard_registry_identity(&store, "bbbb", "bbbb", false, false)
+            .expect_err("and a registry mismatch");
+        guard_timestamp_policy(&store, false, false).expect_err("and a timestamp switch");
+        assert_eq!(store.write_generation(), recorded);
+    }
+
+    /// #1423 review: the owner records what it first starts under, and does not rewrite a store that
+    /// already matches on a later start.
+    #[test]
+    fn an_owner_records_coverage_once_and_leaves_a_matching_store_alone() {
+        use crate::store::HotStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let config = covering("n", "http://a", ADDRESS, 100);
+        guard_coverage(&store, &config, true).unwrap();
+        assert!(
+            store
+                .get_meta(crate::store::COVERAGE_KEY)
+                .unwrap()
+                .is_some(),
+            "the owner records on first start"
+        );
+        store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+        let before = store.write_generation();
+        guard_coverage(&store, &config, true).unwrap();
+        guard_coverage(&store, &covering("renamed", "http://b", ADDRESS, 100), true).unwrap();
+        assert_eq!(
+            store.write_generation(),
+            before,
+            "a matching store was rewritten"
+        );
+    }
+
+    /// #1423 review, through `build_nest`: a query FE handed a store it does not own starts without writing
+    /// to it, and refuses that store under a moved start block.
+    #[tokio::test]
+    async fn a_query_fe_over_a_store_it_does_not_own_starts_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(dir.path().join("abis/t.json"), COVERAGE_ABI).unwrap();
+        let toml = |start: u64| coverage_toml("fe", "http://a", ADDRESS, start);
+        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), toml(100)).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        {
+            let config = Config::load(dir.path()).unwrap();
+            let (nest, _state, worker, _) = build_nest(
+                &source,
+                dir.path().to_path_buf(),
+                &config,
+                None,
+                false,
+                None,
+                None,
+                serve::new_sql_gate(),
+            )
+            .await
+            .unwrap();
+            if let Some(w) = worker {
+                w.abort();
+            }
+            nest.store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+        }
+        let reader = |start: u64| {
+            let (dir, source) = (dir.path().to_path_buf(), source.clone());
+            async move {
+                std::fs::write(dir.join(crate::config::CONFIG_FILE), toml(start)).unwrap();
+                let store: Arc<dyn crate::store::HotStore> =
+                    Arc::new(Store::open_existing(&dir.join(DB_FILE)).unwrap());
+                let mut config = Config::load(&dir).unwrap();
+                config.read_only_role = true;
+                let before = store.write_generation();
+                let built = build_nest(
+                    &source,
+                    dir,
+                    &config,
+                    None,
+                    false,
+                    None,
+                    Some(store.clone()),
+                    serve::new_sql_gate(),
+                )
+                .await
+                .map(|(_, _, worker, _)| {
+                    if let Some(w) = worker {
+                        w.abort();
+                    }
+                });
+                (built, before, store.write_generation())
+            }
+        };
+        let (built, before, after) = reader(100).await;
+        built.expect("the FE starts over the store it reads");
+        assert_eq!(after, before, "the FE wrote to a store it does not own");
+        let (built, before, after) = reader(101).await;
+        let err = built.expect_err("the FE refuses a store whose coverage moved");
+        assert!(
+            format!("{err:#}").contains("covers something nuthatch.toml no longer declares"),
+            "{err:#}"
+        );
+        assert_eq!(after, before);
+        // A record from an earlier version: an owner re-records it, a reader leaves it.
+        Store::open_existing(&dir.path().join(DB_FILE))
+            .unwrap()
+            .set_meta(crate::store::COVERAGE_KEY, r#"{"v":0}"#)
+            .unwrap();
+        let (built, before, after) = reader(100).await;
+        built.expect("the FE starts over an older record");
+        assert_eq!(after, before, "the FE re-recorded a store it does not own");
     }
 
     const QOS_EDGE: &str = "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f";
@@ -12828,9 +13306,9 @@ template = "pool"
         );
 
         let store = Store::open(&indexer.path().join("t.redb")).unwrap();
-        guard_registry_identity(&store, &a, &a_events, true).unwrap();
+        guard_registry_identity(&store, &a, &a_events, true, true).unwrap();
         store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
-        guard_registry_identity(&store, &b, &b_events, true)
+        guard_registry_identity(&store, &b, &b_events, true, true)
             .expect_err("a store indexed under one [[ipfs]] declaration must refuse another");
     }
 
@@ -12844,7 +13322,7 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "100").unwrap();
         store.set_meta(REGISTRY_KEY, "events").unwrap();
 
-        guard_registry_identity(&store, "full", "events", false)
+        guard_registry_identity(&store, "full", "events", false, true)
             .expect("a store matching the old formula adopts the new one");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
@@ -12853,9 +13331,9 @@ template = "pool"
 
         let fresh = tempfile::tempdir().unwrap();
         let fresh = Store::open(&fresh.path().join("t.redb")).unwrap();
-        guard_registry_identity(&fresh, "events", "events", false).unwrap();
+        guard_registry_identity(&fresh, "events", "events", false, true).unwrap();
         fresh.set_meta(LAST_BLOCK_KEY, "100").unwrap();
-        guard_registry_identity(&fresh, "events+ipfs", "events", false).expect_err(
+        guard_registry_identity(&fresh, "events+ipfs", "events", false, true).expect_err(
             "a store recorded under the full formula must refuse a declaration added afterwards",
         );
     }
@@ -16794,15 +17272,15 @@ template="pool"
         let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
 
         // First start records what the nest is built with.
-        guard_timestamp_policy(&store, true).unwrap();
+        guard_timestamp_policy(&store, true, true).unwrap();
         assert_eq!(
             store.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(),
             Some("1")
         );
         // Restarting unchanged is fine, repeatedly.
-        guard_timestamp_policy(&store, true).unwrap();
+        guard_timestamp_policy(&store, true, true).unwrap();
 
-        let err = guard_timestamp_policy(&store, false)
+        let err = guard_timestamp_policy(&store, false, true)
             .unwrap_err()
             .to_string();
         assert!(
@@ -16828,14 +17306,16 @@ template="pool"
         // Untouched nest: adopts whatever it declares.
         let fresh = tempfile::tempdir().unwrap();
         let s1 = Store::open(&fresh.path().join(DB_FILE)).unwrap();
-        guard_timestamp_policy(&s1, false).unwrap();
+        guard_timestamp_policy(&s1, false, true).unwrap();
         assert_eq!(s1.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(), Some("0"));
 
         // Nest with history but no key - as every nest built before slice 4 will be.
         let old = tempfile::tempdir().unwrap();
         let s2 = Store::open(&old.path().join(DB_FILE)).unwrap();
         s2.set_meta(LAST_BLOCK_KEY, "1234").unwrap();
-        let err = guard_timestamp_policy(&s2, false).unwrap_err().to_string();
+        let err = guard_timestamp_policy(&s2, false, true)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("already indexed"),
             "must explain it is the existing data that blocks this: {err}"
@@ -16843,8 +17323,8 @@ template="pool"
         // It recorded the truth (it *has* timestamps), so the next start gives the same answer rather
         // than depending on whether `last_block` happens to still be there.
         assert_eq!(s2.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(), Some("1"));
-        assert!(guard_timestamp_policy(&s2, false).is_err());
-        guard_timestamp_policy(&s2, true).unwrap();
+        assert!(guard_timestamp_policy(&s2, false, true).is_err());
+        guard_timestamp_policy(&s2, true, true).unwrap();
     }
 
     /// Upgrading an existing nest must be a no-op: `block_timestamps` absent from `nuthatch.toml`
