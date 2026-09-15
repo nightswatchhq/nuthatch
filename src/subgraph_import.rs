@@ -342,6 +342,11 @@ pub fn resolve_abi_path(home: &ManifestHome, rel: &str) -> Result<std::path::Pat
         ),
         ManifestHome::Local(d) => d,
     };
+    // Canonical here rather than trusted from the caller: a home under a symlink, such as macOS's
+    // `/var`, would otherwise refuse every file inside it.
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("cannot resolve the manifest's directory {}", dir.display()))?;
     let joined = dir.join(rel);
     let full = joined.canonicalize().with_context(|| {
         format!(
@@ -349,7 +354,7 @@ pub fn resolve_abi_path(home: &ManifestHome, rel: &str) -> Result<std::path::Pat
             joined.display()
         )
     })?;
-    if !full.starts_with(dir) {
+    if !full.starts_with(&dir) {
         bail!(
             "the manifest references `{rel}`, which resolves to {} - outside the manifest's own \
              directory ({}). Refusing: a manifest may name its own files and no others.",
@@ -1171,6 +1176,23 @@ mod tests {
 
         // And the legitimate one still works, or the guard is a wall.
         assert!(resolve_abi_path(&home, "./abis/Token.json").is_ok());
+    }
+
+    /// A home reached through a symlink, as every macOS tempdir is, still resolves its own files. The
+    /// comparison must not depend on the caller having canonicalised the home.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_reached_through_a_symlink_still_resolves_its_own_files() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real");
+        std::fs::create_dir_all(real.join("abis")).unwrap();
+        std::fs::write(real.join("abis/Token.json"), "[]").unwrap();
+        let link = outer.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let got = resolve_abi_path(&ManifestHome::Local(link), "./abis/Token.json")
+            .expect("a file inside the manifest's own directory must resolve");
+        assert!(got.ends_with("real/abis/Token.json"), "{}", got.display());
     }
 
     /// The escape a `..` check does not see, in its own test rather than after the `..` assertion.
