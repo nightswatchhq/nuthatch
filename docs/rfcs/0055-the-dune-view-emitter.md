@@ -223,7 +223,8 @@ What this means for the emitter:
   that uses anything else is listed in `README.md` with the construct named: `/` (integer division in
   Trino, a double in DuckDB), `avg` (a decimal in Trino, a double in DuckDB), a floating-point literal,
   `GROUP BY ALL`, `QUALIFY`, `DISTINCT ON`, a window function, `*` or an unaliased expression in its
-  output, a table function, or a call, block or state table. A view that reads a refused view is refused
+  output, an unaliased expression in a CTE or `FROM` subquery it reads by name, a table function, or a
+  call, block or state table. A view that reads a refused view is refused
   too. One divergence is outside any allowlist: DuckDB answers a decimal sum past 38 digits (measured),
   while Trino's decimal arithmetic raises on overflow (documented, not yet run), so such a query fails
   on Dune rather than returning a different number.

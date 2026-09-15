@@ -182,7 +182,7 @@ impl Translator<'_> {
             return Err("uses a prepared-statement parameter".into());
         }
         let node = &stmt["node"];
-        let columns = output_columns(node)?;
+        let columns = output_columns(node, true)?;
         let (own, body) = self.parts(node, &[])?;
         for key in cte_keys(node) {
             if self.reads.contains(&key) || self.used.contains(&key) {
@@ -250,6 +250,8 @@ impl Translator<'_> {
             if !arr(&value["key_targets"]).is_empty() {
                 return Err(format!("uses `USING KEY` in CTE `{key}`"));
             }
+            output_columns(&value["query"]["node"], false)
+                .map_err(|e| format!("reads CTE `{key}`, which {e}"))?;
             let body = self.nested(&value["query"]["node"], &scope)?;
             scope.push(key.to_ascii_lowercase());
             ctes.push(format!("{} AS ({body})", ident(key)));
@@ -500,7 +502,11 @@ impl Translator<'_> {
                     format!("{left} {kw} {right} ON {on}")
                 }
             }
-            "SUBQUERY" => format!("({}){alias}", self.nested(&t["subquery"]["node"], scope)?),
+            "SUBQUERY" => {
+                output_columns(&t["subquery"]["node"], false)
+                    .map_err(|e| format!("reads a subquery in `FROM`, which {e}"))?;
+                format!("({}){alias}", self.nested(&t["subquery"]["node"], scope)?)
+            }
             other => {
                 return Err(format!(
                     "reads from a `{other}`, which has no DuneSQL counterpart here"
@@ -734,9 +740,10 @@ impl Translator<'_> {
     }
 }
 
-/// The names a caller sees. DuckDB names an unaliased expression after its own text and Trino names
-/// it `_colN`, so only aliases and bare columns are names both engines agree on.
-fn output_columns(node: &Value) -> Refusal<Vec<String>> {
+/// The names a relation exposes. DuckDB names an unaliased expression after its own text and Trino
+/// names it `_colN`, so only aliases and bare columns are names both engines agree on. A nested `*`
+/// keeps the names of what it expands, and those are checked where they are defined.
+fn output_columns(node: &Value, top: bool) -> Refusal<Vec<String>> {
     match str_of(&node["type"]) {
         "SELECT_NODE" => arr(&node["select_list"])
             .iter()
@@ -750,6 +757,7 @@ fn output_columns(node: &Value) -> Refusal<Vec<String>> {
                         .last()
                         .map(|n| str_of(n).to_string())
                         .ok_or_else(|| "selects a column with no name".to_string()),
+                    "STAR" if !top => Ok("*".to_string()),
                     "STAR" => Err(
                         "selects `*`, whose columns follow the upload's column order rather than \
                          the nest's"
@@ -769,7 +777,7 @@ fn output_columns(node: &Value) -> Refusal<Vec<String>> {
                 .filter(|l| l.is_object())
                 .or_else(|| arr(&node["children"]).first())
                 .ok_or_else(|| "is a set operation with no branches".to_string())?;
-            output_columns(first)
+            output_columns(first, top)
         }
         other => Err(format!(
             "is a `{other}` query, which this slice does not translate"
@@ -1090,12 +1098,30 @@ mod tests {
             ),
             ("SELECT \"to\" FROM main.vault__transfer", "qualifier"),
             ("SELECT substr(\"to\", 1, 4) AS p FROM vault__transfer", "calls `substr`"),
+            (
+                "SELECT q.\"1\" AS value FROM (SELECT 1) q",
+                "reads a subquery in `FROM`, which leaves select item 1 without an alias",
+            ),
+            (
+                "WITH c AS (SELECT count(*) FROM vault__transfer) SELECT 1 AS one FROM c",
+                "reads CTE `c`, which leaves select item 1 without an alias",
+            ),
         ] {
             match one(body) {
                 Ok(t) => panic!("`{body}` translated, and must not have:\n{}", t.sql),
                 Err(e) => assert!(e.contains(why), "`{body}` refused for `{e}`, expected `{why}`"),
             }
         }
+    }
+
+    #[test]
+    fn a_nested_star_and_an_unaliased_scalar_subquery_are_still_translated() {
+        let t = one(
+            "WITH x AS (SELECT * FROM vault__transfer WHERE log_index = 0) \
+             SELECT count(*) AS n, (SELECT max(block_number) FROM x) AS last FROM x",
+        )
+        .unwrap();
+        assert_eq!(t.columns, ["n", "last"]);
     }
 
     #[test]
