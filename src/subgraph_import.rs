@@ -406,7 +406,9 @@ pub async fn fetch_ipfs_proven(
     for url in &urls {
         let body = match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => match read_capped(resp).await {
-                Ok(body) if !body.trim().is_empty() => body,
+                // A CID can name an empty (or whitespace-only) file. Let the proof below decide;
+                // rejecting it here makes the resolver retry immutable bytes for half an hour.
+                Ok(body) if !body.trim().is_empty() || expect.is_some() => body,
                 Ok(_) => {
                     failures.push(format!("{url}: empty body"));
                     continue;
@@ -1252,6 +1254,65 @@ mod tests {
     }
 
     const LARGE: usize = 600 * 1024;
+
+    #[tokio::test]
+    async fn an_empty_document_is_proven_when_its_cid_names_empty_bytes() {
+        let (gateway, handle) = trustless_gateway(Vec::new(), None).await;
+        let got = fetch_ipfs_proven(
+            "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
+            &[gateway],
+            Origin::Manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.proof, Proof::Verified);
+        assert_eq!(got.body, "");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_document_is_proven_without_trimming_its_bytes() {
+        let file = b" \n\t";
+        let cid = crate::cid::cid_v0_for(file);
+        let (gateway, handle) = trustless_gateway(file.to_vec(), None).await;
+        let got = fetch_ipfs_proven(&cid, &[gateway], Origin::Manifest)
+            .await
+            .unwrap();
+        assert_eq!(got.proof, Proof::Verified);
+        assert_eq!(got.body.as_bytes(), file);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn an_empty_gateway_response_cannot_replace_a_nonempty_document() {
+        let file = b"[1,2,3]";
+        let cid = crate::cid::cid_v0_for(file);
+        let (empty, empty_handle) = trustless_gateway(Vec::new(), None).await;
+        assert!(
+            fetch_ipfs_proven(&cid, std::slice::from_ref(&empty), Origin::Manifest)
+                .await
+                .is_err()
+        );
+        let (good, good_handle) = trustless_gateway(file.to_vec(), None).await;
+        let got = fetch_ipfs_proven(&cid, &[empty, good], Origin::Manifest)
+            .await
+            .unwrap();
+        assert_eq!(got.proof, Proof::Verified);
+        assert_eq!(got.body.as_bytes(), file);
+        empty_handle.abort();
+        good_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn an_empty_operator_url_still_has_no_document_or_proof() {
+        let (gateway, handle) = trustless_gateway(Vec::new(), None).await;
+        let err = fetch_ipfs_proven(&format!("{gateway}manifest"), &[], Origin::Operator)
+            .await
+            .err()
+            .expect("an unaddressed empty response is still refused");
+        assert!(err.to_string().contains("empty body"), "{err:#}");
+        handle.abort();
+    }
 
     #[tokio::test]
     async fn a_large_document_in_kubos_default_layout_is_proven_from_its_file_bytes() {

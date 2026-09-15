@@ -897,6 +897,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_proven_empty_file_is_refused_as_typed_rows_without_retrying_the_gateway() {
+        use axum::{routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = Router::new().route(
+            "/ipfs/{cid}",
+            get(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { axum::http::StatusCode::NO_CONTENT }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}/ipfs/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let decl = IpfsDecl {
+            rows: Some(one_column_rows("typed", 10)),
+            ..uri_decl()
+        };
+        let gate = Gate::new(&[decl], &[table("nft__uri_set", "uri", "string")]).unwrap();
+        let metrics = crate::metrics::NestMetrics::default();
+        let policy = Policy {
+            first_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            ..Policy::default()
+        };
+        let (rows, given_up) = resolve_inline(
+            &gate,
+            &[gateway],
+            &policy,
+            &[uri_row(
+                10,
+                0,
+                "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH",
+            )],
+            true,
+            &metrics,
+        )
+        .await;
+        assert!(rows.is_empty());
+        assert_eq!(given_up, 1);
+        assert_eq!(metrics.ipfs_rows_refused(), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     /// Room for typed rows is allotted by slot from the plan alone. Keys assigned as documents arrived
     /// would differ between two operators whose gateways answered in a different order.
     #[test]
