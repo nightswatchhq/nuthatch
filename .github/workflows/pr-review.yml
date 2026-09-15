@@ -96,7 +96,7 @@ jobs:
           # cannot pass for a complete one. Review of #1056.
           base="$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq '.baseRefName')"
           # NOT swallowed. `|| : > pr.commits` turned a transient API error into an empty file,
-          # which `pr-review.py` renders as the same `(not supplied)` marker it uses when no file
+          # which `pr-review.sh` renders as the same `(not supplied)` marker it uses when no file
           # was passed - so the review would proceed from the diff alone and produce a verdict,
           # recreating the exact missing-context failure this change exists to prevent. Review of
           # #1056, and the second time in this PR a fix reintroduced its own fault by failing soft.
@@ -244,7 +244,7 @@ jobs:
           conclusion=failure
           title="Jules could not complete the review"
           summary="The review failed closed. Fix the workflow or credentials, then comment /re-review."
-          if python3 scripts/pr-review.py --diff pr.diff --title "$(cat pr.title)" \
+          if bash scripts/pr-review.sh --diff pr.diff --title "$(cat pr.title)" \
               --body-file pr.body --commits-file pr.commits --base-file pr.base \
               --base-commits-file pr.base_commits --base-range "$(cat pr.base_range)" \
               --own-files-file pr.own_files --prior-reviews-file pr.prior_reviews \
