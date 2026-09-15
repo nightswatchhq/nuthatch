@@ -6,6 +6,12 @@
 #
 # Usage: scripts/trino-contract.sh <fixture.json>
 # Needs: jq, sha256sum, the AWS CLI (path-style, `AWS_ENDPOINT` set) and `docker`.
+# macOS ships bash 3.2: no associative arrays, and after a `set -u` error with an EXIT trap set it
+# exits 0, so this script would pass there without comparing anything.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "::error::trino-contract.sh needs bash 4 or later; this is ${BASH_VERSION:-an unknown shell}" >&2
+  exit 1
+fi
 set -euo pipefail
 
 fixture=${1:?usage: trino-contract.sh <fixture.json>}
