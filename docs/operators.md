@@ -999,7 +999,8 @@ rather than as a caught-up seal.
 `{"requested", "effective", "capped_by"}`, and `null` for a nest not started with `--seal-direct`. With a
 single RPC endpoint the pass runs one window at a time whatever `--concurrency` says, to avoid a stall
 of the whole runtime, and `capped_by` then reads `single_rpc_endpoint` (#1399). Add a second endpoint
-to get the concurrency you asked for.
+to get the concurrency you asked for. A nest mounted into a running runtime is held to the same cap,
+counted on the endpoints of its chain's cursor, which is the source it fetches through.
 
 **One IPFS document holds a seal-direct window for at most five minutes by default.** A window seals
 only once every document it names is fetched or given up on. A failed fetch is tried again with a

@@ -1707,6 +1707,8 @@ pub async fn dev(
     let mut estimates: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut sources: std::collections::HashMap<String, Arc<dyn Source>> =
         std::collections::HashMap::new();
+    let mut endpoint_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut runtime_total_mb = RUNTIME_BASE_RSS_MB;
     // The live health surface (RFC-0026 §5): the cursors write quarantine state here, the API reads it
     // per request. Replaces the roster snapshot that was built once at startup and could not express
@@ -1730,6 +1732,13 @@ pub async fn dev(
             .collect();
         let concurrency =
             indexer::backfill_concurrency_for(rpc_urls.len(), concurrency, seal_direct, &names);
+        endpoint_counts.insert(group.endpoint.chain.clone(), rpc_urls.len());
+        // `/ready` reads a runtime nest's metrics by route, and `build_nest` records by the nest's name.
+        for name in &names {
+            crate::metrics::METRICS
+                .nest(name)
+                .set_ipfs_window_deadline(ipfs_window_deadline);
+        }
 
         // Per-cursor footprint budget (RFC-0021): this chain's nests must fit ≤ max_rss.
         let mut cursor_mb = 0u64;
@@ -1904,6 +1913,7 @@ pub async fn dev(
             dir: dir.clone(),
             mounts: mounts.mounts.clone(),
             sources,
+            endpoint_counts,
             backfill,
             seal_direct,
             concurrency,
@@ -2249,6 +2259,9 @@ pub struct MountContext {
     pub mounts: Vec<Mount>,
     /// Chain -> the source driving that chain's cursor. A nest whose chain is absent cannot be mounted.
     pub sources: std::collections::HashMap<String, Arc<dyn Source>>,
+    /// Chain -> the endpoints that source spreads over. A mounted nest fetches through it, so this is
+    /// what `safe_backfill_concurrency` guards, not the nest's own `rpc_urls`.
+    pub endpoint_counts: std::collections::HashMap<String, usize>,
     pub backfill: Option<u64>,
     pub seal_direct: bool,
     pub concurrency: usize,
@@ -2425,6 +2438,21 @@ impl RuntimeHandles {
         // copying a dataset for a nest that is not going to run.
         let prepared = prepare_dataset(&self.mount_ctx.dir, dir, nid.as_deref(), name);
 
+        // Guarded by the chain's endpoints, as at boot. A chain missing from the count is capped to one.
+        let concurrency = indexer::backfill_concurrency_for(
+            self.mount_ctx
+                .endpoint_counts
+                .get(&chain)
+                .copied()
+                .unwrap_or(1),
+            self.mount_ctx.concurrency,
+            self.mount_ctx.seal_direct,
+            &[name],
+        );
+        crate::metrics::METRICS
+            .nest(name)
+            .set_ipfs_window_deadline(config.ipfs_window_deadline);
+
         // Phase 1: build and catch up, off to one side of the cursor.
         let (nest, mut state, worker, next) = indexer::build_and_prepare_nest(
             &source,
@@ -2432,7 +2460,7 @@ impl RuntimeHandles {
             &config,
             self.mount_ctx.backfill,
             self.mount_ctx.seal_direct,
-            self.mount_ctx.concurrency,
+            concurrency,
             self.mount_ctx.window_override,
             self.mount_ctx.admin_enabled,
             self.mount_ctx.admin_token.clone(),
