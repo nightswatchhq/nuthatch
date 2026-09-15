@@ -211,7 +211,7 @@ fn drifted_value(i: u64) -> u128 {
 
 /// One row in ten is 39 digits, past `DECIMAL(38,0)`, so its `_dec` is NULL and its `_overflow` true.
 fn wide_value(i: u64) -> u128 {
-    if i % 10 == 0 {
+    if i.is_multiple_of(10) {
         u128::MAX - i as u128
     } else {
         (i as u128 + 1) * 3
