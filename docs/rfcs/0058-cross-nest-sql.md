@@ -15,7 +15,7 @@ RFC-0047 C4 (the per-cursor analytics budget), RFC-0041 (why a cross view is not
 entity, §7).
 
 **Amends:** RFC-0012 §6's "no cross-nest DuckDB attach", for a declared cross route only. A mount's own
-`/sql` stays scoped to that mount, unchanged.
+`/sql` stays scoped to that mount.
 
 **Nature:** new query-surface capability in the binary. Per RFC-0044 §8 and CLAUDE.md, new binary
 capability is decided by Chief and recorded, or it does not happen.
@@ -33,7 +33,9 @@ one tenant, each under a schema name, plus a directory of authored `*.sql` over 
 served at its own route with `/sql`, `/explain`, `/schema` and `/ready`. A request builds each member
 exactly as that member's own `/sql` would, from that member's own hot snapshot and sealed watermark,
 into one read-only DuckDB connection, and runs the query over them. Nothing is stored and nothing is
-indexed. A member cannot tell that a cross view exists, except by the permits the cross view borrows.
+indexed. At startup the record reserves a declared share of each member cursor's analytical permits
+and RAM, inside the per-cursor budget, and a cross query runs only inside that share. So a cross query
+never competes with a member's own `/sql` for admission or memory (§6).
 
 The one part of #1324 this RFC does not keep is "reports the lower of the two `as_of` watermarks". A
 block height has no meaning on another chain. §5 replaces it with a per-member provenance vector and
@@ -44,11 +46,18 @@ one cross-member bound that is well defined.
 **Per-nest and per-cursor isolation.** One nest's bad view, or one chain's stall or reorg, must not harm
 another.
 
-- A member's own routes, cursor, store, connection cache entry and `/ready` do not change when a cross
-  record exists. S1's criterion is that they are byte-identical.
-- A cross query holds a member cursor's analytical permit only while it holds every member's permit.
-  It never waits on one cursor while it holds another's (§6). So a saturated or stalled chain degrades
-  the cross route, visibly, and never takes capacity from the other chain.
+- A cross record costs its members capacity once, at startup, in the open. Each member cursor gives the
+  record a declared number of its analytical permits and the RAM behind them, and each nest on that
+  cursor reports it in `/ready` and `/schema` (§6).
+- At runtime a cross query takes nothing else from a member: no member permit, no member queue slot and
+  no member's cached connection. However saturated the cross route is, a member's own `/sql` is
+  admitted, queued and refused exactly as it is with the cross route idle. S2 fails if it is not.
+- That guarantee covers admission and memory, which nuthatch budgets. It does not cover CPU or disk
+  I/O, which nuthatch budgets for no query today. A busy cross route can make a member's own queries
+  slower, as two of the member's own queries already can. §11 carries the stronger guarantee as an open
+  question.
+- Apart from the capacity fields §6 adds, a member's own routes, cursor, store and responses do not
+  change when a cross record exists. S1's criterion is that they are otherwise byte-identical.
 - A member's faults stay with that member. A damaged segment reduces that member's table and is named
   `member.table`. A failed hot scan marks that member `tip_unavailable`. A quarantined member is named
   in the provenance and makes the cross route not ready. No member is quarantined because of a cross
@@ -65,13 +74,13 @@ the shared segment store. It never opens a member's redb file. It reads through 
 already-open `HotStore` handle, so the exclusive lock that redb takes at `Database::open` is never
 contended. Ingestion writes nothing here.
 
-**The per-cursor RAM budget.** RFC-0047 C4's inequality is per cursor:
-`(sql_permits × analytics.memory_limit) + ingestion_reservation ≤ 2 GiB`. A cross query takes one
-permit from **each distinct member cursor** and runs under one `analytics.memory_limit`. So every
-cursor it touches has reserved a full slot for it, and no cursor can exceed its own inequality on the
-cross query's account. This counts one connection against two budgets, which over-reserves. That is the
-safe direction, and it adds no term to the inequality. Hot materialisation is bounded by each member's
-own `SQL_MAX_HOT_ROWS` and `SQL_MAX_HOT_BYTES`, and the result by the existing row and byte caps.
+**The per-cursor RAM budget.** RFC-0047 C4's inequality is per cursor, and §6 gives the arithmetic in
+full. A cross record's permits come **out of** each member cursor's configured permits and are never
+added on top, so every term of the inequality keeps its value. At the shipped defaults a member cursor
+runs one member permit and one cross permit at 512 MB each, plus the 1,024 MB reservation: 2,048 MB. One
+cross query is charged in full to every member cursor that reserves for it, which over-reserves; that
+is the safe direction. A cross query's hot snapshot is bounded to one member query's worth, split across
+its members, so the term outside DuckDB does not grow either.
 
 **Determinism.** A cross view is a query-time read. It is never materialised, never written back, never
 seen by ingest, decode, seal or reorg, and it contains no model output. Non-negotiable 4 is untouched,
@@ -103,6 +112,11 @@ single-binary shape. It is not hosted multi-tenancy: joining two tenants' mounts
 4. The response carries `degraded`, `degraded_tables`, `tip_unavailable` and
    `provenance { as_of, sealed_through, source: "hot+sealed", registry_hash, nid, entities }`.
 
+**The per-cursor analytics budget** is checked by `validate_against` in `analytics_budget.rs`:
+`(permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2048 MB`, with the
+reservation never below `2048 - 2 × 512 = 1024 MB`. So at most 1,024 MB of any cursor's budget is ever
+DuckDB's, whatever the settings. A configuration that breaches it refuses to start, naming the sum.
+
 **The runtime** composes one router: `/health`, `/nests`, `/ready`, and each mount's full router nested
 under its route key (`alias`, or `tenant/alias` in a multi-tenant runtime). Each mount's `AppState`
 carries its own `dir`, `store`, `sql_gate`, `sql_queued`, `surface` and `nid`.
@@ -131,13 +145,16 @@ question, and it keeps "no derivation".
 
 ### Goals
 
-- An operator declares, once, which mounts may be read together and under which names.
+- An operator declares, once, which mounts may be read together, under which names, and how much of
+  each member cursor's analytical capacity the pairing may use.
 - A caller reads them with ordinary SQL, including joins over each member's own authored views.
 - Every answer says, per member, which dataset answered and as of what, and gives one bound that is
   valid across chains.
-- A cross view cannot slow, block, stall, quarantine or unmount a member. When a member is in any of
-  those states, the cross view says so.
-- Members on the same chain work too. Two nests on one cursor take one permit.
+- At runtime a cross view never takes a member's admission or memory. What it costs a member is fixed
+  at startup and reported. It cannot stall, quarantine or unmount a member, and when a member is in any
+  of those states the cross view says so.
+- Members on the same chain work too. A record whose members share a cursor reserves on that cursor
+  once.
 
 ### Non-goals
 
@@ -146,6 +163,7 @@ question, and it keeps "no derivation".
 - **Joining two tenants' mounts.** Refused (§3).
 - **Cross-runtime or cross-machine joins.** Members are mounts in this runtime. In v1, RFC-0022's
   query-FE tier and the cursorless serve role refuse a cross record by name (§11).
+- **CPU or disk I/O isolation.** Nuthatch budgets neither for any query today (§6, §11).
 - **Memoisation in v1.** A cross answer is computed per request. The single-nest memo keys one
   directory's state; a cross key is every member's state, and it is a later slice if a measurement asks
   for it.
@@ -163,6 +181,8 @@ name = "arcaidia"                  # route key; must not equal a mount's route k
 tenant = "default"                 # optional; the runtime's default tenant
 views = "cross/arcaidia"           # optional; *.sql, relative to the runtime directory
 sql = "open"                       # optional; "open" | "deny" | "allowlist", as RFC-0034
+permits = 1                        # optional; permits reserved on each member cursor (§6)
+memory_limit_mb = 512              # optional; per cross query; defaults to analytics.memory_limit
 
 [cross.members]
 sepolia = "arcaidia-sepolia"       # schema name = mount alias, within `tenant`
@@ -176,14 +196,15 @@ the same kind of thing as RFC-0034's allowlist and RFC-0052's `[mounts.publish]`
 how data is served, which moves no NID and re-indexes nothing. §10 weighs and rejects a composite nest
 with its own NID.
 
-**The declaration is the consent boundary.** The operator states which mounts may be read together.
-Without a record, nothing crosses.
+**The declaration is the consent boundary.** The operator states which mounts may be read together,
+and what share of their capacity the pairing may take. Without a record, nothing crosses and nothing
+is reserved.
 
 **Serving.** The record is served under its route key, like a mount, with four routes:
 
 - `/sql` and `/explain`, with today's parameters;
 - `/schema`, which lists each member's tables and views under its schema, with the members'
-  `semantic.toml` descriptions;
+  `semantic.toml` descriptions and the record's own capacity (§6);
 - `/ready` (§8).
 
 It has no `/tables`, `/entity`, `/derived`, `/balances`, GraphQL or admin routes. Those routes are
@@ -208,6 +229,10 @@ radius than a fault (RFC-0027).
 | a member whose surface is `allowlist`, while the record is `open` | a cross view may not widen a member's surface; the record must be `allowlist` or `deny` |
 | a `name` equal to a mount route key, or to `nests`, `ready`, `health` or `_admin` | route collision |
 | a schema name that is not `[a-z][a-z0-9_]*`, or that is `main`, `temp`, `information_schema`, `pg_catalog` or `system` | DuckDB's own catalogue names |
+| a reservation that leaves a member cursor fewer than one permit of its own | the member's own `/sql` would have nothing to run on (§6) |
+| a reservation that breaks a member cursor's budget inequality | the cursor would pass 2 GiB; the refusal prints the sum, as `validate_against` does (§6) |
+
+A refused record reserves nothing: its members start with every configured permit.
 
 A cross view's authored SQL is validated like `views/*.sql` (RFC-0018 §1). A broken file is a loud
 warning at startup and a `nuthatch check --dir` failure against the runtime directory, and the other
@@ -217,17 +242,19 @@ files still load.
 
 A cross `/sql` request runs these steps in order.
 
-1. **Admission** (§6), charged against `SQL_TIMEOUT` as today.
+1. **Admission** on the record's own gate (§6), charged against `SQL_TIMEOUT` as today. No member gate
+   is touched.
 2. **Snapshot each member**, in declared order, in one blocking task. Resolve the alias to its current
    `AppState`; if the mount is gone, refuse (§8). Take that member's hot snapshot, entity rows and
    watermarks, `sealed_through`, `last_block`, `indexed_head` and the timestamp of `indexed_head`,
-   under that member's own `SQL_MAX_HOT_ROWS` and `SQL_MAX_HOT_BYTES`. These are the reads the member's
-   own `/sql` makes, with the same same-task discipline (#932), so each member's rows and provenance
-   describe one state of that member. The redb read transaction ends when the snapshot is copied, so a
-   long cross query holds no member's store.
+   under `SQL_MAX_HOT_ROWS` and `SQL_MAX_HOT_BYTES` each divided by the number of members (§6). These
+   are the reads the member's own `/sql` makes, with the same same-task discipline (#932), so each
+   member's rows and provenance describe one state of that member. The redb read transaction ends when
+   the snapshot is copied, so a long cross query holds no member's store.
 3. **Open or reuse a connection.** It is locked down as today. It is keyed by the record's name and by
-   every member's `(nid, sealed_through, excluded set, inputs)`. Its `allowed_directories` is the union
-   of each member's `allowed_read_dirs`.
+   every member's `(nid, sealed_through, excluded set, inputs)`, in a cache of its own, so that it never
+   evicts a member's cached connection. Its `allowed_directories` is the union of each member's
+   `allowed_read_dirs`, and its memory limit is the record's `memory_limit_mb`.
 4. **Define each member into its own schema.** `CREATE SCHEMA <m>`, then that member's table views,
    authored views, offchain views, `labels` and children views, from that member's directory, snapshot
    and watermark. An unqualified name inside a member's view must resolve in that member's schema. Hot ∪
@@ -318,23 +345,89 @@ What the bound does **not** say:
 In the Arcaidia case, this bound makes `PENDING` meaningful. An intent created before
 `complete_before_timestamp`, whose fill also happened before it, cannot read `PENDING`.
 
-## §6 - Admission without coupling two cursors
+## §6 - Capacity: a reservation, never a loan
 
-1. Collect the distinct member cursors, ordered by chain id.
-2. Try to acquire a permit on each, in order. If every attempt succeeds, run.
-3. If one fails, **release every permit already taken**. Then wait on the cursor that refused, for what
-   remains of `SQL_ADMISSION_WAIT`, holding nothing else. When a permit frees, release it and retry the
-   whole set from step 2. Past the deadline, answer `503` and name the busy member.
+**Why a cross query does not borrow member permits.** The first draft of this RFC had a cross query
+take a permit from each member cursor's shared gate at request time. Review on #1403 found the
+contradiction with §0: once a cross query holds a cursor's last permit, that member's own `/sql` queues
+or answers `503`. So a record's capacity is reserved at startup, out of each member cursor's budget,
+and a cross query never touches a member gate.
 
-This enforces the isolation property, not an efficiency: **a cross query never holds one cursor's
-permit while it waits on another's.** Without this rule, a saturated Sepolia cursor would park cross
-queries that hold Arc permits, and Arc's own callers would be refused on Sepolia's account. The ordered
-pass also removes the deadlock in which one query holds A and waits on B while another holds B and
-waits on A. The cost is that a cross query can lose a race to members' own queries repeatedly and be
-refused. That is the direction in which a shared budget should fail.
+**The arithmetic.** Per cursor:
 
-The cross route has its own queue counter, bounded by `SQL_MAX_QUEUED`, so cross callers cannot take a
-member's queue slots.
+| Symbol | Meaning | Shipped default |
+|---|---|---|
+| `P` | configured analytical permits per cursor, `NUTHATCH_SQL_MAX_CONCURRENCY` | 2 |
+| `M` | `analytics.memory_limit`, per member query | 512 MB |
+| `R` | `ingestion_reservation`, never below `2048 - 2 × 512` | 1,024 MB |
+| `H` | `runtime_headroom`, unmeasured and counted as zero | 0 |
+| `c_x` | `permits` of record `x`, reserved on each of its member cursors | 1 |
+| `m_x` | `memory_limit_mb` of record `x`, per cross query | `M` |
+
+A cursor that is a member cursor of the records `X` runs its own gate with `P - Σ c_x` permits. For
+that cursor, `validate_against` checks:
+
+```text
+(P - Σ c_x) × M  +  Σ (c_x × m_x)  +  R  +  H  ≤  2048
+```
+
+At the shipped defaults, with one record:
+
+```text
+(2 - 1) × 512  +  1 × 512  +  1024  +  0  =  2048
+```
+
+It holds with no setting changed. It costs every nest on that cursor half its analytical concurrency:
+one permit where there were two.
+
+A record is refused, naming the cursor and printing the sum, when either condition fails:
+
+- **`P - Σ c_x < 1`.** The member's own `/sql` would have nothing to run on. At the defaults a cursor
+  can carry one reserved permit in total. More needs `P` raised and `M` lowered together. For example,
+  `P = 4` and `M = 256` fit two records: `(4 - 2) × 256 + 2 × 256 + 1024 = 2048`.
+- **The inequality.** When every `m_x ≤ M`, today's check already implies it, because each reserved
+  permit replaces a member permit that was charged `M`. It fails only when a record asks for more
+  memory than the permit it replaces. At the defaults, `m_x = 1024` gives `512 + 1024 + 1024 = 2560`.
+
+**The shape this rules out** is a cross permit added on top of the member permits instead of taken out
+of them: `2 × 512 + 1 × 512 + 1024 = 2560 > 2048`. It is the same shape as a runtime configured with
+four permits at the default memory limit, `4 × 512 + 1024 = 3072 > 2048`, which `validate_against`
+already refuses at startup. S1 fails if a mutation that adds `Σ c_x` to `P`, instead of subtracting it,
+still passes the check at the defaults.
+
+**A refused record reserves nothing.** Its members start with all `P` permits, and the runtime starts.
+An environment setting that breaks the inequality for every cursor still refuses startup, as today,
+because no cursor could run safely. A cross record is additive and removable, so refusing only the
+record is the smaller blast radius.
+
+**The term outside DuckDB.** `R` is a floor that nothing enforces, and it already covers each member
+query's hot snapshot and result materialisation. A cross query's snapshot bounds are `SQL_MAX_HOT_ROWS`
+and `SQL_MAX_HOT_BYTES` divided by the number of members, and its result caps are unchanged. So one
+cross query holds no more outside DuckDB than the member query whose permit it replaced. The cost: a
+member with a large hot tip can be answerable through its own `/sql` and refused through the cross
+route, with `503` naming the member. §11 asks whether measured headroom should replace the split.
+
+**Admission.** Each record has its own semaphore of `c_x` permits, its own queue counter bounded by
+`SQL_MAX_QUEUED`, and the same `SQL_ADMISSION_WAIT`, charged against `SQL_TIMEOUT`. A cross query
+acquires that one semaphore and nothing else, so there is no lock ordering to get wrong and no deadlock
+between records. Past the wait, it answers `503` naming the record.
+
+**What `/ready` and `/schema` report.** Reduced capacity is a fact about a nest, not a verdict, so it
+does not change `ready`.
+
+- Each nest on a member cursor adds an `analytics` object to its `/ready` body, for example
+  `{"permits": 1, "configured_permits": 2, "memory_limit_mb": 512, "reserved": [{"cross": "arcaidia", "permits": 1, "memory_limit_mb": 512}]}`.
+  `permits` is what that nest's own `/sql` can use.
+- The same nest's `/schema` says it in one sentence, because a caller that fans out needs to know it:
+  "This nest's cursor runs 1 SQL query at a time; 1 more permit is reserved for cross view `arcaidia`."
+- The cross route's `/ready` and `/schema` report the record's `permits` and `memory_limit_mb`, and the
+  member cursors that carry them.
+- The SQL rejection counter in `/metrics` carries the gate as a label, so a `503` from a cross gate is
+  never counted as one from a member gate.
+
+**What this does not isolate: CPU and disk I/O.** DuckDB runs `analytics.threads` per connection, and
+nuthatch budgets neither CPU nor I/O per cursor for any query today. A busy cross route can make a
+member's own queries slower. It cannot make them wait for admission, and it cannot make them refused.
 
 ## §7 - Why a cross view is request-time only
 
@@ -363,7 +456,8 @@ records, and a cross record is not a mount record. So unmounting a member decrem
 as today, and `nuthatch prune` may reclaim the data. Until the member is mounted again, every request to
 the cross route is refused with `503` and `member_unmounted`, naming the alias. The route never answers
 from the remaining members, because a view that left-joins an absent member answers with confident,
-wrong values.
+wrong values. The reservation on the remaining members' cursors stays in place until the record is
+removed, so their capacity does not move while an operator remounts.
 
 **NID change.** When a member's alias is bound to a new NID (an edited nest is a new nest), the cross
 view follows the alias at the next request, and the provenance names the new NID. The connection key
@@ -377,13 +471,18 @@ S0 runs first, and it can stop the rest.
 | # | Slice | Ends with | Fails if |
 |---|---|---|---|
 | S0 | Measure §1's two unknowns against the tree and the bundled DuckDB (`duckdb` 1.10504.0). No product code. | A test that defines a view with an unqualified reference inside schema `a`, where both `a.t` and `b.t` exist, and records which one it binds. A test over `json_serialize_sql` that records what the walk sees for `a.t`. A table of whether the store holds a timestamp for `indexed_head` after a tip commit, under finality-only, after the seal-direct hand-off, and with `block_timestamps = false`, on the redb and Postgres stores. | The unqualified reference binds to `b.t` or fails to bind, which invalidates §4 step 4 and returns this RFC for redesign; or the walk cannot recover a base table's schema. |
-| S1 | `[[cross]]` parsing, validation and §3's named refusals, and `nuthatch check --dir` over a runtime directory. No route yet. | A runtime directory with one valid and one invalid record starts and serves every mount. | Any member's `/sql`, `/tables` or `/ready` response differs, byte for byte, from the same runtime with no `[[cross]]` record; or the runtime refuses to start; or any row of §3's table is accepted. |
-| S2 | The cross `/sql` and `/explain`: §4's pipeline, §5's provenance and §6's admission. | §12's `intents` cross view over fixture copies of both datasets, with hot rows on both sides and ingestion stopped. | Its rows differ from an oracle that runs each member's own `/sql` for the six source relations and merges them in the test; a mutation that drops one member's hot rows, or the schema from the walk, leaves that comparison green; a reorg on one member changes the other member's rows or provenance; with one cursor's gate held saturated, the other member's own `/sql` is refused, or a cross query holds a permit on the free cursor (asserted on the semaphore's available count); two cross views over the same members, declared in opposite order, hang past `SQL_TIMEOUT`. |
+| S1 | `[[cross]]` parsing, validation and §3's named refusals; §6's reservation applied to member gates, with its budget check and the `analytics` fields in `/ready` and `/schema`; `nuthatch check --dir` over a runtime directory. No cross route yet. | A runtime directory with one valid and one invalid record starts and serves every mount, and each member cursor of the valid record runs `P - c_x` permits. | Any member's `/sql`, `/tables` or `/ready` response differs, byte for byte, from the same runtime with no `[[cross]]` record, other than §6's capacity fields; or the runtime refuses to start; or any row of §3's table is accepted; or a mutation that adds `Σ c_x` to `P` instead of subtracting it still passes the budget check at the defaults; or a refused record leaves a member with fewer than `P` permits. |
+| S2 | The cross `/sql` and `/explain`: §4's pipeline, §5's provenance and §6's admission. | §12's `intents` cross view over fixture copies of both datasets, with hot rows on both sides and ingestion stopped. | Its rows differ from an oracle that runs each member's own `/sql` for the six source relations and merges them in the test; a mutation that drops one member's hot rows, or the schema from the walk, leaves that comparison green; a reorg on one member changes the other member's rows or provenance; with the cross route saturated, every cross permit held and its queue full, a member's own `/sql` waits for admission or answers `503` where the same request with the cross route idle does not (asserted on the member gate's available permits and the member's rejection count); a mutation that makes a cross query acquire a member gate leaves that assertion green; or, with a member's own gate saturated, a cross query is refused. |
 | S3 | Health, unmount, remount, `/ready` and `/schema` on the cross route. | Unmount a member: the cross route refuses and names it, and prune reclaims the dataset. Remount under a new NID: the provenance names it. | `nuthatch prune` keeps the dataset on the cross record's account; any request answers from the remaining member; the cross `/ready` answers `200` with a quarantined member. |
-| S4 | The budget, on the enforcing surface. | The dense multi-nest RSS gate gains a two-cursor runtime under concurrent member and cross load. | Any cursor's attributed RSS exceeds its 2 GiB budget; or the number of live query connections exceeds the sum of the member cursors' permits. |
+| S4 | The budget, on the enforcing surface. | The dense multi-nest RSS gate gains a two-cursor runtime under concurrent member and cross load, with the cross connection's peak charged to every member cursor. | Any cursor's attributed RSS exceeds its 2 GiB budget; or, on any cursor, live query connections exceed its own permits plus the permits reserved on it. |
 | S5 | Documentation: `docs/operators.md`, the builder skill's `views.md`, `llms.txt`, and the MCP nest selector accepting a cross name. | The documentation drift gates pass, and a runnable example uses the Arcaidia pair. | `tests/doc_command_check.rs` or `tests/skill_refs.rs` fails; or the example's documented query does not run against the fixture runtime. |
 
 ## §10 - Alternatives
+
+**Borrowing member permits at request time.** No capacity is reserved, and a cross query takes a permit
+from each member cursor's gate when it runs. It costs members nothing while the cross route is idle. It
+also lets a saturated cross route make a member's own `/sql` queue or answer `503`, which §0 forbids.
+Rejected in §6.
 
 **The client-side merge, which is today's answer.** Two requests, merged on `intentId` in the caller,
 as the Arcaidia nest's README tells its builder to keep doing. It works. It costs every two-chain
@@ -397,8 +496,8 @@ intents dashboard cannot use that freshness.
 
 **An undeclared runtime-root `/sql` over every mount.** It needs no configuration. It also makes every
 mount joinable with every other by default, bypasses RFC-0034 wherever a member is allowlisted, reads
-across tenants unless a rule is added (and that rule is the declaration by another name), and spends
-every cursor's permits on every query. Rejected.
+across tenants unless a rule is added (and that rule is the declaration by another name), and has no
+place to reserve capacity from. Rejected.
 
 **A composite nest with its own NID over its members' NIDs.** This gives a cross view an identity and a
 place in the registry. But it stores nothing, so the identity keys nothing. Every member edit would move
@@ -425,6 +524,14 @@ members into one connection is the same work with one engine.
 4. **Named queries across a member's ceiling.** §3 lets a record carry RFC-0034's `allowlist` with named
    queries. Whether a cross record's named query must also sit inside each member's manifest ceiling
    (RFC-0034 phase 2) is not settled.
+5. **Isolation beyond admission and memory.** §6 guarantees that a cross route never delays a member's
+   admission or takes its memory. It does not guarantee a member's latency, because CPU and disk I/O are
+   shared and unbudgeted. Should a record carry its own `analytics.threads`, or does that question need
+   a per-cursor CPU budget first? Decide on a measurement of a member's `/sql` latency under a saturated
+   cross route, not before.
+6. **Measured headroom instead of a split snapshot bound.** Once RFC-0047 §6 measures the high-water
+   outside DuckDB, may a cross query spend measured headroom and see each member's full hot tip? Until
+   then, §6's split stands.
 
 ## §12 - Worked example: Arcaidia on Sepolia and Arc
 
@@ -521,5 +628,11 @@ For an intent created before `complete_before_timestamp`, `FAST_FILLED` and `SET
 also mean that its destination chain has not been indexed that far yet. The builder's own merge
 answers the same question with no bound at all.
 
-Nothing in the two nests changes. The nest repository, both NIDs and both mounts' own URLs stay exactly
-as they are, which is S1's criterion applied to a real runtime.
+**What the record costs the two nests.** At the shipped defaults each cursor now runs one query for its
+own nest where it ran two, and reserves one for `arcaidia`. Both nests' `/ready` and `/schema` say so.
+#1319's builder fanned out six queries at once and was helped by more permits. A runtime that wants
+four member permits per cursor, on 3.8.1's budget check, sets `P = 5` and `M = 204`, with the record's
+`memory_limit_mb` left at `M`: `(5 - 1) × 204 + 1 × 204 + 1024 = 2044 ≤ 2048`.
+
+Nothing else in the two nests changes. The nest repository, both NIDs, both mounts' own URLs and every
+row they serve stay exactly as they are, which is S1's criterion applied to a real runtime.
