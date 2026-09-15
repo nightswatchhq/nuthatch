@@ -930,7 +930,8 @@ per-nest series below.
 | `nuthatch_seal_direct_fetched` vs `nuthatch_seal_direct_completed` | the seal-direct pass's fetch position against its durable watermark (#1169). A restart resumes from `completed`; the gap is the work it redoes, which on a sparse range can be tens of millions of blocks |
 | `nuthatch_alert_outbox_depth` | webhook/alert delivery backlog |
 
-Per-nest series, labelled `{nest="…"}` - the ones that make co-tenancy operable:
+Per-nest series, labelled `{nest="…"}` with the nest's route in a runtime (its alias, or `tenant/alias`)
+and its name in a single-nest `dev` (#1415) - the ones that make co-tenancy operable:
 `nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
 `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`,

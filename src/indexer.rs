@@ -2139,7 +2139,8 @@ pub async fn spawn_runtime(
     // this call *is* the cursor, and every nest built below shares the budget rather than each
     // getting its own copy of it.
     let sql_gate = serve::new_sql_gate();
-    for (name, dir, config) in nests {
+    for (name, dir, mut config) in nests {
+        config.route = Some(name.clone());
         let (nest, state, worker, w) = build_nest(
             &source,
             dir,
@@ -2736,9 +2737,13 @@ async fn build_nest(
     };
 
     let shared_store = store.clone();
+    let key = config
+        .route
+        .clone()
+        .unwrap_or_else(|| config.nest.name.clone());
     let nest = NestIngest {
         freshness: config.freshness,
-        name: config.nest.name.clone(),
+        name: key.clone(),
         dir: dir.clone(),
         store: shared_store.clone(),
         registry: registry.clone(),
@@ -2757,7 +2762,7 @@ async fn build_nest(
         finality,
         seal_span,
         metrics: {
-            let m = METRICS.nest(&config.nest.name);
+            let m = METRICS.nest(&key);
             m.set_ipfs_window_deadline(config.ipfs_window_deadline);
             m.set_storage_paths(
                 dir.join(crate::config::DB_FILE),

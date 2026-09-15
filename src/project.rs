@@ -123,6 +123,7 @@ pub async fn init(args: InitArgs) -> Result<()> {
         read_only_role: false,
         freshness: Default::default(),
         ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+        route: None,
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {
@@ -691,6 +692,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         read_only_role: false,
         freshness: Default::default(),
         ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+        route: None,
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {
