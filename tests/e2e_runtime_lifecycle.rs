@@ -97,6 +97,7 @@ async fn two_nest_roost(
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
+            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
@@ -294,6 +295,52 @@ async fn a_mount_is_refused_for_a_taken_name_an_undeclared_chain_or_a_breached_b
     assert_eq!(handles.states.len(), 2, "no partial mount was left behind");
 }
 
+/// A nest mounted into a running runtime fetches through its chain's shared source, so the
+/// single-endpoint concurrency cap applies to its seal-direct pass as it does at boot, and `/ready` says
+/// so. The mount used the runtime's uncapped `--concurrency` before this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hot_mount_is_held_to_the_single_endpoint_concurrency_cap() {
+    for (name, endpoints, want) in [
+        (
+            "solohost",
+            1,
+            serde_json::json!({"requested": 8, "effective": 1, "capped_by": "single_rpc_endpoint"}),
+        ),
+        (
+            "twohosts",
+            2,
+            serde_json::json!({"requested": 8, "effective": 8, "capped_by": null}),
+        ),
+    ] {
+        let roost_dir = tempfile::tempdir().unwrap();
+        let usdc_dir = roost_dir.path().join("nests/usdc");
+        let arb_dir = roost_dir.path().join("nests/arb");
+        std::fs::create_dir_all(&usdc_dir).unwrap();
+        std::fs::create_dir_all(&arb_dir).unwrap();
+        let (mut handles, _tape) = two_nest_roost(roost_dir.path(), &usdc_dir, &arb_dir).await;
+        let dir = roost_dir.path().join("nests").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `/ready` reads by route, so the nest's own name differs from it here, as an alias can.
+        scaffold_nest(&dir, &format!("{name}-nest"), ARB);
+
+        handles.mount_ctx.seal_direct = true;
+        handles.mount_ctx.concurrency = 8;
+        handles
+            .mount_ctx
+            .endpoint_counts
+            .insert("arbitrum-one".to_string(), endpoints);
+        handles.mount(name, None).await.expect("mount");
+
+        let ready = body_json(&handles.live, &format!("/{name}/ready")).await;
+        assert_eq!(ready["seal_direct_concurrency"], want, "{name}: {ready}");
+        assert_eq!(
+            ready["seal_direct_ipfs_window_deadline_secs"],
+            serde_json::json!(300),
+            "{name}: {ready}"
+        );
+    }
+}
+
 /// RFC-0027 §5: a lifecycle change must survive a restart.
 ///
 /// `mounts.toml` is the embedded stand-in for a control-plane DB - desired state lives in the same file
@@ -417,6 +464,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
+            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
@@ -586,6 +634,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
+            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
