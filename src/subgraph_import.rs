@@ -392,6 +392,19 @@ pub async fn fetch_ipfs_proven(
     gateways: &[String],
     origin: Origin,
 ) -> Result<Fetched> {
+    fetch_ipfs_proven_within(source, gateways, origin, FETCH_TIMEOUT).await
+}
+
+/// Each request's timeout in [`fetch_ipfs_proven`], body included.
+pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`fetch_ipfs_proven`] with each request, body included, cut off at `timeout`.
+pub async fn fetch_ipfs_proven_within(
+    source: &str,
+    gateways: &[String],
+    origin: Origin,
+    timeout: std::time::Duration,
+) -> Result<Fetched> {
     let urls = candidate_urls(source, gateways, origin)?;
     // The CID the document must hash to. `None` only for an operator-supplied URL, which addresses a
     // location rather than a content, and therefore commits to nothing we can check.
@@ -400,7 +413,7 @@ pub async fn fetch_ipfs_proven(
         .as_deref()
         .and_then(|c| crate::cid::Cid::parse(c).ok());
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
         .build()
         .context("failed to build HTTP client")?;
 

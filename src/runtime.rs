@@ -1582,6 +1582,7 @@ pub async fn dev(
     backfill: Option<u64>,
     seal_direct: bool,
     concurrency: usize,
+    ipfs_window_deadline: std::time::Duration,
     window_override: Option<u64>,
     no_admin: bool,
     fail_fast: bool,
@@ -1625,7 +1626,7 @@ pub async fn dev(
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
     for (_, _, config) in &mut mounted {
-        config.freshness = freshness;
+        stamp_operator_settings(config, freshness, ipfs_window_deadline);
     }
     let groups = group_by_chain(&endpoints, mounted)?;
 
@@ -1722,7 +1723,13 @@ pub async fn dev(
                 group.endpoint.chain
             );
         }
-        let concurrency = indexer::safe_backfill_concurrency(rpc_urls.len(), concurrency);
+        let names: Vec<&str> = group
+            .nests
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        let concurrency =
+            indexer::backfill_concurrency_for(rpc_urls.len(), concurrency, seal_direct, &names);
 
         // Per-cursor footprint budget (RFC-0021): this chain's nests must fit ≤ max_rss.
         let mut cursor_mb = 0u64;
@@ -1900,6 +1907,7 @@ pub async fn dev(
             backfill,
             seal_direct,
             concurrency,
+            ipfs_window_deadline,
             window_override,
             admin_enabled,
             admin_token: admin_token.clone(),
@@ -2215,6 +2223,17 @@ pub struct RuntimeHandles {
     pub mount_ctx: MountContext,
 }
 
+/// The operator's run-time settings, stamped onto every mounted config at boot and at a hot mount alike.
+/// Neither is identity: each is `#[serde(skip)]` on `Config`.
+pub fn stamp_operator_settings(
+    config: &mut Config,
+    freshness: crate::freshness::Freshness,
+    ipfs_window_deadline: std::time::Duration,
+) {
+    config.freshness = freshness;
+    config.ipfs_window_deadline = ipfs_window_deadline;
+}
+
 /// The context a running mounts needs in order to build and admit a nest (RFC-0027 §3).
 ///
 /// Deliberately captured at startup rather than re-derived per mount: a nest mounted at 3am must be
@@ -2233,6 +2252,8 @@ pub struct MountContext {
     pub backfill: Option<u64>,
     pub seal_direct: bool,
     pub concurrency: usize,
+    /// `--ipfs-window-deadline`, stamped onto a hot-mounted nest's config like `freshness` (#1399).
+    pub ipfs_window_deadline: std::time::Duration,
     pub window_override: Option<u64>,
     pub admin_enabled: bool,
     pub admin_token: Option<String>,
@@ -2349,7 +2370,11 @@ impl RuntimeHandles {
         };
         let mut config = Config::load(&dir)
             .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
-        config.freshness = self.mount_ctx.freshness;
+        stamp_operator_settings(
+            &mut config,
+            self.mount_ctx.freshness,
+            self.mount_ctx.ipfs_window_deadline,
+        );
         let chain = config.nest.chain.clone();
 
         let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
@@ -2792,6 +2817,27 @@ mod tests {
         )
         .unwrap();
         std::fs::write(nest.join("abi.json"), "[]").unwrap();
+    }
+
+    /// #1399: boot and a hot mount both stamp `--ipfs-window-deadline` through this, beside the
+    /// freshness dial, onto a config that loaded with the default.
+    #[test]
+    fn operator_settings_reach_a_mounted_config() {
+        let d = tempfile::tempdir().unwrap();
+        write_nest_dir(d.path(), "n", "arbitrum-one", 42161);
+        let mut config = Config::load(&MountTable::nest_dir(d.path(), "n")).unwrap();
+        assert_eq!(
+            config.ipfs_window_deadline,
+            crate::ipfs_resolve::WINDOW_DEADLINE
+        );
+        let minute = std::time::Duration::from_secs(60);
+        let freshness = crate::freshness::Freshness {
+            poll_interval: minute,
+            finality_only: true,
+        };
+        stamp_operator_settings(&mut config, freshness, std::time::Duration::ZERO);
+        assert_eq!(config.ipfs_window_deadline, std::time::Duration::ZERO);
+        assert_eq!(config.freshness.poll_interval, minute);
     }
 
     fn mounted(roost_dir: &Path, name: &str) -> (String, PathBuf, Config) {

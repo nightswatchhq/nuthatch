@@ -315,6 +315,12 @@ pub struct Policy {
     pub max_backoff: Duration,
     /// Failed fetches before a document is given up on. At the defaults that is about half an hour.
     pub attempts: u32,
+    /// Each request's timeout, body included, on a first attempt. It doubles with each failure, up to
+    /// `max_timeout`: a gateway took 29.86 s to serve a document it had not cached (#1399).
+    pub first_timeout: Duration,
+    pub max_timeout: Duration,
+    /// The longest one document is tried for, requests and waits included, before it is given up on.
+    pub deadline: Option<Duration>,
     /// How often the whole unsealed range is re-read, rather than only the blocks committed since.
     pub rescan_every: Duration,
     /// The longest the resolver sleeps with nothing due.
@@ -328,18 +334,62 @@ impl Default for Policy {
             first_backoff: Duration::from_secs(5),
             max_backoff: Duration::from_secs(600),
             attempts: 10,
+            first_timeout: crate::subgraph_import::FETCH_TIMEOUT,
+            max_timeout: Duration::from_secs(120),
+            deadline: None,
             rescan_every: Duration::from_secs(600),
             idle_poll: Duration::from_secs(2),
         }
     }
 }
 
+/// The default `--ipfs-window-deadline` (#1399).
+pub const WINDOW_DEADLINE: Duration = Duration::from_secs(300);
+
+/// [`WINDOW_DEADLINE`], for a config that was loaded rather than given the flag.
+pub fn window_deadline() -> Duration {
+    WINDOW_DEADLINE
+}
+
 impl Policy {
+    /// For a path whose window cannot seal until every document in it is decided (#1399). Attempts at
+    /// 30, 60 and 120 s and their waits fit inside the five minutes; fast failures get all ten attempts.
+    pub fn seal_direct() -> Self {
+        Self::seal_direct_within(WINDOW_DEADLINE)
+    }
+
+    /// [`Policy::seal_direct`] with an operator's `--ipfs-window-deadline`. Zero is no deadline: a
+    /// document is given up on only once its attempts run out.
+    pub fn seal_direct_within(deadline: Duration) -> Self {
+        Policy {
+            first_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(30),
+            deadline: (!deadline.is_zero()).then_some(deadline),
+            ..Policy::default()
+        }
+    }
+
     pub fn backoff(&self, failures: u32) -> Duration {
         let doublings = failures.saturating_sub(1).min(20);
         self.first_backoff
             .saturating_mul(1u32 << doublings)
             .min(self.max_backoff)
+    }
+
+    pub fn timeout(&self, failures: u32) -> Duration {
+        self.first_timeout
+            .saturating_mul(1u32 << failures.min(20))
+            .min(self.max_timeout)
+    }
+
+    /// The wait before a document that has failed `failures` times over `tried_for` is tried again, or
+    /// `None` when it is to be given up on.
+    pub fn retry_in(&self, failures: u32, tried_for: Duration) -> Option<Duration> {
+        let wait = self.backoff(failures);
+        let past_deadline = self
+            .deadline
+            .is_some_and(|d| tried_for.saturating_add(wait) >= d);
+        (failures < self.attempts && !past_deadline).then_some(wait)
     }
 }
 
@@ -356,9 +406,9 @@ impl std::fmt::Display for Unproven {
 
 impl std::error::Error for Unproven {}
 
-async fn fetch(cid: &str, gateways: &[String]) -> Result<String> {
-    use crate::subgraph_import::{fetch_ipfs_proven, Fetched, NothingProved, Origin, Proof};
-    match fetch_ipfs_proven(cid, gateways, Origin::Manifest).await {
+async fn fetch(cid: &str, gateways: &[String], timeout: Duration) -> Result<String> {
+    use crate::subgraph_import::{fetch_ipfs_proven_within, Fetched, NothingProved, Origin, Proof};
+    match fetch_ipfs_proven_within(cid, gateways, Origin::Manifest, timeout).await {
         Ok(Fetched {
             body,
             proof: Proof::Verified,
@@ -390,10 +440,50 @@ fn count_failure(metrics: &crate::metrics::NestMetrics, e: &anyhow::Error) -> bo
     over_cap
 }
 
+/// One fetch of a document that has failed `failures` times over `tried_for`, cut off at the deadline.
+async fn attempt(
+    cid: &str,
+    gateways: &[String],
+    policy: &Policy,
+    failures: u32,
+    tried_for: Duration,
+) -> Result<String> {
+    let fetching = fetch(cid, gateways, policy.timeout(failures));
+    let Some(deadline) = policy.deadline else {
+        return fetching.await;
+    };
+    tokio::time::timeout(deadline.saturating_sub(tried_for), fetching)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "not fetched within the {deadline:?} a document is tried for"
+            ))
+        })
+}
+
+/// A failed fetch that will be tried again, counted and said on every path, so a pause is attributable.
+fn note_retry(
+    metrics: &NestMetrics,
+    p: &Planned,
+    failures: u32,
+    wait: Duration,
+    e: &anyhow::Error,
+) {
+    metrics.add_ipfs_retries(1);
+    tracing::warn!(
+        "ipfs: attempt {failures} for {} (block {}) failed, trying again in {wait:?} \
+         (nuthatch_nest_ipfs_retries_total): {e:#}",
+        p.cid,
+        p.block
+    );
+}
+
 struct Work {
     planned: Planned,
     failures: u32,
     due: Instant,
+    /// When its first fetch began, which a deadline counts from.
+    first_tried: Option<Instant>,
 }
 
 /// The out-of-band resolver for one nest.
@@ -473,6 +563,7 @@ impl Resolver {
                             planned: p,
                             failures: 0,
                             due: Instant::now(),
+                            first_tried: None,
                         },
                     };
                     self.work.insert(key, work);
@@ -513,17 +604,20 @@ impl Resolver {
             self.give_up(&p)?;
         }
         let now = Instant::now();
-        let due: Vec<Planned> = self
+        let due: Vec<(Planned, u32, Duration)> = self
             .work
-            .values()
+            .values_mut()
             .filter(|w| w.due <= now)
             .take(self.policy.concurrency.max(1))
-            .map(|w| w.planned.clone())
+            .map(|w| {
+                let first = *w.first_tried.get_or_insert(now);
+                (w.planned.clone(), w.failures, now.duration_since(first))
+            })
             .collect();
-        let gateways = &self.gateways;
+        let (gateways, policy) = (&self.gateways, &self.policy);
         let results: Vec<(Planned, Result<String>)> = futures::stream::iter(due)
-            .map(|p| async move {
-                let fetched = fetch(&p.cid, gateways).await;
+            .map(|(p, failures, tried_for)| async move {
+                let fetched = attempt(&p.cid, gateways, policy, failures, tried_for).await;
                 (p, fetched)
             })
             .buffer_unordered(self.policy.concurrency.max(1))
@@ -572,24 +666,25 @@ impl Resolver {
                     };
                     let over_cap = count_failure(&self.metrics, &e);
                     w.failures += 1;
-                    if over_cap || w.failures >= self.policy.attempts {
+                    let failures = w.failures;
+                    let retry = if over_cap {
+                        None
+                    } else {
+                        let tried_for = w.first_tried.map_or(Duration::ZERO, |t| t.elapsed());
+                        self.policy.retry_in(failures, tried_for)
+                    };
+                    if let Some(wait) = retry {
+                        w.due = Instant::now() + wait;
+                        note_retry(&self.metrics, &p, failures, wait, &e);
+                    } else {
                         tracing::warn!(
                             "ipfs: gave up on {} (block {}) after {} failed fetches: {e:#}. Its range \
                              seals without it (nuthatch_nest_ipfs_given_up_total)",
                             p.cid,
                             p.block,
-                            w.failures
+                            failures
                         );
                         self.give_up(&p)?;
-                    } else {
-                        w.due = Instant::now() + self.policy.backoff(w.failures);
-                        tracing::debug!(
-                            "ipfs: {} (block {}) failed {} time(s), retrying in {:?}: {e:#}",
-                            p.cid,
-                            p.block,
-                            w.failures,
-                            self.policy.backoff(w.failures)
-                        );
                     }
                 }
             }
@@ -642,8 +737,8 @@ pub fn spawn(resolver: Resolver) -> Running {
 }
 
 /// Every document `rows` name, fetched now, for a path that seals as it goes and cannot come back for a
-/// document later. Retries on the same policy as [`Resolver`]; the second value counts the documents
-/// that exhausted it and are absent from what is returned.
+/// document later. Retries on `policy`, whose deadline bounds how long one document holds the window;
+/// the second value counts the documents that exhausted it and are absent from what is returned.
 pub async fn resolve_inline(
     gate: &Gate,
     gateways: &[String],
@@ -680,21 +775,28 @@ pub async fn resolve_inline(
         .collect();
     let results: Vec<(Planned, Option<String>)> = futures::stream::iter(planned)
         .map(|p| async move {
+            let started = Instant::now();
             let mut failures = 0;
             loop {
-                match fetch(&p.cid, gateways).await {
+                match attempt(&p.cid, gateways, policy, failures, started.elapsed()).await {
                     Ok(content) => return (p, Some(content)),
                     Err(e) => {
                         failures += 1;
-                        if count_failure(metrics, &e) || failures >= policy.attempts {
+                        let retry = if count_failure(metrics, &e) {
+                            None
+                        } else {
+                            policy.retry_in(failures, started.elapsed())
+                        };
+                        let Some(wait) = retry else {
                             tracing::warn!(
                                 "ipfs: gave up on {} (block {}) after {failures} failed fetches: {e:#}",
                                 p.cid,
                                 p.block
                             );
                             return (p, None);
-                        }
-                        tokio::time::sleep(policy.backoff(failures)).await;
+                        };
+                        note_retry(metrics, &p, failures, wait, &e);
+                        tokio::time::sleep(wait).await;
                     }
                 }
             }
@@ -943,7 +1045,254 @@ mod tests {
         assert_eq!(given_up, 1);
         assert_eq!(metrics.ipfs_rows_refused(), 1);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.ipfs_retries(), 0);
         server.abort();
+    }
+
+    /// A gateway at `/ipfs/{cid}` that answers its `n`th request, from 0, with `answer(n)`.
+    async fn stand_in<F, Fut>(
+        answer: F,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        F: Fn(usize) -> Fut + Clone + Send + Sync + 'static,
+        Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
+    {
+        use axum::{routing::get, Router};
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = Router::new().route(
+            "/ipfs/{cid}",
+            get(move || answer(count.fetch_add(1, std::sync::atomic::Ordering::SeqCst))),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}/ipfs/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (gateway, requests, server)
+    }
+
+    /// The seal-direct policy with millisecond timeouts and no waits between attempts.
+    fn quick(first_timeout_ms: u64, max_timeout_ms: u64, deadline: Option<Duration>) -> Policy {
+        Policy {
+            first_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            first_timeout: Duration::from_millis(first_timeout_ms),
+            max_timeout: Duration::from_millis(max_timeout_ms),
+            deadline,
+            ..Policy::seal_direct()
+        }
+    }
+
+    const BODY: &str = r#"{"name":"a token"}"#;
+
+    async fn resolve_one(
+        gateway: String,
+        cid: &str,
+        policy: &Policy,
+        metrics: &NestMetrics,
+    ) -> (Vec<DecodedRow>, usize) {
+        let gate = Gate::new(&[uri_decl()], &[table("nft__uri_set", "uri", "string")]).unwrap();
+        resolve_inline(
+            &gate,
+            &[gateway],
+            policy,
+            &[uri_row(10, 0, cid)],
+            true,
+            metrics,
+        )
+        .await
+    }
+
+    /// The Graph's gateway took 29.86 s to serve a document it had not cached, against a 30 s timeout
+    /// (#1399). The fetch that timed out is tried again and counted, and the document arrives.
+    #[tokio::test]
+    async fn a_gateway_that_times_out_once_is_tried_again_and_the_retry_counted() {
+        use axum::response::IntoResponse;
+        let cid = crate::cid::cid_v0_for(BODY.as_bytes());
+        let (gateway, requests, server) = stand_in(|n| async move {
+            if n == 0 {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            BODY.into_response()
+        })
+        .await;
+        let metrics = NestMetrics::default();
+        let (rows, given_up) =
+            resolve_one(gateway, &cid, &quick(1_000, 1_000, None), &metrics).await;
+        assert_eq!(
+            (rows.len(), given_up),
+            (1, 0),
+            "served on the second attempt"
+        );
+        assert_eq!(metrics.ipfs_retries(), 1);
+        assert_eq!(metrics.ipfs_given_up(), 0);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    /// A gateway slower than the first timeout but faster than a later one serves the document. The same
+    /// timeout on every attempt refused it ten times.
+    #[tokio::test]
+    async fn a_slow_gateway_is_given_a_longer_timeout_on_each_attempt() {
+        use axum::response::IntoResponse;
+        let cid = crate::cid::cid_v0_for(BODY.as_bytes());
+        let (gateway, _requests, server) = stand_in(|_| async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            BODY.into_response()
+        })
+        .await;
+        let metrics = NestMetrics::default();
+        let (rows, given_up) = resolve_one(gateway, &cid, &quick(50, 2_000, None), &metrics).await;
+        assert_eq!(
+            (rows.len(), given_up),
+            (1, 0),
+            "served once a timeout outlasted the gateway"
+        );
+        assert!(
+            metrics.ipfs_retries() >= 2,
+            "attempts at 50 and 100 ms cannot see a 300 ms answer: {}",
+            metrics.ipfs_retries()
+        );
+        server.abort();
+    }
+
+    /// The Graph's gateway answered 200 for two QoS documents and stalled after 256 to 320 KiB (#1399).
+    /// A document is given up on when its deadline runs out, however many attempts remain, and is counted
+    /// and left out exactly as one that ran out of attempts.
+    #[tokio::test]
+    async fn a_gateway_that_stalls_mid_body_holds_a_document_no_longer_than_its_deadline() {
+        let (cid, gateway, _requests, server) = stalls_mid_body().await;
+        let metrics = NestMetrics::default();
+        let policy = quick(100, 800, Some(Duration::from_secs(1)));
+        assert!(
+            (0..policy.attempts)
+                .map(|f| policy.timeout(f))
+                .sum::<Duration>()
+                > Duration::from_secs(6),
+            "premise: every attempt run to its timeout takes over six seconds"
+        );
+        let started = Instant::now();
+        let (rows, given_up) = resolve_one(gateway, &cid, &policy, &metrics).await;
+        let held = started.elapsed();
+        assert!(held < Duration::from_secs(3), "held for {held:?}");
+        assert!(rows.is_empty());
+        assert_eq!(given_up, 1);
+        assert_eq!(metrics.ipfs_given_up(), 1);
+        assert!(metrics.ipfs_retries() >= 1, "the first attempt is retried");
+        server.abort();
+    }
+
+    /// A gateway that answers 200 for a document, sends half of it and never the rest.
+    async fn stalls_mid_body() -> (
+        String,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::response::IntoResponse;
+        let body = "x".repeat(64 * 1024);
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, requests, server) = stand_in(move |_| {
+            let half = body[..body.len() / 2].to_string();
+            async move {
+                let stalls = futures::stream::once(async move { Ok::<_, std::io::Error>(half) })
+                    .chain(futures::stream::pending());
+                axum::body::Body::from_stream(stalls).into_response()
+            }
+        })
+        .await;
+        (cid, gateway, requests, server)
+    }
+
+    /// `--ipfs-window-deadline 0` (#1399): a document that never arrives is given up on only once its
+    /// attempts run out, as it was before a seal-direct window had a deadline.
+    #[tokio::test]
+    async fn a_zero_window_deadline_gives_up_only_after_every_attempt() {
+        let (cid, gateway, requests, server) = stalls_mid_body().await;
+        let metrics = NestMetrics::default();
+        let policy = Policy {
+            attempts: 4,
+            first_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            first_timeout: Duration::from_millis(50),
+            max_timeout: Duration::from_millis(100),
+            ..Policy::seal_direct_within(Duration::ZERO)
+        };
+        let (rows, given_up) = resolve_one(gateway, &cid, &policy, &metrics).await;
+        assert!(rows.is_empty());
+        assert_eq!(given_up, 1);
+        assert_eq!(metrics.ipfs_given_up(), 1);
+        assert_eq!(
+            metrics.ipfs_retries(),
+            3,
+            "every attempt but the last is retried"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 4);
+        server.abort();
+    }
+
+    /// A 204 for a document that is not empty proves nothing. It is retried to its attempts and given up
+    /// on, each fetch counted unverified as before, and each retry now counted as well.
+    #[tokio::test]
+    async fn a_gateway_that_204s_a_document_is_retried_and_given_up_on_as_before() {
+        use axum::response::IntoResponse;
+        let cid = crate::cid::cid_v0_for(BODY.as_bytes());
+        let (gateway, _requests, server) =
+            stand_in(|_| async { axum::http::StatusCode::NO_CONTENT.into_response() }).await;
+        let metrics = NestMetrics::default();
+        let policy = Policy {
+            attempts: 3,
+            ..quick(1_000, 1_000, Some(Duration::from_secs(60)))
+        };
+        let (rows, given_up) = resolve_one(gateway, &cid, &policy, &metrics).await;
+        assert!(rows.is_empty());
+        assert_eq!(given_up, 1);
+        assert_eq!(metrics.ipfs_given_up(), 1);
+        assert_eq!(metrics.ipfs_unverified(), 3);
+        assert_eq!(
+            metrics.ipfs_retries(),
+            2,
+            "every failed attempt but the last"
+        );
+        server.abort();
+    }
+
+    /// #1399's numbers. A seal-direct document is decided within five minutes, where the resolver's ten
+    /// attempts take about half an hour, and a slow gateway still gets a whole 120 s attempt.
+    #[test]
+    fn a_seal_direct_document_is_decided_within_five_minutes() {
+        let secs = Duration::from_secs;
+        let p = Policy::seal_direct();
+        assert_eq!(
+            [p.timeout(0), p.timeout(1), p.timeout(2), p.timeout(9)],
+            [secs(30), secs(60), secs(120), secs(120)]
+        );
+        let before_third = p.timeout(0) + p.backoff(1) + p.timeout(1);
+        assert_eq!(p.retry_in(2, before_third), Some(secs(4)));
+        assert!(before_third + p.backoff(2) + p.timeout(2) < p.deadline.unwrap());
+        assert_eq!(
+            p.retry_in(1, secs(299)),
+            None,
+            "nothing starts past five minutes"
+        );
+        let waits: Duration = (1..p.attempts).map(|f| p.backoff(f)).sum();
+        assert_eq!(
+            waits,
+            secs(180),
+            "a gateway failing fast still gets all ten attempts"
+        );
+        assert_eq!(p.retry_in(p.attempts, Duration::ZERO), None);
+
+        let resolver = Policy::default();
+        assert_eq!(
+            resolver.deadline, None,
+            "the out-of-band resolver holds no window"
+        );
+        assert_eq!(resolver.retry_in(9, secs(86_400)), Some(secs(600)));
+        assert_eq!(resolver.timeout(0), crate::subgraph_import::FETCH_TIMEOUT);
     }
 
     /// Room for typed rows is allotted by slot from the plan alone. Keys assigned as documents arrived

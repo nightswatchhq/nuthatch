@@ -74,6 +74,10 @@ pub struct Config {
     /// share one content address. Rides on `Config` for the same reason `state_rpc_urls` does.
     #[serde(skip)]
     pub freshness: crate::freshness::Freshness,
+    /// How long a `--seal-direct` window waits for one `[[ipfs]]` document, zero for no limit (#1399).
+    /// Set from `--ipfs-window-deadline`; `#[serde(skip)]` for the same reason as `freshness`.
+    #[serde(skip, default = "crate::ipfs_resolve::window_deadline")]
+    pub ipfs_window_deadline: std::time::Duration,
     /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
     /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
     ///
@@ -676,6 +680,7 @@ impl Config {
             state_rpc_urls: Vec::new(),
             read_only_role: false,
             freshness: Default::default(),
+            ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
@@ -749,6 +754,7 @@ mod tests {
             state_rpc_urls: Vec::new(),
             read_only_role: false,
             freshness: Default::default(),
+            ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {

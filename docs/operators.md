@@ -919,7 +919,7 @@ per-nest series below.
 |---|---|
 | `nuthatch_tip_height`, `nuthatch_last_block`, `nuthatch_tip_lag_blocks` | is it keeping up |
 | `nuthatch_sealed_through` | cold-layer watermark |
-| `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_resolved_total`, `nuthatch_ipfs_given_up_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total`, `nuthatch_ipfs_rows_refused_total` | ingestion |
+| `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_resolved_total`, `nuthatch_ipfs_given_up_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total`, `nuthatch_ipfs_rows_refused_total`, `nuthatch_ipfs_retries_total` | ingestion |
 | `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total` | serving |
 | `nuthatch_sql_memo_hits_total`, `nuthatch_sql_memo_misses_total`, `nuthatch_sql_memo_bytes` | the analytical memo (#1186): how many `/sql` answers were remembered rather than computed, and what it holds |
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
@@ -941,6 +941,8 @@ the lowest), `nuthatch_nest_ipfs_resolved_total`, `nuthatch_nest_ipfs_given_up_t
 row), `nuthatch_nest_ipfs_oversize_total` (documents refused past the byte, block or depth cap),
 `nuthatch_nest_ipfs_rows_refused_total` (proven documents whose content did not fit their declared typed
 rows, so neither the document nor any row was written),
+`nuthatch_nest_ipfs_retries_total` (failed document fetches tried again, each also a warn line naming
+the CID, block, attempt, error and the wait before the next; a window paused on a gateway shows here),
 `nuthatch_nest_seal_direct_fetched`,
 `nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_health` (1 indexing / 0 quarantined),
 `nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
@@ -992,6 +994,24 @@ stopped sealing at tip answered `ready: true` with `lag_blocks: 0` indefinitely 
 blocks behind on a live nest (#1199). `seal_lag_blocks` is `null` for a `serve`-only role, and `null`
 before anything has sealed at all, so read `sealed_through: 0` beside it as "nothing sealed yet"
 rather than as a caught-up seal.
+
+**A seal-direct pass reports the concurrency it runs at.** `seal_direct_concurrency` is
+`{"requested", "effective", "capped_by"}`, and `null` for a nest not started with `--seal-direct`. With a
+single RPC endpoint the pass runs one window at a time whatever `--concurrency` says, to avoid a stall
+of the whole runtime, and `capped_by` then reads `single_rpc_endpoint` (#1399). Add a second endpoint
+to get the concurrency you asked for.
+
+**One IPFS document holds a seal-direct window for at most five minutes by default.** A window seals
+only once every document it names is fetched or given up on. A failed fetch is tried again with a
+timeout of 30, then 60, then 120 seconds, each retry a warn line and a count in
+`nuthatch_nest_ipfs_retries_total`. Under `--seal-direct` a document not fetched within
+`--ipfs-window-deadline` (default `300s`) is given up on, logged and counted as before. It is then
+absent from the sealed segment, and nothing fetches it again (#1410). That is the trade the flag sets:
+raise it, or pass `0` to give up only once all ten attempts have failed, if you would rather a window
+wait than seal without a document. `/ready` reports the setting as
+`seal_direct_ipfs_window_deadline_secs`, `0` meaning none. A second `--ipfs` gateway is the remedy for a gateway
+that stalls on some documents: on 2026-09-15 The Graph's gateway stopped two QoS documents after 256
+to 320 KiB, and Pinata served them whole in 4.6 and 6.1 s.
 
 **What to expect from it.** A healthy nest cuts a segment at least once per the chain's seal span,
 about six hours of chain time, so `seal_lag_blocks` should oscillate rather than climb. It trending up
