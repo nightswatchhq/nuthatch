@@ -56,6 +56,11 @@ impl Planned {
     }
 }
 
+/// Whether a row at `log_index` is a document row, as [`Planned::key`] places one: typed rows sit above.
+pub fn is_document_row(log_index: u64) -> bool {
+    (IPFS_ROW_LOG_INDEX_BASE..IPFS_ROW_LOG_INDEX_BASE + IPFS_DOCUMENT_SLOTS).contains(&log_index)
+}
+
 /// Every document one block's rows name, with slots assigned within the block: declarations in config
 /// order, rows in `log_index` order, and a CID a declaration has already planned in this block skipped.
 ///
@@ -1407,6 +1412,17 @@ mod tests {
             gave_up(&store, &p).unwrap(),
             "a bare CID an earlier build wrote still counts"
         );
+    }
+
+    /// #1421 counts a stored document by its row's place, so the document band ends where typed rows begin.
+    #[test]
+    fn a_document_row_is_told_from_a_typed_row_by_its_place() {
+        assert!(is_document_row(IPFS_ROW_LOG_INDEX_BASE));
+        assert!(is_document_row(
+            IPFS_ROW_LOG_INDEX_BASE + IPFS_DOCUMENT_SLOTS - 1
+        ));
+        assert!(!is_document_row(IPFS_ROW_LOG_INDEX_BASE - 1));
+        assert!(!is_document_row(IPFS_DOCUMENT_ROW_LOG_INDEX_BASE));
     }
 
     /// Room for typed rows is allotted by slot from the plan alone. Keys assigned as documents arrived

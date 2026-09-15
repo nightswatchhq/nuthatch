@@ -3098,6 +3098,16 @@ fn merge_window_rows(
     merge_from: u64,
     rows: impl IntoIterator<Item = SealRow>,
 ) -> Result<u64> {
+    merge_window_rows_seeing(buf, merge_from, rows, |_| {})
+}
+
+/// [`merge_window_rows`], handing `fresh` each row the merge keeps, so a refetched row is seen once.
+fn merge_window_rows_seeing(
+    buf: &mut Vec<SealRow>,
+    merge_from: u64,
+    rows: impl IntoIterator<Item = SealRow>,
+    mut fresh_row: impl FnMut(&SealRow),
+) -> Result<u64> {
     let start = buf.partition_point(|r| r.0 < merge_from);
     let held: std::collections::HashMap<(u64, u64), &str> = buf[start..]
         .iter()
@@ -3106,7 +3116,10 @@ fn merge_window_rows(
     let mut fresh = Vec::new();
     for r in rows {
         match held.get(&(r.0, r.1)) {
-            None => fresh.push(r),
+            None => {
+                fresh_row(&r);
+                fresh.push(r)
+            }
             Some(json) if *json == r.2 => {}
             Some(_) => anyhow::bail!(
                 "block {} log {} came back with different content on refetch - the provider \
@@ -4730,7 +4743,13 @@ pub async fn backfill_direct_pipelined_with(
         }
         // Windows complete in order (`buffered`, not `buffer_unordered`), so a window's refetched
         // tail is merged after the previous window's own rows are in the buffer (#1144).
-        let n = merge_window_rows(&mut buf, fetch_from, json)?;
+        let mut documents = 0;
+        let n = merge_window_rows_seeing(&mut buf, fetch_from, json, |r| {
+            documents += u64::from(crate::ipfs_resolve::is_document_row(r.1))
+        })?;
+        if let (Some(metrics), true) = (extras.metrics, documents > 0) {
+            metrics.add_ipfs_resolved(documents);
+        }
         total += n;
         let window_now = chunker.lock().expect("window controller").window();
         on_progress(w_to, n, window_now);
@@ -5072,12 +5091,17 @@ pub async fn backfill_direct_factory_with(
                 registry.timestamps(),
             )
             .await?;
-        let row_count = merge_window_rows(
+        let mut documents = 0;
+        let row_count = merge_window_rows_seeing(
             &mut buf,
             fetch_from,
             rows.iter()
                 .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
+            |r| documents += u64::from(crate::ipfs_resolve::is_document_row(r.1)),
         )?;
+        if let (Some(metrics), true) = (extras.metrics, documents > 0) {
+            metrics.add_ipfs_resolved(documents);
+        }
         total += row_count;
         next = chunk_to + 1;
         on_progress(chunk_to, row_count, chunker.window());
@@ -12488,6 +12512,72 @@ template = "pool"
                 .map(|(n, b)| (n, b.len()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// #1421: seal-direct stored its documents without counting them in
+    /// `nuthatch_nest_ipfs_resolved_total`, so a backfill that stored 1,177 read 6. Each is counted once
+    /// where it merges into the seal buffer, including one in a window's refetched tail, resolved twice.
+    #[tokio::test]
+    async fn a_seal_direct_pass_counts_each_document_it_stores_once() {
+        // One per block around where the first windows end, so some sit in a refetched tail. Each fetch
+        // builds its own HTTP client, so a document on every block of the range took 40 s.
+        let docs: Vec<(u64, String, String)> = (94..=114u64)
+            .chain(494..=514)
+            .map(|b| {
+                let body = format!(r#"{{"bucket":{b}}}"#);
+                (b, crate::cid::cid_v0_for(body.as_bytes()), body)
+            })
+            .collect();
+        let (gateway, _requests, handle) = content_gateway(
+            docs.iter()
+                .map(|(_, cid, body)| (cid.clone(), body.clone()))
+                .collect::<std::collections::HashMap<_, _>>(),
+            0,
+        )
+        .await;
+        let dir = qos_topic_nest("t");
+        let mut config = Config::load(dir.path()).unwrap();
+        config.ipfs_gateways = vec![gateway];
+        config.nest.name = "seal-direct-resolved-1421".into();
+        let source: Arc<dyn Source> = Arc::new(PostSource(
+            docs.iter().map(|(b, cid, _)| (*b, qos_post(cid))).collect(),
+        ));
+        let (mut nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+        nest.prepare(source.as_ref(), Some(9_996), true, 1, 100)
+            .await
+            .unwrap();
+
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let schema = tables.iter().find(|t| t.table == "qos_payload").unwrap();
+        let stored = crate::seal::read_table_rows(dir.path(), schema)
+            .unwrap()
+            .len() as u64;
+        assert_eq!(stored, docs.len() as u64, "premise: every document sealed");
+        assert_eq!(
+            METRICS.nest("seal-direct-resolved-1421").ipfs_resolved(),
+            stored,
+            "one count per stored document"
+        );
+        drop(nest);
+        drop(state);
+        handle.abort();
     }
 
     /// A range waits for the documents it names, in the window's own seal and not only in the resolver,
