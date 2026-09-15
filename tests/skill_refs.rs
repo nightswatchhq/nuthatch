@@ -383,6 +383,7 @@ const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
     ("Config.ipfs_gateways", "`#[serde(skip)]` - IPFS gateways come from `--ipfs`. A gateway is an *access path*: two operators resolving one CID through different gateways must get the same bytes, so it must not enter the nest's content address"),
     ("Config.freshness", "`#[serde(skip)]` - the poll interval and finality-only mode come from `--poll-interval` / `--finality-only` (RFC-0040, #1173). How often an operator asks is not what the nest is: two nests differing only in cadence hold identical rows and must share one content address."),
     ("Config.ipfs_window_deadline", "`#[serde(skip)]` - how long a seal-direct window waits for one IPFS document comes from `--ipfs-window-deadline` (#1399). Waiting longer or giving up sooner changes which documents seal, not what the nest is, and the reference names the flag beside `[[ipfs]]`."),
+    ("Config.route", "`#[serde(skip)]` - the route a runtime serves a nest under, stamped by the runtime before `build_nest` so its cursor, health and metrics are keyed by it (#1415). Where a nest is mounted is not what it is, and an author never writes it."),
     ("Config.read_only_role", "`#[serde(skip)]` - the `serve` role, set by `serve_role` before `build_nest` so a `[[calls]]` nest it will never sample is not refused for lacking an archive endpoint (#1167). A role is not data identity and is never a config key."),
 ];
 
