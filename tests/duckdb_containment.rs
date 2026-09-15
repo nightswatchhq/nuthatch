@@ -66,6 +66,7 @@ const KNOWN: &[&str] = &[
     "seal.rs",                  // segment-binding oracle (test-only)
     "port_emit.rs",             // emitted-check oracle (test-only)
     "authored_entity_spike.rs", // RFC-0041 spike, reachable via `nuthatch bench`
+    "dune_views.rs",            // AST of authored views, for RFC-0055 S3's translation
 ];
 
 /// Internal (`pub(crate)`) signatures that currently carry a DuckDB type, pinned with their count.

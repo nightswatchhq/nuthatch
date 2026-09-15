@@ -1916,7 +1916,7 @@ fn expand_through_views(
 /// The `SELECT` inside a stored `CREATE VIEW … AS …`, which is all `json_serialize_sql` will accept
 /// (it answers `Only SELECT statements can be serialized to json!` for the whole statement - measured
 /// in the DuckDB CLI, not assumed). `None` when the text is not that shape, which skips the view.
-fn view_body(create_view_sql: &str) -> Option<&str> {
+pub(crate) fn view_body(create_view_sql: &str) -> Option<&str> {
     let lower = create_view_sql.to_ascii_lowercase();
     let (view, view_end) = find_keyword(&lower, "view", 0)?;
     let _ = view;
@@ -1960,7 +1960,7 @@ fn find_keyword(haystack: &str, word: &str, from: usize) -> Option<(usize, usize
 /// The name a `CREATE [OR REPLACE] VIEW <name> AS …` declares, lowercased. The mirror of
 /// [`view_body`], and parsed the same coarse way: the text between ` view ` and the first ` as `
 /// past it.
-fn view_name(create_view_sql: &str) -> Option<String> {
+pub(crate) fn view_name(create_view_sql: &str) -> Option<String> {
     let lower = create_view_sql.to_ascii_lowercase();
     let (_, view_end) = find_keyword(&lower, "view", 0)?;
     let (as_at, _) = find_keyword(&lower, "as", view_end)?;
@@ -3340,7 +3340,7 @@ fn is_bigint(storage: &str) -> bool {
 
 /// The extra `SELECT` items projecting the derived `{c}_dec` / `{c}_overflow` columns for a table's
 /// big-integer columns (empty string if none), shared by the sealed and empty view builders.
-fn derived_bigint_cols(cols: &[(String, String)]) -> String {
+pub(crate) fn derived_bigint_cols(cols: &[(String, String)]) -> String {
     let mut s = String::new();
     for (c, _) in cols.iter().filter(|(_, s)| is_bigint(s)) {
         s.push_str(&format!(
