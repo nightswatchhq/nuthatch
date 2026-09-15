@@ -2456,6 +2456,7 @@ async fn build_nest(
         &hex::encode(registry.hash()),
         config.extract.top_level_calls,
     )?;
+    guard_coverage(store.as_ref(), config)?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
@@ -2807,10 +2808,15 @@ async fn build_nest(
     // here, not permanent - see `serve::poll_stalled`.
     nest.metrics.mark_started();
 
+    // No command printed a single nest's NID (#1420). Computed from the inputs as they are now; `None`
+    // only for a directory `blob` cannot read.
+    let manifest = crate::blob::build_manifest(&dir, None).ok();
     let nest_info = serde_json::json!({
         "name": config.nest.name,
         "chain": config.nest.chain,
         "chain_id": config.nest.chain_id,
+        "nid": manifest.as_ref().map(|m| m.nid()),
+        "data_identity": manifest.as_ref().map(|m| m.data_identity()),
         "registry_hash": format!("0x{identity}"),
         "table_count": registry.tables().len(),
         "contracts": config.contracts.iter()
@@ -3365,6 +3371,134 @@ fn guard_registry_identity(
             Ok(())
         }
     }
+}
+
+/// Bumped whenever [`coverage`] records more, so a store recorded under an earlier version is
+/// re-recorded rather than refused.
+const COVERAGE_VERSION: u64 = 1;
+
+/// What a store's data covers beyond its decode (#1420). None of the chain, a contract's start block or
+/// a factory's start is in the registry hash, so a copied store started under a moved `start_block` and
+/// served its old range. RPC endpoints and the nest's name stay out: they cannot change a stored row.
+/// Sorted, so reordering `nuthatch.toml` is not a change.
+fn coverage(config: &Config) -> serde_json::Value {
+    let mut contracts: Vec<_> = config
+        .contracts
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "alias": c.alias,
+                "address": c.address.to_lowercase(),
+                "start_block": c.start_block,
+            })
+        })
+        .collect();
+    contracts.sort_by_key(|c| c["alias"].to_string());
+    let mut factories: Vec<_> = config
+        .factories
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "watch": f.watch,
+                "event": f.event,
+                "child_param": f.child_param,
+                "template": f.template,
+                "start": f.start,
+            })
+        })
+        .collect();
+    factories.sort_by_key(|f| f.to_string());
+    let e = &config.extract;
+    let sorted = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    serde_json::json!({
+        "v": COVERAGE_VERSION,
+        "chain": config.nest.chain,
+        "chain_id": config.nest.chain_id,
+        "contracts": contracts,
+        "factories": factories,
+        "extract": {
+            "blocks": e.blocks,
+            "traces": e.traces,
+            "top_level_calls": e.top_level_calls,
+            "state": e.state,
+            "contracts": sorted(&e.contracts),
+            "selectors": sorted(&e.selectors),
+        },
+    })
+}
+
+/// Each part of `config` that differs from `stored`, one per line, a contract named by its alias.
+fn coverage_changes(stored: &serde_json::Value, config: &serde_json::Value) -> Vec<String> {
+    let show = |v: Option<&serde_json::Value>| v.map_or("absent".to_string(), |v| v.to_string());
+    let mut out: Vec<String> = ["chain", "chain_id", "factories", "extract"]
+        .into_iter()
+        .filter(|k| stored[k] != config[k])
+        .map(|k| format!("  {k}: stored {}, config {}", stored[k], config[k]))
+        .collect();
+    let by_alias = |v: &serde_json::Value| {
+        v["contracts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| {
+                (
+                    c["alias"].as_str().unwrap_or_default().to_string(),
+                    c.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let (was, now) = (by_alias(stored), by_alias(config));
+    let aliases: std::collections::BTreeSet<&String> = was.keys().chain(now.keys()).collect();
+    for alias in aliases {
+        let (w, n) = (was.get(alias), now.get(alias));
+        if w != n {
+            out.push(format!(
+                "  contract `{alias}`: stored {}, config {}",
+                show(w),
+                show(n)
+            ));
+        }
+    }
+    out
+}
+
+/// Refuse to serve a store under a `nuthatch.toml` that now covers other blocks or contracts (#1420).
+///
+/// A fresh store is recorded. So is one written before this check, which is said to be recorded rather
+/// than verified, so an upgrade never refuses a store. A store recorded under another
+/// [`COVERAGE_VERSION`], or holding no data yet, is re-recorded.
+fn guard_coverage(store: &dyn crate::store::HotStore, config: &Config) -> Result<()> {
+    let want = coverage(config);
+    let holds_data = store.get_meta(LAST_BLOCK_KEY)?.is_some() || store.sealed_through() > 0;
+    let recorded = store
+        .get_meta(crate::store::COVERAGE_KEY)?
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok());
+    match recorded {
+        Some(found) if found == want => return Ok(()),
+        Some(found) if holds_data && found["v"] == want["v"] => anyhow::bail!(
+            "this nest's stored data covers something nuthatch.toml no longer declares:\n\n{}\n\n\
+             The chain, each contract's address and start block, the factories and the extraction \
+             settings decide which blocks and rows a store holds, so a difference means `nuthatch.toml` \
+             changed what this data covers after it was written. Continuing would serve rows indexed \
+             over one range under a configuration that claims another.\n\n\
+             Re-index from scratch to adopt the new configuration (remove `nuthatch.redb` and \
+             `segments/`), or restore the previous configuration to keep serving this data. RPC \
+             endpoints and the nest's name are not part of this check and may change freely.",
+            coverage_changes(&found, &want).join("\n")
+        ),
+        None if holds_data => tracing::warn!(
+            "recording what this store covers for a store written before that was checked (#1420) - \
+             it was recorded, not verified. If a contract's address or start block has changed since \
+             it was indexed, re-index it."
+        ),
+        _ => {}
+    }
+    store.set_meta(crate::store::COVERAGE_KEY, &want.to_string())
 }
 
 fn guard_timestamp_policy(store: &dyn crate::store::HotStore, declared: bool) -> Result<()> {
@@ -12657,6 +12791,194 @@ template = "pool"
         empty.set_meta(REGISTRY_KEY, "events").unwrap();
         guard_registry_identity(&empty, "full", "events", true)
             .expect("a store that never indexed a call has nothing to re-index");
+    }
+
+    const COVERAGE_ABI: &str = r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#;
+
+    /// `nuthatch.toml` for a one-contract nest, with the fields #1420 is about spelled out.
+    fn coverage_toml(name: &str, rpc: &str, address: &str, start_block: u64) -> String {
+        format!(
+            "[nest]\nname = \"{name}\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = [\"{rpc}\"]\n\n[[contracts]]\nalias = \"t\"\naddress = \"{address}\"\n\
+             abi = \"abis/t.json\"\nstart_block = {start_block}\n"
+        )
+    }
+
+    fn covering(name: &str, rpc: &str, address: &str, start_block: u64) -> Config {
+        toml::from_str(&coverage_toml(name, rpc, address, start_block)).unwrap()
+    }
+
+    const ADDRESS: &str = "0x00000000000000000000000000000000000000aa";
+
+    /// #1420: a store is held to what its data covers, and not to its endpoints or its name.
+    #[test]
+    fn a_store_is_held_to_what_its_data_covers_and_not_to_its_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 100))
+            .expect("a fresh store records");
+        store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+
+        guard_coverage(&store, &covering("renamed", "http://b", ADDRESS, 100))
+            .expect("the name and the endpoints cannot change a stored row");
+        guard_coverage(
+            &store,
+            &covering("n", "http://a", &ADDRESS.to_uppercase(), 100),
+        )
+        .expect("an address's case is not a different contract");
+
+        let err = guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101))
+            .expect_err("a moved start block is a different range");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("contract `t`")
+                && msg.contains("\"start_block\":100")
+                && msg.contains("\"start_block\":101"),
+            "the refusal names what moved: {msg}"
+        );
+        let mut elsewhere = covering("n", "http://a", ADDRESS, 100);
+        elsewhere.nest.chain_id = 8453;
+        let err = guard_coverage(&store, &elsewhere).expect_err("another chain is other data");
+        assert!(
+            format!("{err:#}").contains("chain_id: stored 42161, config 8453"),
+            "{err:#}"
+        );
+    }
+
+    /// #1420: an upgrade must not refuse the stores it finds. One written before the check records what
+    /// it covers and starts; so does one recorded under an earlier version, and one that holds no data.
+    #[test]
+    fn a_store_from_before_the_coverage_check_records_rather_than_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 100))
+            .expect("an older store starts");
+        assert!(store
+            .get_meta(crate::store::COVERAGE_KEY)
+            .unwrap()
+            .is_some());
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101))
+            .expect_err("once recorded, a later change is refused");
+
+        store
+            .set_meta(crate::store::COVERAGE_KEY, r#"{"v":0,"chain":"somewhere"}"#)
+            .unwrap();
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101))
+            .expect("a record from an earlier version is re-recorded");
+        guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101)).unwrap();
+
+        let empty = tempfile::tempdir().unwrap();
+        let empty = Store::open(&empty.path().join("t.redb")).unwrap();
+        guard_coverage(&empty, &covering("n", "http://a", ADDRESS, 100)).unwrap();
+        guard_coverage(&empty, &covering("n", "http://a", ADDRESS, 101))
+            .expect("a store with no data has nothing to contradict");
+    }
+
+    /// #1420, as found: a stopped nest copied elsewhere started under an edited `start_block` and served
+    /// its old data. The copy is refused for that and starts under new endpoints or a new name, and `/nest`
+    /// and `/` show the NID and data identity nothing else printed.
+    #[tokio::test]
+    async fn a_copied_store_is_refused_under_a_moved_start_block_and_starts_under_new_endpoints() {
+        use tower::ServiceExt as _;
+        let original = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(original.path().join("abis")).unwrap();
+        std::fs::write(original.path().join("abis/t.json"), COVERAGE_ABI).unwrap();
+        std::fs::write(
+            original.path().join(crate::config::CONFIG_FILE),
+            coverage_toml("copied", "http://a", ADDRESS, 100),
+        )
+        .unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let build = |dir: std::path::PathBuf| {
+            let source = source.clone();
+            async move {
+                let config = Config::load(&dir).unwrap();
+                let built = build_nest(
+                    &source,
+                    dir,
+                    &config,
+                    None,
+                    false,
+                    None,
+                    None,
+                    serve::new_sql_gate(),
+                )
+                .await;
+                built.map(|(nest, state, worker, _)| {
+                    if let Some(w) = worker {
+                        w.abort();
+                    }
+                    (nest, state)
+                })
+            }
+        };
+
+        let (nest, state) = build(original.path().to_path_buf()).await.unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+        let manifest = crate::blob::build_manifest(original.path(), None).unwrap();
+        for uri in ["/nest", "/"] {
+            let res = serve::router(serve::SharedNest::new(state.clone()))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["nid"],
+                serde_json::json!(manifest.nid()),
+                "{uri}: {json}"
+            );
+            assert_eq!(
+                json["data_identity"],
+                serde_json::json!(manifest.data_identity()),
+                "{uri}: {json}"
+            );
+        }
+        drop(nest);
+        drop(state);
+
+        let copy = |toml: String| {
+            let to = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(to.path().join("abis")).unwrap();
+            std::fs::write(to.path().join("abis/t.json"), COVERAGE_ABI).unwrap();
+            std::fs::write(to.path().join(crate::config::CONFIG_FILE), toml).unwrap();
+            std::fs::copy(
+                original.path().join(crate::config::DB_FILE),
+                to.path().join(crate::config::DB_FILE),
+            )
+            .unwrap();
+            to
+        };
+
+        let moved = copy(coverage_toml("copied", "http://a", ADDRESS, 101));
+        let err = build(moved.path().to_path_buf())
+            .await
+            .err()
+            .expect("a copy under a moved start block must be refused");
+        assert!(
+            format!("{err:#}").contains("covers something nuthatch.toml no longer declares"),
+            "{err:#}"
+        );
+
+        for toml in [
+            coverage_toml("copied", "http://elsewhere", ADDRESS, 100),
+            coverage_toml("renamed", "http://a", ADDRESS, 100),
+        ] {
+            let started = copy(toml);
+            let (nest, state) = build(started.path().to_path_buf())
+                .await
+                .expect("new endpoints or a new name must not refuse the copy");
+            drop(nest);
+            drop(state);
+        }
     }
 
     const QOS_EDGE: &str = "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f";

@@ -1773,6 +1773,10 @@ fn summary_value(s: &AppState) -> Value {
         "velocity_buckets": s.velocity.entries(),
         "alert_outbox": s.store.outbox_len(),
         "tables": s.tables.len(),
+        // What this nest's inputs hash to now (#1420): the package identity, and the coarser one that
+        // decides whether a dataset may be adopted.
+        "nid": s.nest_info["nid"],
+        "data_identity": s.nest_info["data_identity"],
         "publish": publish_summary(s),
         "views": ["balances (IVM)", "exposure (IVM)", "velocity (IVM)"],
         "endpoints": [
