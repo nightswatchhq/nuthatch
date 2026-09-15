@@ -78,6 +78,11 @@ pub struct Config {
     /// Set from `--ipfs-window-deadline`; `#[serde(skip)]` for the same reason as `freshness`.
     #[serde(skip, default = "crate::ipfs_resolve::window_deadline")]
     pub ipfs_window_deadline: std::time::Duration,
+    /// The route a runtime serves this nest under (#1415). A runtime keys the nest's cursor, health and
+    /// metrics by it, since two tenants' nests may share a name. `None` outside a runtime, where the
+    /// nest's name is used. `#[serde(skip)]`: where a nest is mounted is not what it is.
+    #[serde(skip)]
+    pub route: Option<String>,
     /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
     /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
     ///
@@ -681,6 +686,7 @@ impl Config {
             read_only_role: false,
             freshness: Default::default(),
             ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+            route: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
@@ -755,6 +761,7 @@ mod tests {
             read_only_role: false,
             freshness: Default::default(),
             ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+            route: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
