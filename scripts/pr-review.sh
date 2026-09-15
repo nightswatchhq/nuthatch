@@ -376,14 +376,34 @@ def build_user($p):
 
 # ── response validation and rendering ──────────────────────────────────────────
 
-def in_range_0_100: type == "number" and . >= 0 and . <= 100;
+# `type == "number"` alone accepts 72.5 for a field the schema types `integer` - the API's strict
+# mode is meant to rule that out, but this checks what actually came back rather than trusting that
+# alone to have held, the same reasoning #1056 applied to the 0-100 bounds (Jules on #1407).
+def is_integer: type == "number" and (. == (. | floor));
 def valid_severity: . as $s | (["high","medium","low"] | index($s)) != null;
 def valid_verdict: . as $v | (["ship","comment","changes-requested"] | index($v)) != null;
 
-def validate_review:
+# Every field the given schema properties type as `integer`, with whatever bounds it declares -
+# driven by the schema actually sent to the model, so a field added there is validated here without
+# a matching manual update.
+def integer_fields_of($props):
+  $props | to_entries | map(select(.value.type == "integer"))
+  | map({name: .key, minimum: .value.minimum, maximum: .value.maximum});
+
+def validate_integer_fields($obj; $fields):
+  ($fields | map(
+      . as $field
+      | ($obj[$field.name]) as $v
+      | if ($v | is_integer | not) then "\($field.name) is not an integer: \($v)"
+        elif ($field.minimum != null and $v < $field.minimum) then "\($field.name) is below its minimum: \($v)"
+        elif ($field.maximum != null and $v > $field.maximum) then "\($field.name) is above its maximum: \($v)"
+        else empty end
+    )) as $errs
+  | if ($errs|length) > 0 then error($errs[0]) else $obj end;
+
+def validate_review($schema):
   if (type != "object") then error("response is not a JSON object") else . end
   | if ((has("confidence")|not) or (.confidence == null)) then error("missing confidence") else . end
-  | if (.confidence | in_range_0_100 | not) then error("confidence out of range: \(.confidence)") else . end
   | if ((has("verdict")|not) or (.verdict == null)) then error("missing verdict") else . end
   | if (.verdict | valid_verdict | not) then error("invalid verdict: \(.verdict)") else . end
   | if ((has("summary")|not) or (.summary == null)) then error("missing summary") else . end
@@ -395,9 +415,10 @@ def validate_review:
        | if $complete then empty else "finding \($i) is missing a required field" end
      )) as $ferrs
   | if ($ferrs|length) > 0 then error($ferrs[0]) else . end
-  | if (.findings | map(.certainty | in_range_0_100) | all | not) then error("a finding certainty is out of range") else . end
   | if (.findings | map(.severity | valid_severity) | all | not) then error("a finding has an invalid severity") else . end
-  ;
+  | validate_integer_fields(.; integer_fields_of($schema.properties))
+  | (.findings | map(validate_integer_fields(.; integer_fields_of($schema.properties.findings.items.properties)))) as $checked_findings
+  | .;
 
 def severity_mark:
   if . == "high" then "**high**" elif . == "medium" then "medium" elif . == "low" then "low" else . end;
@@ -470,9 +491,9 @@ elif $mode == "diff_elided" then
   | budget_diff($sr.diff; $max_diff_chars) as $br
   | $br.elided
 elif $mode == "validate_and_json" then
-  ($content | fromjson | validate_review)
+  ($content | fromjson | validate_review($schema))
 elif $mode == "validate_and_render" then
-  ($content | fromjson | validate_review) as $review
+  ($content | fromjson | validate_review($schema)) as $review
   | render($review; $model; $elided; $max_diff_chars)
 else
   error("unknown mode \($mode)")
@@ -511,7 +532,7 @@ if [ "$self_test_budget" -eq 1 ]; then
     --rawfile own_files /dev/null --rawfile prior /dev/null --rawfile replies /dev/null \
     --rawfile callee /dev/null --rawfile body /dev/null --arg title "" --arg base_range "" \
     --argjson recording_min_chars "$recording_min_chars" --argjson max_prior_chars "$max_prior_chars" \
-    --arg content "" --arg model "" --argjson elided '[]' \
+    --arg content "" --arg model "" --argjson elided '[]' --argjson schema '{}' \
     > "$tmp/self_test_result.json"
   jq -j '.diff' "$tmp/self_test_result.json" > "$self_test_out_diff"
   jq -c '.elided' "$tmp/self_test_result.json" > "$self_test_out_elided"
@@ -535,7 +556,7 @@ jq -n -r -f "$tmp/prog.jq" \
   --argjson max_diff_chars "$max_diff_chars" \
   --argjson recording_min_chars "$recording_min_chars" \
   --argjson max_prior_chars "$max_prior_chars" \
-  --arg content "" --arg model "" --argjson elided '[]' \
+  --arg content "" --arg model "" --argjson elided '[]' --argjson schema '{}' \
   --arg mode "user_prompt" > "$tmp/user.txt"
 
 if [ "$dry_run" -eq 1 ]; then
@@ -554,6 +575,7 @@ jq -n -c -f "$tmp/prog.jq" \
   --rawfile own_files /dev/null --rawfile prior /dev/null --rawfile replies /dev/null \
   --rawfile callee /dev/null --rawfile body /dev/null --arg title "" --arg base_range "" \
   --argjson max_prior_chars "$max_prior_chars" --arg content "" --arg model "" --argjson elided '[]' \
+  --argjson schema '{}' \
   > "$tmp/elided.json"
 
 # ── system prompt: CLAUDE.md spliced in exactly where the old triple-quoted string put it ────────
@@ -654,7 +676,9 @@ if ! printf '%s' "$content" | jq -e . > /dev/null 2>&1; then
 fi
 
 # The schema sent to the API is strict, but this checks what actually came back rather than trusting
-# that alone to have held (#1056: an out-of-range certainty once passed straight through).
+# that alone to have held (#1056: an out-of-range certainty once passed straight through; #1407: a
+# fractional value for a field the schema types `integer`, confidence and certainty included).
+schema_json="$(cat "$tmp/schema.json")"
 if ! review_json="$(jq -n -a -f "$tmp/prog.jq" \
     --arg content "$content" --arg mode "validate_and_json" \
     --rawfile diff /dev/null --rawfile commits /dev/null --rawfile base /dev/null \
@@ -662,7 +686,8 @@ if ! review_json="$(jq -n -a -f "$tmp/prog.jq" \
     --rawfile replies /dev/null --rawfile callee /dev/null --rawfile body /dev/null \
     --arg title "" --arg base_range "" --argjson max_diff_chars "$max_diff_chars" \
     --argjson recording_min_chars "$recording_min_chars" --argjson max_prior_chars "$max_prior_chars" \
-    --arg model "$model" --argjson elided '[]' 2>"$tmp/validate.err")"; then
+    --arg model "$model" --argjson elided '[]' --argjson schema "$schema_json" \
+    2>"$tmp/validate.err")"; then
   echo "pr-review: the model's response was not a complete review ($(tail -1 "$tmp/validate.err"))" >&2
   exit 1
 fi
@@ -677,7 +702,7 @@ else
   elided_json="$(cat "$tmp/elided.json")"
   jq -n -r -f "$tmp/prog.jq" \
     --arg content "$content" --arg mode "validate_and_render" --arg model "$model" \
-    --argjson elided "$elided_json" \
+    --argjson elided "$elided_json" --argjson schema "$schema_json" \
     --rawfile diff /dev/null --rawfile commits /dev/null --rawfile base /dev/null \
     --rawfile base_commits /dev/null --rawfile own_files /dev/null --rawfile prior /dev/null \
     --rawfile replies /dev/null --rawfile callee /dev/null --rawfile body /dev/null \
