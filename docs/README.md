@@ -8,7 +8,7 @@ not to infer work that remains.
 
 - [Backlog guide](backlog.md) - GitHub is the live queue; this explains its labels and settled
   decisions.
-- [Sprint: brisk-brambling](sprint-brisk-brambling.md) - drop-in closed; bugs that are true for everyone; then 0048.
+- [Sprint: diligent-dunnock](sprint-diligent-dunnock.md) - hackathon papercuts, done; then Dune end to end, the warehouse recipes, and cross-nest SQL as an RFC.
 - [Frozen for 2027](frozen-for-2027.md) - capability work deliberately deferred during the 2026
   feature freeze. These issues are closed, with an explicit reopening rule.
 - [RFC index](rfcs/README.md) - design and implementation status for each RFC.
