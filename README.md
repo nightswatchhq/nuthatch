@@ -45,6 +45,21 @@ tiny*. That combination is the point - not any single feature.
 
 ---
 
+## Who runs it
+
+Two deployments that are not demos:
+
+- **[Lodestar](https://www.lodestar-dashboard.com)**, an analytics dashboard for The Graph Protocol on
+  Arbitrum One, serves live panels from self-hosted nests instead of The Graph gateway.
+- **[Arcaidia](https://arcaidia.io)**, a speed layer over Circle's CCTP built at ETHOnline 2026, reads
+  its indexed state from two nests on Ethereum Sepolia and Arc Testnet. Its solver discovers intents
+  there, its settlement agent tracks CCTP there, and its web console renders from them. The nests were
+  serving within two hours of the builder asking The Graph for a higher Studio rate limit.
+
+More on both at [nuthatch-indexer.com/stories](https://www.nuthatch-indexer.com/stories).
+
+---
+
 ## Install
 
 ```sh
