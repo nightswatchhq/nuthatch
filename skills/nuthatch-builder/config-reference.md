@@ -114,7 +114,8 @@ args = ["{to}"]               # `{column}` takes the row's value; anything else 
                               # NO row rather than a wrong one, and the range seals once it is decided.
                               # Under `--seal-direct` one is also given up on after
                               # `--ipfs-window-deadline` (default 5m, `0` for none), and is then absent
-                              # from the sealed segment. Every retry is a warn line and counts in
+                              # from the sealed segment. Each give-up is counted on `/ready` and listed
+                              # at `/ipfs/gave-up`. Every retry is a warn line and counts in
                               # `nuthatch_nest_ipfs_retries_total`.
 name = "token_metadata"       # becomes the result table
 on = "nft__uri_set"           # the table whose rows carry the CID

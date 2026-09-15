@@ -372,6 +372,9 @@ pub trait HotStore: Send + Sync {
     // ---- cursor & meta ----------------------------------------------------------------------
     fn get_meta(&self, key: &str) -> Result<Option<String>>;
     fn set_meta(&self, key: &str, value: &str) -> Result<()>;
+    /// At most `limit` meta entries whose keys start with `prefix`, in key order.
+    fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>>;
+    fn count_meta_with_prefix(&self, prefix: &str) -> Result<u64>;
     fn indexed_head(&self) -> Result<Option<u64>>;
     fn sealed_through(&self) -> u64;
     fn set_block_hash(&self, block: u64, hash: &str) -> Result<()>;
@@ -1118,6 +1121,33 @@ impl Store {
         Ok(())
     }
 
+    pub fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let rtx = self.db.begin_read()?;
+        let t = rtx.open_table(META)?;
+        let mut out = Vec::new();
+        for row in t.range(prefix..)? {
+            let (k, v) = row?;
+            if out.len() >= limit || !k.value().starts_with(prefix) {
+                break;
+            }
+            out.push((k.value().to_string(), v.value().to_string()));
+        }
+        Ok(out)
+    }
+
+    pub fn count_meta_with_prefix(&self, prefix: &str) -> Result<u64> {
+        let rtx = self.db.begin_read()?;
+        let t = rtx.open_table(META)?;
+        let mut n = 0;
+        for row in t.range(prefix..)? {
+            if !row?.0.value().starts_with(prefix) {
+                break;
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// Record the canonical hash we indexed a block against (a reorg checkpoint).
     /// Keeps a timestamp already stored for this block, so a later hash-only pin cannot drop it.
     pub fn set_block_hash(&self, block: u64, hash: &str) -> Result<()> {
@@ -1513,6 +1543,12 @@ impl HotStore for Store {
     fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         Store::set_meta(self, key, value)
     }
+    fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        Store::meta_with_prefix(self, prefix, limit)
+    }
+    fn count_meta_with_prefix(&self, prefix: &str) -> Result<u64> {
+        Store::count_meta_with_prefix(self, prefix)
+    }
     fn indexed_head(&self) -> Result<Option<u64>> {
         Store::indexed_head(self)
     }
@@ -1775,6 +1811,12 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         (**self).set_meta(key, value)
+    }
+    fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        (**self).meta_with_prefix(prefix, limit)
+    }
+    fn count_meta_with_prefix(&self, prefix: &str) -> Result<u64> {
+        (**self).count_meta_with_prefix(prefix)
     }
     fn indexed_head(&self) -> Result<Option<u64>> {
         (**self).indexed_head()
@@ -2174,6 +2216,26 @@ mod tests {
             Some(1_700_000_000),
             "a hash-only commit must not drop the timestamp"
         );
+    }
+
+    /// #1410: a prefix read stops at the end of its prefix and at `limit`, in key order, and the count
+    /// covers the same keys.
+    #[test]
+    fn meta_with_prefix_reads_only_its_own_keys_in_order() {
+        let (store, _d) = temp_store();
+        store.set_meta("ipfs_gave_up:000000000010:1", "b").unwrap();
+        store.set_meta("ipfs_gave_up:000000000004:0", "a").unwrap();
+        store.set_meta("ipfs_gave_up;after", "not ours").unwrap();
+        store.set_meta("ipfs_gave_uo:before", "not ours").unwrap();
+        assert_eq!(
+            store.meta_with_prefix("ipfs_gave_up:", 10).unwrap(),
+            [
+                ("ipfs_gave_up:000000000004:0".to_string(), "a".to_string()),
+                ("ipfs_gave_up:000000000010:1".to_string(), "b".to_string()),
+            ]
+        );
+        assert_eq!(store.meta_with_prefix("ipfs_gave_up:", 1).unwrap().len(), 1);
+        assert_eq!(store.count_meta_with_prefix("ipfs_gave_up:").unwrap(), 2);
     }
 
     #[test]

@@ -3477,6 +3477,8 @@ pub struct DirectExtras<'a> {
     pub metrics: Option<&'a crate::metrics::NestMetrics>,
     /// How long a document is tried before its window seals without it (`--ipfs-window-deadline`).
     pub ipfs_policy: crate::ipfs_resolve::Policy,
+    /// Where each document given up on is recorded (#1410); `None` records nothing, as a bench does.
+    pub store: Option<&'a dyn crate::store::HotStore>,
 }
 
 impl Default for DirectExtras<'_> {
@@ -3487,6 +3489,7 @@ impl Default for DirectExtras<'_> {
             gateways: &[],
             metrics: None,
             ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
+            store: None,
         }
     }
 }
@@ -3527,11 +3530,17 @@ impl DirectExtras<'_> {
                 self.metrics.unwrap_or(&unobserved),
             )
             .await;
-            if given_up > 0 {
+            if !given_up.is_empty() {
                 tracing::warn!(
-                    "seal-direct {from}..={to}: gave up on {given_up} ipfs document(s) after every \
-                     retry; they are absent from the sealed segment"
+                    "seal-direct {from}..={to}: gave up on {} ipfs document(s) after every retry; \
+                     they are absent from the sealed segment and listed at /ipfs/gave-up",
+                    given_up.len()
                 );
+                if let Some(store) = self.store {
+                    for record in &given_up {
+                        crate::ipfs_resolve::record_gave_up(store, record)?;
+                    }
+                }
             }
             rows.extend(docs);
         }
@@ -5338,6 +5347,7 @@ impl NestIngest {
                     gateways: &self.ipfs_gateways,
                     metrics: Some(&self.metrics),
                     ipfs_policy: self.seal_direct_policy(),
+                    store: Some(self.store.as_ref()),
                 };
                 let deadline = match (&self.ipfs_gate, extras.ipfs_policy.deadline) {
                     (None, _) => String::new(),
@@ -11798,6 +11808,7 @@ template = "pool"
                 gateways: &gateways,
                 metrics: None,
                 ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
+                store: None,
             },
             |_| Ok(()),
             |reached, _, _| {
@@ -11855,6 +11866,7 @@ template = "pool"
                 gateways: &gateways,
                 metrics: None,
                 ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
+                store: None,
             },
             |_| Ok(()),
             |_, _, _| {},
@@ -11926,7 +11938,7 @@ template = "pool"
             )
             .await;
             assert!(docs.is_empty(), "a document nothing proved is not a row");
-            assert_eq!(given_up, 1);
+            assert_eq!(given_up.len(), 1);
             assert_eq!(
                 metrics.ipfs_unverified(),
                 2,
@@ -12116,7 +12128,7 @@ template = "pool"
         )
         .await;
         assert!(docs.is_empty(), "neither document may become rows");
-        assert_eq!(given_up, 2);
+        assert_eq!(given_up.len(), 2);
         assert_eq!(
             metrics.ipfs_rows_refused(),
             2,
@@ -12301,9 +12313,176 @@ template = "pool"
             1,
             "the one document the pass named is given up on"
         );
+        let records = nest
+            .store
+            .meta_with_prefix(crate::ipfs_resolve::GAVE_UP_PREFIX, 10)
+            .unwrap();
+        assert_eq!(records.len(), 1, "one record for one document: {records:?}");
+        let record = crate::ipfs_resolve::GaveUp::parse(&records[0].0, &records[0].1).unwrap();
+        assert_eq!(
+            (
+                record.cid.as_str(),
+                record.block,
+                record.declaration.as_deref()
+            ),
+            (cid.as_str(), 4, Some("qos_payload")),
+            "the record names the document the sealed segment is missing (#1410)"
+        );
         drop(nest);
         drop(state);
         drop(silent);
+    }
+
+    /// A QoS document nest's registry, call registry and gate, as a seal-direct pass builds them.
+    fn qos_seal_direct_parts(
+        dir: &std::path::Path,
+    ) -> (
+        DecodeRegistry,
+        crate::calldata::CallRegistry,
+        Arc<crate::ipfs_resolve::Gate>,
+    ) {
+        let config = Config::load(dir).unwrap();
+        let registry = crate::registry::from_nest(dir, &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir, &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        (registry, creg, gate)
+    }
+
+    /// One attempt of 100 ms, so a gateway that never answers is given up on at once.
+    fn one_quick_attempt() -> crate::ipfs_resolve::Policy {
+        crate::ipfs_resolve::Policy {
+            attempts: 1,
+            first_timeout: std::time::Duration::from_millis(100),
+            ..crate::ipfs_resolve::Policy::seal_direct()
+        }
+    }
+
+    /// #1410: seal-direct refetches a window's tail and a restart redoes an unsealed window, so the same
+    /// document can be given up on twice. It is recorded once, and the first record stands.
+    #[tokio::test]
+    async fn a_document_seal_direct_gives_up_on_twice_is_recorded_once() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cid = crate::cid::cid_v0_for(b"never served");
+        let dir = qos_topic_nest("t");
+        let (_registry, creg, gate) = qos_seal_direct_parts(dir.path());
+        let source = PostSource(vec![(4, qos_post(&cid))]);
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        for listener in [&first, &second] {
+            let gateways = vec![format!("http://{}/ipfs/", listener.local_addr().unwrap())];
+            let extras = DirectExtras {
+                call_registry: Some(&creg),
+                ipfs: Some(&gate),
+                gateways: &gateways,
+                metrics: None,
+                ipfs_policy: one_quick_attempt(),
+                store: Some(&store as &dyn crate::store::HotStore),
+            };
+            let mut rows = Vec::new();
+            extras
+                .extend(&source, &[], &mut rows, 4, 4, true)
+                .await
+                .unwrap();
+        }
+        let records = store
+            .meta_with_prefix(crate::ipfs_resolve::GAVE_UP_PREFIX, 10)
+            .unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = crate::ipfs_resolve::GaveUp::parse(&records[0].0, &records[0].1).unwrap();
+        let first_gateway = first.local_addr().unwrap().to_string();
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains(&first_gateway)),
+            "the first give-up's record stands: {record:?}"
+        );
+    }
+
+    /// The Parquet files under a nest's segments, by path, with their bytes.
+    fn parquet_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![dir.join(crate::seal::SEGMENTS_DIR)];
+        while let Some(d) = pending.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|x| x == "parquet") {
+                    let name = path.strip_prefix(dir).unwrap().display().to_string();
+                    out.push((name, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// #1410: recording a give-up writes store meta and nothing else, so a seal-direct backfill seals the
+    /// same segments, byte for byte, with the record as without it.
+    #[tokio::test]
+    async fn recording_a_give_up_does_not_change_the_sealed_segments() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateways = vec![format!("http://{}/ipfs/", silent.local_addr().unwrap())];
+        let cid = crate::cid::cid_v0_for(b"never served");
+        let mut sealed = Vec::new();
+        let mut recorded = Vec::new();
+        for record in [false, true] {
+            let dir = qos_topic_nest("t");
+            let (registry, creg, gate) = qos_seal_direct_parts(dir.path());
+            let source = PostSource(vec![(4, qos_post(&cid))]);
+            let store_dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&store_dir.path().join(DB_FILE)).unwrap();
+            backfill_direct_pipelined_with(
+                &source,
+                &registry,
+                dir.path(),
+                &[],
+                &[],
+                &[],
+                None,
+                100,
+                0,
+                10,
+                1_000,
+                SPAN_REAL,
+                1,
+                DirectExtras {
+                    call_registry: Some(&creg),
+                    ipfs: Some(&gate),
+                    gateways: &gateways,
+                    metrics: None,
+                    ipfs_policy: one_quick_attempt(),
+                    store: record.then_some(&store as &dyn crate::store::HotStore),
+                },
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            sealed.push(parquet_files(dir.path()));
+            recorded.push(
+                store
+                    .count_meta_with_prefix(crate::ipfs_resolve::GAVE_UP_PREFIX)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(recorded, [0, 1], "premise: only the second pass records");
+        assert!(!sealed[0].is_empty(), "premise: the call row seals");
+        assert!(
+            sealed[0] == sealed[1],
+            "recording a give-up changed the sealed segments: {:?} vs {:?}",
+            sealed[0]
+                .iter()
+                .map(|(n, b)| (n, b.len()))
+                .collect::<Vec<_>>(),
+            sealed[1]
+                .iter()
+                .map(|(n, b)| (n, b.len()))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// A range waits for the documents it names, in the window's own seal and not only in the resolver,
@@ -12351,13 +12530,20 @@ template = "pool"
         assert_eq!(resolve_all(&mut resolver).await, 0);
         assert_eq!(metrics.ipfs_given_up(), 1);
         let plan = gate.plan_stored(&nest.store.entities_in_range(4, 4).unwrap());
+        let key = crate::ipfs_resolve::gave_up_key(&plan[&4].0[0]);
+        let record = nest
+            .store
+            .get_meta(&key)
+            .unwrap()
+            .and_then(|v| crate::ipfs_resolve::GaveUp::parse(&key, &v));
         assert_eq!(
-            nest.store
-                .get_meta(&crate::ipfs_resolve::gave_up_key(&plan[&4].0[0]))
-                .unwrap()
-                .as_deref(),
+            record.as_ref().map(|r| r.cid.as_str()),
             Some(cid.as_str()),
             "giving up must be recorded, or a restart would hold the range again"
+        );
+        assert!(
+            record.and_then(|r| r.error).is_some(),
+            "the resolver records why it gave up (#1410)"
         );
         assert_eq!(
             hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),

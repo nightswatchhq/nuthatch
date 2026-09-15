@@ -1006,7 +1006,10 @@ only once every document it names is fetched or given up on. A failed fetch is t
 timeout of 30, then 60, then 120 seconds, each retry a warn line and a count in
 `nuthatch_nest_ipfs_retries_total`. Under `--seal-direct` a document not fetched within
 `--ipfs-window-deadline` (default `300s`) is given up on, logged and counted as before. It is then
-absent from the sealed segment, and nothing fetches it again (#1410). That is the trade the flag sets:
+absent from the sealed segment, and nothing fetches it again yet (#1410 keeps that repair open). Every
+document either path gives up on is recorded under the store's `ipfs_gave_up:` meta keys with its CID,
+block, declaration, last error and time: `/ready` counts them as `ipfs_gave_up_documents`, and
+`/ipfs/gave-up?limit=100` lists them in block order. That is the trade the flag sets:
 raise it, or pass `0` to give up only once all ten attempts have failed, if you would rather a window
 wait than seal without a document. `/ready` reports the setting as
 `seal_direct_ipfs_window_deadline_secs`, `0` meaning none. A second `--ipfs` gateway is the remedy for a gateway

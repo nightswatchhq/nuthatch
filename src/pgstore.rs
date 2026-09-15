@@ -585,6 +585,32 @@ impl HotStore for PgStore {
         self.put_kv("meta", key, value)
     }
 
+    // `left(...) = $1` rather than `LIKE`: a prefix such as `ipfs_gave_up:` carries `_`, a wildcard there.
+    fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let sql = format!(
+            "SELECT key, value FROM \"{}\".meta WHERE left(key, char_length($1::text)) = $1::text \
+             ORDER BY key LIMIT $2",
+            self.schema
+        );
+        let (prefix, limit) = (prefix.to_string(), limit as i64);
+        self.conn.with(move |c| {
+            Ok(c.query(&sql, &[&prefix, &limit])?
+                .iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect())
+        })
+    }
+
+    fn count_meta_with_prefix(&self, prefix: &str) -> Result<u64> {
+        let sql = format!(
+            "SELECT count(*) FROM \"{}\".meta WHERE left(key, char_length($1::text)) = $1::text",
+            self.schema
+        );
+        let prefix = prefix.to_string();
+        self.conn
+            .with(move |c| Ok(c.query_one(&sql, &[&prefix])?.get::<_, i64>(0) as u64))
+    }
+
     fn indexed_head(&self) -> Result<Option<u64>> {
         let hot = self
             .get_meta("last_block")?

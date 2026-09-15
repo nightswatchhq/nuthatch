@@ -372,6 +372,7 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/subgraphs/name/{*name}", post(graph_graphql))
             .route("/table/{name}", get(table))
             .route("/entities", get(entities))
+            .route("/ipfs/gave-up", get(ipfs_gave_up))
             .route("/entity/{id}", get(entity))
             .route("/sql", get(sql))
             .route("/explain", get(explain))
@@ -1724,6 +1725,12 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         })),
         // How long a seal-direct window waits for one ipfs document, `0` for no limit. A document
         // given up on is absent from the sealed segment (#1410), so this is the operator's trade.
+        // #1410: documents given up on, by either path, and so absent from sealed history. Listed at
+        // `/ipfs/gave-up`.
+        "ipfs_gave_up_documents": s
+            .store
+            .count_meta_with_prefix(crate::ipfs_resolve::GAVE_UP_PREFIX)
+            .ok(),
         "seal_direct_ipfs_window_deadline_secs": if s.cursorless {
             serde_json::Value::Null
         } else {
@@ -1773,6 +1780,7 @@ fn summary_value(s: &AppState) -> Value {
             "/tables",
             "/table/{name}?limit=100",
             "/entities?limit=100",
+            "/ipfs/gave-up?limit=100",
             "/entity/{block:012}-{log_index:06}",
             "/sql?q=SELECT count(*) FROM \"<alias>__<event>\"",
             "/balances?limit=100",
@@ -2356,6 +2364,29 @@ async fn entities(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> 
                 .filter_map(|r| serde_json::from_str::<Value>(r).ok())
                 .collect();
             Json(json!({ "count": items.len(), "items": items })).into_response()
+        }
+        Err(e) => error(format!("{e:#}")),
+    }
+}
+
+/// Documents either resolving path gave up on, in block order (#1410). Each is absent from sealed history.
+async fn ipfs_gave_up(
+    State(s): State<AppState>,
+    Query(q): Query<EntitiesQuery>,
+) -> impl IntoResponse {
+    use crate::ipfs_resolve::{GaveUp, GAVE_UP_PREFIX};
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let read = s
+        .store
+        .meta_with_prefix(GAVE_UP_PREFIX, limit)
+        .and_then(|rows| Ok((s.store.count_meta_with_prefix(GAVE_UP_PREFIX)?, rows)));
+    match read {
+        Ok((total, rows)) => {
+            let items: Vec<GaveUp> = rows
+                .iter()
+                .filter_map(|(k, v)| GaveUp::parse(k, v))
+                .collect();
+            Json(json!({ "total": total, "count": items.len(), "items": items })).into_response()
         }
         Err(e) => error(format!("{e:#}")),
     }
@@ -4660,6 +4691,52 @@ mod tests {
             let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
             assert_eq!(json["seal_direct_concurrency"], want, "{name}: {json}");
         }
+    }
+
+    /// #1410: what either path gave up on is counted on `/ready` and listed at `/ipfs/gave-up` in block
+    /// order, including a record an earlier build wrote as the bare CID.
+    #[tokio::test]
+    async fn gave_up_documents_are_counted_on_ready_and_listed() {
+        use crate::ipfs_resolve::{record_gave_up, GaveUp};
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path(), 4);
+        let record = |block: u64| GaveUp {
+            cid: format!("Qm{block}"),
+            block,
+            slot: 0,
+            declaration: Some("qos_payload".into()),
+            error: Some("not fetched within the 300s a document is tried for".into()),
+            at: Some(1_757_900_000),
+        };
+        assert!(record_gave_up(st.store.as_ref(), &record(48_000_010)).unwrap());
+        assert!(record_gave_up(st.store.as_ref(), &record(48_000_004)).unwrap());
+        st.store
+            .set_meta("ipfs_gave_up:000048000020:1", "QmLegacy")
+            .unwrap();
+        let router = router(SharedNest::new(st));
+
+        let (_code, body) = get(router.clone(), "/ready").await;
+        let ready = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(ready["ipfs_gave_up_documents"], json!(3), "{ready}");
+
+        let (code, body) = get(router.clone(), "/ipfs/gave-up?limit=2").await;
+        assert_eq!(code, StatusCode::OK);
+        let page = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(
+            (page["total"].clone(), page["count"].clone()),
+            (json!(3), json!(2)),
+            "{page}"
+        );
+        assert_eq!(page["items"][0]["block"], json!(48_000_004), "{page}");
+        assert_eq!(page["items"][0]["declaration"], json!("qos_payload"));
+
+        let (_code, body) = get(router, "/ipfs/gave-up").await;
+        let all = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(
+            all["items"][2],
+            json!({"cid": "QmLegacy", "block": 48_000_020, "slot": 1, "declaration": null, "error": null, "at": null}),
+            "{all}"
+        );
     }
 
     /// #1399: `--ipfs-window-deadline` is on `/ready`, `0` for none and null before a nest records it.
@@ -7330,6 +7407,7 @@ mod tests {
             "/tables",
             "/schema",
             "/entities",
+            "/ipfs/gave-up",
             "/sql?q=SELECT%201",
         ] {
             let res = router(SharedNest::new(state.clone()))
