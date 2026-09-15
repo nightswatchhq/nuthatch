@@ -2646,19 +2646,23 @@ mod tests {
     async fn per_item_error_server(
         err_json: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        per_item_error_server_with_pause(err_json, std::time::Duration::ZERO).await
+        per_item_error_server_holding(err_json, None).await
     }
 
-    /// `pause` holds each response so a `try_join!` sibling can get its request out before the
-    /// winner's descent completes and cancels it. Zero for tests that only fire one request.
+    /// `hold_width` holds a request of that many items until a second one of the same width has
+    /// arrived, or `PEER_WAIT` passes, so a `try_join!` winner cannot finish its descent before its
+    /// sibling's request is counted. A sequential descent never sends the sibling while the first is
+    /// held, so it still reads as sequential. `None` for tests that only fire one request.
     #[cfg(test)]
-    async fn per_item_error_server_with_pause(
+    async fn per_item_error_server_holding(
         err_json: &'static str,
-        pause: std::time::Duration,
+        hold_width: Option<usize>,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const PEER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
         let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let held = std::sync::Arc::new(AtomicUsize::new(0));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let counter = seen.clone();
@@ -2668,6 +2672,7 @@ mod tests {
                     return;
                 };
                 let counter = counter.clone();
+                let held = held.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 1 << 20];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
@@ -2677,8 +2682,12 @@ mod tests {
                         return;
                     }
                     counter.fetch_add(1, Ordering::SeqCst);
-                    if !pause.is_zero() {
-                        tokio::time::sleep(pause).await;
+                    if hold_width == Some(items) {
+                        held.fetch_add(1, Ordering::SeqCst);
+                        let entered = std::time::Instant::now();
+                        while held.load(Ordering::SeqCst) < 2 && entered.elapsed() < PEER_WAIT {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
                     }
                     let it: Vec<String> = (0..items)
                         .map(|i| format!(r#"{{"jsonrpc":"2.0","id":{i},"error":{err_json}}}"#))
@@ -2751,9 +2760,9 @@ mod tests {
         use super::RpcClient;
         use std::sync::atomic::Ordering;
 
-        let (url, seen) = per_item_error_server_with_pause(
+        let (url, seen) = per_item_error_server_holding(
             r#"{"code":-32602,"message":"query returned more than 10000 results"}"#,
-            std::time::Duration::from_millis(20),
+            Some(4),
         )
         .await;
         let c = RpcClient::new(vec![url]).unwrap();
@@ -2785,10 +2794,10 @@ mod tests {
         // count at all: `fmt · clippy · test` is a required context, so it reddens `main` at random.
         //
         // **The floor is 5, not 4 (#738).** 4 is the sequential count: width-8 plus the winning
-        // half's 4 → 2 → 1 descent without the sibling ever being polled. `try_join!` polls both
-        // futures, but under a loaded test runtime the winner's whole 4 → 2 → 1 can finish before
-        // the sibling's first request leaves the socket (#1283). The mock pauses 20 ms per response
-        // so that cannot happen here; without the pause, 4 showed up in a full parallel suite.
+        // half's 4 → 2 → 1 descent without the sibling ever being polled. Under a loaded test
+        // runtime the winner's whole descent can finish before the sibling's request reaches the
+        // server; a 20 ms pause per response narrowed that race and still lost it under full-suite
+        // load (#1283). So the mock holds each width-4 request until its sibling has arrived.
         // The ceiling is what the note on `batch_is_narrowable` gets wrong: a per-item
         // failure is an HTTP 200, so the retry loop breaks on its first attempt and each level costs
         // **one** request, not `TIMESTAMP_ATTEMPTS`. Were that wrong, the count would be a multiple
