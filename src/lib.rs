@@ -35,6 +35,7 @@ pub mod counter;
 pub mod distribution;
 pub mod doctor;
 pub mod dune_emit;
+pub mod dune_views;
 pub mod effectful;
 pub mod entities;
 pub mod entity_bind;

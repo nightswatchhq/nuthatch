@@ -86,7 +86,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:3.8.0
+  ghcr.io/nightswatchhq/nuthatch:3.8.2
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -123,7 +123,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:3.8.0-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:3.8.2-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -930,7 +930,8 @@ per-nest series below.
 | `nuthatch_seal_direct_fetched` vs `nuthatch_seal_direct_completed` | the seal-direct pass's fetch position against its durable watermark (#1169). A restart resumes from `completed`; the gap is the work it redoes, which on a sparse range can be tens of millions of blocks |
 | `nuthatch_alert_outbox_depth` | webhook/alert delivery backlog |
 
-Per-nest series, labelled `{nest="…"}` - the ones that make co-tenancy operable:
+Per-nest series, labelled `{nest="…"}` with the nest's route in a runtime (its alias, or `tenant/alias`)
+and its name in a single-nest `dev` (#1415) - the ones that make co-tenancy operable:
 `nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
 `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`,

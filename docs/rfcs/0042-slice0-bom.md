@@ -111,9 +111,9 @@ ABI floor on one target and change nothing a user can observe on the other. Wort
 
 The deletion checklist. §9 named four roles; walking the call sites finds six. Two were originally
 classified **product-visible**; slice 3 found that to be **one** - see the correction below the table.
-One test-only site has been added since (`port_emit.rs`, 2026-09-08), so the table now lists seven;
-the six in the heading is what slice 0 found, kept because that is the number the rest of this
-document reasons about.
+Two sites have been added since, `port_emit.rs` (test-only, 2026-09-08) and `dune_views.rs`
+(production, 2026-09-15), so the table now lists eight; the six in the heading is what slice 0 found,
+kept because that is the number the rest of this document reasons about.
 
 | site | role | classification | notes |
 | --- | --- | --- | --- |
@@ -123,6 +123,7 @@ document reasons about.
 | `graft.rs` | engine string in the derivation reuse key (`engine: "duckdb-v1.4.0"`) | **latent** - see correction below | **not** production: nothing calls it and nothing is written to disk |
 | `seal.rs` | segment-binding oracle | test-only | one in-memory connection in a fixture |
 | `port_emit.rs` | emitted-check oracle | test-only | added 2026-09-08 (#1211). Two in-memory connections in `#[cfg(test)]`, proving the generated `checks/port_views.sql` binds and answers the same on an empty and a populated nest. Nothing in the authoring path reaches the engine |
+| `dune_views.rs` | AST of authored views, for exact DuneSQL translation | production | added 2026-09-15 (#1359, RFC-0055 S3). One in-memory connection per `nuthatch emit dune` run, used only for `json_serialize_sql`. The parser is the role, not a convenience: a translation is exact when it means what DuckDB means by the view, so a replacement engine would need its own AST, and views would be written in its dialect |
 | `authored_entity_spike.rs` | RFC-0041 slice-zero spike | **production, measurement-only** | `pub mod` in `lib.rs`, reachable via `nuthatch bench`. A naive read files this as test-only; it ships |
 
 The function vocabulary is what makes "remove DuckDB" more than an implementation change: it decides
@@ -177,6 +178,7 @@ Amp onto the four roles §9 knew about; slice 0 found six. Extending the mapping
 | engine string in grafting identity (`graft.rs`) | **no.** Amp has no entity state to graft |
 | segment-binding oracle (`seal.rs`) | test-only; replaceable by anything that parses Parquet |
 | RFC-0041 spike (`authored_entity_spike.rs`) | measurement-only; follows whatever the reference becomes |
+| AST of authored views for DuneSQL (`dune_views.rs`) | **no.** Views are authored in DuckDB's dialect; a port changes the dialect being translated, and the translator with it |
 
 RFC-0043 §5's summary was **one of four roles, partially**. Against slice 0's fuller inventory it is
 **one of six, partially, plus one that is only test-only anyway**. The honest size did not improve on

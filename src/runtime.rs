@@ -1285,30 +1285,35 @@ pub fn spawn_publishers(
     let mut out = Vec::new();
     for m in mounts {
         if let Some(publish) = &m.publish {
-            out.push(spawn_publisher(dir, m, publish, multi_tenant)?);
+            // The first mount of a dataset is the one its cursor indexes under, as `Dataset::canonical`.
+            let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
+            let cursor_key = mount_route(canonical, multi_tenant);
+            out.push(spawn_publisher(dir, m, publish, multi_tenant, &cursor_key)?);
         }
     }
     Ok(out)
 }
 
+fn mount_route(m: &Mount, multi_tenant: bool) -> String {
+    MountRef {
+        tenant: m.tenant.clone(),
+        alias: m.alias.clone(),
+    }
+    .route_key(multi_tenant)
+}
+
+/// Reports under `cursor_key`, where the dataset's cursor records `sealed_through`, so publish lag compares
+/// the two.
 fn spawn_publisher(
     dir: &Path,
     m: &Mount,
     publish: &MountPublish,
     multi_tenant: bool,
+    cursor_key: &str,
 ) -> Result<(String, crate::publish::Publisher)> {
-    let key = MountRef {
-        tenant: m.tenant.clone(),
-        alias: m.alias.clone(),
-    }
-    .route_key(multi_tenant);
+    let key = mount_route(m, multi_tenant);
     let dataset = MountTable::data_dir(dir, &m.nid);
-    // Reported under the dataset's own name, which is where its cursor records `sealed_through`.
-    let nest = Config::load(&dataset)
-        .with_context(|| format!("loading mount '{key}' to publish it"))?
-        .nest
-        .name;
-    let publisher = crate::publish::spawn(dataset, nest, publish.settings()?)
+    let publisher = crate::publish::spawn(dataset, cursor_key.to_string(), publish.settings()?)
         .with_context(|| format!("publishing mount '{key}'"))?;
     Ok((key, publisher))
 }
@@ -1733,12 +1738,6 @@ pub async fn dev(
         let concurrency =
             indexer::backfill_concurrency_for(rpc_urls.len(), concurrency, seal_direct, &names);
         endpoint_counts.insert(group.endpoint.chain.clone(), rpc_urls.len());
-        // `/ready` reads a runtime nest's metrics by route, and `build_nest` records by the nest's name.
-        for name in &names {
-            crate::metrics::METRICS
-                .nest(name)
-                .set_ipfs_window_deadline(ipfs_window_deadline);
-        }
 
         // Per-cursor footprint budget (RFC-0021): this chain's nests must fit ≤ max_rss.
         let mut cursor_mb = 0u64;
@@ -2449,9 +2448,7 @@ impl RuntimeHandles {
             self.mount_ctx.seal_direct,
             &[name],
         );
-        crate::metrics::METRICS
-            .nest(name)
-            .set_ipfs_window_deadline(config.ipfs_window_deadline);
+        config.route = Some(name.to_string());
 
         // Phase 1: build and catch up, off to one side of the cursor.
         let (nest, mut state, worker, next) = indexer::build_and_prepare_nest(
@@ -2509,7 +2506,13 @@ impl RuntimeHandles {
             .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
         {
             if let (Some(publish), Some(_)) = (&record.publish, &nid) {
-                match spawn_publisher(&self.mount_ctx.dir, record, publish, self.multi_tenant) {
+                match spawn_publisher(
+                    &self.mount_ctx.dir,
+                    record,
+                    publish,
+                    self.multi_tenant,
+                    name,
+                ) {
                     Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
                     Err(e) => {
                         tracing::error!("mounted '{name}' but its mirror did not start: {e:#}")
@@ -2778,7 +2781,8 @@ mod tests {
         let mut quiet = table.mounts[0].clone();
         quiet.alias = "quiet".into();
         quiet.publish = None;
-        table.mounts.push(quiet);
+        // First, so `quiet` is the route the dataset's cursor records under (#1415).
+        table.mounts.insert(0, quiet);
 
         let publishers = spawn_publishers(root.path(), &table.mounts, false).unwrap();
         let keys: Vec<&str> = publishers.iter().map(|(k, _)| k.as_str()).collect();
@@ -2805,6 +2809,15 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        assert_eq!(
+            crate::metrics::METRICS
+                .nest_if_known("quiet")
+                .and_then(|m| m.publish_target())
+                .as_deref(),
+            mirror.path().to_str(),
+            "publish lag is measured where the cursor records sealed_through, under the dataset's first \
+             route rather than the nest's name (#1415)"
+        );
     }
 
     /// Write a minimal mounts.toml + one nest dir on the given chain.

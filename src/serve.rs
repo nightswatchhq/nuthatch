@@ -1797,11 +1797,12 @@ fn summary_value(s: &AppState) -> Value {
 
 /// The admin row for a nest that mirrors itself (RFC-0052 §3.8), `null` for one that does not.
 fn publish_summary(s: &AppState) -> Value {
-    // The publisher reports under the nest's configured name, which `nest_info` carries.
-    let Some(m) = s.nest_info["name"]
-        .as_str()
-        .and_then(|name| crate::metrics::METRICS.nest_if_known(name))
-    else {
+    // The publisher reports where the cursor does: the route in a runtime (#1415), else the nest's name.
+    let key = match &s.runtime_health {
+        Some((route, _)) => Some(route.as_str()),
+        None => s.nest_info["name"].as_str(),
+    };
+    let Some(m) = key.and_then(|k| crate::metrics::METRICS.nest_if_known(k)) else {
         return Value::Null;
     };
     let Some(target) = m.publish_target() else {

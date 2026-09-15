@@ -59,3 +59,6 @@ description = "Result of totalSupply()."
 
 [table.total_supply.footguns]
 bools = ["reverted"]
+
+[view.top_holders]
+description = "The ten largest holders of vault shares."

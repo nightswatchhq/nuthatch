@@ -341,6 +341,156 @@ async fn a_hot_mount_is_held_to_the_single_endpoint_concurrency_cap() {
     }
 }
 
+/// A one-nest runtime whose route differs from the nest's own name, as an alias or a `tenant/alias`
+/// route does, backfilled with `--seal-direct` over a tape it can seal part of.
+async fn route_named_runtime(
+    nest_dir: &std::path::Path,
+    route: &str,
+) -> (runtime::RuntimeHandles, Arc<TapeSource>) {
+    let tape = Arc::new(TapeSource::new());
+    let (a1, a2) = (account(1), account(2));
+    for b in 1..=6u64 {
+        tape.insert_block(
+            b,
+            transfers_block(
+                b,
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
+            ),
+        );
+    }
+    tape.advance_tip_to(6);
+    tape.advance_finalized_to(4);
+
+    let cfg = scaffold_nest(nest_dir, &format!("{route}-nest"), USDC);
+    let health = Arc::new(RuntimeHealth::new());
+    health.register(route, "arbitrum-one");
+    // `runtime::dev` records the concurrency before it spawns the cursor; this harness spawns directly.
+    indexer::backfill_concurrency_for(1, 1, true, &[route]);
+    let cursor = indexer::spawn_runtime(
+        tape.clone(),
+        vec![(route.to_string(), nest_dir.to_path_buf(), cfg)],
+        Some(6),
+        true,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+    let indexed = wait_until(std::time::Duration::from_secs(30), || {
+        let store = &cursor.states[0].1.store;
+        store.get_meta("last_block").ok().flatten().as_deref() == Some("6")
+            && store.sealed_through() >= 4
+    })
+    .await;
+    assert!(
+        indexed,
+        "premise: the runtime indexed to 6 and sealed through 4"
+    );
+
+    let roster = serde_json::json!({"mounts": "test", "nests": [{"name": route}]});
+    let live = serve::LiveRuntime::new(serve::compose_runtime(
+        roster.clone(),
+        cursor.states.clone(),
+        health.clone(),
+    ));
+    let handles = runtime::RuntimeHandles {
+        live,
+        states: cursor.states,
+        alert_workers: cursor.alert_workers,
+        publishers: Vec::new(),
+        lifecycle: std::collections::HashMap::from([(
+            "arbitrum-one".to_string(),
+            cursor.lifecycle.clone(),
+        )]),
+        health,
+        roster,
+        estimates: std::collections::HashMap::from([(route.to_string(), 90)]),
+        multi_tenant: false,
+        mount_ctx: runtime::MountContext {
+            dir: nest_dir.to_path_buf(),
+            mounts: Vec::new(),
+            sources: std::collections::HashMap::from([(
+                "arbitrum-one".to_string(),
+                tape.clone() as Arc<dyn nuthatch::source::Source>,
+            )]),
+            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
+            backfill: None,
+            seal_direct: true,
+            concurrency: 1,
+            ipfs_window_deadline: nuthatch::ipfs_resolve::WINDOW_DEADLINE,
+            window_override: Some(2),
+            admin_enabled: false,
+            admin_token: None,
+            max_rss_mb: 2048,
+            freshness: Default::default(),
+        },
+    };
+    std::mem::forget(cursor.ingest);
+    (handles, tape)
+}
+
+/// #1415: a runtime nest's metrics were recorded under its own name while `/ready`, the
+/// `nuthatch_nest_*` labels, health and unmount all address it by route, so a route that differs from
+/// the name read zeros and nulls, and an unmount left its cursor running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nest_whose_route_differs_from_its_name_is_measured_and_unmounted_by_route() {
+    let nest_dir = tempfile::tempdir().unwrap();
+    let route = "usdc-route";
+    let (mut handles, _tape) = route_named_runtime(nest_dir.path(), route).await;
+
+    let ready = body_json(&handles.live, &format!("/{route}/ready")).await;
+    let nulls: Vec<&String> = ready
+        .as_object()
+        .expect("/ready is an object")
+        .iter()
+        .filter(|(_, v)| v.is_null())
+        .map(|(k, _)| k)
+        .collect();
+    assert!(nulls.is_empty(), "null on /ready: {nulls:?} in {ready}");
+    for (field, want) in [
+        ("tip", 6),
+        ("last_block", 6),
+        ("sealed_through", 4),
+        ("seal_direct_completed", 4),
+        ("seal_direct_target", 4),
+        ("seal_direct_fetched", 4),
+        ("seal_direct_ipfs_window_deadline_secs", 300),
+        ("ipfs_gave_up_documents", 0),
+    ] {
+        assert_eq!(ready[field], serde_json::json!(want), "{field}: {ready}");
+    }
+    assert!(
+        ready["fetch_window_blocks"].as_u64().is_some_and(|w| w > 0),
+        "{ready}"
+    );
+
+    let series = nuthatch::metrics::METRICS.render();
+    for line in [
+        format!("nuthatch_nest_last_block{{nest=\"{route}\"}} 6"),
+        format!("nuthatch_nest_sealed_through{{nest=\"{route}\"}} 4"),
+        format!("nuthatch_nest_seal_direct_completed{{nest=\"{route}\"}} 4"),
+        format!("nuthatch_nest_ipfs_given_up_total{{nest=\"{route}\"}} 0"),
+        format!("nuthatch_nest_ipfs_retries_total{{nest=\"{route}\"}} 0"),
+    ] {
+        assert!(series.contains(&line), "missing `{line}`");
+    }
+    assert!(
+        !series.contains(&format!("nest=\"{route}-nest\"")),
+        "a series is still labelled by the nest's own name"
+    );
+
+    handles.unmount(route).await.expect("unmount");
+    Store::open(&nest_dir.path().join("nuthatch.redb"))
+        .expect("unmounting the route must release its cursor's store");
+}
+
 /// RFC-0027 §5: a lifecycle change must survive a restart.
 ///
 /// `mounts.toml` is the embedded stand-in for a control-plane DB - desired state lives in the same file
