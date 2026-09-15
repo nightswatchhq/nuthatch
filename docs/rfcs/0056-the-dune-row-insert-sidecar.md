@@ -29,8 +29,9 @@ each catalogued segment not yet loaded from Parquet to NDJSON, and appends it to
 nuthatch table in the operator's namespace, named exactly as `nuthatch emit dune` already reads them. A
 cursor file keyed by segment content hash records what landed. Every row carries its segment and its
 row ordinal, so a duplicate is always detectable, and a request whose outcome is unknown blocks its
-table until an explicit reconcile has counted it in Dune. It runs only when an operator invokes it with
-a key. It is not part of `dev` or `serve`, and it has no configuration key.
+table until an explicit reconcile has checked it against Dune, whether the request was an insert or a
+create. It runs only when an operator invokes it with a key. It is not part of `dev` or `serve`, and it
+has no configuration key.
 
 Worked through on a real nest (§5), the per-request credit minimum makes batching the whole credit
 question for a backfill, and Dune's storage caps, not credits, are what bound a nest with real history.
@@ -59,7 +60,7 @@ for publishing to a bucket, each of which carries over.
   records the test suite passing with the module deleted.
 
 Two neighbouring rules hold as well. **Non-negotiable 4:** nothing read back from Dune enters stored
-state. The one read, reconcile's row count (§4.6), goes into the sidecar's own cursor file and nowhere
+state. Reconcile's reads, a table listing and row counts (§4.6), go into the sidecar's own cursor file and nowhere
 else. **RFC-0045 §3:** nothing is fetched from Dune into a nest. The direction is one way.
 
 ## §1 - What is already true
@@ -100,8 +101,12 @@ HTTP client with rustls and streamed bodies (`reqwest`).
 **What Dune documents about its upload route** (keys refer to §11):
 
 - `POST /v1/uploads` creates a table from `namespace`, `table_name`, `schema` (a list of `name`, `type`
-  and `nullable`, which defaults to true), and optional `description` and `is_private`. It fails if the
-  table exists, and costs 10 credits [U1].
+  and `nullable`, which defaults to true), and optional `description` and `is_private`. The page says a
+  create for a name that exists fails, and it also lists an `already_existed` field in the response. It
+  costs 10 credits [U1].
+- `GET /v1/uploads` lists the uploaded tables a key can see, paged, with a `Read` key. Each entry
+  carries `full_name`, `is_private`, `table_size_bytes` and `columns`, each column with its name, type
+  and nullability [U7].
 - "Column names in the table can't start with a special character or a digit." [U1]
 - The create page's examples use two column types, `timestamp` and `double`. No page read lists the
   accepted types, and the published OpenAPI specification defines no `/v1/uploads` path [U1, O1]. The
@@ -216,9 +221,10 @@ access to the nest's directory, and can load any dataset its operator can read.
   to the emitter.
 - **The table description** records the dataset's `data_identity` and `schema_sha256`, so a table's
   origin can be read in Dune without the cursor.
-- **Creation.** The sidecar creates a table only when its cursor has no entry for it. A create that fails
-  because the table exists refuses, naming the table, rather than adopting a table the sidecar cannot
-  prove it wrote.
+- **Creation.** The sidecar creates a table only when its cursor has no entry for it. A create is a
+  request whose outcome can be unknown, so it follows the same rule as an insert (§4.6). A table the
+  cursor did not record is adopted only when it matches a recorded create intent exactly and holds no
+  rows; anything else refuses, naming the table.
 
 ### 4.3 - The row
 
@@ -261,7 +267,10 @@ where authored files feed the NID, and it is never kept in Dune. It holds:
 
 - the `namespace`, the dataset's `data_identity` and `schema_sha256`, the visibility chosen, and the
   `--from-block` value, if one was given;
-- per table: the uploaded column names and types, and the set of **segment hashes** loaded;
+- per table, once its create is confirmed: the uploaded column names, types and nullability, and the set
+  of **segment hashes** loaded;
+- per table: at most one **create intent**, holding the table name, the column names, types and
+  nullability, the visibility, and the time it was sent;
 - per table: at most one **in-flight batch**, with its segment hashes and the time it was sent.
 
 The cursor is keyed by segment content hash, never by block number, because the catalogue appends in seal
@@ -275,7 +284,7 @@ refuses.
 The cursor is replaced atomically, by writing a temporary file and renaming it over the old one, and it is
 flushed before any request that depends on it.
 
-### 4.6 - The dedup key, and the request whose outcome is unknown
+### 4.6 - The dedup key, and every request whose outcome can be unknown
 
 **The dedup key is `(nuthatch_segment, nuthatch_row)`.** `nuthatch_segment` is the first 16 hex
 characters of the segment's hash, and `nuthatch_row` is the row's 0-based position in its Parquet file.
@@ -295,7 +304,7 @@ and the upsert endpoint that might provide it is undocumented (§10). The protoc
    the response.
 5. On a timeout, a reset connection or a crash, the outcome is unknown, and the in-flight record stays.
 
-**A table with an in-flight record refuses to sync.** It is resolved only by `publish dune reconcile`,
+**A table with an in-flight batch refuses to sync.** It is resolved only by `publish dune reconcile`,
 which is an explicit command because it spends query credits. It sends one query through
 `POST /v1/sql/execute` [E1]:
 `SELECT nuthatch_segment, count(*) FROM dune.<namespace>.<table> WHERE nuthatch_segment IN (...) GROUP BY 1`.
@@ -309,6 +318,46 @@ that measurement.
 
 `publish dune verify` runs the same count over every loaded segment and compares each count with the
 catalogue. It is the remote twin of `nuthatch publish verify`, and it is the check S4 records.
+
+**A create has the same gap, and gets the same rule.** If `POST /v1/uploads` creates the table and the
+process dies before the cursor records it, the next run has no entry for the table, and its create meets
+a table the sidecar did write but cannot prove it wrote. The protocol:
+
+1. Record a create intent in the cursor, holding the table name, the column names, types and
+   nullability, and the visibility, and flush.
+2. Send the create.
+3. On `200` with `already_existed` absent or false, record the table as created with those columns, and
+   clear the intent.
+4. On `200` with `already_existed` true, on a response saying the table exists, on a timeout, on a reset
+   connection or on a crash, the outcome is unknown, and the intent stays. The create page both says a
+   duplicate name fails and lists `already_existed` [U1], so neither answer is trusted to mean the
+   sidecar made the table.
+5. On any other status, nothing was created. Clear the intent, and fail the run with the response.
+
+**A table with a create intent refuses to sync**, and `publish dune reconcile` resolves it. It lists the
+namespace's uploaded tables through `GET /v1/uploads` [U7], reading every page.
+
+- **Not listed.** Once the intent is older than `--settle`, reconcile clears it, and the next `sync`
+  creates the table again. An absence younger than `--settle` is not trusted, because how soon a created
+  table appears in the list is not documented (§10). If the listing was only late, the second create meets
+  the existing table and records a new intent, so the cycle can repeat, but it never adopts a table it has
+  not checked.
+- **Listed.** Reconcile compares the table with the intent: the same set of column names, compared
+  case-insensitively as Trino compares identifiers; for each, the type S0 records the list reporting for
+  the type the sidecar sent, and the same nullability; and the same `is_private`. On an exact match it
+  counts the table's rows through `POST /v1/sql/execute` and adopts the table only if the count is zero,
+  recording it as created and clearing the intent. Any difference, or any row, refuses, naming the table
+  and the first difference found.
+
+Adopting an empty table with exactly the intended columns and visibility is safe whoever created it,
+because loading into it produces the same table a confirmed create would have. A table with rows was not
+written through this cursor, because no insert is sent before a create is confirmed.
+
+**Reads leave nothing to reconcile.** The only other requests the sidecar sends are `GET /v1/uploads` and
+counts through `POST /v1/sql/execute`, from `reconcile` and `verify`. Neither changes data in Dune, and
+the cursor changes only after a complete result has been read, so a lost read costs its credits and
+nothing else, and running the command again repeats it. The sidecar sends no clear, delete or upsert;
+those stay with the operator (§7).
 
 ### 4.7 - Column drift and schema change
 
@@ -350,10 +399,10 @@ The subcommands of `dune`, under `nuthatch publish`:
 
 | command | network | does |
 | --- | --- | --- |
-| `publish dune status` | none beyond reading the dataset | per table: segments loaded, pending and in flight; pending bytes; the estimated credits of a sync |
-| `publish dune sync` | Dune, with a key | creates missing tables, loads pending segments in batches, and refuses tables with an in-flight record |
+| `publish dune status` | none beyond reading the dataset | per table: whether its create is confirmed or only intended; segments loaded, pending and in flight; pending bytes; the estimated credits of a sync |
+| `publish dune sync` | Dune, with a key | creates missing tables, loads pending segments in batches, and refuses tables with a create intent or an in-flight batch |
 | `publish dune sync --dry-run --out <dir>` | none beyond reading the dataset | writes each batch it would send as an NDJSON file and each create request as JSON, and changes no cursor |
-| `publish dune reconcile` | Dune, spends query credits | resolves in-flight records (§4.6) |
+| `publish dune reconcile` | Dune, lists tables and spends query credits | resolves create intents and in-flight batches (§4.6) |
 | `publish dune verify` | Dune, spends query credits | counts every loaded segment in Dune against the catalogue |
 
 Every command takes `--dataset`, `--namespace` and `--state`. The exit status is non-zero if any table
@@ -421,13 +470,15 @@ this RFC.
 
 ## §6 - Correctness argument
 
-The invariant, for each selected table after a `sync` that exits zero and leaves no in-flight record: the
-rows of `dune.<namespace>.<table>` are exactly the rows of the catalogued segments whose `to_block` is at
+The invariant, for each selected table after a `sync` that exits zero and leaves no create intent and no
+in-flight batch: the rows of `dune.<namespace>.<table>` are exactly the rows of the catalogued segments whose `to_block` is at
 or above the cursor's `--from-block`, each row once, with every value's text unchanged.
 
 - **Each row once.** A segment enters the loaded set only on a `200`, which means all its rows are in
   Dune [U2], and a segment in the loaded set is never sent again. A request whose outcome is unknown
   blocks its table until a count proves which way it went (§4.6).
+- **No row predates the cursor.** A table enters the cursor only on a confirmed create, or when
+  reconcile finds it listed with exactly the intended columns and visibility and no rows (§4.6).
 - **Nothing skipped.** The cursor is keyed by hash, so a segment appended late for an earlier range is
   pending like any other (§4.5). The source is the published catalogue, which never removes an entry
   (RFC-0052 §3.2).
@@ -442,8 +493,10 @@ or above the cursor's `--from-block`, each row once, with every value's text unc
 
 - A dataset whose `publish.json` never matches its manifest, or whose `data_identity`, `schema_sha256` or
   `--from-block` differs from the cursor's.
-- A table with an in-flight record, until `reconcile`.
-- A table that exists in Dune but not in the cursor.
+- A table with a create intent or an in-flight batch, until `reconcile`.
+- A table that exists in Dune but not in the cursor, unless `reconcile` finds it listed with exactly the
+  columns and visibility of a recorded create intent, and no rows.
+- A listed table that differs from its create intent, naming the table and the first difference.
 - A segment column that `schema.json` does not declare, other than `table` and `_seq`, and a row whose
   `table` value is not its table.
 - An added or mapped column name that collides with a declared one: `nuthatch_segment`, `nuthatch_row`,
@@ -454,7 +507,9 @@ or above the cursor's `--from-block`, each row once, with every value's text unc
 - A missing `DUNE_API_KEY`, for any command that talks to Dune.
 
 There is no repair command. An operator who needs a table rebuilt clears it [U3] and removes the table's
-entry from the cursor, both of which are deliberate acts.
+entry from the cursor, both of which are deliberate acts. The next `sync` meets the existing table on
+create and keeps its intent, and `reconcile` adopts the cleared table, because it is empty and has exactly
+the intended columns.
 
 ## §8 - Alternatives rejected
 
@@ -481,9 +536,9 @@ entry from the cursor, both of which are deliberate acts.
 
 | slice | delivers | fails if |
 | --- | --- | --- |
-| S0 - verify | One recorded run on a real account against a scratch table, with no nest data: a create with `varchar`, `bigint`, `double` and a column named `_x`; a table name containing `__`; an NDJSON insert with an explicit `null` and one that omits a nullable column; the delay before an inserted row is visible, measured by polling a count through `POST /v1/sql/execute`; the credits charged per request, from the account's usage; `is_private: true` on the account's plan; and a delete. Recorded on the issue, with the key never shown | `varchar` is refused, an explicit `null` is refused for a nullable column, or a table name with `__` is refused. Any of those sends §4.2 or §4.3 back for redesign before S1 |
+| S0 - verify | One recorded run on a real account against a scratch table, with no nest data: a create with `varchar`, `bigint`, `double` and a column named `_x`; a table name containing `__`; an NDJSON insert with an explicit `null` and one that omits a nullable column; the delay before an inserted row is visible, measured by polling a count through `POST /v1/sql/execute`; the credits charged per request, from the account's usage; `is_private: true` on the account's plan; a second create of the same name, recording whether it fails or answers `200` with `already_existed`; how `GET /v1/uploads` reports the new table's column names, types and nullability, and how soon it is listed; and a delete. Recorded on the issue, with the key never shown | `varchar` is refused, an explicit `null` is refused for a nullable column, a table name with `__` is refused, or `GET /v1/uploads` does not report a created table's columns. Any of those sends §4.2, §4.3 or §4.6 back for redesign before S1 |
 | S1 - the offline core | The module, `publish dune status` and `publish dune sync --dry-run`: the reader, the transcode, batching, the cursor, the name mapping shared with `emit dune`, and every §7 refusal that needs no network. A golden NDJSON test over the RFC-0055 fixture nest published to a directory. The structural gate of §3, and one recorded run of the suite with the module deleted | the golden bytes change between two runs; a segment appended later for an earlier range is not pending; a segment that lacks a column does not emit `null` for it; a run with no `DUNE_API_KEY` opens a socket; peak RSS passes 256 MiB during a dry run over the §5 nest; or any test outside the module fails with the module deleted |
-| S2 - the network half | `sync`, `reconcile` and `verify` against a mock Dune server in tests, in the style of the mock servers in `src/rpc.rs` | a failure injected after a request is sent and before the cursor records it lets a later `sync` send that segment again without `reconcile`; `reconcile` marks a segment loaded on any count other than its catalogue rows; or `reconcile` trusts a zero younger than `--settle` |
+| S2 - the network half | `sync`, `reconcile` and `verify` against a mock Dune server in tests that answers create, insert, list and count, in the style of the mock servers in `src/rpc.rs` | a failure injected after an insert is sent and before the cursor records it lets a later `sync` send that segment again without `reconcile`; `reconcile` marks a segment loaded on any count other than its catalogue rows; `reconcile` trusts a zero younger than `--settle`; a failure injected between a create's response and the cursor write leaves the table unrecoverable, so that `reconcile` does not adopt the empty, exactly matching table and a later `sync` cannot load it; `reconcile` adopts a listed table whose columns, types, nullability or visibility differ from the intent, or that holds a row; or `reconcile` clears a create intent on an absence younger than `--settle` |
 | S3 - emitter alignment | Only if S0 records a leading underscore as refused: `nuthatch emit dune` reads mapped names through the shared function, with its golden output updated | a column name the sidecar would upload differs from the name the emitted query reads, checked across every fixture column. If S0 records the underscore as accepted, S3 closes citing S0 |
 | S4 - the recorded run | A real public nest loaded into a real account with `sync`, then checked with `verify`, with the credits charged and `bytes_written` recorded against §5's estimate. This unblocks RFC-0055 S4 (#1360) | `verify` finds a segment whose Dune count differs from its catalogue rows; a table is listed as loaded that `verify` did not check; or the recorded credits differ from the estimate by more than a factor of two and §5 is not amended in the same change |
 
@@ -513,6 +568,12 @@ Each item is unsupported until a recorded run answers it. None is assumed.
     request at a time.
 11. **The rate-limit category and cost of Execute SQL** for a grouped count [E1, R1]. S0 records the cost
     of one.
+12. **A create for a name that exists.** The create page says it fails, and also lists an
+    `already_existed` response field [U1]. §4.6 trusts neither answer as proof the sidecar made the table.
+    S0 records which happens.
+13. **How `GET /v1/uploads` reports a table**: whether column names keep their case, how each type is
+    spelled against the type that was sent, and how soon a created table is listed [U7]. §4.6 compares
+    through what S0 records, and waits `--settle` before trusting an absence.
 
 ## §11 - Sources
 
@@ -524,6 +585,7 @@ All read 2026-09-15.
 - U4 https://docs.dune.com/api-reference/tables/endpoint/uploads-delete
 - U5 https://docs.dune.com/api-reference/tables/endpoint/migration
 - U6 https://docs.dune.com/api-reference/tables/endpoint/overview
+- U7 https://docs.dune.com/api-reference/tables/endpoint/uploads-list
 - B1 https://docs.dune.com/api-reference/overview/billing
 - B2 https://docs.dune.com/resources/credits-billing/how-credits-work
 - R1 https://docs.dune.com/api-reference/overview/rate-limits
