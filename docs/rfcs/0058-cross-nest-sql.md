@@ -279,7 +279,8 @@ declines to expose (#828).
 }
 ```
 
-The Sepolia heights are the ones #1341 recorded; the Arc figures are illustrative.
+Sepolia's two heights are the tip and sealed watermark #1341 recorded; every other figure is
+illustrative.
 
 Each member object is that member's own single-nest provenance, with the same meaning, plus three
 fields:
