@@ -360,9 +360,12 @@ jobs:
           # service-backed modules as explicit filters rather than recreating six linked binaries.
           # Each invocation remains serial: they share one Postgres service and the coverage is
           # deliberately about its real control-plane state, not a parallel imitation of it.
-          for module in pg_parity control_plane e2e_reconcile control_api secret_isolation e2e_resolution; do
-            cargo test --locked --features postgres-store --test it "${module}::" -- --test-threads=1
-          done
+          cargo test --locked --features postgres-store --test it pg_parity:: -- --test-threads=1
+          cargo test --locked --features postgres-store --test it control_plane:: -- --test-threads=1
+          cargo test --locked --features postgres-store --test it e2e_reconcile:: -- --test-threads=1
+          cargo test --locked --features postgres-store --test it control_api:: -- --test-threads=1
+          cargo test --locked --features postgres-store --test it secret_isolation:: -- --test-threads=1
+          cargo test --locked --features postgres-store --test it e2e_resolution:: -- --test-threads=1
       # See the identical step in `check` above for why this exists: `cancelled` alone cannot
       # tell a reader an expired `timeout-minutes` apart from a human cancel or a concurrency
       # supersede (#584 hit exactly this - it read as a plain cancel until someone did the
