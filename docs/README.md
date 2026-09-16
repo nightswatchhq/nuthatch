@@ -10,6 +10,8 @@ not to infer work that remains.
   decisions.
 - [Sprint: measured-merlin](sprint-measured-merlin.md) - make the running system identify itself and
   measure itself truthfully, then remove the full-gate races and account for its cost.
+- [Sprint: durable-dipper](sprint-durable-dipper.md) - the next scoped sprint, beginning after
+  `measured-merlin` closes: make external and incomplete data visible, bounded, and versioned.
 - [Frozen for 2027](frozen-for-2027.md) - capability work deliberately deferred during the 2026
   feature freeze. These issues are closed, with an explicit reopening rule.
 - [RFC index](rfcs/README.md) - design and implementation status for each RFC.
