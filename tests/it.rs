@@ -1,0 +1,155 @@
+// The ordinary integration suite shares one executable. Process-global measurements and the
+// resource-sensitive warm restart stay as explicit Cargo targets in Cargo.toml.
+
+#![allow(clippy::duplicate_mod)] // Existing modules each import their own tests/common helpers.
+
+#[path = "abi_floors_documented.rs"]
+mod abi_floors_documented;
+#[path = "actions_are_pinned.rs"]
+mod actions_are_pinned;
+#[path = "authoring_eval_board.rs"]
+mod authoring_eval_board;
+#[path = "authoring_runner_self_test.rs"]
+mod authoring_runner_self_test;
+#[path = "bench_citations.rs"]
+mod bench_citations;
+#[path = "bench_commits.rs"]
+mod bench_commits;
+#[path = "bench_compact_rows.rs"]
+mod bench_compact_rows;
+#[path = "bench_helpers_reject_failures.rs"]
+mod bench_helpers_reject_failures;
+#[path = "bench_restart_to_ready.rs"]
+mod bench_restart_to_ready;
+#[path = "bom_timings_discovery.rs"]
+mod bom_timings_discovery;
+#[path = "concurrent_sql_does_not_corrupt.rs"]
+mod concurrent_sql_does_not_corrupt;
+#[path = "control_api.rs"]
+mod control_api;
+#[path = "control_plane.rs"]
+mod control_plane;
+#[path = "core_stays_pristine.rs"]
+mod core_stays_pristine;
+#[path = "cors_reaches_the_bind.rs"]
+mod cors_reaches_the_bind;
+#[path = "dbsp_step_cost.rs"]
+mod dbsp_step_cost;
+#[path = "doc_command_check.rs"]
+mod doc_command_check;
+#[path = "duckdb_containment.rs"]
+mod duckdb_containment;
+#[path = "duckdb_extensions_are_static.rs"]
+mod duckdb_extensions_are_static;
+#[path = "dune_emit.rs"]
+mod dune_emit;
+#[path = "e2e_bare_help.rs"]
+mod e2e_bare_help;
+#[path = "e2e_crash_safety.rs"]
+mod e2e_crash_safety;
+#[path = "e2e_cursor_death_isolation.rs"]
+mod e2e_cursor_death_isolation;
+#[path = "e2e_early_cutoff.rs"]
+mod e2e_early_cutoff;
+#[path = "e2e_entity_reorg.rs"]
+mod e2e_entity_reorg;
+#[path = "e2e_fencing.rs"]
+mod e2e_fencing;
+#[path = "e2e_migrate_parity.rs"]
+mod e2e_migrate_parity;
+#[path = "e2e_minio_publish.rs"]
+mod e2e_minio_publish;
+#[path = "e2e_plane_split.rs"]
+mod e2e_plane_split;
+#[path = "e2e_prune_lifecycle.rs"]
+mod e2e_prune_lifecycle;
+#[path = "e2e_query_allowlist.rs"]
+mod e2e_query_allowlist;
+#[path = "e2e_reconcile.rs"]
+mod e2e_reconcile;
+#[path = "e2e_reorg.rs"]
+mod e2e_reorg;
+#[path = "e2e_resolution.rs"]
+mod e2e_resolution;
+#[path = "e2e_runtime_lifecycle.rs"]
+mod e2e_runtime_lifecycle;
+#[path = "e2e_runtime_parity.rs"]
+mod e2e_runtime_parity;
+#[path = "e2e_seal_determinism.rs"]
+mod e2e_seal_determinism;
+#[path = "e2e_serve_local_store.rs"]
+mod e2e_serve_local_store;
+#[path = "e2e_shared_dataset.rs"]
+mod e2e_shared_dataset;
+#[path = "e2e_solo.rs"]
+mod e2e_solo;
+#[path = "e2e_sql_cli_backend.rs"]
+mod e2e_sql_cli_backend;
+#[path = "e2e_stall_isolation.rs"]
+mod e2e_stall_isolation;
+#[path = "e2e_transform_cli.rs"]
+mod e2e_transform_cli;
+#[path = "e2e_trino_contract.rs"]
+mod e2e_trino_contract;
+#[path = "engine_batch_boundary.rs"]
+mod engine_batch_boundary;
+#[path = "entity_provenance_is_atomic.rs"]
+mod entity_provenance_is_atomic;
+#[path = "eval_harness.rs"]
+mod eval_harness;
+#[path = "eval_runner_self_test.rs"]
+mod eval_runner_self_test;
+#[path = "gate_audit_cases.rs"]
+mod gate_audit_cases;
+#[path = "graph_over_indexed_data.rs"]
+mod graph_over_indexed_data;
+#[path = "graph_schema_golden.rs"]
+mod graph_schema_golden;
+#[path = "ivm_claims.rs"]
+mod ivm_claims;
+#[path = "launch_copy.rs"]
+mod launch_copy;
+#[path = "lodestar_panel.rs"]
+mod lodestar_panel;
+#[path = "mutants_check.rs"]
+mod mutants_check;
+#[path = "over_i128_is_reported.rs"]
+mod over_i128_is_reported;
+#[path = "payment_absent.rs"]
+mod payment_absent;
+#[path = "pg_parity.rs"]
+mod pg_parity;
+#[path = "port_emit.rs"]
+mod port_emit;
+#[path = "port_report.rs"]
+mod port_report;
+#[path = "pr_review_harness.rs"]
+mod pr_review_harness;
+#[path = "reading_published_nest.rs"]
+mod reading_published_nest;
+#[path = "release_provenance.rs"]
+mod release_provenance;
+#[path = "required_checks.rs"]
+mod required_checks;
+#[path = "required_contexts_script.rs"]
+mod required_contexts_script;
+#[path = "rfc_index_status.rs"]
+mod rfc_index_status;
+#[path = "scheduled_workflow_failure_is_reported.rs"]
+mod scheduled_workflow_failure_is_reported;
+#[path = "seal_batching_asymmetry.rs"]
+mod seal_batching_asymmetry;
+#[path = "secret_isolation.rs"]
+mod secret_isolation;
+#[path = "seed_scale.rs"]
+mod seed_scale;
+#[path = "semantic_layer.rs"]
+mod semantic_layer;
+#[path = "tape_clean.rs"]
+mod tape_clean;
+#[path = "tip_gauges_are_published_per_nest.rs"]
+mod tip_gauges_are_published_per_nest;
+#[path = "verification_non_claims.rs"]
+mod verification_non_claims;
+#[path = "workflow_permission_keys.rs"]
+mod workflow_permission_keys;

@@ -783,9 +783,13 @@ job:
 
 `/sql` is **read-only and single-statement**: a query must open with `SELECT` or `WITH`, filesystem
 and network table functions are refused, and `;`-stacking a second statement is rejected outright.
-Rejections surface as `400`/`503` and count in `nuthatch_sql_rejections_total`. A declared query
-refused by its scan bound answers `422` and also counts in `nuthatch_named_scan_refusals_total`; the
-bounds of those admitted are the `nuthatch_named_scan_bytes` histogram.
+Rejections surface as a `4xx` or `503` and count in the backward-compatible aggregate
+`nuthatch_sql_rejections_total`, and in `nuthatch_sql_rejections_total{reason=…}`. The fixed
+`reason` values distinguish `busy`, `too_large`, `invalid`, `bounded`, and declared-query
+`admission`; they are the useful series for separating saturation from a caller error. A declared
+query refused by its scan bound answers `422` and also counts in
+`nuthatch_named_scan_refusals_total`; the bounds of those admitted are the
+`nuthatch_named_scan_bytes` histogram.
 
 **`/explain` is guarded identically.** It plans caller-supplied SQL without returning rows, but
 planning still materialises the tip, so it carries the same scan cost as the query it is describing
@@ -920,7 +924,7 @@ per-nest series below.
 | `nuthatch_tip_height`, `nuthatch_last_block`, `nuthatch_tip_lag_blocks` | is it keeping up |
 | `nuthatch_sealed_through` | cold-layer watermark |
 | `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_resolved_total`, `nuthatch_ipfs_given_up_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total`, `nuthatch_ipfs_rows_refused_total`, `nuthatch_ipfs_retries_total` | ingestion |
-| `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total` | serving |
+| `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total`, `nuthatch_sql_rejections_total{reason=…}` | serving; the unlabelled rejection total is the aggregate, and the fixed `reason` label classifies its refusals |
 | `nuthatch_sql_memo_hits_total`, `nuthatch_sql_memo_misses_total`, `nuthatch_sql_memo_bytes` | the analytical memo (#1186): how many `/sql` answers were remembered rather than computed, and what it holds |
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
 | `nuthatch_rpc_methods_total{method=…}` | individual JSON-RPC method invocations; a batch of 200 `eth_getBlockByNumber` is 200 here and 1 on `nuthatch_rpc_requests_total`. Multiply by a provider's per-method CU schedule to estimate a bill |
@@ -966,7 +970,7 @@ Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_scre
 | **Ingest stalled** | `time() - nuthatch_last_poll_unixtime > 300` | the loop is wedged even if the process is alive |
 | **Outbox backing up** | `nuthatch_alert_outbox_depth` rising | a webhook sink is down or slow |
 | **Memory near budget** | `nuthatch_rss_bytes` over ~75% of the cursor ceiling | usually the `/sql` hot-scan |
-| **Query rejections spiking** | `rate(nuthatch_sql_rejections_total)` | a caller hammering the guards; a gateway job |
+| **Query rejections spiking** | `rate(nuthatch_sql_rejections_total{reason="busy"}[5m])` | the node is at its analytical concurrency or queue bound; inspect the aggregate too, but do not confuse caller mistakes with saturation |
 | **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
 | **Mirror behind** | `nuthatch_publish_lag_blocks` growing across several intervals, or `nuthatch_publish_dead_letter == 1` | the bucket is unreachable or refusing an object, and consumers of the mirror see stale history |
 
@@ -978,6 +982,8 @@ Get this right in your supervisor and your load balancer:
 - **`/ready`** is readiness. Runtime root: `200` only when **every** cursor and nest is indexing; `503`
   with a body naming what is quarantined (`quarantined`) **and which nests are stalled, with the terms
   that took each one unready** (`stalled`). Per-nest `/<name>/ready` answers only for that nest.
+  Every readiness response also carries `version`, the release version compiled into the running
+  binary, so a probe can identify the process it just judged.
 
   A nest reaches the `stalled` list on exactly the terms its own `/<name>/ready` uses - one function
   computes both, so the two surfaces cannot disagree. Before 3.7.0 the root consulted the quarantine

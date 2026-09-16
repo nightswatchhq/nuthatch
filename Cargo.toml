@@ -2,6 +2,7 @@
 name = "nuthatch"
 version = "3.8.4"
 edition = "2021"
+autotests = false
 # **Measured, not asserted.** `cargo +1.85.0 check` fails outright - `cranelift-assembler-x64` needs
 # 1.94, actix 1.88 - so the 1.85 this declared until 1.0 was a promise nothing could keep. 1.95 is what
 # `rust-toolchain.toml`, CI, and the release build all use, so it is the only version we can honestly
@@ -22,6 +23,39 @@ exclude = ["/components", "/scratchpad", "/fuzz", "/decode", "/tools"]
 [[bin]]
 name = "nuthatch"
 path = "src/main.rs"
+
+# One integration binary avoids linking DuckDB, DBSP and the complete crate into 81 separate
+# executables. These four remain isolated because they change process-global environment variables.
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+[[test]]
+name = "analytics_budget"
+path = "tests/analytics_budget.rs"
+
+[[test]]
+name = "e2e_fe_admin_exposure"
+path = "tests/e2e_fe_admin_exposure.rs"
+
+[[test]]
+name = "hot_store_cache_is_measurable"
+path = "tests/hot_store_cache_is_measurable.rs"
+
+[[test]]
+name = "sql_concurrency_is_measurable"
+path = "tests/sql_concurrency_is_measurable.rs"
+
+# These two do not mutate environment, but they intentionally observe process-global metrics or run
+# a long restart/reseal sequence. Keeping them out of the broad parallel harness makes those claims
+# about their own process rather than its 360 neighbours.
+[[test]]
+name = "e2e_warm_restart"
+path = "tests/e2e_warm_restart.rs"
+
+[[test]]
+name = "skill_refs"
+path = "tests/skill_refs.rs"
 
 [dependencies]
 # graph-node's own pluralisation, so a generated root field name matches it by construction rather

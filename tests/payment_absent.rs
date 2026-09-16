@@ -208,7 +208,9 @@ fn strip_cfg_test_items(src: &str) -> String {
 }
 
 fn skip_walk_dir(name: &str) -> bool {
-    matches!(name, "target" | ".git" | "fuzz")
+    // Local agent worktrees are workspace tooling, not product source. Walking them both repeats the
+    // tree and makes this deletion gate judge a second checkout's payment surface against this one.
+    matches!(name, "target" | ".git" | ".claude" | "fuzz")
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {

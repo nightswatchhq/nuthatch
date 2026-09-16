@@ -2820,6 +2820,9 @@ async fn build_nest(
     // No command printed a single nest's NID (#1420). Computed from the inputs as they are now; `None`
     // only for a directory `blob` cannot read.
     let manifest = crate::blob::build_manifest(&dir, None).ok();
+    let nid = manifest
+        .as_ref()
+        .map(|manifest| Arc::<str>::from(manifest.nid()));
     let nest_info = serde_json::json!({
         "name": config.nest.name,
         "chain": config.nest.chain,
@@ -2869,8 +2872,9 @@ async fn build_nest(
         surface: Arc::new(crate::allowlist::Surface::default()),
         #[cfg(feature = "counter")]
         counter: None,
-        // Set by the runtime for a mounted nest; a solo `dev` nest has no mount record.
-        nid: None,
+        // A runtime replaces this with its mounted dataset identity. A solo `dev` still knows its
+        // manifest NID and must carry it into analytical provenance.
+        nid,
         // Set by `spawn_runtime` for a co-tenanted nest; a solo `dev` nest has no mounts health surface.
         runtime_health: None,
         admin_enabled,
@@ -13055,6 +13059,25 @@ template = "pool"
                 "{uri}: {json}"
             );
         }
+        let res = serve::router(serve::SharedNest::new(state.clone()))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sql?q=SELECT%201%20AS%20n")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["provenance"]["nid"],
+            serde_json::json!(manifest.nid()),
+            "/sql provenance must name the dataset /nest reports: {json}"
+        );
         drop(nest);
         drop(state);
 
@@ -16485,9 +16508,6 @@ template="pool"
         fn highest_asked(&self) -> Option<u64> {
             self.tops.lock().unwrap().iter().copied().max()
         }
-        fn windows(&self) -> usize {
-            self.tops.lock().unwrap().len()
-        }
         fn polls(&self) -> usize {
             self.tip_polls.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -16666,9 +16686,12 @@ template="pool"
             .unwrap_or(Finality::Depth(0))
     }
 
-    /// Drive `index_loop` from 200 blocks behind until it has stopped asking, then report the highest
-    /// block any `getLogs` covered.
-    async fn highest_block_indexed(nest: NestIngest) -> (u64, usize) {
+    /// Drive `index_loop` from 200 blocks behind until it has committed the finality boundary, then
+    /// report the highest block any `getLogs` covered. The committed cursor position is the condition
+    /// the nest itself asserts, unlike a quiet window count which says only that a loaded test process
+    /// happened not to schedule more work for 400 ms.
+    async fn highest_block_indexed(nest: NestIngest, boundary: u64) -> (u64, usize) {
+        let store = nest.store.clone();
         let src = Arc::new(FinalityRecordingSource::new());
         let recorder = src.clone();
         let task = tokio::spawn(index_loop(
@@ -16679,21 +16702,24 @@ template="pool"
             1,
             50,
         ));
-        // The loop is at its ceiling once the windows stop arriving: wait for the first, then for a
-        // quiet second with no new one.
+        // `logs` records a request before the nest commits it. Wait for both the boundary request and
+        // its durable cursor update, so a contended full-suite run becomes slower rather than claiming
+        // it stopped at whichever earlier window happened to arrive before a 400 ms quiet period.
         assert!(
-            within_deadline(|| recorder.windows() >= 1).await,
-            "no window was ever fetched"
+            within_deadline(|| {
+                recorder.highest_asked() == Some(boundary)
+                    && store
+                        .get_meta(LAST_BLOCK_KEY)
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        == Some(boundary)
+            })
+            .await,
+            "cursor did not commit its expected boundary {boundary}: highest request {:?}, last block {:?}",
+            recorder.highest_asked(),
+            store.get_meta(LAST_BLOCK_KEY).ok().flatten(),
         );
-        let mut seen = recorder.windows();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            let now = recorder.windows();
-            if now == seen {
-                break;
-            }
-            seen = now;
-        }
         task.abort();
         (recorder.highest_asked().unwrap_or(0), recorder.probes())
     }
@@ -16713,11 +16739,13 @@ template="pool"
             },
         )
         .await;
-        let (highest, probes) = highest_block_indexed(nest).await;
+        let (highest, probes) =
+            highest_block_indexed(nest, FinalityRecordingSource::FINALIZED).await;
         assert_eq!(
             highest,
             FinalityRecordingSource::FINALIZED,
-            "finality-only asked for blocks above the finalized boundary"
+            "finality-only stopped at {highest}, finalized is {}; it either under-ran or asked above the boundary",
+            FinalityRecordingSource::FINALIZED,
         );
         assert!(
             probes >= 1,
@@ -16729,7 +16757,7 @@ template="pool"
     async fn the_tip_path_still_indexes_to_the_tip() {
         let tmp = tempfile::tempdir().unwrap();
         let nest = build_dialled_nest(tmp.path(), crate::freshness::Freshness::default()).await;
-        let (highest, _probes) = highest_block_indexed(nest).await;
+        let (highest, _probes) = highest_block_indexed(nest, FinalityRecordingSource::TIP).await;
         assert_eq!(highest, FinalityRecordingSource::TIP);
     }
 
