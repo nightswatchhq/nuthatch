@@ -8,7 +8,8 @@ not to infer work that remains.
 
 - [Backlog guide](backlog.md) - GitHub is the live queue; this explains its labels and settled
   decisions.
-- [Sprint: diligent-dunnock](sprint-diligent-dunnock.md) - hackathon papercuts, done; then Dune end to end, the warehouse recipes, and cross-nest SQL as an RFC.
+- [Sprint: measured-merlin](sprint-measured-merlin.md) - make the running system identify itself and
+  measure itself truthfully, then remove the full-gate races and account for its cost.
 - [Frozen for 2027](frozen-for-2027.md) - capability work deliberately deferred during the 2026
   feature freeze. These issues are closed, with an explicit reopening rule.
 - [RFC index](rfcs/README.md) - design and implementation status for each RFC.
@@ -34,7 +35,8 @@ not to infer work that remains.
 ## Dated records
 
 - [Progress log](progress-log.md)
-- `sprint-*.md` - completed and historical sprint scopes. Sprint labels remain on GitHub issues as
+- `sprint-*.md` - completed and historical sprint scopes. `diligent-dunnock` closed on 2026-09-16.
+  Sprint labels remain on GitHub issues as
   provenance; the documents explain the scope as it stood at the time.
 - [July-August 2026 roadmap](high-level-roadmap-jul-aug-2026.md)
 - [2027 direction](roadmap-2027.md)
