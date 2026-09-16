@@ -356,9 +356,16 @@ jobs:
           # Every Postgres-backed suite, not just parity: the control plane and the reconcile loop
           # have no coverage anywhere else, and a job named for one of three would let the other two
           # rot behind the feature flag.
-          cargo test --locked --features postgres-store \
-            --test pg_parity --test control_plane --test e2e_reconcile --test control_api \
-            --test secret_isolation --test e2e_resolution -- --test-threads=1
+          # The ordinary integration sources share `tests/it.rs` (#1429), so retain these six
+          # service-backed modules as explicit filters rather than recreating six linked binaries.
+          # Each invocation remains serial: they share one Postgres service and the coverage is
+          # deliberately about its real control-plane state, not a parallel imitation of it.
+          cargo test --locked --features postgres-store --test it pg_parity -- --test-threads=1
+          cargo test --locked --features postgres-store --test it control_plane -- --test-threads=1
+          cargo test --locked --features postgres-store --test it e2e_reconcile -- --test-threads=1
+          cargo test --locked --features postgres-store --test it control_api -- --test-threads=1
+          cargo test --locked --features postgres-store --test it secret_isolation -- --test-threads=1
+          cargo test --locked --features postgres-store --test it e2e_resolution -- --test-threads=1
       # See the identical step in `check` above for why this exists: `cancelled` alone cannot
       # tell a reader an expired `timeout-minutes` apart from a human cancel or a concurrency
       # supersede (#584 hit exactly this - it read as a plain cancel until someone did the
@@ -428,7 +435,7 @@ jobs:
       - name: create the test bucket
         run: aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
       - name: publish suite against MinIO
-        run: cargo test --locked --test e2e_minio_publish
+        run: cargo test --locked --test it e2e_minio_publish
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         run: |
@@ -489,7 +496,7 @@ jobs:
       - name: publish the drifted nest and record DuckDB's numbers
         env:
           NUTHATCH_TRINO_FIXTURE_OUT: ${{ runner.temp }}/trino-fixture.json
-        run: cargo test --locked --test e2e_trino_contract -- --nocapture
+        run: cargo test --locked --test it e2e_trino_contract -- --nocapture
       # File metastore, kept in the same bucket, so no Hive Metastore service is needed. Trino 483
       # spells the S3 switch `fs.s3.enabled`; `fs.native-s3.enabled` is its legacy name.
       - name: start Trino

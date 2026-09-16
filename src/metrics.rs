@@ -14,6 +14,47 @@ use std::time::Duration;
 /// The one process-wide metrics registry. `const`-constructed, so it needs no lazy init.
 pub static METRICS: Metrics = Metrics::new();
 
+/// Why the analytical surface refused a request. This is deliberately a closed set: a caller must
+/// never be able to turn a bad query or a route name into a new Prometheus series.
+#[derive(Clone, Copy)]
+pub enum SqlRejection {
+    Busy,
+    TooLarge,
+    Invalid,
+    Bounded,
+    Admission,
+}
+
+impl SqlRejection {
+    const ALL: [Self; 5] = [
+        Self::Busy,
+        Self::TooLarge,
+        Self::Invalid,
+        Self::Bounded,
+        Self::Admission,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Busy => 0,
+            Self::TooLarge => 1,
+            Self::Invalid => 2,
+            Self::Bounded => 3,
+            Self::Admission => 4,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::TooLarge => "too_large",
+            Self::Invalid => "invalid",
+            Self::Bounded => "bounded",
+            Self::Admission => "admission",
+        }
+    }
+}
+
 /// Per-nest counterparts of the nest-scoped signals (SEC-9). In a runtime the process-global gauges and
 /// counters blend every mounted nest into one number; these let an operator see each nest's own
 /// progress under a `{nest="…"}` label. Updating a per-nest value also bumps the matching global
@@ -470,7 +511,9 @@ pub struct Metrics {
     // Serving - the surface an operator bills against.
     http_requests: AtomicU64,
     sql_queries: AtomicU64,
+    /// Backward-compatible aggregate of every member of `sql_rejections_by_reason`.
     sql_rejections: AtomicU64,
+    sql_rejections_by_reason: [AtomicU64; 5],
     /// Cumulative per [`NAMED_SCAN_BOUNDS`] entry, then `+Inf`.
     named_scan_buckets: [AtomicU64; 7],
     named_scan_bytes_sum: AtomicU64,
@@ -545,6 +588,7 @@ impl Metrics {
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
             sql_rejections: AtomicU64::new(0),
+            sql_rejections_by_reason: [const { AtomicU64::new(0) }; 5],
             named_scan_buckets: [const { AtomicU64::new(0) }; 7],
             named_scan_bytes_sum: AtomicU64::new(0),
             named_scan_refusals: AtomicU64::new(0),
@@ -704,8 +748,9 @@ impl Metrics {
     pub fn inc_sql(&self) {
         self.sql_queries.fetch_add(1, Relaxed);
     }
-    pub fn inc_sql_rejected(&self) {
+    pub fn inc_sql_rejected(&self, reason: SqlRejection) {
         self.sql_rejections.fetch_add(1, Relaxed);
+        self.sql_rejections_by_reason[reason.index()].fetch_add(1, Relaxed);
     }
     /// A declared query answered under the scan cap, with the source bytes it was admitted at.
     pub fn observe_named_scan(&self, bytes: u64) {
@@ -963,11 +1008,21 @@ impl Metrics {
             "Analytical /sql queries accepted since start.",
             self.sql_queries.load(Relaxed),
         ));
-        s.push_str(&counter(
-            "nuthatch_sql_rejections_total",
-            "Analytical /sql queries rejected (guard: timeout, too-large, over-capacity).",
-            self.sql_rejections.load(Relaxed),
+        s.push_str(
+            "# HELP nuthatch_sql_rejections_total Analytical /sql requests refused since start; the unlabelled series is the aggregate and reason is a fixed refusal classification.\n\
+             # TYPE nuthatch_sql_rejections_total counter\n",
+        );
+        s.push_str(&format!(
+            "nuthatch_sql_rejections_total {}\n",
+            self.sql_rejections.load(Relaxed)
         ));
+        for reason in SqlRejection::ALL {
+            s.push_str(&format!(
+                "nuthatch_sql_rejections_total{{reason=\"{}\"}} {}\n",
+                reason.label(),
+                self.sql_rejections_by_reason[reason.index()].load(Relaxed),
+            ));
+        }
         s.push_str(
             "# HELP nuthatch_named_scan_bytes Source-byte bound declared queries were answered under (RFC-0048).\n\
              # TYPE nuthatch_named_scan_bytes histogram\n",
@@ -1445,7 +1500,8 @@ mod tests {
         m.set_last_block(940);
         m.add_rows_decoded(5);
         m.inc_sql();
-        m.inc_sql_rejected();
+        m.inc_sql_rejected(SqlRejection::Busy);
+        m.inc_sql_rejected(SqlRejection::Invalid);
         let out = m.render();
         assert!(out.contains("# TYPE nuthatch_tip_height gauge"));
         assert!(out.contains("nuthatch_tip_height 1000"));
@@ -1453,7 +1509,9 @@ mod tests {
         assert!(out.contains("# TYPE nuthatch_rows_decoded_total counter"));
         assert!(out.contains("nuthatch_rows_decoded_total 5"));
         assert!(out.contains("nuthatch_sql_queries_total 1"));
-        assert!(out.contains("nuthatch_sql_rejections_total 1"));
+        assert!(out.contains("nuthatch_sql_rejections_total 2"));
+        assert!(out.contains("nuthatch_sql_rejections_total{reason=\"busy\"} 1"));
+        assert!(out.contains("nuthatch_sql_rejections_total{reason=\"invalid\"} 1"));
     }
 
     /// #1399: a retried IPFS fetch is a series, globally and per nest, and not only a log line.

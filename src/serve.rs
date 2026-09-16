@@ -289,8 +289,9 @@ pub struct AppState {
     #[cfg(feature = "counter")]
     pub counter: Option<Arc<crate::counter::Config>>,
     /// The identity of the dataset serving this mount (RFC-0032 §3), stamped into `provenance` so an
-    /// answer can be cited against the data that produced it. `None` for a solo `dev` nest, which has
-    /// no mount record and therefore no identity to report.
+    /// answer can be cited against the data that produced it. A mounted nest carries its mounted
+    /// dataset identity; a solo `dev` nest carries the NID it computed from its manifest. `None`
+    /// only when that manifest could not be built.
     pub nid: Option<Arc<str>>,
     /// This nest's name and the runtime health surface it should answer `/ready` from (RFC-0026 §5).
     /// `None` for a solo `dev` nest, which has no mounts around it and falls back to the global
@@ -658,6 +659,7 @@ fn roost_ready(
         .collect();
     let ready = unhealthy.is_empty() && stalled.is_empty();
     let body = json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "ready": ready,
         "quarantined": unhealthy.iter().map(|(n, r)| json!({"nest": n, "reason": r})).collect::<Vec<_>>(),
         "stalled": stalled,
@@ -1615,6 +1617,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
+                    "version": env!("CARGO_PKG_VERSION"),
                     "ready": false,
                     "quarantined": true,
                     "kind": q.kind,
@@ -1661,6 +1664,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         entities,
     } = nest_readiness(&s);
     let body = json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "ready": !stalled,
         "stalled": stalled,
         "wedged": wedged,
@@ -2442,7 +2446,7 @@ struct SqlQuery {
 /// SQL. And it names what *can* be asked, in RFC-0016's errors-as-prompts style, so an agent hitting
 /// a bounded nest is told the surface rather than left guessing at it.
 fn refuse_free_form(surface: &crate::allowlist::Surface) -> axum::response::Response {
-    crate::metrics::METRICS.inc_sql_rejected();
+    crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Bounded);
     let names = surface.names();
     let body = if names.is_empty() {
         json!({
@@ -2496,7 +2500,7 @@ async fn named_query(
     let _ = &headers;
     use crate::metrics::METRICS;
     let Some(q) = s.surface.get(&name) else {
-        METRICS.inc_sql_rejected();
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Admission);
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -2509,7 +2513,7 @@ async fn named_query(
     let sql = match q.render(&args) {
         Ok(sql) => sql,
         Err(e) => {
-            METRICS.inc_sql_rejected();
+            METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": format!("{e:#}"), "query": name })),
@@ -2763,7 +2767,7 @@ fn named_failure(s: &AppState, failure: NamedFailure, sql: &str) -> axum::respon
     use crate::metrics::METRICS;
     let e = match failure {
         NamedFailure::Busy => {
-            METRICS.inc_sql_rejected();
+            METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
@@ -2774,7 +2778,7 @@ fn named_failure(s: &AppState, failure: NamedFailure, sql: &str) -> axum::respon
         NamedFailure::Query(e) => e,
     };
     if let Some(refusal) = e.downcast_ref::<AdmissionRefusal>() {
-        METRICS.inc_sql_rejected();
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Admission);
         METRICS.inc_named_scan_refused();
         let (status, bound) = match refusal {
             AdmissionRefusal::OverCap(bound) => (StatusCode::UNPROCESSABLE_ENTITY, Some(bound)),
@@ -2788,7 +2792,7 @@ fn named_failure(s: &AppState, failure: NamedFailure, sql: &str) -> axum::respon
             .into_response();
     }
     if let Some(over) = e.downcast_ref::<crate::store::HotScanBudgetExceeded>() {
-        METRICS.inc_sql_rejected();
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Admission);
         METRICS.inc_named_scan_refused();
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2837,7 +2841,7 @@ async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoR
         return refuse_free_form(&s.surface);
     }
     if q.q.len() > SQL_MAX_QUERY_LEN {
-        METRICS.inc_sql_rejected();
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("query too long: {} bytes (max {SQL_MAX_QUERY_LEN})", q.q.len()) })),
@@ -2937,7 +2941,7 @@ async fn run_sql_query(
     // still decides how many queries run at once (#1319).
     let admission = std::time::Instant::now();
     let busy = || {
-        METRICS.inc_sql_rejected();
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
@@ -3082,7 +3086,15 @@ async fn run_sql_query(
 
 fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::response::Response {
     use crate::metrics::METRICS;
-    METRICS.inc_sql_rejected();
+    let reason = if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
+        || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
+            .is_some()
+    {
+        crate::metrics::SqlRejection::TooLarge
+    } else {
+        crate::metrics::SqlRejection::Invalid
+    };
+    METRICS.inc_sql_rejected(reason);
     // The tip is too large to serve in one scan. A `503` rather than a `400`: the query is fine,
     // the node is refusing to spend the memory - so a caller should retry later or narrow to
     // sealed data, not rewrite their SQL.
@@ -3234,7 +3246,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // their SQL. `valid` is deliberately absent rather than `false`: bindability is unknown
         // here, and reporting `false` would tell a caller their query is broken when it is not.
         Ok(Err(e)) if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some() => {
-            METRICS.inc_sql_rejected();
+            METRICS.inc_sql_rejected(crate::metrics::SqlRejection::TooLarge);
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
@@ -3248,7 +3260,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
             if e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
                 .is_some() =>
         {
-            METRICS.inc_sql_rejected();
+            METRICS.inc_sql_rejected(crate::metrics::SqlRejection::TooLarge);
             let over = e
                 .downcast_ref::<crate::store::HotScanBudgetExceeded>()
                 .expect("matched by the guard");
@@ -3264,7 +3276,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
                 .into_response()
         }
         Ok(Err(e)) => {
-            METRICS.inc_sql_rejected();
+            METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
             let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
             let msg = match crate::analytics::enrich_query_error(&s.dir, &raw, &q.q, &s.tables) {
                 Some(hint) => format!("{raw}\n\nhint: {hint}"),
@@ -5246,6 +5258,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["ready"], json!(false));
+        assert_eq!(v["version"], json!(env!("CARGO_PKG_VERSION")));
         assert_eq!(v["quarantined"][0]["nest"], "alpha");
         assert_eq!(
             v["quarantined"].as_array().unwrap().len(),
@@ -5714,6 +5727,7 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
+        assert_eq!(v["version"], json!(env!("CARGO_PKG_VERSION")));
         assert_eq!(
             v["tip"].as_u64(),
             Some(25_632_906),

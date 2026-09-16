@@ -3,6 +3,11 @@
 **What the hackathon found, fixed first. Then Dune end to end: the row-insert sidecar, the rest of
 RFC-0055, and a recorded run. The warehouse recipes RFC-0052 left unrun. Cross-nest SQL as an RFC.**
 
+**Closed 2026-09-16.** Every issue carrying `diligent-dunnock` is closed and no open PR carries the
+label. The Dune sidecar and its recorded run (#1362, #1360), the warehouse runs (#1263), and
+cross-nest SQL (#1324) were parked on Chief's call and removed from the scope before close. Their
+draft RFCs and acceptance evidence remain intact; parked means deliberately not now, not done.
+
 ## Definition of done
 
 Every issue carrying the **`diligent-dunnock`** label is closed, and no open PR is for one of them. The
