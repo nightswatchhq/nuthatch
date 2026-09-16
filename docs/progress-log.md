@@ -13,6 +13,14 @@ binary.** There are 53 of them and the CLI moves every sprint. Check anything yo
 this reads as a real hazard rather than boilerplate: the 2026-07-21 entry documents `nuthatch nest
 upgrade`, which was real that day and does not exist in 2.2.0.
 
+- **2026-09-16 - a debug `target/` a third smaller.** Parallel worktrees were each growing a 50-70 GB
+  `target/`. `[profile.dev] debug = "line-tables-only"`, plus `CXXFLAGS = "-g0"` in `.cargo/config.toml`,
+  because cargo tells build scripts only that debuginfo is on, so cc kept building bundled DuckDB with
+  full `-g` (1,471 MB of its 1,749 MB rlib was DWARF). One cold `cargo test --no-run`: **24.1 GB in
+  141 s before, 16.2 GB in 112 s after**. DuckDB's `D_ASSERT`s still compile in (`NDEBUG` follows
+  `DEBUG`, which stays true), backtraces keep file and line, and the suite is 1740 passed, 0 failed.
+  **Next**: the 38 integration-test binaries are 8.9 GB of what is left; one test binary would remove
+  most of it.
 - **2026-09-14 - #1376's tip-path comparison corrected, and the capped tip run measured on the merged head.**
   The #1376 entry below set the capped tip run against an uncapped **1,622,310,912 bytes**. That uncapped
   run stopped at block 48,138,999, a fifth of the capped run's range, so its peak is a lower bound, and

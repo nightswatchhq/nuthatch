@@ -129,6 +129,10 @@ tokio = { version = "1", features = ["test-util"] }
 alloy-primitives = { version = "1.6", features = ["k256"] }
 alloy-sol-types = "1.6"
 
+# Line tables keep backtrace file:line; full variable info cost ~2.7 GB per `cargo test` target.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 strip = true
