@@ -1,0 +1,4 @@
+[env]
+# cc builds bundled duckdb with full -g whenever dev debuginfo is on: 1.5 GB of its 1.7 GB rlib is
+# DWARF. -g0 drops it; DEBUG stays true, so duckdb's D_ASSERTs (gated on NDEBUG) still run.
+CXXFLAGS = "-g0"
