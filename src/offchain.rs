@@ -19,6 +19,18 @@ const MANIFEST: &str = "manifest.json";
 pub struct Catalogue {
     #[serde(default)]
     pub tables: BTreeMap<String, Vec<Snapshot>>,
+    /// Last host-side pull outcome per table. This is deliberately beside, not inside, the immutable
+    /// snapshot list: a failed attempt must not rewrite history merely to say it failed.
+    #[serde(default)]
+    pub refreshes: BTreeMap<String, Refresh>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Refresh {
+    pub source: String,
+    pub attempted_at: String,
+    pub succeeded_at: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,8 +61,66 @@ pub fn load(dir: &Path) -> Result<Catalogue> {
 pub fn drop_file(dir: &Path, source: &Path, table: &str) -> Result<()> {
     validate_table(table)?;
     let (bytes, rows, columns) = read_source(source)?;
+    seal_snapshot(
+        dir,
+        table,
+        &source.display().to_string(),
+        bytes,
+        rows,
+        columns,
+    )
+}
+
+/// Fetch one JSON price feed outside the chain cursor, then append it through the same immutable
+/// snapshot path as [`drop_file`]. The source is deliberately an operator-supplied URL: a price
+/// provider is an access path, not part of the nest's identity.
+pub async fn pull_json(dir: &Path, source: &str, table: &str) -> Result<()> {
+    validate_table(table)?;
+    tracing::info!(
+        source,
+        table,
+        "fetching offchain price snapshot out of band"
+    );
+    let result = async {
+        let response = reqwest::Client::new()
+            .get(source)
+            .header("user-agent", "nuthatch")
+            .send()
+            .await
+            .with_context(|| format!("request to offchain source {source} failed"))?
+            .error_for_status()
+            .with_context(|| format!("offchain source {source} returned an error status"))?;
+        let body = response
+            .bytes()
+            .await
+            .context("reading offchain source response body")?;
+        let (bytes, rows, columns) = read_json_bytes(&body)?;
+        seal_snapshot(dir, table, source, bytes, rows, columns)
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            record_refresh(dir, table, source, None)?;
+            Ok(())
+        }
+        Err(error) => {
+            let message = error.to_string();
+            record_refresh(dir, table, source, Some(message))?;
+            Err(error)
+        }
+    }
+}
+
+fn seal_snapshot(
+    dir: &Path,
+    table: &str,
+    source: &str,
+    bytes: Vec<u8>,
+    rows: usize,
+    columns: Vec<String>,
+) -> Result<()> {
     if columns.is_empty() {
-        bail!("offchain source {} has no columns", source.display());
+        bail!("offchain source {source} has no columns");
     }
     let hash = hex::encode(Sha256::digest(&bytes));
     let out_dir = dir.join(DIR).join(SEGMENTS);
@@ -91,7 +161,7 @@ pub fn drop_file(dir: &Path, source: &Path, table: &str) -> Result<()> {
             file,
             rows,
             columns,
-            source: source.display().to_string(),
+            source: source.to_string(),
             ingested_at: now_stamp(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
         });
@@ -152,8 +222,12 @@ fn read_csv(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
 
 fn read_json(path: &Path) -> Result<(Vec<u8>, usize, Vec<String>)> {
     let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    read_json_bytes(&raw)
+}
+
+fn read_json_bytes(raw: &[u8]) -> Result<(Vec<u8>, usize, Vec<String>)> {
     let rows: Vec<Value> =
-        serde_json::from_slice(&raw).context("JSON source must be an array of objects")?;
+        serde_json::from_slice(raw).context("JSON source must be an array of objects")?;
     let mut columns = std::collections::BTreeSet::new();
     for row in &rows {
         let Some(obj) = row.as_object() else {
@@ -235,6 +309,29 @@ fn save(dir: &Path, catalogue: &Catalogue) -> Result<()> {
         .context("writing offchain provenance manifest")?;
     std::fs::rename(tmp, path).context("installing offchain provenance manifest")
 }
+
+fn record_refresh(dir: &Path, table: &str, source: &str, error: Option<String>) -> Result<()> {
+    let mut catalogue = load(dir)?;
+    let now = now_stamp();
+    let previous_success = catalogue
+        .refreshes
+        .get(table)
+        .and_then(|refresh| refresh.succeeded_at.clone());
+    catalogue.refreshes.insert(
+        table.to_string(),
+        Refresh {
+            source: source.to_string(),
+            attempted_at: now.clone(),
+            succeeded_at: if error.is_some() {
+                previous_success
+            } else {
+                Some(now)
+            },
+            error,
+        },
+    );
+    save(dir, &catalogue)
+}
 fn now_stamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     format!(
@@ -249,6 +346,55 @@ fn now_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pulled_json_is_an_append_only_snapshot_with_url_provenance() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route(
+            "/prices",
+            get(|| async { r#"[{"token":"WETH","price":"3210"}]"# }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = format!("http://{}/prices", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        pull_json(dir.path(), &source, "prices").await.unwrap();
+        let catalogue = load(dir.path()).unwrap();
+        let snapshot = &catalogue.tables["prices"][0];
+        assert_eq!(snapshot.source, source);
+        assert_eq!(snapshot.rows, 1);
+        assert_eq!(snapshot.columns, ["price", "token"]);
+
+        // The same fetched bytes append nothing twice, exactly as a repeated file drop does.
+        pull_json(dir.path(), &snapshot.source, "prices")
+            .await
+            .unwrap();
+        assert_eq!(load(dir.path()).unwrap().tables["prices"].len(), 1);
+        server.abort();
+
+        let failure = "http://127.0.0.1:1/unavailable";
+        assert!(pull_json(dir.path(), failure, "prices").await.is_err());
+        let refresh = &load(dir.path()).unwrap().refreshes["prices"];
+        assert_eq!(refresh.source, failure);
+        assert!(
+            refresh.succeeded_at.is_some(),
+            "last good price remains named"
+        );
+        assert!(refresh.error.is_some(), "outage is recorded, not hidden");
+
+        let status = crate::analytics::query(
+            dir.path(),
+            "SELECT stale, succeeded_at, error FROM offchain__prices__status",
+        )
+        .unwrap();
+        assert_eq!(status[0]["stale"], true);
+        assert!(status[0]["succeeded_at"].is_string());
+        assert!(status[0]["error"].is_string());
+    }
 
     #[test]
     fn csv_snapshot_is_content_addressed_and_records_provenance() {

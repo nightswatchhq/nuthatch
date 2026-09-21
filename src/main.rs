@@ -163,6 +163,12 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&args.file),
                 &args.table,
             ),
+            cli::OffchainWhat::Pull(args) => offchain::pull_json(
+                std::path::Path::new(&args.dir),
+                &args.source,
+                &args.table,
+            )
+            .await,
         },
         cli::Command::Publish(args) => match args.what {
             cli::PublishWhat::Sync(a) => {

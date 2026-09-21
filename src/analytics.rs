@@ -2984,30 +2984,55 @@ fn define_offchain_views(
         );
         return;
     };
-    for (table, snapshots) in catalogue.tables {
+    for (table, snapshots) in &catalogue.tables {
         let view = format!("offchain__{table}");
-        if wanted.is_some_and(|set| !set.contains(&view.to_ascii_lowercase())) {
-            continue;
+        if !wanted.is_some_and(|set| !set.contains(&view.to_ascii_lowercase())) {
+            let files: Vec<String> = snapshots
+                .iter()
+                .map(|s| {
+                    dir.join(crate::offchain::DIR)
+                        .join("segments")
+                        .join(&s.file)
+                })
+                .filter(|p| p.exists())
+                .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+                .collect();
+            if !files.is_empty() {
+                let ddl = format!(
+                    "CREATE OR REPLACE VIEW \"{view}\" AS SELECT * FROM read_parquet([{}], union_by_name=true)",
+                    files.join(", ")
+                );
+                if let Err(e) = conn.execute_batch(&ddl) {
+                    tracing::warn!("offchain view {view} skipped: {e}");
+                }
+            }
         }
-        let files: Vec<String> = snapshots
-            .iter()
-            .map(|s| {
-                dir.join(crate::offchain::DIR)
-                    .join("segments")
-                    .join(&s.file)
-            })
-            .filter(|p| p.exists())
-            .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
-            .collect();
-        if files.is_empty() {
+
+        let status_view = format!("{view}__status");
+        let Some(refresh) = catalogue.refreshes.get(table) else {
             continue;
-        }
+        };
+        let quote = |value: &str| value.replace('\'', "''");
+        let success = refresh
+            .succeeded_at
+            .as_deref()
+            .map(|value| format!("'{}'", quote(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let error = refresh
+            .error
+            .as_deref()
+            .map(|value| format!("'{}'", quote(value)))
+            .unwrap_or_else(|| "NULL".to_string());
         let ddl = format!(
-            "CREATE OR REPLACE VIEW \"{view}\" AS SELECT * FROM read_parquet([{}], union_by_name=true)",
-            files.join(", ")
+            "CREATE OR REPLACE VIEW \"{status_view}\" AS SELECT \
+             '{}' AS source, '{}' AS attempted_at, {success} AS succeeded_at, {error} AS error, \
+             {} AS stale",
+            quote(&refresh.source),
+            quote(&refresh.attempted_at),
+            refresh.error.is_some()
         );
         if let Err(e) = conn.execute_batch(&ddl) {
-            tracing::warn!("offchain view {view} skipped: {e}");
+            tracing::warn!("offchain status view {status_view} skipped: {e}");
         }
     }
 }

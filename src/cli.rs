@@ -286,12 +286,27 @@ pub struct OffchainArgs {
 pub enum OffchainWhat {
     /// Import one CSV, JSON array, or Parquet file as an immutable, content-addressed snapshot.
     Drop(OffchainDropArgs),
+    /// Fetch a JSON-array price feed once. Schedule this command on the host; it never runs in the
+    /// chain cursor or the query path.
+    Pull(OffchainPullArgs),
 }
 
 #[derive(Args)]
 pub struct OffchainDropArgs {
     /// Source CSV, JSON, or Parquet file. Read once; indexing never reads this path.
     pub file: String,
+    /// SQL table name beneath the `offchain__` namespace.
+    #[arg(long)]
+    pub table: String,
+    /// Nest directory containing the offchain namespace.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+}
+
+#[derive(Args)]
+pub struct OffchainPullArgs {
+    /// HTTPS source returning a JSON array of price objects.
+    pub source: String,
     /// SQL table name beneath the `offchain__` namespace.
     #[arg(long)]
     pub table: String,
