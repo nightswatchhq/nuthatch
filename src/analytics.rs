@@ -2986,55 +2986,81 @@ fn define_offchain_views(
     };
     for (table, snapshots) in &catalogue.tables {
         let view = format!("offchain__{table}");
-        if !wanted.is_some_and(|set| !set.contains(&view.to_ascii_lowercase())) {
-            let files: Vec<String> = snapshots
-                .iter()
-                .map(|s| {
-                    dir.join(crate::offchain::DIR)
-                        .join("segments")
-                        .join(&s.file)
-                })
-                .filter(|p| p.exists())
-                .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
-                .collect();
-            if !files.is_empty() {
-                let ddl = format!(
-                    "CREATE OR REPLACE VIEW \"{view}\" AS SELECT * FROM read_parquet([{}], union_by_name=true)",
-                    files.join(", ")
-                );
-                if let Err(e) = conn.execute_batch(&ddl) {
-                    tracing::warn!("offchain view {view} skipped: {e}");
-                }
-            }
-        }
-
-        let status_view = format!("{view}__status");
-        let Some(refresh) = catalogue.refreshes.get(table) else {
+        if wanted.is_some_and(|set| !set.contains(&view.to_ascii_lowercase())) {
             continue;
-        };
-        let quote = |value: &str| value.replace('\'', "''");
-        let success = refresh
-            .succeeded_at
-            .as_deref()
-            .map(|value| format!("'{}'", quote(value)))
-            .unwrap_or_else(|| "NULL".to_string());
-        let error = refresh
-            .error
-            .as_deref()
-            .map(|value| format!("'{}'", quote(value)))
-            .unwrap_or_else(|| "NULL".to_string());
+        }
+        let files: Vec<String> = snapshots
+            .iter()
+            .map(|s| {
+                dir.join(crate::offchain::DIR)
+                    .join("segments")
+                    .join(&s.file)
+            })
+            .filter(|p| p.exists())
+            .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
         let ddl = format!(
-            "CREATE OR REPLACE VIEW \"{status_view}\" AS SELECT \
-             '{}' AS source, '{}' AS attempted_at, {success} AS succeeded_at, {error} AS error, \
-             {} AS stale",
-            quote(&refresh.source),
-            quote(&refresh.attempted_at),
-            refresh.error.is_some()
+            "CREATE OR REPLACE VIEW \"{view}\" AS SELECT * FROM read_parquet([{}], union_by_name=true)",
+            files.join(", ")
         );
         if let Err(e) = conn.execute_batch(&ddl) {
-            tracing::warn!("offchain status view {status_view} skipped: {e}");
+            tracing::warn!("offchain view {view} skipped: {e}");
         }
     }
+    // Keyed on pulls, not snapshots: a pull that has never succeeded has no snapshot, and its status
+    // is then the only thing there is to see.
+    for (table, refresh) in &catalogue.refreshes {
+        let view = format!("offchain__{table}__status");
+        if wanted.is_some_and(|set| !set.contains(&view.to_ascii_lowercase())) {
+            continue;
+        }
+        let ddl = offchain_status_ddl(&view, table, refresh);
+        if let Err(e) = conn.execute_batch(&ddl) {
+            tracing::warn!("offchain status view {view} skipped: {e}");
+        }
+    }
+}
+
+/// `stale` is true on a recorded failure, before any success, or past the declared cadence. Views
+/// are defined as each query is prepared, so the age is taken then, in Rust: extracting from
+/// DuckDB's `now()` needs ICU, which the bundled build does not load.
+fn offchain_status_ddl(view: &str, table: &str, refresh: &crate::offchain::Refresh) -> String {
+    let text = |value: Option<&str>| {
+        value.map_or("CAST(NULL AS VARCHAR)".to_string(), |v| {
+            format!("'{}'", v.replace('\'', "''"))
+        })
+    };
+    let int =
+        |value: Option<i64>| value.map_or("CAST(NULL AS BIGINT)".to_string(), |v| v.to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let age = refresh
+        .succeeded_at
+        .as_deref()
+        .and_then(|s| s.strip_prefix("unix:"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|t| now - t);
+    let stale_after = refresh.stale_after_secs.map(|s| s as i64);
+    let stale = refresh.error.is_some()
+        || age.is_none()
+        || matches!((age, stale_after), (Some(a), Some(s)) if a > s);
+    format!(
+        "CREATE OR REPLACE VIEW \"{view}\" AS SELECT \
+         {table_lit} AS \"table\", {source} AS source, {attempted} AS attempted_at, \
+         {succeeded} AS succeeded_at, {error} AS error, {stale_after} AS stale_after_secs, \
+         {age} AS age_secs, {stale} AS stale",
+        table_lit = text(Some(table)),
+        source = text(Some(&refresh.source)),
+        attempted = text(Some(&refresh.attempted_at)),
+        succeeded = text(refresh.succeeded_at.as_deref()),
+        error = text(refresh.error.as_deref()),
+        stale_after = int(stale_after),
+        age = int(age),
+    )
 }
 
 /// Make a nest-authored `CREATE VIEW` re-runnable on a cached connection (#295).
