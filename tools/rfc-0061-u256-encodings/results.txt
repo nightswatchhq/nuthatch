@@ -1,0 +1,52 @@
+# spike-1222 on pepe-thinkpad, 2026-09-21T19:29Z; parquet/arrow 58.3.0, ZSTD(3); DuckDB v1.5.4
+== graph_token__approval.value
+rows=2843980 nulls=0 over_38_digits=1333963 over_76_digits=1324091 exactly_2^256-1=404331
+A text               16.03 MB  1.00x
+B flba32             13.90 MB  0.87x
+C decimal76           5.93 MB  0.37x
+D text+dec38+ovf     21.89 MB  1.37x
+== graph_token__transfer.value
+rows=6587086 nulls=0 over_38_digits=0 over_76_digits=0 exactly_2^256-1=0
+A text               43.80 MB  1.00x
+B flba32             37.94 MB  0.87x
+C decimal76          37.94 MB  0.87x
+D text+dec38+ovf     81.29 MB  1.86x
+== DuckDB read-back
+section = -- types as DuckDB 1.5.4 reads them
+     a_text = VARCHAR
+   b_flba32 = BLOB
+c_decimal76 = DOUBLE
+    d_dec38 = DECIMAL(38,0)
+section = -- C: does DECIMAL(76) survive the read? rows whose value differs from the exact text
+       rows_compared = 6587086
+rows_changed_by_read = 6587086
+  longest_exact_text = 27
+section = -- C: one example of what the read does to a value
+exact_text = 18024260660084595035534
+   as_read = 1.8024260660084594e+22
+section = -- ordering: max by each encoding on approvals (numeric max is 2^256-1)
+      a_text_max = 999999999999999999999999999999999999999999999999999999
+b_flba32_max_hex = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+section = -- footer statistics for the value column
+file_name = out-graph_token__approval/a_text.parquet
+stats_min = NULL
+stats_max = NULL
+file_name = out-graph_token__approval/b_flba32.parquet
+stats_min = NULL
+stats_max = NULL
+section = -- D: exact sum over the physical DECIMAL(38,0) companion, transfers
+    sum_dec38 = 31789323362363940308029170464
+overflow_rows = 0
+== footer statistics (min_value / max_value)
+      file_name = out-graph_token__approval/a_text.parquet
+stats_min_value = 0
+stats_max_value = 999999999999999999999999999999999999999999999999999999
+      file_name = out-graph_token__approval/b_flba32.parquet
+stats_min_value = \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00
+stats_max_value = \xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF
+      file_name = out-graph_token__transfer/d_text_dec38.parquet
+stats_min_value = 0
+stats_max_value = 9999999999999999999999
+      file_name = out-graph_token__transfer/d_text_dec38.parquet
+stats_min_value = 0
+stats_max_value = 143573301693755377541155834

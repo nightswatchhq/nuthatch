@@ -204,7 +204,27 @@ narrowing and is not a compatible reading of this format.
 
 Which Utf8 columns are big integers is not in the Parquet schema. nuthatch knows from
 `schema.json` (and the live decode registry). An external reader uses that file, or treats
-every Utf8 column as text.
+every Utf8 column as text. A published mirror carries `schema.json` with its hash.
+
+The conversion, per engine:
+
+| engine | conversion | exact over |
+| --- | --- | --- |
+| DuckDB | `TRY_CAST(c AS DECIMAL(38,0))`, NULL past 38 digits | values up to 38 digits |
+| DuneSQL | `cast(c as uint256)`, or `int256` for a signed column, as `nuthatch emit dune` writes it | every 256-bit value |
+
+Another engine is listed here once its recipe has been run, not before (RFC-0052 S5).
+
+Overflow is concentrated, not general. Measured on the Arbitrum Network corpus (RFC-0061):
+
+- **Approvals:** 46.9% of `graph_token__approval.value` has more than 38 digits, most of it the
+  unlimited-allowance sentinel `2^256 − 1`.
+- **Transfers:** none of the 6.59M `graph_token__transfer.value` rows does.
+
+Amounts fit `DECIMAL(38,0)`; `c_overflow` mostly marks the sentinel.
+
+The physical type stays text. RFC-0061 records why: `DECIMAL(76,0)` cannot hold every 256-bit
+value, and DuckDB reads it as `DOUBLE`. `FIXED_LEN_BYTE_ARRAY(32)` reads as an opaque blob.
 
 The query-side gate is `bigint_columns_get_decimal_and_overflow_views` in `src/analytics.rs`.
 
