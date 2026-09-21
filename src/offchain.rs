@@ -497,6 +497,12 @@ fn validate_table(table: &str) -> Result<()> {
     {
         bail!("offchain table name must contain only letters, digits, and '_'");
     }
+    if table.to_ascii_lowercase().ends_with("__status") {
+        bail!(
+            "offchain table name may not end in `__status`: `offchain__<table>__status` is the \
+             status view of a pulled table, and this name would collide with one"
+        );
+    }
     Ok(())
 }
 fn validate_columns(columns: &[String]) -> Result<()> {
@@ -904,6 +910,17 @@ mod tests {
             w.join().unwrap();
         }
         assert_eq!(load(dir.path()).unwrap().refreshes.len(), 16);
+    }
+
+    #[test]
+    fn a_table_name_ending_in_the_status_suffix_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("p.csv");
+        std::fs::write(&input, "token\nWETH\n").unwrap();
+        let err = drop_file(dir.path(), &input, "prices__Status")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("__status"), "{err}");
     }
 
     #[test]
