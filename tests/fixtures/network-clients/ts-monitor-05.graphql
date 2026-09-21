@@ -1,0 +1,36 @@
+
+            query allocations(
+              $indexer: String!
+              $closedAtEpochThreshold: Int!
+              $lastId: String!
+            ) {
+              allocations(
+                where: {
+                  indexer: $indexer
+                  status: Closed
+                  closedAtEpoch_gte: $closedAtEpochThreshold
+                  id_gt: $lastId
+                }
+                first: 1000
+                orderBy: id
+                orderDirection: desc
+              ) {
+                id
+                isLegacy
+                indexer {
+                  id
+                }
+                allocatedTokens
+                createdAt
+                createdAtEpoch
+                closedAt
+                closedAtEpoch
+                createdAtBlockHash
+                subgraphDeployment {
+                  id
+                  stakedTokens
+                  signalledTokens
+                  queryFeesAmount
+                }
+              }
+            }

@@ -1,0 +1,31 @@
+
+            query allocations(
+              $indexer: String!
+              $status: AllocationStatus!
+              $lastId: String!
+            ) {
+              allocations(
+                where: { indexer: $indexer, status: $status, id_gt: $lastId }
+                first: 1000
+                orderBy: id
+                orderDirection: asc
+              ) {
+                id
+                isLegacy
+                indexer {
+                  id
+                }
+                allocatedTokens
+                createdAt
+                createdAtEpoch
+                closedAt
+                closedAtEpoch
+                createdAtBlockHash
+                subgraphDeployment {
+                  id
+                  stakedTokens
+                  signalledTokens
+                  queryFeesAmount
+                }
+              }
+            }

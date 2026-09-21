@@ -1,0 +1,326 @@
+[nest]
+name = "graph-network"
+chain = "arbitrum-one"
+chain_id = 42161
+schema_version = 3
+block_timestamps = true
+rpc_urls = ["https://arb1.arbitrum.io/rpc"]
+
+[[contracts]]
+alias = "l2_gateway"
+address = "0x65e1a5e8946e7e87d9774f5288f41c30a99fd302"
+start_block = 42449749
+abi = "abis/L2GatewayEvents.json"
+events = ["WithdrawalInitiated", "DepositFinalized"]
+
+[[contracts]]
+alias = "graph_payments"
+address = "0x7aae8ae011927bc36cb4d0d3e81f2e6e30dae06d"
+start_block = 42440000
+abi = "abis/GraphPaymentsEvents.json"
+events = ["GraphPaymentCollected"]
+
+[[contracts]]
+alias = "dispute_legacy"
+address = "0x0ab2b043138352413bb02e67e626a70320e3bd46"
+start_block = 42440000
+abi = "abis/DisputeManagerStitchedEvents.json"
+events = ["DisputeAccepted","DisputeDrawn","DisputeLinked","DisputeRejected","IndexingDisputeCreated","ParameterUpdated","QueryDisputeCreated"]
+
+[[contracts]]
+alias = "dispute_horizon"
+address = "0x2fe023a575449acb698648ed21276293fa176f96"
+start_block = 397492858
+abi = "abis/HorizonDisputeManagerEvents.json"
+events = ["ArbitratorSet","DisputeAccepted","DisputeCancelled","DisputeDrawn","DisputeLinked","DisputePeriodSet","DisputeRejected","FishermanRewardCutSet","IndexingDisputeCreated","LegacyDisputeCreated","MaxSlashingCutSet","QueryDisputeCreated"]
+
+
+[[contracts]]
+alias = "graph_token"
+address = "0x9623063377ad1b27544c965ccd7342f7ea7e88c7"
+start_block = 42440000
+abi = "abis/GraphTokenEvents.json"
+events = ["Transfer", "Approval"]
+
+[[contracts]]
+alias = "controller"
+address = "0x0a8491544221dd212964fbb96487467291b2c97e"
+# Upstream's conservative pre-deployment boundary, not a claimed creation block.
+start_block = 42440000
+abi = "abis/ControllerEvents.json"
+events = ["SetContractProxy", "NewOwnership", "PartialPauseChanged", "PauseChanged", "NewPauseGuardian"]
+
+[[contracts]]
+alias = "epoch_manager"
+address = "0x5a843145c43d328b9bb7a4401d94918f131bb281"
+start_block = 42449227
+abi = "abis/EpochManagerEvents.json"
+events = ["EpochRun", "EpochLengthUpdate"]
+
+[[calls]]
+canonical = true
+name = "governor_read"
+contract = "0x0a8491544221dd212964fbb96487467291b2c97e"
+# The first Arbitrum network event is Controller.PauseChanged, before any
+# NewOwnership event. Preserve the constructor's getGovernor() result.
+on_any = ["controller__set_contract_proxy", "controller__new_ownership", "controller__partial_pause_changed", "controller__pause_changed", "controller__new_pause_guardian"]
+signature = "getGovernor()"
+args = []
+
+[[calls]]
+canonical = true
+name = "epoch_manager_l1_block"
+contract = "0x5a843145c43d328b9bb7a4401d94918f131bb281"
+# The mapping refreshes its L1 clock on these events, not merely EpochRun.
+# Fixed-address calls are deduplicated per block across all matching sources.
+on_any = [
+  "issuance_allocator__target_allocation_updated",
+  "l2_gateway__withdrawal_initiated",
+  "l2_gateway__deposit_finalized",
+  "graph_payments__graph_payment_collected",
+  "dispute_legacy__parameter_updated",
+  "dispute_horizon__arbitrator_set",
+  "dispute_horizon__dispute_accepted",
+  "dispute_horizon__dispute_period_set",
+  "dispute_horizon__fisherman_reward_cut_set",
+  "dispute_horizon__max_slashing_cut_set",
+  "graph_token__transfer",
+  "graph_token__approval",
+  "controller__set_contract_proxy",
+  "controller__new_ownership",
+  "controller__partial_pause_changed",
+  "controller__pause_changed",
+  "controller__new_pause_guardian",
+  "epoch_manager__epoch_run",
+  "epoch_manager__epoch_length_update",
+  "subgraph_service__allocation_closed",
+  "subgraph_service__allocation_created",
+  "subgraph_service__indexing_rewards_collected",
+  "subgraph_service__query_fees_collected",
+  "subgraph_service__p_o_i_presented",
+  "staking_legacy__allocation_collected",
+  "staking_legacy__rebate_claimed",
+  "staking_legacy__allocation_closed_f672",
+  "staking_legacy__allocation_closed_7203",
+  "staking_legacy__allocation_created",
+  "staking_legacy__asset_holder_update",
+  "staking_legacy__delegation_parameters_updated",
+  "staking_legacy__rebate_collected",
+  "staking_legacy__slasher_update",
+  "staking_legacy__stake_delegated_locked",
+  "staking_legacy__stake_deposited",
+  "staking_legacy__stake_locked",
+  "staking_legacy__stake_slashed",
+  "staking_legacy__stake_withdrawn",
+  "staking_parameters__parameter_updated",
+  "gns__n_signal_burned",
+  "gns__n_signal_minted",
+  "gns__subgraph_deprecated_cd16",
+  "gns__subgraph_deprecated_905d",
+  "gns__signal_burned",
+  "gns__signal_minted",
+  "horizon_staking__delegation_slashed",
+  "horizon_staking__delegation_slashing_enabled",
+  "horizon_staking__horizon_stake_deposited",
+  "horizon_staking__horizon_stake_locked",
+  "horizon_staking__horizon_stake_withdrawn",
+  "horizon_staking__max_thawing_period_set",
+  "horizon_staking__provision_created",
+  "horizon_staking__provision_increased",
+  "horizon_staking__provision_slashed",
+  "horizon_staking__provision_thawed",
+  "horizon_staking__thawing_period_cleared",
+  "horizon_staking__tokens_deprovisioned",
+  "horizon_staking__tokens_to_delegation_pool_added",
+  "horizon_staking__tokens_undelegated",
+  "rewards__parameter_updated",
+  "rewards__rewards_assigned",
+  "rewards__horizon_rewards_assigned",
+]
+signature = "blockNum()"
+args = []
+
+[[contracts]]
+alias = "escrow"
+address = "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e"
+start_block = 397491106
+abi = "abis/PaymentsEscrow.json"
+events = ["Deposit", "Withdraw", "Thaw", "CancelThaw", "EscrowCollected"]
+
+[[contracts]]
+alias = "tally"
+address = "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e"
+start_block = 399496057
+abi = "abis/GraphTallyCollector.json"
+events = ["PaymentCollected", "SignerAuthorized", "SignerThawing", "SignerThawCanceled", "SignerRevoked"]
+
+[[contracts]]
+alias = "subgraph_service"
+address = "0xb2bb92d0de618878e438b55d5846cfecd9301105"
+start_block = 397492865
+abi = "abis/SubgraphService.json"
+events = ["AllocationCreated", "AllocationClosed", "AllocationResized", "POIPresented", "IndexingRewardsCollected", "QueryFeesCollected", "ServiceProviderRegistered", "RewardsDestinationSet"]
+
+[[contracts]]
+alias = "staking_legacy"
+address = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+start_block = 42449585
+abi = "abis/IStakingStitched.json"
+events = ["AllocationCreated", "AllocationClosed", "AllocationCollected", "RebateCollected", "RebateClaimed", "StakeDeposited", "StakeWithdrawn", "StakeLocked", "StakeSlashed", "StakeDelegated", "StakeDelegatedLocked", "StakeDelegatedWithdrawn", "DelegationParametersUpdated", "SlasherUpdate", "AssetHolderUpdate"]
+
+[[contracts]]
+alias = "staking_parameters"
+address = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+start_block = 42449585
+abi = "abis/ParameterUpdated.json"
+events = ["ParameterUpdated"]
+
+[[contracts]]
+alias = "curation"
+address = "0x22d78fb4bc72e191c765807f8891b5e1785c8014"
+start_block = 42449403
+abi = "abis/CurationEvents.json"
+events = ["Signalled", "Burned"]
+
+[[contracts]]
+alias = "gns"
+address = "0xec9a7fb6cbc2e41926127929c2dce6e9c5d33bec"
+start_block = 42449510
+abi = "abis/GNSPublishingEvents.json"
+events = ["SubgraphPublished", "SubgraphVersionUpdated", "SubgraphReceivedFromL1", "SubgraphDeprecated", "NSignalMinted", "NSignalBurned", "SignalMinted", "SignalBurned"]
+
+[[contracts]]
+alias = "horizon_staking"
+address = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+# Same proxy as legacy staking. Distinct event signatures, no duplicate ledger entries.
+start_block = 42449585
+abi = "abis/HorizonStaking.json"
+events = ["ProvisionCreated", "ProvisionIncreased", "ProvisionThawed", "TokensDeprovisioned", "ProvisionSlashed", "ProvisionParametersSet", "ProvisionParametersStaged", "ThawRequestCreated", "ThawRequestFulfilled", "HorizonStakeDeposited", "HorizonStakeLocked", "HorizonStakeWithdrawn", "TokensDelegated", "TokensUndelegated", "DelegatedTokensWithdrawn", "TokensToDelegationPoolAdded", "DelegationSlashed", "DelegationFeeCutSet", "MaxThawingPeriodSet", "ThawingPeriodCleared", "DelegationSlashingEnabled"]
+
+[[contracts]]
+alias = "service_registry"
+address = "0x072884c745c0a23144753335776c99be22588f8a"
+start_block = 42449357
+abi = "abis/ServiceRegistryEvents.json"
+events = ["ServiceRegistered", "ServiceUnregistered"]
+
+# A forced closure need not emit IndexingRewardsCollected. Its epoch must come from
+# the EpochManager at the closure block, not the last rewarded epoch or an L2 division.
+[[calls]]
+canonical = true
+name = "allocation_close_epoch"
+contract = "0x5a843145c43d328b9bb7a4401d94918f131bb281"
+on = "subgraph_service__allocation_closed"
+signature = "currentEpoch()"
+args = []
+
+[[contracts]]
+alias = "rewards"
+address = "0x971b9d3d0ae3eca029cab5ea1fb0f72c85e6a525"
+start_block = 42449638
+abi = "abis/RewardsManagerStitched.json"
+events = ["ParameterUpdated", "RewardsDenylistUpdated", "RewardsAssigned", "HorizonRewardsAssigned"]
+
+[[contracts]]
+alias = "issuance_allocator"
+address = "0xb64f29b2d81140ffc3a135e319561a1bd03b1a7e"
+# Proxy deployment, address-book 1.3.0 issuance/addresses.json.
+start_block = 486895439
+abi = "abis/IssuanceAllocator.json"
+events = ["TargetAllocationUpdated"]
+
+[[calls]]
+canonical = true
+name = "allocated_issuance_read"
+contract = "0x971b9d3d0ae3eca029cab5ea1fb0f72c85e6a525"
+on = "rewards__parameter_updated"
+signature = "getAllocatedIssuancePerBlock()"
+args = []
+
+[[calls]]
+canonical = true
+name = "legacy_issuance_read"
+contract = "0x971b9d3d0ae3eca029cab5ea1fb0f72c85e6a525"
+on = "rewards__parameter_updated"
+signature = "issuancePerBlock()"
+args = []
+
+[[calls]]
+canonical = true
+name = "protocol_percentage_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "protocolPercentage()"
+args = []
+
+[[calls]]
+canonical = true
+name = "minimum_indexer_stake_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "minimumIndexerStake()"
+args = []
+
+[[calls]]
+canonical = true
+name = "thawing_period_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "thawingPeriod()"
+args = []
+
+[[calls]]
+canonical = true
+name = "curation_percentage_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "curationPercentage()"
+args = []
+
+[[calls]]
+canonical = true
+name = "delegation_ratio_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "delegationRatio()"
+args = []
+
+[[calls]]
+canonical = true
+name = "max_allocation_epochs_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "maxAllocationEpochs()"
+args = []
+
+[[calls]]
+canonical = true
+name = "channel_dispute_epochs_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "channelDisputeEpochs()"
+args = []
+
+[[calls]]
+canonical = true
+name = "delegation_parameters_cooldown_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "delegationParametersCooldown()"
+args = []
+
+[[calls]]
+canonical = true
+name = "delegation_unbonding_period_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "delegationUnbondingPeriod()"
+args = []
+
+[[calls]]
+canonical = true
+name = "delegation_tax_percentage_read"
+contract = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03"
+on = "staking_parameters__parameter_updated"
+signature = "delegationTaxPercentage()"
+args = []

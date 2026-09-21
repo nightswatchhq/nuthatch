@@ -57,6 +57,10 @@ path = "tests/e2e_warm_restart.rs"
 name = "skill_refs"
 path = "tests/skill_refs.rs"
 
+[[test]]
+name = "network_contract"
+path = "tests/network_contract.rs"
+
 [dependencies]
 # graph-node's own pluralisation, so a generated root field name matches it by construction rather
 # than by a rule reimplemented here (`graph/src/data/graphql/ext.rs:360` calls `to_plural`).
@@ -89,7 +93,7 @@ parquet = { version = "58", default-features = false, features = ["arrow", "snap
 # graph-node computes its own `BigDecimal` on this crate, and the prices a subgraph stores need an
 # integer wider than any fixed-width type: `sqrtPriceX96^2` reaches 2^384.
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
-duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
+duckdb = { version = "1", features = ["bundled", "parquet", "json", "vscalar", "vscalar-arrow"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
 # satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via

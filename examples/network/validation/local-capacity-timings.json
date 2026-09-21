@@ -1,0 +1,23 @@
+{
+  "date": "2026-09-18",
+  "workload": "capacity_uses_the_last_refresh_event_and_its_protocol_parameters",
+  "command": "cargo test --test it capacity_uses_the_last_refresh_event_and_its_protocol_parameters -- --nocapture",
+  "profile": "local macOS debug test binary",
+  "historicalStates": 12,
+  "perQueryTimeoutSeconds": 5,
+  "samplesPerVariant": 1,
+  "testDurationSeconds": {
+    "baseline": 32.26,
+    "refreshFromEventKeys": 28.13,
+    "refreshFromEventKeysAndScopedDependencyDiscovery": 13.30
+  },
+  "allAssertionsPassed": true,
+  "includesCompilation": false,
+  "paidRpcRequests": 0,
+  "peakRssMeasured": false,
+  "limitations": [
+    "Single local observations, not a statistical benchmark or a production latency claim.",
+    "Small synthetic hot-store history, not the full Arbitrum contract history.",
+    "No concurrent-client, Linux, cold-store throughput or freshness measurement."
+  ]
+}

@@ -6,6 +6,17 @@ pinned. Clean release build, `CARGO_TARGET_DIR` private to this run.
 Slice 0 asks four things: what native code ships, why, what it costs, and what DuckDB is actually
 *for*. It does not propose replacing anything.
 
+2026-09-17 inventory addition: `analytics_scalars.rs` supplies bounded, deterministic
+Arrow scalar functions for bounded ABI tuple and uint256 decoding, exact unsigned
+multiply/divide, uint256 word/base58 encoding, Keccak and digest-to-CID encoding.
+DuckDB `BIGNUM` multiplication coerces to floating point,
+so it cannot implement full-width token reward splits faithfully. The one new
+crate-internal DuckDB signature is `register(&Connection)`, called only by the
+existing analytical connection constructor. No engine type crosses the public
+boundary, no second connection path is added, and these functions perform no I/O.
+The inventory checks explicitly include this role; the original measurements below
+have not been re-measured for this addition.
+
 ## 1. What compiles native code into the binary
 
 Ground truth is object files produced under each crate's build directory, not crate names.
@@ -111,13 +122,15 @@ ABI floor on one target and change nothing a user can observe on the other. Wort
 
 The deletion checklist. §9 named four roles; walking the call sites finds six. Two were originally
 classified **product-visible**; slice 3 found that to be **one** - see the correction below the table.
-Two sites have been added since, `port_emit.rs` (test-only, 2026-09-08) and `dune_views.rs`
-(production, 2026-09-15), so the table now lists eight; the six in the heading is what slice 0 found,
+Three sites have been added since: `port_emit.rs` (test-only, 2026-09-08), `dune_views.rs`
+(production, 2026-09-15), and `analytics_scalars.rs` (production, 2026-09-17).
+The table now lists nine; the six in the heading is what slice 0 found,
 kept because that is the number the rest of this document reasons about.
 
 | site | role | classification | notes |
 | --- | --- | --- | --- |
 | `analytics.rs` | general SQL, views, hot+cold federation | production | 53 connection ops, the obvious one |
+| `analytics_scalars.rs` | pure bounded scalar conversions and exact arithmetic | production | registers on the existing analytical connection; one crate-internal `&Connection` signature, no additional connection or I/O |
 | `entities.rs` | aggregate **classification** from `duckdb_functions()` | **production, public contract** | its own comment: "the same catalogue the binder uses". Narrower than first written - see correction |
 | `entity_lower.rs` | AST for lowering authored SQL to a DBSP circuit | production | RFC-0041 parser role |
 | `graft.rs` | engine string in the derivation reuse key (`engine: "duckdb-v1.4.0"`) | **latent** - see correction below | **not** production: nothing calls it and nothing is written to disk |

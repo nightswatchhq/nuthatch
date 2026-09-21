@@ -15,7 +15,7 @@ pub const ABI_FILE: &str = "abi.json";
 
 /// The nest-config schema this build understands. A nest declaring a higher version is rejected on
 /// load (it was authored by a newer nuthatch) - the guard that makes `init --from` safe.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// An absent `schema_version` means **1**, not "current".
 ///
@@ -26,17 +26,18 @@ fn default_schema_version() -> u32 {
     1
 }
 
-/// The lowest config-schema version that can express this nest.
+/// The lowest config-schema version for a nest's timestamp policy, before call requirements.
 ///
 /// **v2 exists for exactly one reason:** `block_timestamps = false` (RFC-0029 §6b). A pre-0.9 binary
 /// does not know the field, so it would parse such a nest, ignore the declaration, and index
 /// timestamps into a store built without them - the two-schemas-in-one-nest failure the runtime guard
 /// catches locally but an older binary cannot. Stamping v2 makes that binary refuse the nest instead.
 ///
-/// A nest that indexes timestamps is stamped **v1 even though this build is v2**, because it is
+/// A nest that indexes timestamps and has no canonical calls is stamped **v1**, because it is
 /// genuinely a v1 file: nothing in it needs a v2 reader, and gratuitously raising the floor would stop
 /// 0.8.x opening nests it can serve perfectly well. The version records what a *reader* must
-/// understand, not which binary happened to write it.
+/// understand, not which binary happened to write it. Canonical calls additionally require v3,
+/// enforced by `check_schema_version`, so older readers cannot silently use block-number reads.
 pub fn required_schema_version(block_timestamps: bool) -> u32 {
     if block_timestamps {
         1
@@ -642,7 +643,7 @@ impl Config {
         )
     }
 
-    /// Both gates on `schema_version`, shared by the TOML and Starlark load paths.
+    /// Reader and feature gates shared by normal and diagnostic loading.
     fn check_schema_version(&self) -> Result<()> {
         // Too new for us: the nest was authored by a later nuthatch and may mean things by fields we
         // do not know. This is the guard that makes `init --from` safe.
@@ -666,6 +667,14 @@ impl Config {
                  into a nest built without them; the version is what makes them refuse instead.",
                 self.nest.block_timestamps,
                 need,
+                self.nest.schema_version
+            );
+        }
+        if self.calls.iter().any(|call| call.canonical) && self.nest.schema_version < 3 {
+            bail!(
+                "canonical calls need `schema_version = 3` (it says {}). Older nuthatch builds \
+                 ignore `canonical` and would read state by block number instead of block hash; \
+                 the version is what makes them refuse instead.",
                 self.nest.schema_version
             );
         }
@@ -947,6 +956,35 @@ rpc_urls = ["https://rpc.example"]
             required_schema_version(false) <= CURRENT_SCHEMA_VERSION,
             "this build must be able to read what it writes"
         );
+    }
+
+    #[test]
+    fn canonical_calls_require_a_reader_that_understands_hash_pinning() {
+        let raw = include_str!("../examples/network/nuthatch.toml");
+        let dir = tempfile::tempdir().unwrap();
+        for version in [1, 2, 3] {
+            let mut cfg: Config = toml::from_str(raw).unwrap();
+            cfg.nest.schema_version = version;
+            std::fs::write(dir.path().join(CONFIG_FILE), toml::to_string(&cfg).unwrap()).unwrap();
+            for result in [
+                Config::load(dir.path()),
+                Config::load_for_diagnostics(dir.path()),
+            ] {
+                if version < 3 {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("canonical"), "{error}");
+                    assert!(error.contains("schema_version = 3"), "{error}");
+                } else {
+                    assert!(result.unwrap().calls.iter().all(|call| call.canonical));
+                }
+            }
+        }
+        let mut cfg: Config = toml::from_str(raw).unwrap();
+        cfg.nest.schema_version = 1;
+        for call in &mut cfg.calls {
+            call.canonical = false;
+        }
+        cfg.check_schema_version().unwrap();
     }
 
     /// #687: `load` used to call `refuse_unwired_calls`. Claiming that it still does, after the

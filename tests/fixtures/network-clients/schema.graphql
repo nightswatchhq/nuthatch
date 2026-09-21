@@ -1,0 +1,1919 @@
+"""
+Graph Network global parameters and contract addresses
+"""
+type GraphNetwork @entity(immutable: false) {
+  "ID is set to 1"
+  id: ID!
+  "Controller address"
+  controller: Bytes!
+  "Graph token address"
+  graphToken: Bytes!
+  "Epoch manager address"
+  epochManager: Bytes!
+  "Epoch Manager implementations. Last in the array is current"
+  epochManagerImplementations: [Bytes!]!
+  "Curation address"
+  curation: Bytes!
+  "Curation implementations. Last in the array is current"
+  curationImplementations: [Bytes!]!
+  "Staking address"
+  staking: Bytes!
+  "Graph token implementations. Last in the array is current"
+  stakingImplementations: [Bytes!]!
+  "Dispute manager address"
+  disputeManager: Bytes!
+  "GNS address"
+  gns: Bytes!
+  "Service registry address"
+  serviceRegistry: Bytes!
+  "Rewards manager address"
+  rewardsManager: Bytes!
+  "Rewards Manager implementations. Last in the array is current"
+  rewardsManagerImplementations: [Bytes!]!
+  "True if the protocol is paused"
+  isPaused: Boolean!
+  "True if the protocol is partially paused"
+  isPartialPaused: Boolean!
+  "Governor of the controller (i.e. the whole protocol)"
+  governor: Bytes!
+  "Pause guardian address"
+  pauseGuardian: Bytes!
+
+  # Staking global parameters
+  "Percentage of fees going to curators. In parts per million"
+  curationPercentage: Int!
+  "Percentage of fees burn as protocol fee. In parts per million"
+  protocolFeePercentage: Int!
+  "Ratio of max staked delegation tokens to indexers stake that earns rewards"
+  delegationRatio: Int!
+  "[DEPRECATED] Epochs to wait before fees can be claimed in rebate pool"
+  channelDisputeEpochs: Int!
+  "Epochs to wait before delegators can settle"
+  maxAllocationEpochs: Int!
+  "Time in blocks needed to wait to unstake. Set to 0 to signal Graph Horizon's transition period end."
+  thawingPeriod: Int!
+  "Minimum time an Indexer must use for resetting their Delegation parameters"
+  delegationParametersCooldown: Int!
+  "Minimum GRT an indexer must stake"
+  minimumIndexerStake: BigInt!
+  "Contracts that have been approved to be a slasher"
+  slashers: [Bytes!]
+  "Time in epochs a delegator needs to wait to withdraw delegated stake"
+  delegationUnbondingPeriod: Int!
+  "[DEPRECATED] Alpha in the cobbs douglas formula"
+  rebateRatio: BigDecimal!
+  "Alpha in the exponential formula"
+  rebateAlpha: BigDecimal!
+  "Lambda in the exponential formula"
+  rebateLambda: BigDecimal!
+  "Tax that delegators pay to deposit. In Parts per million"
+  delegationTaxPercentage: Int!
+  "Asset holder for the protocol"
+  assetHolders: [Bytes!]
+  "Maximum allowed thawing period for provisions, in seconds"
+  maxThawingPeriod: BigInt!
+  "True if delegation slashing is enabled"
+  delegationSlashingEnabled: Boolean!
+
+  # Transfers to L2 totals
+  "Total amount of indexer stake transferred to L2"
+  totalTokensStakedTransferredToL2: BigInt!
+  "Total amount of delegated tokens transferred to L2"
+  totalDelegatedTokensTransferredToL2: BigInt!
+  "Total amount of delegated tokens transferred to L2"
+  totalSignalledTokensTransferredToL2: BigInt!
+
+  # Staking global aggregate values
+  "The total amount of GRT staked in the staking contract"
+  totalTokensStaked: BigInt!
+  "NOT IMPLEMENTED - Total tokens that are settled and waiting to be claimed"
+  totalTokensClaimable: BigInt! # TODO - see https://github.com/graphprotocol/graph-network-subgraph/issues/89
+  "Total tokens that are currently locked or withdrawable in the network from unstaking"
+  totalUnstakedTokensLocked: BigInt!
+  "Total GRT currently in provisions"
+  totalTokensProvisioned: BigInt!
+  "Total GRT currently thawing from provisions"
+  totalTokensThawing: BigInt!
+  "Total GRT currently in allocation"
+  totalTokensAllocated: BigInt!
+  "Total delegated tokens in the protocol"
+  totalDelegatedTokens: BigInt!
+
+  # Curation global aggregate values
+  "The total amount of GRT signalled in the Curation contract"
+  totalTokensSignalled: BigInt!
+  "Total GRT currently curating via the Auto-Migrate function"
+  totalTokensSignalledAutoMigrate: BigDecimal!
+  "Total GRT currently curating to a specific version"
+  totalTokensSignalledDirectly: BigDecimal!
+
+  # Query fees globals
+  "Total query fees generated in the network"
+  totalQueryFees: BigInt!
+  "Total query fees collected by indexers"
+  totalIndexerQueryFeesCollected: BigInt!
+  "Total query fees rebates claimed by indexers"
+  totalIndexerQueryFeeRebates: BigInt!
+  "Total query fees rebates claimed by delegators"
+  totalDelegatorQueryFeeRebates: BigInt!
+  "Total query fees payed to curators"
+  totalCuratorQueryFees: BigInt!
+  "Total protocol taxes applied to the query fees"
+  totalTaxedQueryFees: BigInt!
+  # It is hard to separate the unclaimed and rebates lost
+  "Total unclaimed rebates. Includes unclaimed rebates, and rebates lost in rebates mechanism "
+  totalUnclaimedQueryFeeRebates: BigInt!
+
+  # Indexing rewards globals
+  "Total indexing rewards minted"
+  totalIndexingRewards: BigInt!
+  "Total indexing rewards minted to Delegators"
+  totalIndexingDelegatorRewards: BigInt!
+  "Total indexing rewards minted to Indexers"
+  totalIndexingIndexerRewards: BigInt!
+
+  # Rewards manager global parameters
+  "(Deprecated) The issuance rate of GRT per block before GIP-0037. To get annual rate do (networkGRTIssuance * 10^-18)^(blocksPerYear)"
+  networkGRTIssuance: BigInt!
+  "The issuance rate of GRT per block after GIP-0037. To get annual rate do (networkGRTIssuancePerBlock * blocksPerYear)"
+  networkGRTIssuancePerBlock: BigInt!
+  "Address of the availability oracle"
+  subgraphAvailabilityOracle: Bytes!
+
+  # Curation global parameters
+  "Default reserve ratio for all subgraphs. In parts per million"
+  defaultReserveRatio: Int!
+  "Minimum amount of tokens needed to start curating"
+  minimumCurationDeposit: BigInt!
+  "The fee charged when a curator withdraws signal. In parts per million"
+  curationTaxPercentage: Int!
+  "Percentage of the GNS migration tax payed by the subgraph owner"
+  ownerTaxPercentage: Int!
+
+  # Graph Token global variables
+  "Graph Token supply"
+  totalSupply: BigInt!
+
+  # TODO - implement these with uniswap
+  "NOT IMPLEMENTED - Price of one GRT in USD"
+  GRTinUSD: BigDecimal!
+  "NOT IMPLEMENTED - Price of one GRT in ETH"
+  GRTinETH: BigDecimal
+
+  # Graph Token mint burn totals
+  "Total amount of GRT minted"
+  totalGRTMinted: BigInt!
+  "Total amount of GRT burned"
+  totalGRTBurned: BigInt!
+
+  # Epoch manager global variables
+  "Epoch Length in blocks"
+  epochLength: Int!
+  "Epoch that was last run"
+  lastRunEpoch: Int!
+  "Epoch when epoch length was last updated"
+  lastLengthUpdateEpoch: Int!
+  "Block when epoch length was last updated"
+  lastLengthUpdateBlock: Int!
+  "Current epoch the protocol is in"
+  currentEpoch: Int!
+
+  # Count aggregate values. Note, deprecated subgraphs or inactive users not removed from counts
+  "Total indexers"
+  indexerCount: Int!
+  "Number of indexers that currently have some stake in the protocol"
+  stakedIndexersCount: Int!
+  "Total amount of delegators historically"
+  delegatorCount: Int!
+  "Total active delegators. Those that still have at least one active delegation."
+  activeDelegatorCount: Int!
+  "Total amount of delegations historically"
+  delegationCount: Int!
+  "Total active delegations. Those delegations that still have GRT staked towards an indexer"
+  activeDelegationCount: Int!
+  "Total amount of curators historically"
+  curatorCount: Int!
+  "Total amount of curators historically"
+  activeCuratorCount: Int!
+  "Total amount of Subgraph entities"
+  subgraphCount: Int!
+  "Amount of active Subgraph entities"
+  activeSubgraphCount: Int!
+  "Total amount of SubgraphDeployment entities"
+  subgraphDeploymentCount: Int!
+  "Total epochs"
+  epochCount: Int!
+  "Total amount of allocations opened"
+  allocationCount: Int!
+  "Total amount of allocations currently active"
+  activeAllocationCount: Int!
+
+  # Dispute Manager global variables
+  "Dispute arbitrator"
+  arbitrator: Bytes!
+  "Penalty to Indexer on successful disputes for query disputes. In parts per million"
+  querySlashingPercentage: Int!
+  "Penalty to Indexer on successful disputes for indexing disputes. In parts per million"
+  indexingSlashingPercentage: Int!
+  "[DEPRECATED] Penalty to Indexer on successful disputes for indexing disputes. In parts per million"
+  slashingPercentage: Int!
+  "Minimum deposit to create a dispute"
+  minimumDisputeDeposit: BigInt!
+  "[LEGACY] Reward to Fisherman on successful disputes. In parts per million"
+  fishermanRewardPercentage: Int!
+  "[HORIZON]Reward to Fisherman on successful disputes. In parts per million"
+  fishermanRewardCut: Int!
+  "Maximum Penalty to Indexer on successful disputes for indexing disputes. Percentage of the indexer's stake snapshot (own stake plus delegated). In parts per million"
+  maxSlashingCut: Int!
+  "Dispute period in seconds"
+  disputePeriod: BigInt!
+
+  # Bridge totals (Only available on L1 networks)
+  "Total amount of GRT deposited to the L1 gateway. Note that the actual amount claimed in L2 might be lower due to tickets not redeemed."
+  totalGRTDeposited: BigInt!
+  "Total amount of GRT withdrawn from the L2 gateway and claimed in L1."
+  totalGRTWithdrawnConfirmed: BigInt!
+  "Total amount of GRT minted by L1 bridge"
+  totalGRTMintedFromL2: BigInt!
+
+  # Bridge totals (Only available on L2 networks)
+  "Total amount of GRT deposited to the L1 gateway and redeemed in L2."
+  totalGRTDepositedConfirmed: BigInt!
+  "Total amount of GRT withdrawn from the L2 gateway. Note that the actual amount claimed in L1 might be lower due to outbound transactions not finalized."
+  totalGRTWithdrawn: BigInt!
+  "Block number for L1. Only implemented for L2 deployments to properly reflect the L1 block used for timings"
+  currentL1BlockNumber: BigInt
+}
+
+type DataService @entity(immutable: false) {
+  "Data Service address"
+  id: ID!
+
+  "Total GRT currently in provisions for this DataService"
+  totalTokensProvisioned: BigInt!
+  "Total GRT currently thawing from provisions for this DataService"
+  totalTokensThawing: BigInt!
+  "Total GRT currently in allocations for this DataService"
+  totalTokensAllocated: BigInt!
+  "Total GRT currently delegated to this DataService"
+  totalTokensDelegated: BigInt!
+
+  "Minimum provision tokens for this DataService"
+  minimumProvisionTokens: BigInt!
+  "Maximum provision tokens for this DataService"
+  maximumProvisionTokens: BigInt!
+
+  "Minimum verifier cut for this DataService"
+  minimumVerifierCut: BigInt!
+  "Maximum verifier cut for this DataService"
+  maximumVerifierCut: BigInt!
+
+  "Minimum thawing period for this DataService"
+  minimumThawingPeriod: BigInt!
+  "Maximum thawing period for this DataService"
+  maximumThawingPeriod: BigInt!
+
+  "Ratio of max staked delegation tokens to indexers stake that earns rewards"
+  delegationRatio: Int
+
+  provisions: [Provision!]! @derivedFrom(field: "dataService")
+
+  "True if allowed for usage with token lock wallets"
+  allowedWithTokenLockWallets: Boolean!
+
+  "[SubgraphService] Curation cut for this DataService"
+  curationCut: BigInt!
+  "[SubgraphService] Max POI staleness"
+  maxPOIStaleness: BigInt!
+  "[SubgraphService] Stake to fees ratio"
+  stakeToFeesRatio: BigInt!
+}
+
+"""
+An account within the graph network. Contains metadata and all relevant data for this accounts
+delegating, curating, and indexing.
+"""
+type GraphAccount @entity(immutable: false) {
+  "Graph account ID"
+  id: ID!
+  "All names this graph account has claimed from all name systems"
+  names: [GraphAccountName!]! @derivedFrom(field: "graphAccount")
+  "Default name the graph account has chosen"
+  defaultName: GraphAccountName # Can optimize in future by checking ENS & others to make sure they still own the name
+  "Time the account was created"
+  createdAt: Int!
+  "Default display name is the current default name. Used for filtered queries in the explorer"
+  defaultDisplayName: String
+
+  # IPFS Meta.
+  metadata: GraphAccountMeta
+
+  # Operator info
+  "Operator of other Graph Accounts"
+  operatorOf: [GraphAccount!]! @derivedFrom(field: "operators")
+  "Operators of this Graph Account"
+  operators: [GraphAccount!]!
+  "Horizon Operators of this Graph Account"
+  horizonOperators: [HorizonOperator!]!
+
+  # GRT info
+  "Graph token balance"
+  balance: BigInt!
+  "Balance received due to failed signal transfer from L1"
+  balanceReceivedFromL1Signalling: BigInt!
+  "Balance received due to failed delegation transfer from L1"
+  balanceReceivedFromL1Delegation: BigInt!
+  "Amount this account has approved staking to transfer their GRT"
+  curationApproval: BigInt!
+  "Amount this account has approved curation to transfer their GRT"
+  stakingApproval: BigInt!
+  "Amount this account has approved the GNS to transfer their GRT"
+  gnsApproval: BigInt!
+
+  # Subgraphs
+  "Subgraphs the graph account owns"
+  subgraphs: [Subgraph!]! @derivedFrom(field: "owner")
+  "Time that this graph account became a developer"
+  developerCreatedAt: Int
+  "NOT IMPLEMENTED - Total query fees the subgraphs created by this account have accumulated in GRT"
+  subgraphQueryFees: BigInt! # TODO - This is very hard to calculate, due to the many to one relationship between Subgraphs and SubgraphDeployments
+  # Disputes
+  "Disputes this graph account has created"
+  createdDisputes: [Dispute!]! @derivedFrom(field: "fisherman")
+  "Disputes against this graph account"
+  disputesAgainst: [Dispute!]! @derivedFrom(field: "indexer")
+
+  # Staking and Curating and Delegating
+  "Curator fields for this GraphAccount. Null if never curated"
+  curator: Curator
+  "Indexer fields for this GraphAccount. Null if never indexed"
+  indexer: Indexer
+  "Delegator fields for this GraphAccount. Null if never delegated"
+  delegator: Delegator
+
+  # Transactions / activity feed
+  "Name signal transactions created by this GraphAccount"
+  nameSignalTransactions: [NameSignalTransaction!]! @derivedFrom(field: "signer")
+  bridgeWithdrawalTransactions: [BridgeWithdrawalTransaction!]! @derivedFrom(field: "signer")
+  bridgeDepositTransactions: [BridgeDepositTransaction!]! @derivedFrom(field: "signer")
+
+  # Token Lock Wallets that this account is associated with
+  tokenLockWallets: [TokenLockWallet!]!
+}
+
+type GraphAccountMeta @entity(immutable:true) {
+  "IPFS hash with account metadata details"
+  id: ID!
+  "Account that reference this metadata file. For compatibility purposes. For the full list use graphAccounts"
+  graphAccount: GraphAccount @derivedFrom(field:"metadata")
+  "Accounts that reference this metadata file"
+  graphAccounts: [GraphAccount!]! @derivedFrom(field:"metadata")
+  "True if it is an organization. False if it is an individual"
+  isOrganization: Boolean
+  "Main repository of code for the graph account"
+  codeRepository: String
+  "Description of the graph account"
+  description: String
+  "Image URL"
+  image: String
+  "Website URL"
+  website: String
+  "Display name. Not unique"
+  displayName: String
+}
+
+"""
+A name chosen by a Graph Account from a Name System such as ENS. This allows Graph Accounts to be
+recognized by name, rather than just an Ethereum address
+"""
+type GraphAccountName @entity(immutable: false) {
+  "Name system concatenated with the unique ID of the name system"
+  id: ID!
+  "Name system for this name"
+  nameSystem: NameSystem!
+  "Name from the system"
+  name: String!
+  "The graph account that owned the name when it was linked in the graph network"
+  graphAccount: GraphAccount # May not match if the graph account proceeded to transfer away their name on that system
+}
+
+enum NameSystem {
+  ENS
+}
+
+"""
+The Subgraph entity represents a permanent, unique endpoint. This unique endpoint can resolve to
+many different SubgraphVersions over it's lifetime. The Subgraph can also have a name attributed
+to it. The owner of the Subgraph can only use a name once, thus making the owner account and the
+name chosen a unique combination. When a Curator singals on a Subgraph, they receive "Name Signal".
+"Name Signal" resolves into the underlying "Signal" of the SubgraphDeployment. The metadata of the
+subgraph is stored on IPFS.
+"""
+type Subgraph @entity(immutable: false) {
+  "Subgraph ID - which is derived from the Organization/Individual graph accountID"
+  id: ID!
+  "Graph account that owns this subgraph"
+  owner: GraphAccount!
+  "Current version. Null if the subgraph is deprecated"
+  currentVersion: SubgraphVersion
+  "[DEPRECATED] Past versions. Has the same data as 'versions' but keeps the old naming for backwards compatibility"
+  pastVersions: [SubgraphVersion!]! @derivedFrom(field: "subgraph")
+  "List of all the subgraph versions included the current one"
+  versions: [SubgraphVersion!]! @derivedFrom(field: "subgraph")
+  "Version counter"
+  versionCount: BigInt!
+  "Creation timestamp"
+  createdAt: Int!
+  "Updated timestamp"
+  updatedAt: Int!
+  "Whether the subgraph is active or deprecated"
+  active: Boolean!
+  "Whether the subgraph has been claimed/migrated. Can only be false for subgraphs created with V1 contracts that have not been claimed/migrated"
+  migrated: Boolean!
+  "Whether the subgraph has been transferred from L1 to L2. Subgraphs published on L2 will have this as false unless they were published through a transfer"
+  startedTransferToL2: Boolean!
+  "Timestamp for the L1 -> L2 Transfer. Null if the transfer hasn't started yet"
+  startedTransferToL2At: BigInt
+  "Block number for the L1 -> L2 Transfer. Null if the transfer hasn't started yet"
+  startedTransferToL2AtBlockNumber: BigInt
+  "Transaction hash for the L1 -> L2 Transfer. Null if the transfer hasn't started yet"
+  startedTransferToL2AtTx: String
+  "Whether the subgraph has been fully transferred from L1 to L2. Subgraphs published on L2 will have this as false unless they were published through a transfer"
+  transferredToL2: Boolean!
+  "Timestamp for the L1 -> L2 Transfer. Null if it's not fully transferred or if it's an L1 deployment"
+  transferredToL2At: BigInt
+  "Block number for the L1 -> L2 Transfer. Null if it's not fully transferred or if it's an L1 deployment"
+  transferredToL2AtBlockNumber: BigInt
+  "Transaction hash for the L1 -> L2 Transfer. Null if it's not fully transferred or if it's an L1 deployment"
+  transferredToL2AtTx: String
+  "Amount of GRT transferred to L2"
+  signalledTokensSentToL2: BigInt!
+  "Amount of GRT received on L2"
+  signalledTokensReceivedOnL2: BigInt!
+  "ID of the subgraph on L2. Null if it's not transferred"
+  idOnL2: String
+  "ID of the subgraph on L1. Null if it's not transferred"
+  idOnL1: String
+  "The actual ID of the subgraph on the contracts subgraph NFT implementation. BigInt represented as a String. It's only actually valid once the subgraph is migrated (migrated == true)"
+  nftID: String
+  "ID of the subgraph that was used on the old version of this The Graph Network Subgraph. Null for Subgraphs created with the new GNS implementation or for version 1 entities (since they use the old id)"
+  oldID: String
+  "Address used to create the ID. Only available for Subgraphs created pre-migration"
+  creatorAddress: Bytes
+  "Subgraph number used to create the ID. Only available for Subgraphs created pre-migration"
+  subgraphNumber: BigInt
+  "Auxiliary field to denote whether the subgraph is handling the initialization order on V2 events. Doesn't matter for V1 events."
+  initializing: Boolean!
+  "Version of the entity. Subgraph entities are changing the way their ID is generated when the new GNS v2 rolls out so we need to differnetiate them"
+  entityVersion: Int!
+  "[DEPRECATED] Used for duplicate entities to enable old IDs from before the subgraph NFT update"
+  linkedEntity: Subgraph
+
+  # Name curation data for bonding curve
+  # Note that the Subgraphs V signal is actually stored in a Signal entity, which
+  # considers the GNS as a Curator
+  "CUMULATIVE signaled tokens on this subgraph all time"
+  signalledTokens: BigInt!
+  "CUMULATIVE unsignalled tokens on this subgraph all time"
+  unsignalledTokens: BigInt!
+  "CURRENT amount of tokens signalled on this subgraph latest version. Mirrors the total amount signalled towards the current deployment."
+  currentSignalledTokens: BigInt!
+  "The CURRENT name signal amount for this subgraph"
+  nameSignalAmount: BigInt!
+  "Current amount of version signal managed by the name pool"
+  signalAmount: BigInt!
+  "Reserve ratio of the name curation curve. In parts per million"
+  reserveRatio: Int!
+  "Tokens that can be withdrawn once the Subgraph is deprecated"
+  withdrawableTokens: BigInt!
+  "Tokens the curators have withdrawn from the deprecated Subgraph"
+  withdrawnTokens: BigInt!
+  "Curators of this subgraph deployment"
+  nameSignals: [NameSignal!]! @derivedFrom(field: "subgraph")
+  "Total amount of NameSignal entities"
+  nameSignalCount: Int!
+
+  # Meta from IPFS linked in GNS
+  "Subgraph metadata"
+  metadataHash: Bytes
+  "Subgraph metadata ipfs hash and entity"
+  metadata: SubgraphMeta
+
+  # Auxiliary fields
+  currentVersionRelationEntity: CurrentSubgraphDeploymentRelation
+}
+
+type SubgraphMeta @entity(immutable:true) {
+  "Subgraph metadata ipfs hash"
+  id: ID!
+  "Subgraph that reference this metadata. For compatibility purposes. For the full list use subgraphs"
+  subgraph: Subgraph @derivedFrom(field:"metadata")
+  "Subgraphs that reference this metadata"
+  subgraphs: [Subgraph!]! @derivedFrom(field:"metadata")
+  "Short description of the subgraph"
+  description: String
+  "Image in string format"
+  image: String
+  "NFT Image representation"
+  nftImage: String
+  "Location of the code for this project"
+  codeRepository: String
+  "Projects website"
+  website: String
+  "Display name"
+  displayName: String
+  "Categories that the subgraph belongs to."
+  categories: [String!]
+}
+
+type CurrentSubgraphDeploymentRelation @entity(immutable: false) {
+  "Auxiliary entity used to batch update Subgraph entities when signalling on the deployment changes. ID replicates the deployment ID and adds a counter, to make it easy to reproduce."
+  id: ID!
+
+  subgraph: Subgraph!
+
+  deployment: SubgraphDeployment!
+
+  "Indicates whether this relation is active. This means that the deployment is still the current deployment for the named Subgraph"
+  active: Boolean!
+}
+
+
+"""
+The SubgraphVersion entity represents a version of the Subgraph. A new SubgraphVersion is created
+whenever there is an update to the Subgraph triggered by the owner. The new SubgraphVersion can
+then point to a new SubgraphDeployment, thus allowing the Subgraph to resolve to a different
+deployment, while keeping the same endpoint. The metadata and label are stored on IPFS. The label
+is for the developer to provide a semantic version. This is different from the version, which is
+just a counter than increases each time a new SubgraphVersion is created for a Subgraph.
+"""
+type SubgraphVersion @entity(immutable: false) {
+  "Concatenation of subgraph, subgraph deployment, and version ID"
+  id: ID!
+  "Subgraph of this version"
+  subgraph: Subgraph!
+  "Subgraph deployment of this version"
+  subgraphDeployment: SubgraphDeployment!
+  "Version number"
+  version: Int!
+  "Creation timestamp"
+  createdAt: Int!
+
+  metadataHash: Bytes
+  # Meta from IPFS linked in GNS
+  metadata: SubgraphVersionMeta
+
+  entityVersion: Int!
+  "[DEPRECATED] Used for duplicate entities to enable old IDs from before the subgraph NFT update"
+  linkedEntity: SubgraphVersion
+}
+
+type SubgraphVersionMeta @entity(immutable:true) {
+  "Subgraph version metadata ipfs hash"
+  id: ID!
+  "SubgraphVersion entity that references this metadata. For compatibility purposes. For the full list use subgraphVersions"
+  subgraphVersion: SubgraphVersion @derivedFrom(field:"metadata")
+  "SubgraphVersion entities that reference this metadata"
+  subgraphVersions: [SubgraphVersion!]! @derivedFrom(field:"metadata")
+  "Short description of the version"
+  description: String
+  "Semantic versioning label"
+  label: String
+}
+
+"""
+The SubgraphDeployment is represented by the immutable subgraph code that is uploaded, and posted
+to IPFS. A SubgraphDeployment has a manifest which gives the instructions to the Graph Network on
+what to index. The entity stores relevant data for the SubgraphDeployment on how much it is being
+staked on and signaled on in the contracts, as well as how it is performing in query fees. It is
+related to a SubgraphVersion.
+"""
+type SubgraphDeployment @entity(immutable: false) {
+  "Subgraph Deployment ID. The IPFS hash with Qm removed to fit into 32 bytes"
+  id: ID!
+  "IPFS hash of the subgraph manifest"
+  ipfsHash: String!
+  "The versions this subgraph deployment relates to"
+  versions: [SubgraphVersion!]! @derivedFrom(field: "subgraphDeployment")
+  "Creation timestamp"
+  createdAt: Int!
+  "The block at which this deployment was denied for rewards. Null if not denied"
+  deniedAt: Int!
+  "[DEPRECATED] The original Subgraph that was deployed through GNS. Can be null if never created through GNS. Used for filtering in the Explorer. Always null now"
+  originalName: String
+
+  # From Staking
+  "CURRENT total stake of all indexers on this Subgraph Deployment"
+  stakedTokens: BigInt!
+  "Allocations created by indexers for this Subgraph"
+  indexerAllocations: [Allocation!]! @derivedFrom(field: "subgraphDeployment")
+  "Total rewards accrued all time by this Subgraph Deployment. Includes delegator and indexer rewards"
+  indexingRewardAmount: BigInt!
+  "Total rewards accrued all time by indexers"
+  indexingIndexerRewardAmount: BigInt!
+  "Total rewards accrued all time by delegators"
+  indexingDelegatorRewardAmount: BigInt!
+  "Total query fees earned by this Subgraph Deployment, without curator query fees"
+  queryFeesAmount: BigInt!
+  "Total query fee rebates earned from the protocol, through the rebates formula. Does not include delegation query fees"
+  queryFeeRebates: BigInt!
+  "Total curator rewards from fees"
+  curatorFeeRewards: BigInt!
+  "Total query fee rebates earned from the protocol, through the rebates formula. Does not include indexer query fees"
+  delegatorsQueryFeeRebates: BigInt!
+
+  # Subgraph deployment curation bonding curve
+  "CURRENT signalled tokens in the bonding curve"
+  signalledTokens: BigInt!
+  "NOT IMPLEMENTED - CURRENT signalled tokens in the bonding curve"
+  unsignalledTokens: BigInt! # Will be used for rewards
+  "CURRENT curation signal for this subgraph deployment"
+  signalAmount: BigInt!
+  "signalledTokens / signalAmount"
+  pricePerShare: BigDecimal!
+
+  "Curators of this subgraph deployment"
+  curatorSignals: [Signal!]! @derivedFrom(field: "subgraphDeployment")
+  "Bonding curve reserve ratio. In parts per million"
+  reserveRatio: Int!
+
+  # From Subgraph Manifest
+  # dataSources: [DataSource!]
+  "Entity that represents the manifest of the deployment. Filled by File Data Sources"
+  manifest: SubgraphDeploymentManifest
+
+  # Counters for currentSignalledTokens tracking on Subgraph
+  "Total amount of Subgraph entities that used this deployment at some point. subgraphCount >= activeSubgraphCount + deprecatedSubgraphCount"
+  subgraphCount: Int!
+  "Amount of active Subgraph entities that are currently using this deployment. Deprecated subgraph entities are not counted"
+  activeSubgraphCount: Int!
+  "Amount of Subgraph entities that were currently using this deployment when they got deprecated"
+  deprecatedSubgraphCount: Int!
+
+  "Whether the deployment has been transferred from L1 to L2. Subgraphs published on L2 will have this as false unless they were published through a transfer"
+  transferredToL2: Boolean!
+  "Timestamp for the L1 -> L2 Transfer. Null if it's not fully transferred or if it's an L1 deployment"
+  transferredToL2At: BigInt
+  "Block number for the L1 -> L2 Transfer. Null if it's not fully transferred or if it's an L1 deployment"
+  transferredToL2AtBlockNumber: BigInt
+  "Transaction hash for the L1 -> L2 Transfer. Null if it's not fully transferred or if it's an L1 deployment"
+  transferredToL2AtTx: String
+  "Amount of GRT transferred to L2"
+  signalledTokensSentToL2: BigInt!
+  "Amount of GRT received on L2"
+  signalledTokensReceivedOnL2: BigInt!
+}
+
+type SubgraphDeploymentSchema @entity(immutable:true) {
+  "IPFS Hash"
+  id: ID!
+  "Link to a SubgraphDeploymentManifest entity that references this schema. For backwards compatibility purposes only, for the full list of manifests use manifests"
+  manifest: SubgraphDeploymentManifest @derivedFrom(field:"schema")
+  "Links to SubgraphDeploymentManifest entities that reference this schema"
+  manifests: [SubgraphDeploymentManifest!]! @derivedFrom(field:"schema")
+  "Contents of the Schema file"
+  schema: String
+}
+
+type SubgraphDeploymentManifest @entity(immutable:true) {
+  "IPFS Hash"
+  id: ID!
+  "Link to SubgraphDeployment entity"
+  deployment: SubgraphDeployment @derivedFrom(field:"manifest")
+  "Schema entity"
+  schema: SubgraphDeploymentSchema
+  "Schema ipfs hash"
+  schemaIpfsHash: String
+  "Contents of the Manifest file"
+  manifest: String
+  "Network where the contracts that the subgraph indexes are located"
+  network: String
+  "Whether the subgraph is a SpS/SbS. Null if we can't parse it"
+  poweredBySubstreams: Boolean
+  "Start block for the deployment. It's the lowest startBlock found (0 if some data source doesn't contain a start block)"
+  startBlock: BigInt
+}
+
+# TODO - add when we have the ability to parse data sources
+# """Data source obtained from the subgraph manifest"""
+# type DataSource @entity {
+#   "Unique identifier of the data source. Such as contract address"
+#   id: ID!
+#   "Data source name in the manifest"
+#   name: String!
+#   "Networks that the subgraph deployment is indexing"
+#   networks: [String!]!
+#   "Contract"
+#   contract: Contract!
+#   "ABI of the contract"
+#   abi: String!
+# }
+
+# type Contract @entity {
+#   "Address of the contract"
+#   id: ID!
+#   "Contract name"
+#   name: String
+# }
+
+"""
+Meta for the Indexer along with parameters and staking data
+"""
+type Indexer @entity(immutable: false) {
+  "Eth address of Indexer"
+  id: ID!
+  "Time this indexer was created"
+  createdAt: Int!
+  "Graph account of this indexer"
+  account: GraphAccount!
+  "Service registry URL for the indexer"
+  url: String
+  "Geohash of the indexer. Shows where their indexer is located in the world"
+  geoHash: String
+  "Address that receives the rewards from the indexer"
+  rewardsDestination: Bytes
+  "Default display name is the current default name. Used for filtered queries"
+  defaultDisplayName: String
+
+  "Whether the indexer is a legacy indexer. This is true for all indexers registered before the Horizon upgrade"
+  isLegacy: Boolean!
+
+  # Staking data
+  "CURRENT tokens staked in the protocol. Decreases on withdraw, not on lock"
+  stakedTokens: BigInt!
+  "CURRENT tokens provisioned to data services in the protocol. In the V1 protocol, all staked tokens were always provisioned to an implicit 'subgraph data service'"
+  provisionedTokens: BigInt!
+  "CURRENT tokens thawing from provisions to data services in the protocol. Only for Horizon"
+  thawingTokens: BigInt!
+  "CURRENT  tokens allocated on all subgraphs - including legacy and horizon allocations"
+  allocatedTokens: BigInt!
+  "[Legacy only] CURRENT  tokens allocated on all subgraphs ONLY for legacy allocations"
+  legacyAllocatedTokens: BigInt!
+  "NOT IMPLEMENTED - Tokens that have been unstaked and withdrawn"
+  unstakedTokens: BigInt! # will be used for return % calcs
+  "CURRENT tokens locked"
+  lockedTokens: BigInt!
+  "The block when the Indexers tokens unlock"
+  tokensLockedUntil: Int!
+  "[Legacy only] CURRENT tokens locked"
+  legacyLockedTokens: BigInt!
+  "[Legacy only] The block when the Indexers tokens unlock"
+  legacyTokensLockedUntil: Int!
+  "Active allocations of stake for this Indexer"
+  allocations: [Allocation!]! @derivedFrom(field: "activeForIndexer")
+  "All allocations of stake for this Indexer (i.e. closed and active)"
+  totalAllocations: [Allocation!]! @derivedFrom(field: "indexer")
+  "Number of active allocations of stake for this Indexer"
+  allocationCount: Int!
+  "All allocations for this Indexer (i.e. closed and active)"
+  totalAllocationCount: BigInt!
+  "Total query fees collected. Includes the portion given to delegators"
+  queryFeesCollected: BigInt!
+  "Query fee rebate amount claimed from the protocol through rebates mechanism. Does not include portion given to delegators"
+  queryFeeRebates: BigInt!
+  "Total indexing rewards earned by this indexer from inflation. Including delegation rewards"
+  rewardsEarned: BigInt!
+  "The total amount of indexing rewards the indexer kept"
+  indexerIndexingRewards: BigInt!
+  "The total amount of indexing rewards given to delegators"
+  delegatorIndexingRewards: BigInt!
+  "[Horizon only] Percentage of indexers' own rewards received in relation to its own stake. 1 (100%) means that the indexer is receiving the exact amount that is generated by his own stake"
+  indexerRewardsOwnGenerationRatio: BigDecimal!
+  "Percentage of indexers' own rewards received in relation to its own stake. 1 (100%) means that the indexer is receiving the exact amount that is generated by his own stake. This is the indexerRewardsOwnGenerationRatio before Horizon"
+  legacyIndexerRewardsOwnGenerationRatio: BigDecimal!
+  "Whether the indexer has been transferred from L1 to L2 partially or fully"
+  transferredToL2: Boolean!
+  "Timestamp for the FIRST L1 -> L2 Transfer"
+  firstTransferredToL2At: BigInt
+  "Block number for the FIRST L1 -> L2 Transfer"
+  firstTransferredToL2AtBlockNumber: BigInt
+  "Transaction hash for the FIRST L1 -> L2 Transfer"
+  firstTransferredToL2AtTx: String
+  "Timestamp for the latest L1 -> L2 Transfer"
+  lastTransferredToL2At: BigInt
+  "Block number for the latest L1 -> L2 Transfer"
+  lastTransferredToL2AtBlockNumber: BigInt
+  "Transaction hash for the latest L1 -> L2 Transfer"
+  lastTransferredToL2AtTx: String
+  "Amount of GRT transferred to L2. Only visible from L1, as there's no events for it on L2"
+  stakedTokensTransferredToL2: BigInt!
+  "ID of the indexer on L2. Null if it's not transferred"
+  idOnL2: String
+  "ID of the indexer on L1. Null if it's not transferred"
+  idOnL1: String
+
+  # Capacity Data
+  "Amount of delegated tokens that can be eligible for rewards"
+  delegatedCapacity: BigInt!
+  "Total token capacity = delegatedCapacity + stakedTokens"
+  tokenCapacity: BigInt!
+  "Stake available to earn rewards. tokenCapacity - allocationTokens - lockedTokens"
+  availableStake: BigInt!
+
+  # Delegation Pool
+  "Delegators to this Indexer"
+  delegators: [DelegatedStake!]! @derivedFrom(field: "indexer")
+  "CURRENT tokens delegated to the indexer"
+  delegatedTokens: BigInt!
+  "Tokens delegated that are thawing from the provision"
+  delegatedThawingTokens: BigInt!
+  "Ratio between the amount of the indexers own stake over the total usable stake."
+  ownStakeRatio: BigDecimal!
+  "Ratio between the amount of delegated stake over the total usable stake."
+  delegatedStakeRatio: BigDecimal!
+  "Total shares of the delegator pool"
+  delegatorShares: BigInt!
+  "Exchange rate of of tokens received for each share"
+  delegationExchangeRate: BigDecimal!
+  "[Horizon only] The percent of indexing rewards generated by the total stake that the Indexer keeps for itself. In parts per million"
+  indexingRewardCut: Int!
+  "The percent of indexing rewards generated by the total stake that the Indexer keeps for itself. In parts per million. This is the indexingRewardCut before Horizon"
+  legacyIndexingRewardCut: Int!
+  "[Horizon only] The percent of indexing rewards generated by the delegated stake that the Indexer keeps for itself"
+  indexingRewardEffectiveCut: BigDecimal!
+  "The percent of indexing rewards generated by the delegated stake that the Indexer keeps for itself. This is the indexingRewardEffectiveCut before Horizon"
+  legacyIndexingRewardEffectiveCut: BigDecimal!
+  "The percent of reward dilution delegators experience because of overdelegation. Overdelegated stake can't be used to generate rewards but still gets accounted while distributing the generated rewards. This causes dilution of the rewards for the rest of the pool."
+  overDelegationDilution: BigDecimal!
+  "The total amount of query fees given to delegators"
+  delegatorQueryFees: BigInt!
+  "[Horizon only] The percent of query rebate rewards generated by the total stake that the Indexer keeps for itself. In parts per million"
+  queryFeeCut: Int!
+  "The percent of query rebate rewards generated by the total stake that the Indexer keeps for itself. In parts per million. This is the queryFeeCut before Horizon"
+  legacyQueryFeeCut: Int!
+  "[Horizon only] The percent of query rebate rewards generated by the delegated stake that the Indexer keeps for itself"
+  queryFeeEffectiveCut: BigDecimal!
+  "The percent of query rebate rewards generated by the delegated stake that the Indexer keeps for itself. This is the queryFeeEffectiveCut before Horizon"
+  legacyQueryFeeEffectiveCut: BigDecimal!
+  "Amount of blocks a delegator chooses for the waiting period for changing their params"
+  delegatorParameterCooldown: Int!
+  "Block number for the last time the delegator updated their parameters"
+  lastDelegationParameterUpdate: Int!
+  "Count of how many times this indexer has been forced to close an allocation"
+  forcedClosures: Int!
+  "[Horizon only] Latest value for thaw request thawingUntil"
+  thawingUntil: BigInt!
+
+  # Provisioning
+  provisions: [Provision!]! @derivedFrom(field: "indexer")
+}
+
+type PaymentSource @entity(immutable: false) {
+  "Address used on the payment"
+  id: ID!
+
+  "Total query fees generated in the network"
+  totalQueryFees: BigInt!
+  "Total query fees collected by indexers"
+  totalIndexerQueryFeesCollected: BigInt!
+  "Total query fees rebates claimed by indexers"
+  totalIndexerQueryFeeRebates: BigInt!
+  "Total query fees rebates claimed by delegators"
+  totalDelegatorQueryFeeRebates: BigInt!
+  "Total query fees payed to curators"
+  totalCuratorQueryFees: BigInt!
+  "Total protocol taxes applied to the query fees"
+  totalTaxedQueryFees: BigInt!
+  # It is hard to separate the unclaimed and rebates lost
+  "Total unclaimed rebates. Includes unclaimed rebates, and rebates lost in rebates mechanism "
+  totalUnclaimedQueryFeeRebates: BigInt!
+
+  graphNetwork: GraphNetwork! # to make a derived list on GraphNetwork
+}
+
+type IndexerQueryFeePaymentAggregation @entity(immutable: false) {
+  "Join ID of indexer address and PaymentSource address"
+  id: ID!
+
+  "Total query fees collected. Includes the portion given to delegators"
+  queryFeesCollected: BigInt!
+  "Query fee rebate amount claimed from the protocol through rebates mechanism. Does not include portion given to delegators"
+  queryFeeRebates: BigInt!
+  "The total amount of query fees given to delegators"
+  delegatorQueryFees: BigInt!
+
+  indexer: Indexer!
+
+  paymentSource: PaymentSource!
+}
+
+type HorizonOperator @entity(immutable: false) {
+  "Joint address of all 3 parties involved (Operator, Indexer, DataService)"
+  id: ID!
+
+  operatorOf: [GraphAccount!]! @derivedFrom(field: "horizonOperators")
+
+  operator: GraphAccount!
+
+  indexer: Indexer!
+
+  dataService: DataService!
+
+  allowed: Boolean!
+}
+
+
+"""
+  For the Horizon Stage 1 subgraph, the Provision entity will be mimicking the Indexer entity as closely as possible.
+  That means that the Provision entity will contain some fields that are particular for the Subgraph Service, even if in Horizon
+  a Provision could be for a different Data Service from the Subgraph Service.
+  This is to make the data closer to the legacy protocol, given that the Subgraph Service will be the first Data Service to be supported
+
+  Once the Stage 2 subgraph is implemented, the Provision entity will have to be more generic, and particular data service fields will need to be restructured.
+"""
+type Provision @entity(immutable: false) {
+  "Join ID of indexer address (service provider) and DataService address"
+  id: ID!
+
+  indexer: Indexer!
+
+  dataService: DataService!
+
+  tokensProvisioned: BigInt!
+
+  tokensAllocated: BigInt!
+
+  tokensSlashedServiceProvider: BigInt!
+
+  tokensSlashedDelegationPool: BigInt!
+
+  totalAllocationCount: BigInt!
+
+  allocationCount: Int!
+
+  "Active allocations of stake for this Provision"
+  allocations: [Allocation!]! @derivedFrom(field: "activeForProvision")
+
+  "Timestamp when the provision was created"
+  createdAt: BigInt!
+
+  "Service provider tokens that are being thawed (and will stop being slashable soon)"
+  tokensThawing: BigInt!
+
+  "Max amount that can be taken by the verifier when slashing, expressed in parts-per-million of the amount slashed"
+  maxVerifierCut: BigInt!
+
+  "Pending value for maxVerifierCut. Verifier needs to accept it before it becomes active"
+  maxVerifierCutPending: BigInt!
+
+  "Time, in seconds, tokens must thaw before being withdrawn"
+  thawingPeriod: BigInt!
+
+  "Pending value for thawingPeriod. Verifier needs to accept it before it becomes active"
+  thawingPeriodPending: BigInt!
+
+  # Percentage of rewards/fees that the delegation pool receives
+  "Raw query fee cut. In Horizon this is amount of query fees that the delegation pool receives in PPM"
+  queryFeeCut: BigInt!
+
+  "Raw indexing fee cut. In Horizon this is amount of indexing fees that the delegation pool receives in PPM"
+  indexingFeeCut: BigInt!
+
+  "Raw indexing rewards cut. In Horizon this is amount of indexing rewards that the delegation pool receives in PPM"
+  indexingRewardsCut: BigInt!
+
+  "The percent of indexing rewards generated by the delegated stake that the Indexer keeps for itself"
+  indexingRewardEffectiveCut: BigDecimal!
+  "The percent of query fees generated by the delegated stake that the Indexer keeps for itself"
+  queryFeeEffectiveCut: BigDecimal!
+  "The percent of reward dilution delegators experience because of overdelegation. Overdelegated stake can't be used to generate rewards but still gets accounted while distributing the generated rewards. This causes dilution of the rewards for the rest of the pool."
+  overDelegationDilution: BigDecimal!
+
+  # Might want to add polymorphic handling of different fee cuts through a generic hashmap in the future
+
+  # Indexing rewards. Keeping the same naming from Indexer entity to make it easier to understand
+  "Total indexing rewards earned by this indexer. Including delegation rewards"
+  rewardsEarned: BigInt!
+  "The total amount of indexing rewards the indexer kept"
+  indexerIndexingRewards: BigInt!
+  "The total amount of indexing rewards given to delegators"
+  delegatorIndexingRewards: BigInt!
+
+  # Query fees
+  "Total query fees collected. Includes the portion given to delegators"
+  queryFeesCollected: BigInt!
+  "Query fee amount collected from the protocol. Does not include portion given to delegators"
+  indexerQueryFees: BigInt!
+  "Query fee amount collected from the protocol for Delegators. Does not include portion taken by the indexer"
+  delegatorQueryFees: BigInt!
+
+  # Delegation
+  "Tokens delegated to the provision"
+  delegatedTokens: BigInt!
+  "Tokens delegated that are thawing from the provision"
+  delegatedThawingTokens: BigInt!
+  "Total shares of the delegator pool"
+  delegatorShares: BigInt!
+  "Exchange rate of tokens received for each share"
+  delegationExchangeRate: BigDecimal!
+  "Ratio between the amount of the indexers own stake over the total usable stake (capped by the delegationRatio)."
+  ownStakeRatio: BigDecimal!
+  "Ratio between the amount of delegated stake over the total usable stake (capped by the delegationRatio)."
+  delegatedStakeRatio: BigDecimal!
+  "Percentage of indexers' own rewards received in relation to its own stake. 1 (100%) means that the indexer is receiving the exact amount that is generated by his own stake, the value can be over 100% or below depending on the amount of delegation and cuts set"
+  indexerRewardsOwnGenerationRatio: BigDecimal!
+  "Latest value for thaw request thawingUntil"
+  thawingUntil: BigInt!
+
+  "Service registry URL for the indexer"
+  url: String
+  "Geohash of the indexer. Shows where their indexer is located in the world"
+  geoHash: String
+  "Address set as rewards destination for payments to the service provider"
+  rewardsDestination: Bytes
+}
+
+enum ThawRequestType {
+  Provision
+  Delegation
+}
+
+type ThawRequest @entity(immutable: false) {
+  id: ID!
+
+  type: ThawRequestType!
+
+  indexer: Indexer!
+
+  dataService: DataService!
+
+  owner: GraphAccount!
+
+  "Shares representing the thawing tokens"
+  shares: BigInt!
+
+  "Tokens thawed"
+  tokens: BigInt!
+
+  thawingUntil: BigInt!
+
+  fulfilledAsValid: Boolean
+
+  fulfilled: Boolean!
+}
+
+"""
+A state channel Allocation representing a single Indexer/Provision-SubgraphDeployment stake
+"""
+type Allocation @entity(immutable: false) {
+  "Channel Address"
+  id: ID!
+  "Indexer of this allocation"
+  indexer: Indexer!
+  "Provision of this allocation (for Horizon allocations only)"
+  provision: Provision
+  "Creator of the allocation - can be the operator or the indexer"
+  creator: Bytes!
+  "If the Allocation is active it shows the indexer. If closed, it is null"
+  activeForIndexer: Indexer
+  "If the Allocation is active it shows the provision. If closed, it is null"
+  activeForProvision: Provision
+  "Subgraph deployment that is being allocated to"
+  subgraphDeployment: SubgraphDeployment!
+  "Tokens allocation in this allocation"
+  allocatedTokens: BigInt!
+  "[DEPRECATED] Effective allocation that is realized upon closing"
+  effectiveAllocation: BigInt!
+  "Epoch this allocation was created"
+  createdAtEpoch: Int!
+  "Block at which this allocation was created"
+  createdAtBlockHash: Bytes!
+  "Block number at which this allocation was created"
+  createdAtBlockNumber: Int!
+  "Epoch this allocation was closed in"
+  closedAtEpoch: Int
+  "Block hash at which this allocation was closed"
+  closedAtBlockHash: Bytes
+  "Block number at which this allocation was closed"
+  closedAtBlockNumber: Int
+  "Fees this allocation collected from query fees upon closing. Excludes curator reward and protocol tax"
+  queryFeesCollected: BigInt!
+  "Query fee rebate amount claimed from the protocol through rebates mechanism. Does not include portion given to delegators"
+  queryFeeRebates: BigInt!
+  "Query fee rebates collected from the protocol. Can differ from queryFeeRebates if multiple vouchers per allocation are allowed."
+  distributedRebates: BigInt!
+  "Curator rewards deposited to the curating bonding curve"
+  curatorRewards: BigInt!
+  "Indexing rewards earned by this allocation. Includes delegator and indexer rewards"
+  indexingRewards: BigInt!
+  "Indexing rewards earned by this allocation by indexers"
+  indexingIndexerRewards: BigInt!
+  "Indexing rewards earned by this allocation by delegators"
+  indexingDelegatorRewards: BigInt!
+  "[DEPRECATED] Pool in which this allocation was closed"
+  poolClosedIn: Pool
+  "Fees paid out to delegators"
+  delegationFees: BigInt!
+  "Status of the allocation"
+  status: AllocationStatus!
+  "Timestamp this allocation was created at"
+  createdAt: Int!
+  "Timestamp this allocation was closed at"
+  closedAt: Int
+  "POI submitted when closing allocations in the legacy protocol. Also reflects the latest POI submitted for a Horizon payment collection"
+  poi: Bytes
+  "POIs submitted when collecting payments in Horizon"
+  pois: [PoiSubmission!]! @derivedFrom(field: "allocation")
+  "Number of POIs submitted for this allocation. Only available for Horizon allocations"
+  poiCount: BigInt
+  "Timestamp for the latest POI presentation"
+  latestPoiPresentedAt: Int
+  "Rewards condition determined for the latest POI presented. Only available for Horizon allocations after the POIPresented upgrade"
+  latestPoiCondition: PoiRewardsCondition
+  "Raw bytes32 rewards condition emitted by the contract for the latest POI presented"
+  latestPoiConditionRaw: Bytes
+  "Whether this allocation was created in the legacy protocol. If true, the allocation will not have a provision since it's not a Horizon allocation"
+  isLegacy: Boolean!
+  "Whether this allocation was forced closed. Force closures in Horizon can happen when the latest PoI is stale, compared to the legacy protocol, where force closures can happen when the allocation hasn't been closed within the max amount of epochs"
+  forceClosed: Boolean
+
+  # Indexer/Provision cut settings at start and close
+  indexingRewardCutAtStart: Int!
+  indexingRewardEffectiveCutAtStart: BigDecimal!
+  queryFeeCutAtStart: Int!
+  queryFeeEffectiveCutAtStart: BigDecimal!
+
+  indexingRewardCutAtClose: Int
+  indexingRewardEffectiveCutAtClose: BigDecimal
+  queryFeeCutAtClose: Int
+  queryFeeEffectiveCutAtClose: BigDecimal
+
+  # Metrics NOT IMPLEMENTED YET
+  "NOT IMPLEMENTED - Return for this allocation"
+  totalReturn: BigDecimal!
+  "NOT IMPLEMENTED - Yearly annualzied return"
+  annualizedReturn: BigDecimal!
+}
+
+type PoiSubmission @entity(immutable: true) {
+  id: ID!
+  allocation: Allocation!
+  poi: Bytes!
+  publicPoi: Bytes!
+  submittedAtEpoch: Int!
+  presentedAtTimestamp: Int!
+  indexingStatus: Int!
+  blockNumber: Int!
+  metadataDecoded: Boolean!
+  "Rewards condition determined for this POI (Horizon only). Null for submissions indexed before the REO upgrade"
+  condition: PoiRewardsCondition
+  "Raw bytes32 rewards condition as emitted by the contract (Horizon only)"
+  conditionRaw: Bytes
+}
+
+"Rewards condition determined by the SubgraphService when a POI is presented. Mirrors the on-chain RewardsCondition identifiers"
+enum PoiRewardsCondition {
+  "Rewards claimable normally (bytes32(0))"
+  None
+  "POI submitted after the staleness deadline"
+  StalePoi
+  "POI is bytes32(0)"
+  ZeroPoi
+  "Allocation created in the current epoch - rewards deferred"
+  AllocationTooYoung
+  "Subgraph is on the denylist - rewards deferred"
+  SubgraphDenied
+  "Condition value not recognized by the mapping - see conditionRaw"
+  Unknown
+}
+
+enum AllocationStatus {
+  Null # == indexer == address(0)
+  Active # == not Null && tokens > 0 #
+  Closed # == Active && closedAtEpoch != 0. Still can collect, while you are waiting to be finalized. a.k.a settling
+  Finalized # == [DEPRECATED] Closing && closedAtEpoch + channelDisputeEpochs > now(). Note, the subgraph has no way to return this value. it is implied
+  Claimed # == [DEPRECATED] not Null && tokens == 0 - i.e. finalized, and all tokens withdrawn
+}
+
+"""
+[DEPRECATED] Global pool of query fees for closed state channels. Each Epoch has a single pool,
+hence why they share the same IDs.
+"""
+type Pool @entity(immutable: false) {
+  "Epoch number of the pool"
+  id: ID!
+  "Total effective allocation tokens from all allocations closed in this epoch"
+  allocation: BigInt!
+  "Total query fees collected in this epoch"
+  totalQueryFees: BigInt!
+  "Total query fees claimed in this epoch. Can be smaller than totalFees because of rebates function "
+  claimedFees: BigInt!
+  "Total rewards from query fees deposited to all curator bonding curves during the epoch"
+  curatorRewards: BigInt!
+  "Allocations that were closed during this epoch"
+  closedAllocations: [Allocation!]! @derivedFrom(field: "poolClosedIn")
+}
+
+"""
+Delegator with all their delegated stakes towards Indexers
+"""
+type Delegator @entity(immutable: false) {
+  "Delegator address"
+  id: ID!
+  "Graph account of the delegator"
+  account: GraphAccount!
+  "Stakes of this delegator"
+  stakes: [DelegatedStake!]! @derivedFrom(field: "delegator")
+  "CUMULATIVE staked tokens in DelegatorStakes of this Delegator"
+  totalStakedTokens: BigInt!
+  "CUMULATIVE unstaked tokens in DelegatorStakes of this Delegator"
+  totalUnstakedTokens: BigInt!
+  "Time created at"
+  createdAt: Int!
+  "Total realized rewards on all delegated stakes. Realized rewards are added when undelegating and realizing a profit"
+  totalRealizedRewards: BigDecimal!
+
+  "Total DelegatedStake entity count (Active and inactive)"
+  stakesCount: Int!
+  "Active DelegatedStake entity count. Active means it still has GRT delegated"
+  activeStakesCount: Int!
+
+  "Default display name is the current default name. Used for filtered queries"
+  defaultDisplayName: String
+}
+
+"""
+Delegator stake for a single Indexer
+"""
+type DelegatedStake @entity(immutable: false) {
+  "Concatenation of Delegator address and Provision ID. For compatibility purposes for Horizon, Legacy entities will have the SubgraphService address hardcoded such that <Indexer-SubgraphService> is the provision address"
+  id: ID!
+  "Indexer the stake is delegated to"
+  indexer: Indexer!
+  "DataService the stake is delegated to. Only for Horizon delegations"
+  dataService: DataService
+  "Provision the stake is delegated to. Only for Horizon delegations"
+  provision: Provision
+  "Delegator"
+  delegator: Delegator!
+  "CUMULATIVE tokens delegated"
+  stakedTokens: BigInt!
+  "CUMULATIVE tokens undelegated"
+  unstakedTokens: BigInt!
+  "CURRENT tokens locked"
+  lockedTokens: BigInt!
+  "Epoch the locked tokens get unlocked"
+  lockedUntil: Int!
+  "[Legacy only] CURRENT tokens locked"
+  legacyLockedTokens: BigInt!
+  "[Legacy only] Epoch the locked tokens get unlocked"
+  legacyLockedUntil: Int!
+  "Shares owned in the delegator pool. Used to calculate total amount delegated"
+  shareAmount: BigInt!
+  "The rate this delegator paid for their shares (calculated using average cost basis). Used for rewards calculations"
+  personalExchangeRate: BigDecimal!
+  "Realized rewards from undelegating and realizing a reward"
+  realizedRewards: BigDecimal!
+  "Time this delegator first delegated to an indexer"
+  createdAt: Int!
+  "Last time this delegator delegated towards this indexer"
+  lastDelegatedAt: Int
+  "Last time this delegator undelegated from this indexer"
+  lastUndelegatedAt: Int
+  "Whether the delegation has been transferred from L1 to L2"
+  transferredToL2: Boolean!
+  "Timestamp for the L1 -> L2 Transfer"
+  transferredToL2At: BigInt
+  "Block number for the L1 -> L2 Transfer"
+  transferredToL2AtBlockNumber: BigInt
+  "Transaction hash for the L1 -> L2 Transfer"
+  transferredToL2AtTx: String
+  "Amount of GRT transferred to L2. Only visible from L1, as there's no events for it on L2"
+  stakedTokensTransferredToL2: BigInt!
+  "ID of the delegation on L2. Null if it's not transferred"
+  idOnL2: String
+  "ID of the delegation on L1. Null if it's not transferred"
+  idOnL1: String
+  "Whether the delegation is still legacy/hasn't had any Horizon native interactions yet"
+  isLegacy: Boolean!
+}
+
+"""
+Curator with all Signals and metrics
+"""
+type Curator @entity(immutable: false) {
+  "Eth address of the Curator"
+  id: ID!
+  "Time this curator was created"
+  createdAt: Int!
+  "Graph account of this curator"
+  account: GraphAccount!
+  "CUMULATIVE tokens signalled on all the subgraphs"
+  totalSignalledTokens: BigInt!
+  "CUMULATIVE tokens unsignalled on all the subgraphs"
+  totalUnsignalledTokens: BigInt!
+  "Subgraphs the curator is curating"
+  signals: [Signal!]! @derivedFrom(field: "curator")
+  "Default display name is the current default name. Used for filtered queries"
+  defaultDisplayName: String
+
+  "CUMULATIVE tokens signalled on all names"
+  totalNameSignalledTokens: BigInt!
+  "CUMULATIVE tokens unsignalled on all names"
+  totalNameUnsignalledTokens: BigInt!
+  "CUMULATIVE withdrawn tokens from deprecated subgraphs"
+  totalWithdrawnTokens: BigInt!
+  "Subgraphs the curator is curating"
+  nameSignals: [NameSignal!]! @derivedFrom(field: "curator")
+
+  # Metrics NOTE - will be hard to calculate these with the two types of signal
+  "NOT IMPLEMENTED - Summation of realized rewards from all Signals"
+  realizedRewards: BigInt!
+  "NOT IMPLEMENTED - Annualized rate of return on curator signal"
+  annualizedReturn: BigDecimal!
+  "NOT IMPLEMENTED - Total return of the curator"
+  totalReturn: BigDecimal!
+  "NOT IMPLEMENTED - Signaling efficiency of the curator"
+  signalingEfficiency: BigDecimal!
+
+  "CURRENT summed name signal for all bonding curves"
+  totalNameSignal: BigDecimal!
+  "Total curator cost basis of all shares of name pools purchased on all bonding curves"
+  totalNameSignalAverageCostBasis: BigDecimal!
+  "totalNameSignalAverageCostBasis / totalNameSignal"
+  totalAverageCostBasisPerNameSignal: BigDecimal!
+  "CURRENT summed signal for all bonding curves"
+  totalSignal: BigDecimal!
+  "Total curator cost basis of all version signal shares purchased on all bonding curves. Includes those purchased through GNS name pools"
+  totalSignalAverageCostBasis: BigDecimal!
+  "totalSignalAverageCostBasis / totalSignal"
+  totalAverageCostBasisPerSignal: BigDecimal!
+
+  # Curation counters
+  "Total amount of signals created by this user"
+  signalCount: Int!
+  "Amount of active signals for this user"
+  activeSignalCount: Int!
+  "Total amount of name signals created by this user"
+  nameSignalCount: Int!
+  "Amount of active name signals for this user"
+  activeNameSignalCount: Int!
+  "Total amount of name signals and signals created by this user. signalCount + nameSignalCount"
+  combinedSignalCount: Int!
+  "Amount of active name signals and signals for this user. signalCount + nameSignalCount"
+  activeCombinedSignalCount: Int!
+}
+
+"""
+Curator Signal for a single SubgraphDeployment
+"""
+type Signal @entity(immutable: false) {
+  "Eth address + subgraph deployment ID"
+  id: ID!
+  "Eth address of the curator"
+  curator: Curator!
+  "Subgraph being signalled"
+  subgraphDeployment: SubgraphDeployment!
+  "CUMULATIVE number of tokens the curator has signalled"
+  signalledTokens: BigInt!
+  "CUMULATIVE number of tokens the curator has unsignalled"
+  unsignalledTokens: BigInt!
+  "Signal that the curator has from signaling their GRT"
+  signal: BigInt!
+  "Curator average cost basis for this signal on this subgraph"
+  averageCostBasis: BigDecimal!
+  "averageCostBasis / signal"
+  averageCostBasisPerSignal: BigDecimal!
+
+  # Metrics
+  "Block for which the curator last entered or exited the curve"
+  lastSignalChange: Int!
+  # These are summed up and added whenever curator enters or exists the curve. Then we must calculate
+  # unrealized gains for their current balance, based on the time since the last exit/entry of the curve
+  "Summation of realized rewards from before the last time the curator entered the curation curve"
+  realizedRewards: BigInt!
+
+  "Timetamp when this entity was created"
+  createdAt: Int!
+  "Timetamp when this entity was last updated"
+  lastUpdatedAt: Int!
+  "Block number where this entity was created"
+  createdAtBlock: Int!
+  "Block number where this entity was last updated"
+  lastUpdatedAtBlock: Int!
+}
+
+"""
+Curator Name Signal for a single Subgraph
+"""
+type NameSignal @entity(immutable: false) {
+  "Eth address + subgraph ID"
+  id: ID!
+  "Eth address of the curator"
+  curator: Curator!
+  "Subgraph being signalled"
+  subgraph: Subgraph!
+  "CUMULATIVE number of tokens the curator has signalled"
+  signalledTokens: BigInt!
+  "CUMULATIVE number of tokens the curator has unsignalled"
+  unsignalledTokens: BigInt!
+  "Tokens the curator has withdrawn from a deprecated name curve"
+  withdrawnTokens: BigInt!
+  "Shares of the name pool (GNS) that the curator has from signaling their GRT"
+  nameSignal: BigInt!
+  "Actual signal shares that the name pool minted with the GRT provided by the curator"
+  signal: BigDecimal!
+  "Amount of GRT transferred to L2"
+  signalledTokensSentToL2: BigInt!
+  "Amount of GRT received on L2"
+  signalledTokensReceivedOnL2: BigInt!
+  "Whether the name signal has been transferred from L1 to L2. Only applies to NameSignals that have been transferred, native L2 NameSignal entities will return false"
+  transferredToL2: Boolean!
+  "Timestamp for the L1 -> L2 Transfer."
+  transferredToL2At: BigInt
+  "Block number for the L1 -> L2 Transfer."
+  transferredToL2AtBlockNumber: BigInt
+  "Transaction hash for the L1 -> L2 Transfer."
+  transferredToL2AtTx: String
+  "ID of the NameSignal entity on L2. Null if it's not transferred"
+  idOnL2: String
+  "ID of the NameSignal entity on L1. Null if it's not transferred"
+  idOnL1: String
+
+  # Metrics
+  "Block for which the curator last entered or exited the curve"
+  lastNameSignalChange: Int!
+  # These are summed up and added whenever curator enters or exists the curve. Then we must calculate
+  # unrealized gains for their current balance, based on the time since the last exit/entry of the curve
+  "Summation of realized rewards from before the last time the curator entered the curation curve"
+  realizedRewards: BigInt!
+
+  "[DEPRECATED] Curator average cost basis for this name signal on this subgraph. New field for further versions will be nameSignalAverageCostBasis"
+  averageCostBasis: BigDecimal! # note this is ONLY name signal. This is okay for the protocol for now
+  "[DEPRECATED] nameSignalAverageCostBasis / nameSignal. New field for further versions will be nameSignalAverageCostBasisPerSignal"
+  averageCostBasisPerSignal: BigDecimal!
+
+  "Curator average cost basis for this name signal on this subgraph"
+  nameSignalAverageCostBasis: BigDecimal! # note this is ONLY name signal. This is okay for the protocol for now
+  "nameSignalAverageCostBasis / nameSignal"
+  nameSignalAverageCostBasisPerSignal: BigDecimal!
+
+  "Curator average cost basis for the version signal on this subgraph name pool"
+  signalAverageCostBasis: BigDecimal!
+  "signalAverageCostBasis / signal"
+  signalAverageCostBasisPerSignal: BigDecimal!
+
+  entityVersion: Int!
+  "[DEPRECATED] Used for duplicate entities to enable old IDs from before the subgraph NFT update"
+  linkedEntity: NameSignal
+}
+
+"""
+Auxiliary entity to be able to batch update NameSignal entities
+"""
+type NameSignalSubgraphRelation @entity(immutable: false) {
+  "Subgraph ID + index"
+  id: ID!
+
+  nameSignal: NameSignal!
+
+  subgraph: Subgraph!
+}
+
+"""
+Dispute of a query. Includes single query, conflicting attestation, and indexing disputes
+"""
+type Dispute @entity(immutable: false) {
+  "Dispute ID"
+  id: ID!
+  "Subgraph deployment being disputed"
+  subgraphDeployment: SubgraphDeployment!
+  "Fisherman address"
+  fisherman: GraphAccount!
+  "Fisherman deposit"
+  deposit: BigInt!
+  "Whether this dispute was created in the legacy protocol"
+  isLegacy: Boolean!
+
+  "Time dispute was created"
+  createdAt: Int!
+  "Time dispute was closed at"
+  closedAt: Int!
+  "Time dispute becomes cancellable by the fisherman"
+  cancellableAt: BigInt!
+  "Status of the dispute. Accepted means the Indexer was slashed"
+  status: DisputeStatus!
+  "Total amount of tokens slashed on the dispute"
+  tokensSlashed: BigDecimal!
+  "Amount of the slashed tokens that was burned"
+  tokensBurned: BigDecimal!
+  "Amount of the slashed tokens that was payed as reward to the fisherman"
+  tokensRewarded: BigInt!
+
+  # Type specific data
+  "Type of dispute"
+  type: DisputeType!
+  "Indexer disputed"
+  indexer: GraphAccount!
+  "Attestation. Only for single query and conflicting attestations"
+  attestation: Attestation
+  "Linked dispute of other Indexer. Only for conflicting attestation"
+  linkedDispute: Dispute
+  "Allocation ID. Only for Indexing Disputes"
+  allocation: Allocation
+}
+
+"""
+Attestation of a dispute
+"""
+type Attestation @entity(immutable: false) {
+  "Concatenation of the requestCID and responseCID"
+  id: ID!
+  "Subgraph deployment being disputed"
+  subgraphDeployment: SubgraphDeployment!
+  "RequestCID"
+  requestCID: String!
+  "ResponseCID"
+  responseCID: String!
+  "NOT IMPLEMENTED - Gas used by the attested query"
+  gasUsed: BigInt # Get from Allocation metadata when available
+  "NOT IMPLEMENTED - Bytes of attested query"
+  responseNumBytes: BigInt # Get from Allocation metadata when available
+  "V of the indexers signature"
+  v: Int!
+  "R of the indexers signature"
+  r: String!
+  "S of the indexers signature"
+  s: String!
+}
+
+enum DisputeType {
+  SingleQuery
+  Conflicting
+  Indexing
+  Legacy
+}
+
+enum DisputeStatus {
+  Undecided
+  Accepted
+  Rejected
+  Draw
+  Cancelled
+}
+
+"""
+Epoch aggregate data for network statistics on signaling, rewards, and query fees
+"""
+type Epoch @entity(immutable: false) {
+  "Epoch number"
+  id: ID!
+  "Start block of the epoch"
+  startBlock: Int!
+  "End block of the epoch"
+  endBlock: Int!
+  "Signaled tokens during this epoch"
+  signalledTokens: BigInt!
+  "Stake deposited during this epoch"
+  stakeDeposited: BigInt!
+  "Total amount of query fees generated during this epoch (Includes everything)"
+  totalQueryFees: BigInt!
+  "Amount of query fees generated that were burnt by the 1% protocol tax during this epoch"
+  taxedQueryFees: BigInt!
+  "Amount of query fees generated for indexers during this epoch"
+  queryFeesCollected: BigInt!
+  "Amount of query fees generated that are going to curators during this epoch"
+  curatorQueryFees: BigInt!
+  "Rebate amount claimed from the protocol through rebates mechanism during this epoch"
+  queryFeeRebates: BigInt!
+  "Total indexing rewards earned in this epoch. Includes both delegator and indexer rewards"
+  totalRewards: BigInt!
+  "Total indexing rewards earned in this epoch by indexers"
+  totalIndexerRewards: BigInt!
+  "Total indexing rewards earned in this epoch by delegators"
+  totalDelegatorRewards: BigInt!
+}
+
+"""
+A generic transaction in The Graph Network
+"""
+interface Transaction {
+  "Transaction hash concatenated with event log index"
+  id: ID!
+  "Block number for the transaction"
+  blockNumber: Int!
+  "Timestamp for the transaction"
+  timestamp: Int!
+  "Signer of the transaction"
+  signer: GraphAccount!
+  "Type of Graph Network transaction"
+  type: TransactionType!
+  # TODO - add epoch number,
+}
+
+"""
+All relevant data for a Name Signal Transaction in The Graph Network
+"""
+type NameSignalTransaction implements Transaction @entity(immutable: false) {
+  id: ID!
+  blockNumber: Int!
+  timestamp: Int!
+  signer: GraphAccount!
+  type: TransactionType!
+  "Amount of name signal updated"
+  nameSignal: BigInt!
+  "Amount of version signal updated"
+  versionSignal: BigInt!
+  "Tokens used"
+  tokens: BigInt!
+  "Subgraph where name signal was updated"
+  subgraph: Subgraph!
+}
+
+"""
+All relevant data for a Signal Transaction in The Graph Network
+"""
+type SignalTransaction implements Transaction @entity(immutable: false) {
+  id: ID!
+  blockNumber: Int!
+  timestamp: Int!
+  signer: GraphAccount!
+  type: TransactionType!
+  "Amount of signal updated"
+  signal: BigInt!
+  "Tokens used"
+  tokens: BigInt!
+  "Subgraph where signal was updated"
+  subgraphDeployment: SubgraphDeployment!
+  "Withdrawal fees. On minting only"
+  withdrawalFees: BigInt!
+}
+
+"""
+All relevant data for a bridge withdrawal Transaction in The Graph Network
+"""
+type BridgeWithdrawalTransaction implements Transaction @entity(immutable: false) {
+  id: ID!
+  blockNumber: Int!
+  timestamp: Int!
+  signer: GraphAccount!
+  type: TransactionType!
+  "txHash refers to the tx on the chain corresponding to this subgraph deployment"
+  txHash: Bytes
+  from: Bytes
+  to: Bytes
+  amount: BigInt
+  l1Token: Bytes
+  "transactionIndex is the unique value that allows matching an L2 transaction with its L1 counterpart"
+  transactionIndex: BigInt
+}
+
+"""
+All relevant data for a bridge deposit Transaction in The Graph Network
+"""
+type BridgeDepositTransaction implements Transaction @entity(immutable: false) {
+  id: ID!
+  blockNumber: Int!
+  timestamp: Int!
+  signer: GraphAccount!
+  type: TransactionType!
+  "txHash refers to the tx on the chain corresponding to this subgraph deployment"
+  txHash: Bytes!
+  from: Bytes
+  to: Bytes
+  amount: BigInt
+  l1Token: Bytes
+  "retryableTicketId is the unique value that allows matching an L2 transaction with its L1 counterpart"
+  retryableTicketId: String
+  "Whether the deposit was initiated through Arbitrum's gateway router (Only available on L1 networks)"
+  routed: Boolean
+}
+
+"""
+All relevant data for arbitrum retryable tickets
+"""
+type RetryableTicket @entity(immutable: false) {
+  id: ID!
+  "hash of the retryable ticket creation transaction"
+  txHash: Bytes
+  redeemAttempts: [RetryableTicketRedeemAttempt!]! @derivedFrom(field: "ticketId")
+  "The amount of times the ticket has been scheduled for redeeming"
+  redeemCount: Int
+}
+
+type RetryableTicketRedeemAttempt @entity(immutable: false) {
+  id: ID!
+  ticketId: RetryableTicket!
+  txHash: Bytes
+  sequenceNumber: Int
+}
+
+enum TransactionType {
+  Stake
+  Unstake
+  MintSignal
+  BurnSignal
+  MintNSignal
+  BurnNSignal
+  BridgeWithdrawal
+  BridgeDeposit
+}
+
+"""
+The Token manager data
+"""
+type TokenManager @entity(immutable: false) {
+  "Token manager address"
+  id: ID!
+  "Master copy address"
+  masterCopy: Bytes!
+  "Tokens stored in manger through deposit or withdraw"
+  tokens: BigInt!
+  "List of addresses that are allowed to pull funds"
+  tokenDestinations: [Bytes!]
+  "List of function call authorizations"
+  authorizedFunctions: [AuthorizedFunction!] @derivedFrom(field: "manager")
+  "Token lock count of contracts created"
+  tokenLockCount: BigInt!
+}
+
+"""
+Authorized functions for the Manager
+"""
+type AuthorizedFunction @entity(immutable: false) {
+  "Function signature (string)"
+  id: ID!
+  "The contract address that is authorized to have this function called on itself"
+  target: Bytes!
+  "Hash of the function signature"
+  sigHash: Bytes!
+  "Token lock Manager"
+  manager: TokenManager!
+}
+"""
+Token Lock Wallets which hold locked GRT
+"""
+type TokenLockWallet @entity(immutable: false) {
+  "The address of the token lock wallet"
+  id: ID!
+  "The Manager address"
+  manager: Bytes!
+  "The hash of the initializer"
+  initHash: Bytes!
+  "Address of the beneficiary of locked tokens"
+  beneficiary: Bytes!
+  "The token being used (GRT)"
+  token: Bytes!
+  "Amount of tokens to be managed by the lock contract"
+  managedAmount: BigInt!
+  "Start time of the release schedule"
+  startTime: BigInt!
+  "End time of the release schedule"
+  endTime: BigInt!
+  "Number of periods between start time and end time"
+  periods: BigInt!
+  "Time when the releases start"
+  releaseStartTime: BigInt!
+  "Time the cliff vests, 0 if no cliff"
+  vestingCliffTime: BigInt!
+  "Whether or not the contract is revocable"
+  revocable: Revocability
+  "True if the beneficiary has approved addresses that the manager has approved"
+  tokenDestinationsApproved: Boolean!
+  "The amount of tokens that have been resleased"
+  tokensReleased: BigInt!
+  "The amount of tokens that have been withdrawn"
+  tokensWithdrawn: BigInt!
+  "The amount of tokens that have been revoked"
+  tokensRevoked: BigInt!
+  "The block this wlalet was created"
+  blockNumberCreated: BigInt!
+  "The creation tx hash of the wallet"
+  txHash: Bytes!
+}
+
+"""
+TokenLockWallet Revocability Enum
+"""
+enum Revocability {
+  NotSet
+  Enabled
+  Disabled
+}
+
+"""
+Full test search for displayName and description on the Subgraph Entity
+"""
+type _Schema_
+  @fulltext(
+    name: "subgraphMetadataSearch"
+    language: en
+    algorithm: rank
+    include: [{ entity: "SubgraphMeta", fields: [{ name: "displayName" }, { name: "description" }] }]
+  )
+  @fulltext(
+    name: "curatorSearch"
+    language: en
+    algorithm: rank
+    include: [{ entity: "Curator", fields: [{ name: "defaultDisplayName" }, { name: "id" }] }]
+  )
+  @fulltext(
+    name: "delegatorSearch"
+    language: en
+    algorithm: rank
+    include: [{ entity: "Delegator", fields: [{ name: "defaultDisplayName" }, { name: "id" }] }]
+  )
+
+"""
+Revelant data for a PaymentsEscrow accounts
+"""
+type PaymentsEscrowAccount @entity(immutable: false) {
+  "The payer, collector and receiver concatenated"
+  id: Bytes!
+  "The payer address of the account"
+  payer: Payer!
+  "The collector address of the account"
+  collector: Bytes!
+  "The receiver address of the account"
+  receiver: Receiver!
+  "The balance of the account"
+  balance: BigInt!
+  "The amount of tokens thawing on the account"
+  totalAmountThawing: BigInt!
+  "The thaw end timestamp"
+  thawEndTimestamp: BigInt!
+  "The transactions for the escrow account"
+  transactions: [PaymentsEscrowTransaction!]! @derivedFrom(field: "escrowAccount")
+}
+
+"""
+Payer of a PaymentsEscrow account
+"""
+type Payer @entity(immutable: false) {
+  "The address of the payer"
+  id: Bytes!
+  "The account of the payer"
+  escrowAccounts: [PaymentsEscrowAccount!]! @derivedFrom(field: "payer")
+  "The transactions for the payer"
+  transactions: [PaymentsEscrowTransaction!]! @derivedFrom(field: "payer")
+  "The signers for the payer"
+  signers: [Signer!]! @derivedFrom(field: "payer")
+}
+
+"""
+Receiver of a PaymentsEscrow account
+"""
+type Receiver @entity(immutable: false) {
+  "The address of the receiver"
+  id: Bytes!
+  "The account of the receiver"
+  escrowAccounts: [PaymentsEscrowAccount!]! @derivedFrom(field: "receiver")
+  "The transactions for the receiver"
+  transactions: [PaymentsEscrowTransaction!]! @derivedFrom(field: "receiver")
+}
+
+"""
+Transactions for a PaymentsEscrow account
+"""
+type PaymentsEscrowTransaction @entity(immutable: false) {
+  "The transaction hash concatenated with event log index"
+  id: Bytes!
+  "The transaction group id"
+  transactionGroupId: Bytes
+  "The transaction type"
+  type: String!
+  "The payer"
+  payer: Payer!
+  "The collector"
+  collector: Bytes!
+  "The receiver"
+  receiver: Receiver!
+  "The allocation id"
+  allocationId: Bytes
+  "The amount of tokens"
+  amount: BigInt!
+  "The escrow account"
+  escrowAccount: PaymentsEscrowAccount!
+  "The transaction timestamp"
+  timestamp: BigInt!
+}
+
+"""
+The tokens collected by the GraphTallyCollector
+"""
+type GraphTallyTokensCollected @entity(immutable: false) {
+  "The payer, receiver and collection id concatenated"
+  id: Bytes!
+  "The payer address of the account"
+  payer: Payer!
+  "The receiver address of the account"
+  receiver: Receiver!
+  "The collection id"
+  collectionId: Bytes!
+  "The tokens already collected"
+  tokens: BigInt!
+}
+
+"""
+The signer of a PaymentsEscrow account
+"""
+type Signer @entity(immutable: false) {
+  "The address of the signer"
+  id: Bytes!
+  "Whether the signer is authorized"
+  isAuthorized: Boolean!
+  "The payer that authorized the signer"
+  payer: Payer!
+  "The thaw end timestamp for revoking the signer"
+  thawEndTimestamp: BigInt!
+}

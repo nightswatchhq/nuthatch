@@ -22,6 +22,41 @@ Every refusal below names the thing refused, so a caller can act on it.
 | `pools(block: { number_gte: N }) { … }` | answered on the latest block when the nest's head has reached `N`, else graph-node's own refusal. Not time travel: *"the query will be executed on the latest block **only if** the subgraph has progressed to or past the minimum block number"* (`graph/src/schema/api.rs:1189`), which a nest satisfies exactly with no history stored |
 | `_meta { block { number } … }` | not compiled at all: answered from the nest's own head |
 
+An explicit `block: null` selects the head, as on the Rust monitor's first page. `_meta` honours
+the same minimum-block precondition and refuses unsupported historical selectors rather than
+silently answering at head. Subsequent hash-pinned pages require the historical mode below.
+
+### Opt-in historical reads
+
+A nest whose entity views derive exclusively from complete block-stamped facts can declare
+`graph/history.toml`:
+
+```toml
+version = 1
+first_block = 42449585
+max_head_age_seconds = 15
+max_block_distance = 60
+```
+
+This enables entity number selectors throughout the declared indexed range and hash selectors at
+retained canonical checkpoints. It filters raw facts before
+the authored SQL views evaluate; it does not filter today's aggregated entities. Current maintained
+entities, labels and offchain snapshots are not substituted into past-state queries. The query still
+uses the ordinary SQL admission, row, memory and time bounds. Checkpoint hashes have a persisted
+reverse lookup that is updated transactionally on writes and rollbacks; existing writable stores
+build it once on upgrade.
+
+All roots default to the same captured head. `_meta(block: ...)` describes its selected checkpoint.
+Historical numeric metadata is accepted between retained checkpoints, as it is in graph-node: the
+requested number is returned while `hash` and `timestamp` are null. Hash selectors still require an
+actual retained canonical checkpoint. Entity queries by number do not require a header at that number
+and make no RPC calls. Future blocks, blocks before `first_block`, stale heads and a store generation
+changing during the operation are errors. Unknown hashes remain unavailable. The age limit and
+optional distance limit are admission checks, not evidence that a deployment keeps up with the chain.
+
+The policy is an author assertion of complete input history, not a backfill or completeness proof.
+It does not make a partial schema or incomplete entity derivation a Network Subgraph replacement.
+
 ### Numeric ordering and comparison
 
 A nest stores every big number as canonical text (`analytics.rs:2253`: columns are `UBIGINT`, everything
@@ -110,8 +145,17 @@ inner subquery exists because `ORDER BY` and `LIMIT` cannot sit inside the aggre
 before any of this was written - so a parent with no children would answer `null` for a field the
 generated schema types `[Swap!]!`.
 
-One level, matching the depth `E_orderBy` advertises in the reference: graph-node emits
-`token0__symbol` and no `token0__whitelistPools__id`.
+One to-one relation level is supported generally. A derived list directly below it is also supported,
+with its own `first`, `skip`, `orderBy`, `orderDirection` and `where` applied in the correlated query.
+This is the bounded two-level shape the Horizon escrow client uses:
+
+```graphql
+{ paymentsEscrowAccounts { payer { signers(first: 1000, where: { isAuthorized: true }) { id } } } }
+```
+
+Top-level derived lists accept the same filtering and pagination arguments. They may also select a
+to-one relation with scalar children, as in `subgraphDeployments { indexerAllocations { indexer { id } } }`.
+Both shapes remain one SQL statement, not a parent-by-parent request loop. Further traversal is not accepted.
 
 Every column is qualified with a base alias whether or not the query joins, so a relation whose target
 shares a column name - `id` always does - cannot turn a working query into an ambiguous one on some
@@ -132,6 +176,9 @@ no mapping, so `allow` and `deny` cannot differ.
 
 Bare, `_not`, `_gt`, `_gte`, `_lt`, `_lte`, `_in`, `_not_in`, and the text set: `_contains`,
 `_starts_with`, `_ends_with`, each with a `_not` form and each with a `_nocase` form, eight more.
+
+Null equality and inequality lower to `IS NULL` and `IS NOT NULL`, including the Rust monitor's
+`closedAt_not: null`. Null is not the string `"null"`, and never removes a filter condition.
 
 **Which operators a field accepts is derived from the schema, not from a table here.** The operator has
 to be one `graph_schema::filter_suffixes` declares for that field's type, and that function was derived
@@ -237,11 +284,11 @@ after which the whole operation reads as garbage.
 
 | refused | why it is not approximated |
 |---|---|
-| `block: { number: N }`, `block: { hash: … }` | needs a block-ranged entity store the nest has not got (#1267). Answering as of head while the caller named a past block is a wrong answer that looks right. `number_gte` is **not** in this row - see above |
+| `block: { number: N }`, `block: { hash: … }` without historical mode | cannot substitute current state for a past block. Historical mode supports number-scoped entity reads and retained checkpoint hashes as described above; `number_gte` does not need it |
 | a `block` object carrying anything besides `number_gte` alone | `{ number_gte: N, number: M }` names two different requirements and only one of them is answerable |
-| arguments on a traversed field (`swaps(first: 5)`) | the relation would need its own `LIMIT`, and a dropped `first` there returns every related row. Refused **before** any traversal is lowered: the guard once sat after the aggregation branch, so this compiled with the argument silently gone |
+| arguments on a traversed to-one field or a scalar | these fields do not have independent pagination; derived lists do, and lower it explicitly |
 | a **stored** list of entity ids (`Token.whitelistPools`, no `@derivedFrom`) | a different shape needing `unnest`, not the aggregation below, and using the wrong one would answer with the wrong join |
-| a traversal more than one level deep | refused by name rather than answered with an N+1 walk, which would answer slowly and with a different transaction view per row |
+| traversal beyond the two supported relation shapes above | refused by name rather than answered with an N+1 walk, which would answer slowly and with a different transaction view per row |
 | an entity root with no selection set | not a legal GraphQL query, and answering `*` would invent a field list the caller never asked for |
 | an operator the schema does not declare for that field's type | `sender_starts_with` on a `Bytes` field: our own generated schema says it does not exist |
 | an empty `and`/`or`, or an empty filter object inside one | "no conditions" has no forced reading, and guessing one would be approximating a predicate |
@@ -252,10 +299,14 @@ after which the whole operation reads as garbage.
 | an `operationName` no operation in the document carries | `Operation name not found `X``, likewise. An anonymous operation carries no name, so it is never what a name selects |
 | directives on an operation | skipping one silently is the same class of mistake as a dropped filter |
 | an unbound `$name` | neither the request nor the header supplies a value. Dropping the argument would widen the filter |
-| a `null` filter value, as a literal or through `variables` | in a filter it could mean `IS NULL` or the absence of the condition, and those select different rows. It used to parse as the enum `null` and compile to `= 'null'`, matching rows whose value is that four-character string |
+| `null` for a comparison other than equality or inequality | it is neither a sortable value nor a text pattern; equality and inequality are supported explicitly |
 | a fractional number in `variables` | `BigInt` and `BigDecimal` travel as strings over GraphQL precisely because a float loses them, so a fractional JSON number is refused rather than rounded into a filter |
 
 ## What S2 is done when
+
+The GraphQL route refuses degraded, truncated or tip-unavailable SQL results, and malformed row
+envelopes. These cannot become apparently complete allocation or escrow lists by stripping the
+SQL response's warning flags.
 
 - A canonical client query against the reference schema returns rows that match the reference
   deployment, modulo the declared divergence list.

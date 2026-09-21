@@ -1,0 +1,266 @@
+enum AllocationStatus {
+  Active
+  Closed
+  Finalized
+  Claimed
+}
+
+type Epoch @entity(immutable: false) {
+  id: ID!
+  startBlock: Int!
+  endBlock: Int!
+  signalledTokens: BigInt!
+  stakeDeposited: BigInt!
+  queryFeeRebates: BigInt!
+  queryFeesCollected: BigInt!
+  totalQueryFees: BigInt!
+  taxedQueryFees: BigInt!
+  curatorQueryFees: BigInt!
+  totalRewards: BigInt!
+  totalIndexerRewards: BigInt!
+  totalDelegatorRewards: BigInt!
+}
+
+type GraphNetwork @entity(immutable: false) {
+  id: ID!
+  controller: Bytes!
+  governor: Bytes!
+  pauseGuardian: Bytes!
+  staking: Bytes!
+  epochManager: Bytes!
+  rewardsManager: Bytes!
+  curation: Bytes!
+  gns: Bytes!
+  disputeManager: Bytes!
+  graphToken: Bytes!
+  currentEpoch: Int!
+  epochLength: Int!
+  lastRunEpoch: Int!
+  lastLengthUpdateEpoch: Int!
+  lastLengthUpdateBlock: Int!
+  epochCount: Int!
+  currentL1BlockNumber: BigInt!
+  curationPercentage: Int!
+  protocolFeePercentage: Int!
+  delegationRatio: Int!
+  channelDisputeEpochs: Int!
+  maxAllocationEpochs: Int!
+  thawingPeriod: Int!
+  delegationParametersCooldown: Int!
+  delegationUnbondingPeriod: Int!
+  delegationTaxPercentage: Int!
+  maxThawingPeriod: BigInt!
+  minimumIndexerStake: BigInt!
+  networkGRTIssuancePerBlock: BigInt!
+  isPaused: Boolean!
+  isPartialPaused: Boolean!
+  delegationSlashingEnabled: Boolean!
+  totalSupply: BigInt!
+  totalGRTMinted: BigInt!
+  totalGRTBurned: BigInt!
+  totalTokensStaked: BigInt!
+  totalTokensAllocated: BigInt!
+}
+
+enum DisputeStatus { Undecided Accepted Rejected Draw Cancelled }
+enum DisputeType { SingleQuery Conflicting Indexing Legacy }
+
+type GraphAccount @entity(immutable: false) {
+  id: ID!
+}
+
+type Dispute @entity(immutable: false) {
+  id: ID!
+  subgraphDeployment: SubgraphDeployment!
+  indexer: GraphAccount!
+  fisherman: GraphAccount!
+  deposit: BigInt!
+  isLegacy: Boolean!
+  createdAt: Int!
+  closedAt: Int!
+  cancellableAt: BigInt!
+  status: DisputeStatus!
+  type: DisputeType!
+  tokensRewarded: BigInt!
+  linkedDispute: Dispute
+  allocation: Allocation
+}
+
+type Indexer @entity(immutable: false) {
+  id: ID!
+  queryFeesCollected: BigInt!
+  queryFeeRebates: BigInt!
+  delegatorQueryFees: BigInt!
+  rewardsEarned: BigInt!
+  indexerIndexingRewards: BigInt!
+  delegatorIndexingRewards: BigInt!
+  delegatedCapacity: BigInt!
+  tokenCapacity: BigInt!
+  availableStake: BigInt!
+  createdAt: Int!
+  isLegacy: Boolean!
+  stakedTokens: BigInt!
+  lockedTokens: BigInt!
+  tokensLockedUntil: Int!
+  legacyLockedTokens: BigInt!
+  legacyTokensLockedUntil: Int!
+  allocatedTokens: BigInt!
+  provisionedTokens: BigInt!
+  thawingTokens: BigInt!
+  thawingUntil: BigInt!
+  queryFeeCut: Int!
+  indexingRewardCut: Int!
+  legacyQueryFeeCut: Int!
+  legacyIndexingRewardCut: Int!
+  delegatorParameterCooldown: Int!
+  delegatedTokens: BigInt!
+  delegatedThawingTokens: BigInt!
+  delegatorShares: BigInt!
+  allocationCount: Int!
+  totalAllocationCount: BigInt!
+  allocations: [Allocation!]! @derivedFrom(field: "activeForIndexer")
+  totalAllocations: [Allocation!]! @derivedFrom(field: "indexer")
+  provisions: [Provision!]! @derivedFrom(field: "indexer")
+}
+
+type Allocation @entity(immutable: false) {
+  id: ID!
+  indexer: Indexer!
+  activeForIndexer: Indexer
+  subgraphDeployment: SubgraphDeployment!
+  isLegacy: Boolean!
+  allocatedTokens: BigInt!
+  effectiveAllocation: BigInt!
+  createdAtEpoch: Int!
+  createdAtBlockHash: Bytes!
+  createdAtBlockNumber: Int!
+  createdAt: Int!
+  closedAtEpoch: Int
+  closedAtBlockHash: Bytes
+  closedAtBlockNumber: Int
+  closedAt: Int
+  poi: Bytes
+  forceClosed: Boolean
+  status: AllocationStatus!
+  queryFeesCollected: BigInt!
+  curatorRewards: BigInt!
+  indexingRewards: BigInt!
+  queryFeeRebates: BigInt!
+  delegationFees: BigInt!
+  distributedRebates: BigInt!
+  indexingIndexerRewards: BigInt!
+  indexingDelegatorRewards: BigInt!
+}
+
+type SubgraphDeployment @entity(immutable: false) {
+  id: ID!
+  ipfsHash: String!
+  createdAt: Int!
+  deniedAt: Int!
+  originalName: String
+  stakedTokens: BigInt!
+  signalledTokens: BigInt!
+  signalAmount: BigInt!
+  queryFeesAmount: BigInt!
+  curatorFeeRewards: BigInt!
+  indexingRewardAmount: BigInt!
+  indexerAllocations: [Allocation!]! @derivedFrom(field: "subgraphDeployment")
+  versions: [SubgraphVersion!]! @derivedFrom(field: "subgraphDeployment")
+}
+
+type Subgraph @entity(immutable: false) {
+  id: ID!
+  createdAt: Int!
+  versionCount: BigInt!
+  versions: [SubgraphVersion!]! @derivedFrom(field: "subgraph")
+}
+
+type SubgraphVersion @entity(immutable: false) {
+  id: ID!
+  subgraph: Subgraph!
+  subgraphDeployment: SubgraphDeployment!
+  version: Int!
+  createdAt: Int!
+}
+
+type Provision @entity(immutable: false) {
+  id: ID!
+  queryFeesCollected: BigInt!
+  indexerQueryFees: BigInt!
+  delegatorQueryFees: BigInt!
+  rewardsEarned: BigInt!
+  indexerIndexingRewards: BigInt!
+  delegatorIndexingRewards: BigInt!
+  indexer: Indexer!
+  dataService: DataService!
+  tokensProvisioned: BigInt!
+  tokensAllocated: BigInt!
+  tokensThawing: BigInt!
+  thawingUntil: BigInt!
+  tokensSlashedServiceProvider: BigInt!
+  delegatedTokens: BigInt!
+  delegatorShares: BigInt!
+  delegatedThawingTokens: BigInt!
+  tokensSlashedDelegationPool: BigInt!
+  url: String
+  geoHash: String
+  rewardsDestination: Bytes
+  allocationCount: Int!
+  totalAllocationCount: BigInt!
+  createdAt: BigInt!
+  maxVerifierCut: BigInt!
+  maxVerifierCutPending: BigInt!
+  thawingPeriod: BigInt!
+  thawingPeriodPending: BigInt!
+  queryFeeCut: BigInt!
+  indexingFeeCut: BigInt!
+  indexingRewardsCut: BigInt!
+}
+
+type DataService @entity(immutable: false) {
+  id: ID!
+}
+
+type PaymentsEscrowAccount @entity(immutable: false) {
+  id: Bytes!
+  payer: Payer!
+  collector: Bytes!
+  receiver: Receiver!
+  balance: BigInt!
+  totalAmountThawing: BigInt!
+  thawEndTimestamp: BigInt!
+  transactions: [PaymentsEscrowTransaction!]! @derivedFrom(field: "escrowAccount")
+}
+
+type Payer @entity(immutable: false) {
+  id: Bytes!
+  escrowAccounts: [PaymentsEscrowAccount!]! @derivedFrom(field: "payer")
+  transactions: [PaymentsEscrowTransaction!]! @derivedFrom(field: "payer")
+  signers: [Signer!]! @derivedFrom(field: "payer")
+}
+
+type Receiver @entity(immutable: false) {
+  id: Bytes!
+  escrowAccounts: [PaymentsEscrowAccount!]! @derivedFrom(field: "receiver")
+  transactions: [PaymentsEscrowTransaction!]! @derivedFrom(field: "receiver")
+}
+
+type Signer @entity(immutable: false) {
+  id: Bytes!
+  payer: Payer!
+  isAuthorized: Boolean!
+  thawEndTimestamp: BigInt!
+}
+
+type PaymentsEscrowTransaction @entity(immutable: false) {
+  id: Bytes!
+  transactionGroupId: Bytes
+  type: String!
+  payer: Payer!
+  collector: Bytes!
+  receiver: Receiver!
+  allocationId: Bytes
+  amount: BigInt!
+  escrowAccount: PaymentsEscrowAccount!
+  timestamp: BigInt!
+}

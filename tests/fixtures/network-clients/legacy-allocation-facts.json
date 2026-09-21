@@ -1,0 +1,180 @@
+{
+  "block": 200000000,
+  "scope": "Six independently indexed legacy allocation logs, selected by four allocation IDs, with hash-pinned EpochManager.blockNum calls. Not a complete ledger.",
+  "provenance": {
+    "as_of": 506359805,
+    "entities": null,
+    "nid": null,
+    "registry_hash": "0xa93f8b09cc8d5f392ac78acc5aeb1061a5c279ec258afec5876732b9f618dac0",
+    "sealed_through": 506291104,
+    "source": "hot+sealed"
+  },
+  "tables": {
+    "staking_legacy__allocation_created": [
+      {
+        "_seq": 137021011001344,
+        "address": "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03",
+        "allocationID": "0x00160367519684c1f10ae62acf01c27c775d9724",
+        "block_hash": "0xa1703d38e45278bb8f9d0fb113f78b8a6b38f784c5adf482b7be41566489fc20",
+        "block_number": 130673419,
+        "block_timestamp": 1694597205,
+        "epoch": "291",
+        "indexer": "0xdecba5154aab37ae5e381a19f804f3af4d1bcbb5",
+        "log_index": 0,
+        "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "subgraphDeploymentID": "0xa13ecbbfb7c9b2479479516185eb5a0ccb3d747364f2b175a5e22627c780c0c6",
+        "table": "staking_legacy__allocation_created",
+        "tokens": "15200000000000000000000",
+        "tx_hash": "0xedae4b83338f1f9d6a82f20c175d755495e1169f6713e6b66c48cdb82f3a75ca"
+      },
+      {
+        "_seq": 195816510717970,
+        "address": "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03",
+        "allocationID": "0x00196b151ec1702eb2f777985b1e1257f3f68033",
+        "block_hash": "0xf02857618f336fa6fe540faedb1a196f00363efe553c8af8296cfe3063ee9817",
+        "block_number": 186745177,
+        "block_timestamp": 1709485570,
+        "epoch": "462",
+        "indexer": "0xdecba5154aab37ae5e381a19f804f3af4d1bcbb5",
+        "log_index": 18,
+        "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "subgraphDeploymentID": "0x5abf6ee384171e5e925ad57575528069abd97ae111ee1139df8b7b4de91f0d2c",
+        "table": "staking_legacy__allocation_created",
+        "tokens": "313000000000000000000000",
+        "tx_hash": "0x3fbf6ea1663fbb0184d77616895e3039c1de55553b7fb258f2e55cb0d4ab9c9a"
+      },
+      {
+        "_seq": 208853338685445,
+        "address": "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03",
+        "allocationID": "0x0628b739afb515e6c8af15ec751a5b11d7f33e81",
+        "block_hash": "0x63333135d276b5e55739c51db7d96ec428cae5a4973c4b200a0623cad63182c6",
+        "block_number": 199178065,
+        "block_timestamp": 1712655731,
+        "epoch": "498",
+        "indexer": "0xdecba5154aab37ae5e381a19f804f3af4d1bcbb5",
+        "log_index": 5,
+        "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "subgraphDeploymentID": "0x4d7cff900a9ea5d7882817e38736382243a409e68b627d01442922d19b39f54a",
+        "table": "staking_legacy__allocation_created",
+        "tokens": "5306588000000000000000000",
+        "tx_hash": "0xbd4e9daa952a882c5cc108f6621ebc19785a2b1b3d672831b12886424761b3b5"
+      },
+      {
+        "_seq": 208853646966812,
+        "address": "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03",
+        "allocationID": "0x023c2911705640e4fe8e223caba46c759650ac18",
+        "block_hash": "0xd4761dc8d1f4574951f2dca81dfd62777ebbc4a51f5ef52a4989f37a762753fc",
+        "block_number": 199178359,
+        "block_timestamp": 1712655805,
+        "epoch": "498",
+        "indexer": "0xdecba5154aab37ae5e381a19f804f3af4d1bcbb5",
+        "log_index": 28,
+        "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "subgraphDeploymentID": "0xfe789e161e5894ea866a2467820668a39d74dc59f6099d8df833a2e848ac5522",
+        "table": "staking_legacy__allocation_created",
+        "tokens": "243000000000000000000000",
+        "tx_hash": "0xc98c96aaec101c871ab5580f40cdb8f1bcd9bf806d07a9a49639e53f25f3b750"
+      }
+    ],
+    "staking_legacy__allocation_closed_f672": [
+      {
+        "_seq": 138276540252427,
+        "address": "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03",
+        "allocationID": "0x00160367519684c1f10ae62acf01c27c775d9724",
+        "block_hash": "0x556186d8203f860dee8c1958620b716ab6dfd5b01a47dd8a2fa8f6c13599c38f",
+        "block_number": 131870785,
+        "block_timestamp": 1694942311,
+        "epoch": "295",
+        "indexer": "0xdecba5154aab37ae5e381a19f804f3af4d1bcbb5",
+        "isPublic": "false",
+        "log_index": 267,
+        "poi": "0x11fd2982e7000a3b79b15f2b7989e33b906056428233bff3841c380cdbafabc2",
+        "sender": "0xc4e706f488751cecc0a184e5a7acff5f35b0d5bb",
+        "subgraphDeploymentID": "0xa13ecbbfb7c9b2479479516185eb5a0ccb3d747364f2b175a5e22627c780c0c6",
+        "table": "staking_legacy__allocation_closed_f672",
+        "tokens": "15200000000000000000000",
+        "tx_hash": "0x8f75da481ebe74ba5aa75ff9e95c1055ed6aa95c6383c51a88c88326e23a4f64"
+      },
+      {
+        "_seq": 197758268998167,
+        "address": "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03",
+        "allocationID": "0x00196b151ec1702eb2f777985b1e1257f3f68033",
+        "block_hash": "0x9e77bcffeea5043de270e9674a7148e6734fa90de4f18d80dec837f4c1ec2c0d",
+        "block_number": 188596982,
+        "block_timestamp": 1709972890,
+        "epoch": "468",
+        "indexer": "0xdecba5154aab37ae5e381a19f804f3af4d1bcbb5",
+        "isPublic": "false",
+        "log_index": 535,
+        "poi": "0x9ca318f96b33c4ad3a690e9f87fed6fc6cafd49c49bf985b549574d7d7ba81fb",
+        "sender": "0xc4e706f488751cecc0a184e5a7acff5f35b0d5bb",
+        "subgraphDeploymentID": "0x5abf6ee384171e5e925ad57575528069abd97ae111ee1139df8b7b4de91f0d2c",
+        "table": "staking_legacy__allocation_closed_f672",
+        "tokens": "313000000000000000000000",
+        "tx_hash": "0xb9491206689b19f1693f239fc0608b84a2709b16d08ed02df4615c0dfadbc685"
+      }
+    ],
+    "epoch_manager_l1_block": [
+      {
+        "block_number": 130673419,
+        "block_hash": "0xa1703d38e45278bb8f9d0fb113f78b8a6b38f784c5adf482b7be41566489fc20",
+        "block_timestamp": 1694597205,
+        "address": "0x5a843145c43d328b9bb7a4401d94918f131bb281",
+        "calldata": "0x8ae63d6d",
+        "result": "0x0000000000000000000000000000000000000000000000000000000001149695",
+        "reverted": false,
+        "log_index": 500000
+      },
+      {
+        "block_number": 186745177,
+        "block_hash": "0xf02857618f336fa6fe540faedb1a196f00363efe553c8af8296cfe3063ee9817",
+        "block_timestamp": 1709485570,
+        "address": "0x5a843145c43d328b9bb7a4401d94918f131bb281",
+        "calldata": "0x8ae63d6d",
+        "result": "0x0000000000000000000000000000000000000000000000000000000001275973",
+        "reverted": false,
+        "log_index": 500000
+      },
+      {
+        "block_number": 199178065,
+        "block_hash": "0x63333135d276b5e55739c51db7d96ec428cae5a4973c4b200a0623cad63182c6",
+        "block_timestamp": 1712655731,
+        "address": "0x5a843145c43d328b9bb7a4401d94918f131bb281",
+        "calldata": "0x8ae63d6d",
+        "result": "0x00000000000000000000000000000000000000000000000000000000012b55ef",
+        "reverted": false,
+        "log_index": 500000
+      },
+      {
+        "block_number": 199178359,
+        "block_hash": "0xd4761dc8d1f4574951f2dca81dfd62777ebbc4a51f5ef52a4989f37a762753fc",
+        "block_timestamp": 1712655805,
+        "address": "0x5a843145c43d328b9bb7a4401d94918f131bb281",
+        "calldata": "0x8ae63d6d",
+        "result": "0x00000000000000000000000000000000000000000000000000000000012b55f4",
+        "reverted": false,
+        "log_index": 500000
+      },
+      {
+        "block_number": 131870785,
+        "block_hash": "0x556186d8203f860dee8c1958620b716ab6dfd5b01a47dd8a2fa8f6c13599c38f",
+        "block_timestamp": 1694942311,
+        "address": "0x5a843145c43d328b9bb7a4401d94918f131bb281",
+        "calldata": "0x8ae63d6d",
+        "result": "0x0000000000000000000000000000000000000000000000000000000001150548",
+        "reverted": false,
+        "log_index": 500000
+      },
+      {
+        "block_number": 188596982,
+        "block_hash": "0x9e77bcffeea5043de270e9674a7148e6734fa90de4f18d80dec837f4c1ec2c0d",
+        "block_timestamp": 1709972890,
+        "address": "0x5a843145c43d328b9bb7a4401d94918f131bb281",
+        "calldata": "0x8ae63d6d",
+        "result": "0x000000000000000000000000000000000000000000000000000000000127f6f9",
+        "reverted": false,
+        "log_index": 500000
+      }
+    ]
+  }
+}

@@ -115,6 +115,13 @@ pub struct CallDecl {
     /// the same moment a subgraph handler would have made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
+    /// Alternative row-driven trigger across several event tables. A fixed getter is still
+    /// fetched once per block, even when several of these tables fire in that block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_any: Vec<String>,
+    /// Require EIP-1898 hash pinning and canonicality. No block-number fallback.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub canonical: bool,
     /// The ABI signature to call, e.g. `balanceOf(address)`. Row-driven declarations only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
@@ -141,10 +148,18 @@ fn default_every() -> u64 {
     1000
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl CallDecl {
     /// True when this declaration is driven by the rows of a table rather than a block schedule.
     pub fn is_row_driven(&self) -> bool {
-        self.on.is_some()
+        self.on.is_some() || !self.on_any.is_empty()
+    }
+
+    pub fn matches_source(&self, table: &str) -> bool {
+        self.on.as_deref() == Some(table) || self.on_any.iter().any(|name| name == table)
     }
 
     /// Validate a declaration at load time rather than at the first RPC round trip.
@@ -152,6 +167,22 @@ impl CallDecl {
     /// Every one of these is a config error that would otherwise surface thousands of blocks into a
     /// backfill, as a wall of identical failures.
     pub fn validate(&self) -> Result<()> {
+        if self.on.is_some() && !self.on_any.is_empty() {
+            bail!("call `{}`: choose `on` or `on_any`, not both", self.name);
+        }
+        let mut seen = std::collections::HashSet::new();
+        if self.on_any.len() > 128
+            || self.on_any.iter().any(|s| {
+                s.is_empty()
+                    || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    || !seen.insert(s)
+            })
+        {
+            bail!(
+                "call `{}`: `on_any` requires at most 128 distinct table identifiers",
+                self.name
+            );
+        }
         if self.name.is_empty() {
             bail!("a [[calls]] declaration needs a `name` - it becomes the result table");
         }
@@ -300,6 +331,11 @@ impl CallDecl {
     /// therefore produce the same content addresses. Anchoring on `from` would give two operators
     /// different sample sets for the same declaration, which defeats tier 4 sharing entirely.
     pub fn blocks_in(&self, from: u64, to: u64) -> Vec<u64> {
+        // Event-triggered calls obtain their blocks from decoded rows. A periodic
+        // schedule here makes timestamp preparation buy headers nobody uses.
+        if self.is_row_driven() {
+            return Vec::new();
+        }
         let start = self.start.unwrap_or(0).max(from);
         if start > to {
             return Vec::new();
@@ -320,6 +356,9 @@ pub async fn resolve_at(
     decls: &[CallDecl],
     block: u64,
 ) -> Result<Vec<CallResult>> {
+    if decls.iter().any(|decl| decl.canonical) {
+        bail!("canonical calls require a source block hash; use resolve_pairs_at_hash");
+    }
     let pairs: Vec<(String, String)> = decls
         .iter()
         .map(|d| {
@@ -358,6 +397,35 @@ pub async fn resolve_pairs_at(
                 calldata: key.calldata.clone(),
                 result: r.map(|s| s.to_ascii_lowercase()),
                 address: key.address(),
+            }
+        })
+        .collect())
+}
+
+/// Hash-pinned counterpart; the content address includes the fork identity.
+pub async fn resolve_pairs_at_hash(
+    rpc: &crate::rpc::RpcClient,
+    chain_id: u64,
+    pairs: &[(String, String)],
+    block: u64,
+    hash: &str,
+) -> Result<Vec<CallResult>> {
+    let raw = rpc.eth_call_batch_at_hash(pairs, hash).await?;
+    Ok(pairs
+        .iter()
+        .zip(raw)
+        .map(|((contract, calldata), result)| {
+            let key = CallKey::new(chain_id, block, contract, calldata);
+            let mut digest = Sha256::new();
+            digest.update(b"nuthatch-canonical-call-v1\0");
+            digest.update(key.address().as_bytes());
+            digest.update(hash.to_ascii_lowercase().as_bytes());
+            CallResult {
+                block,
+                contract: key.contract,
+                calldata: key.calldata,
+                result: result.map(|r| r.to_ascii_lowercase()),
+                address: hex::encode(digest.finalize()),
             }
         })
         .collect())
@@ -638,6 +706,8 @@ mod tests {
             every,
             start: None,
             on: None,
+            on_any: Vec::new(),
+            canonical: false,
             signature: None,
             args: Vec::new(),
         }
@@ -692,6 +762,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn canonical_calls_pin_the_wire_request_and_content_identity_to_the_hash() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let app = Router::new().route("/", post(|Json(batch): Json<Value>| async move {
+            Json(Value::Array(batch.as_array().unwrap().iter().map(|request| {
+                let selector = &request["params"][1];
+                assert_eq!(selector["requireCanonical"], true);
+                assert!(selector["blockHash"].as_str().unwrap().starts_with("0x"));
+                assert!(selector.get("blockNumber").is_none());
+                if selector["blockHash"].as_str().unwrap().ends_with('c') {
+                    json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32000,"message":"block is not canonical"}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":"0x0012"})
+                }
+            }).collect()))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rpc = crate::rpc::RpcClient::new(vec![format!("http://{address}")]).unwrap();
+        let pairs = vec![(
+            "0x1111111111111111111111111111111111111111".into(),
+            "0x12345678".into(),
+        )];
+        let a = format!("0x{}", "a".repeat(64));
+        let b = format!("0x{}", "b".repeat(64));
+        let first = resolve_pairs_at_hash(&rpc, 42161, &pairs, 100, &a)
+            .await
+            .unwrap();
+        let repeated = resolve_pairs_at_hash(
+            &rpc,
+            42161,
+            &pairs,
+            100,
+            &a.to_uppercase().replacen("0X", "0x", 1),
+        )
+        .await
+        .unwrap();
+        let fork = resolve_pairs_at_hash(&rpc, 42161, &pairs, 100, &b)
+            .await
+            .unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(first[0].result, fork[0].result);
+        assert_ne!(first[0].address, fork[0].address);
+        let error =
+            resolve_pairs_at_hash(&rpc, 42161, &pairs, 100, &format!("0x{}", "c".repeat(64)))
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("not canonical"));
+        assert!(resolve_pairs_at_hash(&rpc, 42161, &pairs, 100, "0xbad")
+            .await
+            .is_err());
+        server.abort();
+    }
+
     /// The separator earns its keep: without it, `("0xab","cd")` and `("0xabcd","")` would hash the
     /// same, silently merging two genuinely different reads.
     #[test]
@@ -704,6 +830,16 @@ mod tests {
     /// Sampling is anchored on absolute block numbers, so a resumed backfill hits the same blocks as a
     /// fresh one. Anchoring on the range start would give two operators different sample sets for the
     /// same declaration - and therefore different content addresses for the same question.
+    #[test]
+    fn event_driven_calls_do_not_schedule_periodic_header_reads() {
+        let single = row_driven("clock", "blockNum()", &[]);
+        assert!(single.blocks_in(0, 10_000).is_empty());
+        let mut multi = single;
+        multi.on = None;
+        multi.on_any = vec!["staking__created".into(), "service__closed".into()];
+        assert!(multi.blocks_in(0, 10_000).is_empty());
+    }
+
     #[test]
     fn sampling_is_anchored_on_absolute_blocks_not_on_the_range() {
         let d = decl("x", 1000);
@@ -807,9 +943,30 @@ mod tests {
             every: default_every(),
             start: None,
             on: Some("tok__transfer".into()),
+            on_any: Vec::new(),
+            canonical: false,
             signature: Some(sig.into()),
             args: args.iter().map(|a| a.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn multi_source_triggers_are_explicit_and_do_not_change_existing_declaration_identity() {
+        let old = row_driven("epoch", "currentEpoch()", &[]);
+        let encoded = serde_json::to_value(&old).unwrap();
+        assert!(encoded.get("on_any").is_none());
+        let mut multi = old.clone();
+        multi.on = None;
+        multi.on_any = vec!["staking__created".into(), "service__closed".into()];
+        multi.validate().unwrap();
+        assert!(multi.matches_source("staking__created"));
+        assert!(multi.matches_source("service__closed"));
+        assert!(!multi.matches_source("other__closed"));
+        multi.on = Some("other".into());
+        assert!(multi.validate().is_err());
+        multi.on = None;
+        multi.on_any.push("service__closed".into());
+        assert!(multi.validate().is_err());
     }
 
     /// The claim RFC-0038 exists for: a declaration can name an event's parameters, which is what a
@@ -1081,6 +1238,8 @@ mod tests {
             every: 1_000_000,
             start: None,
             on: None,
+            on_any: Vec::new(),
+            canonical: false,
             signature: None,
             args: Vec::new(),
         }];
