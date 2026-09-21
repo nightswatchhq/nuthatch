@@ -1,0 +1,41 @@
+
+            query allocations(
+              $deployments: [String!]!
+              $minimumAllocation: Int!
+              $disputableEpoch: Int!
+              $zeroPOI: String!
+              $lastId: String!
+            ) {
+              allocations(
+                where: {
+                  id_gt: $lastId
+                  subgraphDeployment_in: $deployments
+                  allocatedTokens_gt: $minimumAllocation
+                  closedAtEpoch_gte: $disputableEpoch
+                  status: Closed
+                  poi_not: $zeroPOI
+                }
+                first: 1000
+                orderBy: id
+                orderDirection: asc
+              ) {
+                id
+                isLegacy
+                createdAt
+                indexer {
+                  id
+                }
+                poi
+                allocatedTokens
+                createdAtEpoch
+                closedAtEpoch
+                closedAt
+                closedAtBlockHash
+                subgraphDeployment {
+                  id
+                  stakedTokens
+                  signalledTokens
+                  queryFeesAmount
+                }
+              }
+            }

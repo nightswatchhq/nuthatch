@@ -1,0 +1,27 @@
+# Copy outside the nest to a durable operator directory and set NUTHATCH_RPC_BUDGET
+# to that path. All RpcClient log/state pools in that process share the allowance.
+# No API key belongs here. Do not delete the adjacent .redb or .budget-initialized files.
+#
+# 285,000,000 units is the operator's US$150 ceiling at the conservative
+# $0.525/M CU estimate. Existing reserved units are preserved when this allowance
+# is migrated upward. The pilot has its own durable ledger.
+# At the public 2026-09-17 PAYG rate of $0.525/M CU this is $21 before tax. This is
+# deliberately below Chief's $50 ceiling. It is NOT an account-level billing cap;
+# other processes, custom pricing, taxes and future provider changes are outside it.
+# Source: https://www.alchemy.com/docs/reference/compute-unit-costs
+# Pricing: https://www.alchemy.com/pricing
+version = 1
+limit_units = 285000000
+
+[methods]
+eth_chainId = 0
+eth_blockNumber = 10
+eth_getBlockByNumber = 20
+eth_getBlockByHash = 20
+eth_getCode = 20
+eth_getStorageAt = 20
+eth_getTransactionReceipt = 20
+eth_getBlockReceipts = 20
+eth_call = 26
+# Reserve the older, higher published value rather than the current table's 60.
+eth_getLogs = 75

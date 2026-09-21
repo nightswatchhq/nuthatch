@@ -2385,6 +2385,7 @@ dependencies = [
  "fallible-streaming-iterator",
  "hashlink 0.10.0",
  "libduckdb-sys",
+ "num",
  "num-integer",
  "rust_decimal",
  "strum",

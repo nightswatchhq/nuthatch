@@ -181,6 +181,12 @@ pub struct BenchReport {
     /// means (it does not apply) and because a factory nest measured without it is measuring the
     /// wrong workload.
     pub factory: bool,
+    /// Durable operator-budget reservations surrounding the entire benchmark, not a median.
+    /// Includes state-call pools and failed requests; these are units, not billed dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_budget_units_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_budget_units_after: Option<u64>,
     /// Children discovered during the run. For a factory workload this is the number that says the
     /// harness actually followed the templates: `"factory": true` with `"children": 0` is a broken
     /// measurement, not a fast one.
@@ -367,6 +373,13 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     // `nuthatch.toml`: an archive endpoint usually carries an API key.
     config.state_rpc_urls = args.state_rpc.clone();
     let registry = Arc::new(crate::registry::from_nest(&dir, &config)?);
+
+    let budget = if args.replay.is_none() {
+        crate::rpc_budget::Budget::from_env()?
+    } else {
+        None
+    };
+    let rpc_budget_units_before = budget.as_ref().map(|b| b.reserved_units()).transpose()?;
 
     // Refuse rather than silently bench a declared-but-unresolved `[[calls]]` nest (#725): all three
     // seal-direct call sites below used to pass an empty calls slice regardless of what the nest
@@ -589,6 +602,8 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         events_per_sec: round2(median_f64(runs.iter().map(|r| r.events_per_sec))),
         peak_rss_mb: median_u64(runs.iter().map(|r| r.peak_rss_mb)),
         rpc_requests: median_u64(runs.iter().map(|r| r.rpc_requests)),
+        rpc_budget_units_before,
+        rpc_budget_units_after: budget.as_ref().map(|b| b.reserved_units()).transpose()?,
         factory: factory.is_some(),
         children: median_u64(runs.iter().map(|r| r.children)),
         calls_declared: config.calls.len(),
@@ -1360,10 +1375,15 @@ async fn hot_store_backfill(
         //
         // An `Ok` empty map stays legitimate: `block_timestamps` is documented best-effort, and a
         // nest that does not index timestamps never reaches here. Only a genuine failure stops the run.
-        let ts = source
-            .block_timestamps(&blocks)
-            .await
-            .with_context(|| format!("block timestamps for {next}..={chunk_to}"))?;
+        let block_data = crate::indexer::fetch_window_block_data(
+            source,
+            registry,
+            &blocks,
+            state_rpc.is_some() && calls.iter().any(|c| c.canonical),
+        )
+        .await
+        .with_context(|| format!("block timestamps for {next}..={chunk_to}"))?;
+        let ts = block_data.timestamps;
         for r in &mut rows {
             r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
         }
@@ -1382,6 +1402,7 @@ async fn hot_store_backfill(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
+                block_data.headers.as_ref(),
             )
             .await?;
         }

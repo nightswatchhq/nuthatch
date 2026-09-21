@@ -1,0 +1,23 @@
+[Unit]
+Description=Nuthatch Arbitrum Network Subgraph backfill
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pepe
+Group=pepe
+Environment=NETWORK_STATE_DIR=/home/pepe/.local/state/network-facade
+Environment=NUTHATCH_BINARY=/home/pepe/network-facade-build-20260917/target/release/nuthatch
+ExecStart=/bin/sh /home/pepe/.local/state/network-facade/run-indexer.sh
+Restart=on-failure
+RestartSec=20s
+TimeoutStopSec=120s
+KillSignal=SIGINT
+# A mature Network nest has thousands of sealed Parquet segments. DuckDB opens one descriptor per
+# referenced segment while planning a GraphQL view, so systemd's usual 1024-file default is not
+# enough even for a read-only parity query.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

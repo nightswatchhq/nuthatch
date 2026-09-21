@@ -174,7 +174,7 @@ impl Cid {
 }
 
 /// base58btc encode - the inverse of [`base58_decode`], used to *produce* a CIDv0.
-fn base58_encode(bytes: &[u8]) -> String {
+pub(crate) fn base58_encode(bytes: &[u8]) -> String {
     let mut digits: Vec<u8> = Vec::with_capacity(bytes.len() * 137 / 100 + 1);
     for &b in bytes {
         let mut carry = b as usize;

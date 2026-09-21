@@ -206,6 +206,8 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
 ///   state only. Slice one validates them, and slice two rebuilds that state from the adopted facts;
 ///   they must move the package NID without forcing the decoded dataset to be re-indexed.
 /// - `semantic.toml` - descriptions and derived footguns, read by the MCP/semantic surface only.
+/// - `graph/schema.graphql`, `graph/history.toml` - the optional Graph read schema and snapshot
+///   admission policy. Only serving reads these files; neither changes ingested facts or calls.
 /// - `llms.txt`, `README.md` - documentation.
 /// - `.claude/**` - the scaffolded agent skill.
 ///
@@ -222,6 +224,8 @@ const NON_DATA_INPUTS: &[&str] = &[
     "queries.toml",
     "entities.toml",
     "semantic.toml",
+    "graph/schema.graphql",
+    "graph/history.toml",
     "llms.txt",
     "README.md",
     ".claude/",
@@ -928,10 +932,13 @@ abi = "abis/c.json"
         write_nest(a.path());
         std::fs::create_dir_all(a.path().join("views")).unwrap();
         std::fs::create_dir_all(a.path().join("entities")).unwrap();
+        std::fs::create_dir_all(a.path().join("graph")).unwrap();
         std::fs::write(a.path().join("views/10-v.sql"), "CREATE VIEW v AS SELECT 1").unwrap();
         let before = build_manifest(a.path(), None).unwrap();
 
         for (file, contents, what) in [
+            ("graph/schema.graphql", "type Epoch @entity { id: ID!, startBlock: Int! }", "the Graph read schema"),
+            ("graph/history.toml", "version = 1\nfirst_block = 10\nmax_head_age_seconds = 30\n", "the Graph read admission policy"),
             ("llms.txt", "completely different docs\n", "documentation"),
             (
                 "views/10-v.sql",
@@ -1052,6 +1059,8 @@ abi = "abis/c.json"
             "entities/delegations.sql",
             "views/nested/deep.sql",
             "semantic.toml",
+            "graph/schema.graphql",
+            "graph/history.toml",
             "llms.txt",
             "README.md",
             ".claude/skills/x.md",
@@ -1068,6 +1077,8 @@ abi = "abis/c.json"
             "my-views/x.sql",
             "semantic.toml.bak",
             "docs/README.md",
+            "graph/ingest.toml",
+            "graph/history.toml.bak",
         ] {
             assert!(affects_data(included), "{included} must affect data");
         }

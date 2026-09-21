@@ -1,0 +1,21 @@
+{
+  "block": 42460000,
+  "query": "{ graphNetwork(id:\"1\",block:{number:42460000}) { id controller governor pauseGuardian } }",
+  "referenceDeployment": "QmatH4cd25ymsfCFpgKPRQQ7uCYNgarxanVQ9WCfg4Y7TZ",
+  "reference": {
+    "id": "1",
+    "controller": "0x0a8491544221dd212964fbb96487467291b2c97e",
+    "governor": "0x4528fd7868c91ef64b9907450ee8d82dc639612c",
+    "pauseGuardian": "0xb0ad33a21b98bca1761729a105e2e34e27153aae"
+  },
+  "call": {
+    "block_number": 42449197,
+    "block_hash": "0xd3f40588c2eb199af9ec748777169118321e546714f8bbb20d1c3d35ba7171bc",
+    "block_timestamp": 1669815505,
+    "address": "0x0a8491544221dd212964fbb96487467291b2c97e",
+    "calldata": "0x4fc07d75",
+    "result": "0x0000000000000000000000004528fd7868c91ef64b9907450ee8d82dc639612c",
+    "reverted": false,
+    "log_index": 500001
+  }
+}

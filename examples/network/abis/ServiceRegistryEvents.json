@@ -1,0 +1,14 @@
+[
+  {
+    "name": "ServiceRegistered", "type": "event", "anonymous": false,
+    "inputs": [
+      {"name": "indexer", "type": "address", "indexed": true},
+      {"name": "url", "type": "string", "indexed": false},
+      {"name": "geohash", "type": "string", "indexed": false}
+    ]
+  },
+  {
+    "name": "ServiceUnregistered", "type": "event", "anonymous": false,
+    "inputs": [{"name": "indexer", "type": "address", "indexed": true}]
+  }
+]

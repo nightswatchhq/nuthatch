@@ -63,6 +63,7 @@ fn allowed_read_dirs(dir: &Path) -> Vec<PathBuf> {
 struct DuckCache {
     dir: PathBuf,
     sealed_through: u64,
+    as_of: Option<u64>,
     excluded: std::collections::BTreeSet<String>,
     inputs: std::collections::BTreeMap<PathBuf, DuckInputStamp>,
     last_used: u64,
@@ -314,6 +315,12 @@ fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
             .context("duckdb max_temp_directory_size")?;
     }
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
+    crate::analytics_scalars::register(&conn)?;
+    // GraphQL and the SQL surface define observable order explicitly. Retaining insertion order for
+    // intermediate operators therefore buys no contract and can keep a full extra ordering buffer
+    // alive for a large historical aggregation. Let DuckDB release that memory instead.
+    conn.execute_batch("SET preserve_insertion_order=false;")
+        .context("failed to disable DuckDB insertion-order preservation")?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
     // materialisation fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet
     // file holding rows on both sides of the filter. The optimiser compresses the sort key against
@@ -726,7 +733,7 @@ pub fn degraded_tables(
 /// Run a read-only query to completion. Only SELECT/WITH statements are accepted - this is a query
 /// surface, not a mutation surface. Unguarded: for trusted, registry-built SQL that must finish.
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
-    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[], None)?.rows)
+    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[], None, None)?.rows)
 }
 
 /// Run a trusted read-only query over **only the segments finalized at/below `sealed_through`** (the
@@ -737,14 +744,33 @@ pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
 /// compliance exposure/velocity views. Bounding to the persisted watermark keeps cold (<= watermark)
 /// and hot (everything still in the store) partitioned regardless of crash timing.
 fn query_cold(dir: &Path, sql: &str, sealed_through: u64) -> Result<Vec<Value>> {
-    Ok(run(dir, sql, None, &HotRows::new(), sealed_through, &[], None)?.rows)
+    Ok(run(
+        dir,
+        sql,
+        None,
+        &HotRows::new(),
+        sealed_through,
+        &[],
+        None,
+        None,
+    )?
+    .rows)
 }
 
 /// Run a read-only query under a resource guard, over the **sealed segments only** - the cold path used
 /// by trusted callers and the `/table` endpoint's cold fill (which merges hot itself). See [`QueryGuard`].
 pub fn query_guarded(dir: &Path, sql: &str, guard: QueryGuard) -> Result<QueryOutput> {
     // Cold-only: `u64::MAX` includes every sealed segment (no hot rows to keep disjoint from).
-    run(dir, sql, Some(guard), &HotRows::new(), u64::MAX, &[], None)
+    run(
+        dir,
+        sql,
+        Some(guard),
+        &HotRows::new(),
+        u64::MAX,
+        &[],
+        None,
+        None,
+    )
 }
 
 /// Run a guarded read-only query over the sealed segments **and the hot tip** - the public `/sql`
@@ -762,7 +788,40 @@ pub fn query_hot_cold(
     sealed_through: u64,
     declared: &[crate::registry::TableSchema],
 ) -> Result<QueryOutput> {
-    run(dir, sql, Some(guard), hot, sealed_through, declared, None)
+    run(
+        dir,
+        sql,
+        Some(guard),
+        hot,
+        sealed_through,
+        declared,
+        None,
+        None,
+    )
+}
+
+/// Historical evaluation filters stored facts before authored views aggregate them. Filtering the
+/// finished entity rows would retain today's balances and merely hide recently-created entities.
+/// Callers must supply only block-stamped facts, not current maintained-entity snapshots.
+pub fn query_hot_cold_at(
+    dir: &Path,
+    sql: &str,
+    guard: QueryGuard,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+    block: u64,
+) -> Result<QueryOutput> {
+    run(
+        dir,
+        sql,
+        Some(guard),
+        hot,
+        sealed_through,
+        declared,
+        None,
+        Some(block),
+    )
 }
 
 /// [`query_hot_cold`] for a declared query: refused before evaluation when the plan that would run
@@ -784,6 +843,7 @@ pub fn query_named(
         sealed_through,
         declared,
         Some(admission),
+        None,
     )
 }
 
@@ -970,6 +1030,7 @@ pub(crate) fn test_set_first_attempt_delay_ms(dir: &Path, ms: u64) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     dir: &Path,
     sql: &str,
@@ -978,6 +1039,7 @@ fn run(
     sealed_through: u64,
     declared: &[crate::registry::TableSchema],
     named: Option<&NamedAdmission>,
+    as_of: Option<u64>,
 ) -> Result<QueryOutput> {
     // One deadline for the whole call, computed once - not a fresh `guard.timeout` handed to each
     // `attempt` (#476). Before this, the watchdog only ever bounded a single `attempt`: the first
@@ -1000,6 +1062,7 @@ fn run(
         deadline,
         declared,
         named,
+        as_of,
     );
     // A segment the plan named was gone by execution (#1162). Nothing is corrupt and nothing is
     // missing: a seal replaced the file under the query, and planning again reads the manifest as it
@@ -1029,6 +1092,7 @@ fn run(
             deadline,
             declared,
             named,
+            as_of,
         )? {
             Attempt::Ok(out) => Ok(out),
             Attempt::DiedExecuting { error, .. } => Err(error),
@@ -1099,6 +1163,7 @@ fn run(
         deadline,
         declared,
         named,
+        as_of,
     )? {
         Attempt::Ok(out) => Ok(out),
         Attempt::DiedExecuting { error, .. } => Err(error),
@@ -1127,6 +1192,7 @@ fn attempt(
     deadline: Option<Instant>,
     declared: &[crate::registry::TableSchema],
     named: Option<&NamedAdmission>,
+    as_of: Option<u64>,
 ) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. DuckDB gets the original text.
@@ -1182,13 +1248,17 @@ fn attempt(
     let inputs = duck_inputs(dir);
     let mut slot = duck_cache_lock().remove(dir);
     let reusable = slot.as_ref().is_some_and(|c| {
-        c.sealed_through == sealed_through && c.excluded == *excluded && c.inputs == inputs
+        c.sealed_through == sealed_through
+            && c.as_of == as_of
+            && c.excluded == *excluded
+            && c.inputs == inputs
     });
     if !reusable {
         let (conn, spill) = open_locked_duckdb(dir).context("failed to open DuckDB")?;
         slot = Some(DuckCache {
             dir: dir.to_path_buf(),
             sealed_through,
+            as_of,
             excluded: excluded.clone(),
             inputs,
             last_used: DUCK_USE.fetch_add(1, Ordering::Relaxed),
@@ -1225,16 +1295,21 @@ fn attempt(
             excluded,
             declared,
             wanted.as_ref(),
+            as_of,
         )?;
         let degraded_tables = defined.degraded.clone();
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
         define_nest_views(conn, dir, wanted.as_ref());
-        define_offchain_views(conn, dir, wanted.as_ref());
+        if as_of.is_none() {
+            define_offchain_views(conn, dir, wanted.as_ref());
+        }
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
         // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
-        define_labels_view(conn, dir);
+        if as_of.is_none() {
+            define_labels_view(conn, dir);
+        }
         // Factory nests (RFC-0009): a `{template}__children` view over the sealed factory events, so
         // "which pools, discovered when, by which parent" is one query. Best-effort - no factories, no-op.
         define_children_views(conn, dir);
@@ -1889,9 +1964,9 @@ fn expand_through_views(
 
     let mut out = named.clone();
     let mut frontier: Vec<String> = named.iter().cloned().collect();
-    // A view built on a view built on a view: follow the chain, but never in circles. DuckDB refuses
-    // to create a cyclic view, so this bound is a backstop rather than the mechanism.
-    for _ in 0..8 {
+    // Visit each name once. The finite catalogue and `out` bound traversal without
+    // silently dropping sources beyond an arbitrary dependency depth.
+    while !frontier.is_empty() {
         let mut next = Vec::new();
         for name in frontier.drain(..) {
             let Some(sql) = defs.get(&name) else { continue };
@@ -2005,8 +2080,9 @@ fn reachable_tables(
 
     let mut out = referenced.clone();
     let mut frontier: Vec<String> = referenced.iter().cloned().collect();
-    // A view on a view on a view: follow the chain, bounded, exactly as `expand_through_views` is.
-    for _ in 0..8 {
+    // Authored files may contain cycles that DuckDB will later reject. `out`
+    // prevents revisiting them while retaining sources at any dependency depth.
+    while !frontier.is_empty() {
         let mut next = Vec::new();
         for name in frontier.drain(..) {
             let Some(body) = bodies.get(&name) else {
@@ -2049,12 +2125,81 @@ fn table_refs_in(
         return None;
     }
     let mut out = std::collections::BTreeSet::new();
+    if wanted_kind == "BASE_TABLE" {
+        walk_base_table_refs(&v, &Default::default(), &mut out);
+        return Some(out);
+    }
     walk_table_refs(&v, &mut |kind, name| {
         if kind == wanted_kind {
             out.insert(name.to_ascii_lowercase());
         }
     });
     Some(out)
+}
+
+/// Dependency discovery respects lexical CTE scope. The security walk below deliberately remains
+/// separate: a local name must not hide a forbidden function or a qualified schema from that walk.
+fn walk_base_table_refs(
+    value: &Value,
+    outer: &std::collections::BTreeSet<String>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            let mut scope = outer.clone();
+            let ctes = map
+                .get("cte_map")
+                .and_then(|v| v.get("map"))
+                .and_then(Value::as_array);
+            if let Some(ctes) = ctes {
+                // Definitions see earlier siblings, not later ones. A nonrecursive definition may
+                // read a physical table with its own name; only bind its name after visiting it.
+                for cte in ctes {
+                    let name = cte
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .map(str::to_ascii_lowercase);
+                    let recursive = cte
+                        .pointer("/value/query/node/type")
+                        .and_then(Value::as_str)
+                        == Some("RECURSIVE_CTE_NODE");
+                    if recursive {
+                        if let Some(name) = &name {
+                            scope.insert(name.clone());
+                        }
+                    }
+                    walk_base_table_refs(cte, &scope, out);
+                    if let Some(name) = name {
+                        scope.insert(name);
+                    }
+                }
+            }
+            if map.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
+                if let Some(name) = map.get("table_name").and_then(Value::as_str) {
+                    let qualified = ["schema_name", "catalog_name"].iter().any(|key| {
+                        map.get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                    });
+                    let name = name.to_ascii_lowercase();
+                    if qualified || !scope.contains(&name) {
+                        out.insert(name);
+                    }
+                }
+            }
+            for (key, child) in map {
+                if key != "cte_map" || ctes.is_none() {
+                    walk_base_table_refs(child, &scope, out);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                walk_base_table_refs(value, outer, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Walk the serialized AST, calling `f(kind, name)` for every table reference found.
@@ -2457,7 +2602,17 @@ fn define_views(
     // what a statement reaches. See `reachable_tables` for why this matters (#896).
     wanted: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<std::collections::BTreeSet<String>> {
-    Ok(define_views_bound(conn, dir, hot, sealed_through, excluded, declared, wanted)?.degraded)
+    Ok(define_views_bound(
+        conn,
+        dir,
+        hot,
+        sealed_through,
+        excluded,
+        declared,
+        wanted,
+        None,
+    )?
+    .degraded)
 }
 
 /// What [`define_views_bound`] built: the degraded tables, each defined table's sealed segments as
@@ -2468,6 +2623,7 @@ struct DefinedViews {
     catalogue_hash: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn define_views_bound(
     conn: &Connection,
     dir: &Path,
@@ -2476,6 +2632,7 @@ fn define_views_bound(
     excluded: &std::collections::BTreeSet<String>,
     declared: &[crate::registry::TableSchema],
     wanted: Option<&std::collections::BTreeSet<String>>,
+    as_of: Option<u64>,
 ) -> Result<DefinedViews> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
@@ -2550,6 +2707,17 @@ fn define_views_bound(
 
     for table in &tables {
         let cols = cols_of(table);
+        if as_of.is_some() {
+            if !cols.iter().any(|(name, _)| name == "block_number") {
+                bail!("historical query requires block-stamped facts: {table} has no declared block_number");
+            }
+            if hot.get(table).is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.get("block_number").and_then(Value::as_u64).is_none())
+            }) {
+                bail!("historical query requires block-stamped facts: {table} contains an unstamped row");
+            }
+        }
         // Only segments finalized at or below the served watermark (COR-1 disjointness).
         let sealed: Vec<(String, u64)> = manifest
             .tables
@@ -2643,6 +2811,7 @@ fn define_views_bound(
                 )),
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
+                    degraded.insert(table.clone());
                     None
                 }
             }
@@ -2653,18 +2822,25 @@ fn define_views_bound(
         let view_ddl = |files: &[String]| -> Option<String> {
             let mut parts: Vec<String> = Vec::new();
             if !files.is_empty() {
-                // COR-2: `union_by_name=true` NULL-fills columns that differ across segments - segment
-                // schemas legitimately drift over a nest's life as ABIs are versioned (CLAUDE.md), and
-                // without this a single drifted column makes `read_parquet` throw and the whole table's
-                // view silently vanish.
-                parts.push(format!(
-                    "SELECT *{} FROM {}",
-                    derived_bigint_cols(cols),
-                    with_declared_base_cols(
-                        &format!("read_parquet([{}], union_by_name=true)", files.join(", ")),
-                        cols
-                    )
-                ));
+                // Do not hand one `read_parquet` invocation ten thousand paths. DuckDB opens and
+                // plans a whole input list together, which turns an append-only historical corpus
+                // into an FD and memory cliff before the query has read a row. Each branch has the
+                // same declared projection, so UNION ALL BY NAME preserves the schema-drift rule
+                // below while bounding one scan node to a tractable number of segment handles.
+                //
+                // This is not compaction. Files remain content-addressed and independently
+                // verifiable; the reader merely groups its immutable inputs.
+                const PARQUET_INPUT_BATCH: usize = 256;
+                for batch in files.chunks(PARQUET_INPUT_BATCH) {
+                    parts.push(format!(
+                        "SELECT *{} FROM {}",
+                        derived_bigint_cols(cols),
+                        with_declared_base_cols(
+                            &format!("read_parquet([{}], union_by_name=true)", batch.join(", ")),
+                            cols
+                        )
+                    ));
+                }
             }
             parts.extend(hot_part.clone());
             if parts.is_empty() {
@@ -2678,10 +2854,16 @@ fn define_views_bound(
                 // `UNION ALL BY NAME` aligns columns by name and NULL-fills any a side lacks (a column
                 // all-null over the sealed range is dropped from its Parquet schema; hot may still
                 // carry it).
-                Some(format!(
-                    "CREATE OR REPLACE VIEW \"{table}\" AS {}",
-                    parts.join(" UNION ALL BY NAME ")
-                ))
+                let union = parts.join(" UNION ALL BY NAME ");
+                let select = match as_of {
+                    Some(block) => format!(
+                        "SELECT * FROM ({union}) historical_facts WHERE CASE \
+                         WHEN block_number IS NULL THEN error('historical query requires block-stamped facts: unstamped archived row') \
+                         ELSE block_number <= {block} END"
+                    ),
+                    None => union,
+                };
+                Some(format!("CREATE OR REPLACE VIEW \"{table}\" AS {select}"))
             }
         };
 
@@ -3055,8 +3237,8 @@ fn view_build_failure(
     // `CREATE VIEW` statements failed at load, each with the same "pool_effective_fee does not
     // exist". Chase that chain to the view whose failure is not itself just a missing upstream view -
     // the one line that actually explains anything - rather than reporting a hop that only repeats
-    // the same "does not exist" one level removed. Bounded to 8 hops, matching `expand_through_views`'
-    // cycle guard (DuckDB itself refuses a cyclic view, so this is a backstop, not the mechanism).
+    // the same "does not exist" one level removed. Error explanation is bounded to 8 hops;
+    // unlike dependency discovery, it may stop early without omitting query input data.
     view_build_failure_at(dir, schema, missing, 8)
 }
 
@@ -3071,6 +3253,7 @@ fn view_build_failure_at(
         return None;
     }
     let conn = Connection::open_in_memory().ok()?;
+    crate::analytics_scalars::register(&conn).ok()?;
     let empty_hot = HotRows::new();
     let _ = define_views(
         &conn,
@@ -3199,6 +3382,13 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     let Ok(conn) = Connection::open_in_memory() else {
         return Vec::new();
     };
+    if let Err(error) = crate::analytics_scalars::register(&conn) {
+        return vec![ViewIssue {
+            file: "<scalar functions>".into(),
+            error: format!("register query scalar functions: {error:#}"),
+            hint: None,
+        }];
+    }
     // Base surface the views bind against. `u64::MAX` includes every sealed segment (or, on a fresh
     // nest, yields the empty typed views) so a view referencing `usdc__transfer` resolves.
     let empty_hot = HotRows::new();
@@ -3268,6 +3458,7 @@ pub fn entity_output_columns(
     sql: &str,
 ) -> Result<Vec<String>> {
     let conn = Connection::open_in_memory()?;
+    crate::analytics_scalars::register(&conn)?;
     let empty_hot = HotRows::new();
     let _ = define_views(
         &conn,
@@ -3441,6 +3632,172 @@ fn value_to_json(v: ValueRef<'_>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_discovery_distinguishes_local_ctes_from_entity_views() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let sql = "WITH allocation AS (SELECT * FROM raw_fees), provision AS (SELECT * FROM allocation) SELECT * FROM provision";
+        let ast: String = conn
+            .query_row(
+                &format!("SELECT json_serialize_sql('{}')", sql.replace('\'', "''")),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            super::base_tables_in(&conn, sql).unwrap(),
+            std::collections::BTreeSet::from(["raw_fees".to_string()]),
+            "{ast}"
+        );
+        for (sql, expected) in [
+            ("WITH z AS (SELECT * FROM raw_fees), a AS (SELECT * FROM z) SELECT * FROM a", vec!["raw_fees"]),
+            ("WITH allocation AS (SELECT * FROM allocation) SELECT * FROM allocation", vec!["allocation"]),
+            ("WITH earlier AS (SELECT * FROM allocation), allocation AS (SELECT * FROM raw_fees) SELECT * FROM earlier", vec!["allocation", "raw_fees"]),
+            ("WITH allocation AS (SELECT * FROM raw_fees) SELECT * FROM main.allocation", vec!["allocation", "raw_fees"]),
+            ("WITH allocation AS (SELECT * FROM raw_fees) SELECT * FROM (WITH allocation AS (SELECT * FROM other_fees) SELECT * FROM allocation) nested CROSS JOIN allocation", vec!["other_fees", "raw_fees"]),
+            ("WITH RECURSIVE walk AS (SELECT * FROM raw_fees UNION ALL SELECT * FROM walk) SELECT * FROM walk", vec!["raw_fees"]),
+        ] {
+            assert_eq!(super::base_tables_in(&conn, sql).unwrap(), expected.into_iter().map(str::to_string).collect::<std::collections::BTreeSet<_>>(), "{sql}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/report.sql"),
+            format!(
+            "CREATE VIEW allocation AS SELECT * FROM unrelated_fees; CREATE VIEW report AS {sql};"
+        ),
+        )
+        .unwrap();
+        let wanted = std::collections::BTreeSet::from(["report".to_string()]);
+        assert_eq!(
+            super::reachable_tables(&conn, dir.path(), &wanted).unwrap(),
+            std::collections::BTreeSet::from(["report".to_string(), "raw_fees".to_string()])
+        );
+        // The separate security/function walk still inspects every CTE definition.
+        let functions = super::table_refs_in(
+            &conn,
+            "WITH allocation AS (SELECT * FROM read_csv('secret.csv')) SELECT * FROM allocation",
+            "TABLE_FUNCTION",
+        )
+        .unwrap();
+        assert!(functions.contains("read_csv"));
+    }
+    #[test]
+    fn historical_facts_are_filtered_before_aggregation_across_hot_and_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), r#"{"tables":[{"table":"changes","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/balance.sql"),
+            "CREATE VIEW balance AS SELECT sum(CAST(value AS BIGINT)) AS total FROM changes;",
+        )
+        .unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        crate::seal::seal_range(
+            dir.path(),
+            &[
+                r#"{"table":"changes","block_number":10,"value":"5"}"#.into(),
+                r#"{"table":"changes","block_number":20,"value":"7"}"#.into(),
+            ],
+            10,
+            20,
+        )
+        .unwrap();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "changes".into(),
+            vec![
+                serde_json::json!({"block_number":20,"value":"7"}),
+                serde_json::json!({"block_number":30,"value":"11"}),
+            ],
+        );
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 100,
+        };
+        // Alternating blocks also proves a cached historical connection cannot leak a later view.
+        for (block, expected) in [(10, 5), (30, 23), (20, 12), (10, 5)] {
+            let result = query_hot_cold_at(
+                dir.path(),
+                "SELECT total FROM balance",
+                guard,
+                &hot,
+                20,
+                &[],
+                block,
+            )
+            .unwrap();
+            assert_eq!(result.rows[0]["total"], Value::String(expected.to_string()));
+            assert!(!result.degraded());
+        }
+        let current = query_hot_cold(
+            dir.path(),
+            "SELECT total FROM balance",
+            guard,
+            &hot,
+            20,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(current.rows[0]["total"], Value::String("23".into()));
+    }
+
+    #[test]
+    fn historical_queries_refuse_unstamped_current_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "current_balance".into(),
+            vec![serde_json::json!({"id":"a","balance":"99"})],
+        );
+        let result = query_hot_cold_at(
+            dir.path(),
+            "SELECT * FROM current_balance",
+            QueryGuard {
+                timeout: Duration::from_secs(5),
+                max_rows: 100,
+            },
+            &hot,
+            0,
+            &[],
+            10,
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("block-stamped facts"));
+    }
+
+    #[test]
+    fn historical_queries_refuse_unstamped_archived_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), r#"{"tables":[{"table":"changes","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#).unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        crate::seal::seal_range(
+            dir.path(),
+            &[
+                r#"{"table":"changes","value":"5"}"#.into(),
+                r#"{"table":"changes","value":"7"}"#.into(),
+            ],
+            10,
+            20,
+        )
+        .unwrap();
+        let result = query_hot_cold_at(
+            dir.path(),
+            "SELECT sum(CAST(value AS BIGINT)) FROM changes",
+            QueryGuard {
+                timeout: Duration::from_secs(5),
+                max_rows: 100,
+            },
+            &HotRows::new(),
+            20,
+            &[],
+            10,
+        );
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("unstamped archived row"), "{error}");
+    }
 
     #[test]
     fn rejects_non_select() {
@@ -6790,6 +7147,44 @@ template="pool"
             .expect("a view on a view must still resolve under the narrowed definition");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["from"], "0xa");
+    }
+
+    #[test]
+    fn dependency_closure_reaches_sources_beyond_eight_views() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_facts (amount INTEGER); INSERT INTO source_facts VALUES (7)",
+        )
+        .unwrap();
+        for i in 0..12 {
+            let source = if i == 0 {
+                "source_facts".to_string()
+            } else {
+                format!("layer_{}", i - 1)
+            };
+            let sql = format!("CREATE VIEW layer_{i} AS SELECT amount FROM {source};");
+            std::fs::write(dir.path().join(format!("views/{i:02}.sql")), &sql).unwrap();
+            conn.execute_batch(&sql).unwrap();
+        }
+        let named = ["layer_11".to_string()].into_iter().collect();
+        let expected: std::collections::BTreeSet<_> = (0..12)
+            .map(|i| format!("layer_{i}"))
+            .chain(std::iter::once("source_facts".to_string()))
+            .collect();
+        assert_eq!(
+            reachable_tables(&conn, dir.path(), &named).unwrap(),
+            expected
+        );
+        assert_eq!(expand_through_views(&conn, &named), expected);
+        // Even invalid, cyclic authored definitions must terminate during discovery.
+        std::fs::write(dir.path().join("views/12.sql"),
+            "CREATE VIEW cycle_a AS SELECT * FROM cycle_b; CREATE VIEW cycle_b AS SELECT * FROM cycle_a;").unwrap();
+        let cycle = ["cycle_a".to_string(), "cycle_b".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(reachable_tables(&conn, dir.path(), &cycle).unwrap(), cycle);
     }
 
     /// The other half of the same mechanism: **without** a schema there are no columns, so the empty

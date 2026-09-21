@@ -108,6 +108,21 @@ pub fn sql_max_concurrency() -> usize {
 }
 /// Wall-clock deadline for a single analytical query; a runaway (e.g. cartesian) is interrupted.
 const SQL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The public query budget. The default is deliberately short: this is an untrusted read surface,
+/// not a batch engine. An operator may raise it for a private replay or catalogue warm-up by setting
+/// `NUTHATCH_SQL_TIMEOUT_SECS`; malformed and zero values retain the safe default.
+///
+/// Kept as a function rather than a process-global `OnceLock` so a test server can exercise both
+/// budgets without sharing state with the rest of the test process.
+fn sql_timeout() -> Duration {
+    std::env::var("NUTHATCH_SQL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(SQL_TIMEOUT)
+}
 /// How long a request waits for an analytical permit before it is told the node is busy (#1319).
 ///
 /// The permit count still caps what *runs*; this only caps how long a caller waits to be told no.
@@ -369,6 +384,7 @@ pub fn router(backing: SharedNest) -> Router {
             // RFC-0053 S1 (#1265). Both shapes: a plain endpoint an operator points people at, and
             // the subgraph URL form so a client's existing URL needs only its host changed.
             .route("/graphql", post(graph_graphql))
+            .route("/graph/status", get(graph_status))
             .route("/subgraphs/id/{id}", post(graph_graphql))
             .route("/subgraphs/name/{*name}", post(graph_graphql))
             .route("/table/{name}", get(table))
@@ -1953,10 +1969,58 @@ async fn graph_graphql(
     // `__schema` meant a filter value of `"__schema"` - a perfectly ordinary thing to store in a
     // `hooks` column - was answered with the schema document instead of rows (Jules on #1282). A root
     // field name is a structural fact and a string literal is not, so read the structure.
-    let roots = match crate::graph_query::parse_named(&query, &vars, operation_name.as_deref()) {
+    let mut roots = match crate::graph_query::parse_named(&query, &vars, operation_name.as_deref())
+    {
         Ok(r) => r,
         Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
     };
+    let history = match crate::graph_history::Policy::load(&path.with_file_name("history.toml")) {
+        Ok(policy) => policy,
+        Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+    };
+    let mut historical_blocks = std::collections::BTreeMap::new();
+    let mut history_fence = None;
+    if let Some(policy) = &history {
+        let Some(generation) = s.store.write_generation() else {
+            return (
+                StatusCode::OK,
+                Json(gql_error(
+                    "historical read cannot obtain a stable store generation; retry",
+                )),
+            );
+        };
+        history_fence = Some((generation, s.store.sealed_through()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let head = match graph_history_head(&s, policy, now) {
+            Ok(head) => head,
+            Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+        };
+        for root in &mut roots {
+            if root.name.starts_with("__") {
+                continue;
+            }
+            let selected = if root.name == "_meta" {
+                policy
+                    // graph-node accepts a numeric metadata selector between retained
+                    // checkpoints. Its `_Block_` carries that requested number, while
+                    // `hash` and `timestamp` are null because there is no exact
+                    // checkpoint. Entity reads use precisely the same data bound.
+                    // Hash selectors still require a retained canonical checkpoint.
+                    .select_data_block(s.store.as_ref(), &head, root.args.get("block"))
+            } else {
+                policy.select_data_block(s.store.as_ref(), &head, root.args.get("block"))
+            };
+            let block = match selected {
+                Ok(block) => block,
+                Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+            };
+            historical_blocks.insert(root.key.clone(), block);
+            root.args.remove("block");
+        }
+    }
     let mut data = serde_json::Map::new();
     // Rendered at most once, and only if a root asks for it.
     let mut doc: Option<serde_json::Value> = None;
@@ -2002,12 +2066,32 @@ async fn graph_graphql(
             // `hasIndexingErrors` is false as a fact rather than as a convenience - there is no
             // handler that could have aborted.
             "_meta" => {
-                let last = s
-                    .store
-                    .get_meta("last_block")
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.parse::<u64>().ok());
+                let mut min_block = None;
+                for (name, value) in &root.args {
+                    if name != "block" {
+                        return (
+                            StatusCode::OK,
+                            Json(gql_error(&format!("unsupported _meta argument `{name}`"))),
+                        );
+                    }
+                    min_block = match crate::graph_query::minimum_block(value) {
+                        Ok(n) => n,
+                        Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+                    };
+                }
+                let last = historical_blocks.get(&root.key).copied().or_else(|| {
+                    s.store
+                        .get_meta("last_block")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse::<u64>().ok())
+                });
+                if min_block.is_some_and(|min| last.is_none_or(|head| head < min)) {
+                    return (StatusCode::OK, Json(gql_error(&format!(
+                        "subgraph has only indexed up to block number {} and data for block number {} is therefore not yet available",
+                        last.unwrap_or(0), min_block.unwrap()
+                    ))));
+                }
                 // Rendered complete, then narrowed by the selection, exactly as `__schema` and
                 // `__type` are. It used to insert this object whole, so `{ _meta { block { number } } }`
                 // came back carrying `deployment` and `hasIndexingErrors` the client had not asked
@@ -2080,7 +2164,7 @@ async fn graph_graphql(
                 );
             }
         }
-        match graph_rows(&s, &compiled).await {
+        match graph_rows(&s, &compiled, historical_blocks.get(&root.key).copied()).await {
             Ok(rows) => {
                 let shaped: Result<Vec<serde_json::Value>, String> =
                     rows.iter().map(|r| graph_shape(&compiled, r)).collect();
@@ -2088,6 +2172,18 @@ async fn graph_graphql(
                     Ok(v) => v,
                     Err(e) => return (StatusCode::OK, Json(gql_error(&e))),
                 };
+                if history.is_some() {
+                    for row in &shaped {
+                        if let Err(e) = crate::graph_history::validate_result(
+                            &schema,
+                            &compiled.entity,
+                            &root.sel,
+                            row,
+                        ) {
+                            return (StatusCode::OK, Json(gql_error(&e.to_string())));
+                        }
+                    }
+                }
                 let value = if compiled.singular {
                     shaped.into_iter().next().unwrap_or(serde_json::Value::Null)
                 } else {
@@ -2096,6 +2192,25 @@ async fn graph_graphql(
                 data.insert(root.key.clone(), value);
             }
             Err(msg) => return (StatusCode::OK, Json(gql_error(&msg))),
+        }
+    }
+    if let Some((generation, sealed)) = history_fence {
+        if s.store.write_generation() != Some(generation) || s.store.sealed_through() != sealed {
+            return (
+                StatusCode::OK,
+                Json(gql_error(
+                    "indexed state changed while reading the GraphQL operation; retry",
+                )),
+            );
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(policy) = &history {
+            if let Err(e) = graph_history_head(&s, policy, now) {
+                return (StatusCode::OK, Json(gql_error(&e.to_string())));
+            }
         }
     }
     (StatusCode::OK, Json(serde_json::json!({"data": data})))
@@ -2184,11 +2299,33 @@ fn graph_shape(
                 key,
                 marker,
                 fields,
+                lists,
             } => {
                 let mut inner = serde_json::Map::new();
                 for (sub_key, col) in fields {
                     let v = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
                     inner.insert(sub_key.clone(), v);
+                }
+                for (sub_key, col) in lists {
+                    let list = match row.get(col) {
+                        Some(serde_json::Value::Array(items)) => {
+                            serde_json::Value::Array(items.clone())
+                        }
+                        Some(serde_json::Value::String(text)) => match serde_json::from_str(text) {
+                            Ok(serde_json::Value::Array(items)) => serde_json::Value::Array(items),
+                            _ => {
+                                return Err(format!(
+                                    "`{sub_key}` did not come back as a JSON array: {text}"
+                                ))
+                            }
+                        },
+                        other => {
+                            return Err(format!(
+                                "`{sub_key}` is missing from the related object: {other:?}"
+                            ))
+                        }
+                    };
+                    inner.insert(sub_key.clone(), list);
                 }
                 // The marker is the target's id, so it is non-null exactly when the `LEFT JOIN` found a
                 // row. Deciding from the *selected* values instead answered `null` for a relation that
@@ -2214,29 +2351,128 @@ fn gql_error(message: &str) -> serde_json::Value {
     serde_json::json!({"errors":[{"message": message}]})
 }
 
+/// Operational freshness, not a claim that every Graph entity has passed reference parity.
+async fn graph_status(State(state): State<AppState>) -> impl IntoResponse {
+    let unavailable = |reason: String| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"fresh":false,"reason":reason})),
+        )
+    };
+    let policy = match crate::graph_history::Policy::load(&state.dir.join("graph/history.toml")) {
+        Ok(Some(policy)) => policy,
+        Ok(None) => {
+            return unavailable("historical Graph freshness policy is not configured".into())
+        }
+        Err(error) => return unavailable(format!("invalid Graph freshness policy: {error}")),
+    };
+    let generation = state.store.write_generation();
+    let sealed = state.store.sealed_through();
+    let now = crate::metrics::now_unix();
+    let snapshot = match policy.indexed_head(state.store.as_ref()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return unavailable(error.to_string()),
+    };
+    let (tip, last_poll) = match &state.runtime_health {
+        Some((name, _)) => {
+            let metrics = crate::metrics::METRICS.nest(name);
+            (metrics.tip(), metrics.last_poll_ok())
+        }
+        None => (
+            crate::metrics::METRICS.tip_height(),
+            crate::metrics::METRICS.last_poll_ok(),
+        ),
+    };
+    let checked = graph_history_head(&state, &policy, now);
+    if generation.is_none()
+        || state.store.write_generation() != generation
+        || state.store.sealed_through() != sealed
+    {
+        return unavailable("indexed state changed during freshness check; retry".into());
+    }
+    let fresh = checked.is_ok();
+    (
+        if fresh {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(json!({
+            "fresh":fresh,
+            "indexed":{"number":snapshot.number,"hash":snapshot.hash,"timestamp":snapshot.timestamp},
+            "observedHead":(tip != 0).then_some(tip),
+            "lastHeadObservation":(last_poll != 0).then_some(last_poll),
+            "blockDistance":(tip != 0).then(|| tip.checked_sub(snapshot.number)).flatten(),
+            "ageSeconds":now.checked_sub(snapshot.timestamp),
+            "limits":{"maxAgeSeconds":policy.max_head_age_seconds,"maxBlockDistance":policy.max_block_distance},
+            "reason":checked.err().map(|error| error.to_string())
+        })),
+    )
+}
+
+fn graph_history_head(
+    state: &AppState,
+    policy: &crate::graph_history::Policy,
+    now: u64,
+) -> anyhow::Result<crate::graph_history::Snapshot> {
+    use crate::metrics::METRICS;
+    let head = policy.head(state.store.as_ref(), now)?;
+    let (tip, last_poll) = match &state.runtime_health {
+        Some((name, health)) => {
+            if let Some(fault) = health.status(name) {
+                anyhow::bail!("Graph history is quarantined: {}", fault.reason);
+            }
+            let metrics = METRICS.nest(name);
+            (metrics.tip(), metrics.last_poll_ok())
+        }
+        None => (METRICS.tip_height(), METRICS.last_poll_ok()),
+    };
+    policy.check_observed_head(head.number, tip, last_poll, now)?;
+    Ok(head)
+}
+
 /// Run a compiled query through the same analytical path `/sql` uses, so a Graph query inherits
 /// RFC-0034's admission bounds rather than opening a second unbounded door into DuckDB.
 async fn graph_rows(
     s: &AppState,
     compiled: &crate::graph_query::Compiled,
+    historical_block: Option<u64>,
 ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
-    let resp = run_sql_query(s.clone(), compiled.sql.clone(), None).await;
+    let resp = run_sql_query_at(s.clone(), compiled.sql.clone(), None, historical_block).await;
     let body = axum::body::to_bytes(resp.into_response().into_body(), 64 << 20)
         .await
         .map_err(|e| format!("reading the query result: {e}"))?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| format!("decoding the query result: {e}"))?;
+    graph_result_rows(&v)
+}
+
+/// SQL may return a useful partial answer with explicit warnings. GraphQL clients do not see that
+/// envelope, so stripping its warnings would turn incomplete allocation or escrow data into truth.
+fn graph_result_rows(
+    v: &serde_json::Value,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
     if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
         return Err(err.to_string());
     }
-    Ok(v.get("rows")
+    for flag in ["truncated", "degraded", "tip_unavailable"] {
+        if v.get(flag)
+            .is_some_and(|value| value != &serde_json::Value::Bool(false))
+        {
+            return Err(format!("GraphQL requires a complete query result: {flag}"));
+        }
+    }
+    let rows = v
+        .get("rows")
         .and_then(|r| r.as_array())
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| r.as_object().cloned())
-                .collect::<Vec<_>>()
+        .ok_or_else(|| "query result has no rows array".to_string())?;
+    rows.iter()
+        .map(|row| {
+            row.as_object()
+                .cloned()
+                .ok_or_else(|| "query result contains a non-object row".to_string())
         })
-        .unwrap_or_default())
+        .collect()
 }
 
 async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
@@ -2332,7 +2568,7 @@ async fn table(
             );
             let dir = s.dir.clone();
             let guard = analytics::QueryGuard {
-                timeout: SQL_TIMEOUT,
+                timeout: sql_timeout(),
                 max_rows: need,
             };
             if let Ok(Ok(out)) = tokio::task::spawn_blocking(move || {
@@ -2719,11 +2955,11 @@ async fn named_scan(
         if let Some(refusal) = stale(sealed_through) {
             return Err(refusal.into());
         }
-        let timeout = SQL_TIMEOUT.saturating_sub(started.elapsed());
+        let timeout = sql_timeout().saturating_sub(started.elapsed());
         if timeout.is_zero() {
             anyhow::bail!(
                 "query exceeded the {}s time budget on the read-only SQL surface",
-                SQL_TIMEOUT.as_secs()
+                sql_timeout().as_secs()
             );
         }
         let admission = NamedAdmission {
@@ -2861,6 +3097,15 @@ async fn run_sql_query(
     sql_text: String,
     requested_max_rows: Option<usize>,
 ) -> axum::response::Response {
+    run_sql_query_at(s, sql_text, requested_max_rows, None).await
+}
+
+async fn run_sql_query_at(
+    s: AppState,
+    sql_text: String,
+    requested_max_rows: Option<usize>,
+    historical_block: Option<u64>,
+) -> axum::response::Response {
     use crate::metrics::METRICS;
     let q = SqlQuery {
         q: sql_text,
@@ -2877,6 +3122,7 @@ async fn run_sql_query(
     let memo = s
         .store
         .write_generation()
+        .filter(|_| historical_block.is_none())
         .filter(|_| crate::sqlmemo::is_deterministic(&q.q))
         .map(|generation| {
             let watermarks: std::collections::BTreeMap<String, u64> = s
@@ -2969,7 +3215,7 @@ async fn run_sql_query(
     };
     // Charged against the query's own deadline, so queuing can never extend the total time a
     // request occupies the node.
-    let sql_timeout = SQL_TIMEOUT.saturating_sub(admission.elapsed());
+    let sql_timeout = sql_timeout().saturating_sub(admission.elapsed());
     METRICS.inc_sql();
     let dir = s.dir.clone();
     let sql = q.q.clone();
@@ -3030,6 +3276,9 @@ async fn run_sql_query(
         // more current than the rows it is made of.
         let mut watermarks: std::collections::BTreeMap<String, u64> = Default::default();
         for entity in declared_entities.iter() {
+            if historical_block.is_some() {
+                continue;
+            }
             if entity.unavailable().is_some() || entity.fault().is_some() {
                 continue;
             }
@@ -3038,28 +3287,28 @@ async fn run_sql_query(
             hot.insert(entity.name().to_string(), rows);
         }
         let sealed_through = store.sealed_through();
-        let mut out = analytics::query_hot_cold(
-            &dir,
-            &sql,
-            analytics::QueryGuard {
-                timeout: sql_timeout,
-                max_rows,
-            },
-            &hot,
-            sealed_through,
-            &tables,
-        )?;
+        let guard = analytics::QueryGuard {
+            timeout: sql_timeout,
+            max_rows,
+        };
+        let mut out = if let Some(block) = historical_block {
+            analytics::query_hot_cold_at(&dir, &sql, guard, &hot, sealed_through, &tables, block)?
+        } else {
+            analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)?
+        };
         out.tip_unavailable = tip_unavailable;
         // The state after the query, for the memo: an answer is remembered only if nothing it reads
         // moved while it ran, so a remembered answer always describes exactly the state its key names.
         let after = (store.write_generation(), store.sealed_through());
         // Provenance from the same task as the query, for the same reason as the watermarks: read
         // out on the response path it can name a newer state than the rows came from.
-        let as_of = store
-            .get_meta("last_block")
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<u64>().ok());
+        let as_of = historical_block.or_else(|| {
+            store
+                .get_meta("last_block")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+        });
         // The watermarks ride out with the result: they describe the rows this query was answered
         // from, and re-reading them out here is the race #932 is about.
         Ok((out, watermarks, after, as_of))
@@ -3221,7 +3470,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
             &dir,
             &probe,
             analytics::QueryGuard {
-                timeout: SQL_TIMEOUT,
+                timeout: sql_timeout(),
                 max_rows: 1,
             },
             &hot,
@@ -3794,6 +4043,37 @@ mod tests {
     use crate::store::Store;
 
     #[test]
+    fn a_related_derived_list_is_shaped_inside_its_parent_object() {
+        use crate::graph_query::{Compiled, Shape};
+
+        let compiled = Compiled {
+            sql: String::new(),
+            shape: vec![Shape::Object {
+                key: "payer".into(),
+                marker: "payer_present".into(),
+                fields: vec![("id".into(), "payer_id".into())],
+                lists: vec![("signers".into(), "payer_signers".into())],
+            }],
+            entity: "PaymentsEscrowAccount".into(),
+            singular: false,
+            min_block: None,
+        };
+        let row = serde_json::json!({
+            "payer_present": "0xpayer",
+            "payer_id": "0xpayer",
+            "payer_signers": r#"[{"id":"0xsigner"}]"#,
+        });
+        let shaped = graph_shape(&compiled, row.as_object().unwrap()).unwrap();
+        assert_eq!(
+            shaped,
+            serde_json::json!({
+                "payer": {"id": "0xpayer", "signers": [{"id": "0xsigner"}]}
+            }),
+            "an escrow payer's derived signers list must remain a list, not a JSON string"
+        );
+    }
+
+    #[test]
     fn readiness_stall_logic() {
         let now = 1_000_000u64;
         // Never polled, just started → starting up, not stalled (grace).
@@ -4073,6 +4353,186 @@ mod tests {
             nest_info: Arc::new(json!({ "name": "t" })),
             runtime_health: None,
         }
+    }
+
+    #[tokio::test]
+    async fn graph_history_pins_entities_and_meta_to_the_same_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Account @entity { id: ID! balance: BigInt! }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("graph/history.toml"),
+            "version = 1\nfirst_block = 10\nmax_head_age_seconds = 15\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("schema.json"), r#"{"tables":[{"table":"changes","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#).unwrap();
+        std::fs::write(dir.path().join("views/account.sql"), "CREATE VIEW account AS SELECT 'a' AS id, sum(CAST(value AS BIGINT)) AS balance FROM changes;").unwrap();
+        let state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        let old_hash = format!("0x{}", "11".repeat(32));
+        let hash = format!("0x{}", "22".repeat(32));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (block, value, hash) in [(10, "5", &old_hash), (20, "7", &hash)] {
+            state
+                .store
+                .put_entity(
+                    &Store::entity_key(block, 0),
+                    &json!({"table":"changes","block_number":block,"value":value}).to_string(),
+                )
+                .unwrap();
+            state.store.set_block_hash(block, hash).unwrap();
+            state.store.set_block_timestamp(block, now).unwrap();
+        }
+        state.store.set_meta("last_block", "20").unwrap();
+        state
+            .store
+            .put_entity(
+                &Store::entity_key(15, 0),
+                &json!({"table":"changes","block_number":15,"value":"4"}).to_string(),
+            )
+            .unwrap();
+        let answer = graph_ask(
+            "/graphql",
+            &format!(
+                r#"{{
+            old: account(id: "a", block: {{hash: "{old_hash}"}}) {{ balance }}
+            before: account(id: "a", block: {{number: 14}}) {{ balance }}
+            between: account(id: "a", block: {{number: 15}}) {{ balance }}
+            latest: account(id: "a") {{ balance }}
+            meta: _meta(block: {{number: 10}}) {{ block {{ number hash }} }}
+        }}"#
+            ),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            answer,
+            json!({"data": {"old":{"balance":"5"},"before":{"balance":"5"},"between":{"balance":"9"},"latest":{"balance":"16"},
+            "meta":{"block":{"number":10,"hash":old_hash}}}})
+        );
+        let numeric_meta = graph_ask(
+            "/graphql",
+            "{ account(id: \"a\", block: {number: 15}) { balance } _meta(block: {number: 15}) { block { number hash } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            numeric_meta,
+            json!({"data":{"account":{"balance":"9"},"_meta":{"block":{"number":15,"hash":null}}}})
+        );
+        state.store.set_block_timestamp(20, now - 60).unwrap();
+        let stale = graph_ask(
+            "/graphql",
+            "{ accounts { id } _meta { block { number } } }",
+            state,
+        )
+        .await;
+        assert!(stale["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stale"));
+        assert!(stale.get("data").is_none());
+    }
+
+    #[test]
+    fn graph_history_freshness_uses_its_own_cursor_and_refuses_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let name = format!("network-history-{}", dir.path().display());
+        health.register(&name, "arbitrum-one");
+        state.runtime_health = Some((name.clone(), health.clone()));
+        let now = crate::metrics::now_unix();
+        state.store.set_meta("last_block", "100").unwrap();
+        state
+            .store
+            .set_block_hash(100, &format!("0x{}", "11".repeat(32)))
+            .unwrap();
+        state.store.set_block_timestamp(100, now).unwrap();
+        let own = crate::metrics::METRICS.nest(&name);
+        own.mark_poll_ok();
+        own.set_tip(160);
+        crate::metrics::METRICS.set_tip(9999999);
+        let policy = crate::graph_history::Policy {
+            version: 1,
+            first_block: 0,
+            max_head_age_seconds: 60,
+            max_block_distance: Some(60),
+        };
+        assert!(graph_history_head(&state, &policy, now).is_ok());
+        own.set_tip(161);
+        assert!(graph_history_head(&state, &policy, now)
+            .unwrap_err()
+            .to_string()
+            .contains("61 blocks"));
+        own.set_tip(100);
+        health.quarantine_cursor("arbitrum-one", "reorg beyond finality".into());
+        assert!(graph_history_head(&state, &policy, now)
+            .unwrap_err()
+            .to_string()
+            .contains("quarantined"));
+        crate::metrics::METRICS.remove_nest(&name);
+    }
+
+    #[tokio::test]
+    async fn graph_status_reports_the_stale_checkpoint_instead_of_a_healthy_chain_tip() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let name = format!("graph-status-{}", dir.path().display());
+        health.register(&name, "arbitrum-one");
+        state.runtime_health = Some((name.clone(), health));
+        let app = router(SharedNest::new(state.clone()));
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/graph/status")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/history.toml"),
+            "version=1\nfirst_block=1\nmax_head_age_seconds=60\nmax_block_distance=60\n",
+        )
+        .unwrap();
+        let now = crate::metrics::now_unix();
+        state.store.set_meta("last_block", "100").unwrap();
+        state
+            .store
+            .set_block_hash(100, &format!("0x{}", "11".repeat(32)))
+            .unwrap();
+        state.store.set_block_timestamp(100, now).unwrap();
+        let metrics = crate::metrics::METRICS.nest(&name);
+        metrics.mark_poll_ok();
+        metrics.set_tip(110);
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        metrics.set_tip(200);
+        let response = app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["fresh"], false);
+        assert_eq!(body["indexed"]["number"], 100);
+        assert_eq!(body["observedHead"], 200);
+        assert_eq!(body["blockDistance"], 100);
+        crate::metrics::METRICS.remove_nest(&name);
     }
 
     /// Clock-derived fields, which legitimately differ between two calls a moment apart.
@@ -6951,6 +7411,15 @@ mod tests {
 
     /// POST one GraphQL operation and decode the envelope.
     async fn graph_ask(uri: &str, q: &str, st: AppState) -> serde_json::Value {
+        graph_ask_variables(uri, q, json!({}), st).await
+    }
+
+    async fn graph_ask_variables(
+        uri: &str,
+        q: &str,
+        variables: serde_json::Value,
+        st: AppState,
+    ) -> serde_json::Value {
         use tower::ServiceExt;
         let res = router(SharedNest::new(st))
             .oneshot(
@@ -6959,7 +7428,7 @@ mod tests {
                     .uri(uri)
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        serde_json::json!({ "query": q }).to_string(),
+                        serde_json::json!({ "query": q, "variables": variables }).to_string(),
                     ))
                     .unwrap(),
             )
@@ -6969,6 +7438,498 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn recorded_network_fixture(facts: &Value, block: u64) -> (tempfile::TempDir, AppState) {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/network");
+        let config = crate::config::Config::load(&source).unwrap();
+        let registry = crate::registry::from_nest(&source, &config).unwrap();
+        let mut tables = registry.schema();
+        tables.extend(crate::calls::schema(&config.calls, true));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::copy(
+            source.join("graph/schema.graphql"),
+            dir.path().join("graph/schema.graphql"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("graph/history.toml"),
+            "version = 1\nfirst_block = 42440000\nmax_head_age_seconds = 60\n",
+        )
+        .unwrap();
+        for entry in std::fs::read_dir(source.join("views")).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(
+                entry.path(),
+                dir.path().join("views").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+        let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        state.tables = Arc::new(tables);
+        for (table, rows) in facts["tables"].as_object().unwrap() {
+            for (i, row) in rows.as_array().unwrap().iter().enumerate() {
+                let mut row = row.clone();
+                row["table"] = json!(table);
+                state
+                    .store
+                    .put_entity(&format!("fixture:{table}:{i}"), &row.to_string())
+                    .unwrap();
+            }
+        }
+        if let Some(logs) = facts["poiLogs"].as_array() {
+            for raw in logs {
+                let log: crate::rpc::Log = serde_json::from_value(raw.clone()).unwrap();
+                let mut row = registry.decode(&log).unwrap().unwrap();
+                row.block_timestamp = raw["block_timestamp"].as_u64().unwrap();
+                assert_eq!(row.table, "subgraph_service__p_o_i_presented");
+                state
+                    .store
+                    .put_entity(
+                        &Store::entity_key(row.block_number, row.log_index),
+                        &row.to_json().to_string(),
+                    )
+                    .unwrap();
+            }
+        }
+        // Synthetic fresh checkpoint for admission only. The recorded query selects
+        // entity fields, not _meta; this does not claim historical header parity.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        state
+            .store
+            .set_meta("last_block", &block.to_string())
+            .unwrap();
+        state
+            .store
+            .set_block_hash(block, &format!("0x{}", "11".repeat(32)))
+            .unwrap();
+        state.store.set_block_timestamp(block, now).unwrap();
+        (dir, state)
+    }
+
+    #[tokio::test]
+    async fn recorded_network_allocation_query_matches_reference_through_http() {
+        let facts: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/network-clients/legacy-allocation-facts.json"
+        ))
+        .unwrap();
+        let reference: Value = serde_json::from_str(include_str!(
+            "../examples/network/validation/legacy-allocations-reference.json"
+        ))
+        .unwrap();
+        let (_dir, state) = recorded_network_fixture(&facts, 200_000_000);
+        let response = graph_ask("/graphql", reference["query"].as_str().unwrap(), state).await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(response["data"], reference["response"]["data"]);
+        assert_eq!(response["data"]["active"].as_array().unwrap().len(), 2);
+        assert_eq!(response["data"]["closed"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recorded_horizon_allocations_and_poi_logs_match_reference_through_http() {
+        let facts: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/network-clients/horizon-allocation-facts.json"
+        ))
+        .unwrap();
+        let reference: Value = serde_json::from_str(include_str!(
+            "../examples/network/validation/horizon-allocations-reference.json"
+        ))
+        .unwrap();
+        assert_eq!(facts["poiLogs"].as_array().unwrap().len(), 2);
+        // This recorded number-scoped query must also work when its block is not a checkpoint.
+        let (_dir, state) = recorded_network_fixture(&facts, 506_000_001);
+        assert!(state.store.get_block_hash(506_000_000).unwrap().is_none());
+        let response = graph_ask(
+            "/graphql",
+            reference["query"].as_str().unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(response["data"], reference["response"]["data"]);
+        assert_eq!(response["data"]["active"].as_array().unwrap().len(), 2);
+        assert_eq!(response["data"]["closed"].as_array().unwrap().len(), 2);
+        let rewards: Value = serde_json::from_str(include_str!(
+            "../examples/network/validation/horizon-reward-distribution-reference.json"
+        ))
+        .unwrap();
+        let response = graph_ask("/graphql", rewards["query"].as_str().unwrap(), state).await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(response["data"], rewards["response"]["data"]);
+    }
+
+    #[tokio::test]
+    async fn every_captured_network_document_binds_through_http() {
+        let facts: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/network-clients/genesis-facts.json"
+        ))
+        .unwrap();
+        let (_dir, state) = recorded_network_fixture(&facts, 42_460_000);
+        let variables = json!({
+            "indexer":"0x1111111111111111111111111111111111111111",
+            "receiver":"0x1111111111111111111111111111111111111111",
+            "payer":"0x2222222222222222222222222222222222222222",
+            "collector":"0x3333333333333333333333333333333333333333",
+            "closedAtThreshold":1789650000,"thawEndTimestamp":"1789650000",
+            "first":200,"last":"","minBalance":"100000000000000000","block":null,
+            "allocation_ids":[],"allocationIds":[],
+            "allocation":"0x1111111111111111111111111111111111111111",
+            "status":"Active","lastId":"","dataService":"0x3333333333333333333333333333333333333333",
+            "epochs":[1],"closedAtEpochThreshold":1,"subgraphDeploymentId":"0x00",
+            "subgraphs":[],"ipfsHash":"QmExample","disputableEpoch":1,
+            "minimumQueryFeesCollected":"0","deployments":[],"minimumAllocation":0,"zeroPOI":"0x00"
+        });
+        let corpus =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-clients");
+        let mut count = 0;
+        for file in std::fs::read_dir(corpus).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) != Some("graphql")
+                || path.file_name().unwrap() == "schema.graphql"
+            {
+                continue;
+            }
+            let document = std::fs::read_to_string(&path).unwrap();
+            let response =
+                graph_ask_variables("/graphql", &document, variables.clone(), state.clone()).await;
+            assert!(
+                response.get("errors").is_none(),
+                "{}: {response}",
+                path.display()
+            );
+            assert!(
+                response.get("data").is_some(),
+                "{}: {response}",
+                path.display()
+            );
+            count += 1;
+        }
+        assert_eq!(count, 21);
+        // Most entities do not exist at genesis. This verifies real SQL binding,
+        // not complete-history semantics or current-head client compatibility.
+    }
+
+    #[tokio::test]
+    async fn recorded_signers_match_the_reference_through_http() {
+        let facts: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/network-clients/signer-facts.json"
+        ))
+        .unwrap();
+        let reference: Value = serde_json::from_str(include_str!(
+            "../examples/network/validation/signers-reference.json"
+        ))
+        .unwrap();
+        let (_dir, state) = recorded_network_fixture(&facts, 502_165_911);
+        let response = graph_ask(
+            "/graphql",
+            reference["referenceQuery"].as_str().unwrap(),
+            state.clone(),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(response["data"], reference["reference"]);
+        assert_eq!(response["data"]["signers"].as_array().unwrap().len(), 9);
+        let signer = "0x7d14ae5f20cc2f6421317386aa8e79e8728353d9";
+        let document = include_str!("../tests/fixtures/network-clients/signers_by_payer.graphql");
+        for (deadline, last, expected) in [
+            ("1781024226", "", json!([])),
+            ("1781024227", "", json!([{ "id": signer }])),
+            ("1781024227", signer, json!([])),
+        ] {
+            let response = graph_ask_variables(
+                "/graphql",
+                document,
+                json!({"payer":signer,"first":1000,"last":last,
+                    "thawEndTimestamp":deadline,"block":{"number":502165911}}),
+                state.clone(),
+            )
+            .await;
+            assert!(response.get("errors").is_none(), "{response}");
+            assert_eq!(response["data"]["signers"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn real_redemption_matches_the_reference_and_tap_document_through_http() {
+        let facts: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/network-clients/redemption-facts.json"
+        ))
+        .unwrap();
+        let expected = &facts["reference"];
+        let (_dir, state) = recorded_network_fixture(&facts, 506_000_000);
+        let query = "{ paymentsEscrowTransactions(block:{number:506000000}) { id allocationId timestamp amount collector transactionGroupId type payer { id } receiver { id } escrowAccount { id } } }";
+        let full = graph_ask("/graphql", query, state.clone()).await;
+        assert!(full.get("errors").is_none(), "{full}");
+        assert_eq!(full["data"]["paymentsEscrowTransactions"], *expected);
+        let variables = json!({"payer":expected[0]["payer"]["id"],
+            "receiver":expected[0]["receiver"]["id"],
+            "allocationIds":[expected[0]["allocationId"]]});
+        let document = include_str!(
+            "../tests/fixtures/network-clients/payments_escrow_transactions_redeem.graphql"
+        );
+        let response = graph_ask_variables("/graphql", document, variables, state).await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(
+            response["data"]["paymentsEscrowTransactions"],
+            json!([{
+                "id":expected[0]["id"], "allocationId":expected[0]["allocationId"],
+                "timestamp":expected[0]["timestamp"]
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn network_rust_allocation_pages_keep_the_first_page_snapshot_when_the_tip_advances() {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/network");
+        let config = crate::config::Config::load(&source).unwrap();
+        let mut tables = crate::registry::from_nest(&source, &config)
+            .unwrap()
+            .schema();
+        tables.extend(crate::calls::schema(&config.calls, true));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::copy(
+            source.join("graph/schema.graphql"),
+            dir.path().join("graph/schema.graphql"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("graph/history.toml"),
+            "version = 1\nfirst_block = 10\nmax_head_age_seconds = 60\n",
+        )
+        .unwrap();
+        for entry in std::fs::read_dir(source.join("views")).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(
+                entry.path(),
+                dir.path().join("views").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+        let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        state.tables = Arc::new(tables);
+        let indexer = format!("0x{}", "11".repeat(20));
+        let deployment = format!("0x{}", "22".repeat(32));
+        let ids = ["33", "44", "55"].map(|s| format!("0x{}", s.repeat(20)));
+        let hash = format!("0x{}", "aa".repeat(32));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let deposit = json!({"table":"staking_legacy__stake_deposited","block_number":10,
+            "block_hash":hash,"block_timestamp":now,"log_index":0,"indexer":indexer,"tokens":"100"});
+        state
+            .store
+            .put_entity(&Store::entity_key(10, 0), &deposit.to_string())
+            .unwrap();
+        let allocation = |id: &str, block: u64, log: u64, hash: &str| {
+            json!({
+                "table":"staking_legacy__allocation_created","block_number":block,"block_hash":hash,
+                "block_timestamp":now,"log_index":log,"indexer":indexer,"allocationID":id,
+                "subgraphDeploymentID":deployment,"tokens":"10","epoch":"1"
+            })
+        };
+        for (i, id) in ids[..2].iter().enumerate() {
+            state
+                .store
+                .put_entity(
+                    &Store::entity_key(20, i as u64),
+                    &allocation(id, 20, i as u64, &hash).to_string(),
+                )
+                .unwrap();
+        }
+        state.store.set_block_hash(20, &hash).unwrap();
+        state.store.set_block_timestamp(20, now).unwrap();
+        state.store.set_meta("last_block", "20").unwrap();
+        let document = include_str!("../tests/fixtures/network-clients/allocations.graphql");
+        let mut variables =
+            json!({"indexer":indexer,"closedAtThreshold":0,"block":null,"first":1,"last":""});
+        let first =
+            graph_ask_variables("/graphql", document, variables.clone(), state.clone()).await;
+        assert!(first.get("errors").is_none(), "{first}");
+        assert_eq!(first["data"]["allocations"].as_array().unwrap().len(), 1);
+        assert_eq!(first["data"]["allocations"][0]["id"], ids[0]);
+        assert_eq!(first["data"]["allocations"][0]["createdAtEpoch"], 1);
+        assert_eq!(first["data"]["allocations"][0]["allocatedTokens"], "10");
+        assert_eq!(first["data"]["meta"]["block"]["hash"], hash);
+        let next_hash = format!("0x{}", "bb".repeat(32));
+        state
+            .store
+            .put_entity(
+                &Store::entity_key(30, 0),
+                &allocation(&ids[2], 30, 0, &next_hash).to_string(),
+            )
+            .unwrap();
+        state.store.set_block_hash(30, &next_hash).unwrap();
+        state.store.set_block_timestamp(30, now).unwrap();
+        state.store.set_meta("last_block", "30").unwrap();
+        variables["last"] = json!(ids[0]);
+        variables["first"] = json!(100);
+        variables["block"] = json!({"hash":hash});
+        let second =
+            graph_ask_variables("/graphql", document, variables.clone(), state.clone()).await;
+        assert!(second.get("errors").is_none(), "{second}");
+        assert_eq!(second["data"]["allocations"].as_array().unwrap().len(), 1);
+        assert_eq!(second["data"]["allocations"][0]["id"], ids[1]);
+        assert_eq!(second["data"]["meta"]["block"]["number"], 20);
+        variables["block"] = serde_json::Value::Null;
+        let latest = graph_ask_variables("/graphql", document, variables, state).await;
+        assert!(latest.get("errors").is_none(), "{latest}");
+        assert_eq!(latest["data"]["allocations"].as_array().unwrap().len(), 2);
+        assert_eq!(latest["data"]["meta"]["block"]["number"], 30);
+    }
+
+    /// The Horizon escrow monitor asks for a payer's filtered, paged signer list below each account.
+    /// This runs the actual GraphQL route over views, rather than merely asserting the compiler's SQL:
+    /// the response must contain a list beneath `payer`, and only the authorised first signer.
+    #[test]
+    fn graph_results_never_hide_partial_or_malformed_sql_answers() {
+        for flag in ["truncated", "degraded", "tip_unavailable"] {
+            let mut result = serde_json::json!({"rows": [{"id": "a"}]});
+            result[flag] = serde_json::json!(true);
+            assert!(graph_result_rows(&result).unwrap_err().contains(flag));
+            result[flag] = serde_json::json!(false);
+            assert_eq!(graph_result_rows(&result).unwrap().len(), 1);
+        }
+        assert!(graph_result_rows(&serde_json::json!({})).is_err());
+        assert!(graph_result_rows(&serde_json::json!({"rows": [null]})).is_err());
+        assert!(graph_result_rows(&serde_json::json!({"rows": [], "error": "busy"})).is_err());
+        assert_eq!(
+            graph_result_rows(&serde_json::json!({"rows": []}))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_meta_never_discards_a_block_argument() {
+        let (_d, state) = graph_fixture();
+        for block in [
+            "{ number: 100 }",
+            "{ hash: \"0xabc\" }",
+            "{ number_gte: 999999999 }",
+        ] {
+            let answer = graph_ask(
+                "/graphql",
+                &format!("{{ _meta(block: {block}) {{ block {{ number }} }} }}"),
+                state.clone(),
+            )
+            .await;
+            assert!(answer.get("errors").is_some(), "{answer}");
+            assert!(answer.get("data").is_none(), "{answer}");
+        }
+        let answer = graph_ask(
+            "/graphql",
+            "{ _meta(block: null) { block { number } } }",
+            state,
+        )
+        .await;
+        assert!(answer.get("errors").is_none(), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_derived_list_can_page_and_select_its_to_one_relation() {
+        let (_d, state) = graph_fixture();
+        let answer = graph_ask(
+            "/graphql",
+            r#"{
+            pool(id: "0xaaa") {
+                swaps(first: 1, skip: 1, orderBy: id) { id pool { id liquidity } }
+                first: swaps(first: 1, where: { amount_gt: "4" }) { id }
+            }
+        }"#,
+            state,
+        )
+        .await;
+        assert_eq!(
+            answer,
+            json!({"data": {"pool": {
+                "swaps": [{"id": "s2", "pool": {"id": "0xaaa", "liquidity": "42"}}],
+                "first": [{"id": "s1"}]
+            }}})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escrow_payers_filtered_signers_answer_in_one_graphql_request() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("graph")).unwrap();
+        std::fs::write(
+            d.path().join("graph/schema.graphql"),
+            r#"
+type PaymentsEscrowAccount @entity {
+  id: ID!
+  balance: BigInt!
+  payer: Payer!
+}
+type Payer @entity {
+  id: ID!
+  signers: [Signer!]! @derivedFrom(field: "payer")
+}
+type Signer @entity {
+  id: ID!
+  payer: Payer!
+  isAuthorized: Boolean!
+}
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.path().join("views")).unwrap();
+        std::fs::write(
+            d.path().join("views/payments_escrow_account.sql"),
+            "CREATE VIEW payments_escrow_account AS \
+             SELECT '0xaccount' AS id, 101 AS balance, '0xpayer' AS payer;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("views/payer.sql"),
+            "CREATE VIEW payer AS SELECT '0xpayer' AS id;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("views/signer.sql"),
+            "CREATE VIEW signer AS \
+             SELECT '0xsigner-a' AS id, '0xpayer' AS payer, true AS \"isAuthorized\" \
+             UNION ALL SELECT '0xsigner-b', '0xpayer', true \
+             UNION ALL SELECT '0xaaa-unauthorised', '0xpayer', false \
+             UNION ALL SELECT '0xaaa-other-payer', '0xother', true;\n",
+        )
+        .unwrap();
+        let state = test_state(d.path(), SQL_MAX_CONCURRENCY);
+        let body = graph_ask(
+            "/graphql",
+            r#"{
+              paymentsEscrowAccounts(where: { balance_gt: "100" }) {
+                id balance payer {
+                  id
+                  signers(first: 1, where: { isAuthorized: true }) { id }
+                  last: signers(first: 1, orderDirection: desc, where: { isAuthorized: true }) { id }
+                }
+              }
+            }"#,
+            state,
+        )
+        .await;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "data": {
+                    "paymentsEscrowAccounts": [{
+                        "id": "0xaccount", "balance": "101",
+                        "payer": {"id": "0xpayer", "signers": [{"id": "0xsigner-a"}],
+                                  "last": [{"id": "0xsigner-b"}]}
+                    }]
+                }
+            }),
+            "the nested signer filter and page limit must be applied before GraphQL shapes payer"
+        );
     }
 
     /// RFC-0053 S1 (#1265): a client can introspect a nest over HTTP.
@@ -7224,14 +8185,14 @@ mod tests {
         );
     }
 
-    /// `null` is refused by name, from a literal and from a variable alike (Jules on #1282).
+    /// Null equality is SQL null equality, from a literal and from a variable alike.
     ///
     /// The literal used to parse as the enum `null` and compile to `hooks = 'null'`, which matches rows
     /// whose `hooks` is the four-character string - a filter that quietly selects the wrong rows. The
     /// variable used to be dropped by `filter_map` and re-surfaced as `unbound variable`, which is a
     /// refusal naming the wrong cause.
     #[tokio::test]
-    async fn a_null_filter_value_is_refused_by_name() {
+    async fn a_null_filter_value_is_compared_as_null() {
         let (_d, state) = graph_fixture();
 
         let body = graph_ask(
@@ -7240,18 +8201,14 @@ mod tests {
             state.clone(),
         )
         .await;
-        let msg = body["errors"][0]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            msg.contains("`hooks` was given `null`"),
-            "a null literal must be named, not compared as a string: {body}"
-        );
-        assert!(
-            body["data"].is_null(),
-            "and it must not answer rows: {body}"
-        );
+        assert_eq!(body, json!({"data": {"pools": []}}));
+        let closed = graph_ask(
+            "/graphql",
+            "{ tokens(where: { symbol_not: null }) { id } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(closed, json!({"data": {"tokens": [{"id": "0xt1"}]}}));
 
         // The same value through `variables`, which is how a generated client sends it.
         use tower::ServiceExt;
@@ -7278,14 +8235,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let msg = body["errors"][0]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            msg.contains("`hooks` was given `null`"),
-            "a supplied null must be bound and named, not reported as unbound: {body}"
-        );
+        assert_eq!(body, json!({"data": {"pools": []}}));
     }
 
     /// `operationName` selects among several operations in one document (Jules on #1282).

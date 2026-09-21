@@ -1,0 +1,17 @@
+
+        query provisions($indexer: String!, $dataService: String!) {
+          provisions(where: { indexer: $indexer, dataService: $dataService }) {
+            id
+            indexer {
+              id
+            }
+            dataService {
+              id
+            }
+            tokensProvisioned
+            tokensAllocated
+            tokensThawing
+            thawingPeriod
+            maxVerifierCut
+          }
+        }

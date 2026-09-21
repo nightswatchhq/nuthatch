@@ -1,0 +1,57 @@
+# Temporary allocation-control endpoint. The Graph gateway token is supplied only
+# through Caddy's service environment as GRAPH_GATEWAY_TOKEN; it never belongs
+# in this file or in the public URL. Replace this route with the native nest
+# only after the full-history and TAP acceptance gates in DEPLOYMENT.md pass.
+{
+    order rate_limit before basic_auth
+}
+
+network.thenightswatch.dev {
+    request_body {
+        max_size 32KB
+    }
+    rate_limit {
+        zone network_ip {
+            key {remote_host}
+            events 1200
+            window 10s
+        }
+        zone network_all {
+            key static
+            events 12000
+            window 10s
+        }
+    }
+    header {
+        -Server
+        X-Content-Type-Options "nosniff"
+        Cache-Control "no-store"
+    }
+    @landing {
+        path /graphql
+        method GET
+    }
+    handle @landing {
+        header Content-Type "text/plain; charset=utf-8"
+        respond "Network Subgraph GraphQL endpoint. Send POST requests to /graphql." 200
+    }
+    @graphql {
+        path /graphql
+        method POST
+    }
+    handle @graphql {
+        rewrite * /api/deployments/id/QmR8WQECdNR6TSUf4FfLSFW7D5RDGGkd7F4A6me56pLqJb
+        reverse_proxy https://gateway.thegraph.com {
+            header_up Host gateway.thegraph.com
+            header_up Authorization "Bearer {$GRAPH_GATEWAY_TOKEN}"
+            transport http {
+                tls_server_name gateway.thegraph.com
+                dial_timeout 3s
+                response_header_timeout 30s
+            }
+        }
+    }
+    handle {
+        respond "not found" 404
+    }
+}
