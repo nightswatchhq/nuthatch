@@ -1,0 +1,65 @@
+# Standalone validation candidate. Do not replace the VPS's existing Caddyfile.
+# Merge only this virtual host after backfill, parity and capacity acceptance.
+{
+    order rate_limit before basic_auth
+}
+
+network.thenightswatch.dev {
+    request_body {
+        max_size 32KB
+    }
+    # Provisional burst allowances, not a measured capacity claim.
+    rate_limit {
+        zone network_ip {
+            key {remote_host}
+            events 1200
+            window 10s
+        }
+        zone network_all {
+            key static
+            events 12000
+            window 10s
+        }
+    }
+    header {
+        -Server
+        X-Content-Type-Options "nosniff"
+        Cache-Control "no-store"
+    }
+    @landing {
+        path /graphql
+        method GET
+    }
+    handle @landing {
+        header Content-Type "text/plain; charset=utf-8"
+        respond "Network Subgraph GraphQL endpoint. Send POST requests to /graphql." 200
+    }
+    @graphql {
+        path /graphql
+        method POST
+    }
+    handle @graphql {
+        reverse_proxy 100.83.44.63:8124 {
+            transport http {
+                dial_timeout 3s
+                response_header_timeout 30s
+            }
+        }
+    }
+    @status {
+        path /status
+        method GET
+    }
+    handle @status {
+        rewrite * /graph/status
+        reverse_proxy 100.83.44.63:8124 {
+            transport http {
+                dial_timeout 3s
+                response_header_timeout 5s
+            }
+        }
+    }
+    handle {
+        respond "not found" 404
+    }
+}

@@ -111,6 +111,8 @@ const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 /// Block-hash checkpoints (block -> canonical hash we indexed against), for reorg detection.
 /// The value is `hash`, or `hash\tunix_seconds` once a timestamp is known (#1289).
 const BLOCKS: TableDefinition<&str, &str> = TableDefinition::new("blocks");
+/// Derived reverse index, transactionally maintained with the canonical checkpoint table.
+const CHECKPOINT_HASHES: TableDefinition<&str, u64> = TableDefinition::new("checkpoint_hashes");
 
 /// The `block_hash` a stored row JSON carries.
 pub(crate) fn row_block_hash(json: &str) -> Option<String> {
@@ -382,6 +384,11 @@ pub trait HotStore: Send + Sync {
     fn set_block_timestamp(&self, block: u64, timestamp: u64) -> Result<()>;
     fn get_block_timestamp(&self, block: u64) -> Result<Option<u64>>;
     fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>>;
+    /// Resolve a recent canonical checkpoint without materialising the full checkpoint history.
+    /// Backends without this lookup must refuse hash-pinned reads rather than substitute the head.
+    fn checkpoint_number(&self, _hash: &str) -> Result<Option<u64>> {
+        anyhow::bail!("this store does not support checkpoint hash lookup")
+    }
 
     // ---- mutation windows (the atomic ones) --------------------------------------------------
     fn commit_window(
@@ -650,7 +657,7 @@ impl Store {
     }
 
     fn from_db(db: Database) -> Result<Store> {
-        // Materialise all four tables up front so read txns never hit a missing one. Only `open`
+        // Materialise the base tables and checkpoint lookup up front. Only `open`
         // (the creating path) goes through this - `open_existing` takes no write txn, see #471.
         let wtx = db.begin_write()?;
         {
@@ -658,6 +665,18 @@ impl Store {
             wtx.open_table(META)?;
             wtx.open_table(BLOCKS)?;
             wtx.open_table(OUTBOX)?;
+            let blocks = wtx.open_table(BLOCKS)?;
+            let mut hashes = wtx.open_table(CHECKPOINT_HASHES)?;
+            // One-time upgrade, streaming rather than materialising the checkpoint history.
+            if hashes.is_empty()? {
+                for row in blocks.iter()? {
+                    let (key, value) = row?;
+                    let hash = decode_block_record(value.value()).0.to_ascii_lowercase();
+                    if !hash.is_empty() {
+                        hashes.insert(hash.as_str(), key.value().parse::<u64>()?)?;
+                    }
+                }
+            }
         }
         wtx.commit()?;
         Ok(Store {
@@ -861,6 +880,14 @@ impl Store {
                     .and_then(|v| decode_block_record(v.value()).1);
                 let (h, packed_ts) = decode_block_record(hash);
                 let packed = encode_block_record(&h, packed_ts.or(existing_ts));
+                let mut hashes = wtx.open_table(CHECKPOINT_HASHES)?;
+                if let Some(old) = b.get(key.as_str())? {
+                    let old_hash = decode_block_record(old.value()).0.to_ascii_lowercase();
+                    hashes.remove(old_hash.as_str())?;
+                }
+                if !h.is_empty() {
+                    hashes.insert(h.to_ascii_lowercase().as_str(), block)?;
+                }
                 b.insert(key.as_str(), packed.as_str())?;
             }
             let mut m = wtx.open_table(META)?;
@@ -1196,6 +1223,12 @@ impl Store {
                 .unwrap_or((String::new(), None));
             let packed =
                 encode_block_record(hash.unwrap_or(&existing_hash), timestamp.or(existing_ts));
+            let mut hashes = wtx.open_table(CHECKPOINT_HASHES)?;
+            hashes.remove(existing_hash.to_ascii_lowercase().as_str())?;
+            let new_hash = hash.unwrap_or(&existing_hash).to_ascii_lowercase();
+            if !new_hash.is_empty() {
+                hashes.insert(new_hash.as_str(), block)?;
+            }
             t.insert(key.as_str(), packed.as_str())?;
         }
         self.commit(wtx)?;
@@ -1227,6 +1260,15 @@ impl Store {
             out.push((block, hash));
         }
         Ok(out)
+    }
+
+    pub fn checkpoint_number(&self, hash: &str) -> Result<Option<u64>> {
+        let rtx = self.db.begin_read()?;
+        let table = rtx.open_table(CHECKPOINT_HASHES)
+            .context("checkpoint hash index is unavailable; open this store with the current writer to upgrade it")?;
+        Ok(table
+            .get(hash.to_ascii_lowercase().as_str())?
+            .map(|value| value.value()))
     }
 
     /// Reorg handling: drop every entity and checkpoint strictly above `block`. Returns the number
@@ -1262,7 +1304,14 @@ impl Store {
                 })
                 .collect();
             for k in doomed {
-                blocks.remove(k.as_str())?;
+                if let Some(value) = blocks.remove(k.as_str())? {
+                    wtx.open_table(CHECKPOINT_HASHES)?.remove(
+                        decode_block_record(value.value())
+                            .0
+                            .to_ascii_lowercase()
+                            .as_str(),
+                    )?;
+                }
             }
         }
         self.commit(wtx)?;
@@ -1313,7 +1362,14 @@ impl Store {
                 })
                 .collect();
             for k in doomed {
-                blocks.remove(k.as_str())?;
+                if let Some(value) = blocks.remove(k.as_str())? {
+                    wtx.open_table(CHECKPOINT_HASHES)?.remove(
+                        decode_block_record(value.value())
+                            .0
+                            .to_ascii_lowercase()
+                            .as_str(),
+                    )?;
+                }
             }
 
             let mut m = wtx.open_table(META)?;
@@ -1572,6 +1628,9 @@ impl HotStore for Store {
     }
     fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
         Store::checkpoints_desc(self)
+    }
+    fn checkpoint_number(&self, hash: &str) -> Result<Option<u64>> {
+        Store::checkpoint_number(self, hash)
     }
     fn commit_window(
         &self,
@@ -1842,6 +1901,9 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
         (**self).checkpoints_desc()
     }
+    fn checkpoint_number(&self, hash: &str) -> Result<Option<u64>> {
+        (**self).checkpoint_number(hash)
+    }
     fn commit_window(
         &self,
         entities: &[(String, String)],
@@ -1921,6 +1983,57 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkpoint_hash_index_upgrades_old_history_and_tracks_reorgs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                tx.open_table(super::ENTITIES).unwrap();
+                tx.open_table(super::META).unwrap();
+                tx.open_table(super::OUTBOX).unwrap();
+                let mut blocks = tx.open_table(super::BLOCKS).unwrap();
+                for number in 1..=4100u64 {
+                    blocks
+                        .insert(
+                            super::Store::block_key(number).as_str(),
+                            format!("0x{number:064x}").as_str(),
+                        )
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let store = super::Store::open(&path).unwrap();
+        assert_eq!(
+            store.checkpoint_number(&format!("0x{:064x}", 1)).unwrap(),
+            Some(1)
+        );
+        let replacement = format!("0x{}", "ff".repeat(32));
+        store.set_block_hash(1, &replacement).unwrap();
+        assert_eq!(
+            store.checkpoint_number(&format!("0x{:064x}", 1)).unwrap(),
+            None
+        );
+        assert_eq!(store.checkpoint_number(&replacement).unwrap(), Some(1));
+        store
+            .rollback_to_and_set_meta(3, "last_block", "3")
+            .unwrap();
+        assert_eq!(
+            store.checkpoint_number(&format!("0x{:064x}", 4)).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.checkpoint_number(&format!("0x{:064x}", 3)).unwrap(),
+            Some(3)
+        );
+        drop(store);
+        let read_only = super::Store::open_existing(&path).unwrap();
+        assert_eq!(read_only.checkpoint_number(&replacement).unwrap(), Some(1));
+    }
+
     use super::*;
 
     #[test]

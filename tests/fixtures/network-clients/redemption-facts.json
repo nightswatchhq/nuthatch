@@ -1,0 +1,45 @@
+{
+  "block": 506000000,
+  "scope": "One real PaymentCollected log and its same-block grafted-reference transaction. No complete escrow balance or signer history is implied.",
+  "referenceDeployment": "QmR8WQECdNR6TSUf4FfLSFW7D5RDGGkd7F4A6me56pLqJb",
+  "tables": {
+    "tally__payment_collected": [
+      {
+        "_seq": 530379288084557,
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "block_hash": "0x8fc3d5b6b128887f0b1d6aea62556693cb030c0a0aa6eda2139dd7de933f513b",
+        "block_number": 505809105,
+        "block_timestamp": 1789574811,
+        "collectionId": "0x000000000000000000000000fb0c386a952becd18048de3c101ca55d2e5bb588",
+        "dataService": "0xb2bb92d0de618878e438b55d5846cfecd9301105",
+        "log_index": 77,
+        "payer": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467",
+        "paymentType": "0",
+        "receiver": "0xf92f430dd8567b0d466358c79594ab58d919a6d4",
+        "table": "tally__payment_collected",
+        "tokens": "475310326476606759310",
+        "tx_hash": "0xb1d31e8c88fc9ca2a0dd9fe004969ac5939a7cff11a9fe97803b453e13acbb29"
+      }
+    ]
+  },
+  "reference": [
+    {
+      "id": "0xb1d31e8c88fc9ca2a0dd9fe004969ac5939a7cff11a9fe97803b453e13acbb294d000000",
+      "allocationId": "0xfb0c386a952becd18048de3c101ca55d2e5bb588",
+      "timestamp": "1789574811",
+      "amount": "475310326476606759310",
+      "collector": "0xb2bb92d0de618878e438b55d5846cfecd9301105",
+      "transactionGroupId": "0xb1d31e8c88fc9ca2a0dd9fe004969ac5939a7cff11a9fe97803b453e13acbb29",
+      "type": "redeem",
+      "payer": {
+        "id": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467"
+      },
+      "receiver": {
+        "id": "0xf92f430dd8567b0d466358c79594ab58d919a6d4"
+      },
+      "escrowAccount": {
+        "id": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f4678f69f5c07477ac46fbc491b1e6d91e2bb0111a9ef92f430dd8567b0d466358c79594ab58d919a6d4"
+      }
+    }
+  ]
+}

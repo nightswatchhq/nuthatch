@@ -1,0 +1,35 @@
+{
+  "block": 506000000,
+  "referenceDeployment": "QmR8WQECdNR6TSUf4FfLSFW7D5RDGGkd7F4A6me56pLqJb",
+  "query": "{ allocations(block:{number:506000000},where:{id_in:[\"0x00419a2a120372f144ed9dccce8bf629edb58bd2\",\"0x0068d7a281c782c05c207aae1c2bafe59b18d80d\",\"0x00012d523d614775ad7a0c3b1c6bd15110bfc842\",\"0x0006391730761c0c3bba5b9b4527a3f1d21d7ea2\"]},orderBy:id){ id indexingRewards indexingIndexerRewards indexingDelegatorRewards } }",
+  "response": {
+    "data": {
+      "allocations": [
+        {
+          "id": "0x00012d523d614775ad7a0c3b1c6bd15110bfc842",
+          "indexingRewards": "2632680873006522696933",
+          "indexingIndexerRewards": "760844772298885059414",
+          "indexingDelegatorRewards": "1871836100707637637519"
+        },
+        {
+          "id": "0x0006391730761c0c3bba5b9b4527a3f1d21d7ea2",
+          "indexingRewards": "12766741983768520725",
+          "indexingIndexerRewards": "3498087303552574679",
+          "indexingDelegatorRewards": "9268654680215946046"
+        },
+        {
+          "id": "0x00419a2a120372f144ed9dccce8bf629edb58bd2",
+          "indexingRewards": "1965008659609278025675",
+          "indexingIndexerRewards": "756269954588764750713",
+          "indexingDelegatorRewards": "1208738705020513274962"
+        },
+        {
+          "id": "0x0068d7a281c782c05c207aae1c2bafe59b18d80d",
+          "indexingRewards": "1980339439981237467109",
+          "indexingIndexerRewards": "757651794585016975723",
+          "indexingDelegatorRewards": "1222687645396220491386"
+        }
+      ]
+    }
+  }
+}

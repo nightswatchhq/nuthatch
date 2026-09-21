@@ -35,6 +35,64 @@ type CallBatchFuture<'a> =
 /// where we currently re-fetch every timestamp in a range we just split.
 const TIMESTAMP_CACHE_MAX: usize = 262_144;
 
+// `None` is a stored EVM fact, not a convenient bucket for provider failures.
+fn decode_call_batch(response: &Value, expected: usize) -> Result<Vec<Option<String>>> {
+    let items = response
+        .as_array()
+        .context("eth_call batch response is not an array")?;
+    let mut out = vec![None; expected];
+    let mut seen = vec![false; expected];
+    for item in items {
+        let id = item
+            .get("id")
+            .and_then(Value::as_u64)
+            .and_then(|id| usize::try_from(id).ok())
+            .context("eth_call batch item has no valid id")?;
+        if id >= expected || seen[id] {
+            bail!("eth_call batch contains an unexpected or duplicate id {id}");
+        }
+        seen[id] = true;
+        if let Some(error) = item.get("error") {
+            if item.get("result").is_some() {
+                bail!("eth_call batch item contains both result and error");
+            }
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let code = error.get("code").and_then(Value::as_i64);
+            let explicit_revert = matches!(code, Some(3 | -32000 | -32015))
+                && (message == "execution reverted"
+                    || message.starts_with("execution reverted:")
+                    || message.starts_with("vm execution error: revert"));
+            if !explicit_revert {
+                return Err(ClassifiedError {
+                    class: classify_rpc_error(error),
+                    detail: format!("eth_call batch item {id} failed: {error}"),
+                }
+                .into());
+            }
+        } else {
+            let result = item
+                .get("result")
+                .and_then(Value::as_str)
+                .context("eth_call batch item has no string result or explicit revert")?;
+            if !result.starts_with("0x")
+                || result.len() % 2 != 0
+                || !result[2..].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("eth_call batch item has malformed return data");
+            }
+            out[id] = Some(result.to_string());
+        }
+    }
+    if seen.iter().any(|seen| !seen) {
+        bail!("eth_call batch omitted one or more requested results");
+    }
+    Ok(out)
+}
+
 /// Select the RPC endpoint pool for a command, preserving order and dropping duplicates.
 ///
 /// An explicit `--rpc` is an isolation boundary, not a preference hint: it is the complete pool
@@ -596,6 +654,7 @@ fn retry_hint_of(err: &Value) -> Option<Duration> {
 
 pub struct RpcClient {
     http: reqwest::Client,
+    budget: Option<std::sync::Arc<crate::rpc_budget::Budget>>,
     urls: Vec<String>,
     cursor: AtomicUsize,
     /// Per-endpoint health: the millis-since-epoch until which the endpoint is considered unhealthy
@@ -617,16 +676,28 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(urls: Vec<String>) -> Result<Self> {
+        Self::with_budget(urls, crate::rpc_budget::Budget::from_env()?)
+    }
+
+    fn with_budget(
+        urls: Vec<String>,
+        budget: Option<std::sync::Arc<crate::rpc_budget::Budget>>,
+    ) -> Result<Self> {
         if urls.is_empty() {
             bail!("no RPC URLs configured");
         }
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .context("failed to build HTTP client")?;
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
+        if budget.is_some() {
+            // A 307 could otherwise resend a paid request outside the reservation boundary.
+            builder = builder
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never());
+        }
+        let http = builder.build().context("failed to build HTTP client")?;
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             http,
+            budget,
             urls,
             cursor: AtomicUsize::new(0),
             health,
@@ -825,10 +896,20 @@ impl RpcClient {
         let classified = |class: FailureClass, detail: String| {
             anyhow::Error::new(ClassifiedError { class, detail })
         };
-        let resp =
-            self.http.post(url).json(body).send().await.map_err(|e| {
-                classified(FailureClass::Transient, format!("transport error: {e}"))
+        if let Some(budget) = &self.budget {
+            budget.reserve(body).map_err(|e| {
+                classified(
+                    FailureClass::Terminal,
+                    format!("RPC budget refused request: {e:#}"),
+                )
             })?;
+        }
+        let resp = self.http.post(url).json(body).send().await.map_err(|e| {
+            classified(
+                FailureClass::Transient,
+                format!("transport error: {}", e.without_url()),
+            )
+        })?;
         let status = resp.status();
         // Read `Retry-After` before the body consumes the response (#361). Seconds-form only: the
         // HTTP-date form needs a clock comparison to be meaningful, and no provider we have measured
@@ -1075,7 +1156,7 @@ impl RpcClient {
     /// batched-boundary discipline as log extraction").
     ///
     /// Returns results **positionally**, so a caller can zip them back against its declarations. A
-    /// call that reverted or that the endpoint declined yields `None` in that slot rather than failing
+    /// call that explicitly reverted yields `None` in that slot rather than failing
     /// the batch: a revert is a legitimate answer about chain state at that block (the function may not
     /// have existed yet), and collapsing it into a whole-batch error would make one unlucky
     /// declaration poison every other call at the same block.
@@ -1087,17 +1168,47 @@ impl RpcClient {
         calls: &'a [(String, String)],
         block: u64,
     ) -> CallBatchFuture<'a> {
+        self.eth_call_batch_with_selector(calls, json!(format!("0x{block:x}")))
+    }
+
+    /// EIP-1898 pins state to the same block hash as the source logs. A provider
+    /// declining the selector is an error, never a reason to retry by number.
+    pub async fn eth_call_batch_at_hash(
+        &self,
+        calls: &[(String, String)],
+        hash: &str,
+    ) -> Result<Vec<Option<String>>> {
+        if hash.len() != 66
+            || !hash.starts_with("0x")
+            || !hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            bail!("canonical eth_call requires a 32-byte block hash");
+        }
+        self.eth_call_batch_with_selector(
+            calls,
+            json!({"blockHash":hash.to_ascii_lowercase(),"requireCanonical":true}),
+        )
+        .await
+    }
+
+    fn eth_call_batch_with_selector<'a>(
+        &'a self,
+        calls: &'a [(String, String)],
+        selector: Value,
+    ) -> CallBatchFuture<'a> {
         Box::pin(async move {
             if calls.is_empty() {
                 return Ok(Vec::new());
             }
-            match self.eth_call_batch_once(calls, block).await {
+            match self.eth_call_batch_once(calls, &selector).await {
                 Ok(v) => Ok(v),
                 Err(e) if calls.len() > 1 && crate::chunker::is_result_too_large(&e) => {
                     let mid = calls.len() / 2;
                     let (a, b) = calls.split_at(mid);
-                    let mut out = self.eth_call_batch_at(a, block).await?;
-                    out.extend(self.eth_call_batch_at(b, block).await?);
+                    let mut out = self
+                        .eth_call_batch_with_selector(a, selector.clone())
+                        .await?;
+                    out.extend(self.eth_call_batch_with_selector(b, selector).await?);
                     Ok(out)
                 }
                 Err(e) => Err(e),
@@ -1108,33 +1219,18 @@ impl RpcClient {
     async fn eth_call_batch_once(
         &self,
         calls: &[(String, String)],
-        block: u64,
+        selector: &Value,
     ) -> Result<Vec<Option<String>>> {
         let batch: Vec<Value> = calls
             .iter()
             .enumerate()
             .map(|(i, (to, data))| {
                 json!({ "jsonrpc": "2.0", "id": i, "method": "eth_call",
-                        "params": [{ "to": to, "data": data }, format!("0x{block:x}")] })
+                        "params": [{ "to": to, "data": data }, selector] })
             })
             .collect();
         let resp = self.post_with_failover(&Value::Array(batch)).await?;
-        let mut out = vec![None; calls.len()];
-        for item in resp.as_array().into_iter().flatten() {
-            let Some(idx) = item.get("id").and_then(Value::as_u64) else {
-                continue;
-            };
-            let Some(slot) = out.get_mut(idx as usize) else {
-                continue;
-            };
-            // `error` here is a revert or an unsupported call at that block - a fact about chain
-            // state, not a transport failure, so it stays `None` rather than aborting the batch.
-            *slot = item
-                .get("result")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-        }
-        Ok(out)
+        decode_call_batch(&resp, calls.len())
     }
 
     /// Send a raw JSON-RPC batch and return the raw response. For `doctor` only: measuring the
@@ -1720,8 +1816,129 @@ pub(crate) fn redact_url(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn call_batches_distinguish_reverts_from_provider_failures_and_missing_results() {
+        use serde_json::json;
+        assert_eq!(
+            super::decode_call_batch(
+                &json!([
+                    {"id":1,"error":{"code":3,"message":"execution reverted: missing getter"}},
+                    {"id":0,"result":"0x0012"}
+                ]),
+                2
+            )
+            .unwrap(),
+            vec![Some("0x0012".into()), None]
+        );
+        for response in [
+            json!([]),
+            json!({"result":"0x"}),
+            json!([{"id":0,"result":null}]),
+            json!([{"id":1,"result":"0x"}]),
+            json!([{"id":0,"result":"0x"},{"id":0,"result":"0x"}]),
+            json!([{"id":0,"result":"0xyz"}]),
+            json!([{"id":0,"result":"0x1"}]),
+            json!([{"id":0,"error":{"code":-32000,"message":"missing trie node"}}]),
+            json!([{"id":0,"error":{"code":-32602,"message":"invalid block selector"}}]),
+            json!([{"id":0,"error":{"code":429,"message":"rate limit exceeded"}}]),
+            json!([{"id":0,"result":"0x","error":{"code":3,"message":"execution reverted"}}]),
+        ] {
+            assert!(
+                super::decode_call_batch(&response, 1).is_err(),
+                "accepted {response}"
+            );
+        }
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn rpc_budget_charges_failed_wire_attempts_and_stops_before_the_next_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.toml");
+        std::fs::write(
+            &path,
+            "version=1\nlimit_units=20\n[methods]\neth_blockNumber=10\n",
+        )
+        .unwrap();
+        let budget = crate::rpc_budget::Budget::open(&path).unwrap();
+        let (url, server, hits) = broken_rpc().await;
+        let client =
+            super::RpcClient::with_budget(vec![url.clone()], Some(budget.clone())).unwrap();
+        assert!(client
+            .send_classified(
+                &url,
+                &serde_json::json!({"method":"debug_traceBlockByNumber"})
+            )
+            .await
+            .is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let body =
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]});
+        assert!(client.send_classified(&url, &body).await.is_err());
+        assert!(client.send_classified(&url, &body).await.is_err());
+        let error = client.send_classified(&url, &body).await.unwrap_err();
+        assert!(error.to_string().contains("budget exhausted"), "{error}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let other = super::RpcClient::with_budget(vec![url.clone()], Some(budget)).unwrap();
+        assert!(other
+            .send_classified(&url, &body)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("budget exhausted"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rpc_budget_never_follows_an_unmetered_http_redirect() {
+        use axum::{
+            http::{header, StatusCode},
+            routing::post,
+            Router,
+        };
+        let hits = Arc::new(AtomicU64::new(0));
+        let target_hits = hits.clone();
+        let app = Router::new()
+            .route(
+                "/",
+                post(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, "/target")],
+                    )
+                }),
+            )
+            .route(
+                "/target",
+                post(move || {
+                    let hits = target_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.toml");
+        std::fs::write(
+            &path,
+            "version=1\nlimit_units=20\n[methods]\neth_blockNumber=10\n",
+        )
+        .unwrap();
+        let budget = crate::rpc_budget::Budget::open(&path).unwrap();
+        let client = super::RpcClient::with_budget(vec![url.clone()], Some(budget)).unwrap();
+        assert!(client
+            .send_classified(&url, &serde_json::json!({"method":"eth_blockNumber"}))
+            .await
+            .is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
 
     /// A one-endpoint fake JSON-RPC server on a loopback port. Returns `(url, handle)`; the caller
     /// aborts the handle when done. Real HTTP, so `RpcClient`'s actual request path is exercised -

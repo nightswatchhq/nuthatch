@@ -170,8 +170,9 @@ fn dev_and_serve_take_no_graph_flag() {
 
 /// 4. One set of data underneath, and the lane only reads it.
 ///
-/// The handler compiles the dialect to SQL and hands it to `run_sql_query` - the same function `/sql`
-/// uses, so the same admission and the same read-only attach. A second store, a GraphQL-shaped table
+/// The handler compiles the dialect to SQL and hands it to `run_sql_query_at` - the same helper
+/// `/sql` reaches through `run_sql_query`, with the same admission and read-only attach.
+/// A second store, a GraphQL-shaped table
 /// or any write would all show up as the lane no longer going through that one door.
 #[test]
 fn the_graph_lane_reads_through_the_same_sql_path() {
@@ -182,12 +183,29 @@ fn the_graph_lane_reads_through_the_same_sql_path() {
         .1;
     let body = &handler[..handler.find("\n}\n").unwrap_or(handler.len())];
     assert!(
-        body.contains("run_sql_query("),
-        "the Graph lane must read through `run_sql_query`, the same path `/sql` takes, so it inherits \
+        body.contains("run_sql_query_at("),
+        "the Graph lane must read through `run_sql_query_at`, the same path `/sql` takes, so it inherits \
          RFC-0034 admission and the read-only attach rather than opening a second door.\n\nIf you moved \
          the call behind a helper, that is fine: point this assertion at the helper and satisfy yourself \
          the lane still goes through admission. If you replaced it, do not - one set of data underneath \
          is the property this gate exists for.\n\n{body}"
+    );
+    let wrapper = src.split_once("async fn run_sql_query(").unwrap().1;
+    let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
+    assert!(wrapper.contains("run_sql_query_at(s, sql_text, requested_max_rows, None).await"));
+    let shared = src.split_once("async fn run_sql_query_at(").unwrap().1;
+    let shared = &shared[..shared.find("\n}\n").unwrap()];
+    assert!(
+        shared.contains("s.sql_gate"),
+        "both lanes must retain SQL admission"
+    );
+    assert!(
+        shared.contains("SQL_ADMISSION_WAIT"),
+        "admission must remain bounded"
+    );
+    assert!(
+        shared.contains("SQL_TIMEOUT"),
+        "execution must remain bounded"
     );
     for forbidden in [
         "begin_write",

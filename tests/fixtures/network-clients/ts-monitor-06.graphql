@@ -1,0 +1,32 @@
+
+          query allocations($indexer: String!, $subgraphDeploymentId: String!) {
+            allocations(
+              where: {
+                indexer: $indexer
+                status: Closed
+                subgraphDeployment: $subgraphDeploymentId
+              }
+              first: 5
+              orderBy: closedAtBlockNumber
+              orderDirection: desc
+            ) {
+              id
+              isLegacy
+              poi
+              indexer {
+                id
+              }
+              allocatedTokens
+              createdAt
+              createdAtEpoch
+              closedAt
+              closedAtEpoch
+              createdAtBlockHash
+              subgraphDeployment {
+                id
+                stakedTokens
+                signalledTokens
+                queryFeesAmount
+              }
+            }
+          }

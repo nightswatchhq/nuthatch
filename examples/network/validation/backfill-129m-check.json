@@ -1,0 +1,55 @@
+{
+  "date": "2026-09-19",
+  "snapshot": {
+    "manifestSha256": "e9453598fbc66554fd8bb8575b09788a158bdebe91a02b876fe650b3ae2c1b0a",
+    "lastSegmentBlock": 129252459,
+    "segments": 163,
+    "rows": 211360,
+    "reservedUnitsAtStop": 4138872,
+    "budgetLimitUnits": 39980000
+  },
+  "parity": {
+    "networkReference": "backfill-129m-reference.json",
+    "networkFields": 35,
+    "epochs": 279,
+    "epochFields": 13,
+    "deploymentReference": "backfill-129m-deployments-reference.json",
+    "deployments": 376,
+    "deploymentFields": 10,
+    "passed": true,
+    "perQueryTimeoutSeconds": 10,
+    "combinedCheckpointTestSeconds": 40.22,
+    "networkQuerySeconds": 5.73,
+    "epochQuerySeconds": 4.035,
+    "deploymentQuerySeconds": 0.65
+  },
+  "delegationOptimization": {
+    "viewSha256": "96c99cdb06cad6b5911ad010d156b9931dfeaac8486c2c5c238f7abb38e36d44",
+    "description": "Compute additive balances with windows and recurse only over reward events; reconstruct every intermediate row.",
+    "originalFoldComparisonRows": 600,
+    "installed": false
+  },
+  "resume": {
+    "unit": "network-facade-backfill-20260919-resume3.service",
+    "startUtc": "2026-09-19T10:46:23Z",
+    "fromBlock": 129252460,
+    "runtimeLimitMinutes": 60,
+    "automaticRestart": false,
+    "readinessHttpStatus": 503
+  },
+  "verification": {
+    "integrationTestsPassed": 369,
+    "integrationTestsIgnored": 7,
+    "networkTestsPassed": 21,
+    "capturedHttpClientDocumentsPassed": 21,
+    "coldParityPassed": true,
+    "clippyWarningsDeniedPassed": true
+  },
+  "limitations": [
+    "Historical SQL comparisons, not current-head parity or actual client-process acceptance.",
+    "The 39-indexer comparison remains at block 123615752, not this later block.",
+    "Latest delegation optimization is local only; install at a clean stop.",
+    "The dense-range ingestion speed does not establish full-history duration or cost.",
+    "Conditional GNS save paths and complete historical metadata still require validation."
+  ]
+}

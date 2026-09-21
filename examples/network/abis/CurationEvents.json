@@ -1,0 +1,21 @@
+[
+  {
+    "type": "event", "name": "Signalled", "anonymous": false,
+    "inputs": [
+      {"name": "curator", "type": "address", "indexed": true},
+      {"name": "subgraphDeploymentID", "type": "bytes32", "indexed": true},
+      {"name": "tokens", "type": "uint256", "indexed": false},
+      {"name": "signal", "type": "uint256", "indexed": false},
+      {"name": "curationTax", "type": "uint256", "indexed": false}
+    ]
+  },
+  {
+    "type": "event", "name": "Burned", "anonymous": false,
+    "inputs": [
+      {"name": "curator", "type": "address", "indexed": true},
+      {"name": "subgraphDeploymentID", "type": "bytes32", "indexed": true},
+      {"name": "tokens", "type": "uint256", "indexed": false},
+      {"name": "signal", "type": "uint256", "indexed": false}
+    ]
+  }
+]

@@ -3602,6 +3602,51 @@ async fn fetch_timestamps(
     source.block_timestamps(blocks).await
 }
 
+pub(crate) struct WindowBlockData {
+    pub(crate) timestamps: std::collections::HashMap<u64, u64>,
+    pub(crate) headers: Option<std::collections::HashMap<u64, serde_json::Value>>,
+}
+
+/// Canonical reads need the same header as the event timestamps. Keep it only
+/// for this window; a retry or another window must fetch its own fork evidence.
+pub(crate) async fn fetch_window_block_data(
+    source: &dyn Source,
+    registry: &DecodeRegistry,
+    blocks: &[u64],
+    canonical_calls: bool,
+) -> Result<WindowBlockData> {
+    if !canonical_calls {
+        return Ok(WindowBlockData {
+            timestamps: fetch_timestamps(source, registry, blocks).await?,
+            headers: None,
+        });
+    }
+    let headers = source.block_headers(blocks).await?;
+    let mut timestamps = std::collections::HashMap::new();
+    for block in blocks {
+        let header = headers
+            .get(block)
+            .with_context(|| format!("missing canonical window header at {block}"))?;
+        if registry.timestamps() {
+            let timestamp = header
+                .get("timestamp")
+                .and_then(|v| {
+                    v.as_u64().or_else(|| {
+                        v.as_str()?
+                            .strip_prefix("0x")
+                            .and_then(|s| u64::from_str_radix(s, 16).ok())
+                    })
+                })
+                .with_context(|| format!("missing canonical window timestamp at {block}"))?;
+            timestamps.insert(*block, timestamp);
+        }
+    }
+    Ok(WindowBlockData {
+        timestamps,
+        headers: Some(headers),
+    })
+}
+
 /// Blocks that still need a header after local filtering (#765).
 ///
 /// A topic0-only fetch (factory flip, RFC-0009 §4) returns every log on the chain with that
@@ -3806,6 +3851,11 @@ const TOP_LEVEL_BODY_BATCH: usize = 20;
 /// 34 blocks/s serially, 114 at four, 145 at eight.
 pub const CALL_BODY_CONCURRENCY: usize = 4;
 
+/// Hash-pinned state-call batches in flight while resolving one log window.
+/// Kept independent from body fetching: archive state calls have their own
+/// provider limits and each batch is already metered before it leaves process.
+const PINNED_CALL_BATCH_CONCURRENCY: usize = 4;
+
 /// A chunk holds ten batches, so more would buy nothing.
 pub const CALL_BODY_CONCURRENCY_CEILING: usize = TOP_LEVEL_BODY_CHUNK / TOP_LEVEL_BODY_BATCH;
 
@@ -3928,15 +3978,17 @@ pub(crate) async fn resolve_calls_for_window(
     to: u64,
     timestamps: &std::collections::HashMap<u64, u64>,
     with_timestamps: bool,
+    window_headers: Option<&std::collections::HashMap<u64, serde_json::Value>>,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
     use std::collections::BTreeMap;
 
     let mut wanted: BTreeMap<u64, Vec<(usize, String, String)>> = BTreeMap::new();
     for (i, d) in calls.iter().enumerate() {
         if d.is_row_driven() {
-            let table = d.on.as_deref().unwrap_or_default();
-            let mut src: Vec<&crate::registry::DecodedRow> =
-                event_rows.iter().filter(|r| r.table == table).collect();
+            let mut src: Vec<&crate::registry::DecodedRow> = event_rows
+                .iter()
+                .filter(|r| d.matches_source(&r.table))
+                .collect();
             src.sort_by_key(|r| (r.block_number, r.log_index));
             for r in src {
                 let (contract, calldata) = d.resolve_for_row(r)?;
@@ -3957,21 +4009,25 @@ pub(crate) async fn resolve_calls_for_window(
     }
 
     let capacity = crate::registry::BLOCK_ROW_LOG_INDEX - crate::registry::CALL_ROW_LOG_INDEX_BASE;
-    // One batched header fetch for every block this window's calls touch (#720), rather than a
-    // sequential single-block `block_hash` per block below. The blocks' timestamps already came
-    // from a batched fetch (`fetch_timestamps`, above the caller); the hash was the one field still
-    // paying an unbatched round trip per sampled block.
+    // Canonical windows retain their timestamp headers, avoiding a second fetch.
+    // Other callers still fetch the wanted headers in one batch (#720).
     let wanted_blocks: Vec<u64> = wanted.keys().copied().collect();
-    let headers = retry_transient(
-        &format!(
-            "seal-direct block headers for {} block(s)",
-            wanted_blocks.len()
-        ),
-        BACKFILL_RETRY_BASE,
-        || async { source.block_headers(&wanted_blocks).await },
-    )
-    .await?;
-    let mut out: Vec<crate::registry::DecodedRow> = Vec::new();
+    let fetched_headers;
+    let headers = if let Some(headers) = window_headers {
+        headers
+    } else {
+        fetched_headers = retry_transient(
+            &format!(
+                "seal-direct block headers for {} block(s)",
+                wanted_blocks.len()
+            ),
+            BACKFILL_RETRY_BASE,
+            || async { source.block_headers(&wanted_blocks).await },
+        )
+        .await?;
+        &fetched_headers
+    };
+    let mut planned = Vec::with_capacity(wanted.len());
     for (block, mut items) in wanted {
         let mut seen = std::collections::HashSet::new();
         items.retain(|(i, c, d)| seen.insert((*i, c.clone(), d.clone())));
@@ -3989,22 +4045,92 @@ pub(crate) async fn resolve_calls_for_window(
             .iter()
             .map(|(_, c, d)| (c.clone(), d.clone()))
             .collect();
-        let results = retry_transient(
-            &format!("seal-direct pinned eth_call batch at block {block}"),
-            BACKFILL_RETRY_BASE,
-            || async { crate::calls::resolve_pairs_at(state_rpc, chain_id, &pairs, block).await },
-        )
-        .await?;
         let hash = headers
             .get(&block)
             .and_then(|h| h.get("hash"))
             .and_then(|h| h.as_str())
             .unwrap_or_default()
             .to_string();
-        let ts = timestamps.get(&block).copied().unwrap_or(0);
-        for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
-            out.push(r.to_row(&calls[*i].name, slot, &hash, ts, with_timestamps));
+        let canonical = items.iter().any(|(i, _, _)| calls[*i].canonical);
+        if canonical {
+            if hash.len() != 66
+                || !hash.starts_with("0x")
+                || !hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                anyhow::bail!("canonical call source has no valid block hash at {block}");
+            }
+            if with_timestamps {
+                let timestamp = headers
+                    .get(&block)
+                    .and_then(|h| h.get("timestamp"))
+                    .and_then(|value| {
+                        value.as_u64().or_else(|| {
+                            value
+                                .as_str()
+                                .and_then(|s| s.strip_prefix("0x"))
+                                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                        })
+                    })
+                    .context("canonical call source has no valid block timestamp")?;
+                if timestamps.get(&block) != Some(&timestamp)
+                    || event_rows
+                        .iter()
+                        .filter(|row| row.block_number == block)
+                        .any(|row| row.block_timestamp != timestamp)
+                {
+                    anyhow::bail!(
+                        "source timestamp/header mismatch at block {block}; refusing pinned reads"
+                    );
+                }
+            }
+            for row in event_rows.iter().filter(|row| row.block_number == block) {
+                if !row.block_hash.eq_ignore_ascii_case(&hash) {
+                    anyhow::bail!(
+                        "source log/header fork mismatch at block {block}; refusing pinned reads"
+                    );
+                }
+            }
         }
+        let ts = timestamps.get(&block).copied().unwrap_or(0);
+        planned.push((block, items, pairs, hash, canonical, ts));
+    }
+
+    use futures::stream::StreamExt;
+    let batches = futures::stream::iter(planned.into_iter().map(
+        |(block, items, pairs, hash, canonical, ts)| async move {
+            let results = retry_transient(
+                &format!("seal-direct pinned eth_call batch at block {block}"),
+                BACKFILL_RETRY_BASE,
+                || async {
+                    if canonical {
+                        crate::calls::resolve_pairs_at_hash(
+                            state_rpc, chain_id, &pairs, block, &hash,
+                        )
+                        .await
+                    } else {
+                        crate::calls::resolve_pairs_at(state_rpc, chain_id, &pairs, block).await
+                    }
+                },
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(
+                items
+                    .iter()
+                    .zip(results)
+                    .enumerate()
+                    .map(|(slot, ((i, _, _), result))| {
+                        result.to_row(&calls[*i].name, slot, &hash, ts, with_timestamps)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        },
+    ))
+    .buffer_unordered(PINNED_CALL_BATCH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut out = Vec::new();
+    for batch in batches {
+        out.extend(batch?);
     }
     out.sort_by_key(|r| (r.block_number, r.log_index));
     Ok(out)
@@ -4155,7 +4281,14 @@ pub async fn backfill_direct(
         }
         blocks.sort_unstable();
         blocks.dedup();
-        let ts = fetch_timestamps(source, registry, &blocks).await?;
+        let block_data = fetch_window_block_data(
+            source,
+            registry,
+            &blocks,
+            state_rpc.is_some() && calls.iter().any(|c| c.canonical),
+        )
+        .await?;
+        let ts = block_data.timestamps;
         for r in &mut rows {
             r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
         }
@@ -4172,6 +4305,7 @@ pub async fn backfill_direct(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
+                block_data.headers.as_ref(),
             )
             .await?;
             rows.extend(call_rows);
@@ -4775,12 +4909,20 @@ pub async fn backfill_direct_pipelined_with(
             }
             blocks.sort_unstable();
             blocks.dedup();
-            let ts = retry_transient(
+            let block_data = retry_transient(
                 &format!("seal-direct block_timestamps {w_from}..={w_to}"),
                 BACKFILL_RETRY_BASE,
-                || fetch_timestamps(source, registry, &blocks),
+                || {
+                    fetch_window_block_data(
+                        source,
+                        registry,
+                        &blocks,
+                        state_rpc.is_some() && calls.iter().any(|c| c.canonical),
+                    )
+                },
             )
             .await?;
+            let ts = block_data.timestamps;
             // Seal in canonical (block, log_index) order, not RPC-provider order, so a segment's bytes
             // (and its content address) are identical across providers - see `backfill_direct`.
             rows.sort_by_key(|r| (r.block_number, r.log_index));
@@ -4799,6 +4941,7 @@ pub async fn backfill_direct_pipelined_with(
                     w_to,
                     &ts,
                     registry.timestamps(),
+                    block_data.headers.as_ref(),
                 )
                 .await?;
                 rows.extend(call_rows);
@@ -5210,12 +5353,20 @@ pub async fn backfill_direct_factory_with(
             Vec::new()
         };
         let blocks = blocks_needing_timestamps(&rows, extra);
-        let ts = retry_transient(
+        let block_data = retry_transient(
             &format!("factory block_timestamps {next}..={chunk_to}"),
             BACKFILL_RETRY_BASE,
-            || fetch_timestamps(source, registry, &blocks),
+            || {
+                fetch_window_block_data(
+                    source,
+                    registry,
+                    &blocks,
+                    state_rpc.is_some() && calls.iter().any(|c| c.canonical),
+                )
+            },
         )
         .await?;
+        let ts = block_data.timestamps;
         apply_row_timestamps(&mut rows, &ts);
         children.apply_timestamps(&ts);
         // RFC-0023 tier-3: resolve declared [[calls]] and merge so sealed segments match the hot path.
@@ -5230,6 +5381,7 @@ pub async fn backfill_direct_factory_with(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
+                block_data.headers.as_ref(),
             )
             .await?;
             rows.extend(call_rows);
@@ -5984,7 +6136,14 @@ impl NestIngest {
         // blocks join the timestamp fetch rather than being handled after it.
         let extra = self.calls.iter().flat_map(|d| d.blocks_in(next, to));
         let blocks = blocks_needing_timestamps(&rows, extra);
-        let timestamps = match fetch_timestamps(source, &self.registry, &blocks).await {
+        let block_data = match fetch_window_block_data(
+            source,
+            &self.registry,
+            &blocks,
+            self.calls.iter().any(|c| c.canonical),
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 // Don't store this window with zeroed timestamps - once it finalizes it would
@@ -5997,6 +6156,7 @@ impl NestIngest {
                 return Ok(None);
             }
         };
+        let timestamps = block_data.timestamps;
         apply_row_timestamps(&mut rows, &timestamps);
         self.children.apply_timestamps(&timestamps);
 
@@ -6222,107 +6382,25 @@ impl NestIngest {
                 .state_rpc
                 .clone()
                 .context("tier-3 calls declared with no --state-rpc; refused at startup")?;
-            let mut wanted: std::collections::BTreeMap<u64, Vec<(usize, String, String)>> =
-                std::collections::BTreeMap::new();
-            for (i, d) in self.calls.iter().enumerate() {
-                if d.is_row_driven() {
-                    let table = d.on.as_deref().unwrap_or_default();
-                    let mut src: Vec<&crate::registry::DecodedRow> =
-                        rows.iter().filter(|r| r.table == table).collect();
-                    src.sort_by_key(|r| (r.block_number, r.log_index));
-                    for r in src {
-                        let (contract, calldata) = d.resolve_for_row(r)?;
-                        wanted
-                            .entry(r.block_number)
-                            .or_default()
-                            .push((i, contract, calldata));
-                    }
-                } else {
-                    for b in d.blocks_in(next, to) {
-                        wanted.entry(b).or_default().push((
-                            i,
-                            d.contract.to_ascii_lowercase(),
-                            d.calldata.to_ascii_lowercase(),
-                        ));
-                    }
-                }
-            }
-
-            let capacity =
-                crate::registry::BLOCK_ROW_LOG_INDEX - crate::registry::CALL_ROW_LOG_INDEX_BASE;
-            // One batched header fetch for every block this window's calls touch (#720), rather
-            // than a sequential single-block `block_hash` per block below. `timestamps` above
-            // already came from a batched fetch; the hash was the one field still paying an
-            // unbatched round trip per sampled block.
-            let wanted_blocks: Vec<u64> = wanted.keys().copied().collect();
-            let headers = retry_transient(
-                &format!("block headers for {} block(s)", wanted_blocks.len()),
-                BACKFILL_RETRY_BASE,
-                || async { source.block_headers(&wanted_blocks).await },
+            let call_rows = resolve_calls_for_window(
+                source,
+                &self.calls,
+                rpc.as_ref(),
+                self.chain_id,
+                &rows,
+                next,
+                to,
+                &timestamps,
+                self.registry.timestamps(),
+                block_data.headers.as_ref(),
             )
             .await?;
-            for (block, mut items) in wanted {
-                // `CallKey` is a content address, so N rows asking the same question of the same
-                // contract at the same block are one call and one row. Dedupe before the RPC, not
-                // after: the saving is the request, not the storage.
-                let mut seen = std::collections::HashSet::new();
-                items.retain(|(i, c, d)| seen.insert((*i, c.clone(), d.clone())));
-
-                if items.len() as u64 >= capacity {
-                    anyhow::bail!(
-                        "block {block} wants {} distinct pinned reads, and only {capacity} fit in the \
-                         reserved row-index band.\n\n\
-                         A row-driven `[[calls]]` declaration fires once per source row, so a dense \
-                         table can ask for more reads than a block can hold. Narrow the source table \
-                         (index fewer events), or make the declaration sampled instead.",
-                        items.len()
-                    );
-                }
-
-                let pairs: Vec<(String, String)> = items
-                    .iter()
-                    .map(|(_, c, d)| (c.clone(), d.clone()))
-                    .collect();
-                // Retried like every other RPC fetch on this path, and it was not, which cost a
-                // 454M-block backfill 8 hours in at 87.6%: one `transport error: error sending
-                // request` on a pinned batch propagated straight out and killed the nest. `getLogs`
-                // and the timestamp fetches have gone through `retry_transient` since #538; this one
-                // shipped in 2.6.0 with a bare `?`, so any long backfill declaring `[[calls]]` died
-                // on the first blip from the provider.
-                //
-                // Never-give-up with capped backoff, matching the sealed-history path exactly: a
-                // transient provider failure is not a reason to discard hours of work, and the
-                // progress line resumes moving once it clears.
-                let chain_id = self.chain_id;
-                let results = retry_transient(
-                    &format!("pinned eth_call batch at block {block}"),
-                    BACKFILL_RETRY_BASE,
-                    || async {
-                        crate::calls::resolve_pairs_at(rpc.as_ref(), chain_id, &pairs, block).await
-                    },
-                )
-                .await?;
-                let hash = headers
-                    .get(&block)
-                    .and_then(|h| h.get("hash"))
-                    .and_then(|h| h.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let ts = timestamps.get(&block).copied().unwrap_or(0);
-                for (slot, ((i, _, _), r)) in items.iter().zip(results).enumerate() {
-                    let row = r.to_row(
-                        &self.calls[*i].name,
-                        slot,
-                        &hash,
-                        ts,
-                        self.registry.timestamps(),
-                    );
-                    to_store.push((
-                        Store::entity_key(row.block_number, row.log_index),
-                        row.to_json().to_string(),
-                    ));
-                    stored += 1;
-                }
+            for row in call_rows {
+                to_store.push((
+                    Store::entity_key(row.block_number, row.log_index),
+                    row.to_json().to_string(),
+                ));
+                stored += 1;
             }
         }
 
@@ -15726,6 +15804,305 @@ template="pool"
             "the post whose payload is not JSON is unreadable to both declarations, and counted"
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_multi_source_fixed_read_is_fetched_once_per_touched_block() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let rpc = crate::rpc::RpcClient::new(vec![url]).unwrap();
+        let decl: crate::calls::CallDecl = toml::from_str(
+            r#"
+            name = "epoch"
+            contract = "0x1111111111111111111111111111111111111111"
+            on_any = ["staking__created", "service__closed"]
+            signature = "currentEpoch()"
+        "#,
+        )
+        .unwrap();
+        decl.validate().unwrap();
+        let rows = [
+            ("staking__created", 5),
+            ("service__closed", 5),
+            ("service__closed", 6),
+            ("other", 7),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (table, block))| crate::registry::DecodedRow {
+            table: table.into(),
+            params: Vec::new(),
+            block_number: block,
+            block_hash: format!("0x{block:064x}"),
+            block_timestamp: 1000 + block,
+            timestamps: true,
+            log_index: i as u64,
+            tx_hash: format!("0x{i:064x}"),
+            address: "0x1111111111111111111111111111111111111111".into(),
+        })
+        .collect::<Vec<_>>();
+        let result = resolve_calls_for_window(
+            &MockSource { logs: Vec::new() },
+            &[decl],
+            &rpc,
+            42161,
+            &rows,
+            5,
+            7,
+            &std::collections::HashMap::from([(5, 1005), (6, 1006)]),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let asked = seen.lock().unwrap().clone();
+        assert_eq!(
+            asked.len(),
+            2,
+            "duplicate events must not multiply fixed reads: {asked:?}"
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].block_number, 5);
+        assert_eq!(result[1].block_number, 6);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn pinned_call_batches_are_bounded_and_rows_remain_block_ordered() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct InFlight {
+            active: Arc<AtomicUsize>,
+            maximum: Arc<AtomicUsize>,
+        }
+        async fn handler(
+            axum::extract::State(state): axum::extract::State<InFlight>,
+            body: String,
+        ) -> axum::Json<serde_json::Value> {
+            let now = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+            state.maximum.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            state.active.fetch_sub(1, Ordering::SeqCst);
+            let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let answer = |request: &serde_json::Value| {
+                serde_json::json!({
+                    "jsonrpc":"2.0", "id":request["id"].clone(),
+                    "result":format!("0x{:064x}", 42),
+                })
+            };
+            axum::Json(match request.as_array() {
+                Some(requests) => serde_json::Value::Array(requests.iter().map(answer).collect()),
+                None => answer(&request),
+            })
+        }
+
+        let state = InFlight {
+            active: Arc::new(AtomicUsize::new(0)),
+            maximum: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rpc = crate::rpc::RpcClient::new(vec![format!("http://{address}/")]).unwrap();
+        let decl: crate::calls::CallDecl = toml::from_str(
+            "name='clock'\ncontract='0x1111111111111111111111111111111111111111'\non='staking__created'\nsignature='blockNum()'",
+        )
+        .unwrap();
+        let rows = (1..=8)
+            .map(|block| crate::registry::DecodedRow {
+                table: "staking__created".into(),
+                params: Vec::new(),
+                block_number: block,
+                block_hash: format!("0x{block:064x}"),
+                block_timestamp: 0,
+                timestamps: false,
+                log_index: 0,
+                tx_hash: String::new(),
+                address: decl.contract.clone(),
+            })
+            .collect::<Vec<_>>();
+        let resolved = resolve_calls_for_window(
+            &MockSource { logs: Vec::new() },
+            &[decl],
+            &rpc,
+            42161,
+            &rows,
+            1,
+            8,
+            &std::collections::HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|row| row.block_number)
+                .collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>(),
+            "completion order must not become stored row order"
+        );
+        assert!(state.maximum.load(Ordering::SeqCst) > 1);
+        assert!(state.maximum.load(Ordering::SeqCst) <= PINNED_CALL_BATCH_CONCURRENCY);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canonical_window_headers_are_fetched_once_and_not_reused_across_windows() {
+        struct HeadersOnly(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl Source for HeadersOnly {
+            async fn tip(&self) -> Result<u64> {
+                Ok(5)
+            }
+            async fn block_hash(&self, _: u64) -> Result<Option<String>> {
+                anyhow::bail!("unexpected hash read")
+            }
+            async fn logs(
+                &self,
+                _: &crate::source::LogFilter,
+                _: u64,
+                _: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+            async fn block_timestamps(
+                &self,
+                _: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                anyhow::bail!("duplicate timestamp read")
+            }
+            async fn block_headers(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                let version = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(blocks
+                    .iter()
+                    .map(|b| {
+                        (
+                            *b,
+                            serde_json::json!({
+                                "hash":format!("0x{:064x}", b + version as u64),
+                                "timestamp":format!("0x{:x}", 1000 + b + version as u64)
+                            }),
+                        )
+                    })
+                    .collect())
+            }
+        }
+        let source = HeadersOnly(std::sync::atomic::AtomicUsize::new(0));
+        let registry = DecodeRegistry::build(Vec::new()).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let rpc = crate::rpc::RpcClient::new(vec![url]).unwrap();
+        let decl: crate::calls::CallDecl = toml::from_str(
+            "name='clock'\ncontract='0x1111111111111111111111111111111111111111'\non='token__transfer'\nsignature='blockNum()'\ncanonical=true"
+        ).unwrap();
+        for version in 0..2 {
+            let data = fetch_window_block_data(&source, &registry, &[5], true)
+                .await
+                .unwrap();
+            let row = crate::registry::DecodedRow {
+                table: "token__transfer".into(),
+                params: Vec::new(),
+                block_number: 5,
+                block_hash: format!("0x{:064x}", 5 + version),
+                block_timestamp: 1005 + version,
+                timestamps: true,
+                log_index: 0,
+                tx_hash: String::new(),
+                address: decl.contract.clone(),
+            };
+            assert_eq!(data.timestamps[&5], 1005 + version);
+            let resolved = resolve_calls_for_window(
+                &source,
+                std::slice::from_ref(&decl),
+                &rpc,
+                42161,
+                &[row],
+                5,
+                5,
+                &data.timestamps,
+                true,
+                data.headers.as_ref(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].block_hash, format!("0x{:064x}", 5 + version));
+            assert_eq!(
+                source.0.load(std::sync::atomic::Ordering::SeqCst),
+                version as usize + 1
+            );
+        }
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn canonical_calls_refuse_mixed_source_hashes_and_timestamps_before_rpc() {
+        let rpc = crate::rpc::RpcClient::new(vec!["http://127.0.0.1:1".into()]).unwrap();
+        let decl: crate::calls::CallDecl = toml::from_str(
+            r#"
+            name = "clock"
+            contract = "0x1111111111111111111111111111111111111111"
+            on = "token__transfer"
+            signature = "blockNum()"
+            canonical = true
+        "#,
+        )
+        .unwrap();
+        let row = crate::registry::DecodedRow {
+            table: "token__transfer".into(),
+            params: Vec::new(),
+            block_number: 5,
+            block_hash: format!("0x{:064x}", 5),
+            block_timestamp: 1_700_000_005,
+            timestamps: true,
+            log_index: 0,
+            tx_hash: String::new(),
+            address: "0x1111111111111111111111111111111111111111".into(),
+        };
+        let headers = LogCountingSource::new().block_headers(&[5]).await.unwrap();
+        for (bad_hash, cached, expected) in [
+            (true, false, "fork mismatch"),
+            (false, false, "timestamp/header mismatch"),
+            (true, true, "fork mismatch"),
+            (false, true, "timestamp/header mismatch"),
+        ] {
+            let mut row = row.clone();
+            if bad_hash {
+                row.block_hash = format!("0x{:064x}", 6);
+            } else {
+                row.block_timestamp += 1;
+            }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                resolve_calls_for_window(
+                    &LogCountingSource::new(),
+                    std::slice::from_ref(&decl),
+                    &rpc,
+                    42161,
+                    &[row],
+                    5,
+                    5,
+                    &std::collections::HashMap::from([(5, 1_700_000_005)]),
+                    true,
+                    cached.then_some(&headers),
+                ),
+            )
+            .await
+            .unwrap();
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     /// **RFC-0038 §3, end to end: a declaration names an event's parameter.**

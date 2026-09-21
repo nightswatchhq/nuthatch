@@ -1,0 +1,65 @@
+{
+  "date": "2026-09-18",
+  "binarySha256": "e57146ddffd2a2eb7ccef6a2dd325023b282d34ee97cf231e40edaa3fc6e1796",
+  "configSha256": "d0e84eccee9aec728628b7de2107ac1384fc922eb56bb3c8104ac2b0a651f02c",
+  "pilot": {
+    "fromBlock": 42440000,
+    "toBlock": 43440000,
+    "rows": 98,
+    "callRows": 58,
+    "reservedUnitsBefore": 1084513,
+    "reservedUnitsAfter": 1087551,
+    "reservedUnits": 3038,
+    "baselineReservedUnits": 23078,
+    "seconds": 6.85,
+    "baselineSeconds": 11.16,
+    "peakRssMB": 34,
+    "segmentsAndManifestByteIdentical": true
+  },
+  "stoppedBackfill": {
+    "manifestSha256": "3946850d226a7adbadcd982591aec51c99e8d96ef635d4a52e22c3b13d092426",
+    "lastSegmentBlock": 84363706,
+    "rows": 11096,
+    "segments": 54,
+    "stopUtc": "2026-09-18T14:51:46Z",
+    "stopReason": "Operator stopped to remove unnecessary event-driven periodic header reads",
+    "cleanStop": true
+  },
+  "resume": {
+    "unit": "network-facade-backfill-20260918-resume1.service",
+    "startUtc": "2026-09-18T15:09:57Z",
+    "priorSealedBlock": 84363706,
+    "fromBlock": 84363707,
+    "observedProgressBlock": 92005706,
+    "observedProgressUtc": "2026-09-18T15:12:42Z",
+    "runtimeLimitMinutes": 15,
+    "automaticRestart": false,
+    "existingBudgetLedgerRetained": true
+  },
+  "secondResume": {
+    "unit": "network-facade-backfill-20260918-resume2.service",
+    "startUtc": "2026-09-18T15:17:50Z",
+    "priorSealedBlock": 100620845,
+    "fromBlock": 100620846,
+    "clockViewSha256": "5750b94eb50ac0e3042246b4a694d412889cd3cd895bb972e04a45ecab653fd6",
+    "runtimeLimitMinutes": 15,
+    "automaticRestart": false,
+    "existingBudgetLedgerRetained": true,
+    "readinessHttpStatus": 503
+  },
+  "coldParity": {
+    "passed": true,
+    "block": 84363706,
+    "networkFields": 35,
+    "epochs": 145,
+    "epochFields": 13,
+    "reference": "backfill-84m-reference.json",
+    "test": "network_contract::independently_ingested_cold_history_matches_genesis_reference"
+  },
+  "limitations": [
+    "Sample timing does not establish sustained throughput or whole-history cost.",
+    "Cold parity uses corrected local SQL projections, not the old views present at original ingestion.",
+    "The Linux binary contains the scheduler and startup-validator fixes; later local error-message wording and test-only changes are not in that binary.",
+    "No public endpoint or complete-history readiness policy enabled."
+  ]
+}

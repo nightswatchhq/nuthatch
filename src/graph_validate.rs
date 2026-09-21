@@ -509,6 +509,42 @@ pub struct Operation {
     /// Variables, passed through to both endpoints unchanged so the two answers are comparable.
     #[serde(default)]
     pub variables: serde_json::Value,
+    #[serde(default, rename = "operationName")]
+    pub operation_name: Option<String>,
+}
+
+/// The executable corpus uses the same fragment expansion as the Graph read surface.
+/// Compare response aliases, and merge repeated selections instead of dropping a branch.
+fn operation_selection(op: &Operation) -> anyhow::Result<Selection> {
+    let mut vars = std::collections::BTreeMap::new();
+    if !op.variables.is_null() {
+        for (key, value) in op
+            .variables
+            .as_object()
+            .context("variables must be an object")?
+        {
+            vars.insert(
+                key.clone(),
+                crate::graph_query::Value::from_json(value)
+                    .with_context(|| format!("unsupported variable {key}"))?,
+            );
+        }
+    }
+    let roots = crate::graph_query::parse_named(&op.query, &vars, op.operation_name.as_deref())
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    fn merge(out: &mut Selection, fields: &[crate::graph_query::Selection]) {
+        for field in fields {
+            merge(out.fields.entry(field.key.clone()).or_default(), &field.sub);
+        }
+    }
+    let mut selection = Selection::default();
+    for root in roots {
+        merge(selection.fields.entry(root.key).or_default(), &root.sel);
+    }
+    if selection.fields.is_empty() {
+        anyhow::bail!("operation selects no fields");
+    }
+    Ok(selection)
 }
 
 /// What one operation produced when run against both endpoints.
@@ -527,39 +563,63 @@ async fn post(
     client: &reqwest::Client,
     url: &str,
     op: &Operation,
+    bearer: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let mut body = serde_json::json!({"query": op.query});
     if !op.variables.is_null() {
         body["variables"] = op.variables.clone();
     }
-    let resp = client
-        .post(url)
+    if let Some(name) = &op.operation_name {
+        body["operationName"] = Value::String(name.clone());
+    }
+    let mut request = client.post(url);
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    let mut resp = request
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("{url}: {e}"))?;
+        .map_err(|e| e.without_url().to_string())?;
     let status = resp.status();
-    let value: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("{url}: response was not JSON ({e})"))?;
     if !status.is_success() {
-        return Err(format!("{url}: HTTP {status}"));
+        return Err(format!("HTTP {status}"));
     }
+    const RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+    if resp
+        .content_length()
+        .is_some_and(|size| size > RESPONSE_LIMIT as u64)
+    {
+        return Err("Graph response exceeds 16 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| e.without_url().to_string())?
+    {
+        if chunk.len() > RESPONSE_LIMIT - bytes.len() {
+            return Err("Graph response exceeds 16 MiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("response was not JSON ({e})"))?;
     // A GraphQL endpoint can return 200 with an `errors` array and a partial `data`. Comparing the
     // partial answer would be comparing a failure to a success, so it is reported as an error.
     if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
         if !errors.is_empty() {
             return Err(format!(
-                "{url}: {}",
+                "GraphQL errors: {}",
                 serde_json::Value::Array(errors.clone())
             ));
         }
     }
-    Ok(value
+    value
         .get("data")
+        .filter(|data| data.is_object())
         .cloned()
-        .unwrap_or(serde_json::Value::Null))
+        .ok_or_else(|| "Graph response has no data object".into())
 }
 
 /// Run a whole corpus against both endpoints.
@@ -574,14 +634,31 @@ pub async fn run(args: crate::cli::GraphValidateArgs) -> anyhow::Result<()> {
             args.corpus
         );
     }
-    let client = reqwest::Client::new();
+    let token = |name: &Option<String>| -> anyhow::Result<Option<String>> {
+        name.as_ref()
+            .map(|name| {
+                let value = std::env::var(name)
+                    .with_context(|| format!("token environment variable {name} is unavailable"))?;
+                if value.trim().is_empty() {
+                    anyhow::bail!("token environment variable {name} is empty");
+                }
+                Ok(value)
+            })
+            .transpose()
+    };
+    let reference_token = token(&args.reference_token_env)?;
+    let nest_token = token(&args.nest_token_env)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     let mut outcomes = Vec::new();
     for op in &corpus {
-        let result = match Selection::from_query(&op.query) {
+        let result = match operation_selection(op) {
             Err(e) => Err(format!("selection: {e}")),
             Ok(sel) => match (
-                post(&client, &args.reference, op).await,
-                post(&client, &args.nest, op).await,
+                post(&client, &args.reference, op, reference_token.as_deref()).await,
+                post(&client, &args.nest, op, nest_token.as_deref()).await,
             ) {
                 (Err(e), _) => Err(format!("reference: {e}")),
                 (_, Err(e)) => Err(format!("nest: {e}")),
@@ -627,6 +704,61 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn corpus_selections_expand_fragments_merge_fields_and_follow_aliases() {
+        let operation: Operation = serde_json::from_value(json!({
+            "name":"allocations", "operationName":"Allocations", "variables":{"indexer":"0xabc"},
+            "query":"query Unused { ignored { id } } query Allocations($indexer: String!) { page: allocations(where: {indexer: $indexer}) { ...Fields indexer { id } indexer { stakedTokens } } } fragment Fields on Allocation { address: id allocatedTokens }"
+        })).unwrap();
+        let selection = operation_selection(&operation).unwrap();
+        assert_eq!(
+            selection,
+            Selection::from_paths([
+                "page.address",
+                "page.allocatedTokens",
+                "page.indexer.id",
+                "page.indexer.stakedTokens"
+            ])
+        );
+        let reference = json!({"page":[{"address":"0xa","allocatedTokens":"12","indexer":{"id":"0xb","stakedTokens":"34"}}]});
+        let incomplete =
+            json!({"page":[{"address":"0xa","indexer":{"id":"0xb","stakedTokens":"34"}}]});
+        assert!(!compare(&selection, &reference, &incomplete).is_clean());
+    }
+
+    #[tokio::test]
+    async fn parity_http_uses_bearer_auth_and_refuses_missing_data() {
+        use axum::{routing::post as route_post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            route_post(
+                |headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                    assert_eq!(
+                        headers.get("authorization").unwrap(),
+                        "Bearer test-only-token"
+                    );
+                    assert_eq!(body["operationName"], "Probe");
+                    Json(json!({"extensions":{"request":"no-data"}}))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let operation: Operation = serde_json::from_value(json!({"name":"probe","operationName":"Probe","query":"query Probe { _meta { block { number } } }"})).unwrap();
+        let error = post(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            &operation,
+            Some("test-only-token"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "Graph response has no data object");
+        assert!(!error.contains("test-only-token"));
+        server.abort();
+    }
+
     fn sel(paths: &[&str]) -> Selection {
         Selection::from_paths(paths)
     }
@@ -644,6 +776,8 @@ mod tests {
             corpus: corpus.display().to_string(),
             reference: "http://127.0.0.1:1".into(),
             nest: "http://127.0.0.1:1".into(),
+            reference_token_env: None,
+            nest_token_env: None,
         })
         .await
         .expect_err("an empty corpus must not report success");
@@ -660,7 +794,7 @@ mod tests {
             &corpus,
             serde_json::to_string(&json!([{
                 "name": "aliased",
-                // Refused by the selection parser, so it is never even sent.
+                // Aliases now parse, but an unreachable endpoint still cannot pass.
                 "query": "{ pool { vol: volumeUSD } }"
             }]))
             .unwrap(),
@@ -670,6 +804,8 @@ mod tests {
             corpus: corpus.display().to_string(),
             reference: "http://127.0.0.1:1".into(),
             nest: "http://127.0.0.1:1".into(),
+            reference_token_env: None,
+            nest_token_env: None,
         })
         .await
         .expect_err("an operation that could not be compared must fail the run");
