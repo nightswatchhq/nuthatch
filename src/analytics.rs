@@ -1500,13 +1500,56 @@ fn decimal_safe_sql(conn: &Connection, sql: &str) -> Result<String, Died> {
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let inner = without_trailing_statement_terminator(sql);
     Ok(format!(
-        "SELECT {projection} FROM ({sql}) AS \"__nuthatch_decimal_source\""
+        "SELECT {projection} FROM ({inner}) AS \"__nuthatch_decimal_source\""
     ))
 }
 
 fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A public query may end with a statement terminator, but an inner derived-table query may not.
+/// `collect` is reached only after [`reject_statement_stacking`] has proved any top-level semicolon
+/// is terminal, so removing it and its trailing comment is safe. Semicolons in strings, quoted
+/// identifiers, or comments are not terminators and remain part of the query.
+fn without_trailing_statement_terminator(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut terminator = None;
+    let (mut in_single, mut in_double) = (false, false);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            b'\'' if !in_double => {
+                if in_single && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 1;
+                } else {
+                    in_single = !in_single;
+                }
+            }
+            b'"' if !in_single => in_double = !in_double,
+            b';' if !in_single && !in_double => terminator = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    terminator.map_or(sql, |i| &sql[..i])
 }
 
 /// The per-result Rust-side byte ceiling for the guarded `/sql` surface (64 MiB). Comfortably above any
@@ -3548,7 +3591,7 @@ mod tests {
         };
         let out = query_guarded(
             dir.path(),
-            "SELECT CAST('100000000000000000000000000000' AS DECIMAL(38,2)) AS amount",
+            "SELECT CAST('100000000000000000000000000000' AS DECIMAL(38,2)) AS amount; -- terminal",
             guard,
         )
         .unwrap();
