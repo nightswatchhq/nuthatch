@@ -11,6 +11,7 @@
 //! query can't blow the embedded-mode RAM budget.
 
 use anyhow::{bail, Context, Result};
+use duckdb::arrow::datatypes::DataType;
 use duckdb::types::{Value as DuckValue, ValueRef};
 use duckdb::{Config, Connection};
 use serde_json::{Map, Value};
@@ -1399,8 +1400,9 @@ enum Died {
 /// materialises every row. Row materialisation is Rust-side and escapes DuckDB's own memory limit,
 /// so the cap is what actually bounds a `SELECT *` result buffer.
 fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+    let sql = decimal_safe_sql(conn, sql)?;
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(&sql)
         .context("failed to prepare query")
         .map_err(Died::Binding)?;
     let mut rows = stmt
@@ -1446,6 +1448,108 @@ fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Valu
         }
     }
     Ok((out, false))
+}
+
+/// `duckdb-rs` currently materialises a scaled `DECIMAL(38, s)` through
+/// `rust_decimal::Decimal`. That type only holds 96 bits, while DuckDB's decimal holds 128, and its
+/// `from_i128_with_scale` constructor panics before we can render the cell. Detect those result
+/// columns after execution, then run an outer projection which asks DuckDB to format them as text.
+/// This preserves the established JSON contract for exact wide numbers and, importantly, turns an
+/// ordinary SQL result into an ordinary SQL result rather than a request-thread panic (#1433).
+fn decimal_safe_sql(conn: &Connection, sql: &str) -> Result<String, Died> {
+    let mut stmt = conn
+        .prepare(sql)
+        .context("failed to prepare query")
+        .map_err(Died::Binding)?;
+    let rows = stmt
+        .query([])
+        .context("query failed")
+        .map_err(Died::Executing)?;
+    let columns: Vec<(String, bool)> = {
+        let Some(statement) = rows.as_ref() else {
+            return Ok(sql.to_owned());
+        };
+        statement
+            .column_names()
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let scaled_decimal = matches!(
+                    statement.column_type(i),
+                    DataType::Decimal128(_, scale) if scale != 0
+                );
+                (name.to_string(), scaled_decimal)
+            })
+            .collect()
+    };
+    drop(rows);
+
+    if !columns.iter().any(|(_, scaled_decimal)| *scaled_decimal) {
+        return Ok(sql.to_owned());
+    }
+
+    let projection = columns
+        .iter()
+        .map(|(name, scaled_decimal)| {
+            let ident = quote_identifier(name);
+            if *scaled_decimal {
+                format!("CAST({ident} AS VARCHAR) AS {ident}")
+            } else {
+                ident
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let inner = without_trailing_statement_terminator(sql);
+    Ok(format!(
+        "SELECT {projection} FROM ({inner}) AS \"__nuthatch_decimal_source\""
+    ))
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A public query may end with a statement terminator, but an inner derived-table query may not.
+/// `collect` is reached only after [`reject_statement_stacking`] has proved any top-level semicolon
+/// is terminal, so removing it and its trailing comment is safe. Semicolons in strings, quoted
+/// identifiers, or comments are not terminators and remain part of the query.
+fn without_trailing_statement_terminator(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut terminator = None;
+    let (mut in_single, mut in_double) = (false, false);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            b'\'' if !in_double => {
+                if in_single && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 1;
+                } else {
+                    in_single = !in_single;
+                }
+            }
+            b'"' if !in_single => in_double = !in_double,
+            b';' if !in_single && !in_double => terminator = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    terminator.map_or(sql, |i| &sql[..i])
 }
 
 /// The per-result Rust-side byte ceiling for the guarded `/sql` surface (64 MiB). Comfortably above any
@@ -2296,7 +2400,7 @@ pub fn cold_velocity(
     let w = window.max(1);
     // window_start = (block // W) * W; sum outbound volume + count per (sender, window).
     let sql = format!(
-        "SELECT lower(\"{from_col}\") AS addr, (block_number / {w}) * {w} AS ws, \
+        "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
                 SUM(TRY_CAST(\"{value_col}\" AS HUGEINT))::VARCHAR AS vol, COUNT(*) AS cnt \
          FROM \"{table}\" GROUP BY addr, ws"
     );
@@ -3478,6 +3582,25 @@ mod tests {
         assert!(!out.truncated);
     }
 
+    #[test]
+    fn guarded_query_formats_wide_scaled_decimal_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 10,
+        };
+        let out = query_guarded(
+            dir.path(),
+            "SELECT CAST('100000000000000000000000000000' AS DECIMAL(38,2)) AS amount; -- terminal",
+            guard,
+        )
+        .unwrap();
+        assert_eq!(
+            out.rows[0]["amount"],
+            Value::String("100000000000000000000000000000.00".into())
+        );
+    }
+
     /// RFC-0009 step 6: a factory nest gets an auto-generated `{template}__children` view over the
     /// sealed factory events - the discovered children with provenance, de-duplicated to the earliest
     /// discovery per address. Answers "which pools, discovered when, by whom" in one query.
@@ -4476,6 +4599,19 @@ template="pool"
         assert_eq!(map["0xa"], big - 30); // received big, sent 30
         assert_eq!(map["0xb"], 30);
         assert!(!map.contains_key("nobody"));
+    }
+
+    #[test]
+    fn cold_velocity_seeds_sealed_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let entities = vec![
+            r#"{"table":"t__transfer","from":"0xa","to":"0xb","value":"5","block_number":15,"tx_hash":"0xt","log_index":0}"#.to_string(),
+            r#"{"table":"t__transfer","from":"0xa","to":"0xc","value":"7","block_number":19,"tx_hash":"0xu","log_index":0}"#.to_string(),
+        ];
+        crate::seal::seal_range(dir.path(), &entities, 15, 19).unwrap();
+
+        let rows = cold_velocity(dir.path(), "t__transfer", "from", "value", 10, 19).unwrap();
+        assert_eq!(rows, vec![("0xa\u{1f}10".to_string(), 12, 2)]);
     }
 
     /// RFC-0008 C1: labels imported as a content-addressed snapshot are visible to `/sql` as a
