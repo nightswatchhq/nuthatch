@@ -4,6 +4,23 @@
 behind the `folds` cargo feature, **off by default**, and a regular nuthatch user never sees it
 unless they opt in (§ Packaging). Tracking #1441. S0 is #1439; S1 to S4 are filed when S0 reports.
 
+> **S0 reported 2026-09-21: continue** (#1439, harness and results in
+> nightswatchhq/graph-network-nest#1). The Network nest's saved-clock, epoch and pause chain was run in
+> carry-and-window form over the sealed replay.
+>
+> - **Exactness:** it matched the one-shot views exactly at 24 blocks, and the reference matched the
+>   gateway at 123.6M and at head.
+> - **Cost at head:** 63.2 s and 10.7 GiB for the one-shot views; 0.14 s for the fold's own statements.
+>
+> Four measured corrections are folded into §5, §8 and §9 below:
+>
+> - invariance is checked just after each cut, not only at the end;
+> - windows are bounded by event volume;
+> - head cost is measured in process;
+> - large set carries need pruning.
+>
+> The recursive delegation ledger remains untested.
+
 **Date:** 2026-09-21
 
 **Author:** Pete (cargopete)
@@ -259,16 +276,25 @@ rows, not on Parquet bytes.
 
 **Rebuild.** A new `fold_hash` has no checkpoints. The runtime walks forward from genesis over the
 sealed segments one window at a time. This makes no RPC calls and never evaluates more than one window
-at once. It is the same code path backfill uses. How this interacts with `Manifest::data_identity()`,
+at once. It is the same code path backfill uses.
+
+**A window is bounded by event volume, not by block span** (S0). A dense 10M-block window peaked at
+591 MiB. The same span split at its midpoint peaked at 417 and 359 MiB, with identical carries. How this interacts with `Manifest::data_identity()`,
 so that a fold edit does not force re-ingestion, is confirmed in S1.
 
 **Retention.** Every checkpoint in the most recent `R_seals` seals is kept. Older history keeps one
 checkpoint every `retain_every_blocks`, and the rest are pruned. A historical read costs at most one
 retention interval of window. The default is an open question with a measurement behind it.
 
-The arithmetic says it must be chosen rather than defaulted to "keep all". This is an order-of-magnitude
-estimate, not a measurement: a carry of a few hundred thousand allocation rows is tens of MB of
-Parquet, and 10,285 of those is hundreds of GB.
+It must be chosen rather than defaulted to "keep all". S0 measured the Network chain's carries at head.
+
+- **Eight of the nine carries total under 40 KB.**
+- **The ninth, the set of every legacy allocation id, is 591,071 rows and 23.9 MB.** It exists only to
+  filter `HorizonRewardsAssigned` against legacy allocations.
+
+Kept at every seal, that one set alone would be hundreds of GB. So a large set carry is either narrowed
+to the members that can still matter (here, the legacy allocations that can still receive rewards) or
+stored as deltas against the previous checkpoint.
 
 **Verification.** `nuthatch check --folds` recomputes a checkpoint from its predecessor, which costs
 one window. `--from-genesis` walks the whole chain offline.
@@ -305,13 +331,22 @@ is for #1267 to decide. This RFC does not decide it.
 - **Differential, the core test.** For random `C < n` over a real corpus, a one-window evaluation from
   genesis to `n` must equal a walk to `C` followed by `step(C, (C, n])`, compared as multisets. When a
   view is ported, the fold is also diffed against the original one-shot view.
-- **Partition invariance.** Stepping from genesis to `n` in windows of random sizes yields the same
-  checkpoint at `n`. This is the test that catches a carry missing some state. The runtime can run it
-  on itself at checkpoint time, on a sample, by computing one window as two halves and comparing.
-  Whether it should is open question 4.
+- **Partition invariance, checked just after each cut.** Stepping from genesis in windows of random
+  sizes must give the same state as a regular partition. **It must be compared at the first event after
+  every cut, not only at the end.**
+
+  S0 learned this the hard way. Folds heal themselves: later events in a window overwrite an early
+  mistake. Two broken carries both left the end state identical to the correct run. Evaluated at the
+  first refresh event after each of 37 random cuts, one of them showed at 26 cuts. The other showed at
+  none, consistent with its carried value being redundant for every served field. That is the other
+  thing this check finds.
+
+  The runtime can run a sampled version on itself at checkpoint time, by computing one window as two
+  halves and comparing the first events after the split. Whether it should is open question 4.
 - **Reorg property.** Random reorg depths within the tail must converge to the one-shot fold over
   canonical facts, and must never modify a checkpoint file.
-- **Mutation.** Dropping a column from a carry must turn partition invariance red. Replacing the window
+- **Mutation.** Dropping a column from a carry must turn the post-cut invariance check red. If it
+  does not, the carry is either redundant or untested, and the RFC says which. Replacing the window
   binding with the full history must be caught by the scope test (S1). An absence test that stays green
   with the mechanism removed proves nothing, and each gate here is shown to fail first.
 - **Crash.** Kill the writer mid-checkpoint. On restart it must serve from the previous checkpoint and
@@ -333,12 +368,28 @@ Each slice's acceptance is written so it can fail.
 
   *Stop* if a fold cannot carry its state, or if head evaluation does not fit those targets. Either
   answer is worth having.
+
+  **Reported 2026-09-21: continue** (#1439, nightswatchhq/graph-network-nest#1).
+
+  | Criterion | Result |
+  |---|---|
+  | ≥20 blocks | 24 of 24 exact |
+  | ≥3 random partitions | Invariance holds on all three, at the end state and at 37 post-cut probe points |
+  | Dropping a carry turns the test red | Only once the test was moved to the post-cut probe points |
+  | Head evaluation targets | The fold's statements met them (0.135 to 0.146 s). A cold process did not (0.85 to 1.12 s and 252 to 313 MiB, of which 0.64 s and about 275 MiB is an empty window) |
+  | No step over 512 MiB | Met at 5M-block windows, not at 10M |
+
+  The recursive delegation ledger was not covered. It needs `nuthatch_mul_div`, which plain DuckDB
+  cannot reproduce, so it moves into S1.
 - **S1 - folds in the runtime.** Load `folds/`, bind carries and window-scoped facts, check the schema
   and volatility at load, declare keys, and read at `n` on demand from a checkpoint built by
   `nuthatch fold build`. *Accept when:*
   - a fold computing `count(*)` over a fact table returns the window's count, not history's;
   - a volatile fold is refused;
-  - a schema mismatch is refused.
+  - a schema mismatch is refused;
+  - head evaluation, measured **inside the running process**, meets S0's 500 ms and 256 MiB targets;
+  - the recursive delegation ledger passes the S0 differential and post-cut invariance, on nuthatch's
+    own connection with its real scalars.
 - **S2 - checkpoints from the seal loop.** Identity chain, atomic write, retention, restart and
   `check --folds`. *Accept when:*
   - a mid-write kill recovers;

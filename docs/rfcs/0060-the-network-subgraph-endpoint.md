@@ -369,6 +369,13 @@ Every slice's acceptance can fail. S1 is where the whole approach can be stopped
 - **S1 - the kill-or-continue slice.** RFC-0059 S0 on this nest's saved-clock, epoch and pause chain,
   on the ThinkPad corpus. In parallel, compile all 21 documents against the RFC-0053 surface and list
   what is missing. *Stop* if RFC-0059 S0 fails. The gateway proxy remains, and this RFC records why.
+
+  **The spike half reported 2026-09-21: continue** (#1439).
+  - The chain matched the one-shot views exactly at 24 blocks, and the reference matched the gateway.
+  - At head, the one-shot views take 63.2 s and 10.7 GiB for the two `graphNetwork` fields clients
+    read. The fold's own statements take 0.14 s.
+
+  Still open in this slice: compiling the 21 documents on the RFC-0053 surface.
 - **S2 - the runtime.** RFC-0059 S1 to S3.
 - **S3 - port the folds, in the order a failure costs money.** Each lands with its differential test:
   1. allocations, the saved clock and epochs (eligibility, and the agent's lifecycle);
