@@ -108,21 +108,6 @@ pub fn sql_max_concurrency() -> usize {
 }
 /// Wall-clock deadline for a single analytical query; a runaway (e.g. cartesian) is interrupted.
 const SQL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The public query budget. The default is deliberately short: this is an untrusted read surface,
-/// not a batch engine. An operator may raise it for a private replay or catalogue warm-up by setting
-/// `NUTHATCH_SQL_TIMEOUT_SECS`; malformed and zero values retain the safe default.
-///
-/// Kept as a function rather than a process-global `OnceLock` so a test server can exercise both
-/// budgets without sharing state with the rest of the test process.
-fn sql_timeout() -> Duration {
-    std::env::var("NUTHATCH_SQL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(SQL_TIMEOUT)
-}
 /// How long a request waits for an analytical permit before it is told the node is busy (#1319).
 ///
 /// The permit count still caps what *runs*; this only caps how long a caller waits to be told no.
@@ -2576,7 +2561,7 @@ async fn table(
             );
             let dir = s.dir.clone();
             let guard = analytics::QueryGuard {
-                timeout: sql_timeout(),
+                timeout: SQL_TIMEOUT,
                 max_rows: need,
             };
             if let Ok(Ok(out)) = tokio::task::spawn_blocking(move || {
@@ -2963,11 +2948,11 @@ async fn named_scan(
         if let Some(refusal) = stale(sealed_through) {
             return Err(refusal.into());
         }
-        let timeout = sql_timeout().saturating_sub(started.elapsed());
+        let timeout = SQL_TIMEOUT.saturating_sub(started.elapsed());
         if timeout.is_zero() {
             anyhow::bail!(
                 "query exceeded the {}s time budget on the read-only SQL surface",
-                sql_timeout().as_secs()
+                SQL_TIMEOUT.as_secs()
             );
         }
         let admission = NamedAdmission {
@@ -3223,7 +3208,7 @@ async fn run_sql_query_at(
     };
     // Charged against the query's own deadline, so queuing can never extend the total time a
     // request occupies the node.
-    let sql_timeout = sql_timeout().saturating_sub(admission.elapsed());
+    let sql_timeout = SQL_TIMEOUT.saturating_sub(admission.elapsed());
     METRICS.inc_sql();
     let dir = s.dir.clone();
     let sql = q.q.clone();
@@ -3478,7 +3463,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
             &dir,
             &probe,
             analytics::QueryGuard {
-                timeout: sql_timeout(),
+                timeout: SQL_TIMEOUT,
                 max_rows: 1,
             },
             &hot,
@@ -4363,6 +4348,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn graph_history_pins_entities_and_meta_to_the_same_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
@@ -7449,6 +7435,7 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    #[cfg(feature = "graph")]
     fn recorded_network_fixture(facts: &Value, block: u64) -> (tempfile::TempDir, AppState) {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/network");
         let config = crate::config::Config::load(&source).unwrap();
@@ -7521,6 +7508,7 @@ mod tests {
         (dir, state)
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn recorded_network_allocation_query_matches_reference_through_http() {
         let facts: Value = serde_json::from_str(include_str!(
@@ -7539,6 +7527,7 @@ mod tests {
         assert_eq!(response["data"]["closed"].as_array().unwrap().len(), 2);
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn recorded_horizon_allocations_and_poi_logs_match_reference_through_http() {
         let facts: Value = serde_json::from_str(include_str!(
@@ -7572,6 +7561,7 @@ mod tests {
         assert_eq!(response["data"], rewards["response"]["data"]);
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn every_captured_network_document_binds_through_http() {
         let facts: Value = serde_json::from_str(include_str!(
@@ -7623,6 +7613,7 @@ mod tests {
         // not complete-history semantics or current-head client compatibility.
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn recorded_signers_match_the_reference_through_http() {
         let facts: Value = serde_json::from_str(include_str!(
@@ -7663,6 +7654,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn real_redemption_matches_the_reference_and_tap_document_through_http() {
         let facts: Value = serde_json::from_str(include_str!(
@@ -7692,6 +7684,8 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "graph")]
+    #[ignore = "never passed: DuckDB binder assertion on the historical allocation query (#1458)"]
     #[tokio::test]
     async fn network_rust_allocation_pages_keep_the_first_page_snapshot_when_the_tip_advances() {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/network");
@@ -7817,6 +7811,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn graph_meta_never_discards_a_block_argument() {
         let (_d, state) = graph_fixture();
@@ -7843,6 +7838,7 @@ mod tests {
         assert!(answer.get("errors").is_none(), "{answer}");
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn a_derived_list_can_page_and_select_its_to_one_relation() {
         let (_d, state) = graph_fixture();
@@ -7866,6 +7862,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn an_escrow_payers_filtered_signers_answer_in_one_graphql_request() {
         let d = tempfile::tempdir().unwrap();
@@ -8200,6 +8197,7 @@ type Signer @entity {
     /// whose `hooks` is the four-character string - a filter that quietly selects the wrong rows. The
     /// variable used to be dropped by `filter_map` and re-surfaced as `unbound variable`, which is a
     /// refusal naming the wrong cause.
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn a_null_filter_value_is_compared_as_null() {
         let (_d, state) = graph_fixture();

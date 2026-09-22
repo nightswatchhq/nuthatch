@@ -89,7 +89,6 @@ pub mod recipes;
 pub mod reconcile;
 pub mod registry;
 pub mod rpc;
-mod rpc_budget;
 pub mod runtime;
 /// Cursor placement for scaled mode (RFC-0022 §2) - pure decision logic, no I/O.
 pub mod scheduler;

@@ -312,6 +312,7 @@ fn decimal_wire(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "graph")]
     use crate::store::Store;
 
     #[test]
@@ -348,6 +349,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "graph")]
     #[test]
     fn selectors_resolve_canonical_checkpoints_and_refuse_stale_or_unavailable_data() {
         let dir = tempfile::tempdir().unwrap();

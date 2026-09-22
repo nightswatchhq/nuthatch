@@ -1024,8 +1024,30 @@ rpc_urls = ["https://rpc.example"]
         cfg.nest.schema_version = 1;
         for call in &mut cfg.calls {
             call.canonical = false;
+            if let Some(first) = call.on_any.first().cloned() {
+                call.on = Some(first);
+                call.on_any.clear();
+            }
         }
         cfg.check_schema_version().unwrap();
+    }
+
+    /// An older reader ignores `on_any`, so its calls would never fire; v3 is what makes it refuse.
+    #[test]
+    fn on_any_triggers_need_schema_v3() {
+        let raw = include_str!("../examples/network/nuthatch.toml");
+        let mut cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.calls.iter().any(|call| !call.on_any.is_empty()));
+        for call in &mut cfg.calls {
+            call.canonical = false;
+        }
+        cfg.nest.schema_version = 2;
+        let error = cfg.check_schema_version().unwrap_err().to_string();
+        assert!(error.contains("`on_any`"), "{error}");
+        cfg.nest.schema_version = 3;
+        if cfg!(feature = "graph") {
+            cfg.check_schema_version().unwrap();
+        }
     }
 
     /// #687: `load` used to call `refuse_unwired_calls`. Claiming that it still does, after the

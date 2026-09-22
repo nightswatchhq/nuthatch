@@ -1979,10 +1979,11 @@ mod tests {
         ] {
             let roots = super::parse_named(document, &vars, None).unwrap();
             for root in roots.iter().filter(|r| r.name != "_meta") {
-                super::compile(&schema, root).unwrap_or_else(|e| panic!("{}: {e}", root.name));
+                super::compile_with(&schema, root, &super::Capabilities::NETWORK)
+                    .unwrap_or_else(|e| panic!("{}: {e}", root.name));
                 // Every captured client root must bind against the actual workbench.
                 // Compilation is necessary, but is not live-data parity evidence.
-                super::compile(&workbench, root)
+                super::compile_with(&workbench, root, &super::Capabilities::NETWORK)
                     .unwrap_or_else(|e| panic!("workbench {}: {e}", root.name));
             }
         }
@@ -2360,8 +2361,7 @@ type Swap @entity { id: ID! pool: Pool! }
         // here and not only over HTTP: a mutation dropping this passed because the only test that
         // could see it was in a different test function than the mutation runner's filter named.
         assert!(
-            c.sql
-                .contains(r#"ORDER BY c1."id" ASC LIMIT 100 OFFSET 0) t)"#),
+            c.sql.contains(r#"ORDER BY c1."id" ASC LIMIT 100) t)"#),
             "the child is ordered and paged inside the aggregate: {}",
             c.sql
         );
@@ -2448,15 +2448,20 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
 "#,
         )
         .unwrap();
-        let c = compile(
-            &nested_schema,
-            &one(
-                r#"{ accounts { payer { signers(first: 1, where: { id_gt: "0xaaa" }) { id } } } }"#,
-            ),
-        )
-        .expect("nested derived list lowers");
+        let nested = one(
+            r#"{ accounts { payer { signers(first: 1, where: { id_gt: "0xaaa" }) { id } } } }"#,
+        );
         assert!(
-            c.sql.contains(r#"FROM "signer" j0c0 WHERE j0c0."payer" = j0."id" AND j0c0."id" > '0xaaa' ORDER BY j0c0."id" ASC LIMIT 1 OFFSET 0"#),
+            matches!(
+                compile(&nested_schema, &nested),
+                Err(Unsupported::NestedSelection(_))
+            ),
+            "RFC-0053 as shipped refuses the nested list; only the network dialect lowers it"
+        );
+        let c = compile_with(&nested_schema, &nested, &Capabilities::NETWORK)
+            .expect("nested derived list lowers");
+        assert!(
+            c.sql.contains(r#"FROM "signer" j0c0 WHERE j0c0."payer" = j0."id" AND j0c0."id" > '0xaaa' ORDER BY j0c0."id" ASC LIMIT 1) t)"#),
             "the nested list keeps its relation, filter, ordering and limit: {}",
             c.sql
         );

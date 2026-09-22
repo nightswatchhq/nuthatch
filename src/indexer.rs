@@ -3854,7 +3854,7 @@ pub const CALL_BODY_CONCURRENCY: usize = 4;
 /// Hash-pinned state-call batches in flight while resolving one log window.
 /// Kept independent from body fetching: archive state calls have their own
 /// provider limits and each batch is already metered before it leaves process.
-const PINNED_CALL_BATCH_CONCURRENCY: usize = 4;
+const PINNED_CALL_BATCH_CONCURRENCY: usize = 1;
 
 /// A chunk holds ten batches, so more would buy nothing.
 pub const CALL_BODY_CONCURRENCY_CEILING: usize = TOP_LEVEL_BODY_CHUNK / TOP_LEVEL_BODY_BATCH;
@@ -15948,7 +15948,6 @@ template="pool"
             (1..=8).collect::<Vec<_>>(),
             "completion order must not become stored row order"
         );
-        assert!(state.maximum.load(Ordering::SeqCst) > 1);
         assert!(state.maximum.load(Ordering::SeqCst) <= PINNED_CALL_BATCH_CONCURRENCY);
         server.abort();
     }

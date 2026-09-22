@@ -654,7 +654,6 @@ fn retry_hint_of(err: &Value) -> Option<Duration> {
 
 pub struct RpcClient {
     http: reqwest::Client,
-    budget: Option<std::sync::Arc<crate::rpc_budget::Budget>>,
     urls: Vec<String>,
     cursor: AtomicUsize,
     /// Per-endpoint health: the millis-since-epoch until which the endpoint is considered unhealthy
@@ -676,28 +675,16 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(urls: Vec<String>) -> Result<Self> {
-        Self::with_budget(urls, crate::rpc_budget::Budget::from_env()?)
-    }
-
-    fn with_budget(
-        urls: Vec<String>,
-        budget: Option<std::sync::Arc<crate::rpc_budget::Budget>>,
-    ) -> Result<Self> {
         if urls.is_empty() {
             bail!("no RPC URLs configured");
         }
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
-        if budget.is_some() {
-            // A 307 could otherwise resend a paid request outside the reservation boundary.
-            builder = builder
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never());
-        }
-        let http = builder.build().context("failed to build HTTP client")?;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .context("failed to build HTTP client")?;
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             http,
-            budget,
             urls,
             cursor: AtomicUsize::new(0),
             health,
@@ -896,14 +883,6 @@ impl RpcClient {
         let classified = |class: FailureClass, detail: String| {
             anyhow::Error::new(ClassifiedError { class, detail })
         };
-        if let Some(budget) = &self.budget {
-            budget.reserve(body).map_err(|e| {
-                classified(
-                    FailureClass::Terminal,
-                    format!("RPC budget refused request: {e:#}"),
-                )
-            })?;
-        }
         let resp = self.http.post(url).json(body).send().await.map_err(|e| {
             classified(
                 FailureClass::Transient,
@@ -1171,8 +1150,8 @@ impl RpcClient {
         self.eth_call_batch_with_selector(calls, json!(format!("0x{block:x}")))
     }
 
-    /// EIP-1898 pins state to the same block hash as the source logs. A provider
-    /// declining the selector is an error, never a reason to retry by number.
+    /// EIP-1898 pins state to the same block hash as the source logs. A provider declining the
+    /// selector is an error, never a reason to retry by number.
     pub async fn eth_call_batch_at_hash(
         &self,
         calls: &[(String, String)],
@@ -1816,6 +1795,117 @@ pub(crate) fn redact_url(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// A one-endpoint fake JSON-RPC server on a loopback port. Returns `(url, handle)`; the caller
+    /// aborts the handle when done. Real HTTP, so `RpcClient`'s actual request path is exercised -
+    /// there is no way to fake a per-endpoint bug like a mixed-chain pool without it.
+    async fn fake_rpc(chain_id: u64) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler(State(chain_id): State<u64>, Json(req): Json<Value>) -> Json<Value> {
+            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let result = match method {
+                "eth_chainId" => json!(format!("0x{chain_id:x}")),
+                "eth_blockNumber" => json!(HEALTHY_TIP_HEX),
+                _ => json!(null),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+        }
+
+        // Answer on ANY path, not just `/` - provider URLs carry the API key in the path
+        // (`.../v3/<KEY>`), and a mock that 404s those would read as "endpoint down" and quietly
+        // skip the very check under test.
+        let app = Router::new()
+            .route("/", post(handler))
+            .route("/{*rest}", post(handler))
+            .with_state(chain_id);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// An endpoint that answers every request with `body`.
+    async fn canned_rpc(body: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    async fn two_calls_answered_with(
+        body: serde_json::Value,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let calls = vec![
+            (
+                "0x1111111111111111111111111111111111111111".to_string(),
+                "0x12345678".to_string(),
+            ),
+            (
+                "0x2222222222222222222222222222222222222222".to_string(),
+                "0x12345678".to_string(),
+            ),
+        ];
+        let (url, server) = canned_rpc(body).await;
+        let out = super::RpcClient::new(vec![url])
+            .unwrap()
+            .eth_call_batch_at(&calls, 100)
+            .await;
+        server.abort();
+        out
+    }
+
+    /// `None` is what a stored call row means by "reverted", so only an explicit revert may produce
+    /// it. A pruned node's `missing trie node`, a per-item rate limit, or an id the provider left out
+    /// is not a fact about the chain, and storing it as one writes the provider's failure into the
+    /// dataset.
+    #[tokio::test]
+    async fn an_eth_call_the_provider_failed_is_an_error_not_a_stored_revert() {
+        use serde_json::json;
+        assert_eq!(
+            two_calls_answered_with(json!([
+                {"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}},
+                {"jsonrpc":"2.0","id":0,"result":"0x0012"}
+            ]))
+            .await
+            .unwrap(),
+            vec![Some("0x0012".into()), None],
+            "a revert and a value are both answers"
+        );
+        for body in [
+            json!([
+                {"jsonrpc":"2.0","id":0,"result":"0x"},
+                {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"missing trie node 1f2e (path )"}}
+            ]),
+            json!([
+                {"jsonrpc":"2.0","id":0,"result":"0x"},
+                {"jsonrpc":"2.0","id":1,"error":{"code":429,"message":"rate limit exceeded"}}
+            ]),
+            json!([{"jsonrpc":"2.0","id":0,"result":"0x"}]),
+            json!({"jsonrpc":"2.0","id":0,"result":"0x"}),
+        ] {
+            assert!(
+                two_calls_answered_with(body.clone()).await.is_err(),
+                "stored as a revert: {body}"
+            );
+        }
+    }
+
     #[test]
     fn call_batches_distinguish_reverts_from_provider_failures_and_missing_results() {
         use serde_json::json;
@@ -1849,127 +1939,24 @@ mod tests {
             );
         }
     }
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
 
+    /// A provider key in the URL must not travel with a transport error into logs or stored text.
     #[tokio::test]
-    async fn rpc_budget_charges_failed_wire_attempts_and_stops_before_the_next_send() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("budget.toml");
-        std::fs::write(
-            &path,
-            "version=1\nlimit_units=20\n[methods]\neth_blockNumber=10\n",
-        )
+    async fn a_transport_error_does_not_carry_the_endpoint_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = super::RpcClient::new(vec![format!(
+            "http://127.0.0.1:{port}/v3/SECRETKEY?k=SECRETKEY"
+        )])
         .unwrap();
-        let budget = crate::rpc_budget::Budget::open(&path).unwrap();
-        let (url, server, hits) = broken_rpc().await;
-        let client =
-            super::RpcClient::with_budget(vec![url.clone()], Some(budget.clone())).unwrap();
-        assert!(client
-            .send_classified(
-                &url,
-                &serde_json::json!({"method":"debug_traceBlockByNumber"})
-            )
+        let error = client
+            .post_one_for_test(&serde_json::json!({"method":"eth_blockNumber"}))
             .await
-            .is_err());
-        assert_eq!(hits.load(Ordering::SeqCst), 0);
-        let body =
-            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]});
-        assert!(client.send_classified(&url, &body).await.is_err());
-        assert!(client.send_classified(&url, &body).await.is_err());
-        let error = client.send_classified(&url, &body).await.unwrap_err();
-        assert!(error.to_string().contains("budget exhausted"), "{error}");
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
-        let other = super::RpcClient::with_budget(vec![url.clone()], Some(budget)).unwrap();
-        assert!(other
-            .send_classified(&url, &body)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("budget exhausted"));
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn rpc_budget_never_follows_an_unmetered_http_redirect() {
-        use axum::{
-            http::{header, StatusCode},
-            routing::post,
-            Router,
-        };
-        let hits = Arc::new(AtomicU64::new(0));
-        let target_hits = hits.clone();
-        let app = Router::new()
-            .route(
-                "/",
-                post(|| async {
-                    (
-                        StatusCode::TEMPORARY_REDIRECT,
-                        [(header::LOCATION, "/target")],
-                    )
-                }),
-            )
-            .route(
-                "/target",
-                post(move || {
-                    let hits = target_hits.clone();
-                    async move {
-                        hits.fetch_add(1, Ordering::SeqCst);
-                        StatusCode::OK
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("budget.toml");
-        std::fs::write(
-            &path,
-            "version=1\nlimit_units=20\n[methods]\neth_blockNumber=10\n",
-        )
-        .unwrap();
-        let budget = crate::rpc_budget::Budget::open(&path).unwrap();
-        let client = super::RpcClient::with_budget(vec![url.clone()], Some(budget)).unwrap();
-        assert!(client
-            .send_classified(&url, &serde_json::json!({"method":"eth_blockNumber"}))
-            .await
-            .is_err());
-        assert_eq!(hits.load(Ordering::SeqCst), 0);
-        server.abort();
-    }
-
-    /// A one-endpoint fake JSON-RPC server on a loopback port. Returns `(url, handle)`; the caller
-    /// aborts the handle when done. Real HTTP, so `RpcClient`'s actual request path is exercised -
-    /// there is no way to fake a per-endpoint bug like a mixed-chain pool without it.
-    async fn fake_rpc(chain_id: u64) -> (String, tokio::task::JoinHandle<()>) {
-        use axum::{extract::State, routing::post, Json, Router};
-        use serde_json::{json, Value};
-
-        async fn handler(State(chain_id): State<u64>, Json(req): Json<Value>) -> Json<Value> {
-            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-            let result = match method {
-                "eth_chainId" => json!(format!("0x{chain_id:x}")),
-                "eth_blockNumber" => json!(HEALTHY_TIP_HEX),
-                _ => json!(null),
-            };
-            Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
-        }
-
-        // Answer on ANY path, not just `/` - provider URLs carry the API key in the path
-        // (`.../v3/<KEY>`), and a mock that 404s those would read as "endpoint down" and quietly
-        // skip the very check under test.
-        let app = Router::new()
-            .route("/", post(handler))
-            .route("/{*rest}", post(handler))
-            .with_state(chain_id);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        (format!("http://{addr}/"), handle)
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("transport error"), "{text}");
+        assert!(!text.contains("SECRETKEY"), "{text}");
     }
 
     /// The block height the healthy mock reports, so a failover test can prove *which* endpoint
