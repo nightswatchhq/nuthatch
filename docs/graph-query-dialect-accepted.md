@@ -20,7 +20,7 @@ Every refusal below names the thing refused, so a caller can act on it.
 | `pools { … }` | `SELECT … FROM "pool" ORDER BY "id" ASC LIMIT 100 OFFSET 0` |
 | `pool(id: "0x…") { … }` | the same with `WHERE "id" = '0x…' LIMIT 1`, answered as an object |
 | `pools(block: { number_gte: N }) { … }` | answered on the latest block when the nest's head has reached `N`, else graph-node's own refusal. Not time travel: *"the query will be executed on the latest block **only if** the subgraph has progressed to or past the minimum block number"* (`graph/src/schema/api.rs:1189`), which a nest satisfies exactly with no history stored |
-| `_meta { block { number } … }` | not compiled at all: answered from the nest's own head |
+| `_meta { block { number } … }` | not compiled at all: answered from the nest's own head. It takes the same `block: { number_gte: N }` precondition and refuses any other argument, rather than answering a named block with the head |
 
 ### Numeric ordering and comparison
 
@@ -268,4 +268,5 @@ after which the whole operation reads as garbage.
 an existing client's URL can be swapped host-for-host without rewriting the path.
 
 Queries run through `run_sql_query`, so they inherit the node's admission bounds and row cap rather
-than opening a second unmetered way into DuckDB.
+than opening a second unmetered way into DuckDB. An answer `/sql` would flag as truncated, degraded or
+missing its tip is refused here, because a GraphQL response has nowhere to carry the flag.
