@@ -1,0 +1,7 @@
+# Admission policy for the complete Arbitrum One Network Subgraph history.
+# This is read by the private nest first. Public Caddy routing remains a separate
+# acceptance decision after parity and capacity checks.
+version = 1
+first_block = 42440000
+max_head_age_seconds = 90
+max_block_distance = 60

@@ -1,0 +1,82 @@
+{
+  "block": 502165911,
+  "referenceDeployment": "QmatH4cd25ymsfCFpgKPRQQ7uCYNgarxanVQ9WCfg4Y7TZ",
+  "referenceQuery": "{ signers(block:{number:502165911},first:1000,orderBy:id,orderDirection:asc) { id payer { id } isAuthorized thawEndTimestamp } }",
+  "reference": {
+    "signers": [
+      {
+        "id": "0x02526499ae2879a94090267017c3816f733825bb",
+        "payer": {
+          "id": "0x02526499ae2879a94090267017c3816f733825bb"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "0"
+      },
+      {
+        "id": "0x0f05c7a4bfd4cc10cdb9c7dfe0f6084b433a6f64",
+        "payer": {
+          "id": "0x55a6e41e923566ada567d68e07a7415d0d5724c8"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "0"
+      },
+      {
+        "id": "0x15113132bc8dacbf42596e38664604bac02d3a62",
+        "payer": {
+          "id": "0xdd6a6f76eb36b873c1c184e8b9b9e762fe216490"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "0"
+      },
+      {
+        "id": "0x6164e7026756c8a5f6eb2414b8adef5e884e11d4",
+        "payer": {
+          "id": "0x89e7ad20521c351877b926d944a4fc3deb724ee0"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "0"
+      },
+      {
+        "id": "0x7d14ae5f20cc2f6421317386aa8e79e8728353d9",
+        "payer": {
+          "id": "0x7d14ae5f20cc2f6421317386aa8e79e8728353d9"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "1781024227"
+      },
+      {
+        "id": "0x88e8f78d8992206496d3561919b29420e9acf08b",
+        "payer": {
+          "id": "0xb70781305939a39e74aa918416df1b893e1bd904"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "0"
+      },
+      {
+        "id": "0xada0dec1f50dc4044ca84afacb74cbaf9a2c4853",
+        "payer": {
+          "id": "0x8eec11cf2ce7e2872c37f8dccfc071923183326e"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "0"
+      },
+      {
+        "id": "0xde85a56136fd3696a52e9d3f318b6a84ba464c13",
+        "payer": {
+          "id": "0xa59a262716a0d6ecd58e937f4992d38b83183713"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "0"
+      },
+      {
+        "id": "0xff4b7a5efd00ff2ec3518d4f250a27e4c29a2211",
+        "payer": {
+          "id": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467"
+        },
+        "isAuthorized": true,
+        "thawEndTimestamp": "0"
+      }
+    ]
+  },
+  "scope": "All nine signers at this historical checkpoint. Covers authorization and one thaw, not live-head state, cancellation, revocation or reauthorization."
+}

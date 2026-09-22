@@ -1,0 +1,44 @@
+{
+  "date": "2026-09-18",
+  "platform": "Linux x86_64",
+  "host": "ThinkPad",
+  "toolchain": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "baseCommit": "6e5aef0b",
+  "worktree": "uncommitted",
+  "sourceSha256": {
+    "src/analytics.rs": "12ae5919fd1832d658fe168016c1b6f5698bc2cd914a7e47468a8c67399badb8",
+    "src/serve.rs": "f6278be19b7e07861ef235824f4117a459188681172e592ebf429cf08bd7c2d8",
+    "tests/network_contract.rs": "d76d772cfeea71d9d2f1e9bc1cd2f0751fc8e7829eb6296d3b01453080c55c1a",
+    "examples/network/views/42-query-fee-distribution.sql": "f90247e5ecfa12e8d65fbc45cddf5dda0702d0ac7261179fd99bc88538e13f81",
+    "examples/network/views/47-indexer-state.sql": "68f745bf84aba74570f6fb7936be33602e0a1e04c319a837ed38ae5c6f3d267b"
+  },
+  "releaseBuild": {
+    "command": "cargo build --release --locked",
+    "passed": true
+  },
+  "networkFixtureSuite": {
+    "command": "cargo test --release --locked --test it network_contract -- --test-threads=2",
+    "passed": 17,
+    "failed": 0,
+    "ignored": 0,
+    "durationSeconds": 21.64
+  },
+  "capacityReplay": {
+    "test": "network_contract::capacity_uses_the_last_refresh_event_and_its_protocol_parameters",
+    "historicalStates": 12,
+    "perQueryTimeoutSeconds": 5,
+    "samples": 1,
+    "elapsedSeconds": 6.191532984143123,
+    "peakRssKiB": 98764,
+    "rssSource": "Python resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss, Linux KiB, one directly invoked release test binary",
+    "exitCode": 0
+  },
+  "paidRpcRequests": 0,
+  "productionServicesChanged": false,
+  "limitations": [
+    "Synthetic hot-store fixtures, not a full-history replay or a running chain cursor.",
+    "No concurrent-client capacity, production p50/p99, cold-store throughput or freshness claim.",
+    "The Linux source predates the subsequent unbounded dependency traversal fix and recorded signer HTTP test. Those later changes were tested locally, not by this binary.",
+    "The release build reused a cache from the previous verification directory; no running nest was replaced."
+  ]
+}

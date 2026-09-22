@@ -1,0 +1,80 @@
+{
+  "date": "2026-09-18",
+  "block": 43440000,
+  "deployment": "QmatH4cd25ymsfCFpgKPRQQ7uCYNgarxanVQ9WCfg4Y7TZ",
+  "query": "{ graphNetwork(id:\"1\", block:{number:43440000}) { channelDisputeEpochs curation curationPercentage currentEpoch currentL1BlockNumber delegationParametersCooldown delegationRatio delegationSlashingEnabled delegationTaxPercentage delegationUnbondingPeriod disputeManager epochCount epochLength epochManager gns graphToken id isPartialPaused isPaused lastLengthUpdateBlock lastLengthUpdateEpoch lastRunEpoch maxAllocationEpochs maxThawingPeriod minimumIndexerStake networkGRTIssuancePerBlock protocolFeePercentage rewardsManager staking thawingPeriod totalGRTBurned totalGRTMinted totalSupply totalTokensAllocated totalTokensStaked } epoches(first:1000, orderBy:id, block:{number:43440000}) { curatorQueryFees endBlock id queryFeeRebates queryFeesCollected signalledTokens stakeDeposited startBlock taxedQueryFees totalDelegatorRewards totalIndexerRewards totalQueryFees totalRewards } }",
+  "reference": {
+    "graphNetwork": {
+      "channelDisputeEpochs": 7,
+      "curation": "0x22d78fb4bc72e191c765807f8891b5e1785c8014",
+      "curationPercentage": 100000,
+      "currentEpoch": 3,
+      "currentL1BlockNumber": "16098512",
+      "delegationParametersCooldown": 0,
+      "delegationRatio": 16,
+      "delegationSlashingEnabled": false,
+      "delegationTaxPercentage": 5000,
+      "delegationUnbondingPeriod": 28,
+      "disputeManager": "0x0ab2b043138352413bb02e67e626a70320e3bd46",
+      "epochCount": 2,
+      "epochLength": 6646,
+      "epochManager": "0x5a843145c43d328b9bb7a4401d94918f131bb281",
+      "gns": "0xec9a7fb6cbc2e41926127929c2dce6e9c5d33bec",
+      "graphToken": "0x9623063377ad1b27544c965ccd7342f7ea7e88c7",
+      "id": "1",
+      "isPartialPaused": false,
+      "isPaused": false,
+      "lastLengthUpdateBlock": 16083151,
+      "lastLengthUpdateEpoch": 1,
+      "lastRunEpoch": 0,
+      "maxAllocationEpochs": 28,
+      "maxThawingPeriod": "0",
+      "minimumIndexerStake": "100000000000000000000000",
+      "networkGRTIssuancePerBlock": "0",
+      "protocolFeePercentage": 10000,
+      "rewardsManager": "0x971b9d3d0ae3eca029cab5ea1fb0f72c85e6a525",
+      "staking": "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03",
+      "thawingPeriod": 186092,
+      "totalGRTBurned": "0",
+      "totalGRTMinted": "105000000000000000000",
+      "totalSupply": "105000000000000000000",
+      "totalTokensAllocated": "0",
+      "totalTokensStaked": "0"
+    },
+    "epoches": [
+      {
+        "curatorQueryFees": "0",
+        "endBlock": 16089797,
+        "id": "1",
+        "queryFeeRebates": "0",
+        "queryFeesCollected": "0",
+        "signalledTokens": "0",
+        "stakeDeposited": "0",
+        "startBlock": 16083151,
+        "taxedQueryFees": "0",
+        "totalDelegatorRewards": "0",
+        "totalIndexerRewards": "0",
+        "totalQueryFees": "0",
+        "totalRewards": "0"
+      },
+      {
+        "curatorQueryFees": "0",
+        "endBlock": 16103089,
+        "id": "3",
+        "queryFeeRebates": "0",
+        "queryFeesCollected": "0",
+        "signalledTokens": "0",
+        "stakeDeposited": "0",
+        "startBlock": 16096443,
+        "taxedQueryFees": "0",
+        "totalDelegatorRewards": "0",
+        "totalIndexerRewards": "0",
+        "totalQueryFees": "0",
+        "totalRewards": "0"
+      }
+    ]
+  },
+  "limitations": [
+    "Early sparse historical checkpoint, not current-head parity or a complete indexer financial ledger."
+  ]
+}

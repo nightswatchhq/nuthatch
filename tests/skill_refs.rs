@@ -370,6 +370,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
 /// documenting it is the decision. It is checked for staleness below, so an entry that becomes
 /// documented fails rather than lingering.
 const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
+    // RFC-0060 §5.6 (#1438): the network facade stays invisible to a default build, which refuses these
+    // by name. They are documented with the network nest, not in the builder reference every nest reads.
+    ("CallDecl.on_any", "`graph` builds only (RFC-0060 §5.6): a default build refuses it by name"),
+    ("CallDecl.canonical", "`graph` builds only (RFC-0060 §5.6): a default build refuses it by name"),
     // `Config.extract` is documented now (RFC-0038 §5 added `top_level_calls`, which works on
     // ordinary RPC), so its excuse is gone. The node-gated fields below keep theirs.
     ("Extract.blocks", "field of `[extract]`; sourceable from ordinary RPC (RFC-0036) but not yet written up"),

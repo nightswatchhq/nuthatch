@@ -152,6 +152,9 @@ postgres-store = ["dep:postgres"]
 # RFC-0046 S2: an operator's optional x402 counter. It is deliberately not part of the default
 # binary: an unconfigured self-hoster remains entirely unpriced (#1217).
 counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
+# RFC-0060 §5.6: the Graph network facade. Off by default: a default build never shows it and
+# refuses a nest that needs it.
+graph = []
 
 [dev-dependencies]
 proptest = "1"

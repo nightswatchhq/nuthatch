@@ -1147,17 +1147,47 @@ impl RpcClient {
         calls: &'a [(String, String)],
         block: u64,
     ) -> CallBatchFuture<'a> {
+        self.eth_call_batch_with_selector(calls, json!(format!("0x{block:x}")))
+    }
+
+    /// EIP-1898 pins state to the same block hash as the source logs. A provider declining the
+    /// selector is an error, never a reason to retry by number.
+    pub async fn eth_call_batch_at_hash(
+        &self,
+        calls: &[(String, String)],
+        hash: &str,
+    ) -> Result<Vec<Option<String>>> {
+        if hash.len() != 66
+            || !hash.starts_with("0x")
+            || !hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            bail!("canonical eth_call requires a 32-byte block hash");
+        }
+        self.eth_call_batch_with_selector(
+            calls,
+            json!({"blockHash":hash.to_ascii_lowercase(),"requireCanonical":true}),
+        )
+        .await
+    }
+
+    fn eth_call_batch_with_selector<'a>(
+        &'a self,
+        calls: &'a [(String, String)],
+        selector: Value,
+    ) -> CallBatchFuture<'a> {
         Box::pin(async move {
             if calls.is_empty() {
                 return Ok(Vec::new());
             }
-            match self.eth_call_batch_once(calls, block).await {
+            match self.eth_call_batch_once(calls, &selector).await {
                 Ok(v) => Ok(v),
                 Err(e) if calls.len() > 1 && crate::chunker::is_result_too_large(&e) => {
                     let mid = calls.len() / 2;
                     let (a, b) = calls.split_at(mid);
-                    let mut out = self.eth_call_batch_at(a, block).await?;
-                    out.extend(self.eth_call_batch_at(b, block).await?);
+                    let mut out = self
+                        .eth_call_batch_with_selector(a, selector.clone())
+                        .await?;
+                    out.extend(self.eth_call_batch_with_selector(b, selector).await?);
                     Ok(out)
                 }
                 Err(e) => Err(e),
@@ -1168,14 +1198,14 @@ impl RpcClient {
     async fn eth_call_batch_once(
         &self,
         calls: &[(String, String)],
-        block: u64,
+        selector: &Value,
     ) -> Result<Vec<Option<String>>> {
         let batch: Vec<Value> = calls
             .iter()
             .enumerate()
             .map(|(i, (to, data))| {
                 json!({ "jsonrpc": "2.0", "id": i, "method": "eth_call",
-                        "params": [{ "to": to, "data": data }, format!("0x{block:x}")] })
+                        "params": [{ "to": to, "data": data }, selector] })
             })
             .collect();
         let resp = self.post_with_failover(&Value::Array(batch)).await?;

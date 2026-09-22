@@ -1,0 +1,49 @@
+{
+  "date": "2026-09-18",
+  "platform": "Linux x86_64",
+  "host": "ThinkPad",
+  "baselineBinarySha256": "c43660423c44529d929e55cfa80d3bf5d29583714170987b0a4525d1c07a3eb7",
+  "sharedHeadersBinarySha256": "a972d0e5a1a1fdce3ea5663bdd0ee9cbd30471f06aece433f6e4f1279e2d01e8",
+  "configSha256": "d0e84eccee9aec728628b7de2107ac1384fc922eb56bb3c8104ac2b0a651f02c",
+  "samples": [
+    {
+      "fromBlock": 505990000,
+      "toBlock": 506000000,
+      "rows": 453,
+      "callRows": 34,
+      "baselineUnits": 2764,
+      "sharedHeadersUnits": 2104,
+      "ledgerBefore": 15428,
+      "ledgerAfter": 17532,
+      "baselineSeconds": 7.78,
+      "sharedHeadersSeconds": 5.36,
+      "peakRssMB": 30,
+      "segmentsIncludingManifestByteIdentical": true,
+      "manifestSha256": "636377660b418caa6e1778bc5768544fb7df23f5f3e78e27decac5d4e05a280a"
+    },
+    {
+      "fromBlock": 149990000,
+      "toBlock": 150000000,
+      "rows": 531,
+      "callRows": 184,
+      "baselineUnits": 12664,
+      "sharedHeadersUnits": 9004,
+      "ledgerBefore": 17532,
+      "ledgerAfter": 26536,
+      "baselineSeconds": 26.14,
+      "sharedHeadersSeconds": 20.52,
+      "peakRssMB": 32,
+      "segmentsIncludingManifestByteIdentical": true,
+      "manifestSha256": "60d011cae944e6c2871d7c2a7eec5b339c00190f55e859e208ce7c39b38d7d38"
+    }
+  ],
+  "comparison": "diff -rq of each retained segments directory, including manifest.json; both exited 0",
+  "limitations": [
+    "One sample per interval and binary; timing is not a controlled throughput benchmark.",
+    "Neither interval has complete history or proves cumulative entity balances, current-head freshness, or public serving capacity.",
+    "Reservations cover both source and state RPC pools, including unsuccessful requests; they are conservative compute units, not an invoice.",
+    "The durable 39980000-unit ledger remains unchanged and must not be reset.",
+    "The Linux binary predates only the subsequent extra cached-header mismatch test and documentation edits, not production code changes."
+  ],
+  "productionServicesChanged": false
+}

@@ -1,0 +1,4 @@
+[
+  {"type":"event","name":"WithdrawalInitiated","anonymous":false,"inputs":[{"name":"l1Token","type":"address","indexed":false},{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"l2ToL1Id","type":"uint256","indexed":true},{"name":"exitNum","type":"uint256","indexed":false},{"name":"amount","type":"uint256","indexed":false}]},
+  {"type":"event","name":"DepositFinalized","anonymous":false,"inputs":[{"name":"l1Token","type":"address","indexed":true},{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"amount","type":"uint256","indexed":false}]}
+]
