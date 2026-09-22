@@ -86,7 +86,7 @@ fn derived_provenance_is_handed_its_watermark() {
         .1;
     let head = &sig[..sig.find(") -> Value").unwrap_or(sig.len().min(400))];
     assert!(
-        head.contains("applied_through: u64"),
+        head.contains("applied: &crate::entity_view::Applied"),
         "derived_provenance must be *given* the watermark captured with the rows, not read one \
          (#932). Signature was:\nfn derived_provenance({head})"
     );
