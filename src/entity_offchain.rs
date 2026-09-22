@@ -92,6 +92,7 @@ pub struct Snapshot {
     pub hash: String,
     path: PathBuf,
     schema: SchemaRef,
+    rows: u64,
 }
 
 /// An offchain table as the entity binder sees it: its present snapshots, in manifest order.
@@ -170,6 +171,11 @@ impl Table {
 }
 
 impl Snapshot {
+    /// From the Parquet footer, so a feed can be bounded before any row is read.
+    pub fn row_count(&self) -> u64 {
+        self.rows
+    }
+
     /// This snapshot's rows as entity rows of `columns`, in order.
     ///
     /// The bytes are checked against the content hash first. An entity reports the hashes it has
@@ -275,14 +281,13 @@ impl Tables {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
         };
-        let schema = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("reading the schema of {}", path.display()))?
-            .schema()
-            .clone();
+        let footer = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading the schema of {}", path.display()))?;
         Ok(Some(Snapshot {
             hash: s.hash.clone(),
+            schema: footer.schema().clone(),
+            rows: u64::try_from(footer.metadata().file_metadata().num_rows()).unwrap_or(u64::MAX),
             path,
-            schema,
         }))
     }
 

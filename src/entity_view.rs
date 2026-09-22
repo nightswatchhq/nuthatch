@@ -71,8 +71,15 @@ enum Msg {
     /// A rebuild, folded into a pending circuit and relation beside the live ones so readers keep
     /// the old, correctly labelled state until `Rebuild::Commit` swaps the new one in under one lock.
     Rebuild(Rebuild),
+    /// A bound refused on the caller's side: the fault is already recorded, and the circuit stops
+    /// so its state is released.
+    Stop,
     Flush(SyncSender<()>),
 }
+
+/// The offchain rows one entity may hold per table (#1437). A join keeps its whole offchain input in
+/// its trace, so this bounds resident memory within the per-cursor budget, not only one batch.
+pub const OFFCHAIN_ROWS_PER_TABLE: u64 = 1_000_000;
 
 const REBUILD_ORDER: &str =
     "a rebuild message arrived with no rebuild in progress; the ingest path fed it out of order";
@@ -199,6 +206,8 @@ pub struct EntityView {
     /// Per offchain table, the snapshots sent to the circuit (#1437). Sent, not folded: the next
     /// refresh compares the manifest against this, so no snapshot is ever fed twice.
     fed: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
+    /// Per offchain table, the rows sent, against [`OFFCHAIN_ROWS_PER_TABLE`].
+    held: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 impl EntityView {
@@ -404,6 +413,7 @@ impl EntityView {
                         }
                         // Messages are processed in order, so by the time the barrier is seen every
                         // prior batch is folded - the ack unblocks the waiter.
+                        Msg::Stop => break,
                         Msg::Flush(ack) => {
                             if let Some(through) = pending.take() {
                                 stamp(through, &mut shared.write().unwrap());
@@ -424,6 +434,7 @@ impl EntityView {
             unavailable,
             fault,
             fed: Default::default(),
+            held: Default::default(),
         })
     }
 
@@ -582,6 +593,9 @@ impl EntityView {
         if self.unavailable.is_some() {
             return Ok(());
         }
+        let Some(rows) = self.admit_offchain(table, snapshots) else {
+            return Ok(());
+        };
         let batch = self.offchain_batch(table, snapshots)?;
         let _ = self.tx.send(Msg::Offchain(
             Box::new(batch),
@@ -592,13 +606,35 @@ impl EntityView {
             .lock()
             .unwrap()
             .insert(table.to_string(), version.to_vec());
+        self.held.lock().unwrap().insert(table.to_string(), rows);
         Ok(())
+    }
+
+    /// The rows `table` holds once `snapshots` are sent, or `None` when that is over
+    /// [`OFFCHAIN_ROWS_PER_TABLE`]. Then this entity alone faults, before any row is read.
+    fn admit_offchain(&self, table: &str, snapshots: &[Snapshot]) -> Option<u64> {
+        let held = self.held.lock().unwrap().get(table).copied().unwrap_or(0);
+        let rows = snapshots
+            .iter()
+            .map(Snapshot::row_count)
+            .fold(held, u64::saturating_add);
+        if rows <= OFFCHAIN_ROWS_PER_TABLE {
+            return Some(rows);
+        }
+        *self.fault.write().unwrap() = Some(format!(
+            "offchain__{table} would hold {rows} rows in entity `{}`, over the \
+             {OFFCHAIN_ROWS_PER_TABLE} one entity may hold from an offchain table",
+            self.name
+        ));
+        let _ = self.tx.send(Msg::Stop);
+        None
     }
 
     /// Start rebuilding off to one side (#1437). Until [`Self::rebuild_commit`], readers keep the
     /// current relation and the version that labels it; the cost is holding both while it runs.
     pub fn rebuild_begin(&self) {
         self.fed.lock().unwrap().clear();
+        self.held.lock().unwrap().clear();
         let _ = self.tx.send(Msg::Rebuild(Rebuild::Begin));
     }
 
@@ -623,6 +659,9 @@ impl EntityView {
         snapshots: &[Snapshot],
         version: &[String],
     ) -> Result<()> {
+        let Some(rows) = self.admit_offchain(table, snapshots) else {
+            return Ok(());
+        };
         let batch = self.offchain_batch(table, snapshots)?;
         let _ = self.tx.send(Msg::Rebuild(Rebuild::Offchain(
             Box::new(batch),
@@ -633,6 +672,7 @@ impl EntityView {
             .lock()
             .unwrap()
             .insert(table.to_string(), version.to_vec());
+        self.held.lock().unwrap().insert(table.to_string(), rows);
         Ok(())
     }
 

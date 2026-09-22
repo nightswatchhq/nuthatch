@@ -1648,7 +1648,9 @@ fn refresh_offchain(
     use crate::entity_offchain::{advance, Advance, Tables};
     let reading: Vec<&EntityView> = entities
         .iter()
-        .filter(|e| e.unavailable().is_none() && !e.offchain_tables().is_empty())
+        .filter(|e| {
+            e.unavailable().is_none() && e.fault().is_none() && !e.offchain_tables().is_empty()
+        })
         .collect();
     if reading.is_empty() {
         return Ok(());
@@ -1680,7 +1682,14 @@ fn refresh_offchain(
                 )?);
             }
             let rows = hot.as_deref().unwrap_or_default();
-            rebuild_entity(dir, &schema, rows, &tables, entity, through)?;
+            // An entity that faults while rebuilding reports it as its own fault. Failing the window
+            // would stall every table on the chain behind one entity.
+            if let Err(e) = rebuild_entity(dir, &schema, rows, &tables, entity, through) {
+                if entity.fault().is_none() {
+                    return Err(e);
+                }
+                tracing::error!("entity `{}`: {e:#}", entity.name());
+            }
             continue;
         }
         for (table, snapshots, version) in appends {
@@ -18015,6 +18024,152 @@ rpc_urls = ["https://rpc.example"]
             (11, 1)
         );
         assert!(entity.is_healthy());
+    }
+
+    const BY_TIER_AND_TOTALS: &str = "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
+         sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+         JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier'\n\
+         [[entities]]\nname='totals'\nkey=['to']\nmax_rows=100\n\
+         sql='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n";
+
+    fn drop_tiers(dir: &std::path::Path, name: &str, account: &str, tier: &str) {
+        let csv = dir.join(format!("{name}.csv"));
+        std::fs::write(&csv, format!("account,tier\n{account},{tier}\n")).unwrap();
+        crate::offchain::drop_file(dir, &csv, "tiers").unwrap();
+    }
+
+    /// A tiers snapshot of `rows` identical rows, written as Parquet so a large one is quick.
+    fn drop_big_tiers(dir: &std::path::Path, rows: usize) {
+        use arrow::array::{RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("account", DataType::Utf8, false),
+            Field::new("tier", DataType::Utf8, false),
+        ]));
+        let column =
+            |v: &str| Arc::new(StringArray::from_iter_values(std::iter::repeat_n(v, rows)));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                column("0x3333333333333333333333333333333333333333"),
+                column("bronze"),
+            ],
+        )
+        .unwrap();
+        let path = dir.join("big.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        crate::offchain::drop_file(dir, &path, "tiers").unwrap();
+    }
+
+    fn view<'a>(views: &'a [EntityView], name: &str) -> &'a EntityView {
+        views.iter().find(|v| v.name() == name).unwrap()
+    }
+
+    /// #1437: a warm entity is unavailable until seeded, and its seed takes every present snapshot,
+    /// so after a restart it answers as a cold start would.
+    #[test]
+    fn a_warm_entity_takes_its_offchain_snapshots_in_its_seed() {
+        use crate::entity_row::{Row, Scalar};
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(dir.path(), "first", BOB, "gold");
+        std::fs::write(dir.path().join("entities.toml"), BY_TIER_AND_TOTALS).unwrap();
+        let stored = vec![(
+            Store::entity_key(10, 0),
+            transfer_row(10, 0, ALICE, Some(BOB), "100"),
+        )];
+        store.commit_window(&stored, Some((11, "aa")), 11).unwrap();
+
+        let mut views = start_entities(dir.path(), &registry, true).unwrap();
+        assert!(view(&views, "by_tier").unavailable().is_some());
+        seed_entities(dir.path(), &store, &registry, &mut views, 11).unwrap();
+        let entity = view(&views, "by_tier");
+        assert!(entity.unavailable().is_none());
+        assert_eq!(
+            entity
+                .relation()
+                .get(&Row(vec![Scalar::Str("gold".into())]))
+                .cloned(),
+            Some(Row(vec![Scalar::Int(100)])),
+            "the seed must apply bob's tier"
+        );
+        let (_, applied) = entity.len_and_watermark();
+        assert_eq!(
+            (applied.through, applied.offchain["tiers"].snapshots),
+            (11, 1)
+        );
+    }
+
+    /// An offchain table larger than one entity may hold faults that entity alone, before a row of
+    /// it is read. The window succeeds and the chain-only entity beside it carries on.
+    #[test]
+    fn an_offchain_append_over_the_bound_faults_only_its_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(
+            dir.path(),
+            "first",
+            "0x2222222222222222222222222222222222222222",
+            "gold",
+        );
+        std::fs::write(dir.path().join("entities.toml"), BY_TIER_AND_TOTALS).unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+        assert!(view(&views, "by_tier").fault().is_none());
+
+        let limit = crate::entity_view::OFFCHAIN_ROWS_PER_TABLE;
+        drop_big_tiers(dir.path(), limit as usize);
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+        let fault = view(&views, "by_tier").fault().expect("by_tier must fault");
+        assert!(fault.contains("offchain__tiers"), "{fault}");
+        assert!(fault.contains(&(limit + 1).to_string()), "{fault}");
+        assert!(view(&views, "totals").fault().is_none());
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+    }
+
+    /// The same bound met while rebuilding. A faulted rebuild is the entity's, not the window's:
+    /// failing the window would stall every table on the chain behind one entity.
+    #[test]
+    fn an_offchain_rebuild_over_the_bound_faults_only_its_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(
+            dir.path(),
+            "first",
+            "0x2222222222222222222222222222222222222222",
+            "gold",
+        );
+        drop_tiers(
+            dir.path(),
+            "second",
+            "0x1111111111111111111111111111111111111111",
+            "silver",
+        );
+        std::fs::write(dir.path().join("entities.toml"), BY_TIER_AND_TOTALS).unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+
+        let catalogue = crate::offchain::load(dir.path()).unwrap();
+        std::fs::remove_file(crate::offchain::segment_path(
+            dir.path(),
+            &catalogue.tables["tiers"][0],
+        ))
+        .unwrap();
+        drop_big_tiers(
+            dir.path(),
+            crate::entity_view::OFFCHAIN_ROWS_PER_TABLE as usize,
+        );
+        refresh_offchain(dir.path(), &store, &registry, &views, 11)
+            .expect("an entity's fault must not fail the window");
+        let fault = view(&views, "by_tier").fault().expect("by_tier must fault");
+        assert!(fault.contains("offchain__tiers"), "{fault}");
+        assert!(view(&views, "totals").fault().is_none());
     }
 
     /// A `LabelSet` containing `pairs`, built the only way one can be: written to disk and loaded.
