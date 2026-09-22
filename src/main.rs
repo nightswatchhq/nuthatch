@@ -163,6 +163,25 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&args.file),
                 &args.table,
             ),
+            cli::OffchainWhat::Pull(args) => {
+                let cli::PullFormat::Json = args.format;
+                let opts = offchain::PullOptions {
+                    max_bytes: args.max_bytes,
+                    timeout: std::time::Duration::from_secs(args.timeout_secs),
+                    attempts: args.attempts,
+                    headers: offchain::resolve_header_env(&args.header_env)?,
+                    allow_loopback_http: args.allow_loopback_http,
+                    stale_after_secs: args.stale_after_secs,
+                    ..Default::default()
+                };
+                offchain::pull_json(
+                    std::path::Path::new(&args.dir),
+                    &args.source,
+                    &args.table,
+                    &opts,
+                )
+                .await
+            }
         },
         cli::Command::Publish(args) => match args.what {
             cli::PublishWhat::Sync(a) => {
