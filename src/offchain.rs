@@ -36,6 +36,10 @@ pub fn catalogue_path(dir: &Path) -> PathBuf {
     dir.join(DIR).join(MANIFEST)
 }
 
+pub fn segment_path(dir: &Path, snapshot: &Snapshot) -> PathBuf {
+    dir.join(DIR).join(SEGMENTS).join(&snapshot.file)
+}
+
 pub fn load(dir: &Path) -> Result<Catalogue> {
     let path = catalogue_path(dir);
     match std::fs::read_to_string(&path) {

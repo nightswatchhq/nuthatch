@@ -1,0 +1,635 @@
+//! RFC-0041 × RFC-0045: an offchain snapshot table as an entity input (#1437).
+//!
+//! A chain source is bound from the decode registry and fed decoded windows. An offchain source is
+//! bound from its retained snapshots' own Parquet schemas and fed whole snapshots, append-only: no
+//! block height, no reorg, no retraction. Its rows are the rows `offchain__<table>` answers with on
+//! `/sql`, which is `read_parquet(<present snapshots>, union_by_name=true)`, so a column one snapshot
+//! lacks reads NULL for that snapshot's rows here as well.
+
+use crate::entity_row::{Row, Scalar};
+use anyhow::{anyhow, bail, Context, Result};
+use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::datatypes::{
+    DataType, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef, UInt16Type, UInt32Type,
+    UInt64Type, UInt8Type,
+};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+
+pub use crate::registry::OFFCHAIN_NAMESPACE;
+
+/// The offchain table an entity source names, if it names one.
+///
+/// Case-insensitive, as DuckDB resolves it; the table after the prefix is matched exactly, as a
+/// decoded table is.
+pub fn table_of(source: &str) -> Option<&str> {
+    // `get`, not indexing: a quoted identifier may put a multibyte character across the boundary.
+    let head = source.get(..OFFCHAIN_NAMESPACE.len())?;
+    let table = &source[OFFCHAIN_NAMESPACE.len()..];
+    (head.eq_ignore_ascii_case(OFFCHAIN_NAMESPACE) && !table.is_empty()).then_some(table)
+}
+
+/// What an offchain column's values become in an entity. §3.3 has no float, and there is no
+/// decimal scalar yet, so a feed carrying either is refused at load rather than rounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Str,
+    Int,
+    Bool,
+}
+
+impl Kind {
+    fn of(ty: &DataType) -> std::result::Result<Kind, &'static str> {
+        Ok(match ty {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Kind::Str,
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => Kind::Int,
+            DataType::Boolean => Kind::Bool,
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                return Err(
+                    "floating point is not exact (RFC-0041 §3.3); publish a scaled \
+                            integer such as price_e8, or text and CAST it",
+                )
+            }
+            DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..) => {
+                return Err(
+                    "entities have no decimal type yet; publish a scaled integer such \
+                            as price_e8",
+                )
+            }
+            _ => return Err("an entity reads text, integer and boolean columns only"),
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Str => "text",
+            Kind::Int => "integer",
+            Kind::Bool => "boolean",
+        }
+    }
+}
+
+/// One column an entity reads from an offchain table, and the kind every snapshot carrying it has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Column {
+    pub name: String,
+    pub kind: Kind,
+}
+
+/// One retained snapshot whose segment is present.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub hash: String,
+    path: PathBuf,
+    schema: SchemaRef,
+}
+
+/// An offchain table as the entity binder sees it: its present snapshots, in manifest order.
+#[derive(Clone, Debug)]
+pub struct Table {
+    snapshots: Vec<Snapshot>,
+}
+
+impl Table {
+    /// The content hashes of the snapshots that make up this table, in the order they were
+    /// appended. This is the table's version, which an entity reports as what it has applied.
+    pub fn version(&self) -> Vec<String> {
+        self.snapshots.iter().map(|s| s.hash.clone()).collect()
+    }
+
+    pub fn snapshots(&self) -> &[Snapshot] {
+        &self.snapshots
+    }
+
+    /// Every column any snapshot carries, in first-appearance order.
+    fn column_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for s in &self.snapshots {
+            for f in s.schema.fields() {
+                if !names.contains(f.name()) {
+                    names.push(f.name().clone());
+                }
+            }
+        }
+        names
+    }
+
+    /// Resolve the columns an entity reads, or refuse at load.
+    pub fn bind(&self, source: &str, columns: &[String]) -> Result<Vec<Column>> {
+        columns
+            .iter()
+            .map(|name| {
+                let mut kind: Option<(Kind, &str)> = None;
+                for s in &self.snapshots {
+                    let Ok(field) = s.schema.field_with_name(name) else {
+                        continue;
+                    };
+                    let k = Kind::of(field.data_type()).map_err(|why| {
+                        anyhow!(
+                            "{source}.{name} is {} in snapshot {}: {why}",
+                            field.data_type(),
+                            short(&s.hash)
+                        )
+                    })?;
+                    match kind {
+                        None => kind = Some((k, &s.hash)),
+                        Some((seen, at)) if seen != k => bail!(
+                            "{source}.{name} is {} in snapshot {} and {} in snapshot {}. An entity \
+                             reads one type per column",
+                            seen.name(),
+                            short(at),
+                            k.name(),
+                            short(&s.hash)
+                        ),
+                        Some(_) => {}
+                    }
+                }
+                let (kind, _) = kind.ok_or_else(|| {
+                    anyhow!(
+                        "no column {name} in {source}. Its columns are: {}",
+                        self.column_names().join(", ")
+                    )
+                })?;
+                Ok(Column {
+                    name: name.clone(),
+                    kind,
+                })
+            })
+            .collect()
+    }
+}
+
+impl Snapshot {
+    /// This snapshot's rows as entity rows of `columns`, in order.
+    ///
+    /// The bytes are checked against the content hash first. An entity reports the hashes it has
+    /// applied, and that claim is only true if these are the bytes the hash names.
+    pub fn rows(&self, columns: &[Column]) -> Result<Vec<Row>> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let bytes = std::fs::read(&self.path)
+            .with_context(|| format!("reading offchain snapshot {}", self.path.display()))?;
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != self.hash {
+            bail!(
+                "offchain snapshot {} hashes to {}, not the {} its manifest records",
+                self.path.display(),
+                short(&actual),
+                short(&self.hash)
+            );
+        }
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .and_then(|b| b.build())
+            .with_context(|| format!("reading offchain snapshot {}", self.path.display()))?;
+        let mut out = Vec::new();
+        for batch in reader {
+            out.extend(batch_rows(&batch?, columns)?);
+        }
+        Ok(out)
+    }
+}
+
+/// The nest's offchain catalogue, with snapshot schemas read only for the tables asked about.
+pub struct Tables {
+    dir: PathBuf,
+    catalogue: crate::offchain::Catalogue,
+}
+
+impl Tables {
+    /// No offchain tables, for a caller that binds chain sources only.
+    pub fn none() -> Self {
+        Self {
+            dir: PathBuf::new(),
+            catalogue: Default::default(),
+        }
+    }
+
+    pub fn load(dir: &Path) -> Result<Self> {
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            catalogue: crate::offchain::load(dir)?,
+        })
+    }
+
+    /// `table` as the `/sql` view defines it, or `None` when that view would not exist: no such
+    /// table, or none of its snapshots present.
+    pub fn table(&self, table: &str) -> Result<Option<Table>> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let Some(retained) = self.catalogue.tables.get(table) else {
+            return Ok(None);
+        };
+        let mut snapshots = Vec::with_capacity(retained.len());
+        for s in retained {
+            let path = crate::offchain::segment_path(&self.dir, s);
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+            };
+            let schema = ParquetRecordBatchReaderBuilder::try_new(file)
+                .with_context(|| format!("reading the schema of {}", path.display()))?
+                .schema()
+                .clone();
+            snapshots.push(Snapshot {
+                hash: s.hash.clone(),
+                path,
+                schema,
+            });
+        }
+        Ok((!snapshots.is_empty()).then_some(Table { snapshots }))
+    }
+
+    pub fn names(&self) -> Vec<&str> {
+        self.catalogue.tables.keys().map(String::as_str).collect()
+    }
+}
+
+fn batch_rows(batch: &RecordBatch, columns: &[Column]) -> Result<Vec<Row>> {
+    let arrays = columns
+        .iter()
+        .map(|c| {
+            let Ok(i) = batch.schema().index_of(&c.name) else {
+                return Ok(None);
+            };
+            let array = batch.column(i).clone();
+            match Kind::of(array.data_type()) {
+                Ok(k) if k == c.kind => Ok(Some(array)),
+                _ => bail!(
+                    "{} is {} in this snapshot but was bound as {}; the entity must be rebuilt",
+                    c.name,
+                    array.data_type(),
+                    c.kind.name()
+                ),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    (0..batch.num_rows())
+        .map(|r| {
+            arrays
+                .iter()
+                .map(|a| a.as_ref().map_or(Ok(Scalar::Null), |a| cell(a.as_ref(), r)))
+                .collect::<Result<Vec<_>>>()
+                .map(Row)
+        })
+        .collect()
+}
+
+fn cell(a: &dyn Array, i: usize) -> Result<Scalar> {
+    if a.is_null(i) {
+        return Ok(Scalar::Null);
+    }
+    Ok(match a.data_type() {
+        DataType::Utf8 => Scalar::Str(a.as_string::<i32>().value(i).to_string()),
+        DataType::LargeUtf8 => Scalar::Str(a.as_string::<i64>().value(i).to_string()),
+        DataType::Utf8View => Scalar::Str(a.as_string_view().value(i).to_string()),
+        DataType::Boolean => Scalar::Bool(a.as_boolean().value(i)),
+        DataType::Int8 => Scalar::Int(a.as_primitive::<Int8Type>().value(i).into()),
+        DataType::Int16 => Scalar::Int(a.as_primitive::<Int16Type>().value(i).into()),
+        DataType::Int32 => Scalar::Int(a.as_primitive::<Int32Type>().value(i).into()),
+        DataType::Int64 => Scalar::Int(a.as_primitive::<Int64Type>().value(i).into()),
+        DataType::UInt8 => Scalar::Int(a.as_primitive::<UInt8Type>().value(i).into()),
+        DataType::UInt16 => Scalar::Int(a.as_primitive::<UInt16Type>().value(i).into()),
+        DataType::UInt32 => Scalar::Int(a.as_primitive::<UInt32Type>().value(i).into()),
+        DataType::UInt64 => Scalar::Int(a.as_primitive::<UInt64Type>().value(i).into()),
+        other => bail!("{other} is not an offchain type an entity reads"),
+    })
+}
+
+/// What a change in a table's snapshots means for an entity that has applied `applied`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Advance<'a> {
+    Unchanged,
+    /// The current version extends the applied one; feed these snapshots at `+1`.
+    Append(&'a [String]),
+    /// A snapshot was replaced, removed or reordered. Offchain rows have no retraction path, so the
+    /// entity is rebuilt from every retained snapshot rather than patched.
+    Rebuild,
+}
+
+pub fn advance<'a>(applied: &[String], current: &'a [String]) -> Advance<'a> {
+    match current.strip_prefix(applied) {
+        Some([]) => Advance::Unchanged,
+        Some(new) => Advance::Append(new),
+        None => Advance::Rebuild,
+    }
+}
+
+fn short(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array};
+    use arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+
+    fn parquet(batch: &RecordBatch) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, batch.schema(), None).unwrap();
+        w.write(batch).unwrap();
+        w.close().unwrap();
+        out
+    }
+
+    /// Seal `batch` as a snapshot of `table` the way `offchain drop` does, and return its hash.
+    fn seal(dir: &Path, table: &str, batch: &RecordBatch) -> String {
+        let src = dir.join(format!("{table}-{}.parquet", batch.num_rows()));
+        std::fs::write(&src, parquet(batch)).unwrap();
+        crate::offchain::drop_file(dir, &src, table).unwrap();
+        crate::offchain::load(dir).unwrap().tables[table]
+            .last()
+            .unwrap()
+            .hash
+            .clone()
+    }
+
+    fn batch(columns: Vec<(&str, Arc<dyn Array>)>) -> RecordBatch {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
+            .collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns.into_iter().map(|(_, a)| a).collect(),
+        )
+        .unwrap()
+    }
+
+    fn prices(symbols: &[&str], e8: &[i64]) -> RecordBatch {
+        batch(vec![
+            ("symbol", Arc::new(StringArray::from(symbols.to_vec()))),
+            ("price_e8", Arc::new(Int64Array::from(e8.to_vec()))),
+        ])
+    }
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_source_names_an_offchain_table_only_through_the_namespace() {
+        assert_eq!(table_of("offchain__prices"), Some("prices"));
+        assert_eq!(table_of("OFFCHAIN__prices"), Some("prices"));
+        assert_eq!(table_of("offchain__"), None);
+        assert_eq!(table_of("usdc__transfer"), None);
+        assert_eq!(table_of("offchain_prices"), None);
+        assert_eq!(
+            table_of("offchain_é"),
+            None,
+            "a boundary inside a character"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_binds_and_reads_as_exact_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = seal(
+            dir.path(),
+            "prices",
+            &prices(&["ETH", "BTC"], &[250_000_000_000, 7]),
+        );
+        let tables = Tables::load(dir.path()).unwrap();
+        let table = tables.table("prices").unwrap().expect("one snapshot");
+        assert_eq!(table.version(), vec![hash]);
+
+        let bound = table
+            .bind("offchain__prices", &cols(&["price_e8", "symbol"]))
+            .unwrap();
+        assert_eq!(
+            bound,
+            vec![
+                Column {
+                    name: "price_e8".into(),
+                    kind: Kind::Int
+                },
+                Column {
+                    name: "symbol".into(),
+                    kind: Kind::Str
+                },
+            ]
+        );
+        assert_eq!(
+            table.snapshots()[0].rows(&bound).unwrap(),
+            vec![
+                Row(vec![
+                    Scalar::Int(250_000_000_000),
+                    Scalar::Str("ETH".into())
+                ]),
+                Row(vec![Scalar::Int(7), Scalar::Str("BTC".into())]),
+            ]
+        );
+    }
+
+    /// `union_by_name`: a column a snapshot lacks is NULL for that snapshot's rows, not an error and
+    /// not a shifted column.
+    #[test]
+    fn a_column_one_snapshot_lacks_reads_null_there() {
+        let dir = tempfile::tempdir().unwrap();
+        seal(dir.path(), "prices", &prices(&["ETH"], &[1]));
+        seal(
+            dir.path(),
+            "prices",
+            &batch(vec![
+                ("symbol", Arc::new(StringArray::from(vec!["ETH"]))),
+                ("price_e8", Arc::new(Int64Array::from(vec![2]))),
+                ("venue", Arc::new(StringArray::from(vec!["cex"]))),
+            ]),
+        );
+        let table = Tables::load(dir.path())
+            .unwrap()
+            .table("prices")
+            .unwrap()
+            .unwrap();
+        let bound = table
+            .bind("offchain__prices", &cols(&["venue", "price_e8"]))
+            .unwrap();
+        let rows: Vec<Row> = table
+            .snapshots()
+            .iter()
+            .flat_map(|s| s.rows(&bound).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                Row(vec![Scalar::Null, Scalar::Int(1)]),
+                Row(vec![Scalar::Str("cex".into()), Scalar::Int(2)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_column_is_refused_with_the_columns_there_are() {
+        let dir = tempfile::tempdir().unwrap();
+        seal(dir.path(), "prices", &prices(&["ETH"], &[1]));
+        let table = Tables::load(dir.path())
+            .unwrap()
+            .table("prices")
+            .unwrap()
+            .unwrap();
+        let err = format!(
+            "{:#}",
+            table
+                .bind("offchain__prices", &cols(&["price"]))
+                .unwrap_err()
+        );
+        assert!(err.contains("no column price in offchain__prices"), "{err}");
+        assert!(err.contains("symbol, price_e8"), "{err}");
+    }
+
+    #[test]
+    fn inexact_and_unsupported_types_are_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        seal(
+            dir.path(),
+            "prices",
+            &batch(vec![
+                ("price", Arc::new(Float64Array::from(vec![2500.5]))),
+                (
+                    "at",
+                    Arc::new(arrow::array::TimestampSecondArray::from(vec![
+                        1_700_000_000,
+                    ])),
+                ),
+            ]),
+        );
+        let table = Tables::load(dir.path())
+            .unwrap()
+            .table("prices")
+            .unwrap()
+            .unwrap();
+        let float = format!(
+            "{:#}",
+            table
+                .bind("offchain__prices", &cols(&["price"]))
+                .unwrap_err()
+        );
+        assert!(float.contains("floating point"), "{float}");
+        let ts = format!(
+            "{:#}",
+            table.bind("offchain__prices", &cols(&["at"])).unwrap_err()
+        );
+        assert!(ts.contains("text, integer and boolean"), "{ts}");
+    }
+
+    /// One column, two kinds across snapshots, is refused rather than resolved by a rule DuckDB
+    /// and the entity might not share. Two integer widths are one kind and bind.
+    #[test]
+    fn a_column_whose_kind_differs_between_snapshots_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        seal(dir.path(), "prices", &prices(&["ETH"], &[1]));
+        seal(
+            dir.path(),
+            "prices",
+            &batch(vec![("price_e8", Arc::new(UInt32Array::from(vec![2u32])))]),
+        );
+        let table = Tables::load(dir.path())
+            .unwrap()
+            .table("prices")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            table
+                .bind("offchain__prices", &cols(&["price_e8"]))
+                .unwrap(),
+            vec![Column {
+                name: "price_e8".into(),
+                kind: Kind::Int
+            }]
+        );
+
+        seal(
+            dir.path(),
+            "prices",
+            &batch(vec![("symbol", Arc::new(BooleanArray::from(vec![true])))]),
+        );
+        let table = Tables::load(dir.path())
+            .unwrap()
+            .table("prices")
+            .unwrap()
+            .unwrap();
+        let err = format!(
+            "{:#}",
+            table
+                .bind("offchain__prices", &cols(&["symbol"]))
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("text in snapshot") && err.contains("boolean in snapshot"),
+            "{err}"
+        );
+    }
+
+    /// The view skips a snapshot whose segment is gone, so the entity does too, and the version
+    /// says so: a deleted snapshot is a different table, which is a rebuild.
+    #[test]
+    fn a_missing_segment_is_absent_from_the_table_and_its_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = seal(dir.path(), "prices", &prices(&["ETH"], &[1]));
+        let second = seal(dir.path(), "prices", &prices(&["ETH"], &[2]));
+        let tables = Tables::load(dir.path()).unwrap();
+        let catalogue = crate::offchain::load(dir.path()).unwrap();
+        std::fs::remove_file(crate::offchain::segment_path(
+            dir.path(),
+            &catalogue.tables["prices"][0],
+        ))
+        .unwrap();
+        let version = tables.table("prices").unwrap().unwrap().version();
+        assert_eq!(version, vec![second.clone()]);
+        assert_eq!(advance(&[first, second], &version), Advance::Rebuild);
+        assert!(Tables::load(dir.path())
+            .unwrap()
+            .table("absent")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_segment_whose_bytes_changed_is_refused_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        seal(dir.path(), "prices", &prices(&["ETH"], &[1]));
+        let table = Tables::load(dir.path())
+            .unwrap()
+            .table("prices")
+            .unwrap()
+            .unwrap();
+        let catalogue = crate::offchain::load(dir.path()).unwrap();
+        let path = crate::offchain::segment_path(dir.path(), &catalogue.tables["prices"][0]);
+        std::fs::write(&path, parquet(&prices(&["ETH"], &[999]))).unwrap();
+        let bound = table
+            .bind("offchain__prices", &cols(&["price_e8"]))
+            .unwrap();
+        let err = format!("{:#}", table.snapshots()[0].rows(&bound).unwrap_err());
+        assert!(err.contains("not the"), "{err}");
+    }
+
+    #[test]
+    fn only_an_extension_of_the_applied_snapshots_is_a_delta() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            advance(&v(&["a", "b"]), &v(&["a", "b"])),
+            Advance::Unchanged
+        );
+        assert_eq!(
+            advance(&v(&[]), &v(&["a"])),
+            Advance::Append(&v(&["a"])[..])
+        );
+        assert_eq!(
+            advance(&v(&["a"]), &v(&["a", "b", "c"])),
+            Advance::Append(&v(&["b", "c"])[..])
+        );
+        assert_eq!(advance(&v(&["a", "b"]), &v(&["a", "c"])), Advance::Rebuild);
+        assert_eq!(advance(&v(&["a", "b"]), &v(&["a"])), Advance::Rebuild);
+        assert_eq!(advance(&v(&["a", "b"]), &v(&["b", "a"])), Advance::Rebuild);
+    }
+}
