@@ -142,14 +142,27 @@ impl EntityView {
         max_rows: usize,
         warm: bool,
     ) -> Result<Self> {
+        let binding = Binding::bind(plan, registry)
+            .with_context(|| format!("binding entity `{name}` to this nest's tables"))?;
+        Self::start_bound(name, plan, binding, columns, max_rows, warm)
+    }
+
+    /// [`Self::start`] for a plan already bound, which is how one reading offchain snapshots is
+    /// started: the caller binds it against the nest's offchain tables as well as its registry.
+    pub fn start_bound(
+        name: &str,
+        plan: &Plan,
+        binding: Binding,
+        columns: &[String],
+        max_rows: usize,
+        warm: bool,
+    ) -> Result<Self> {
         if max_rows == 0 {
             return Err(anyhow!(
                 "entity `{name}` declares max_rows = 0, which admits nothing. §7 wants a bound that \
                  bites, not one that forbids the entity outright"
             ));
         }
-        let binding = Binding::bind(plan, registry)
-            .with_context(|| format!("binding entity `{name}` to this nest's tables"))?;
         let unavailable = warm.then(|| {
             format!(
                 "entity `{name}` cannot be rebuilt after a restart: its state is derived and not \
@@ -329,10 +342,12 @@ impl EntityView {
         self.unavailable.as_deref()
     }
 
-    /// The decoded tables this entity reads - one, or two when it joins.
-    pub fn tables(&self) -> Vec<&str> {
-        std::iter::once(self.binding.left.table.as_str())
-            .chain(self.binding.right.as_ref().map(|r| r.table.as_str()))
+    /// The decoded tables this entity reads: none, one, or two when it joins.
+    pub fn chain_tables(&self) -> Vec<&str> {
+        std::iter::once(&self.binding.left)
+            .chain(self.binding.right.as_ref())
+            .filter(|s| s.offchain_table().is_none())
+            .map(|s| s.table.as_str())
             .collect()
     }
 
