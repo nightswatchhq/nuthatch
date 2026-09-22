@@ -380,6 +380,39 @@ jobs:
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 60m timeout-minutes ceiling. Close to 60m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
+  # RFC-0060 §5.6 (#1438). The network facade is off by default, so no other job compiles it: without
+  # this leg it rots out of sight, exactly as `pg-parity` guards the Postgres store.
+  graph-facade:
+    name: graph facade (--features graph)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: record start time
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Clippy first, as in `pg-parity`: it compiles `--all-targets` under the feature and warms the
+      # cache the test step then reuses.
+      - name: clippy (graph)
+        run: cargo clippy --features graph --all-targets -- -D warnings
+      # The whole suite, not only the facade's own: the feature changes what the Graph surface
+      # serves, so every test that reaches it has to hold in this build too.
+      - name: test (graph)
+        run: cargo test --locked --features graph
+      - name: distinguish an expired timeout from a cancel or supersede
+        if: always() && cancelled()
+        run: |
+          if [ -z "${JOB_START_EPOCH:-}" ]; then
+            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 60m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
+            exit 0
+          fi
+          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
+          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 60m timeout-minutes ceiling. Close to 60m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
+
   # #1343. RFC-0052 S1's closed acceptance asked for a reconciler proof "over FsStore and S3 (MinIO
   # in CI)", but #1335 shipped the S3 mirror with every sync test run against `memory://` and no job
   # here ever started a real object store - S3 publishing had never touched one. This job does.

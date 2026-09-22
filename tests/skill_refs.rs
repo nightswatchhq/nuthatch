@@ -279,6 +279,9 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // operator config like any other when the feature is on, and an undocumented price is exactly
     // the key an operator most needs to find.
     ("src/counter.rs", Some(&["Config", "Network"])),
+    // RFC-0060: `graph/history.toml`, the Graph history read policy. Operator config, but only a
+    // `graph` build reads it; see its entries in KNOWN_UNDOCUMENTED.
+    ("src/graph_history.rs", Some(&["Policy"])),
 ];
 
 /// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not
@@ -370,6 +373,14 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
 /// documenting it is the decision. It is checked for staleness below, so an entry that becomes
 /// documented fails rather than lingering.
 const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
+    // RFC-0060 §5.6 (#1438): the network facade stays invisible to a default build, which refuses these
+    // by name. They are documented with the network nest, not in the builder reference every nest reads.
+    ("CallDecl.on_any", "`graph` builds only (RFC-0060 §5.6): a default build refuses it by name"),
+    ("CallDecl.canonical", "`graph` builds only (RFC-0060 §5.6): a default build refuses it by name"),
+    ("Policy.version", "`graph/history.toml`, which only a `graph` build reads (RFC-0060 §5.6)"),
+    ("Policy.first_block", "`graph/history.toml`, which only a `graph` build reads (RFC-0060 §5.6)"),
+    ("Policy.max_head_age_seconds", "`graph/history.toml`, which only a `graph` build reads (RFC-0060 §5.6)"),
+    ("Policy.max_block_distance", "`graph/history.toml`, which only a `graph` build reads (RFC-0060 §5.6)"),
     // `Config.extract` is documented now (RFC-0038 §5 added `top_level_calls`, which works on
     // ordinary RPC), so its excuse is gone. The node-gated fields below keep theirs.
     ("Extract.blocks", "field of `[extract]`; sourceable from ordinary RPC (RFC-0036) but not yet written up"),
