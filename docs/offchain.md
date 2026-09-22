@@ -57,6 +57,7 @@ SELECT * FROM offchain__prices__status;
 | `error` | the last attempt's failure, or NULL |
 | `stale_after_secs`, `age_secs` | the declared cadence, and seconds since the last success |
 | `stale` | true after a failed attempt, before any success, or once `age_secs` exceeds `stale_after_secs` |
+| `snapshot`, `fetched_sha256` | the snapshot the last successful pull resolved to, and the SHA-256 of the bytes the source served. An unchanged body resolves to an existing snapshot, perhaps a dropped file, and is still recorded here |
 
 Set `--stale-after-secs` a little above the timer's period. Without it, a timer that silently stops
 firing leaves the last successful pull reading as fresh for ever.
