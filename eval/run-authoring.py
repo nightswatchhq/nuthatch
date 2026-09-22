@@ -546,7 +546,8 @@ def reap_group(proc: subprocess.Popen, pgid: int, grace: float = 5.0) -> None:
         # would still hold the redb lock.
         try:
             os.killpg(pgid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # macOS answers EPERM for a group holding only zombies, which hold no lock (#1462).
             return
     try:
         os.killpg(pgid, signal.SIGKILL)
