@@ -59,7 +59,7 @@ fn seed_cost_against_a_real_nest() {
     let mut distinct_in: std::collections::BTreeSet<String> = Default::default();
     let mut buffered = Vec::new();
     view.seed_begin();
-    for table in view.tables() {
+    for table in view.chain_tables() {
         let ts = schema
             .iter()
             .find(|t| t.table == table)
@@ -207,7 +207,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
     let mut source_bytes = 0u64;
     let mut source_rows = 0usize;
     view.seed_begin();
-    for table in view.tables() {
+    for table in view.chain_tables() {
         let ts = schema.iter().find(|t| t.table == table).unwrap();
         nuthatch::seal::read_table_rows_by_segment(&dir, ts, &mut |chunk| {
             source_rows += chunk.len();
@@ -308,7 +308,7 @@ fn a_maintained_relation_answers_without_the_segments_it_was_built_from() {
 
     // The assertion the plan would have shown. Rename every source segment out of reach; a query
     // that still answers cannot have read them.
-    let moved = hide_segments(&dir, &view.tables());
+    let moved = hide_segments(&dir, &view.chain_tables());
     assert!(
         !moved.is_empty(),
         "no segments were hidden, so this proves nothing"
@@ -438,7 +438,10 @@ fn update_cost_tracks_the_block_not_the_history() {
             "shape", &plan, &columns, &registry, 5_000_000, true,
         )
         .unwrap();
-        v.tables().iter().map(|t| t.to_string()).collect::<Vec<_>>()
+        v.chain_tables()
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
     } {
         let ts = schema.iter().find(|t| t.table == table).unwrap();
         nuthatch::seal::read_table_rows_by_segment(&dir, ts, &mut |chunk| {

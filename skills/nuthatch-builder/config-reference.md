@@ -23,6 +23,8 @@ block_timestamps = true       # init-time only; false drops block_timestamp from
 
 [[contracts]]                 # one or more
 alias = "usdc"                # table prefix → usdc__transfer, usdc__approval, …
+                              #   never `offchain` or `offchain_…`: its tables would land in
+                              #   `offchain__`, where offchain snapshots are served. Refused at load
 address = "0xA0b8…eB48"
 start_block = 6082465         # optional; deployment block (init detects it)
 abi = "abis/usdc.json"        # vendored ABI path
@@ -38,6 +40,7 @@ velocity_window = 7200            # window in BLOCKS, not seconds (≈24h at 12s
 
 [[templates]]                 # optional (RFC-0009 factories)
 name = "pool"                 # shared table prefix for discovered children
+                              #   same rule as an alias: not inside `offchain__`
 abi = "abis/pool.json"
 filter = "topic0"             # optional backfill-STRATEGY override - HOW the range is fetched:
                               #   force topic0-only fetch for many-children templates
