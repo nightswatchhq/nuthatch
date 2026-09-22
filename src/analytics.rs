@@ -64,6 +64,7 @@ fn allowed_read_dirs(dir: &Path) -> Vec<PathBuf> {
 struct DuckCache {
     dir: PathBuf,
     sealed_through: u64,
+    as_of: Option<u64>,
     excluded: std::collections::BTreeSet<String>,
     inputs: std::collections::BTreeMap<PathBuf, DuckInputStamp>,
     last_used: u64,
@@ -285,6 +286,23 @@ fn new_spill_dir() -> Result<SpillDir> {
     }
 }
 
+/// RFC-0060 §5.6: what a `graph` build adds to every connection. A default build adds nothing, so its
+/// connections behave exactly as they did before the feature existed.
+fn register_extensions(conn: &Connection) -> Result<()> {
+    #[cfg(feature = "graph")]
+    {
+        crate::analytics_scalars::register(conn)?;
+        // GraphQL and the SQL surface define observable order explicitly, so retaining insertion
+        // order buys no contract and can hold a whole extra ordering buffer for a large historical
+        // aggregation.
+        conn.execute_batch("SET preserve_insertion_order=false;")
+            .context("failed to disable DuckDB insertion-order preservation")?;
+    }
+    #[cfg(not(feature = "graph"))]
+    let _ = conn;
+    Ok(())
+}
+
 fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
     note_duck_open(dir);
     let spill = new_spill_dir()?;
@@ -315,6 +333,7 @@ fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
             .context("duckdb max_temp_directory_size")?;
     }
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
+    register_extensions(&conn)?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
     // materialisation fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet
     // file holding rows on both sides of the filter. The optimiser compresses the sort key against
@@ -727,7 +746,7 @@ pub fn degraded_tables(
 /// Run a read-only query to completion. Only SELECT/WITH statements are accepted - this is a query
 /// surface, not a mutation surface. Unguarded: for trusted, registry-built SQL that must finish.
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
-    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[], None)?.rows)
+    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[], None, None)?.rows)
 }
 
 /// Run a trusted read-only query over **only the segments finalized at/below `sealed_through`** (the
@@ -738,14 +757,33 @@ pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
 /// compliance exposure/velocity views. Bounding to the persisted watermark keeps cold (<= watermark)
 /// and hot (everything still in the store) partitioned regardless of crash timing.
 fn query_cold(dir: &Path, sql: &str, sealed_through: u64) -> Result<Vec<Value>> {
-    Ok(run(dir, sql, None, &HotRows::new(), sealed_through, &[], None)?.rows)
+    Ok(run(
+        dir,
+        sql,
+        None,
+        &HotRows::new(),
+        sealed_through,
+        &[],
+        None,
+        None,
+    )?
+    .rows)
 }
 
 /// Run a read-only query under a resource guard, over the **sealed segments only** - the cold path used
 /// by trusted callers and the `/table` endpoint's cold fill (which merges hot itself). See [`QueryGuard`].
 pub fn query_guarded(dir: &Path, sql: &str, guard: QueryGuard) -> Result<QueryOutput> {
     // Cold-only: `u64::MAX` includes every sealed segment (no hot rows to keep disjoint from).
-    run(dir, sql, Some(guard), &HotRows::new(), u64::MAX, &[], None)
+    run(
+        dir,
+        sql,
+        Some(guard),
+        &HotRows::new(),
+        u64::MAX,
+        &[],
+        None,
+        None,
+    )
 }
 
 /// Run a guarded read-only query over the sealed segments **and the hot tip** - the public `/sql`
@@ -763,7 +801,40 @@ pub fn query_hot_cold(
     sealed_through: u64,
     declared: &[crate::registry::TableSchema],
 ) -> Result<QueryOutput> {
-    run(dir, sql, Some(guard), hot, sealed_through, declared, None)
+    run(
+        dir,
+        sql,
+        Some(guard),
+        hot,
+        sealed_through,
+        declared,
+        None,
+        None,
+    )
+}
+
+/// Historical evaluation filters stored facts before authored views aggregate them. Filtering the
+/// finished entity rows would retain today's balances and merely hide recently-created entities.
+/// Callers must supply only block-stamped facts, not current maintained-entity snapshots.
+pub fn query_hot_cold_at(
+    dir: &Path,
+    sql: &str,
+    guard: QueryGuard,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+    block: u64,
+) -> Result<QueryOutput> {
+    run(
+        dir,
+        sql,
+        Some(guard),
+        hot,
+        sealed_through,
+        declared,
+        None,
+        Some(block),
+    )
 }
 
 /// [`query_hot_cold`] for a declared query: refused before evaluation when the plan that would run
@@ -785,6 +856,7 @@ pub fn query_named(
         sealed_through,
         declared,
         Some(admission),
+        None,
     )
 }
 
@@ -971,6 +1043,7 @@ pub(crate) fn test_set_first_attempt_delay_ms(dir: &Path, ms: u64) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     dir: &Path,
     sql: &str,
@@ -979,6 +1052,7 @@ fn run(
     sealed_through: u64,
     declared: &[crate::registry::TableSchema],
     named: Option<&NamedAdmission>,
+    as_of: Option<u64>,
 ) -> Result<QueryOutput> {
     // One deadline for the whole call, computed once - not a fresh `guard.timeout` handed to each
     // `attempt` (#476). Before this, the watchdog only ever bounded a single `attempt`: the first
@@ -1001,6 +1075,7 @@ fn run(
         deadline,
         declared,
         named,
+        as_of,
     );
     // A segment the plan named was gone by execution (#1162). Nothing is corrupt and nothing is
     // missing: a seal replaced the file under the query, and planning again reads the manifest as it
@@ -1030,6 +1105,7 @@ fn run(
             deadline,
             declared,
             named,
+            as_of,
         )? {
             Attempt::Ok(out) => Ok(out),
             Attempt::DiedExecuting { error, .. } => Err(error),
@@ -1100,6 +1176,7 @@ fn run(
         deadline,
         declared,
         named,
+        as_of,
     )? {
         Attempt::Ok(out) => Ok(out),
         Attempt::DiedExecuting { error, .. } => Err(error),
@@ -1128,6 +1205,7 @@ fn attempt(
     deadline: Option<Instant>,
     declared: &[crate::registry::TableSchema],
     named: Option<&NamedAdmission>,
+    as_of: Option<u64>,
 ) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. DuckDB gets the original text.
@@ -1183,13 +1261,17 @@ fn attempt(
     let inputs = duck_inputs(dir);
     let mut slot = duck_cache_lock().remove(dir);
     let reusable = slot.as_ref().is_some_and(|c| {
-        c.sealed_through == sealed_through && c.excluded == *excluded && c.inputs == inputs
+        c.sealed_through == sealed_through
+            && c.as_of == as_of
+            && c.excluded == *excluded
+            && c.inputs == inputs
     });
     if !reusable {
         let (conn, spill) = open_locked_duckdb(dir).context("failed to open DuckDB")?;
         slot = Some(DuckCache {
             dir: dir.to_path_buf(),
             sealed_through,
+            as_of,
             excluded: excluded.clone(),
             inputs,
             last_used: DUCK_USE.fetch_add(1, Ordering::Relaxed),
@@ -1226,16 +1308,21 @@ fn attempt(
             excluded,
             declared,
             wanted.as_ref(),
+            as_of,
         )?;
         let degraded_tables = defined.degraded.clone();
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
         define_nest_views(conn, dir, wanted.as_ref());
-        define_offchain_views(conn, dir, wanted.as_ref());
+        if as_of.is_none() {
+            define_offchain_views(conn, dir, wanted.as_ref());
+        }
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
         // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
-        define_labels_view(conn, dir);
+        if as_of.is_none() {
+            define_labels_view(conn, dir);
+        }
         // Factory nests (RFC-0009): a `{template}__children` view over the sealed factory events, so
         // "which pools, discovered when, by which parent" is one query. Best-effort - no factories, no-op.
         define_children_views(conn, dir);
@@ -2631,7 +2718,17 @@ fn define_views(
     // what a statement reaches. See `reachable_tables` for why this matters (#896).
     wanted: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<std::collections::BTreeSet<String>> {
-    Ok(define_views_bound(conn, dir, hot, sealed_through, excluded, declared, wanted)?.degraded)
+    Ok(define_views_bound(
+        conn,
+        dir,
+        hot,
+        sealed_through,
+        excluded,
+        declared,
+        wanted,
+        None,
+    )?
+    .degraded)
 }
 
 /// What [`define_views_bound`] built: the degraded tables, each defined table's sealed segments as
@@ -2642,6 +2739,7 @@ struct DefinedViews {
     catalogue_hash: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn define_views_bound(
     conn: &Connection,
     dir: &Path,
@@ -2650,6 +2748,7 @@ fn define_views_bound(
     excluded: &std::collections::BTreeSet<String>,
     declared: &[crate::registry::TableSchema],
     wanted: Option<&std::collections::BTreeSet<String>>,
+    as_of: Option<u64>,
 ) -> Result<DefinedViews> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
@@ -2724,6 +2823,17 @@ fn define_views_bound(
 
     for table in &tables {
         let cols = cols_of(table);
+        if as_of.is_some() {
+            if !cols.iter().any(|(name, _)| name == "block_number") {
+                bail!("historical query requires block-stamped facts: {table} has no declared block_number");
+            }
+            if hot.get(table).is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.get("block_number").and_then(Value::as_u64).is_none())
+            }) {
+                bail!("historical query requires block-stamped facts: {table} contains an unstamped row");
+            }
+        }
         // Only segments finalized at or below the served watermark (COR-1 disjointness).
         let sealed: Vec<(String, u64)> = manifest
             .tables
@@ -2817,6 +2927,7 @@ fn define_views_bound(
                 )),
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
+                    degraded.insert(table.clone());
                     None
                 }
             }
@@ -2852,10 +2963,16 @@ fn define_views_bound(
                 // `UNION ALL BY NAME` aligns columns by name and NULL-fills any a side lacks (a column
                 // all-null over the sealed range is dropped from its Parquet schema; hot may still
                 // carry it).
-                Some(format!(
-                    "CREATE OR REPLACE VIEW \"{table}\" AS {}",
-                    parts.join(" UNION ALL BY NAME ")
-                ))
+                let union = parts.join(" UNION ALL BY NAME ");
+                let select = match as_of {
+                    Some(block) => format!(
+                        "SELECT * FROM ({union}) historical_facts WHERE CASE \
+                         WHEN block_number IS NULL THEN error('historical query requires block-stamped facts: unstamped archived row') \
+                         ELSE block_number <= {block} END"
+                    ),
+                    None => union,
+                };
+                Some(format!("CREATE OR REPLACE VIEW \"{table}\" AS {select}"))
             }
         };
 
@@ -3245,6 +3362,7 @@ fn view_build_failure_at(
         return None;
     }
     let conn = Connection::open_in_memory().ok()?;
+    register_extensions(&conn).ok()?;
     let empty_hot = HotRows::new();
     let _ = define_views(
         &conn,
@@ -3373,6 +3491,13 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     let Ok(conn) = Connection::open_in_memory() else {
         return Vec::new();
     };
+    if let Err(error) = register_extensions(&conn) {
+        return vec![ViewIssue {
+            file: "<scalar functions>".into(),
+            error: format!("register query scalar functions: {error:#}"),
+            hint: None,
+        }];
+    }
     // Base surface the views bind against. `u64::MAX` includes every sealed segment (or, on a fresh
     // nest, yields the empty typed views) so a view referencing `usdc__transfer` resolves.
     let empty_hot = HotRows::new();
@@ -3442,6 +3567,7 @@ pub fn entity_output_columns(
     sql: &str,
 ) -> Result<Vec<String>> {
     let conn = Connection::open_in_memory()?;
+    register_extensions(&conn)?;
     let empty_hot = HotRows::new();
     let _ = define_views(
         &conn,
@@ -3702,6 +3828,122 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(reachable_tables(&conn, dir.path(), &cycle).unwrap(), cycle);
+    }
+    #[test]
+    fn historical_facts_are_filtered_before_aggregation_across_hot_and_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), r#"{"tables":[{"table":"changes","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/balance.sql"),
+            "CREATE VIEW balance AS SELECT sum(CAST(value AS BIGINT)) AS total FROM changes;",
+        )
+        .unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        crate::seal::seal_range(
+            dir.path(),
+            &[
+                r#"{"table":"changes","block_number":10,"value":"5"}"#.into(),
+                r#"{"table":"changes","block_number":20,"value":"7"}"#.into(),
+            ],
+            10,
+            20,
+        )
+        .unwrap();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "changes".into(),
+            vec![
+                serde_json::json!({"block_number":20,"value":"7"}),
+                serde_json::json!({"block_number":30,"value":"11"}),
+            ],
+        );
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 100,
+        };
+        // Alternating blocks also proves a cached historical connection cannot leak a later view.
+        for (block, expected) in [(10, 5), (30, 23), (20, 12), (10, 5)] {
+            let result = query_hot_cold_at(
+                dir.path(),
+                "SELECT total FROM balance",
+                guard,
+                &hot,
+                20,
+                &[],
+                block,
+            )
+            .unwrap();
+            assert_eq!(result.rows[0]["total"], Value::String(expected.to_string()));
+            assert!(!result.degraded());
+        }
+        let current = query_hot_cold(
+            dir.path(),
+            "SELECT total FROM balance",
+            guard,
+            &hot,
+            20,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(current.rows[0]["total"], Value::String("23".into()));
+    }
+
+    #[test]
+    fn historical_queries_refuse_unstamped_current_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "current_balance".into(),
+            vec![serde_json::json!({"id":"a","balance":"99"})],
+        );
+        let result = query_hot_cold_at(
+            dir.path(),
+            "SELECT * FROM current_balance",
+            QueryGuard {
+                timeout: Duration::from_secs(5),
+                max_rows: 100,
+            },
+            &hot,
+            0,
+            &[],
+            10,
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("block-stamped facts"));
+    }
+
+    #[test]
+    fn historical_queries_refuse_unstamped_archived_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), r#"{"tables":[{"table":"changes","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#).unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        crate::seal::seal_range(
+            dir.path(),
+            &[
+                r#"{"table":"changes","value":"5"}"#.into(),
+                r#"{"table":"changes","value":"7"}"#.into(),
+            ],
+            10,
+            20,
+        )
+        .unwrap();
+        let result = query_hot_cold_at(
+            dir.path(),
+            "SELECT sum(CAST(value AS BIGINT)) FROM changes",
+            QueryGuard {
+                timeout: Duration::from_secs(5),
+                max_rows: 100,
+            },
+            &HotRows::new(),
+            20,
+            &[],
+            10,
+        );
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("unstamped archived row"), "{error}");
     }
 
     #[test]

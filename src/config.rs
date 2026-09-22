@@ -27,6 +27,18 @@ pub const READABLE_SCHEMA_VERSION: u32 = if cfg!(feature = "graph") {
     CURRENT_SCHEMA_VERSION
 };
 
+/// RFC-0060: the Graph history read policy needs a `graph` build. A default build would otherwise
+/// serve latest-only answers without the freshness limit the policy promises.
+fn refuse_graph_only_files(dir: &Path) -> Result<()> {
+    if !cfg!(feature = "graph") && dir.join("graph/history.toml").exists() {
+        bail!(
+            "this nest declares graph/history.toml, the Graph history read policy, which only a \
+             nuthatch built with `--features graph` honours"
+        );
+    }
+    Ok(())
+}
+
 /// An absent `schema_version` means **1**, not "current".
 ///
 /// Every nest written before the field existed is a v1 nest, and treating it as current would mean a
@@ -559,6 +571,7 @@ impl Config {
             }
         }
         cfg.refuse_tip_finality_webhooks()?;
+        refuse_graph_only_files(dir)?;
         Ok(cfg)
     }
 
@@ -1209,5 +1222,28 @@ rpc_urls = ["https://rpc.example"]
         // Without the `.star`, the same directory loads normally.
         std::fs::remove_file(dir.path().join("nest.star")).unwrap();
         assert_eq!(Config::load(dir.path()).unwrap().nest.name, "t");
+    }
+
+    /// RFC-0060 §5.6: a default build refuses the Graph history policy by name rather than serving
+    /// latest-only answers without the freshness limit the policy promises.
+    #[test]
+    fn a_graph_history_policy_needs_a_graph_build() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::write(dir.path().join("graph/history.toml"), "version = 1\n").unwrap();
+
+        let result = Config::load(dir.path());
+        if cfg!(feature = "graph") {
+            assert_eq!(result.unwrap().nest.name, "t");
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("graph/history.toml"), "{err}");
+            assert!(err.contains("--features graph"), "{err}");
+        }
     }
 }

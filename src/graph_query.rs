@@ -65,7 +65,7 @@ pub enum Value {
     Object(BTreeMap<String, Value>),
     /// The literal `null`, or a `variables` entry that is JSON null.
     ///
-    /// Carried rather than dropped, and refused rather than lowered. It used to fall through the enum
+    /// Carried rather than dropped; equality filters lower it to SQL null predicates. It used to fall through the enum
     /// branch of the parser, so `where: { hooks: null }` compiled to `hooks = 'null'` and matched rows
     /// whose `hooks` is the four-character string - a filter that quietly selects the wrong rows, which
     /// is the one thing this module may not do. From the variables side it was dropped by `filter_map`
@@ -102,8 +102,7 @@ impl Value {
             Value::Int(n) => n.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Str(s) | Value::Enum(s) => format!("'{}'", s.replace('\'', "''")),
-            // SQL `NULL` is not what GraphQL null means in a filter, and guessing which it meant is
-            // exactly the approximation this module refuses. The caller names it instead.
+            // Equality handles null as a predicate, never as a literal in `= NULL`.
             Value::Null | Value::List(_) | Value::Object(_) => return None,
         })
     }
@@ -205,19 +204,53 @@ impl fmt::Display for Unsupported {
     }
 }
 
-/// Parse the root fields of an operation, with their arguments.
-/// Levels of relation traversal `compile` will lower.
-///
-/// One, matching `E_orderBy`'s traversal depth in the recorded reference: graph-node emits
-/// `token0__symbol` and no `token0__whitelistPools__id`, so one level is the depth the schema itself
-/// advertises. Deeper parses - the handler needs deep selections for introspection - and is refused
-/// by name at lowering rather than answered with an N+1 walk.
-const MAX_TRAVERSAL: usize = 1;
+/// What the compiler lowers beyond RFC-0053 as shipped (RFC-0060 §5.6). Chosen once, at the router,
+/// so the `graph` feature selects a value rather than forking the lowering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Levels of relation traversal. Deeper selections are refused by name rather than answered with
+    /// an N+1 walk.
+    pub max_traversal: usize,
+    /// `where`, `first`, `skip`, `orderBy` and `orderDirection` on a `@derivedFrom` list.
+    pub list_args: bool,
+    /// A `@derivedFrom` list below a to-one reference: indexer-rs's payer → signers. It still lowers
+    /// to one statement with a correlated list subquery.
+    pub nested_lists: bool,
+    /// `field: null` and `field_not: null` as `IS NULL` filters.
+    pub null_filters: bool,
+    /// `block: null` as the latest block, as graph-node reads it.
+    pub null_block: bool,
+}
+
+impl Capabilities {
+    /// RFC-0053 as shipped: what a default build answers.
+    pub const CORE: Self = Self {
+        max_traversal: 1,
+        list_args: false,
+        nested_lists: false,
+        null_filters: false,
+        null_block: false,
+    };
+    /// RFC-0060's network client dialect.
+    pub const NETWORK: Self = Self {
+        max_traversal: 2,
+        list_args: true,
+        nested_lists: true,
+        null_filters: true,
+        null_block: true,
+    };
+    /// What this build serves.
+    pub const BUILD: Self = if cfg!(feature = "graph") {
+        Self::NETWORK
+    } else {
+        Self::CORE
+    };
+}
 
 /// The field at which `sel` exceeds `budget` levels of traversal, if any.
 ///
-/// Recursive rather than a one-level `!sub.is_empty()` test, so [`MAX_TRAVERSAL`] is the thing being
-/// enforced instead of a comment next to a hand-unrolled check of it.
+/// Recursive rather than a one-level `!sub.is_empty()` test, so the traversal capability is the thing
+/// being enforced instead of a comment next to a hand-unrolled check of it.
 fn too_deep(sel: &[Selection], budget: usize) -> Option<&Selection> {
     for s in sel {
         if s.sub.is_empty() {
@@ -982,6 +1015,10 @@ pub enum Shape {
         marker: String,
         /// Each selected sub-field's key, and the column alias it arrives under.
         fields: Vec<(String, String)>,
+        /// A derived list selected below this to-one relation. Keeping it separate from `fields`
+        /// preserves the distinction between a scalar value and a JSON-packed entity list when the
+        /// response is shaped.
+        lists: Vec<(String, String)>,
     },
     /// A `@derivedFrom` list, aggregated into one JSON array by a correlated subquery.
     List {
@@ -1018,7 +1055,16 @@ pub struct Compiled {
 /// Compile one root field against the generated schema.
 ///
 /// The view name is the entity's snake_case alias, which is what `port-emit` writes.
+/// [`compile_with`] at [`Capabilities::CORE`].
 pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupported> {
+    compile_with(schema, root, &Capabilities::CORE)
+}
+
+pub fn compile_with(
+    schema: &Schema,
+    root: &RootField,
+    caps: &Capabilities,
+) -> Result<Compiled, Unsupported> {
     let (entity, singular) = resolve_root(schema, &root.name)?;
     let ent = schema
         .entities
@@ -1026,7 +1072,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         .find(|e| e.name == entity)
         .expect("resolve_root returned an entity the schema has");
 
-    if let Some(s) = too_deep(&root.sel, MAX_TRAVERSAL) {
+    if let Some(s) = too_deep(&root.sel, caps.max_traversal) {
         return Err(Unsupported::NestedSelection(s.name.clone()));
     }
     // Every column is qualified with the base alias whether or not this query joins. One shape
@@ -1094,18 +1140,12 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             });
             continue;
         }
-        // Arguments on a traversed field are refused **before** any traversal is lowered. This guard
-        // used to sit after the derived-list branch below, so `swaps(first: 5)` compiled with the
-        // `first` silently dropped and every related row returned - caught by an existing test, and
-        // the same class of fault as everything else this module refuses.
-        if !sel.args.is_empty() {
-            return Err(Unsupported::NestedSelection(sel.name.clone()));
-        }
-        // A `@derivedFrom` list is aggregated rather than joined. A plain join would multiply the
-        // parent row once per child, so `first` would stop meaning what it says; one correlated
-        // subquery per parent keeps the parent's row count and the child's own page size separate.
+        // A derived list has its own bounded filter and page, independent of its parent.
         if let (graph_schema::FieldType::List(inner), Some(back)) = (&field.ty, &field.derived_from)
         {
+            if !caps.list_args && !sel.args.is_empty() {
+                return Err(Unsupported::NestedSelection(sel.name.clone()));
+            }
             let Some(target) = inner.entity_name() else {
                 return Err(Unsupported::NestedSelection(sel.name.clone()));
             };
@@ -1117,8 +1157,6 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                     entity: entity.clone(),
                     field: sel.name.clone(),
                 })?;
-            // The back-reference is the schema author's, named in `@derivedFrom(field: …)`. One that
-            // the child has not got is a broken schema rather than a query this can answer.
             if !child.fields.iter().any(|f| &f.name == back) {
                 return Err(Unsupported::UnknownField {
                     entity: target.to_string(),
@@ -1126,55 +1164,25 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                 });
             }
             let alias = format!("c{i}");
-            let cview = crate::subgraph_import::to_alias(target);
-            let mut packed = Vec::new();
-            for sub in &sel.sub {
-                if !sub.sub.is_empty() || !sub.args.is_empty() {
-                    return Err(Unsupported::NestedSelection(sub.name.clone()));
-                }
-                let Some(cf) = child.fields.iter().find(|f| f.name == sub.name) else {
-                    return Err(Unsupported::UnknownField {
-                        entity: target.to_string(),
-                        field: sub.name.clone(),
-                    });
-                };
-                if let Some(inner_target) = cf.ty.entity_name() {
-                    return Err(Unsupported::Syntax(format!(
-                        "`{target}.{}` returns `{inner_target}`, which needs a selection set",
-                        sub.name
-                    )));
-                }
-                // **Keyed by the alias, valued from the field.** This packed `sub.name` on both sides, so
-                // `{ pools { swaps { sid: id } } }` answered under `id` - a key the client never asked for,
-                // inside a list where its own alias test could not see it (Jules, #1282).
-                //
-                // Cast on the same rule as a top-level scalar: a `BigInt` packed raw is a JSON number
-                // inside the array, which is the wire-type defect one level down.
-                let value = if wire_string_cast(&cf.ty) {
-                    format!("CAST({alias}.\"{}\" AS VARCHAR)", sub.name)
-                } else {
-                    format!("{alias}.\"{}\"", sub.name)
-                };
-                packed.push(format!("\"{}\" := {value}", sub.key));
-            }
             let col = format!("{alias}__{}", sel.name);
-            // `to_json(list(…))` rather than a bare `LIST` of `STRUCT`, so the column arrives as a
-            // plain JSON string and nothing depends on how the row serialiser handles a nested DuckDB
-            // type. `ORDER BY`/`LIMIT` cannot sit inside the aggregate, hence the inner subquery.
-            //
-            // **`coalesce` is not decoration**: `list()` over zero rows is `NULL`, so a parent with no
-            // children would answer `null` for a field the generated schema types `[{target}!]!`.
-            cols.push(format!(
-                "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s \
-                 FROM \"{cview}\" {alias} WHERE {alias}.\"{back}\" = {BASE}.\"id\" \
-                 ORDER BY {alias}.\"id\" ASC LIMIT 100) t), '[]') AS \"{col}\"",
-                packed.join(", ")
-            ));
+            let packed = derived_list_sql(
+                schema,
+                child,
+                back,
+                &format!("{BASE}.\"id\""),
+                &alias,
+                sel,
+                caps,
+            )?;
+            cols.push(format!("{packed} AS \"{col}\""));
             shape.push(Shape::List {
                 key: sel.key.clone(),
                 col,
             });
             continue;
+        }
+        if !sel.args.is_empty() {
+            return Err(Unsupported::NestedSelection(sel.name.clone()));
         }
         // A **to-one** reference is a join on the id this row already holds, and because the target's
         // id is unique the join cannot multiply rows - so `first` still means what it says. Anything
@@ -1206,8 +1214,10 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         let marker = format!("{alias}__present");
         cols.push(format!("{alias}.\"id\" AS \"{marker}\""));
         let mut sub = Vec::new();
-        for s in &sel.sub {
-            if !s.args.is_empty() {
+        let mut lists = Vec::new();
+        for (sub_i, s) in sel.sub.iter().enumerate() {
+            // RFC-0053 checks a nested field's arguments before looking it up; core keeps that order.
+            if !caps.nested_lists && !s.args.is_empty() {
                 return Err(Unsupported::NestedSelection(s.name.clone()));
             }
             let Some(cf) = tent.fields.iter().find(|x| x.name == s.name) else {
@@ -1216,6 +1226,50 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                     field: s.name.clone(),
                 });
             };
+            // The indexer-rs escrow query is deliberately two relations deep:
+            // `paymentsEscrowAccounts { payer { signers(first:, where:) { id } } }`.
+            // A derived list is still one bounded SQL subquery here, not an N+1 trip through the
+            // HTTP handler. Its own pagination and filters belong to the list, so refusing those
+            // arguments would either make the real client unusable or tempt a later implementation
+            // to drop them. Neither is a useful outcome.
+            if let (true, graph_schema::FieldType::List(inner), Some(back)) =
+                (caps.nested_lists, &cf.ty, &cf.derived_from)
+            {
+                let Some(child_name) = inner.entity_name() else {
+                    return Err(Unsupported::NestedSelection(s.name.clone()));
+                };
+                let child = schema
+                    .entities
+                    .iter()
+                    .find(|e| e.name == child_name)
+                    .ok_or_else(|| Unsupported::UnknownField {
+                        entity: target.clone(),
+                        field: s.name.clone(),
+                    })?;
+                if !child.fields.iter().any(|f| &f.name == back) {
+                    return Err(Unsupported::UnknownField {
+                        entity: child_name.to_string(),
+                        field: back.clone(),
+                    });
+                }
+                let child_alias = format!("{alias}c{sub_i}");
+                let col = format!("{alias}__list{sub_i}");
+                let packed = derived_list_sql(
+                    schema,
+                    child,
+                    back,
+                    &format!("{alias}.\"id\""),
+                    &child_alias,
+                    s,
+                    caps,
+                )?;
+                cols.push(format!("{packed} AS \"{col}\""));
+                lists.push((s.key.clone(), col));
+                continue;
+            }
+            if !s.args.is_empty() || !s.sub.is_empty() {
+                return Err(Unsupported::NestedSelection(s.name.clone()));
+            }
             // The same rule as the outer selection: a composite field needs a selection set. Without
             // this a traversed child's own relation was emitted as a scalar column, so
             // `{ pools { token0 { whitelistPools } } }` returned a stored id list under a field the
@@ -1243,6 +1297,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             key: sel.key.clone(),
             marker,
             fields: sub,
+            lists,
         });
     }
     // An entity root with no selection set is not a legal GraphQL query - a composite type must be
@@ -1262,7 +1317,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
 
     for (name, value) in &root.args {
         match name.as_str() {
-            "block" => min_block = Some(minimum_block(value)?),
+            "block" => min_block = minimum_block(value, caps)?,
             // Accepted and ignored on purpose: it selects an error policy, and a nest has no
             // subgraph indexing errors to report either way.
             "subgraphError" => {}
@@ -1280,7 +1335,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                     return Err(Unsupported::Argument("`where` must be an object".into()));
                 };
                 for (key, v) in m {
-                    wheres.push(lower_predicate(schema, ent, key, v, BASE, 0)?);
+                    wheres.push(lower_predicate(schema, ent, key, v, BASE, 0, caps)?);
                 }
             }
             "first" | "skip" | "orderBy" | "orderDirection" if !singular => {}
@@ -1409,10 +1464,197 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
     })
 }
 
+/// Lower a `@derivedFrom` list below a to-one relation into one correlated, bounded SQL value.
+///
+/// This is intentionally narrower than a recursive query executor. A GraphQL relation list is a
+/// database query in miniature, so its `where`, ordering and page size have to be carried into the
+/// correlated subquery rather than ignored. The result is JSON because [`Shape::Object`] otherwise
+/// carries scalar columns only; the HTTP layer parses it back into the selected list shape.
+fn derived_list_sql(
+    schema: &Schema,
+    child: &graph_schema::Entity,
+    back: &str,
+    parent_id: &str,
+    alias: &str,
+    selection: &Selection,
+    caps: &Capabilities,
+) -> Result<String, Unsupported> {
+    let mut packed = Vec::new();
+    for (i, sub) in selection.sub.iter().enumerate() {
+        if !sub.args.is_empty() {
+            return Err(Unsupported::NestedSelection(sub.name.clone()));
+        }
+        let Some(field) = child.fields.iter().find(|f| f.name == sub.name) else {
+            return Err(Unsupported::UnknownField {
+                entity: child.name.clone(),
+                field: sub.name.clone(),
+            });
+        };
+        if let Some(target) = field.ty.entity_name() {
+            if let (graph_schema::FieldType::Entity(_), None) = (&field.ty, &field.derived_from) {
+                if !sub.sub.is_empty() {
+                    let entity = schema
+                        .entities
+                        .iter()
+                        .find(|e| e.name == target)
+                        .ok_or_else(|| Unsupported::UnknownField {
+                            entity: child.name.clone(),
+                            field: sub.name.clone(),
+                        })?;
+                    let nested_alias = format!("{alias}r{i}");
+                    let mut values = Vec::new();
+                    for leaf in &sub.sub {
+                        let leaf_field = entity
+                            .fields
+                            .iter()
+                            .find(|f| f.name == leaf.name)
+                            .ok_or_else(|| Unsupported::UnknownField {
+                                entity: target.to_string(),
+                                field: leaf.name.clone(),
+                            })?;
+                        if !leaf.sub.is_empty()
+                            || !leaf.args.is_empty()
+                            || leaf_field.ty.entity_name().is_some()
+                        {
+                            return Err(Unsupported::NestedSelection(leaf.name.clone()));
+                        }
+                        let value = format!("{nested_alias}.\"{}\"", leaf.name);
+                        let value = if wire_string_cast(&leaf_field.ty) {
+                            format!("CAST({value} AS VARCHAR)")
+                        } else {
+                            value
+                        };
+                        values.push(format!("\"{}\" := {value}", leaf.key));
+                    }
+                    let view = crate::subgraph_import::to_alias(target);
+                    packed.push(format!(
+                        "\"{}\" := (SELECT struct_pack({}) FROM \"{view}\" {nested_alias} WHERE {nested_alias}.\"id\" = {alias}.\"{}\")",
+                        sub.key, values.join(", "), sub.name
+                    ));
+                    continue;
+                }
+            }
+            return Err(Unsupported::Syntax(format!(
+                "`{}.{}` returns `{target}`, which needs a selection set",
+                child.name, sub.name
+            )));
+        }
+        if !sub.sub.is_empty() {
+            return Err(Unsupported::NestedSelection(sub.name.clone()));
+        }
+        let value = if wire_string_cast(&field.ty) {
+            format!("CAST({alias}.\"{}\" AS VARCHAR)", sub.name)
+        } else {
+            format!("{alias}.\"{}\"", sub.name)
+        };
+        packed.push(format!("\"{}\" := {value}", sub.key));
+    }
+    if packed.is_empty() {
+        return Err(Unsupported::Syntax(format!(
+            "`{}` returns `{}`, which needs a selection set",
+            selection.name, child.name
+        )));
+    }
+
+    let mut wheres = vec![format!("{alias}.\"{back}\" = {parent_id}")];
+    for (name, value) in &selection.args {
+        match name.as_str() {
+            "where" => {
+                let Value::Object(filters) = value else {
+                    return Err(Unsupported::Argument("`where` must be an object".into()));
+                };
+                for (key, value) in filters {
+                    wheres.push(lower_predicate(schema, child, key, value, alias, 0, caps)?);
+                }
+            }
+            "first" | "skip" | "orderBy" | "orderDirection" => {}
+            other => return Err(Unsupported::Argument(other.to_string())),
+        }
+    }
+
+    let first = match selection.args.get("first") {
+        None => 100,
+        Some(Value::Int(n)) if (0..=1000).contains(n) => *n,
+        Some(Value::Int(n)) => {
+            return Err(Unsupported::Argument(format!(
+                "first must be between 0 and 1000, got {n}"
+            )))
+        }
+        Some(_) => return Err(Unsupported::Argument("first must be an integer".into())),
+    };
+    let skip = match selection.args.get("skip") {
+        None => 0,
+        Some(Value::Int(n)) if *n >= 0 => *n,
+        Some(Value::Int(n)) => {
+            return Err(Unsupported::Argument(format!(
+                "skip must not be negative, got {n}"
+            )))
+        }
+        Some(_) => return Err(Unsupported::Argument("skip must be an integer".into())),
+    };
+    let order = match selection.args.get("orderBy") {
+        None => "id".to_string(),
+        Some(Value::Enum(name)) | Some(Value::Str(name)) => {
+            let Some(field) = child.fields.iter().find(|f| &f.name == name) else {
+                return Err(Unsupported::UnknownField {
+                    entity: child.name.clone(),
+                    field: name.clone(),
+                });
+            };
+            if field.derived_from.is_some()
+                || matches!(field.ty, graph_schema::FieldType::List(_))
+                || field.ty.entity_name().is_some()
+            {
+                return Err(Unsupported::Argument(format!(
+                    "orderBy `{name}` is a relation rather than a stored value, which needs the join this slice does not lower yet"
+                )));
+            }
+            name.clone()
+        }
+        Some(_) => return Err(Unsupported::Argument("orderBy must be an enum".into())),
+    };
+    let direction = match selection.args.get("orderDirection") {
+        None => "ASC",
+        Some(Value::Enum(d)) | Some(Value::Str(d)) if d == "asc" => "ASC",
+        Some(Value::Enum(d)) | Some(Value::Str(d)) if d == "desc" => "DESC",
+        Some(_) => {
+            return Err(Unsupported::Argument(
+                "orderDirection must be asc or desc".into(),
+            ))
+        }
+    };
+    let order_expr = format!("{alias}.\"{order}\"");
+    let order_expr = if child
+        .fields
+        .iter()
+        .find(|f| f.name == order)
+        .is_some_and(|f| needs_numeric_key(&f.ty))
+    {
+        numeric_sort_key(&order_expr)
+    } else {
+        order_expr
+    };
+    let view = crate::subgraph_import::to_alias(&child.name);
+    // No `OFFSET 0`, so an unargumented list lowers to exactly the SQL RFC-0053 always emitted.
+    let offset = if skip > 0 {
+        format!(" OFFSET {skip}")
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s FROM \"{view}\" {alias} WHERE {} ORDER BY {order_expr} {direction} LIMIT {first}{offset}) t), '[]')",
+        packed.join(", "),
+        wheres.join(" AND "),
+    ))
+}
+
 /// A root's `block` argument, shared by entity roots and `_meta`. `number_gte` is a precondition on
 /// the head rather than a past state, so it is answerable exactly. `number` and `hash` are real time
-/// travel and stay refused (#1267).
-pub fn minimum_block(value: &Value) -> Result<u64, Unsupported> {
+/// travel and stay refused (#1267). An explicit `null` selects the head where `caps` allows it.
+pub fn minimum_block(value: &Value, caps: &Capabilities) -> Result<Option<u64>, Unsupported> {
+    if caps.null_block && matches!(value, Value::Null) {
+        return Ok(None);
+    }
     let Value::Object(m) = value else {
         return Err(Unsupported::Argument("`block` must be an object".into()));
     };
@@ -1426,6 +1668,7 @@ pub fn minimum_block(value: &Value) -> Result<u64, Unsupported> {
     };
     // Negative is not a block. graph-node types it `Int`, so the parser accepts one.
     u64::try_from(*n)
+        .map(Some)
         .map_err(|_| Unsupported::Argument("`block.number_gte` must not be negative".into()))
 }
 
@@ -1436,6 +1679,7 @@ fn lower_predicate(
     v: &Value,
     base: &str,
     depth: usize,
+    caps: &Capabilities,
 ) -> Result<String, Unsupported> {
     if key == "and" || key == "or" {
         let Value::List(items) = v else {
@@ -1467,7 +1711,7 @@ fn lower_predicate(
             }
             let inner: Result<Vec<String>, Unsupported> = m
                 .iter()
-                .map(|(k, vv)| lower_predicate(schema, ent, k, vv, base, depth))
+                .map(|(k, vv)| lower_predicate(schema, ent, k, vv, base, depth, caps))
                 .collect();
             // Conditions within one filter object are ANDed, which is what `where` itself does.
             parts.push(format!("({})", inner?.join(" AND ")));
@@ -1526,7 +1770,7 @@ fn lower_predicate(
         let view = crate::subgraph_import::to_alias(&target);
         let parts: Result<Vec<String>, Unsupported> = inner
             .iter()
-            .map(|(k, vv)| lower_predicate(schema, child, k, vv, &alias, depth + 1))
+            .map(|(k, vv)| lower_predicate(schema, child, k, vv, &alias, depth + 1, caps))
             .collect();
         // `EXISTS` rather than a join: the parent's row count must not change, and `first` still means
         // what it says.
@@ -1585,6 +1829,12 @@ fn lower_predicate(
             return Err(Unsupported::Operator(key.to_string()));
         }
         let col = format!("{base}.\"{field}\"");
+        if caps.null_filters && matches!(v, Value::Null) && matches!(*suffix, "" | "_not") {
+            return Ok(format!(
+                "{col} IS {}NULL",
+                if *suffix == "_not" { "NOT " } else { "" }
+            ));
+        }
         return match *suffix {
             "_in" | "_not_in" => {
                 let Value::List(items) = v else {
@@ -1674,6 +1924,74 @@ fn resolve_root(schema: &Schema, name: &str) -> Result<(String, bool), Unsupport
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn real_network_client_first_pages_compile_against_the_pinned_schema() {
+        let schema = super::graph_schema::parse(include_str!(
+            "../tests/fixtures/network-clients/schema.graphql"
+        ))
+        .unwrap();
+        let workbench = super::graph_schema::parse(include_str!(
+            "../tests/fixtures/network-nest/graph/schema.graphql"
+        ))
+        .unwrap();
+        let vars = serde_json::json!({
+            "indexer": "0x1111111111111111111111111111111111111111",
+            "receiver": "0x1111111111111111111111111111111111111111",
+            "payer": "0x2222222222222222222222222222222222222222",
+            "collector": "0x3333333333333333333333333333333333333333",
+            "closedAtThreshold": 1789650000, "thawEndTimestamp": "1789650000",
+            "first": 200, "last": "", "minBalance": "100000000000000000",
+            "block": null, "allocation_ids": [], "allocationIds": []
+            , "allocation": "0x1111111111111111111111111111111111111111",
+            "status": "Active", "lastId": "", "dataService": "0x3333333333333333333333333333333333333333",
+            "epochs": [1], "closedAtEpochThreshold": 1, "subgraphDeploymentId": "0x00",
+            "subgraphs": [], "ipfsHash": "QmExample", "disputableEpoch": 1,
+            "minimumQueryFeesCollected": "0", "deployments": [], "minimumAllocation": 0,
+            "zeroPOI": "0x00"
+        });
+        let vars = vars
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), super::Value::from_json(v).unwrap()))
+            .collect();
+        for document in [
+            include_str!("../tests/fixtures/network-clients/allocations.graphql"),
+            include_str!("../tests/fixtures/network-clients/closed_allocations.graphql"),
+            include_str!("../tests/fixtures/network-clients/network_escrow_account_v2.graphql"),
+            include_str!("../tests/fixtures/network-clients/signers_by_payer.graphql"),
+            include_str!(
+                "../tests/fixtures/network-clients/payments_escrow_transactions_redeem.graphql"
+            ),
+            include_str!("../tests/fixtures/network-clients/horizon_detection.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-eligible-current-epoch.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-eligible-active.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-eligible-closed.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-01.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-02.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-03.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-04.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-05.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-06.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-07.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-08.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-09.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-11.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-12.graphql"),
+            include_str!("../tests/fixtures/network-clients/ts-monitor-13.graphql"),
+        ] {
+            let roots = super::parse_named(document, &vars, None).unwrap();
+            for root in roots.iter().filter(|r| r.name != "_meta") {
+                super::compile_with(&schema, root, &super::Capabilities::NETWORK)
+                    .unwrap_or_else(|e| panic!("{}: {e}", root.name));
+                // Every captured client root must bind against the actual workbench.
+                // Compilation is necessary, but is not live-data parity evidence.
+                super::compile_with(&workbench, root, &super::Capabilities::NETWORK)
+                    .unwrap_or_else(|e| panic!("workbench {}: {e}", root.name));
+            }
+        }
+    }
+
     use super::*;
 
     /// The numeric sort key abbreviated to `KEY(<inner>)`, so an exact-SQL assertion stays readable.
@@ -2117,9 +2435,43 @@ type Swap @entity { id: ID! pool: Pool! }
                     key: "token0".into(),
                     marker: "j1__present".into(),
                     fields: vec![("symbol".into(), "j1__symbol".into())],
+                    lists: vec![],
                 },
             ],
             "only the shape knows `j1__symbol` belongs under `token0`"
+        );
+
+        // A bounded derived list below a to-one join is the escrow shape used by indexer-rs:
+        // account → payer → signers. The child list's arguments must reach the correlated query.
+        let nested_schema = graph_schema::parse(
+            r#"
+type Account @entity { id: ID! payer: Payer! }
+type Payer @entity { id: ID! signers: [Signer!]! @derivedFrom(field: "payer") }
+type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
+"#,
+        )
+        .unwrap();
+        let nested = one(
+            r#"{ accounts { payer { signers(first: 1, where: { id_gt: "0xaaa" }) { id } } } }"#,
+        );
+        assert!(
+            matches!(
+                compile(&nested_schema, &nested),
+                Err(Unsupported::NestedSelection(_))
+            ),
+            "RFC-0053 as shipped refuses the nested list; only the network dialect lowers it"
+        );
+        let c = compile_with(&nested_schema, &nested, &Capabilities::NETWORK)
+            .expect("nested derived list lowers");
+        assert!(
+            c.sql.contains(r#"FROM "signer" j0c0 WHERE j0c0."payer" = j0."id" AND j0c0."id" > '0xaaa' ORDER BY j0c0."id" ASC LIMIT 1) t)"#),
+            "the nested list keeps its relation, filter, ordering and limit: {}",
+            c.sql
+        );
+        assert!(
+            matches!(&c.shape[0], Shape::Object { lists, .. } if lists == &vec![("signers".into(), "j0__list0".into())]),
+            "the JSON list remains attached to payer when the row is shaped: {:?}",
+            c.shape
         );
 
         // A composite field inside a traversal needs a selection set too. Without this the child's own
@@ -2170,6 +2522,28 @@ type Swap @entity { id: ID! pool: Pool! }
             matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
             "{e:?}"
         );
+
+        // The network dialect admits two levels for a derived list beneath a to-one relation. An
+        // unrelated relation is still validated against the target schema rather than becoming a
+        // free recursive traversal merely because the escrow shape needed one more level.
+        let e = compile_with(
+            &schema(),
+            &one("{ pools { token0 { pool { id } } } }"),
+            &Capabilities::NETWORK,
+        )
+        .expect_err("unknown relation");
+        assert!(
+            matches!(&e, Unsupported::UnknownField { entity, field } if entity == "Token" && field == "pool"),
+            "{e:?}"
+        );
+        // And there a derived list's page size belongs to the child, not the parent.
+        let c = compile_with(
+            &schema(),
+            &one("{ pools { swaps(first: 5) { id } } }"),
+            &Capabilities::NETWORK,
+        )
+        .expect("bounded child page");
+        assert!(c.sql.contains("LIMIT 5) t)"), "{}", c.sql);
         // And arguments on a leaf *inside* a traversal, which is a different guard: the case above
         // is caught before the relation is resolved, so removing this one changed nothing and no
         // test noticed - found by mutation, not by reading.
@@ -2438,6 +2812,7 @@ type Swap @entity { id: ID! pool: Pool! }
                 key: "t".into(),
                 marker: "j0__present".into(),
                 fields: vec![("s".into(), "j0__symbol".into())],
+                lists: vec![],
             }],
             "the join is still on token0, the answer is still under t"
         );

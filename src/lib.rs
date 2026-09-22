@@ -10,6 +10,8 @@ pub mod alerts;
 pub mod allowlist;
 pub mod analytics;
 pub mod analytics_budget;
+#[cfg(feature = "graph")]
+mod analytics_scalars;
 pub mod audit;
 pub mod authored_entity_spike;
 pub mod bench;
@@ -52,6 +54,7 @@ pub mod freshness;
 pub mod graft;
 /// RFC-0053 S2: compile an accepted Graph query dialect to SQL over a nest (#1266).
 pub mod graph_decimal;
+pub mod graph_history;
 pub mod graph_query;
 /// RFC-0053 S1: graph-node's generated schema, from an imported `schema.graphql` (#1265).
 pub mod graph_schema;

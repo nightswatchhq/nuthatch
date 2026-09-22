@@ -255,6 +255,67 @@ after which the whole operation reads as garbage.
 | a `null` filter value, as a literal or through `variables` | in a filter it could mean `IS NULL` or the absence of the condition, and those select different rows. It used to parse as the enum `null` and compile to `= 'null'`, matching rows whose value is that four-character string |
 | a fractional number in `variables` | `BigInt` and `BigDecimal` travel as strings over GraphQL precisely because a float loses them, so a fractional JSON number is refused rather than rounded into a filter |
 
+## With `--features graph` (RFC-0060)
+
+A nuthatch built with `--features graph` serves the Network Subgraph client dialect on top of
+everything above. A default build serves exactly the sections above, and refuses a nest that
+declares `graph/history.toml`. In this build four rows of the refusal table change:
+`block: { number: N }` and `block: { hash: … }` are answered in historical mode, a derived list takes
+its own arguments, the two-level shapes below are accepted, and `null` is accepted for equality and
+inequality.
+
+An explicit `block: null` selects the head, on entity roots and on `_meta`, as on the Rust monitor's
+first page. Subsequent hash-pinned pages require the historical mode below.
+
+One to-one relation level is supported generally. A derived list directly below it is also supported,
+with its own `first`, `skip`, `orderBy`, `orderDirection` and `where` applied in the correlated query.
+This is the bounded two-level shape the Horizon escrow client uses:
+
+```graphql
+{ paymentsEscrowAccounts { payer { signers(first: 1000, where: { isAuthorized: true }) { id } } } }
+```
+
+Top-level derived lists accept the same filtering and pagination arguments. They may also select a
+to-one relation with scalar children, as in `subgraphDeployments { indexerAllocations { indexer { id } } }`.
+Both shapes remain one SQL statement, not a parent-by-parent request loop. Further traversal is not
+accepted.
+
+Null equality and inequality lower to `IS NULL` and `IS NOT NULL`, including the Rust monitor's
+`closedAt_not: null`. Null is not the string `"null"`, and never removes a filter condition. `null`
+with any other comparison stays refused.
+
+### Historical reads
+
+A nest whose entity views derive exclusively from complete block-stamped facts can declare
+`graph/history.toml`:
+
+```toml
+version = 1
+first_block = 42449585
+max_head_age_seconds = 15
+max_block_distance = 60
+```
+
+This enables entity number selectors throughout the declared indexed range and hash selectors at
+retained canonical checkpoints. It filters raw facts before the authored SQL views evaluate; it does
+not filter today's aggregated entities. Current maintained entities, labels and offchain snapshots are
+not substituted into past-state queries. The query still uses the ordinary SQL admission, row, memory
+and time bounds. Checkpoint hashes have a persisted reverse lookup, updated transactionally on writes
+and rollbacks and rebuilt whenever this build opens a writable store, because a default build keeps
+none and may have written checkpoints since.
+
+All roots default to the same captured head. `_meta(block: ...)` describes its selected checkpoint.
+Historical numeric metadata is accepted between retained checkpoints, as it is in graph-node: the
+requested number is returned while `hash` and `timestamp` are null. Hash selectors still require an
+actual retained canonical checkpoint. Entity queries by number do not require a header at that number
+and make no RPC calls. Future blocks, blocks before `first_block`, stale heads and a store generation
+changing during the operation are errors. Unknown hashes remain unavailable. The age limit and
+optional distance limit are admission checks, not evidence that a deployment keeps up with the chain.
+`GET /graph/status` reports the same freshness check.
+
+The policy is an author assertion of complete input history, not a backfill or completeness proof.
+It does not make a partial schema or incomplete entity derivation a Network Subgraph replacement.
+
 ## What S2 is done when
 
 - A canonical client query against the reference schema returns rows that match the reference

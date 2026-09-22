@@ -154,7 +154,7 @@ postgres-store = ["dep:postgres"]
 counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
 # RFC-0060 §5.6: the Graph network facade. Off by default: a default build never shows it and
 # refuses a nest that needs it.
-graph = []
+graph = ["duckdb/vscalar", "duckdb/vscalar-arrow"]
 
 [dev-dependencies]
 proptest = "1"

@@ -1,0 +1,24 @@
+
+        query allocation($allocation: String!) {
+          allocation(id: $allocation) {
+            id
+            status
+            isLegacy
+            indexer {
+              id
+            }
+            allocatedTokens
+            createdAt
+            createdAtEpoch
+            createdAtBlockHash
+            closedAt
+            closedAtEpoch
+            subgraphDeployment {
+              id
+              ipfsHash
+              stakedTokens
+              signalledTokens
+              queryFeesAmount
+            }
+          }
+        }
