@@ -1262,30 +1262,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
 
     for (name, value) in &root.args {
         match name.as_str() {
-            // `number_gte` is a precondition on the head rather than a past state, so it is answerable
-            // exactly. `number` and `hash` are real time travel and stay refused (#1267).
-            "block" => {
-                let Value::Object(m) = value else {
-                    return Err(Unsupported::Argument("`block` must be an object".into()));
-                };
-                let mut keys: Vec<&str> = m.keys().map(String::as_str).collect();
-                keys.sort_unstable();
-                match keys.as_slice() {
-                    ["number_gte"] => {
-                        let Some(Value::Int(n)) = m.get("number_gte") else {
-                            return Err(Unsupported::Argument(
-                                "`block.number_gte` must be an integer".into(),
-                            ));
-                        };
-                        // Negative is not a block. graph-node types it `Int`, so the parser accepts one.
-                        let n = u64::try_from(*n).map_err(|_| {
-                            Unsupported::Argument("`block.number_gte` must not be negative".into())
-                        })?;
-                        min_block = Some(n);
-                    }
-                    _ => return Err(Unsupported::TimeTravel),
-                }
-            }
+            "block" => min_block = Some(minimum_block(value)?),
             // Accepted and ignored on purpose: it selects an error policy, and a nest has no
             // subgraph indexing errors to report either way.
             "subgraphError" => {}
@@ -1430,6 +1407,26 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         singular,
         min_block,
     })
+}
+
+/// A root's `block` argument, shared by entity roots and `_meta`. `number_gte` is a precondition on
+/// the head rather than a past state, so it is answerable exactly. `number` and `hash` are real time
+/// travel and stay refused (#1267).
+pub fn minimum_block(value: &Value) -> Result<u64, Unsupported> {
+    let Value::Object(m) = value else {
+        return Err(Unsupported::Argument("`block` must be an object".into()));
+    };
+    if m.len() != 1 || !m.contains_key("number_gte") {
+        return Err(Unsupported::TimeTravel);
+    }
+    let Some(Value::Int(n)) = m.get("number_gte") else {
+        return Err(Unsupported::Argument(
+            "`block.number_gte` must be an integer".into(),
+        ));
+    };
+    // Negative is not a block. graph-node types it `Int`, so the parser accepts one.
+    u64::try_from(*n)
+        .map_err(|_| Unsupported::Argument("`block.number_gte` must not be negative".into()))
 }
 
 fn lower_predicate(
