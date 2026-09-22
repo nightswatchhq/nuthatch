@@ -44,6 +44,7 @@ pub mod entity_bind;
 pub mod entity_circuit;
 pub mod entity_expr;
 pub mod entity_lower;
+pub mod entity_offchain;
 pub mod entity_plan;
 pub mod entity_row;
 pub mod entity_view;

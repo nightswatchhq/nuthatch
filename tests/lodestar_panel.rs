@@ -81,7 +81,7 @@ fn the_lodestar_panel_before_and_after() {
     let mut source_rows = 0usize;
     let mut segments = 0usize;
     view.seed_begin();
-    for table in view.tables() {
+    for table in view.chain_tables() {
         let ts = schema.iter().find(|t| t.table == table).unwrap();
         nuthatch::seal::read_table_rows_by_segment(&dir, ts, &mut |chunk| {
             source_rows += chunk.len();

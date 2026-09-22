@@ -31,12 +31,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # #586: save the cache even when the job fails or is cancelled. rust-cache gates its save
-          # on success() by default, so a job killed by an expired timeout seeds nothing and the next
-          # run starts cold too - the deadlock half of #584, which raising ceilings does not fix.
-          # Proven step-level on run 31824503060: rust-cache's post step was *skipped* while
-          # checkout's succeeded in the same grace window.
-          cache-on-failure: true
+          # #1396: no save. Only CI on main writes to the 10 GB store every PR restores from; this
+          # weekly job's 816 MB entry evicted those, and a weekly probe can afford a cold build.
+          save-if: false
       - name: build doctor
         run: cargo build --release --bin nuthatch
 

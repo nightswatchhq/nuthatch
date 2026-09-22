@@ -21,6 +21,9 @@
 //! MCP schema tool report. There is deliberately no second opinion about a table's shape.
 
 use crate::entity_expr::Expr;
+use crate::entity_offchain::{
+    table_of, Column as OffchainColumn, Snapshot, Tables, OFFCHAIN_NAMESPACE,
+};
 use crate::entity_plan::{Agg, Plan, Source};
 use crate::entity_row::{Row, Scalar};
 use crate::registry::{DecodeRegistry, DecodedRow, TableSchema, Value};
@@ -47,17 +50,37 @@ enum Extract {
     Param(usize, String),
 }
 
+/// Where a bound source's rows come from.
+#[derive(Clone, Debug)]
+enum Columns {
+    /// Decoded windows, through the registry.
+    Chain(Vec<Extract>),
+    /// Retained offchain snapshots (#1437), fed whole and append-only, never as windows.
+    Offchain(Vec<OffchainColumn>),
+}
+
 /// One input relation, bound.
 #[derive(Clone, Debug)]
 pub struct BoundSource {
     pub table: String,
-    columns: Vec<Extract>,
+    columns: Columns,
 }
 
 impl BoundSource {
     /// How many columns this source contributes to the joined row.
     pub fn width(&self) -> usize {
-        self.columns.len()
+        match &self.columns {
+            Columns::Chain(c) => c.len(),
+            Columns::Offchain(c) => c.len(),
+        }
+    }
+
+    /// The offchain table this source reads, if it is an offchain source.
+    pub fn offchain_table(&self) -> Option<&str> {
+        match self.columns {
+            Columns::Offchain(_) => table_of(&self.table),
+            Columns::Chain(_) => None,
+        }
     }
 }
 
@@ -69,15 +92,26 @@ pub struct Binding {
 }
 
 impl Binding {
-    /// Resolve `plan` against `registry`, or refuse.
+    /// Resolve `plan` against `registry`, or refuse. A nest with no offchain tables binds this way.
     pub fn bind(plan: &Plan, registry: &DecodeRegistry) -> Result<Self> {
+        Self::bind_with_offchain(plan, registry, &Tables::none())
+    }
+
+    /// Resolve `plan` against `registry` and the nest's offchain snapshots, or refuse. The registry
+    /// refuses any alias that would decode into `offchain__`, so the namespace alone decides the
+    /// kind of source.
+    pub fn bind_with_offchain(
+        plan: &Plan,
+        registry: &DecodeRegistry,
+        offchain: &Tables,
+    ) -> Result<Self> {
         let schema = registry.schema();
-        let left = bind_source(&plan.left, &schema)?;
-        let right = plan
-            .join
-            .as_ref()
-            .map(|j| bind_source(&j.right, &schema))
-            .transpose()?;
+        let bind = |source: &Source| match table_of(&source.table) {
+            Some(table) => bind_offchain(source, table, offchain),
+            None => bind_source(source, &schema),
+        };
+        let left = bind(&plan.left)?;
+        let right = plan.join.as_ref().map(|j| bind(&j.right)).transpose()?;
 
         let binding = Binding { left, right };
         binding.check_indices(plan)?;
@@ -162,9 +196,43 @@ impl Binding {
         Ok((left, right))
     }
 
+    /// The offchain counterpart of [`Self::window`]: one snapshot of `table` as the circuit's two
+    /// input relations. Only a side reading that table gets rows; both do when it joins itself.
+    pub fn snapshot(&self, table: &str, snapshot: &Snapshot) -> Result<(Vec<Row>, Vec<Row>)> {
+        let side = |bound: &BoundSource| -> Result<Vec<Row>> {
+            match &bound.columns {
+                Columns::Offchain(columns) if bound.offchain_table() == Some(table) => snapshot
+                    .rows(columns)
+                    .with_context(|| format!("converting a snapshot of {}", bound.table)),
+                _ => Ok(Vec::new()),
+            }
+        };
+        let left = side(&self.left)?;
+        let right = self
+            .right
+            .as_ref()
+            .map(side)
+            .transpose()?
+            .unwrap_or_default();
+        Ok((left, right))
+    }
+
+    /// The offchain tables this binding reads, left then right.
+    pub fn offchain_tables(&self) -> Vec<&str> {
+        std::iter::once(&self.left)
+            .chain(self.right.as_ref())
+            .filter_map(BoundSource::offchain_table)
+            .collect()
+    }
+
     fn row(&self, bound: &BoundSource, row: &DecodedRow) -> Result<Row> {
-        bound
-            .columns
+        let Columns::Chain(columns) = &bound.columns else {
+            bail!(
+                "{} is an offchain source; it is fed snapshots, not decoded windows",
+                bound.table
+            )
+        };
+        columns
             .iter()
             .map(|e| self.value(e, row))
             .collect::<Result<Vec<_>>>()
@@ -255,7 +323,30 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
 
     Ok(BoundSource {
         table: source.table.clone(),
-        columns,
+        columns: Columns::Chain(columns),
+    })
+}
+
+fn bind_offchain(source: &Source, table: &str, offchain: &Tables) -> Result<BoundSource> {
+    let Some(found) = offchain.table(table)? else {
+        let known: Vec<String> = offchain
+            .names()
+            .iter()
+            .map(|t| format!("{OFFCHAIN_NAMESPACE}{t}"))
+            .collect();
+        bail!(
+            "no offchain table {} in this nest. Offchain tables: {}",
+            source.table,
+            if known.is_empty() {
+                "none".into()
+            } else {
+                known.join(", ")
+            }
+        )
+    };
+    Ok(BoundSource {
+        table: source.table.clone(),
+        columns: Columns::Offchain(found.bind(&source.table, &source.columns)?),
     })
 }
 
@@ -488,6 +579,132 @@ mod tests {
             plan.evaluate(&left, &[]).unwrap(),
             "§8 still holds on rows that came from a real decode"
         );
+    }
+
+    /// Seal one `tiers(account, tier)` snapshot the way `offchain drop` does.
+    fn tiers(dir: &std::path::Path, rows: &[(&str, i64)]) {
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![
+                Field::new("account", DataType::Utf8, false),
+                Field::new("tier", DataType::Int64, false),
+            ])),
+            vec![
+                std::sync::Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                std::sync::Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let src = dir.join("tiers.parquet");
+        std::fs::write(&src, bytes).unwrap();
+        crate::offchain::drop_file(dir, &src, "tiers").unwrap();
+    }
+
+    /// `SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account
+    /// GROUP BY t.tier`
+    fn received_by_tier() -> Plan {
+        Plan {
+            left: transfer_source(&["to", "value"]),
+            left_filter: None,
+            join: Some(Join {
+                right: Source {
+                    table: "offchain__tiers".into(),
+                    columns: vec!["account".into(), "tier".into()],
+                },
+                right_filter: None,
+                on: (0, 0),
+            }),
+            key: vec![Expr::Column(3)],
+            aggregates: vec![Agg::Sum(Expr::Column(1))],
+        }
+    }
+
+    /// #1437: a chain source and an offchain source in one entity. Decoded windows feed only the
+    /// chain side and snapshots only the offchain side, and the circuit agrees with the evaluator.
+    #[test]
+    fn an_offchain_snapshot_joins_a_decoded_window_through_the_binding_and_the_circuit() {
+        let reg = registry();
+        let dir = tempfile::tempdir().unwrap();
+        tiers(dir.path(), &[(BOB, 1), (ALICE, 2)]);
+        let offchain = Tables::load(dir.path()).unwrap();
+        let plan = received_by_tier();
+        let binding = Binding::bind_with_offchain(&plan, &reg, &offchain).unwrap();
+        assert_eq!(binding.offchain_tables(), vec!["tiers"]);
+
+        let (left, right) = binding
+            .window(&decode(
+                &reg,
+                &[
+                    transfer(ALICE, BOB, "64", 10, 0),
+                    transfer(BOB, ALICE, "5", 11, 0),
+                ],
+            ))
+            .unwrap();
+        assert_eq!(
+            (left.len(), right.len()),
+            (2, 0),
+            "a window never feeds the offchain side"
+        );
+
+        let snapshot = &offchain.table("tiers").unwrap().unwrap().snapshots()[0].clone();
+        let (none, tiers) = binding.snapshot("tiers", snapshot).unwrap();
+        assert_eq!(
+            (none.len(), tiers.len()),
+            (0, 2),
+            "a snapshot never feeds the chain side"
+        );
+        let (a, b) = binding.snapshot("other", snapshot).unwrap();
+        assert!(
+            a.is_empty() && b.is_empty(),
+            "a snapshot of another table feeds nothing"
+        );
+
+        let weighted = |rows: &[Row]| rows.iter().map(|r| (r.clone(), 1)).collect::<Vec<_>>();
+        let mut circuit = EntityCircuit::build(plan.clone()).unwrap();
+        let mut relation = crate::entity_plan::Relation::new();
+        circuit
+            .apply(&weighted(&left), &weighted(&tiers), &mut relation)
+            .unwrap();
+        assert_eq!(
+            relation.get(&Row(vec![Scalar::Int(1)])),
+            Some(&Row(vec![Scalar::Int(100)])),
+            "0x64 to bob, who is tier 1"
+        );
+        assert_eq!(relation, plan.evaluate(&left, &tiers).unwrap());
+    }
+
+    #[test]
+    fn an_unknown_offchain_table_is_refused_at_load_and_names_the_ones_there_are() {
+        let reg = registry();
+        let err = format!(
+            "{:#}",
+            Binding::bind(&received_by_tier(), &reg).unwrap_err()
+        );
+        assert!(
+            err.contains("no offchain table offchain__tiers")
+                && err.contains("Offchain tables: none"),
+            "{err}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        tiers(dir.path(), &[(BOB, 1)]);
+        let mut plan = received_by_tier();
+        plan.join.as_mut().unwrap().right.table = "offchain__tier".into();
+        let err = format!(
+            "{:#}",
+            Binding::bind_with_offchain(&plan, &reg, &Tables::load(dir.path()).unwrap())
+                .unwrap_err()
+        );
+        assert!(err.contains("Offchain tables: offchain__tiers"), "{err}");
     }
 
     /// The refusal that has to happen at load. An entity naming a column the ABI does not have is a

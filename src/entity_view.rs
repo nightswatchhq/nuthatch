@@ -30,6 +30,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::entity_bind::Binding;
 use crate::entity_circuit::EntityCircuit;
+use crate::entity_offchain::Snapshot;
 use crate::entity_plan::{Plan, Relation};
 use crate::entity_row::Row;
 use crate::registry::{DecodeRegistry, DecodedRow};
@@ -64,7 +65,77 @@ enum Msg {
     /// something any reader should see anyway. `Flush` publishes what a deferred batch left
     /// pending, which is what `EntityView::seed_end` waits on.
     Batch(Box<Batch>, u64, bool),
+    /// Rows of appended offchain snapshots (#1437), and the version `table` reaches once they fold.
+    /// The block watermark does not move: a snapshot carries no block.
+    Offchain(Box<Batch>, String, OffchainMark),
+    /// A rebuild, folded into a pending circuit and relation beside the live ones so readers keep
+    /// the old, correctly labelled state until `Rebuild::Commit` swaps the new one in under one lock.
+    Rebuild(Rebuild),
     Flush(SyncSender<()>),
+}
+
+const REBUILD_ORDER: &str =
+    "a rebuild message arrived with no rebuild in progress; the ingest path fed it out of order";
+
+enum Rebuild {
+    Begin,
+    Batch(Box<Batch>),
+    Offchain(Box<Batch>, String, OffchainMark),
+    Commit(u64),
+}
+
+/// How far an entity has applied one offchain table (#1437): how many snapshots, the latest, and a
+/// digest of the whole ordered list, which is what tells a replaced snapshot from an unchanged one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OffchainMark {
+    pub snapshots: usize,
+    pub latest: String,
+    pub digest: String,
+}
+
+impl OffchainMark {
+    pub fn of(version: &[String]) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for hash in version {
+            h.update((hash.len() as u64).to_le_bytes());
+            h.update(hash.as_bytes());
+        }
+        Self {
+            snapshots: version.len(),
+            latest: version.last().cloned().unwrap_or_default(),
+            digest: hex::encode(h.finalize()),
+        }
+    }
+}
+
+/// What an entity's rows account for, read with them under one lock (#932): the block it has folded
+/// through and, per offchain table it reads, the snapshots it has folded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub through: u64,
+    pub offchain: std::collections::BTreeMap<String, OffchainMark>,
+}
+
+/// Per entity, what the rows it contributed to an answer account for.
+pub type Watermarks = std::collections::BTreeMap<String, Applied>;
+
+impl Applied {
+    /// The offchain half as a response label, or `None` for an entity that reads no offchain table.
+    pub fn offchain_json(&self) -> Option<serde_json::Value> {
+        (!self.offchain.is_empty()).then(|| {
+            self.offchain
+                .iter()
+                .map(|(table, m)| {
+                    (
+                        format!("{}{table}", crate::entity_offchain::OFFCHAIN_NAMESPACE),
+                        serde_json::json!({ "snapshots": m.snapshots, "latest": m.latest }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        })
+    }
 }
 
 /// What the entity currently answers with, published as one value.
@@ -87,6 +158,17 @@ struct Published {
     /// legitimately behind, indefinitely, and indistinguishable from dead unless something watches
     /// it advance. Zero until the first batch lands, which is "no progress yet" rather than 1970.
     progress_at: u64,
+    /// Per offchain table, the snapshots folded into `relation` (#1437).
+    offchain: std::collections::BTreeMap<String, OffchainMark>,
+}
+
+impl Published {
+    fn applied(&self) -> Applied {
+        Applied {
+            through: self.through,
+            offchain: self.offchain.clone(),
+        }
+    }
 }
 
 /// One maintained authored entity: its circuit, its state, and how far it has been applied.
@@ -114,6 +196,9 @@ pub struct EntityView {
     /// and "unhealthy" without a cause sends whoever is on call to the logs of a process that may
     /// since have restarted.
     fault: Arc<RwLock<Option<String>>>,
+    /// Per offchain table, the snapshots sent to the circuit (#1437). Sent, not folded: the next
+    /// refresh compares the manifest against this, so no snapshot is ever fed twice.
+    fed: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 impl EntityView {
@@ -142,14 +227,27 @@ impl EntityView {
         max_rows: usize,
         warm: bool,
     ) -> Result<Self> {
+        let binding = Binding::bind(plan, registry)
+            .with_context(|| format!("binding entity `{name}` to this nest's tables"))?;
+        Self::start_bound(name, plan, binding, columns, max_rows, warm)
+    }
+
+    /// [`Self::start`] for a plan already bound, which is how one reading offchain snapshots is
+    /// started: the caller binds it against the nest's offchain tables as well as its registry.
+    pub fn start_bound(
+        name: &str,
+        plan: &Plan,
+        binding: Binding,
+        columns: &[String],
+        max_rows: usize,
+        warm: bool,
+    ) -> Result<Self> {
         if max_rows == 0 {
             return Err(anyhow!(
                 "entity `{name}` declares max_rows = 0, which admits nothing. §7 wants a bound that \
                  bites, not one that forbids the entity outright"
             ));
         }
-        let binding = Binding::bind(plan, registry)
-            .with_context(|| format!("binding entity `{name}` to this nest's tables"))?;
         let unavailable = warm.then(|| {
             format!(
                 "entity `{name}` cannot be rebuilt after a restart: its state is derived and not \
@@ -171,7 +269,7 @@ impl EntityView {
         std::thread::Builder::new()
             .name(format!("nuthatch-entity-{name}"))
             .spawn(move || {
-                let mut circuit = match EntityCircuit::build(plan) {
+                let mut circuit = match EntityCircuit::build(plan.clone()) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!("entity `{thread_label}` circuit failed to start: {e:#}");
@@ -190,6 +288,13 @@ impl EntityView {
                 let mut live: i64 = 0;
                 // The watermark of a folded-but-unpublished batch, i.e. a seed in progress.
                 let mut pending: Option<u64> = None;
+                // A rebuild in progress (#1437): circuit, relation, live count and offchain marks.
+                let mut rebuilding: Option<(
+                    EntityCircuit,
+                    Relation,
+                    i64,
+                    std::collections::BTreeMap<String, OffchainMark>,
+                )> = None;
                 // Stamp the watermark onto the already-updated relation. **The relation is not
                 // copied here.** `circuit.apply` folds its deltas straight into `published.relation`
                 // under this same lock, so a batch costs what the batch changed rather than what the
@@ -239,6 +344,64 @@ impl EntityView {
                                 }
                             }
                         }
+                        Msg::Offchain(batch, table, mark) => {
+                            let mut published = shared.write().unwrap();
+                            if let Err(e) = step(
+                                &mut circuit,
+                                &batch,
+                                &mut live,
+                                max_rows,
+                                &mut published.relation,
+                            ) {
+                                tracing::error!("entity `{thread_label}` step failed: {e:#}");
+                                *stopped.write().unwrap() = Some(format!("{e:#}"));
+                                break;
+                            }
+                            published.offchain.insert(table, mark);
+                        }
+                        Msg::Rebuild(Rebuild::Begin) => match EntityCircuit::build(plan.clone()) {
+                            Ok(c) => rebuilding = Some((c, Relation::new(), 0, Default::default())),
+                            Err(e) => {
+                                *stopped.write().unwrap() = Some(format!("{e:#}"));
+                                break;
+                            }
+                        },
+                        Msg::Rebuild(Rebuild::Batch(batch)) => {
+                            let Some((c, relation, count, _)) = rebuilding.as_mut() else {
+                                *stopped.write().unwrap() = Some(REBUILD_ORDER.into());
+                                break;
+                            };
+                            if let Err(e) = step(c, &batch, count, max_rows, relation) {
+                                tracing::error!("entity `{thread_label}` rebuild failed: {e:#}");
+                                *stopped.write().unwrap() = Some(format!("{e:#}"));
+                                break;
+                            }
+                        }
+                        Msg::Rebuild(Rebuild::Offchain(batch, table, mark)) => {
+                            let Some((c, relation, count, marks)) = rebuilding.as_mut() else {
+                                *stopped.write().unwrap() = Some(REBUILD_ORDER.into());
+                                break;
+                            };
+                            if let Err(e) = step(c, &batch, count, max_rows, relation) {
+                                tracing::error!("entity `{thread_label}` rebuild failed: {e:#}");
+                                *stopped.write().unwrap() = Some(format!("{e:#}"));
+                                break;
+                            }
+                            marks.insert(table, mark);
+                        }
+                        Msg::Rebuild(Rebuild::Commit(through)) => {
+                            let Some((c, relation, count, marks)) = rebuilding.take() else {
+                                *stopped.write().unwrap() = Some(REBUILD_ORDER.into());
+                                break;
+                            };
+                            let mut published = shared.write().unwrap();
+                            circuit = c;
+                            live = count;
+                            published.relation = relation;
+                            published.offchain = marks;
+                            pending = None;
+                            stamp(through, &mut published);
+                        }
                         // Messages are processed in order, so by the time the barrier is seen every
                         // prior batch is folded - the ack unblocks the waiter.
                         Msg::Flush(ack) => {
@@ -260,6 +423,7 @@ impl EntityView {
             state,
             unavailable,
             fault,
+            fed: Default::default(),
         })
     }
 
@@ -297,12 +461,12 @@ impl EntityView {
     ///
     /// The circuit thread was never the problem - `step` and `stamp` already share one write lock, so
     /// no reader sees the relation mid-transaction. The gap was entirely on the reading side.
-    pub fn rows_as_json_with_watermark(&self) -> (Vec<serde_json::Value>, u64) {
+    pub fn rows_as_json_with_watermark(&self) -> (Vec<serde_json::Value>, Applied) {
         let state = match self.state.read() {
             Ok(s) => s,
-            Err(_) => return (Vec::new(), 0),
+            Err(_) => return (Vec::new(), Applied::default()),
         };
-        let through = state.through;
+        let applied = state.applied();
         let rows = state
             .relation
             .iter()
@@ -314,7 +478,7 @@ impl EntityView {
                 serde_json::Value::Object(obj)
             })
             .collect();
-        (rows, through)
+        (rows, applied)
     }
 
     /// Whether the circuit thread is alive and folding. `false` means it died - on start, on a step,
@@ -329,10 +493,12 @@ impl EntityView {
         self.unavailable.as_deref()
     }
 
-    /// The decoded tables this entity reads - one, or two when it joins.
-    pub fn tables(&self) -> Vec<&str> {
-        std::iter::once(self.binding.left.table.as_str())
-            .chain(self.binding.right.as_ref().map(|r| r.table.as_str()))
+    /// The decoded tables this entity reads: none, one, or two when it joins.
+    pub fn chain_tables(&self) -> Vec<&str> {
+        std::iter::once(&self.binding.left)
+            .chain(self.binding.right.as_ref())
+            .filter(|s| s.offchain_table().is_none())
+            .map(|s| s.table.as_str())
             .collect()
     }
 
@@ -386,6 +552,114 @@ impl EntityView {
             return Err(anyhow!("seeding entity `{}` faulted: {why}", self.name));
         }
         Ok(())
+    }
+
+    /// The offchain tables this entity reads (#1437), by manifest name.
+    pub fn offchain_tables(&self) -> Vec<&str> {
+        self.binding.offchain_tables()
+    }
+
+    /// The snapshots of `table` already sent to this entity, in append order.
+    pub fn offchain_fed(&self, table: &str) -> Vec<String> {
+        self.fed
+            .lock()
+            .unwrap()
+            .get(table)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Feed appended `snapshots` of `table` at `+1`, carrying it to `version` (#1437). Offchain rows
+    /// are never retracted: a snapshot that changes any other way is a [`Self::rebuild_begin`].
+    ///
+    /// An unavailable entity is fed nothing, exactly as with a window.
+    pub fn apply_offchain(
+        &self,
+        table: &str,
+        snapshots: &[Snapshot],
+        version: &[String],
+    ) -> Result<()> {
+        if self.unavailable.is_some() {
+            return Ok(());
+        }
+        let batch = self.offchain_batch(table, snapshots)?;
+        let _ = self.tx.send(Msg::Offchain(
+            Box::new(batch),
+            table.to_string(),
+            OffchainMark::of(version),
+        ));
+        self.fed
+            .lock()
+            .unwrap()
+            .insert(table.to_string(), version.to_vec());
+        Ok(())
+    }
+
+    /// Start rebuilding off to one side (#1437). Until [`Self::rebuild_commit`], readers keep the
+    /// current relation and the version that labels it; the cost is holding both while it runs.
+    pub fn rebuild_begin(&self) {
+        self.fed.lock().unwrap().clear();
+        let _ = self.tx.send(Msg::Rebuild(Rebuild::Begin));
+    }
+
+    /// Feed stored chain history to the rebuild at `+1`.
+    pub fn rebuild_chain(&self, rows: &[DecodedRow]) -> Result<()> {
+        let (left, right) = self
+            .binding
+            .window(rows)
+            .with_context(|| format!("rebuilding entity `{}` from stored history", self.name))?;
+        let batch = Batch {
+            left: left.into_iter().map(|r| (r, 1)).collect(),
+            right: right.into_iter().map(|r| (r, 1)).collect(),
+        };
+        let _ = self.tx.send(Msg::Rebuild(Rebuild::Batch(Box::new(batch))));
+        Ok(())
+    }
+
+    /// Feed every present snapshot of `table` to the rebuild.
+    pub fn rebuild_offchain(
+        &self,
+        table: &str,
+        snapshots: &[Snapshot],
+        version: &[String],
+    ) -> Result<()> {
+        let batch = self.offchain_batch(table, snapshots)?;
+        let _ = self.tx.send(Msg::Rebuild(Rebuild::Offchain(
+            Box::new(batch),
+            table.to_string(),
+            OffchainMark::of(version),
+        )));
+        self.fed
+            .lock()
+            .unwrap()
+            .insert(table.to_string(), version.to_vec());
+        Ok(())
+    }
+
+    /// Swap the rebuilt relation in, labelled `through`, and wait until it is visible.
+    pub fn rebuild_commit(&self, through: u64) -> Result<()> {
+        let _ = self.tx.send(Msg::Rebuild(Rebuild::Commit(through)));
+        self.flush();
+        match self.fault() {
+            Some(why) => Err(anyhow!("rebuilding entity `{}` faulted: {why}", self.name)),
+            None => Ok(()),
+        }
+    }
+
+    fn offchain_batch(&self, table: &str, snapshots: &[Snapshot]) -> Result<Batch> {
+        let mut batch = Batch {
+            left: Vec::new(),
+            right: Vec::new(),
+        };
+        for snapshot in snapshots {
+            let (left, right) = self
+                .binding
+                .snapshot(table, snapshot)
+                .with_context(|| format!("feeding offchain__{table} to entity `{}`", self.name))?;
+            batch.left.extend(left.into_iter().map(|r| (r, 1)));
+            batch.right.extend(right.into_iter().map(|r| (r, 1)));
+        }
+        Ok(batch)
     }
 
     /// Why this entity stopped, if it has. `None` is a live entity.
@@ -480,15 +754,15 @@ impl EntityView {
     ///
     /// Serving a row and then reading `applied_through()` separately is the race this fixes; doing it
     /// inside the accessor would only move the race, so both come off the same guard.
-    pub fn get_with_watermark(&self, key: &Row) -> (Option<Row>, u64) {
+    pub fn get_with_watermark(&self, key: &Row) -> (Option<Row>, Applied) {
         match self.state.read() {
-            Ok(s) => (s.relation.get(key).cloned(), s.through),
-            Err(_) => (None, 0),
+            Ok(s) => (s.relation.get(key).cloned(), s.applied()),
+            Err(_) => (None, Applied::default()),
         }
     }
 
     /// [`Self::head_rows`] **with** the watermark describing those rows, one acquisition (#932).
-    pub fn head_rows_with_watermark(&self, limit: usize) -> (usize, Vec<(Row, Row)>, u64) {
+    pub fn head_rows_with_watermark(&self, limit: usize) -> (usize, Vec<(Row, Row)>, Applied) {
         match self.state.read() {
             Ok(s) => (
                 s.relation.len(),
@@ -497,9 +771,9 @@ impl EntityView {
                     .take(limit)
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                s.through,
+                s.applied(),
             ),
-            Err(_) => (0, Vec::new(), 0),
+            Err(_) => (0, Vec::new(), Applied::default()),
         }
     }
 
@@ -531,11 +805,11 @@ impl EntityView {
     /// separately, so a batch landing between the two produced a count from block N labelled N+k.
     /// Less consequential than the `/sql` case (nobody reconciles against a row count) but the same
     /// defect, and cheaper to fix once than to explain twice.
-    pub fn len_and_watermark(&self) -> (usize, u64) {
+    pub fn len_and_watermark(&self) -> (usize, Applied) {
         self.state
             .read()
-            .map(|s| (s.relation.len(), s.through))
-            .unwrap_or((0, 0))
+            .map(|s| (s.relation.len(), s.applied()))
+            .unwrap_or_default()
     }
 
     /// The block this entity has folded through (criterion 2).
@@ -549,7 +823,8 @@ impl EntityView {
 
     /// The applied-through watermark **for a fence, never for a label** (#1186).
     ///
-    /// The same number [`applied_through`](Self::applied_through) returns, under a different name on
+    /// [`applied_through`](Self::applied_through) plus the offchain snapshots applied (#1437), since
+    /// an appended snapshot changes the rows without moving the block, under a different name on
     /// purpose. #932 is that a watermark read separately from the rows it describes can label an
     /// answer more current than the rows in it, and `entity_provenance_is_atomic.rs` is a source gate
     /// that keeps bare `applied_through()` out of the serving path so nobody reintroduces it by
@@ -561,8 +836,8 @@ impl EntityView {
     /// So the gate keeps meaning exactly what it says, and a value that must never be reported has a
     /// name that says so. If you find yourself putting this into a response body, you want
     /// `rows_as_json_with_watermark`, and you are about to reintroduce #932.
-    pub fn fence_watermark(&self) -> u64 {
-        self.applied_through()
+    pub fn fence_watermark(&self) -> Applied {
+        self.state.read().map(|s| s.applied()).unwrap_or_default()
     }
 
     /// When the applied-through watermark last moved, in unix seconds; `0` before the first batch.
@@ -758,6 +1033,36 @@ mod tests {
 
         assert_eq!(v.relation().get(&bob()), Some(&Row(vec![Scalar::Int(9)])));
         assert_eq!(v.applied_through(), 101);
+        assert!(v.is_healthy());
+    }
+
+    /// #1437: a rebuild is folded beside the live relation, so readers keep the old one, and the
+    /// label that describes it, until the commit swaps the new one in whole.
+    #[test]
+    fn a_rebuild_is_invisible_until_it_commits() {
+        let reg = registry();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1_000, false).unwrap();
+        v.apply_window(
+            &decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]),
+            1,
+            100,
+        )
+        .unwrap();
+        v.flush();
+        let before = v.relation();
+
+        v.rebuild_begin();
+        v.rebuild_chain(&decode(
+            &reg,
+            &[log(TRANSFER_TOPIC0, ALICE, BOB, "9", 100, 0)],
+        ))
+        .unwrap();
+        v.flush();
+        assert_eq!(v.relation(), before, "a pending rebuild is not visible");
+
+        v.rebuild_commit(100).unwrap();
+        assert_eq!(v.relation().get(&bob()), Some(&Row(vec![Scalar::Int(9)])));
+        assert_eq!(v.applied_through(), 100);
         assert!(v.is_healthy());
     }
 

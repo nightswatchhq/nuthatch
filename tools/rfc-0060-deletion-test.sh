@@ -1,10 +1,14 @@
 #!/bin/bash
 # RFC-0060 §5.6 deletion test: a default build's CLI help and `init` output must equal main's.
 # Usage: rfc-0060-deletion-test.sh <main-binary> <default-build-binary> <out-dir> <main src/cli.rs>
-# Hidden commands come from cli.rs, because `--help` never lists them.
+# Hidden commands come from cli.rs, because `--help` never lists them. Exits 1 on any difference.
 set -u
-REF=$1; GATED=$2; OUT=$3
+OUT=$3
 mkdir -p "$OUT"; rm -rf "$OUT"/*
+# clap prints argv[0] in every usage line, so both sides run under the same name.
+mkdir -p "$OUT/bin-ref" "$OUT/bin-gated"
+cp "$1" "$OUT/bin-ref/nuthatch"; cp "$2" "$OUT/bin-gated/nuthatch"
+REF=$OUT/bin-ref/nuthatch; GATED=$OUT/bin-gated/nuthatch
 subs() { "$1" $2 --help 2>/dev/null | grep -E '^  [a-z][a-z0-9-]* ' | awk '{print $1}' | grep -v '^help$'; }
 top="$(subs "$REF" "") $(awk '/#\[command\(hide = true\)\]/{getline; print}' "$4" | sed -E 's/^ *([A-Za-z]+).*/\1/; s/([a-z])([A-Z])/\1-\2/g' | tr A-Z a-z)"
 help() {
@@ -23,8 +27,14 @@ ABI='[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"fro
 for side in ref gated; do
   bin=$REF; [ $side = gated ] && bin=$GATED
   mkdir -p "$OUT/$side"; echo "$ABI" > "$OUT/$side/erc20.json"
-  ( cd "$OUT/$side" && "$bin" init 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48 --abi erc20.json --chain mainnet --rpc http://127.0.0.1:9 --dir nest > init.log 2>&1; echo "init-$side-exit=$?" )
+  ( cd "$OUT/$side" && "$bin" init 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48 --abi erc20.json --chain mainnet --rpc http://127.0.0.1:9 --dir nest > init.log 2>&1; echo $? > init.exit )
 done
+echo "init exit: ref=$(cat "$OUT/ref/init.exit") gated=$(cat "$OUT/gated/init.exit")"
 diff -r "$OUT/ref/nest" "$OUT/gated/nest" > "$OUT/init.diff"; echo "init-diff-lines=$(wc -l < "$OUT/init.diff" | tr -d ' ')"
 diff "$OUT/ref/init.log" "$OUT/gated/init.log" > "$OUT/init-log.diff"; echo "init-output-diff-lines=$(wc -l < "$OUT/init-log.diff" | tr -d ' ')"
 echo "init files: $(find "$OUT/ref/nest" -type f | wc -l | tr -d ' ')"
+if [ -s "$OUT/help.diff" ] || [ -s "$OUT/init.diff" ] || [ -s "$OUT/init-log.diff" ] \
+  || ! cmp -s "$OUT/ref/init.exit" "$OUT/gated/init.exit"; then
+  echo "FAIL: the default build differs from main; see $OUT"; exit 1
+fi
+echo "PASS"

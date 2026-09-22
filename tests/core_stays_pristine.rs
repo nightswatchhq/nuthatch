@@ -256,3 +256,29 @@ fn the_golden_path_routes_are_all_still_mounted() {
         );
     }
 }
+
+/// RFC-0045 stage 2 (#1436): a price pull runs only as its own host-scheduled command. A call from
+/// the indexer, the seal loop or a query handler would put a provider's outage or latency on the
+/// chain cursor or a caller's request, which is the inline shape RFC-0037 is still paying for.
+#[test]
+fn an_offchain_pull_runs_only_from_its_own_command() {
+    let mut callers = Vec::new();
+    for path in production_files() {
+        let src = strip_test_modules(&std::fs::read_to_string(&path).unwrap());
+        let calls = src.matches("pull_json(").count();
+        let definitions = src.matches("fn pull_json(").count();
+        if calls > definitions {
+            callers.push(path.strip_prefix(root()).unwrap().display().to_string());
+        }
+    }
+    assert_eq!(
+        callers,
+        ["src/main.rs"],
+        "offchain::pull_json must be reached only from the `offchain pull` dispatch"
+    );
+    let main = strip_test_modules(&std::fs::read_to_string(root().join("src/main.rs")).unwrap());
+    assert!(
+        main.contains("cli::OffchainWhat::Pull(args)"),
+        "the dispatch arm moved"
+    );
+}
