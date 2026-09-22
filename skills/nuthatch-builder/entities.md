@@ -101,6 +101,11 @@ An entity may read or join `offchain__<table>`, the snapshots `nuthatch offchain
 `/ready`, `/derived` and `/sql` provenance name what was applied:
 `"offchain": {"offchain__prices": {"snapshots": 12, "latest": "<hash>"}}`.
 
+**Such an entity is reproducible by snapshot, not re-derivable from chain,** and every surface says
+so with `"reproducibility": "snapshot"`, as does any `/sql` answer that reads `offchain__<table>`
+directly. The label follows from what the entity reads, so no configuration removes it. Do not cite
+one of these answers as chain-derived.
+
 ## Watching one
 
 Six series on `/metrics`, labelled by nest and entity:

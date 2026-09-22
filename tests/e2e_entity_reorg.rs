@@ -58,6 +58,15 @@ key = ["to"]
 max_rows = 10000
 "#;
 
+/// #1437: an entity joining chain transfers to an offchain `tiers` table.
+const BY_TIER: &str = r#"
+[[entities]]
+name = "by_tier"
+sql = "SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier"
+key = ["tier"]
+max_rows = 10000
+"#;
+
 fn declare_entity(dir: &std::path::Path) {
     declare(dir, RECEIVED);
 }
@@ -1384,13 +1393,6 @@ async fn a_derived_keyed_read_answers_from_maintained_state_with_provenance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_offchain_snapshot_dropped_while_running_reaches_the_entity_and_survives_a_restart() {
     use nuthatch::entity_row::{Row, Scalar};
-    const BY_TIER: &str = r#"
-[[entities]]
-name = "by_tier"
-sql = "SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier"
-key = ["tier"]
-max_rows = 10000
-"#;
     let dir = tempfile::tempdir().unwrap();
     let drop = |name: &str, tier: &str| {
         let csv = dir.path().join(format!("{name}.csv"));
@@ -1442,4 +1444,66 @@ max_rows = 10000
     shutdown_and_settle(warm).await;
     assert_eq!(after, before, "a warm restart seeds the snapshots back");
     assert_eq!(applied.offchain["tiers"].snapshots, 2);
+}
+
+/// #1437 slice 3, through the routes. An answer that read an offchain table, directly or through an
+/// entity, says it is reproducible by snapshot and names the snapshots; a remembered answer says so
+/// too; a chain-only answer asserts nothing of the kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_read_offchain_data_says_it_is_reproducible_by_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("tiers.csv");
+    std::fs::write(&csv, format!("account,tier\n{},gold\n", account(2))).unwrap();
+    nuthatch::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
+    let hash = nuthatch::offchain::load(dir.path()).unwrap().tables["tiers"][0]
+        .hash
+        .clone();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=4 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(4);
+    let rt = spawn_declared(dir.path(), tape, 4, BY_TIER).await;
+    rt.state.entities[0].flush();
+    let sql = |q: &str| format!("/sql?q={}", urlencoding_lite(q));
+
+    let (status, direct) = get_json(&rt, &sql("SELECT * FROM offchain__tiers")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{direct}");
+    let provenance = &direct["provenance"];
+    assert_eq!(provenance["reproducibility"], "snapshot", "{direct}");
+    assert_eq!(provenance["offchain"]["offchain__tiers"]["snapshots"], 1);
+    assert_eq!(
+        provenance["offchain"]["offchain__tiers"]["latest"],
+        hash.as_str()
+    );
+    let (_, again) = get_json(&rt, &sql("SELECT * FROM offchain__tiers")).await;
+    assert_eq!(again["cached"], true, "{again}");
+    assert_eq!(
+        again["provenance"]["reproducibility"], "snapshot",
+        "{again}"
+    );
+
+    let (_, through) = get_json(&rt, &sql("SELECT * FROM by_tier")).await;
+    assert_eq!(
+        through["provenance"]["reproducibility"], "snapshot",
+        "{through}"
+    );
+    assert_eq!(
+        through["provenance"]["entities"][0]["reproducibility"],
+        "snapshot"
+    );
+
+    let (_, derived) = get_json(&rt, "/derived").await;
+    assert_eq!(
+        derived["entities"][0]["reproducibility"], "snapshot",
+        "{derived}"
+    );
+
+    let (_, chain) = get_json(&rt, &sql("SELECT count(*) AS n FROM usdc__transfer")).await;
+    assert!(
+        chain["provenance"].get("reproducibility").is_none(),
+        "{chain}"
+    );
+    assert!(chain["provenance"].get("offchain").is_none(), "{chain}");
+    shutdown_and_settle(rt).await;
 }
