@@ -300,6 +300,10 @@ impl CallDecl {
     /// therefore produce the same content addresses. Anchoring on `from` would give two operators
     /// different sample sets for the same declaration, which defeats tier 4 sharing entirely.
     pub fn blocks_in(&self, from: u64, to: u64) -> Vec<u64> {
+        // A row-driven call's blocks come from its rows. A schedule here only buys headers.
+        if self.is_row_driven() {
+            return Vec::new();
+        }
         let start = self.start.unwrap_or(0).max(from);
         if start > to {
             return Vec::new();
@@ -699,6 +703,14 @@ mod tests {
         let a = CallKey::new(1, 1, "0xab", "cd");
         let b = CallKey::new(1, 1, "0xabcd", "");
         assert_ne!(a.address(), b.address());
+    }
+
+    /// A row-driven call takes its blocks from the rows that fire it. A periodic schedule on top
+    /// only makes every window fetch headers for blocks nothing reads.
+    #[test]
+    fn a_row_driven_call_schedules_no_periodic_blocks() {
+        let d = row_driven("clock", "blockNum()", &[]);
+        assert!(d.blocks_in(0, 10_000).is_empty());
     }
 
     /// Sampling is anchored on absolute block numbers, so a resumed backfill hits the same blocks as a
