@@ -1,0 +1,8 @@
+[
+  {
+    "anonymous": false,
+    "inputs": [{"indexed": false, "name": "param", "type": "string"}],
+    "name": "ParameterUpdated",
+    "type": "event"
+  }
+]

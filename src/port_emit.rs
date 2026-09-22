@@ -385,6 +385,8 @@ fn calls_to_decls(
             contract,
             calldata: String::new(),
             on: Some(on),
+            on_any: Vec::new(),
+            canonical: false,
             signature: Some(call.signature.clone()),
             args,
             contract_column,

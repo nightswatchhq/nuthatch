@@ -1,0 +1,84 @@
+{
+  "block": 506000000,
+  "referenceDeployment": "QmR8WQECdNR6TSUf4FfLSFW7D5RDGGkd7F4A6me56pLqJb",
+  "referenceQuery": "{ paymentsEscrowTransactions(block:{number:506000000},where:{id:\"0xb1d31e8c88fc9ca2a0dd9fe004969ac5939a7cff11a9fe97803b453e13acbb294d000000\"}) { id allocationId timestamp amount collector transactionGroupId type payer { id } receiver { id } escrowAccount { id } } paymentsEscrowAccounts(block:{number:506000000},where:{payer:\"0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467\",receiver:\"0xf92f430dd8567b0d466358c79594ab58d919a6d4\",collector:\"0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e\"}) { id balance totalAmountThawing thawEndTimestamp } }",
+  "reference": {
+    "paymentsEscrowTransactions": [
+      {
+        "id": "0xb1d31e8c88fc9ca2a0dd9fe004969ac5939a7cff11a9fe97803b453e13acbb294d000000",
+        "allocationId": "0xfb0c386a952becd18048de3c101ca55d2e5bb588",
+        "timestamp": "1789574811",
+        "amount": "475310326476606759310",
+        "collector": "0xb2bb92d0de618878e438b55d5846cfecd9301105",
+        "transactionGroupId": "0xb1d31e8c88fc9ca2a0dd9fe004969ac5939a7cff11a9fe97803b453e13acbb29",
+        "type": "redeem",
+        "payer": {
+          "id": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467"
+        },
+        "receiver": {
+          "id": "0xf92f430dd8567b0d466358c79594ab58d919a6d4"
+        },
+        "escrowAccount": {
+          "id": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f4678f69f5c07477ac46fbc491b1e6d91e2bb0111a9ef92f430dd8567b0d466358c79594ab58d919a6d4"
+        }
+      }
+    ],
+    "paymentsEscrowAccounts": [
+      {
+        "id": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f4678f69f5c07477ac46fbc491b1e6d91e2bb0111a9ef92f430dd8567b0d466358c79594ab58d919a6d4",
+        "balance": "1316664836619148514816418",
+        "totalAmountThawing": "0",
+        "thawEndTimestamp": "0"
+      }
+    ]
+  },
+  "sourceMovementSummary": {
+    "count": 13229,
+    "provenance": {
+      "as_of": 506362182,
+      "entities": null,
+      "nid": null,
+      "registry_hash": "0xa93f8b09cc8d5f392ac78acc5aeb1061a5c279ec258afec5876732b9f618dac0",
+      "sealed_through": 506291104,
+      "source": "hot+sealed"
+    },
+    "groups": {
+      "escrow__deposit": {
+        "count": 1509,
+        "tokens": "8121312380345991737084983"
+      },
+      "escrow__escrow_collected": {
+        "count": 11720,
+        "tokens": "6804647543726843222268565"
+      }
+    },
+    "latestThaw": null
+  },
+  "authoredSql": "WITH source_escrow__deposit AS (SELECT * FROM escrow__deposit WHERE block_number <= 506000000 AND payer = '0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467' AND receiver = '0xf92f430dd8567b0d466358c79594ab58d919a6d4' AND collector = '0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e'),\nsource_escrow__withdraw AS (SELECT * FROM escrow__withdraw WHERE block_number <= 506000000 AND payer = '0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467' AND receiver = '0xf92f430dd8567b0d466358c79594ab58d919a6d4' AND collector = '0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e'),\nsource_escrow__escrow_collected AS (SELECT * FROM escrow__escrow_collected WHERE block_number <= 506000000 AND payer = '0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467' AND receiver = '0xf92f430dd8567b0d466358c79594ab58d919a6d4' AND collector = '0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e'),\nsource_escrow__thaw AS (SELECT * FROM escrow__thaw WHERE block_number <= 506000000 AND payer = '0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467' AND receiver = '0xf92f430dd8567b0d466358c79594ab58d919a6d4' AND collector = '0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e'),\nsource_escrow__cancel_thaw AS (SELECT * FROM escrow__cancel_thaw WHERE block_number <= 506000000 AND payer = '0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467' AND receiver = '0xf92f430dd8567b0d466358c79594ab58d919a6d4' AND collector = '0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e'),\nsource_tally__payment_collected AS (SELECT * FROM tally__payment_collected WHERE block_number <= 506000000 AND payer = '0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467' AND receiver = '0xf92f430dd8567b0d466358c79594ab58d919a6d4'),\nescrow_movement AS (SELECT payer, collector, receiver, CAST(tokens AS BIGNUM) AS delta FROM source_escrow__deposit\nUNION ALL\nSELECT payer, collector, receiver, -CAST(tokens AS BIGNUM) FROM source_escrow__withdraw\nUNION ALL\nSELECT payer, collector, receiver, -CAST(tokens AS BIGNUM) FROM source_escrow__escrow_collected),\nescrow_thaw_update AS (SELECT payer, collector, receiver, tokens AS amount, \"thawEndTimestamp\" AS deadline,\n       block_number, log_index FROM source_escrow__thaw\nUNION ALL\nSELECT payer, collector, receiver, '0', '0', block_number, log_index FROM source_escrow__cancel_thaw\nUNION ALL\nSELECT payer, collector, receiver, '0', '0', block_number, log_index FROM source_escrow__withdraw),\nescrow_identity AS (SELECT payer, collector, receiver FROM escrow_movement\nUNION\nSELECT payer, collector, receiver FROM escrow_thaw_update\nUNION\nSELECT payer, '0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e', receiver FROM source_tally__payment_collected),\npayments_escrow_account AS (WITH balance AS (\n    SELECT payer, collector, receiver, sum(delta) AS amount\n    FROM escrow_movement GROUP BY payer, collector, receiver\n), thaw AS (\n    SELECT *, row_number() OVER (PARTITION BY payer, collector, receiver ORDER BY block_number DESC, log_index DESC) AS rank\n    FROM escrow_thaw_update\n)\nSELECT i.payer || substr(i.collector, 3) || substr(i.receiver, 3) AS id,\n       i.payer, i.collector, i.receiver,\n       coalesce(CAST(b.amount AS VARCHAR), '0') AS balance,\n       coalesce(t.amount, '0') AS \"totalAmountThawing\",\n       coalesce(t.deadline, '0') AS \"thawEndTimestamp\"\nFROM escrow_identity i\nLEFT JOIN balance b USING (payer, collector, receiver)\nLEFT JOIN thaw t ON t.payer = i.payer AND t.collector = i.collector AND t.receiver = i.receiver AND t.rank = 1)\nSELECT id, balance, \"totalAmountThawing\", \"thawEndTimestamp\" FROM payments_escrow_account ORDER BY id",
+  "authoredSqlResponse": {
+    "cached": false,
+    "count": 1,
+    "degraded": false,
+    "degraded_tables": [],
+    "provenance": {
+      "as_of": 506362182,
+      "entities": null,
+      "nid": null,
+      "registry_hash": "0xa93f8b09cc8d5f392ac78acc5aeb1061a5c279ec258afec5876732b9f618dac0",
+      "sealed_through": 506291104,
+      "source": "hot+sealed"
+    },
+    "rows": [
+      {
+        "balance": "1316664836619148514816418",
+        "id": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f4678f69f5c07477ac46fbc491b1e6d91e2bb0111a9ef92f430dd8567b0d466358c79594ab58d919a6d4",
+        "thawEndTimestamp": "0",
+        "totalAmountThawing": "0"
+      }
+    ],
+    "tip_unavailable": false,
+    "truncated": false
+  },
+  "matched": true,
+  "scope": "One account's four selected balance fields over 13229 independent source logs. Author-written account views run read-only as CTEs on Lodestar's SQL endpoint at the reference block. Signer history and other accounts are not covered."
+}

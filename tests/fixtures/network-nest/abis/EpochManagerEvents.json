@@ -1,0 +1,4 @@
+[
+  {"type":"event","name":"EpochRun","anonymous":false,"inputs":[{"name":"epoch","type":"uint256","indexed":true},{"name":"caller","type":"address","indexed":false}]},
+  {"type":"event","name":"EpochLengthUpdate","anonymous":false,"inputs":[{"name":"epoch","type":"uint256","indexed":true},{"name":"epochLength","type":"uint256","indexed":false}]}
+]

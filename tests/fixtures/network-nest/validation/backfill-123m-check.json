@@ -1,0 +1,45 @@
+{
+  "date": "2026-09-19",
+  "snapshot": {
+    "manifestSha256": "8241fc50a29875bedbf8557e3402be3f8560a873929ac331343bd70ff62456c1",
+    "lastSegmentBlock": 123615752,
+    "segments": 113,
+    "rows": 73187,
+    "reservedUnits": 1698806,
+    "budgetLimitUnits": 39980000
+  },
+  "parity": {
+    "reference": "backfill-123m-reference.json",
+    "networkFields": 35,
+    "epochs": 261,
+    "epochFields": 13,
+    "passed": true,
+    "perQueryTimeoutSeconds": 10,
+    "fourCheckpointTestSeconds": 29.86,
+    "indexerReference": "backfill-123m-indexers-reference.json",
+    "indexers": 39,
+    "indexerFields": 18,
+    "indexerQuerySeconds": 8.003
+  },
+  "fixes": [
+    "Use ordered clock carry-forward instead of a per-signal preceding-history join.",
+    "Do not persist a delegation-parameter clock refresh for an existing indexer unless a new epoch is created.",
+    "Materialize the delegation fold's ordered input once instead of rebuilding it in recursive steps.",
+    "Accumulate stake/allocation movements with windows and recurse only over lock-changing events; 600 intermediate states match the original fold.",
+    "Materialize the shared capacity-refresh input once per query."
+  ],
+  "viewSha256": {
+    "26-network-clock.sql": "ab1e471cd4eb397750375ebc479e3bae589ed78863a023aee157a32cdf2c4638",
+    "41-delegation.sql": "926da05babce247b18111915742cf5f2db0cadc72874e7318113b73761646b3a",
+    "48-network-clock-saved.sql": "f86423d5aa8d57de944eac0334c4580e6e4aeb7adec1a343a93c5001cc1bf1fe",
+    "45-indexer.sql": "c92e3248ca16a6f17189de798e5a96328a1b40ea6fb8ba15ba5c45b5fa92536a",
+    "46-capacity.sql": "bc3700921c5f8b5c78c2f47630e7b78c243f0d73df0ee85592f67135d3910139"
+  },
+  "limitations": [
+    "Historical SQL parity is not current-head or actual-client-process acceptance.",
+    "Timing is one local run over a stopped snapshot, not concurrent serving capacity.",
+    "Conditional GNS save paths and cached-clock interactions still require validation.",
+    "The spending ledger is a local request guard, not a provider account billing cap.",
+    "The 45-indexer.sql and 46-capacity.sql hashes were installed and verified before the 2026-09-19 resume3 run. Later 41-delegation.sql optimization is recorded separately."
+  ]
+}

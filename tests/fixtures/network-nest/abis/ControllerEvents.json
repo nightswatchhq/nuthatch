@@ -1,0 +1,7 @@
+[
+  {"type":"event","name":"SetContractProxy","anonymous":false,"inputs":[{"name":"id","type":"bytes32","indexed":true},{"name":"contractAddress","type":"address","indexed":false}]},
+  {"type":"event","name":"NewOwnership","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true}]},
+  {"type":"event","name":"PartialPauseChanged","anonymous":false,"inputs":[{"name":"isPaused","type":"bool","indexed":false}]},
+  {"type":"event","name":"PauseChanged","anonymous":false,"inputs":[{"name":"isPaused","type":"bool","indexed":false}]},
+  {"type":"event","name":"NewPauseGuardian","anonymous":false,"inputs":[{"name":"oldPauseGuardian","type":"address","indexed":true},{"name":"pauseGuardian","type":"address","indexed":true}]}
+]

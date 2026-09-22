@@ -1,0 +1,77 @@
+{
+  "block": 200000000,
+  "query": "{ active:allocations(block:{number:200000000},first:2,orderBy:id,where:{indexer:\"0xdecba5154aab37ae5e381a19f804f3af4d1bcbb5\",status:Active}){id allocatedTokens effectiveAllocation createdAtEpoch createdAtBlockHash createdAtBlockNumber createdAt closedAtEpoch closedAtBlockHash closedAtBlockNumber closedAt poi status} closed:allocations(block:{number:200000000},first:2,orderBy:id,where:{indexer:\"0xdecba5154aab37ae5e381a19f804f3af4d1bcbb5\",status:Closed}){id allocatedTokens effectiveAllocation createdAtEpoch createdAtBlockHash createdAtBlockNumber createdAt closedAtEpoch closedAtBlockHash closedAtBlockNumber closedAt poi status} }",
+  "response": {
+    "data": {
+      "active": [
+        {
+          "id": "0x023c2911705640e4fe8e223caba46c759650ac18",
+          "allocatedTokens": "243000000000000000000000",
+          "effectiveAllocation": "0",
+          "createdAtEpoch": 498,
+          "createdAtBlockHash": "0xd4761dc8d1f4574951f2dca81dfd62777ebbc4a51f5ef52a4989f37a762753fc",
+          "createdAtBlockNumber": 19617268,
+          "createdAt": 1712655805,
+          "closedAtEpoch": null,
+          "closedAtBlockHash": null,
+          "closedAtBlockNumber": null,
+          "closedAt": null,
+          "poi": null,
+          "status": "Active"
+        },
+        {
+          "id": "0x0628b739afb515e6c8af15ec751a5b11d7f33e81",
+          "allocatedTokens": "5306588000000000000000000",
+          "effectiveAllocation": "0",
+          "createdAtEpoch": 498,
+          "createdAtBlockHash": "0x63333135d276b5e55739c51db7d96ec428cae5a4973c4b200a0623cad63182c6",
+          "createdAtBlockNumber": 19617263,
+          "createdAt": 1712655731,
+          "closedAtEpoch": null,
+          "closedAtBlockHash": null,
+          "closedAtBlockNumber": null,
+          "closedAt": null,
+          "poi": null,
+          "status": "Active"
+        }
+      ],
+      "closed": [
+        {
+          "id": "0x00160367519684c1f10ae62acf01c27c775d9724",
+          "allocatedTokens": "15200000000000000000000",
+          "effectiveAllocation": "0",
+          "createdAtEpoch": 291,
+          "createdAtBlockHash": "0xa1703d38e45278bb8f9d0fb113f78b8a6b38f784c5adf482b7be41566489fc20",
+          "createdAtBlockNumber": 18126485,
+          "createdAt": 1694597205,
+          "closedAtEpoch": 295,
+          "closedAtBlockHash": "0x556186d8203f860dee8c1958620b716ab6dfd5b01a47dd8a2fa8f6c13599c38f",
+          "closedAtBlockNumber": 18154824,
+          "closedAt": 1694942311,
+          "poi": "0x11fd2982e7000a3b79b15f2b7989e33b906056428233bff3841c380cdbafabc2",
+          "status": "Closed"
+        },
+        {
+          "id": "0x00196b151ec1702eb2f777985b1e1257f3f68033",
+          "allocatedTokens": "313000000000000000000000",
+          "effectiveAllocation": "0",
+          "createdAtEpoch": 462,
+          "createdAtBlockHash": "0xf02857618f336fa6fe540faedb1a196f00363efe553c8af8296cfe3063ee9817",
+          "createdAtBlockNumber": 19356019,
+          "createdAt": 1709485570,
+          "closedAtEpoch": 468,
+          "closedAtBlockHash": "0x9e77bcffeea5043de270e9674a7148e6734fa90de4f18d80dec837f4c1ec2c0d",
+          "closedAtBlockNumber": 19396345,
+          "closedAt": 1709972890,
+          "poi": "0x9ca318f96b33c4ad3a690e9f87fed6fc6cafd49c49bf985b549574d7d7ba81fb",
+          "status": "Closed"
+        }
+      ]
+    }
+  },
+  "referenceDeployment": "QmatH4cd25ymsfCFpgKPRQQ7uCYNgarxanVQ9WCfg4Y7TZ",
+  "comparisonStatus": "Matched through SQL and the HTTP GraphQL handler against independently indexed logs and hash-pinned EpochManager reads.",
+  "matchedAllocations": 4,
+  "matchedFieldsPerAllocation": 13,
+  "scope": "Two active and two closed legacy allocations at block 200000000; not Horizon allocation, complete indexer or current-head parity."
+}

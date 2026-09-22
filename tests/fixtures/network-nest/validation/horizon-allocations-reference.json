@@ -1,0 +1,84 @@
+{
+  "block": 506000000,
+  "referenceDeployment": "QmR8WQECdNR6TSUf4FfLSFW7D5RDGGkd7F4A6me56pLqJb",
+  "query": "{ active:allocations(block:{number:506000000},first:2,orderBy:id,where:{indexer:\"0xf92f430dd8567b0d466358c79594ab58d919a6d4\",isLegacy:false,status:Active}){id isLegacy forceClosed allocatedTokens effectiveAllocation createdAtEpoch createdAtBlockHash createdAtBlockNumber createdAt closedAtEpoch closedAtBlockHash closedAtBlockNumber closedAt poi status} closed:allocations(block:{number:506000000},first:2,orderBy:id,where:{indexer:\"0xf92f430dd8567b0d466358c79594ab58d919a6d4\",isLegacy:false,status:Closed}){id isLegacy forceClosed allocatedTokens effectiveAllocation createdAtEpoch createdAtBlockHash createdAtBlockNumber createdAt closedAtEpoch closedAtBlockHash closedAtBlockNumber closedAt poi status} }",
+  "response": {
+    "data": {
+      "active": [
+        {
+          "id": "0x00419a2a120372f144ed9dccce8bf629edb58bd2",
+          "isLegacy": false,
+          "forceClosed": null,
+          "allocatedTokens": "36075000000000000000000",
+          "effectiveAllocation": "0",
+          "createdAtEpoch": 1317,
+          "createdAtBlockHash": "0x62c04a8f08a87678a2c4f018cc2f2b3a149962353abff9f841ac231c2443120d",
+          "createdAtBlockNumber": 25510049,
+          "createdAt": 1783781085,
+          "closedAtEpoch": null,
+          "closedAtBlockHash": null,
+          "closedAtBlockNumber": null,
+          "closedAt": null,
+          "poi": "0x3e14aac1cf70e8624573cf15d786f64992edcd4e09ed84525b0220790f2588ee",
+          "status": "Active"
+        },
+        {
+          "id": "0x0068d7a281c782c05c207aae1c2bafe59b18d80d",
+          "isLegacy": false,
+          "forceClosed": null,
+          "allocatedTokens": "34346000000000000000000",
+          "effectiveAllocation": "0",
+          "createdAtEpoch": 1307,
+          "createdAtBlockHash": "0x70cf1cc3f992e74472ed050171d3991f8de1b6f34180f1af9932ed6af1eda2bc",
+          "createdAtBlockNumber": 25437948,
+          "createdAt": 1782912333,
+          "closedAtEpoch": null,
+          "closedAtBlockHash": null,
+          "closedAtBlockNumber": null,
+          "closedAt": null,
+          "poi": "0x3a82dbbdeadd1d6d91f3676bef8bf9fdf770d1c37f5f369e2d5cbdfbb6618ae0",
+          "status": "Active"
+        }
+      ],
+      "closed": [
+        {
+          "id": "0x00012d523d614775ad7a0c3b1c6bd15110bfc842",
+          "isLegacy": false,
+          "forceClosed": false,
+          "allocatedTokens": "144141000000000000000000",
+          "effectiveAllocation": "0",
+          "createdAtEpoch": 1296,
+          "createdAtBlockHash": "0x698063491d1bf76a2b9c1a9c7dd8c7c87fee8182a503409547c8933e17f8cf52",
+          "createdAtBlockNumber": 25358578,
+          "createdAt": 1781955864,
+          "closedAtEpoch": 1317,
+          "closedAtBlockHash": "0x62c04a8f08a87678a2c4f018cc2f2b3a149962353abff9f841ac231c2443120d",
+          "closedAtBlockNumber": 25510049,
+          "closedAt": 1783781085,
+          "poi": "0x57997ce3660d988a865c5516a6a87b52fd4e410d02734a7fcac10081d5caee66",
+          "status": "Closed"
+        },
+        {
+          "id": "0x0006391730761c0c3bba5b9b4527a3f1d21d7ea2",
+          "isLegacy": false,
+          "forceClosed": false,
+          "allocatedTokens": "14775000000000000000000",
+          "effectiveAllocation": "0",
+          "createdAtEpoch": 1191,
+          "createdAtBlockHash": "0x82e4f2a45bf6a09dc5b9c91a948c2b30b405918f3f1001b80cfe05a2410f26e3",
+          "createdAtBlockNumber": 24601978,
+          "createdAt": 1772843088,
+          "closedAtEpoch": 1192,
+          "closedAtBlockHash": "0x85da770aae9d163db9d6e8bd7a1a84d197fc9059c32010e1798698c5054b1633",
+          "closedAtBlockNumber": 24614439,
+          "closedAt": 1772993344,
+          "poi": "0xb14052f9485857a1909e27ae9e5da2f1efacdc40cdd4509b578754899dc654da",
+          "status": "Closed"
+        }
+      ]
+    }
+  },
+  "comparisonStatus": "Matched through the HTTP GraphQL handler, including ABI-decoded POIPresented logs and seven hash-pinned EpochManager reads.",
+  "matchedAllocations": 4,
+  "matchedFieldsPerAllocation": 15
+}
