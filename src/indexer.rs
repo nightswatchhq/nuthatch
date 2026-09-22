@@ -18166,6 +18166,29 @@ rpc_urls = ["https://rpc.example"]
         assert!(view(&views, "totals").fault().is_none());
     }
 
+    /// The allowance is the entity's, not each table's: two tables of sixty rows are 120 held.
+    #[test]
+    fn an_entitys_offchain_allowance_spans_all_its_offchain_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        for table in ["a", "b"] {
+            let csv = dir.path().join(format!("{table}.csv"));
+            let rows: String = (0..60).map(|i| format!("k{i},{i}\n")).collect();
+            std::fs::write(&csv, format!("k,v\n{rows}")).unwrap();
+            crate::offchain::drop_file(dir.path(), &csv, table).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='paired'\nkey=['k']\nmax_rows=100\n\
+             sql='SELECT a.k, sum(b.v) AS v FROM offchain__a a \
+             JOIN offchain__b b ON a.k = b.k GROUP BY a.k'\n",
+        )
+        .unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+        let fault = view(&views, "paired").fault().expect("paired must fault");
+        assert!(fault.contains("120 rows"), "{fault}");
+    }
+
     /// Rows are not the only measure: two rows can carry more bytes than a hundred rows are charged
     /// for at admission, and the allowance counts both.
     #[test]
