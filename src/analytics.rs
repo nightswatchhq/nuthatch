@@ -2938,25 +2938,18 @@ fn define_views_bound(
         let view_ddl = |files: &[String]| -> Option<String> {
             let mut parts: Vec<String> = Vec::new();
             if !files.is_empty() {
-                // Do not hand one `read_parquet` invocation ten thousand paths. DuckDB opens and
-                // plans a whole input list together, which turns an append-only historical corpus
-                // into an FD and memory cliff before the query has read a row. Each branch has the
-                // same declared projection, so UNION ALL BY NAME preserves the schema-drift rule
-                // below while bounding one scan node to a tractable number of segment handles.
-                //
-                // This is not compaction. Files remain content-addressed and independently
-                // verifiable; the reader merely groups its immutable inputs.
-                const PARQUET_INPUT_BATCH: usize = 256;
-                for batch in files.chunks(PARQUET_INPUT_BATCH) {
-                    parts.push(format!(
-                        "SELECT *{} FROM {}",
-                        derived_bigint_cols(cols),
-                        with_declared_base_cols(
-                            &format!("read_parquet([{}], union_by_name=true)", batch.join(", ")),
-                            cols
-                        )
-                    ));
-                }
+                // COR-2: `union_by_name=true` NULL-fills columns that differ across segments - segment
+                // schemas legitimately drift over a nest's life as ABIs are versioned (CLAUDE.md), and
+                // without this a single drifted column makes `read_parquet` throw and the whole table's
+                // view silently vanish.
+                parts.push(format!(
+                    "SELECT *{} FROM {}",
+                    derived_bigint_cols(cols),
+                    with_declared_base_cols(
+                        &format!("read_parquet([{}], union_by_name=true)", files.join(", ")),
+                        cols
+                    )
+                ));
             }
             parts.extend(hot_part.clone());
             if parts.is_empty() {
