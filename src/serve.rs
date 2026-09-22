@@ -4066,7 +4066,7 @@ mod tests {
     /// #1437: readiness and `/derived` provenance name the offchain snapshots an entity's rows were
     /// applied through, and a chain-only entity's output is unchanged.
     #[test]
-    fn an_offchain_entity_names_the_snapshots_it_was_applied_through() {
+    fn an_offchain_entity_names_the_snapshots_it_applied() {
         use crate::entity_plan::{Agg, Plan, Source};
         let dir = tempfile::tempdir().unwrap();
         let csv = dir.path().join("tiers.csv");
