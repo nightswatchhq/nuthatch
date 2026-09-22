@@ -1993,9 +1993,9 @@ fn expand_through_views(
 
     let mut out = named.clone();
     let mut frontier: Vec<String> = named.iter().cloned().collect();
-    // A view built on a view built on a view: follow the chain, but never in circles. DuckDB refuses
-    // to create a cyclic view, so this bound is a backstop rather than the mechanism.
-    for _ in 0..8 {
+    // Visit each name once. The finite catalogue and `out` bound traversal without
+    // silently dropping sources beyond an arbitrary dependency depth.
+    while !frontier.is_empty() {
         let mut next = Vec::new();
         for name in frontier.drain(..) {
             let Some(sql) = defs.get(&name) else { continue };
@@ -2109,8 +2109,9 @@ fn reachable_tables(
 
     let mut out = referenced.clone();
     let mut frontier: Vec<String> = referenced.iter().cloned().collect();
-    // A view on a view on a view: follow the chain, bounded, exactly as `expand_through_views` is.
-    for _ in 0..8 {
+    // Authored files may contain cycles that DuckDB will later reject. `out`
+    // prevents revisiting them while retaining sources at any dependency depth.
+    while !frontier.is_empty() {
         let mut next = Vec::new();
         for name in frontier.drain(..) {
             let Some(body) = bodies.get(&name) else {
@@ -2153,12 +2154,81 @@ fn table_refs_in(
         return None;
     }
     let mut out = std::collections::BTreeSet::new();
+    if wanted_kind == "BASE_TABLE" {
+        walk_base_table_refs(&v, &Default::default(), &mut out);
+        return Some(out);
+    }
     walk_table_refs(&v, &mut |kind, name| {
         if kind == wanted_kind {
             out.insert(name.to_ascii_lowercase());
         }
     });
     Some(out)
+}
+
+/// Dependency discovery respects lexical CTE scope. The security walk below deliberately remains
+/// separate: a local name must not hide a forbidden function or a qualified schema from that walk.
+fn walk_base_table_refs(
+    value: &Value,
+    outer: &std::collections::BTreeSet<String>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            let mut scope = outer.clone();
+            let ctes = map
+                .get("cte_map")
+                .and_then(|v| v.get("map"))
+                .and_then(Value::as_array);
+            if let Some(ctes) = ctes {
+                // Definitions see earlier siblings, not later ones. A nonrecursive definition may
+                // read a physical table with its own name; only bind its name after visiting it.
+                for cte in ctes {
+                    let name = cte
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .map(str::to_ascii_lowercase);
+                    let recursive = cte
+                        .pointer("/value/query/node/type")
+                        .and_then(Value::as_str)
+                        == Some("RECURSIVE_CTE_NODE");
+                    if recursive {
+                        if let Some(name) = &name {
+                            scope.insert(name.clone());
+                        }
+                    }
+                    walk_base_table_refs(cte, &scope, out);
+                    if let Some(name) = name {
+                        scope.insert(name);
+                    }
+                }
+            }
+            if map.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
+                if let Some(name) = map.get("table_name").and_then(Value::as_str) {
+                    let qualified = ["schema_name", "catalog_name"].iter().any(|key| {
+                        map.get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                    });
+                    let name = name.to_ascii_lowercase();
+                    if qualified || !scope.contains(&name) {
+                        out.insert(name);
+                    }
+                }
+            }
+            for (key, child) in map {
+                if key != "cte_map" || ctes.is_none() {
+                    walk_base_table_refs(child, &scope, out);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                walk_base_table_refs(value, outer, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Walk the serialized AST, calling `f(kind, name)` for every table reference found.
@@ -3159,8 +3229,8 @@ fn view_build_failure(
     // `CREATE VIEW` statements failed at load, each with the same "pool_effective_fee does not
     // exist". Chase that chain to the view whose failure is not itself just a missing upstream view -
     // the one line that actually explains anything - rather than reporting a hop that only repeats
-    // the same "does not exist" one level removed. Bounded to 8 hops, matching `expand_through_views`'
-    // cycle guard (DuckDB itself refuses a cyclic view, so this is a backstop, not the mechanism).
+    // the same "does not exist" one level removed. Error explanation is bounded to 8 hops;
+    // unlike dependency discovery, it may stop early without omitting query input data.
     view_build_failure_at(dir, schema, missing, 8)
 }
 
@@ -3545,6 +3615,94 @@ fn value_to_json(v: ValueRef<'_>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_discovery_distinguishes_local_ctes_from_entity_views() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let sql = "WITH allocation AS (SELECT * FROM raw_fees), provision AS (SELECT * FROM allocation) SELECT * FROM provision";
+        let ast: String = conn
+            .query_row(
+                &format!("SELECT json_serialize_sql('{}')", sql.replace('\'', "''")),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            super::base_tables_in(&conn, sql).unwrap(),
+            std::collections::BTreeSet::from(["raw_fees".to_string()]),
+            "{ast}"
+        );
+        for (sql, expected) in [
+            ("WITH z AS (SELECT * FROM raw_fees), a AS (SELECT * FROM z) SELECT * FROM a", vec!["raw_fees"]),
+            ("WITH allocation AS (SELECT * FROM allocation) SELECT * FROM allocation", vec!["allocation"]),
+            ("WITH earlier AS (SELECT * FROM allocation), allocation AS (SELECT * FROM raw_fees) SELECT * FROM earlier", vec!["allocation", "raw_fees"]),
+            ("WITH allocation AS (SELECT * FROM raw_fees) SELECT * FROM main.allocation", vec!["allocation", "raw_fees"]),
+            ("WITH allocation AS (SELECT * FROM raw_fees) SELECT * FROM (WITH allocation AS (SELECT * FROM other_fees) SELECT * FROM allocation) nested CROSS JOIN allocation", vec!["other_fees", "raw_fees"]),
+            ("WITH RECURSIVE walk AS (SELECT * FROM raw_fees UNION ALL SELECT * FROM walk) SELECT * FROM walk", vec!["raw_fees"]),
+        ] {
+            assert_eq!(super::base_tables_in(&conn, sql).unwrap(), expected.into_iter().map(str::to_string).collect::<std::collections::BTreeSet<_>>(), "{sql}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/report.sql"),
+            format!(
+            "CREATE VIEW allocation AS SELECT * FROM unrelated_fees; CREATE VIEW report AS {sql};"
+        ),
+        )
+        .unwrap();
+        let wanted = std::collections::BTreeSet::from(["report".to_string()]);
+        assert_eq!(
+            super::reachable_tables(&conn, dir.path(), &wanted).unwrap(),
+            std::collections::BTreeSet::from(["report".to_string(), "raw_fees".to_string()])
+        );
+        // The separate security/function walk still inspects every CTE definition.
+        let functions = super::table_refs_in(
+            &conn,
+            "WITH allocation AS (SELECT * FROM read_csv('secret.csv')) SELECT * FROM allocation",
+            "TABLE_FUNCTION",
+        )
+        .unwrap();
+        assert!(functions.contains("read_csv"));
+    }
+
+    #[test]
+    fn dependency_closure_reaches_sources_beyond_eight_views() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_facts (amount INTEGER); INSERT INTO source_facts VALUES (7)",
+        )
+        .unwrap();
+        for i in 0..12 {
+            let source = if i == 0 {
+                "source_facts".to_string()
+            } else {
+                format!("layer_{}", i - 1)
+            };
+            let sql = format!("CREATE VIEW layer_{i} AS SELECT amount FROM {source};");
+            std::fs::write(dir.path().join(format!("views/{i:02}.sql")), &sql).unwrap();
+            conn.execute_batch(&sql).unwrap();
+        }
+        let named = ["layer_11".to_string()].into_iter().collect();
+        let expected: std::collections::BTreeSet<_> = (0..12)
+            .map(|i| format!("layer_{i}"))
+            .chain(std::iter::once("source_facts".to_string()))
+            .collect();
+        assert_eq!(
+            reachable_tables(&conn, dir.path(), &named).unwrap(),
+            expected
+        );
+        assert_eq!(expand_through_views(&conn, &named), expected);
+        // Even invalid, cyclic authored definitions must terminate during discovery.
+        std::fs::write(dir.path().join("views/12.sql"),
+            "CREATE VIEW cycle_a AS SELECT * FROM cycle_b; CREATE VIEW cycle_b AS SELECT * FROM cycle_a;").unwrap();
+        let cycle = ["cycle_a".to_string(), "cycle_b".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(reachable_tables(&conn, dir.path(), &cycle).unwrap(), cycle);
+    }
 
     #[test]
     fn rejects_non_select() {
