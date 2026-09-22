@@ -20,8 +20,8 @@ pub use crate::registry::OFFCHAIN_NAMESPACE;
 
 /// The offchain table an entity source names, if it names one.
 ///
-/// Case-insensitive, as DuckDB resolves it; the table after the prefix is matched exactly, as a
-/// decoded table is.
+/// Case-insensitive, as DuckDB resolves it. The table after the prefix is returned as written, and
+/// [`Tables`] resolves it case-insensitively too.
 pub fn table_of(source: &str) -> Option<&str> {
     // `get`, not indexing: a quoted identifier may put a multibyte character across the boundary.
     let head = source.get(..OFFCHAIN_NAMESPACE.len())?;
