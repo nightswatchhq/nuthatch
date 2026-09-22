@@ -4110,6 +4110,12 @@ mod tests {
         let provenance = derived_provenance(&state, &state.entities[0], 0, &applied);
         assert_eq!(provenance["offchain"], ready[0]["offchain"], "{provenance}");
 
+        let referenced: std::collections::BTreeSet<String> = ["by_tier".to_string()].into();
+        let captured: crate::entity_view::Watermarks =
+            [("by_tier".to_string(), applied.clone())].into();
+        let sql = sql_entity_provenance(&state, Some(&referenced), &captured);
+        assert_eq!(sql[0]["offchain"], ready[0]["offchain"], "{sql}");
+
         let chain_only = derived_provenance(
             &state,
             &state.entities[0],

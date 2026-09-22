@@ -1377,3 +1377,69 @@ async fn a_derived_keyed_read_answers_from_maintained_state_with_provenance() {
 
     shutdown_and_settle(rt).await;
 }
+
+/// #1437, end to end through `spawn_nest`: an entity joining an offchain table starts with the
+/// snapshot already sealed, takes one dropped while it runs at the next window, and a warm restart
+/// seeds both back. Only the full path shows the ingest loop really calls the refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offchain_snapshot_dropped_while_running_reaches_the_entity_and_survives_a_restart() {
+    use nuthatch::entity_row::{Row, Scalar};
+    const BY_TIER: &str = r#"
+[[entities]]
+name = "by_tier"
+sql = "SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier"
+key = ["tier"]
+max_rows = 10000
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let drop = |name: &str, tier: &str| {
+        let csv = dir.path().join(format!("{name}.csv"));
+        std::fs::write(&csv, format!("account,tier\n{},{tier}\n", account(2))).unwrap();
+        nuthatch::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
+    };
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=4 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(4);
+    drop("first", "gold");
+
+    let rt = spawn_declared(dir.path(), tape.clone(), 4, BY_TIER).await;
+    let tier = |t: &str| Row(vec![Scalar::Str(t.into())]);
+    let sum = |v: i128| Some(Row(vec![Scalar::Int(v)]));
+    let entity = &rt.state.entities[0];
+    entity.flush();
+    assert_eq!(
+        entity.get(&tier("gold")),
+        sum(1_000),
+        "100 * (1 + 2 + 3 + 4)"
+    );
+
+    drop("second", "silver");
+    for b in 5..=6 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(6);
+    let applied = wait_until(POLL_TIMEOUT, || {
+        let (_, a) = entity.len_and_watermark();
+        a.through == 6 && a.offchain.get("tiers").is_some_and(|m| m.snapshots == 2)
+    })
+    .await;
+    assert!(applied, "the dropped snapshot never reached the entity");
+    entity.flush();
+    assert_eq!(entity.get(&tier("gold")), sum(2_100));
+    assert_eq!(
+        entity.get(&tier("silver")),
+        sum(2_100),
+        "account 2 is now both"
+    );
+    let before = relation(&rt);
+    shutdown_and_settle(rt).await;
+
+    let warm = spawn_declared(dir.path(), tape, 6, BY_TIER).await;
+    let after = relation(&warm);
+    let (_, applied) = warm.state.entities[0].len_and_watermark();
+    shutdown_and_settle(warm).await;
+    assert_eq!(after, before, "a warm restart seeds the snapshots back");
+    assert_eq!(applied.offchain["tiers"].snapshots, 2);
+}
