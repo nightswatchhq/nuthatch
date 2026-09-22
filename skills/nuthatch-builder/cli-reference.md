@@ -288,6 +288,21 @@ Import one CSV, JSON array, or Parquet file as an immutable, content-addressed s
 - `--table <TABLE>` - SQL table name beneath the `offchain__` namespace
 - `--dir <DIR>` - Nest directory containing the offchain namespace
 
+## `nuthatch offchain pull`
+
+Fetch a JSON-array price feed once. Schedule this command on the host; it never runs in the chain cursor or the query path
+
+- `<SOURCE>` - HTTPS URL of the feed. Recorded without its query string, and never part of the nest's identity
+- `--table <TABLE>` - SQL table name beneath the `offchain__` namespace
+- `--format <FORMAT>` - The feed's format, declared rather than guessed from the URL
+- `--dir <DIR>` - Nest directory containing the offchain namespace
+- `--max-bytes <MAX_BYTES>` - Refuse a response larger than this many bytes
+- `--timeout-secs <TIMEOUT_SECS>` - Give up on one attempt after this many seconds, response body included
+- `--attempts <ATTEMPTS>` - Attempts for a transient failure (connect, timeout, HTTP 429 or 5xx), backing off 1s, 2s, 4s. Anything else fails at once
+- `--header-env <HEADER_ENV>` - `NAME=ENV_VAR`: send header NAME with ENV_VAR's value. Read at run time, never stored
+- `--stale-after-secs <STALE_AFTER_SECS>` - Report the table stale once its last success is older than this, even with no failure recorded, so a timer that stopped firing shows. Set it a little above the timer's period
+- `--allow-loopback-http` - Permit plain http to a loopback address, for a local fixture. Never for a real feed
+
 ## `nuthatch pack`
 
 Build, sign, and verify the signed compliance-pack manifest (RFC-0008 C6)
