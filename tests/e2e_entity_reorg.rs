@@ -1531,3 +1531,131 @@ async fn an_answer_that_read_offchain_data_says_it_is_reproducible_by_snapshot()
     );
     shutdown_and_settle(rt).await;
 }
+
+/// #1437's proof. Sealed chain facts, a hot tail, and two append-only price snapshots: after each
+/// snapshot the maintained relation must equal DuckDB's answer to the same SQL over the same sealed,
+/// hot and offchain inputs. The second snapshot both adds a group and changes an existing one, and it
+/// lands before two windows, so re-feeding it on the second would double it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offchain_entity_equals_duckdb_after_each_appended_snapshot() {
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    const PRICED: &str = r#"
+[[entities]]
+name = "priced"
+sql = "SELECT p.symbol, SUM(x.value * p.price_e8) AS usd_e8 FROM usdc__transfer x JOIN offchain__prices p ON x.address = p.token GROUP BY p.symbol"
+key = ["symbol"]
+max_rows = 10000
+"#;
+    const REFERENCE: &str = "SELECT p.symbol AS k, SUM(x.value_dec * p.price_e8) AS v \
+         FROM usdc__transfer x JOIN offchain__prices p ON x.address = p.token GROUP BY p.symbol";
+    const MAINTAINED: &str = "SELECT symbol AS k, usd_e8 AS v FROM priced";
+
+    let dir = tempfile::tempdir().unwrap();
+    let token = USDC.to_ascii_lowercase();
+    let prices = |name: &str, rows: &[(&str, i64)]| {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("token", DataType::Utf8, false),
+                Field::new("symbol", DataType::Utf8, false),
+                Field::new("price_e8", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![token.as_str(); rows.len()])),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let path = dir.path().join(format!("{name}.parquet"));
+        std::fs::write(&path, bytes).unwrap();
+        nuthatch::offchain::drop_file(dir.path(), &path, "prices").unwrap();
+    };
+    let agree = |step: &str, maintained: &[(String, String)], reference: &[(String, String)]| {
+        assert!(
+            !reference.is_empty(),
+            "{step}: the reference is empty, so it proves nothing"
+        );
+        assert_eq!(
+            maintained, reference,
+            "{step}: the entity and DuckDB disagree"
+        );
+    };
+
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=10u64 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(10);
+    prices("first", &[("USDC", 100_000_000)]);
+    let first = spawn_declared(dir.path(), tape.clone(), 10, PRICED).await;
+    shutdown_and_settle(first).await;
+    {
+        let store = nuthatch::store::Store::open(&dir.path().join("nuthatch.redb")).unwrap();
+        let rows = store.entities_in_range(1, 8).unwrap();
+        assert_eq!(
+            rows.len(),
+            8,
+            "fixture must hold [1,8] hot before we seal it"
+        );
+        nuthatch::seal::seal_range(dir.path(), &rows, 1, 8)
+            .unwrap()
+            .expect("range holds rows");
+        store
+            .prune_and_set_meta(1, 8, "sealed_through", "8")
+            .unwrap();
+        assert!(store.entities_in_range(1, 8).unwrap().is_empty());
+    }
+
+    for b in 11..=12u64 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(12);
+    let rt = spawn_declared(dir.path(), tape.clone(), 12, PRICED).await;
+    assert_eq!(
+        rt.state.store.sealed_through(),
+        8,
+        "the chain facts are sealed"
+    );
+    rt.state.entities[0].flush();
+    let one = sql_pairs(&rt, MAINTAINED).await;
+    agree(
+        "after the first snapshot",
+        &one,
+        &sql_pairs(&rt, REFERENCE).await,
+    );
+
+    prices("second", &[("USDC", 100_010_000), ("USDCe", 99_990_000)]);
+    for b in 13..=16u64 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(16);
+    let entity = &rt.state.entities[0];
+    let applied = wait_until(POLL_TIMEOUT, || {
+        let (_, a) = entity.len_and_watermark();
+        a.through == 16 && a.offchain.get("prices").is_some_and(|m| m.snapshots == 2)
+    })
+    .await;
+    assert!(applied, "the second snapshot never reached the entity");
+    entity.flush();
+    let two = sql_pairs(&rt, MAINTAINED).await;
+    agree(
+        "after the second snapshot",
+        &two,
+        &sql_pairs(&rt, REFERENCE).await,
+    );
+    assert_ne!(
+        one, two,
+        "the second snapshot changed nothing, so the comparison is vacuous"
+    );
+    assert!(two.iter().any(|(k, _)| k == "USDCe"), "{two:?}");
+    shutdown_and_settle(rt).await;
+}
