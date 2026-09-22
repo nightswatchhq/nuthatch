@@ -13,9 +13,31 @@ pub const DB_FILE: &str = "nuthatch.redb";
 /// v1 default ABI filename, retained for migration of old single-contract projects.
 pub const ABI_FILE: &str = "abi.json";
 
-/// The nest-config schema this build understands. A nest declaring a higher version is rejected on
-/// load (it was authored by a newer nuthatch) - the guard that makes `init --from` safe.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+/// The nest-config schema this build writes and every build reads. A nest declaring a version above
+/// [`READABLE_SCHEMA_VERSION`] is rejected on load - the guard that makes `init --from` safe.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+/// v3: canonical calls and `on_any` triggers (RFC-0060). Only a `graph` build reads it.
+pub const GRAPH_SCHEMA_VERSION: u32 = 3;
+
+/// The newest nest-config schema this build can load.
+pub const READABLE_SCHEMA_VERSION: u32 = if cfg!(feature = "graph") {
+    GRAPH_SCHEMA_VERSION
+} else {
+    CURRENT_SCHEMA_VERSION
+};
+
+/// RFC-0060: the Graph history read policy needs a `graph` build. A default build would otherwise
+/// serve latest-only answers without the freshness limit the policy promises.
+fn refuse_graph_only_files(dir: &Path) -> Result<()> {
+    if !cfg!(feature = "graph") && dir.join("graph/history.toml").exists() {
+        bail!(
+            "this nest declares graph/history.toml, the Graph history read policy, which only a \
+             nuthatch built with `--features graph` honours"
+        );
+    }
+    Ok(())
+}
 
 /// An absent `schema_version` means **1**, not "current".
 ///
@@ -549,6 +571,7 @@ impl Config {
             }
         }
         cfg.refuse_tip_finality_webhooks()?;
+        refuse_graph_only_files(dir)?;
         Ok(cfg)
     }
 
@@ -647,11 +670,17 @@ impl Config {
     fn check_schema_version(&self) -> Result<()> {
         // Too new for us: the nest was authored by a later nuthatch and may mean things by fields we
         // do not know. This is the guard that makes `init --from` safe.
-        if self.nest.schema_version > CURRENT_SCHEMA_VERSION {
+        if self.nest.schema_version > READABLE_SCHEMA_VERSION {
+            if self.nest.schema_version == GRAPH_SCHEMA_VERSION {
+                bail!(
+                    "this nest uses config schema v{GRAPH_SCHEMA_VERSION} (canonical calls or \
+                     `on_any` triggers), which only a nuthatch built with `--features graph` reads"
+                );
+            }
             bail!(
                 "this nest needs config schema v{} but this nuthatch supports up to v{} - upgrade nuthatch",
                 self.nest.schema_version,
-                CURRENT_SCHEMA_VERSION
+                READABLE_SCHEMA_VERSION
             );
         }
         // Too *old* for what it declares - the mirror case, and the dangerous one. A file claiming v1
@@ -675,6 +704,14 @@ impl Config {
                 "canonical calls need `schema_version = 3` (it says {}). Older nuthatch builds \
                  ignore `canonical` and would read state by block number instead of block hash; \
                  the version is what makes them refuse instead.",
+                self.nest.schema_version
+            );
+        }
+        if self.calls.iter().any(|call| !call.on_any.is_empty()) && self.nest.schema_version < 3 {
+            bail!(
+                "`on_any` triggers need `schema_version = 3` (it says {}). Older nuthatch builds \
+                 ignore `on_any`, so those calls would never fire and store nothing; the version \
+                 is what makes them refuse instead.",
                 self.nest.schema_version
             );
         }
@@ -974,8 +1011,12 @@ rpc_urls = ["https://rpc.example"]
                     let error = result.unwrap_err().to_string();
                     assert!(error.contains("canonical"), "{error}");
                     assert!(error.contains("schema_version = 3"), "{error}");
-                } else {
+                } else if cfg!(feature = "graph") {
                     assert!(result.unwrap().calls.iter().all(|call| call.canonical));
+                } else {
+                    // A default build refuses the nest and names what would read it.
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("--features graph"), "{error}");
                 }
             }
         }

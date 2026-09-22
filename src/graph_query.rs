@@ -204,20 +204,53 @@ impl fmt::Display for Unsupported {
     }
 }
 
-/// Parse the root fields of an operation, with their arguments.
-/// Levels of relation traversal `compile` will lower.
-///
-/// Two. One remains the ordinary to-one join, and the second is a bounded `@derivedFrom` list below
-/// it. The latter is the shape indexer-rs uses for escrow accounts: payer → signers. It still lowers
-/// to one SQL statement with a correlated list subquery, not a per-parent request. Deeper parses -
-/// the handler needs deep selections for introspection - remain refused by name rather than answered
-/// with an N+1 walk.
-const MAX_TRAVERSAL: usize = 2;
+/// What the compiler lowers beyond RFC-0053 as shipped (RFC-0060 §5.6). Chosen once, at the router,
+/// so the `graph` feature selects a value rather than forking the lowering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Levels of relation traversal. Deeper selections are refused by name rather than answered with
+    /// an N+1 walk.
+    pub max_traversal: usize,
+    /// `where`, `first`, `skip`, `orderBy` and `orderDirection` on a `@derivedFrom` list.
+    pub list_args: bool,
+    /// A `@derivedFrom` list below a to-one reference: indexer-rs's payer → signers. It still lowers
+    /// to one statement with a correlated list subquery.
+    pub nested_lists: bool,
+    /// `field: null` and `field_not: null` as `IS NULL` filters.
+    pub null_filters: bool,
+    /// `block: null` as the latest block, as graph-node reads it.
+    pub null_block: bool,
+}
+
+impl Capabilities {
+    /// RFC-0053 as shipped: what a default build answers.
+    pub const CORE: Self = Self {
+        max_traversal: 1,
+        list_args: false,
+        nested_lists: false,
+        null_filters: false,
+        null_block: false,
+    };
+    /// RFC-0060's network client dialect.
+    pub const NETWORK: Self = Self {
+        max_traversal: 2,
+        list_args: true,
+        nested_lists: true,
+        null_filters: true,
+        null_block: true,
+    };
+    /// What this build serves.
+    pub const BUILD: Self = if cfg!(feature = "graph") {
+        Self::NETWORK
+    } else {
+        Self::CORE
+    };
+}
 
 /// The field at which `sel` exceeds `budget` levels of traversal, if any.
 ///
-/// Recursive rather than a one-level `!sub.is_empty()` test, so [`MAX_TRAVERSAL`] is the thing being
-/// enforced instead of a comment next to a hand-unrolled check of it.
+/// Recursive rather than a one-level `!sub.is_empty()` test, so the traversal capability is the thing
+/// being enforced instead of a comment next to a hand-unrolled check of it.
 fn too_deep(sel: &[Selection], budget: usize) -> Option<&Selection> {
     for s in sel {
         if s.sub.is_empty() {
@@ -1022,7 +1055,16 @@ pub struct Compiled {
 /// Compile one root field against the generated schema.
 ///
 /// The view name is the entity's snake_case alias, which is what `port-emit` writes.
+/// [`compile_with`] at [`Capabilities::CORE`].
 pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupported> {
+    compile_with(schema, root, &Capabilities::CORE)
+}
+
+pub fn compile_with(
+    schema: &Schema,
+    root: &RootField,
+    caps: &Capabilities,
+) -> Result<Compiled, Unsupported> {
     let (entity, singular) = resolve_root(schema, &root.name)?;
     let ent = schema
         .entities
@@ -1030,7 +1072,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         .find(|e| e.name == entity)
         .expect("resolve_root returned an entity the schema has");
 
-    if let Some(s) = too_deep(&root.sel, MAX_TRAVERSAL) {
+    if let Some(s) = too_deep(&root.sel, caps.max_traversal) {
         return Err(Unsupported::NestedSelection(s.name.clone()));
     }
     // Every column is qualified with the base alias whether or not this query joins. One shape
@@ -1101,6 +1143,9 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         // A derived list has its own bounded filter and page, independent of its parent.
         if let (graph_schema::FieldType::List(inner), Some(back)) = (&field.ty, &field.derived_from)
         {
+            if !caps.list_args && !sel.args.is_empty() {
+                return Err(Unsupported::NestedSelection(sel.name.clone()));
+            }
             let Some(target) = inner.entity_name() else {
                 return Err(Unsupported::NestedSelection(sel.name.clone()));
             };
@@ -1120,8 +1165,15 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             }
             let alias = format!("c{i}");
             let col = format!("{alias}__{}", sel.name);
-            let packed =
-                derived_list_sql(schema, child, back, &format!("{BASE}.\"id\""), &alias, sel)?;
+            let packed = derived_list_sql(
+                schema,
+                child,
+                back,
+                &format!("{BASE}.\"id\""),
+                &alias,
+                sel,
+                caps,
+            )?;
             cols.push(format!("{packed} AS \"{col}\""));
             shape.push(Shape::List {
                 key: sel.key.clone(),
@@ -1164,6 +1216,10 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
         let mut sub = Vec::new();
         let mut lists = Vec::new();
         for (sub_i, s) in sel.sub.iter().enumerate() {
+            // RFC-0053 checks a nested field's arguments before looking it up; core keeps that order.
+            if !caps.nested_lists && !s.args.is_empty() {
+                return Err(Unsupported::NestedSelection(s.name.clone()));
+            }
             let Some(cf) = tent.fields.iter().find(|x| x.name == s.name) else {
                 return Err(Unsupported::UnknownField {
                     entity: target.clone(),
@@ -1176,7 +1232,9 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
             // HTTP handler. Its own pagination and filters belong to the list, so refusing those
             // arguments would either make the real client unusable or tempt a later implementation
             // to drop them. Neither is a useful outcome.
-            if let (graph_schema::FieldType::List(inner), Some(back)) = (&cf.ty, &cf.derived_from) {
+            if let (true, graph_schema::FieldType::List(inner), Some(back)) =
+                (caps.nested_lists, &cf.ty, &cf.derived_from)
+            {
                 let Some(child_name) = inner.entity_name() else {
                     return Err(Unsupported::NestedSelection(s.name.clone()));
                 };
@@ -1203,6 +1261,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                     &format!("{alias}.\"id\""),
                     &child_alias,
                     s,
+                    caps,
                 )?;
                 cols.push(format!("{packed} AS \"{col}\""));
                 lists.push((s.key.clone(), col));
@@ -1258,7 +1317,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
 
     for (name, value) in &root.args {
         match name.as_str() {
-            "block" => min_block = minimum_block(value)?,
+            "block" => min_block = minimum_block(value, caps)?,
             // Accepted and ignored on purpose: it selects an error policy, and a nest has no
             // subgraph indexing errors to report either way.
             "subgraphError" => {}
@@ -1276,7 +1335,7 @@ pub fn compile(schema: &Schema, root: &RootField) -> Result<Compiled, Unsupporte
                     return Err(Unsupported::Argument("`where` must be an object".into()));
                 };
                 for (key, v) in m {
-                    wheres.push(lower_predicate(schema, ent, key, v, BASE, 0)?);
+                    wheres.push(lower_predicate(schema, ent, key, v, BASE, 0, caps)?);
                 }
             }
             "first" | "skip" | "orderBy" | "orderDirection" if !singular => {}
@@ -1418,6 +1477,7 @@ fn derived_list_sql(
     parent_id: &str,
     alias: &str,
     selection: &Selection,
+    caps: &Capabilities,
 ) -> Result<String, Unsupported> {
     let mut packed = Vec::new();
     for (i, sub) in selection.sub.iter().enumerate() {
@@ -1504,7 +1564,7 @@ fn derived_list_sql(
                     return Err(Unsupported::Argument("`where` must be an object".into()));
                 };
                 for (key, value) in filters {
-                    wheres.push(lower_predicate(schema, child, key, value, alias, 0)?);
+                    wheres.push(lower_predicate(schema, child, key, value, alias, 0, caps)?);
                 }
             }
             "first" | "skip" | "orderBy" | "orderDirection" => {}
@@ -1575,8 +1635,14 @@ fn derived_list_sql(
         order_expr
     };
     let view = crate::subgraph_import::to_alias(&child.name);
+    // No `OFFSET 0`, so an unargumented list lowers to exactly the SQL RFC-0053 always emitted.
+    let offset = if skip > 0 {
+        format!(" OFFSET {skip}")
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s FROM \"{view}\" {alias} WHERE {} ORDER BY {order_expr} {direction} LIMIT {first} OFFSET {skip}) t), '[]')",
+        "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s FROM \"{view}\" {alias} WHERE {} ORDER BY {order_expr} {direction} LIMIT {first}{offset}) t), '[]')",
         packed.join(", "),
         wheres.join(" AND "),
     ))
@@ -1584,8 +1650,8 @@ fn derived_list_sql(
 
 /// The supported head precondition, shared by entities and `_meta`. A historical argument must
 /// never be ignored by the metadata resolver merely because it does not compile to SQL.
-pub fn minimum_block(value: &Value) -> Result<Option<u64>, Unsupported> {
-    if matches!(value, Value::Null) {
+pub fn minimum_block(value: &Value, caps: &Capabilities) -> Result<Option<u64>, Unsupported> {
+    if caps.null_block && matches!(value, Value::Null) {
         return Ok(None);
     }
     let Value::Object(fields) = value else {
@@ -1611,6 +1677,7 @@ fn lower_predicate(
     v: &Value,
     base: &str,
     depth: usize,
+    caps: &Capabilities,
 ) -> Result<String, Unsupported> {
     if key == "and" || key == "or" {
         let Value::List(items) = v else {
@@ -1642,7 +1709,7 @@ fn lower_predicate(
             }
             let inner: Result<Vec<String>, Unsupported> = m
                 .iter()
-                .map(|(k, vv)| lower_predicate(schema, ent, k, vv, base, depth))
+                .map(|(k, vv)| lower_predicate(schema, ent, k, vv, base, depth, caps))
                 .collect();
             // Conditions within one filter object are ANDed, which is what `where` itself does.
             parts.push(format!("({})", inner?.join(" AND ")));
@@ -1701,7 +1768,7 @@ fn lower_predicate(
         let view = crate::subgraph_import::to_alias(&target);
         let parts: Result<Vec<String>, Unsupported> = inner
             .iter()
-            .map(|(k, vv)| lower_predicate(schema, child, k, vv, &alias, depth + 1))
+            .map(|(k, vv)| lower_predicate(schema, child, k, vv, &alias, depth + 1, caps))
             .collect();
         // `EXISTS` rather than a join: the parent's row count must not change, and `first` still means
         // what it says.
@@ -1760,7 +1827,7 @@ fn lower_predicate(
             return Err(Unsupported::Operator(key.to_string()));
         }
         let col = format!("{base}.\"{field}\"");
-        if matches!(v, Value::Null) && matches!(*suffix, "" | "_not") {
+        if caps.null_filters && matches!(v, Value::Null) && matches!(*suffix, "" | "_not") {
             return Ok(format!(
                 "{col} IS {}NULL",
                 if *suffix == "_not" { "NOT " } else { "" }

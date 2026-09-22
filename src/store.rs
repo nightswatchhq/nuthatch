@@ -113,6 +113,9 @@ const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 const BLOCKS: TableDefinition<&str, &str> = TableDefinition::new("blocks");
 /// Derived reverse index, transactionally maintained with the canonical checkpoint table.
 const CHECKPOINT_HASHES: TableDefinition<&str, u64> = TableDefinition::new("checkpoint_hashes");
+/// RFC-0060: only a `graph` build keeps the index. A default build never creates or writes it, so its
+/// on-disk layout is unchanged.
+const INDEX_CHECKPOINT_HASHES: bool = cfg!(feature = "graph");
 
 /// The `block_hash` a stored row JSON carries.
 pub(crate) fn row_block_hash(json: &str) -> Option<String> {
@@ -657,7 +660,7 @@ impl Store {
     }
 
     fn from_db(db: Database) -> Result<Store> {
-        // Materialise the base tables and checkpoint lookup up front. Only `open`
+        // Materialise all four tables up front so read txns never hit a missing one. Only `open`
         // (the creating path) goes through this - `open_existing` takes no write txn, see #471.
         let wtx = db.begin_write()?;
         {
@@ -665,16 +668,18 @@ impl Store {
             wtx.open_table(META)?;
             wtx.open_table(BLOCKS)?;
             wtx.open_table(OUTBOX)?;
+        }
+        if INDEX_CHECKPOINT_HASHES {
+            // Rebuilt, not trusted: a default build may have written checkpoints since, and a
+            // non-empty index is not a current one. One streaming pass over the checkpoints.
+            wtx.delete_table(CHECKPOINT_HASHES)?;
             let blocks = wtx.open_table(BLOCKS)?;
             let mut hashes = wtx.open_table(CHECKPOINT_HASHES)?;
-            // One-time upgrade, streaming rather than materialising the checkpoint history.
-            if hashes.is_empty()? {
-                for row in blocks.iter()? {
-                    let (key, value) = row?;
-                    let hash = decode_block_record(value.value()).0.to_ascii_lowercase();
-                    if !hash.is_empty() {
-                        hashes.insert(hash.as_str(), key.value().parse::<u64>()?)?;
-                    }
+            for row in blocks.iter()? {
+                let (key, value) = row?;
+                let hash = decode_block_record(value.value()).0.to_ascii_lowercase();
+                if !hash.is_empty() {
+                    hashes.insert(hash.as_str(), key.value().parse::<u64>()?)?;
                 }
             }
         }
@@ -880,13 +885,15 @@ impl Store {
                     .and_then(|v| decode_block_record(v.value()).1);
                 let (h, packed_ts) = decode_block_record(hash);
                 let packed = encode_block_record(&h, packed_ts.or(existing_ts));
-                let mut hashes = wtx.open_table(CHECKPOINT_HASHES)?;
-                if let Some(old) = b.get(key.as_str())? {
-                    let old_hash = decode_block_record(old.value()).0.to_ascii_lowercase();
-                    hashes.remove(old_hash.as_str())?;
-                }
-                if !h.is_empty() {
-                    hashes.insert(h.to_ascii_lowercase().as_str(), block)?;
+                if INDEX_CHECKPOINT_HASHES {
+                    let mut hashes = wtx.open_table(CHECKPOINT_HASHES)?;
+                    if let Some(old) = b.get(key.as_str())? {
+                        let old_hash = decode_block_record(old.value()).0.to_ascii_lowercase();
+                        hashes.remove(old_hash.as_str())?;
+                    }
+                    if !h.is_empty() {
+                        hashes.insert(h.to_ascii_lowercase().as_str(), block)?;
+                    }
                 }
                 b.insert(key.as_str(), packed.as_str())?;
             }
@@ -1223,11 +1230,13 @@ impl Store {
                 .unwrap_or((String::new(), None));
             let packed =
                 encode_block_record(hash.unwrap_or(&existing_hash), timestamp.or(existing_ts));
-            let mut hashes = wtx.open_table(CHECKPOINT_HASHES)?;
-            hashes.remove(existing_hash.to_ascii_lowercase().as_str())?;
-            let new_hash = hash.unwrap_or(&existing_hash).to_ascii_lowercase();
-            if !new_hash.is_empty() {
-                hashes.insert(new_hash.as_str(), block)?;
+            if INDEX_CHECKPOINT_HASHES {
+                let mut hashes = wtx.open_table(CHECKPOINT_HASHES)?;
+                hashes.remove(existing_hash.to_ascii_lowercase().as_str())?;
+                let new_hash = hash.unwrap_or(&existing_hash).to_ascii_lowercase();
+                if !new_hash.is_empty() {
+                    hashes.insert(new_hash.as_str(), block)?;
+                }
             }
             t.insert(key.as_str(), packed.as_str())?;
         }
@@ -1263,6 +1272,9 @@ impl Store {
     }
 
     pub fn checkpoint_number(&self, hash: &str) -> Result<Option<u64>> {
+        if !INDEX_CHECKPOINT_HASHES {
+            anyhow::bail!("hash-pinned reads need a nuthatch built with `--features graph`");
+        }
         let rtx = self.db.begin_read()?;
         let table = rtx.open_table(CHECKPOINT_HASHES)
             .context("checkpoint hash index is unavailable; open this store with the current writer to upgrade it")?;
@@ -1305,12 +1317,14 @@ impl Store {
                 .collect();
             for k in doomed {
                 if let Some(value) = blocks.remove(k.as_str())? {
-                    wtx.open_table(CHECKPOINT_HASHES)?.remove(
-                        decode_block_record(value.value())
-                            .0
-                            .to_ascii_lowercase()
-                            .as_str(),
-                    )?;
+                    if INDEX_CHECKPOINT_HASHES {
+                        wtx.open_table(CHECKPOINT_HASHES)?.remove(
+                            decode_block_record(value.value())
+                                .0
+                                .to_ascii_lowercase()
+                                .as_str(),
+                        )?;
+                    }
                 }
             }
         }
@@ -1363,12 +1377,14 @@ impl Store {
                 .collect();
             for k in doomed {
                 if let Some(value) = blocks.remove(k.as_str())? {
-                    wtx.open_table(CHECKPOINT_HASHES)?.remove(
-                        decode_block_record(value.value())
-                            .0
-                            .to_ascii_lowercase()
-                            .as_str(),
-                    )?;
+                    if INDEX_CHECKPOINT_HASHES {
+                        wtx.open_table(CHECKPOINT_HASHES)?.remove(
+                            decode_block_record(value.value())
+                                .0
+                                .to_ascii_lowercase()
+                                .as_str(),
+                        )?;
+                    }
                 }
             }
 
@@ -1983,6 +1999,7 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "graph")]
     #[test]
     fn checkpoint_hash_index_upgrades_old_history_and_tracks_reorgs() {
         let dir = tempfile::tempdir().unwrap();
@@ -2032,6 +2049,60 @@ mod tests {
         drop(store);
         let read_only = super::Store::open_existing(&path).unwrap();
         assert_eq!(read_only.checkpoint_number(&replacement).unwrap(), Some(1));
+    }
+
+    /// A default build may write checkpoints without the index, so a non-empty index left behind is
+    /// stale, not current. Opening rebuilds it.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn a_stale_checkpoint_hash_index_is_rebuilt_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.redb");
+        let stale = format!("0x{}", "ee".repeat(32));
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                tx.open_table(super::ENTITIES).unwrap();
+                tx.open_table(super::META).unwrap();
+                tx.open_table(super::OUTBOX).unwrap();
+                let mut blocks = tx.open_table(super::BLOCKS).unwrap();
+                blocks
+                    .insert(
+                        super::Store::block_key(7).as_str(),
+                        format!("0x{:064x}", 7).as_str(),
+                    )
+                    .unwrap();
+                tx.open_table(super::CHECKPOINT_HASHES)
+                    .unwrap()
+                    .insert(stale.as_str(), 7)
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let store = super::Store::open(&path).unwrap();
+        assert_eq!(
+            store.checkpoint_number(&format!("0x{:064x}", 7)).unwrap(),
+            Some(7)
+        );
+        assert_eq!(store.checkpoint_number(&stale).unwrap(), None);
+    }
+
+    /// RFC-0060 §5.6: a default build's store has exactly main's tables.
+    #[cfg(not(feature = "graph"))]
+    #[test]
+    fn a_default_build_keeps_no_checkpoint_hash_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.redb");
+        let store = super::Store::open(&path).unwrap();
+        store
+            .set_block_hash(1, &format!("0x{}", "aa".repeat(32)))
+            .unwrap();
+        assert!(store.checkpoint_number("0x00").is_err());
+        drop(store);
+        let db = redb::Database::open(&path).unwrap();
+        let rtx = db.begin_read().unwrap();
+        assert!(rtx.open_table(super::CHECKPOINT_HASHES).is_err());
     }
 
     use super::*;

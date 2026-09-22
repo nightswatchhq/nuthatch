@@ -3,9 +3,6 @@
 
 #![allow(clippy::duplicate_mod)] // Existing modules each import their own tests/common helpers.
 
-#[path = "network_contract.rs"]
-mod network_contract;
-
 #[path = "abi_floors_documented.rs"]
 mod abi_floors_documented;
 #[path = "actions_are_pinned.rs"]

@@ -165,12 +165,6 @@ pub struct GraphValidateArgs {
     /// The nest's GraphQL endpoint, the thing under test.
     #[arg(long)]
     pub nest: String,
-    /// Environment variable containing the reference endpoint's bearer token, never the token itself.
-    #[arg(long)]
-    pub reference_token_env: Option<String>,
-    /// Environment variable containing the nest endpoint's bearer token.
-    #[arg(long)]
-    pub nest_token_env: Option<String>,
 }
 
 /// A zero publish interval would have the mirror reconcile in a loop.

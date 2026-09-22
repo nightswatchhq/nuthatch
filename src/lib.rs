@@ -10,6 +10,7 @@ pub mod alerts;
 pub mod allowlist;
 pub mod analytics;
 pub mod analytics_budget;
+#[cfg(feature = "graph")]
 mod analytics_scalars;
 pub mod audit;
 pub mod authored_entity_spike;

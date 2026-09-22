@@ -286,6 +286,23 @@ fn new_spill_dir() -> Result<SpillDir> {
     }
 }
 
+/// RFC-0060 §5.6: what a `graph` build adds to every connection. A default build adds nothing, so its
+/// connections behave exactly as they did before the feature existed.
+fn register_extensions(conn: &Connection) -> Result<()> {
+    #[cfg(feature = "graph")]
+    {
+        crate::analytics_scalars::register(conn)?;
+        // GraphQL and the SQL surface define observable order explicitly, so retaining insertion
+        // order buys no contract and can hold a whole extra ordering buffer for a large historical
+        // aggregation.
+        conn.execute_batch("SET preserve_insertion_order=false;")
+            .context("failed to disable DuckDB insertion-order preservation")?;
+    }
+    #[cfg(not(feature = "graph"))]
+    let _ = conn;
+    Ok(())
+}
+
 fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
     note_duck_open(dir);
     let spill = new_spill_dir()?;
@@ -316,12 +333,7 @@ fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
             .context("duckdb max_temp_directory_size")?;
     }
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
-    crate::analytics_scalars::register(&conn)?;
-    // GraphQL and the SQL surface define observable order explicitly. Retaining insertion order for
-    // intermediate operators therefore buys no contract and can keep a full extra ordering buffer
-    // alive for a large historical aggregation. Let DuckDB release that memory instead.
-    conn.execute_batch("SET preserve_insertion_order=false;")
-        .context("failed to disable DuckDB insertion-order preservation")?;
+    register_extensions(&conn)?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
     // materialisation fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet
     // file holding rows on both sides of the filter. The optimiser compresses the sort key against
@@ -3357,7 +3369,7 @@ fn view_build_failure_at(
         return None;
     }
     let conn = Connection::open_in_memory().ok()?;
-    crate::analytics_scalars::register(&conn).ok()?;
+    register_extensions(&conn).ok()?;
     let empty_hot = HotRows::new();
     let _ = define_views(
         &conn,
@@ -3486,7 +3498,7 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     let Ok(conn) = Connection::open_in_memory() else {
         return Vec::new();
     };
-    if let Err(error) = crate::analytics_scalars::register(&conn) {
+    if let Err(error) = register_extensions(&conn) {
         return vec![ViewIssue {
             file: "<scalar functions>".into(),
             error: format!("register query scalar functions: {error:#}"),
@@ -3562,7 +3574,7 @@ pub fn entity_output_columns(
     sql: &str,
 ) -> Result<Vec<String>> {
     let conn = Connection::open_in_memory()?;
-    crate::analytics_scalars::register(&conn)?;
+    register_extensions(&conn)?;
     let empty_hot = HotRows::new();
     let _ = define_views(
         &conn,

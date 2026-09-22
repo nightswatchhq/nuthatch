@@ -365,6 +365,12 @@ pub fn router(backing: SharedNest) -> Router {
     // (`indexer::admin_enabled`), so it is constant for the life of the endpoint - a hot swap (RFC-0020
     // slice 2) re-points the *data*, never the admin decision.
     let admin_enabled = backing.current().admin_enabled;
+    // RFC-0060 §5.6: the network facade's own routes, registered only in a `graph` build.
+    let graph_facade = |r: Router<SharedNest>| {
+        #[cfg(feature = "graph")]
+        let r = r.route("/graph/status", get(graph_status));
+        r
+    };
     let admin = |r: Router<SharedNest>| {
         if !admin_enabled {
             return r;
@@ -373,7 +379,7 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/_admin/", get(admin_index))
             .route("/_admin/events", get(admin_events))
     };
-    admin(
+    admin(graph_facade(
         Router::new()
             .route("/", get(summary))
             .route("/health", get(|| async { "ok" }))
@@ -384,7 +390,6 @@ pub fn router(backing: SharedNest) -> Router {
             // RFC-0053 S1 (#1265). Both shapes: a plain endpoint an operator points people at, and
             // the subgraph URL form so a client's existing URL needs only its host changed.
             .route("/graphql", post(graph_graphql))
-            .route("/graph/status", get(graph_status))
             .route("/subgraphs/id/{id}", post(graph_graphql))
             .route("/subgraphs/name/{*name}", post(graph_graphql))
             .route("/table/{name}", get(table))
@@ -404,7 +409,7 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/flags", get(flags))
             .route("/nest", get(nest))
             .route("/shape", get(shape)),
-    )
+    ))
     // Count every served request for `/metrics` (the operator's billing signal).
     .layer(axum::middleware::from_fn(count_request))
     .with_state(backing)
@@ -2002,17 +2007,12 @@ async fn graph_graphql(
             if root.name.starts_with("__") {
                 continue;
             }
-            let selected = if root.name == "_meta" {
-                policy
-                    // graph-node accepts a numeric metadata selector between retained
-                    // checkpoints. Its `_Block_` carries that requested number, while
-                    // `hash` and `timestamp` are null because there is no exact
-                    // checkpoint. Entity reads use precisely the same data bound.
-                    // Hash selectors still require a retained canonical checkpoint.
-                    .select_data_block(s.store.as_ref(), &head, root.args.get("block"))
-            } else {
-                policy.select_data_block(s.store.as_ref(), &head, root.args.get("block"))
-            };
+            // `_meta` and entity reads share one data bound. graph-node accepts a numeric metadata
+            // selector between retained checkpoints: its `_Block_` carries the requested number,
+            // with `hash` and `timestamp` null because there is no exact checkpoint. Hash selectors
+            // still require a retained canonical checkpoint.
+            let selected =
+                policy.select_data_block(s.store.as_ref(), &head, root.args.get("block"));
             let block = match selected {
                 Ok(block) => block,
                 Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
@@ -2074,7 +2074,10 @@ async fn graph_graphql(
                             Json(gql_error(&format!("unsupported _meta argument `{name}`"))),
                         );
                     }
-                    min_block = match crate::graph_query::minimum_block(value) {
+                    min_block = match crate::graph_query::minimum_block(
+                        value,
+                        &crate::graph_query::Capabilities::BUILD,
+                    ) {
                         Ok(n) => n,
                         Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
                     };
@@ -2129,7 +2132,11 @@ async fn graph_graphql(
             }
             _ => {}
         }
-        let compiled = match crate::graph_query::compile(&schema, root) {
+        let compiled = match crate::graph_query::compile_with(
+            &schema,
+            root,
+            &crate::graph_query::Capabilities::BUILD,
+        ) {
             Ok(c) => c,
             Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
         };
@@ -2352,6 +2359,7 @@ fn gql_error(message: &str) -> serde_json::Value {
 }
 
 /// Operational freshness, not a claim that every Graph entity has passed reference parity.
+#[cfg(feature = "graph")]
 async fn graph_status(State(state): State<AppState>) -> impl IntoResponse {
     let unavailable = |reason: String| {
         (
@@ -4481,6 +4489,7 @@ mod tests {
         crate::metrics::METRICS.remove_nest(&name);
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn graph_status_reports_the_stale_checkpoint_instead_of_a_healthy_chain_tip() {
         use tower::ServiceExt;
