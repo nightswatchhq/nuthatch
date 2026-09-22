@@ -2761,14 +2761,21 @@ fn define_views_bound(
                 // schemas legitimately drift over a nest's life as ABIs are versioned (CLAUDE.md), and
                 // without this a single drifted column makes `read_parquet` throw and the whole table's
                 // view silently vanish.
-                parts.push(format!(
-                    "SELECT *{} FROM {}",
-                    derived_bigint_cols(cols),
-                    with_declared_base_cols(
-                        &format!("read_parquet([{}], union_by_name=true)", files.join(", ")),
-                        cols
-                    )
-                ));
+                //
+                // Grouped, not one `read_parquet` over every file: DuckDB opens and plans a whole input
+                // list together, which makes a long append-only corpus a file-handle and memory cliff
+                // before a row is read. `UNION ALL BY NAME` below keeps the drift rule across groups.
+                const PARQUET_INPUT_BATCH: usize = 256;
+                for batch in files.chunks(PARQUET_INPUT_BATCH) {
+                    parts.push(format!(
+                        "SELECT *{} FROM {}",
+                        derived_bigint_cols(cols),
+                        with_declared_base_cols(
+                            &format!("read_parquet([{}], union_by_name=true)", batch.join(", ")),
+                            cols
+                        )
+                    ));
+                }
             }
             parts.extend(hot_part.clone());
             if parts.is_empty() {
@@ -3931,6 +3938,54 @@ template="pool"
         let sql = format!("SELECT 1; COPY (SELECT 2) TO '{}'", target.display());
         assert!(named(dir.path(), &sql, u64::MAX, 0, false, None).is_err());
         assert!(!target.exists());
+    }
+
+    /// A long-lived table holds thousands of sealed segments. One `read_parquet` over all of them
+    /// plans every file together, so the view reads them in groups instead, and loses no row doing it.
+    #[test]
+    fn a_table_of_many_segments_reads_them_in_bounded_groups_and_loses_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        for b in 1..=300u64 {
+            let row = format!(
+                r#"{{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"1","block_number":{b},"tx_hash":"0xt","log_index":0}}"#
+            );
+            crate::seal::seal_range(dir.path(), &[row], b, b).unwrap();
+        }
+        let got = query(
+            dir.path(),
+            r#"SELECT count(*) AS n, sum(block_number) AS s FROM "usdc__transfer""#,
+        )
+        .unwrap();
+        assert_eq!(got[0]["n"], Value::from(300u64));
+        assert_eq!(
+            got[0]["s"],
+            Value::String("45150".into()),
+            "1 + 2 + ... + 300"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        let _ = define_views(
+            &conn,
+            dir.path(),
+            &HotRows::new(),
+            u64::MAX,
+            &Default::default(),
+            &[],
+            None,
+        );
+        let ddl: String = conn
+            .query_row(
+                "SELECT sql FROM duckdb_views() WHERE view_name = 'usdc__transfer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ddl.matches("read_parquet(").count(),
+            2,
+            "300 segments are read as groups of at most 256: {ddl}"
+        );
     }
 
     #[test]
