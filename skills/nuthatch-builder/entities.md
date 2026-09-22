@@ -82,6 +82,25 @@ there is no rollback interface because there is nothing to roll back. Observed l
 mainnet: a reorg rolled back 32 rows and the relation still summed to the same total as every decoded
 transfer the nest held, to the last digit.
 
+## Reading an offchain table
+
+An entity may read or join `offchain__<table>`, the snapshots `nuthatch offchain drop` and `pull` seal.
+
+- **Its columns are typed from the snapshots: text, integers and booleans.** A float or decimal
+  column is refused at load, so publish a scaled integer such as `price_e8`. So is a column typed
+  one way in one snapshot and another way in the next.
+- **A new snapshot is a delta.** The window after it is sealed feeds its rows at `+1`. Nothing
+  already applied is recomputed.
+- **A replaced or deleted snapshot is a rebuild** from the sealed corpus, the hot tail and every
+  snapshot still present. It runs beside the live relation and is swapped in whole, so until it
+  lands the entity answers from the old snapshots and says so.
+- **Offchain rows never retract.** A reorg retracts the chain side only.
+- **New snapshots are picked up at window boundaries.** A chain that stops producing blocks also
+  stops the entity picking up snapshots.
+
+`/ready`, `/derived` and `/sql` provenance name what was applied:
+`"offchain": {"offchain__prices": {"snapshots": 12, "latest": "<hash>"}}`.
+
 ## Watching one
 
 Six series on `/metrics`, labelled by nest and entity:
