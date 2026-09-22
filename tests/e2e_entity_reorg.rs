@@ -1269,6 +1269,10 @@ async fn the_sql_route_serves_the_relation_by_name_and_says_where_it_came_from()
         axum::http::StatusCode::OK,
         "/sql over the entity: {body}"
     );
+    assert!(
+        body["provenance"].get("reproducibility").is_none(),
+        "a chain-only entity's answer is not labelled as snapshot data (#1437): {body}"
+    );
     let rows = body["rows"].as_array().expect("rows").clone();
     assert_eq!(
         rows.len(),
@@ -1505,5 +1509,25 @@ async fn an_answer_that_read_offchain_data_says_it_is_reproducible_by_snapshot()
         "{chain}"
     );
     assert!(chain["provenance"].get("offchain").is_none(), "{chain}");
+
+    // A catalogue survey defines every view, offchain ones included, but reads none of their rows.
+    let (status, survey) = get_json(
+        &rt,
+        &sql("SELECT count(*) AS n FROM information_schema.tables"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{survey}");
+    assert_eq!(survey["count"], 1, "{survey}");
+    assert!(
+        survey["provenance"].get("reproducibility").is_none(),
+        "{survey}"
+    );
+
+    let (_, schema) = get_json(&rt, "/schema").await;
+    let doc = schema["raw"].as_str().unwrap_or_default();
+    assert!(
+        doc.contains("reads offchain__tiers: reproducible by snapshot"),
+        "{doc}"
+    );
     shutdown_and_settle(rt).await;
 }
