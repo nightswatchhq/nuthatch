@@ -35,6 +35,64 @@ type CallBatchFuture<'a> =
 /// where we currently re-fetch every timestamp in a range we just split.
 const TIMESTAMP_CACHE_MAX: usize = 262_144;
 
+// `None` is a stored EVM fact, not a convenient bucket for provider failures.
+fn decode_call_batch(response: &Value, expected: usize) -> Result<Vec<Option<String>>> {
+    let items = response
+        .as_array()
+        .context("eth_call batch response is not an array")?;
+    let mut out = vec![None; expected];
+    let mut seen = vec![false; expected];
+    for item in items {
+        let id = item
+            .get("id")
+            .and_then(Value::as_u64)
+            .and_then(|id| usize::try_from(id).ok())
+            .context("eth_call batch item has no valid id")?;
+        if id >= expected || seen[id] {
+            bail!("eth_call batch contains an unexpected or duplicate id {id}");
+        }
+        seen[id] = true;
+        if let Some(error) = item.get("error") {
+            if item.get("result").is_some() {
+                bail!("eth_call batch item contains both result and error");
+            }
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let code = error.get("code").and_then(Value::as_i64);
+            let explicit_revert = matches!(code, Some(3 | -32000 | -32015))
+                && (message == "execution reverted"
+                    || message.starts_with("execution reverted:")
+                    || message.starts_with("vm execution error: revert"));
+            if !explicit_revert {
+                return Err(ClassifiedError {
+                    class: classify_rpc_error(error),
+                    detail: format!("eth_call batch item {id} failed: {error}"),
+                }
+                .into());
+            }
+        } else {
+            let result = item
+                .get("result")
+                .and_then(Value::as_str)
+                .context("eth_call batch item has no string result or explicit revert")?;
+            if !result.starts_with("0x")
+                || result.len() % 2 != 0
+                || !result[2..].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("eth_call batch item has malformed return data");
+            }
+            out[id] = Some(result.to_string());
+        }
+    }
+    if seen.iter().any(|seen| !seen) {
+        bail!("eth_call batch omitted one or more requested results");
+    }
+    Ok(out)
+}
+
 /// Select the RPC endpoint pool for a command, preserving order and dropping duplicates.
 ///
 /// An explicit `--rpc` is an isolation boundary, not a preference hint: it is the complete pool
@@ -825,10 +883,12 @@ impl RpcClient {
         let classified = |class: FailureClass, detail: String| {
             anyhow::Error::new(ClassifiedError { class, detail })
         };
-        let resp =
-            self.http.post(url).json(body).send().await.map_err(|e| {
-                classified(FailureClass::Transient, format!("transport error: {e}"))
-            })?;
+        let resp = self.http.post(url).json(body).send().await.map_err(|e| {
+            classified(
+                FailureClass::Transient,
+                format!("transport error: {}", e.without_url()),
+            )
+        })?;
         let status = resp.status();
         // Read `Retry-After` before the body consumes the response (#361). Seconds-form only: the
         // HTTP-date form needs a clock comparison to be meaningful, and no provider we have measured
@@ -1075,7 +1135,7 @@ impl RpcClient {
     /// batched-boundary discipline as log extraction").
     ///
     /// Returns results **positionally**, so a caller can zip them back against its declarations. A
-    /// call that reverted or that the endpoint declined yields `None` in that slot rather than failing
+    /// call that explicitly reverted yields `None` in that slot rather than failing
     /// the batch: a revert is a legitimate answer about chain state at that block (the function may not
     /// have existed yet), and collapsing it into a whole-batch error would make one unlucky
     /// declaration poison every other call at the same block.
@@ -1119,22 +1179,7 @@ impl RpcClient {
             })
             .collect();
         let resp = self.post_with_failover(&Value::Array(batch)).await?;
-        let mut out = vec![None; calls.len()];
-        for item in resp.as_array().into_iter().flatten() {
-            let Some(idx) = item.get("id").and_then(Value::as_u64) else {
-                continue;
-            };
-            let Some(slot) = out.get_mut(idx as usize) else {
-                continue;
-            };
-            // `error` here is a revert or an unsupported call at that block - a fact about chain
-            // state, not a transport failure, so it stays `None` rather than aborting the batch.
-            *slot = item
-                .get("result")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-        }
-        Ok(out)
+        decode_call_batch(&resp, calls.len())
     }
 
     /// Send a raw JSON-RPC batch and return the raw response. For `doctor` only: measuring the
@@ -1753,6 +1798,135 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// An endpoint that answers every request with `body`.
+    async fn canned_rpc(body: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    async fn two_calls_answered_with(
+        body: serde_json::Value,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let calls = vec![
+            (
+                "0x1111111111111111111111111111111111111111".to_string(),
+                "0x12345678".to_string(),
+            ),
+            (
+                "0x2222222222222222222222222222222222222222".to_string(),
+                "0x12345678".to_string(),
+            ),
+        ];
+        let (url, server) = canned_rpc(body).await;
+        let out = super::RpcClient::new(vec![url])
+            .unwrap()
+            .eth_call_batch_at(&calls, 100)
+            .await;
+        server.abort();
+        out
+    }
+
+    /// `None` is what a stored call row means by "reverted", so only an explicit revert may produce
+    /// it. A pruned node's `missing trie node`, a per-item rate limit, or an id the provider left out
+    /// is not a fact about the chain, and storing it as one writes the provider's failure into the
+    /// dataset.
+    #[tokio::test]
+    async fn an_eth_call_the_provider_failed_is_an_error_not_a_stored_revert() {
+        use serde_json::json;
+        assert_eq!(
+            two_calls_answered_with(json!([
+                {"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}},
+                {"jsonrpc":"2.0","id":0,"result":"0x0012"}
+            ]))
+            .await
+            .unwrap(),
+            vec![Some("0x0012".into()), None],
+            "a revert and a value are both answers"
+        );
+        for body in [
+            json!([
+                {"jsonrpc":"2.0","id":0,"result":"0x"},
+                {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"missing trie node 1f2e (path )"}}
+            ]),
+            json!([
+                {"jsonrpc":"2.0","id":0,"result":"0x"},
+                {"jsonrpc":"2.0","id":1,"error":{"code":429,"message":"rate limit exceeded"}}
+            ]),
+            json!([{"jsonrpc":"2.0","id":0,"result":"0x"}]),
+            json!({"jsonrpc":"2.0","id":0,"result":"0x"}),
+        ] {
+            assert!(
+                two_calls_answered_with(body.clone()).await.is_err(),
+                "stored as a revert: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_batches_distinguish_reverts_from_provider_failures_and_missing_results() {
+        use serde_json::json;
+        assert_eq!(
+            super::decode_call_batch(
+                &json!([
+                    {"id":1,"error":{"code":3,"message":"execution reverted: missing getter"}},
+                    {"id":0,"result":"0x0012"}
+                ]),
+                2
+            )
+            .unwrap(),
+            vec![Some("0x0012".into()), None]
+        );
+        for response in [
+            json!([]),
+            json!({"result":"0x"}),
+            json!([{"id":0,"result":null}]),
+            json!([{"id":1,"result":"0x"}]),
+            json!([{"id":0,"result":"0x"},{"id":0,"result":"0x"}]),
+            json!([{"id":0,"result":"0xyz"}]),
+            json!([{"id":0,"result":"0x1"}]),
+            json!([{"id":0,"error":{"code":-32000,"message":"missing trie node"}}]),
+            json!([{"id":0,"error":{"code":-32602,"message":"invalid block selector"}}]),
+            json!([{"id":0,"error":{"code":429,"message":"rate limit exceeded"}}]),
+            json!([{"id":0,"result":"0x","error":{"code":3,"message":"execution reverted"}}]),
+        ] {
+            assert!(
+                super::decode_call_batch(&response, 1).is_err(),
+                "accepted {response}"
+            );
+        }
+    }
+
+    /// A provider key in the URL must not travel with a transport error into logs or stored text.
+    #[tokio::test]
+    async fn a_transport_error_does_not_carry_the_endpoint_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = super::RpcClient::new(vec![format!(
+            "http://127.0.0.1:{port}/v3/SECRETKEY?k=SECRETKEY"
+        )])
+        .unwrap();
+        let error = client
+            .post_one_for_test(&serde_json::json!({"method":"eth_blockNumber"}))
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("transport error"), "{text}");
+        assert!(!text.contains("SECRETKEY"), "{text}");
     }
 
     /// The block height the healthy mock reports, so a failover test can prove *which* endpoint
