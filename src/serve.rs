@@ -2015,6 +2015,23 @@ async fn graph_graphql(
             // `hasIndexingErrors` is false as a fact rather than as a convenience - there is no
             // handler that could have aborted.
             "_meta" => {
+                // Its one argument is `block`, and ignoring it answered a past or future block with
+                // today's head.
+                for (name, value) in &root.args {
+                    if name != "block" {
+                        return (
+                            StatusCode::OK,
+                            Json(gql_error(&format!("unsupported _meta argument `{name}`"))),
+                        );
+                    }
+                    let unmet = match crate::graph_query::minimum_block(value) {
+                        Ok(min) => unmet_minimum_block(&s, min),
+                        Err(e) => Some(e.to_string()),
+                    };
+                    if let Some(e) = unmet {
+                        return (StatusCode::OK, Json(gql_error(&e)));
+                    }
+                }
                 let last = s
                     .store
                     .get_meta("last_block")
@@ -2062,36 +2079,11 @@ async fn graph_graphql(
             Ok(c) => c,
             Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
         };
-        // **`block: { number_gte: N }` is a precondition on the head**, checked here because the head is
-        // runtime state the compiler cannot see. graph-node answers on the latest block when the
-        // deployment has reached `N` and refuses otherwise, and its refusal is quoted rather than
-        // paraphrased: `DeploymentState::block_queryable` in `graph/src/data/subgraph/mod.rs:1362`.
-        //
-        // A nest with no head has indexed nothing, so it has not reached any block: reported as 0, which
-        // is what the message then says.
-        if let Some(min) = compiled.min_block {
-            let head = s
-                .store
-                .get_meta("last_block")
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            if head < min {
-                let id = s.nid.as_deref().map(str::to_string).unwrap_or_else(|| {
-                    s.nest_info["name"]
-                        .as_str()
-                        .unwrap_or("nuthatch")
-                        .to_string()
-                });
-                return (
-                    StatusCode::OK,
-                    Json(gql_error(&format!(
-                        "subgraph {id} has only indexed up to block number {head} and data for block \
-                         number {min} is therefore not yet available"
-                    ))),
-                );
-            }
+        if let Some(e) = compiled
+            .min_block
+            .and_then(|min| unmet_minimum_block(&s, min))
+        {
+            return (StatusCode::OK, Json(gql_error(&e)));
         }
         match graph_rows(&s, &compiled).await {
             Ok(rows) => {
@@ -2227,6 +2219,36 @@ fn gql_error(message: &str) -> serde_json::Value {
     serde_json::json!({"errors":[{"message": message}]})
 }
 
+/// **`block: { number_gte: N }` is a precondition on the head**, checked here because the head is
+/// runtime state the compiler cannot see. graph-node answers on the latest block when the deployment
+/// has reached `N` and refuses otherwise, and its refusal is quoted rather than paraphrased:
+/// `DeploymentState::block_queryable` in `graph/src/data/subgraph/mod.rs:1362`.
+///
+/// A nest with no head has indexed nothing, so it has not reached any block: reported as 0, which is
+/// what the message then says.
+fn unmet_minimum_block(s: &AppState, min: u64) -> Option<String> {
+    let head = s
+        .store
+        .get_meta("last_block")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if head >= min {
+        return None;
+    }
+    let id = s.nid.as_deref().map(str::to_string).unwrap_or_else(|| {
+        s.nest_info["name"]
+            .as_str()
+            .unwrap_or("nuthatch")
+            .to_string()
+    });
+    Some(format!(
+        "subgraph {id} has only indexed up to block number {head} and data for block number {min} \
+         is therefore not yet available"
+    ))
+}
+
 /// Run a compiled query through the same analytical path `/sql` uses, so a Graph query inherits
 /// RFC-0034's admission bounds rather than opening a second unbounded door into DuckDB.
 async fn graph_rows(
@@ -2239,17 +2261,35 @@ async fn graph_rows(
         .map_err(|e| format!("reading the query result: {e}"))?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| format!("decoding the query result: {e}"))?;
+    graph_result_rows(&v)
+}
+
+/// SQL may return a useful partial answer with explicit warnings. GraphQL clients do not see that
+/// envelope, so stripping its warnings would turn incomplete data into truth.
+fn graph_result_rows(
+    v: &serde_json::Value,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
     if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
         return Err(err.to_string());
     }
-    Ok(v.get("rows")
+    for flag in ["truncated", "degraded", "tip_unavailable"] {
+        if v.get(flag)
+            .is_some_and(|value| value != &serde_json::Value::Bool(false))
+        {
+            return Err(format!("GraphQL requires a complete query result: {flag}"));
+        }
+    }
+    let rows = v
+        .get("rows")
         .and_then(|r| r.as_array())
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| r.as_object().cloned())
-                .collect::<Vec<_>>()
+        .ok_or_else(|| "query result has no rows array".to_string())?;
+    rows.iter()
+        .map(|row| {
+            row.as_object()
+                .cloned()
+                .ok_or_else(|| "query result contains a non-object row".to_string())
         })
-        .unwrap_or_default())
+        .collect()
 }
 
 async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
@@ -7304,6 +7344,66 @@ mod tests {
                 .contains("must not be negative"),
             "a negative minimum is named: {body}"
         );
+    }
+
+    /// `_meta` takes the same `block` argument. Ignoring it answered a past or future block with
+    /// today's head.
+    #[tokio::test]
+    async fn graph_meta_never_discards_a_block_argument() {
+        let (_d, state) = graph_fixture();
+        let body = graph_ask(
+            "/graphql",
+            "{ _meta(block: { number_gte: 23456789 }) { block { number } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["_meta"]["block"]["number"], 23_456_789,
+            "{body}"
+        );
+        let body = graph_ask(
+            "/graphql",
+            "{ _meta(block: { number_gte: 23456790 }) { block { number } } }",
+            state.clone(),
+        )
+        .await;
+        assert_eq!(
+            body["errors"][0]["message"],
+            "subgraph t has only indexed up to block number 23456789 and data for block number \
+             23456790 is therefore not yet available",
+            "{body}"
+        );
+        for arg in [
+            "block: { number: 100 }",
+            "block: { hash: \"0xabc\" }",
+            "first: 1",
+        ] {
+            let body = graph_ask(
+                "/graphql",
+                &format!("{{ _meta({arg}) {{ block {{ number }} }} }}"),
+                state.clone(),
+            )
+            .await;
+            assert!(body["errors"].is_array(), "`{arg}` must be refused: {body}");
+            assert!(body["data"].is_null(), "`{arg}` answered: {body}");
+        }
+    }
+
+    #[test]
+    fn graph_results_never_hide_partial_or_malformed_sql_answers() {
+        for flag in ["truncated", "degraded", "tip_unavailable"] {
+            let mut result = serde_json::json!({"rows": [{"id": "a"}]});
+            result[flag] = serde_json::json!(true);
+            assert!(graph_result_rows(&result).unwrap_err().contains(flag));
+            result[flag] = serde_json::json!(false);
+            assert_eq!(graph_result_rows(&result).unwrap().len(), 1);
+        }
+        assert!(graph_result_rows(&serde_json::json!({})).is_err());
+        assert!(graph_result_rows(&serde_json::json!({"rows": [null]})).is_err());
+        assert!(graph_result_rows(&serde_json::json!({"rows": [], "error": "busy"})).is_err());
+        assert!(graph_result_rows(&serde_json::json!({"rows": []}))
+            .unwrap()
+            .is_empty());
     }
 
     /// `null` is refused by name, from a literal and from a variable alike (Jules on #1282).
