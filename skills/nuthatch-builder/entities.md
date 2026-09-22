@@ -95,11 +95,20 @@ An entity may read or join `offchain__<table>`, the snapshots `nuthatch offchain
   snapshot still present. It runs beside the live relation and is swapped in whole, so until it
   lands the entity answers from the old snapshots and says so.
 - **Offchain rows never retract.** A reorg retracts the chain side only.
+- **What an entity holds from its offchain tables is bounded by its own `max_rows`,** in rows and
+  at 3,200 bytes a row, across all of them. Past that the entity faults, naming the table, and the
+  rest of the nest carries on. Admission charges such an entity twice its `max_rows`, so declare a
+  larger one to hold a larger table.
 - **New snapshots are picked up at window boundaries.** A chain that stops producing blocks also
   stops the entity picking up snapshots.
 
 `/ready`, `/derived` and `/sql` provenance name what was applied:
 `"offchain": {"offchain__prices": {"snapshots": 12, "latest": "<hash>"}}`.
+
+**Such an entity is reproducible by snapshot, not re-derivable from chain,** and every surface says
+so with `"reproducibility": "snapshot"`, as does any `/sql` answer that reads `offchain__<table>`
+directly. The label follows from what the entity reads, so no configuration removes it. Do not cite
+one of these answers as chain-derived.
 
 ## Watching one
 

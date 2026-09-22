@@ -71,6 +71,9 @@ enum Msg {
     /// A rebuild, folded into a pending circuit and relation beside the live ones so readers keep
     /// the old, correctly labelled state until `Rebuild::Commit` swaps the new one in under one lock.
     Rebuild(Rebuild),
+    /// A bound refused on the caller's side: the fault is already recorded, and the circuit stops
+    /// so its state is released.
+    Stop,
     Flush(SyncSender<()>),
 }
 
@@ -199,6 +202,10 @@ pub struct EntityView {
     /// Per offchain table, the snapshots sent to the circuit (#1437). Sent, not folded: the next
     /// refresh compares the manifest against this, so no snapshot is ever fed twice.
     fed: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
+    /// Per offchain table, the rows and uncompressed bytes sent, against the allowance in
+    /// [`Self::admit_offchain`].
+    held: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    max_rows: u64,
 }
 
 impl EntityView {
@@ -404,6 +411,7 @@ impl EntityView {
                         }
                         // Messages are processed in order, so by the time the barrier is seen every
                         // prior batch is folded - the ack unblocks the waiter.
+                        Msg::Stop => break,
                         Msg::Flush(ack) => {
                             if let Some(through) = pending.take() {
                                 stamp(through, &mut shared.write().unwrap());
@@ -424,6 +432,8 @@ impl EntityView {
             unavailable,
             fault,
             fed: Default::default(),
+            held: Default::default(),
+            max_rows: max_rows as u64,
         })
     }
 
@@ -582,6 +592,9 @@ impl EntityView {
         if self.unavailable.is_some() {
             return Ok(());
         }
+        let Some(rows) = self.admit_offchain(table, snapshots) else {
+            return Ok(());
+        };
         let batch = self.offchain_batch(table, snapshots)?;
         let _ = self.tx.send(Msg::Offchain(
             Box::new(batch),
@@ -592,13 +605,52 @@ impl EntityView {
             .lock()
             .unwrap()
             .insert(table.to_string(), version.to_vec());
+        self.held.lock().unwrap().insert(table.to_string(), rows);
         Ok(())
+    }
+
+    /// The rows and bytes `table` holds once `snapshots` are sent, or `None` when the entity's
+    /// offchain input would pass its allowance. Then this entity alone faults, before any row is read.
+    ///
+    /// The allowance is the declared `max_rows`, in rows and at admission's per-row charge in bytes.
+    /// Admission charges an entity that reads offchain for it on top of its own rows, so every
+    /// allowance on a cursor sits inside that cursor's budget (RFC-0041 §7).
+    fn admit_offchain(&self, table: &str, snapshots: &[Snapshot]) -> Option<(u64, u64)> {
+        let add =
+            |(r, b): (u64, u64), (sr, sb): (u64, u64)| (r.saturating_add(sr), b.saturating_add(sb));
+        let (others, before) = {
+            let held = self.held.lock().unwrap();
+            let others = held
+                .iter()
+                .filter(|(t, _)| t.as_str() != table)
+                .fold((0, 0), |sum, (_, h)| add(sum, *h));
+            (others, held.get(table).copied().unwrap_or((0, 0)))
+        };
+        let after = snapshots
+            .iter()
+            .fold(before, |sum, s| add(sum, (s.row_count(), s.byte_size())));
+        let (rows, bytes) = add(others, after);
+        let max_bytes = self
+            .max_rows
+            .saturating_mul(crate::runtime::ENTITY_RSS_BYTES_PER_ROW);
+        if rows <= self.max_rows && bytes <= max_bytes {
+            return Some(after);
+        }
+        *self.fault.write().unwrap() = Some(format!(
+            "offchain__{table} would bring entity `{}`'s offchain input to {rows} rows and {bytes} \
+             bytes, over its allowance of {} rows and {max_bytes} bytes. Raise its max_rows, which \
+             admission charges for",
+            self.name, self.max_rows
+        ));
+        let _ = self.tx.send(Msg::Stop);
+        None
     }
 
     /// Start rebuilding off to one side (#1437). Until [`Self::rebuild_commit`], readers keep the
     /// current relation and the version that labels it; the cost is holding both while it runs.
     pub fn rebuild_begin(&self) {
         self.fed.lock().unwrap().clear();
+        self.held.lock().unwrap().clear();
         let _ = self.tx.send(Msg::Rebuild(Rebuild::Begin));
     }
 
@@ -623,6 +675,9 @@ impl EntityView {
         snapshots: &[Snapshot],
         version: &[String],
     ) -> Result<()> {
+        let Some(rows) = self.admit_offchain(table, snapshots) else {
+            return Ok(());
+        };
         let batch = self.offchain_batch(table, snapshots)?;
         let _ = self.tx.send(Msg::Rebuild(Rebuild::Offchain(
             Box::new(batch),
@@ -633,6 +688,7 @@ impl EntityView {
             .lock()
             .unwrap()
             .insert(table.to_string(), version.to_vec());
+        self.held.lock().unwrap().insert(table.to_string(), rows);
         Ok(())
     }
 

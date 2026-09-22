@@ -379,7 +379,7 @@ const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity vi
 /// making explicitly rather than as a side effect of one afternoon's measurement on one machine.
 /// Note also that half the old figure was two copies of the relation, one in the circuit and one in
 /// `Published`; #897 removed the second, so these numbers are not comparable to any taken before it.
-const ENTITY_RSS_BYTES_PER_ROW: u64 = 3_200;
+pub(crate) const ENTITY_RSS_BYTES_PER_ROW: u64 = 3_200;
 
 /// What one authored entity's circuit and thread cost, before any of its declared rows.
 ///
@@ -442,7 +442,16 @@ pub fn declared_entities(dir: &Path) -> (usize, u64) {
     let declared = crate::entities::load(dir).unwrap_or_default();
     (
         declared.len(),
-        declared.iter().map(|e| e.max_rows as u64).sum(),
+        declared
+            .iter()
+            .map(|e| {
+                // An entity reading an offchain table may also hold `max_rows` of offchain input
+                // (#1437), which `EntityView::admit_offchain` enforces at runtime.
+                let reads_offchain = crate::entity_lower::lower_with_columns(&e.sql)
+                    .is_ok_and(|(plan, _)| crate::entity_offchain::reads_offchain(&plan));
+                e.max_rows as u64 * if reads_offchain { 2 } else { 1 }
+            })
+            .sum(),
     )
 }
 
@@ -3949,6 +3958,23 @@ mod tests {
             estimate_nest_rss_mb(&all, true, 0, 0),
             NEST_BASE_RSS_MB + 3 * NEST_VIEW_RSS_MB
         );
+    }
+
+    /// #1437: an entity reading an offchain table is charged for the offchain input it may hold as
+    /// well as its own rows, so their allowances add up inside the cursor budget.
+    #[test]
+    fn an_offchain_entity_is_charged_for_its_offchain_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=10\n\
+             sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+             JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier'\n\
+             [[entities]]\nname='totals'\nkey=['to']\nmax_rows=5\n\
+             sql='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n",
+        )
+        .unwrap();
+        assert_eq!(declared_entities(dir.path()), (2, 2 * 10 + 5));
     }
 
     /// RFC-0041 §7 criterion 9: an entity's declared `max_rows` reaches the admission calculation.
