@@ -1590,10 +1590,7 @@ fn start_entities(
         }
         // The manifest is read only for an entity that names an offchain table, so a damaged one
         // cannot stop a chain-only nest from starting.
-        let offchain = if std::iter::once(&plan.left)
-            .chain(plan.join.as_ref().map(|j| &j.right))
-            .any(|s| crate::entity_offchain::table_of(&s.table).is_some())
-        {
+        let offchain = if crate::entity_offchain::reads_offchain(&plan) {
             crate::entity_offchain::Tables::load(dir)?
         } else {
             crate::entity_offchain::Tables::none()
@@ -18123,12 +18120,12 @@ rpc_urls = ["https://rpc.example"]
         let views = start_entities(dir.path(), &registry, false).unwrap();
         assert!(view(&views, "by_tier").fault().is_none());
 
-        let limit = crate::entity_view::OFFCHAIN_ROWS_PER_TABLE;
-        drop_big_tiers(dir.path(), limit as usize);
+        // `by_tier` declares max_rows = 100, and one row is already held.
+        drop_big_tiers(dir.path(), 100);
         refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
         let fault = view(&views, "by_tier").fault().expect("by_tier must fault");
         assert!(fault.contains("offchain__tiers"), "{fault}");
-        assert!(fault.contains(&(limit + 1).to_string()), "{fault}");
+        assert!(fault.contains("101 rows"), "{fault}");
         assert!(view(&views, "totals").fault().is_none());
         refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
     }
@@ -18161,14 +18158,40 @@ rpc_urls = ["https://rpc.example"]
             &catalogue.tables["tiers"][0],
         ))
         .unwrap();
-        drop_big_tiers(
-            dir.path(),
-            crate::entity_view::OFFCHAIN_ROWS_PER_TABLE as usize,
-        );
+        drop_big_tiers(dir.path(), 100);
         refresh_offchain(dir.path(), &store, &registry, &views, 11)
             .expect("an entity's fault must not fail the window");
         let fault = view(&views, "by_tier").fault().expect("by_tier must fault");
         assert!(fault.contains("offchain__tiers"), "{fault}");
+        assert!(view(&views, "totals").fault().is_none());
+    }
+
+    /// Rows are not the only measure: two rows can carry more bytes than a hundred rows are charged
+    /// for at admission, and the allowance counts both.
+    #[test]
+    fn an_offchain_row_too_wide_for_the_allowance_faults_its_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(
+            dir.path(),
+            "first",
+            "0x2222222222222222222222222222222222222222",
+            "gold",
+        );
+        std::fs::write(dir.path().join("entities.toml"), BY_TIER_AND_TOTALS).unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+
+        let wide = "x".repeat(100 * crate::runtime::ENTITY_RSS_BYTES_PER_ROW as usize);
+        drop_tiers(
+            dir.path(),
+            "wide",
+            "0x1111111111111111111111111111111111111111",
+            &wide,
+        );
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+        let fault = view(&views, "by_tier").fault().expect("by_tier must fault");
+        assert!(fault.contains("2 rows"), "{fault}");
         assert!(view(&views, "totals").fault().is_none());
     }
 

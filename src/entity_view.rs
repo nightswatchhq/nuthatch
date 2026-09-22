@@ -77,10 +77,6 @@ enum Msg {
     Flush(SyncSender<()>),
 }
 
-/// The offchain rows one entity may hold per table (#1437). A join keeps its whole offchain input in
-/// its trace, so this bounds resident memory within the per-cursor budget, not only one batch.
-pub const OFFCHAIN_ROWS_PER_TABLE: u64 = 1_000_000;
-
 const REBUILD_ORDER: &str =
     "a rebuild message arrived with no rebuild in progress; the ingest path fed it out of order";
 
@@ -206,8 +202,10 @@ pub struct EntityView {
     /// Per offchain table, the snapshots sent to the circuit (#1437). Sent, not folded: the next
     /// refresh compares the manifest against this, so no snapshot is ever fed twice.
     fed: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
-    /// Per offchain table, the rows sent, against [`OFFCHAIN_ROWS_PER_TABLE`].
-    held: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Per offchain table, the rows and uncompressed bytes sent, against the allowance in
+    /// [`Self::admit_offchain`].
+    held: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    max_rows: u64,
 }
 
 impl EntityView {
@@ -435,6 +433,7 @@ impl EntityView {
             fault,
             fed: Default::default(),
             held: Default::default(),
+            max_rows: max_rows as u64,
         })
     }
 
@@ -610,21 +609,38 @@ impl EntityView {
         Ok(())
     }
 
-    /// The rows `table` holds once `snapshots` are sent, or `None` when that is over
-    /// [`OFFCHAIN_ROWS_PER_TABLE`]. Then this entity alone faults, before any row is read.
-    fn admit_offchain(&self, table: &str, snapshots: &[Snapshot]) -> Option<u64> {
-        let held = self.held.lock().unwrap().get(table).copied().unwrap_or(0);
-        let rows = snapshots
+    /// The rows and bytes `table` holds once `snapshots` are sent, or `None` when the entity's
+    /// offchain input would pass its allowance. Then this entity alone faults, before any row is read.
+    ///
+    /// The allowance is the declared `max_rows`, in rows and at admission's per-row charge in bytes.
+    /// Admission charges an entity that reads offchain for it on top of its own rows, so every
+    /// allowance on a cursor sits inside that cursor's budget (RFC-0041 §7).
+    fn admit_offchain(&self, table: &str, snapshots: &[Snapshot]) -> Option<(u64, u64)> {
+        let add =
+            |(r, b): (u64, u64), (sr, sb): (u64, u64)| (r.saturating_add(sr), b.saturating_add(sb));
+        let (others, before) = {
+            let held = self.held.lock().unwrap();
+            let others = held
+                .iter()
+                .filter(|(t, _)| t.as_str() != table)
+                .fold((0, 0), |sum, (_, h)| add(sum, *h));
+            (others, held.get(table).copied().unwrap_or((0, 0)))
+        };
+        let after = snapshots
             .iter()
-            .map(Snapshot::row_count)
-            .fold(held, u64::saturating_add);
-        if rows <= OFFCHAIN_ROWS_PER_TABLE {
-            return Some(rows);
+            .fold(before, |sum, s| add(sum, (s.row_count(), s.byte_size())));
+        let (rows, bytes) = add(others, after);
+        let max_bytes = self
+            .max_rows
+            .saturating_mul(crate::runtime::ENTITY_RSS_BYTES_PER_ROW);
+        if rows <= self.max_rows && bytes <= max_bytes {
+            return Some(after);
         }
         *self.fault.write().unwrap() = Some(format!(
-            "offchain__{table} would hold {rows} rows in entity `{}`, over the \
-             {OFFCHAIN_ROWS_PER_TABLE} one entity may hold from an offchain table",
-            self.name
+            "offchain__{table} would bring entity `{}`'s offchain input to {rows} rows and {bytes} \
+             bytes, over its allowance of {} rows and {max_bytes} bytes. Raise its max_rows, which \
+             admission charges for",
+            self.name, self.max_rows
         ));
         let _ = self.tx.send(Msg::Stop);
         None

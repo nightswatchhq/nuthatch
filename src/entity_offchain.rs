@@ -29,6 +29,14 @@ pub fn table_of(source: &str) -> Option<&str> {
     (head.eq_ignore_ascii_case(OFFCHAIN_NAMESPACE) && !table.is_empty()).then_some(table)
 }
 
+/// Whether an entity's SQL reads an offchain table. Admission charges such an entity for the
+/// offchain input it may hold (RFC-0041 §7), so it must agree with what `start_entities` binds.
+pub fn reads_offchain(plan: &crate::entity_plan::Plan) -> bool {
+    std::iter::once(&plan.left)
+        .chain(plan.join.as_ref().map(|j| &j.right))
+        .any(|s| table_of(&s.table).is_some())
+}
+
 /// What an offchain column's values become in an entity. §3.3 has no float, and there is no
 /// decimal scalar yet, so a feed carrying either is refused at load rather than rounded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +101,7 @@ pub struct Snapshot {
     path: PathBuf,
     schema: SchemaRef,
     rows: u64,
+    bytes: u64,
 }
 
 /// An offchain table as the entity binder sees it: its present snapshots, in manifest order.
@@ -174,6 +183,11 @@ impl Snapshot {
     /// From the Parquet footer, so a feed can be bounded before any row is read.
     pub fn row_count(&self) -> u64 {
         self.rows
+    }
+
+    /// Uncompressed, from the Parquet footer, for the same reason.
+    pub fn byte_size(&self) -> u64 {
+        self.bytes
     }
 
     /// This snapshot's rows as entity rows of `columns`, in order.
@@ -287,6 +301,12 @@ impl Tables {
             hash: s.hash.clone(),
             schema: footer.schema().clone(),
             rows: u64::try_from(footer.metadata().file_metadata().num_rows()).unwrap_or(u64::MAX),
+            bytes: footer
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|g| u64::try_from(g.total_byte_size()).unwrap_or(u64::MAX))
+                .fold(0, u64::saturating_add),
             path,
         }))
     }
