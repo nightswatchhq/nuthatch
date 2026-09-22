@@ -254,8 +254,16 @@ impl Tables {
         Ok(out)
     }
 
+    /// Case-insensitive, as DuckDB resolves `offchain__<table>`. `offchain drop` refuses a case-only
+    /// variant, so at most one name matches.
     fn retained(&self, table: &str) -> impl Iterator<Item = &crate::offchain::Snapshot> {
-        self.catalogue.tables.get(table).into_iter().flatten()
+        self.catalogue
+            .tables
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(table))
+            .map(|(_, snapshots)| snapshots)
+            .into_iter()
+            .flatten()
     }
 
     /// A retained snapshot, or `None` when its segment is absent, as the `/sql` view treats it.
@@ -622,6 +630,21 @@ mod tests {
             .table("absent")
             .unwrap()
             .is_none());
+    }
+
+    /// `/sql` reads `offchain__prices` for a table dropped as `Prices`, so an entity must too.
+    #[test]
+    fn an_offchain_table_resolves_case_insensitively_as_duckdb_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = seal(dir.path(), "Prices", &prices(&["ETH"], &[1]));
+        let tables = Tables::load(dir.path()).unwrap();
+        let table = tables
+            .table("prices")
+            .unwrap()
+            .expect("found despite the case");
+        assert_eq!(table.version(), vec![hash.clone()]);
+        assert_eq!(tables.version("prices").unwrap(), vec![hash.clone()]);
+        assert_eq!(tables.snapshots("PRICES", &[hash]).unwrap().len(), 1);
     }
 
     #[test]
