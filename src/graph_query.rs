@@ -2498,22 +2498,49 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
             c.sql
         );
 
-        // Two levels are now admitted for a derived list beneath a to-one relation. This unrelated
-        // third relation is still validated against the target schema rather than becoming a free
-        // recursive traversal merely because the escrow shape needed one more level.
+        // One level only, matching the depth `E_orderBy` advertises in the reference. Refused at
+        // lowering rather than while parsing, because an introspection query is far deeper and the
+        // handler has to be able to see its root field name.
         let e = compile(&schema(), &one("{ pools { token0 { pool { id } } } }"))
-            .expect_err("unknown relation");
+            .expect_err("two levels");
         assert!(
-            matches!(&e, Unsupported::UnknownField { entity, field } if entity == "Token" && field == "pool"),
+            matches!(&e, Unsupported::NestedSelection(n) if n == "pool"),
             "{e:?}"
         );
         // But it does parse, so `__schema { types { fields { … } } }` can reach the handler.
         assert!(parse("{ pools { token0 { pool { id } } } }").is_ok());
 
-        // A derived list's page size belongs to the child, not the parent.
-        let c = compile(&schema(), &one("{ pools { swaps(first: 5) { id } } }"))
-            .expect("bounded child page");
-        assert!(c.sql.contains("LIMIT 5 OFFSET 0"));
+        // Arguments on a traversed field need the same join plus its own LIMIT; dropping `first`
+        // there would return every related row. Also refused at lowering - a real introspection
+        // query writes `fields(includeDeprecated: true)`.
+        let e = compile(&schema(), &one("{ pools { swaps(first: 5) { id } } }"))
+            .expect_err("nested arguments");
+        assert!(
+            matches!(&e, Unsupported::NestedSelection(n) if n == "swaps"),
+            "{e:?}"
+        );
+
+        // The network dialect admits two levels for a derived list beneath a to-one relation. An
+        // unrelated relation is still validated against the target schema rather than becoming a
+        // free recursive traversal merely because the escrow shape needed one more level.
+        let e = compile_with(
+            &schema(),
+            &one("{ pools { token0 { pool { id } } } }"),
+            &Capabilities::NETWORK,
+        )
+        .expect_err("unknown relation");
+        assert!(
+            matches!(&e, Unsupported::UnknownField { entity, field } if entity == "Token" && field == "pool"),
+            "{e:?}"
+        );
+        // And there a derived list's page size belongs to the child, not the parent.
+        let c = compile_with(
+            &schema(),
+            &one("{ pools { swaps(first: 5) { id } } }"),
+            &Capabilities::NETWORK,
+        )
+        .expect("bounded child page");
+        assert!(c.sql.contains("LIMIT 5) t)"), "{}", c.sql);
         // And arguments on a leaf *inside* a traversal, which is a different guard: the case above
         // is caught before the relation is resolved, so removing this one changed nothing and no
         // test noticed - found by mutation, not by reading.
