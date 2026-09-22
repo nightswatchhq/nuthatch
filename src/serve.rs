@@ -1345,13 +1345,14 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
             // #932: one acquisition for the pair, so `rows` and `applied_through` cannot describe
             // two different moments.
             let (row_count, applied) = e.len_and_watermark();
+            let through = applied.through;
             let fault = e.fault();
             let unavailable = e.unavailable();
-            let behind = applied < head;
+            let behind = through < head;
             let progress = e.last_progress();
             // A nest that has indexed nothing yet has no head to be behind, so an entity at zero is
             // waiting rather than wedged.
-            let wedged = entity_wedged(applied, head, progress, now);
+            let wedged = entity_wedged(through, head, progress, now);
             // Unavailable is unready too. It is not a fault - nothing died - but an entity holding
             // no answer must not be reachable behind a 200, which is the whole of §5.1's "never
             // serves a plausible partial relation as current" applied to the case where there is no
@@ -1359,21 +1360,33 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
             if fault.is_some() || wedged || unavailable.is_some() {
                 stalled = true;
             }
-            json!({
-                "name": e.name(),
-                "applied_through": applied,
-                "current": !behind,
-                "catching_up": behind && fault.is_none() && !wedged && unavailable.is_none(),
-                "rows": row_count,
-                "faulted": fault.is_some(),
-                "fault": fault,
-                "wedged": wedged,
-                "unavailable": unavailable,
-                "seconds_since_progress": (progress != 0).then(|| now.saturating_sub(progress)),
-            })
+            with_offchain(
+                json!({
+                    "name": e.name(),
+                    "applied_through": through,
+                    "current": !behind,
+                    "catching_up": behind && fault.is_none() && !wedged && unavailable.is_none(),
+                    "rows": row_count,
+                    "faulted": fault.is_some(),
+                    "fault": fault,
+                    "wedged": wedged,
+                    "unavailable": unavailable,
+                    "seconds_since_progress": (progress != 0).then(|| now.saturating_sub(progress)),
+                }),
+                &applied,
+            )
         })
         .collect();
     (Value::Array(entities), stalled)
+}
+
+/// Name the offchain snapshots an entity's rows were applied through (#1437). Absent, not null, for
+/// an entity that reads no offchain table, so a chain-only entity reads exactly as it did.
+fn with_offchain(mut v: Value, applied: &crate::entity_view::Applied) -> Value {
+    if let (Some(offchain), Some(obj)) = (applied.offchain_json(), v.as_object_mut()) {
+        obj.insert("offchain".into(), offchain);
+    }
+    v
 }
 
 /// One nest's readiness verdict, and the counters it was reached from.
@@ -2269,8 +2282,8 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
             crate::semantic::MaintainedRelation {
                 name: e.name().to_string(),
                 columns: e.columns().to_vec(),
-                applied_through: applied,
-                current: applied >= head,
+                applied_through: applied.through,
+                current: applied.through >= head,
                 unavailable: e.unavailable().map(str::to_string),
                 fault: e.fault(),
                 rows,
@@ -2604,7 +2617,7 @@ async fn named_query(
 /// A declared query taken through RFC-0048 admission.
 struct NamedRun {
     out: crate::analytics::QueryOutput,
-    watermarks: std::collections::BTreeMap<String, u64>,
+    watermarks: crate::entity_view::Watermarks,
     provenance: (Option<u64>, u64),
     /// The boundary the statement was planned against, which a quote names.
     #[cfg_attr(not(feature = "counter"), allow(dead_code))]
@@ -2697,7 +2710,7 @@ async fn named_scan(
             if hot_rows.saturating_add(entity.len() as u64) > max_hot_rows as u64 {
                 return Err(crate::store::HotScanTooLarge { cap: max_hot_rows }.into());
             }
-            let (rows, through) = entity.rows_as_json_with_watermark();
+            let (rows, applied) = entity.rows_as_json_with_watermark();
             hot_rows += rows.len() as u64;
             if hot_rows > max_hot_rows as u64 {
                 return Err(crate::store::HotScanTooLarge { cap: max_hot_rows }.into());
@@ -2712,7 +2725,7 @@ async fn named_scan(
                 }
                 .into());
             }
-            watermarks.insert(entity.name().to_string(), through);
+            watermarks.insert(entity.name().to_string(), applied);
             hot.insert(entity.name().to_string(), rows);
         }
         let sealed_through = store.sealed_through();
@@ -2879,7 +2892,7 @@ async fn run_sql_query(
         .write_generation()
         .filter(|_| crate::sqlmemo::is_deterministic(&q.q))
         .map(|generation| {
-            let watermarks: std::collections::BTreeMap<String, u64> = s
+            let watermarks: crate::entity_view::Watermarks = s
                 .entities
                 .iter()
                 .filter(|e| e.unavailable().is_none() && e.fault().is_none())
@@ -2907,7 +2920,7 @@ async fn run_sql_query(
             // is the interval between this check and the response, which is the interval every
             // computed answer has between its last read and its response - no memo could narrow it
             // further, and no caller could tell the two apart (Jules on #1189).
-            let still: std::collections::BTreeMap<String, u64> = s
+            let still: crate::entity_view::Watermarks = s
                 .entities
                 .iter()
                 .filter(|e| e.unavailable().is_none() && e.fault().is_none())
@@ -3028,13 +3041,13 @@ async fn run_sql_query(
         // that watermark into the provenance below. Re-reading `applied_through()` after the query
         // ran is a race - measured at 1 in 12 on a 0.25s-block chain - and it reports an answer as
         // more current than the rows it is made of.
-        let mut watermarks: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut watermarks: crate::entity_view::Watermarks = Default::default();
         for entity in declared_entities.iter() {
             if entity.unavailable().is_some() || entity.fault().is_some() {
                 continue;
             }
-            let (rows, through) = entity.rows_as_json_with_watermark();
-            watermarks.insert(entity.name().to_string(), through);
+            let (rows, applied) = entity.rows_as_json_with_watermark();
+            watermarks.insert(entity.name().to_string(), applied);
             hot.insert(entity.name().to_string(), rows);
         }
         let sealed_through = store.sealed_through();
@@ -3328,14 +3341,17 @@ async fn derived_index(State(s): State<AppState>) -> impl IntoResponse {
         .map(|e| {
             // #932: the pair under one lock.
             let (row_count, applied) = e.len_and_watermark();
-            json!({
-                "name": e.name(),
-                "rows": row_count,
-                "incremental": true,
-                "applied_through": applied,
-                "current": applied >= head,
-                "available": e.unavailable().is_none() && e.fault().is_none(),
-            })
+            with_offchain(
+                json!({
+                    "name": e.name(),
+                    "rows": row_count,
+                    "incremental": true,
+                    "applied_through": applied.through,
+                    "current": applied.through >= head,
+                    "available": e.unavailable().is_none() && e.fault().is_none(),
+                }),
+                &applied,
+            )
         })
         .collect();
     Json(json!({ "count": items.len(), "head": head, "entities": items }))
@@ -3412,7 +3428,7 @@ fn dataset_head(s: &AppState) -> u64 {
 fn sql_response(
     s: &AppState,
     out: &crate::analytics::QueryOutput,
-    watermarks: &std::collections::BTreeMap<String, u64>,
+    watermarks: &crate::entity_view::Watermarks,
     (as_of, sealed_through): (Option<u64>, u64),
     cached: bool,
 ) -> axum::response::Response {
@@ -3468,7 +3484,7 @@ fn sql_response(
 fn sql_entity_provenance(
     s: &AppState,
     referenced: Option<&std::collections::BTreeSet<String>>,
-    watermarks: &std::collections::BTreeMap<String, u64>,
+    watermarks: &crate::entity_view::Watermarks,
 ) -> Value {
     let Some(referenced) = referenced else {
         return Value::Null;
@@ -3479,22 +3495,23 @@ fn sql_entity_provenance(
         .iter()
         .filter(|e| referenced.contains(&e.name().to_ascii_lowercase()))
         .map(|e| {
-            json!({
-                // #932: the watermark captured with the rows, never a fresh read. Falling back
-                // to a fresh read for an entity that was not registered (faulted or unavailable, so
-                // it contributed no rows) is correct - there are no rows for it to disagree with.
+            // #932: the watermark captured with the rows, never a fresh read. Falling back to a
+            // fresh read for an entity that was not registered (faulted or unavailable, so it
+            // contributed no rows) is correct - there are no rows for it to disagree with.
+            let captured = watermarks.get(e.name());
+            let through = captured
+                .map(|a| a.through)
+                .unwrap_or_else(|| e.applied_through());
+            let v = json!({
                 "entity": e.name(),
                 "incremental": true,
-                "applied_through": watermarks
-                    .get(e.name())
-                    .copied()
-                    .unwrap_or_else(|| e.applied_through()),
-                "current": watermarks
-                    .get(e.name())
-                    .copied()
-                    .unwrap_or_else(|| e.applied_through())
-                    >= head,
-            })
+                "applied_through": through,
+                "current": through >= head,
+            });
+            match captured {
+                Some(applied) => with_offchain(v, applied),
+                None => v,
+            }
         })
         .collect();
     if used.is_empty() {
@@ -3513,17 +3530,20 @@ fn derived_provenance(
     s: &AppState,
     entity: &crate::entity_view::EntityView,
     head: u64,
-    applied_through: u64,
+    applied: &crate::entity_view::Applied,
 ) -> Value {
-    json!({
-        "nid": s.nid,
-        "entity": entity.name(),
-        "incremental": true,
-        "from_maintained_state": true,
-        "applied_through": applied_through,
-        "dataset_head": head,
-        "current": applied_through >= head,
-    })
+    with_offchain(
+        json!({
+            "nid": s.nid,
+            "entity": entity.name(),
+            "incremental": true,
+            "from_maintained_state": true,
+            "applied_through": applied.through,
+            "dataset_head": head,
+            "current": applied.through >= head,
+        }),
+        applied,
+    )
 }
 
 /// **Criterion 2: a direct keyed read does not invoke DuckDB or scan canonical fact history.**
@@ -3557,7 +3577,7 @@ async fn derived_key(
         Some(row) => Json(json!({
             "key": key,
             "row": row.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-            "provenance": derived_provenance(&s, entity, head, applied),
+            "provenance": derived_provenance(&s, entity, head, &applied),
         }))
         .into_response(),
         None => (
@@ -3566,7 +3586,7 @@ async fn derived_key(
                 "error": "no such key",
                 "entity": name,
                 "key": key,
-                "provenance": derived_provenance(&s, entity, head, applied),
+                "provenance": derived_provenance(&s, entity, head, &applied),
             })),
         )
             .into_response(),
@@ -3607,7 +3627,7 @@ async fn derived_all(
         "rows": rows,
         "returned": items.len(),
         "items": items,
-        "provenance": derived_provenance(&s, entity, head, applied),
+        "provenance": derived_provenance(&s, entity, head, &applied),
     }))
     .into_response()
 }
@@ -4041,6 +4061,68 @@ mod tests {
                 .is_some_and(|r| r.contains("max_rows")),
             "the refusal must name the cause: {body}"
         );
+    }
+
+    /// #1437: readiness and `/derived` provenance name the offchain snapshots an entity's rows were
+    /// applied through, and a chain-only entity's output is unchanged.
+    #[test]
+    fn an_offchain_entity_names_the_snapshots_it_applied() {
+        use crate::entity_plan::{Agg, Plan, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("tiers.csv");
+        std::fs::write(&csv, "account,tier\n0xa,gold\n").unwrap();
+        crate::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
+        let offchain = crate::entity_offchain::Tables::load(dir.path()).unwrap();
+        let tiers = offchain.table("tiers").unwrap().unwrap();
+        let reg = crate::registry::DecodeRegistry::build(Vec::new()).unwrap();
+        let plan = Plan {
+            left: Source {
+                table: "offchain__tiers".into(),
+                columns: vec!["tier".into()],
+            },
+            left_filter: None,
+            join: None,
+            key: vec![crate::entity_expr::Expr::Column(0)],
+            aggregates: vec![Agg::Count],
+        };
+        let binding =
+            crate::entity_bind::Binding::bind_with_offchain(&plan, &reg, &offchain).unwrap();
+        let columns = vec!["tier".to_string(), "n".to_string()];
+        let entity = crate::entity_view::EntityView::start_bound(
+            "by_tier", &plan, binding, &columns, 100, false,
+        )
+        .unwrap();
+        entity
+            .apply_offchain("tiers", tiers.snapshots(), &tiers.version())
+            .unwrap();
+        entity.flush();
+        let state = AppState {
+            entities: Arc::new(vec![entity]),
+            ..test_state(dir.path(), 1)
+        };
+
+        let (ready, _) = entity_readiness(&state, 0, 0);
+        let label = &ready[0]["offchain"]["offchain__tiers"];
+        assert_eq!(label["snapshots"], 1, "{ready}");
+        assert_eq!(label["latest"], tiers.version()[0].as_str(), "{ready}");
+
+        let (_, applied) = state.entities[0].len_and_watermark();
+        let provenance = derived_provenance(&state, &state.entities[0], 0, &applied);
+        assert_eq!(provenance["offchain"], ready[0]["offchain"], "{provenance}");
+
+        let referenced: std::collections::BTreeSet<String> = ["by_tier".to_string()].into();
+        let captured: crate::entity_view::Watermarks =
+            [("by_tier".to_string(), applied.clone())].into();
+        let sql = sql_entity_provenance(&state, Some(&referenced), &captured);
+        assert_eq!(sql[0]["offchain"], ready[0]["offchain"], "{sql}");
+
+        let chain_only = derived_provenance(
+            &state,
+            &state.entities[0],
+            0,
+            &crate::entity_view::Applied::default(),
+        );
+        assert!(chain_only.get("offchain").is_none(), "{chain_only}");
     }
 
     fn test_state(dir: &std::path::Path, permits: usize) -> AppState {

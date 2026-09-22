@@ -124,6 +124,11 @@ jobs:
           # #733: this key is the default-feature pair only. The exex pair has its own job and key.
           # Mixing them in one cache is how four artifact sets landed on one disk.
           key: check-default
+          # #1396: only main writes caches. GitHub's 10 GB per-repo store evicts least-recently-used
+          # entries, and 14-16 Sep every leg of 69% of runs started cold (no entry of any age under
+          # its prefix) and took ~45m instead of ~8m. PR-scoped saves only ever help a later push to
+          # the same PR; their cost is evicting main's, which every PR restores from.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # #733 moved the `exex` pair onto its own runner. This job holds clippy + test for the
       # default feature set, plus the decode crate's own checks. Two compiles, one `target/`.
       #
@@ -231,6 +236,7 @@ jobs:
         with:
           cache-on-failure: true
           key: check-exex
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       # Feature-gated code is invisible to the default lint, and `exex` had never been built
       # here at all - so its only test had been failing `-D warnings` unnoticed (#423). A
       # feature nobody lints is a feature that rots silently. It now has its own runner so it
@@ -285,6 +291,7 @@ jobs:
         with:
           cache-on-failure: true
           key: check-counter
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       - name: reclaim runner disk
         run: |
           df -h /
@@ -333,6 +340,7 @@ jobs:
           # Proven step-level on run 31824503060: rust-cache's post step was *skipped* while
           # checkout's succeeded in the same grace window.
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       # Clippy runs **first**, deliberately. It compiles `--all-targets` under this feature, which is a
       # superset of what the test step needs, so running it first warms the shared cache and the test
       # step reuses it. In the other order both steps did a near-full build of duckdb, wasmtime and
@@ -441,8 +449,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          cache-on-failure: true
-          key: minio-publish
+          # #1396: this job builds exactly check-default's graph (debug, default features, the `it`
+          # binary), so it restores that cache and writes none of its own. The doubled name is
+          # deliberate: shared-key replaces key + job id, and check-default's key is both.
+          shared-key: check-default-check-default
+          save-if: false
       # `minio/minio` needs an explicit `server /data` command, and GitHub's `services:` block has
       # no field for that - its `options` are `docker create` flags, not the container's CMD - so
       # this starts MinIO as an ordinary step instead of a service container.
@@ -508,8 +519,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          cache-on-failure: true
-          key: trino-contract
+          # #1396: this job builds exactly check-default's graph (debug, default features, the `it`
+          # binary), so it restores that cache and writes none of its own. The doubled name is
+          # deliberate: shared-key replaces key + job id, and check-default's key is both.
+          shared-key: check-default-check-default
+          save-if: false
       - name: start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
@@ -611,6 +625,7 @@ jobs:
           # checkout's succeeded in the same grace window.
           cache-on-failure: true
           key: fleet-postgres-store
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       # This job exists because of four bugs that 41 passing tests never touched, found the first time
       # the stack was actually brought up: a migration race (`CREATE … IF NOT EXISTS` is not atomic in
       # Postgres, and the control plane plus every worker migrate at startup), a control plane that
@@ -758,6 +773,7 @@ jobs:
           # Proven step-level on run 31824503060: rust-cache's post step was *skipped* while
           # checkout's succeeded in the same grace window.
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       - name: build
         run: cargo build --release --locked
       - name: upload binary
@@ -1019,6 +1035,7 @@ jobs:
         with:
           workspaces: fuzz -> target
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       - name: install cargo-fuzz
         env:
           RUSTUP_TOOLCHAIN: nightly

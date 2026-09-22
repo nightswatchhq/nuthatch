@@ -22,6 +22,8 @@ pub struct EntityIdentity {
     pub input_entity_keys: Vec<String>,
     /// Resolved decoded-table identities, never just aliases such as `usdc__transfer`.
     pub sources: Vec<crate::graft::SourceIdentity>,
+    /// Offchain snapshot tables read (#1437), kept apart from chain sources.
+    pub offchain_sources: Vec<OffchainSourceIdentity>,
     /// Ordered because it defines the point-read tuple exposed by the entity.
     pub key: Vec<String>,
     /// Ordered because a relation's output is positional at the compiler boundary.
@@ -46,11 +48,19 @@ impl EntityIdentity {
             engine: format!("{ENTITY_COMPILER_ID}/{}", self.engine),
             finality: crate::graft::Finality::Final,
         };
+        let offchain = self.offchain_sources.iter().flat_map(|s| {
+            ["offchain".to_string(), s.table.clone()].into_iter().chain(
+                s.columns
+                    .iter()
+                    .flat_map(|c| [c.name.clone(), c.kind.name().to_string()]),
+            )
+        });
         let mut hash = Sha256::new();
         hash.update(b"nuthatch-entity-reuse-key-v1\0");
         for part in std::iter::once(derivation.reuse_key())
             .chain(self.key.iter().cloned())
             .chain(self.output_schema.iter().cloned())
+            .chain(offchain)
         {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
@@ -59,12 +69,28 @@ impl EntityIdentity {
     }
 }
 
+/// One offchain table an entity reads.
+///
+/// `snapshots` is what the entity has applied, not part of its definition, so it stays out of
+/// [`EntityIdentity::reuse_key`] for the reason that key has no block range: an appended snapshot
+/// advances the entity rather than making it a different program. A replaced, removed or reordered
+/// snapshot is a rebuild, which [`crate::entity_offchain::advance`] decides from this list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffchainSourceIdentity {
+    pub table: String,
+    /// The columns the entity reads, in the plan's order, with the kind each binds as.
+    pub columns: Vec<crate::entity_offchain::Column>,
+    /// Content hashes of the applied snapshots, in append order.
+    pub snapshots: Vec<String>,
+}
+
 /// Construct the entity definition identity from DuckDB's parser. A parser failure is represented
 /// as raw text by `canonical_plan`, which can only forfeit reuse, never make two meanings collide.
 pub fn identity(
     sql: &str,
     input_entity_keys: Vec<String>,
     sources: Vec<crate::graft::SourceIdentity>,
+    offchain_sources: Vec<OffchainSourceIdentity>,
     key: Vec<String>,
     output_schema: Vec<String>,
 ) -> Result<EntityIdentity> {
@@ -73,6 +99,7 @@ pub fn identity(
         plan: parser.canonical_plan(sql),
         input_entity_keys,
         sources,
+        offchain_sources,
         key,
         output_schema,
         engine: parser.engine_version(),
@@ -165,6 +192,12 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
         let name = entity.name.clone();
         if !names.insert(name.clone()) {
             issues.push(issue(&name, "duplicate entity name"));
+        }
+        if crate::entity_offchain::table_of(&name).is_some() {
+            issues.push(issue(
+                &name,
+                "entity name is inside the offchain__ namespace and would shadow an offchain table",
+            ));
         }
         if entity.key.is_empty() {
             issues.push(issue(&name, "key must name at least one output column"));
@@ -1056,6 +1089,7 @@ mod tests {
             "SELECT owner FROM facts",
             vec!["upstream".into()],
             vec![source("0xaaa")],
+            Vec::new(),
             vec!["owner".into()],
             vec!["owner".into()],
         )
@@ -1067,6 +1101,7 @@ mod tests {
                 "SELECT other FROM facts",
                 vec!["upstream".into()],
                 vec![source("0xaaa")],
+                Vec::new(),
                 vec!["owner".into()],
                 vec!["owner".into()]
             )
@@ -1079,6 +1114,7 @@ mod tests {
                 "SELECT owner FROM facts",
                 vec!["other-upstream".into()],
                 vec![source("0xaaa")],
+                Vec::new(),
                 vec!["owner".into()],
                 vec!["owner".into()]
             )
@@ -1091,6 +1127,7 @@ mod tests {
                 "SELECT owner FROM facts",
                 vec!["upstream".into()],
                 vec![source("0xbbb")],
+                Vec::new(),
                 vec!["owner".into()],
                 vec!["owner".into()]
             )
@@ -1103,6 +1140,7 @@ mod tests {
                 "SELECT owner FROM facts",
                 vec!["upstream".into()],
                 vec![source("0xaaa")],
+                Vec::new(),
                 vec!["id".into()],
                 vec!["owner".into()]
             )
@@ -1115,11 +1153,82 @@ mod tests {
                 "SELECT owner FROM facts",
                 vec!["upstream".into()],
                 vec![source("0xaaa")],
+                Vec::new(),
                 vec!["owner".into()],
                 vec!["owner".into(), "amount".into()]
             )
             .unwrap()
             .reuse_key()
         );
+    }
+
+    /// #1437: `check` validates an entity over an offchain table against its snapshots, reference
+    /// query included. `by_count` is only non-unique if that query really ran over the offchain rows.
+    #[test]
+    fn check_validates_an_offchain_entity_against_its_snapshots() {
+        let dir = configured_nest();
+        let csv = dir.path().join("prices.csv");
+        std::fs::write(&csv, "symbol,price_e8\nETH,250000000000\nBTC,7\n").unwrap();
+        crate::offchain::drop_file(dir.path(), &csv, "prices").unwrap();
+        std::fs::write(
+            dir.path().join(ENTITY_FILE),
+            "[[entities]]\nname='quotes'\nsql='entities/quotes.sql'\nkey=['symbol']\nmax_rows=10\n\
+             [[entities]]\nname='by_count'\nsql='entities/by_count.sql'\nkey=['n']\nmax_rows=10\n\
+             [[entities]]\nname='offchain__x'\nsql='entities/offchain__x.sql'\nkey=['k']\nmax_rows=1\n",
+        )
+        .unwrap();
+        let grouped = "SELECT symbol, count(*) AS n FROM offchain__prices GROUP BY symbol";
+        std::fs::write(dir.path().join("entities/quotes.sql"), grouped).unwrap();
+        std::fs::write(dir.path().join("entities/by_count.sql"), grouped).unwrap();
+        std::fs::write(dir.path().join("entities/offchain__x.sql"), "SELECT 1 AS k").unwrap();
+
+        let issues = validate(dir.path());
+        assert!(!issues.iter().any(|i| i.name == "quotes"), "{issues:?}");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.name == "by_count" && i.error.contains("not unique")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.name == "offchain__x" && i.error.contains("namespace")),
+            "{issues:?}"
+        );
+    }
+
+    /// #1437: the offchain table and the columns it is read through are the definition; the
+    /// snapshots applied are the version, and appending one must not make a different program.
+    #[test]
+    fn an_offchain_source_keys_by_definition_not_by_applied_snapshots() {
+        use crate::entity_offchain::{Column, Kind};
+        let key = |table: &str, kind: Kind, snapshots: &[&str]| {
+            identity(
+                "SELECT symbol FROM offchain__prices",
+                Vec::new(),
+                Vec::new(),
+                vec![OffchainSourceIdentity {
+                    table: table.into(),
+                    columns: vec![Column {
+                        name: "price_e8".into(),
+                        kind,
+                    }],
+                    snapshots: snapshots.iter().map(|s| s.to_string()).collect(),
+                }],
+                vec!["symbol".into()],
+                vec!["symbol".into()],
+            )
+            .unwrap()
+            .reuse_key()
+        };
+        let base = key("prices", Kind::Int, &["a"]);
+        assert_eq!(
+            base,
+            key("prices", Kind::Int, &["a", "b"]),
+            "an append is a delta"
+        );
+        assert_ne!(base, key("quotes", Kind::Int, &["a"]));
+        assert_ne!(base, key("prices", Kind::Str, &["a"]));
     }
 }

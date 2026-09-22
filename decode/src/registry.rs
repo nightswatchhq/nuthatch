@@ -853,6 +853,26 @@ fn reserved_column_names() -> &'static [&'static str] {
     ]
 }
 
+/// Where offchain snapshots are served (RFC-0045 §6), and how an entity tells an offchain source
+/// from a decoded one (#1437).
+pub const OFFCHAIN_NAMESPACE: &str = "offchain__";
+
+/// Refuse a contract or template whose `{alias}__{event}` tables would land in the offchain
+/// namespace. DuckDB resolves names case-insensitively, so the two views would replace each other.
+fn refuse_offchain_namespace(what: &str, who: &str) -> Result<()> {
+    if format!("{who}__")
+        .to_ascii_lowercase()
+        .starts_with(OFFCHAIN_NAMESPACE)
+    {
+        bail!(
+            "{what} '{who}' would name its tables `{who}__<event>`, inside the `{OFFCHAIN_NAMESPACE}` \
+             namespace offchain snapshots are served from (RFC-0045 §6). On the SQL surface one \
+             table would silently answer with the other's rows. Rename the {what}."
+        );
+    }
+    Ok(())
+}
+
 /// Refuse an ABI whose decoded events name a parameter after an implicit column (#814).
 fn refuse_reserved_parameter_names(
     what: &str,
@@ -943,6 +963,7 @@ impl DecodeRegistry {
                     }
                 }
             }
+            refuse_offchain_namespace("contract", &c.alias)?;
             refuse_reserved_parameter_names("contract", &c.alias, &c.abi, &c.events)?;
             skipped_anonymous +=
                 register_events(&mut by_topic0, &c.alias, c.address, &c.abi, &c.events);
@@ -972,6 +993,7 @@ impl DecodeRegistry {
                     }
                 }
             }
+            refuse_offchain_namespace("template", &t.name)?;
             refuse_reserved_parameter_names("template", &t.name, &t.abi, &t.events)?;
             // An empty allowlist still decodes everything, so a template that does not set `events`
             // behaves exactly as it did before RFC-0009 gained one.
@@ -1599,6 +1621,54 @@ mod stored_roundtrip {
                 msg.contains(name) && msg.contains("Odd"),
                 "the refusal must name the offending parameter and its event, or an operator with \
                  several ABIs cannot tell which to open; got: {msg}"
+            );
+        }
+    }
+
+    /// #1437: a decoded table inside `offchain__` would be replaced by an offchain view of the same
+    /// name on `/sql`, and an entity would bind it as the wrong kind of source.
+    #[test]
+    fn an_alias_inside_the_offchain_namespace_is_refused() {
+        let abi: JsonAbi = serde_json::from_str(
+            r#"[{"type":"event","name":"Price","anonymous":false,"inputs":[
+                {"name":"v","type":"uint256","indexed":false,"internalType":"uint256"}]}]"#,
+        )
+        .unwrap();
+        let contract = |alias: &str| {
+            DecodeRegistry::build(vec![ContractSpec {
+                alias: alias.into(),
+                address: Address::from([0x11; 20]),
+                abi: abi.clone(),
+                events: Vec::new(),
+            }])
+        };
+        let template = |name: &str| {
+            DecodeRegistry::build_with_templates(
+                Vec::new(),
+                vec![TemplateSpec {
+                    name: name.into(),
+                    abi: abi.clone(),
+                    events: Vec::new(),
+                }],
+            )
+        };
+        for alias in ["offchain", "Offchain", "offchain_", "offchain__feed"] {
+            for (what, built) in [("contract", contract(alias)), ("template", template(alias))] {
+                let msg = match built {
+                    Err(e) => format!("{e:#}"),
+                    Ok(_) => panic!("{what} `{alias}` decodes into the offchain namespace"),
+                };
+                assert!(msg.contains(OFFCHAIN_NAMESPACE), "{msg}");
+            }
+        }
+        for alias in ["offchainfeed", "feed_offchain", "off_chain"] {
+            assert!(
+                contract(alias).is_ok(),
+                "`{alias}` is outside the namespace"
+            );
+            assert!(
+                template(alias).is_ok(),
+                "`{alias}` is outside the namespace"
             );
         }
     }

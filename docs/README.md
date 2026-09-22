@@ -32,6 +32,7 @@ not to infer work that remains.
 - [Operator reference](operators.md)
 - [Reading sealed segments without nuthatch](reading-segments.md)
 - [Reading a published nest](reading-published-nest.md)
+- [Offchain data: file drops and scheduled price pulls](offchain.md)
 - [Release notes](releases/README.md)
 
 ## Dated records

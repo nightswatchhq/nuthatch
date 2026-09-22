@@ -845,7 +845,7 @@ fn seed_entities(
         // `seal::read_table_rows_by_segment` for what that is worth in peak RSS. The hot tail is
         // fed by reference for the same reason: it used to be cloned once per entity on the nest.
         let mut sealed = 0usize;
-        for table in entity.tables() {
+        for table in entity.chain_tables() {
             let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
                 anyhow::bail!(TerminalFault(format!(
                     "entity `{}` reads `{table}`, which this nest's registry does not describe",
@@ -858,6 +858,9 @@ fn seed_entities(
             })?;
         }
         entity.seed_chunk(&hot, through)?;
+        if !entity.offchain_tables().is_empty() {
+            feed_offchain(&crate::entity_offchain::Tables::load(dir)?, entity)?;
+        }
         tracing::info!(
             "entity `{}` seeding from {sealed} sealed and {} hot row(s) through block {through}",
             entity.name(),
@@ -1577,14 +1580,35 @@ fn start_entities(
                 t.table
             )
         }
-        views.push(EntityView::start(
-            &decl.name,
-            &plan,
-            &columns,
-            registry,
-            decl.max_rows,
-            warm,
-        )?);
+        if crate::entity_offchain::table_of(&decl.name).is_some() {
+            anyhow::bail!(
+                "entity `{}` is named inside the `{}` namespace, where it would shadow an offchain \
+                 table on the SQL surface. Rename the entity",
+                decl.name,
+                crate::entity_offchain::OFFCHAIN_NAMESPACE
+            )
+        }
+        // The manifest is read only for an entity that names an offchain table, so a damaged one
+        // cannot stop a chain-only nest from starting.
+        let offchain = if std::iter::once(&plan.left)
+            .chain(plan.join.as_ref().map(|j| &j.right))
+            .any(|s| crate::entity_offchain::table_of(&s.table).is_some())
+        {
+            crate::entity_offchain::Tables::load(dir)?
+        } else {
+            crate::entity_offchain::Tables::none()
+        };
+        let binding =
+            crate::entity_bind::Binding::bind_with_offchain(&plan, registry, &offchain)
+                .with_context(|| format!("binding entity `{}` to this nest's tables", decl.name))?;
+        let view =
+            EntityView::start_bound(&decl.name, &plan, binding, &columns, decl.max_rows, warm)?;
+        // A cold entity takes every present snapshot before its first window (#1437). A warm one is
+        // unavailable and takes them inside its seed instead.
+        if !warm {
+            feed_offchain(&offchain, &view)?;
+        }
+        views.push(view);
         tracing::info!(
             "entity `{}` maintained incrementally, bound to max_rows {}",
             decl.name,
@@ -1592,6 +1616,118 @@ fn start_entities(
         );
     }
     Ok(views)
+}
+
+/// Feed `entity` every present snapshot of each offchain table it reads (#1437).
+fn feed_offchain(offchain: &crate::entity_offchain::Tables, entity: &EntityView) -> Result<()> {
+    for table in entity.offchain_tables() {
+        if let Some(found) = offchain.table(table)? {
+            entity.apply_offchain(table, found.snapshots(), &found.version())?;
+        }
+    }
+    Ok(())
+}
+
+/// Bring each entity that reads offchain tables up to the manifest (#1437), once `through` is
+/// committed to the store.
+///
+/// A snapshot list that extends what an entity was fed is a delta: only the new snapshots are fed,
+/// at `+1`. Any other change (a snapshot replaced, removed or reordered) cannot be expressed as one,
+/// because offchain rows have no retraction path, so the entity is rebuilt from the sealed corpus,
+/// the hot tail and every present snapshot, beside the live relation, and swapped in whole.
+///
+/// This reads the manifest and checks each snapshot of a table an entity reads for presence, once
+/// per window. The `/sql` view over the same table already checks every snapshot on every query.
+fn refresh_offchain(
+    dir: &std::path::Path,
+    store: &dyn crate::store::HotStore,
+    registry: &DecodeRegistry,
+    entities: &[EntityView],
+    through: u64,
+) -> Result<()> {
+    use crate::entity_offchain::{advance, Advance, Tables};
+    let reading: Vec<&EntityView> = entities
+        .iter()
+        .filter(|e| e.unavailable().is_none() && !e.offchain_tables().is_empty())
+        .collect();
+    if reading.is_empty() {
+        return Ok(());
+    }
+    let tables = Tables::load(dir)?;
+    let mut hot: Option<Vec<crate::registry::DecodedRow>> = None;
+    for entity in reading {
+        let mut appends = Vec::new();
+        let mut rebuild = false;
+        for table in entity.offchain_tables() {
+            let current = tables.version(table)?;
+            match advance(&entity.offchain_fed(table), &current) {
+                Advance::Unchanged => {}
+                Advance::Append(new) => {
+                    let snapshots = tables.snapshots(table, new)?;
+                    // Gone between the two reads: whatever it is now, it is not this append.
+                    rebuild |= snapshots.len() != new.len();
+                    appends.push((table, snapshots, current.clone()));
+                }
+                Advance::Rebuild => rebuild = true,
+            }
+        }
+        if rebuild {
+            let schema = registry.schema();
+            if hot.is_none() {
+                hot = Some(decode_stored_rows(
+                    &schema,
+                    &store.entities_in_range(0, through)?,
+                )?);
+            }
+            let rows = hot.as_deref().unwrap_or_default();
+            rebuild_entity(dir, &schema, rows, &tables, entity, through)?;
+            continue;
+        }
+        for (table, snapshots, version) in appends {
+            entity.apply_offchain(table, &snapshots, &version)?;
+            tracing::info!(
+                "entity `{}` applied {} new snapshot(s) of offchain__{table}",
+                entity.name(),
+                snapshots.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_entity(
+    dir: &std::path::Path,
+    schema: &[crate::registry::TableSchema],
+    hot: &[crate::registry::DecodedRow],
+    tables: &crate::entity_offchain::Tables,
+    entity: &EntityView,
+    through: u64,
+) -> Result<()> {
+    tracing::info!(
+        "entity `{}` rebuilding: an offchain snapshot it had applied was replaced or removed",
+        entity.name()
+    );
+    entity.rebuild_begin();
+    for table in entity.chain_tables() {
+        let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
+            anyhow::bail!(TerminalFault(format!(
+                "entity `{}` reads `{table}`, which this nest's registry does not describe",
+                entity.name()
+            )))
+        };
+        crate::seal::read_table_rows_by_segment(dir, table_schema, &mut |rows| {
+            entity.rebuild_chain(&rows)
+        })?;
+    }
+    entity.rebuild_chain(hot)?;
+    for table in entity.offchain_tables() {
+        let (snapshots, version) = match tables.table(table)? {
+            Some(found) => (found.snapshots().to_vec(), found.version()),
+            None => (Vec::new(), Vec::new()),
+        };
+        entity.rebuild_offchain(table, &snapshots, &version)?;
+    }
+    entity.rebuild_commit(through)
 }
 
 fn live_nest(nests: &mut [Option<NestIngest>], i: usize) -> &mut NestIngest {
@@ -6467,6 +6603,25 @@ impl NestIngest {
         self.store
             .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
             .await?;
+        // After the commit, so a rebuild reads exactly the history the entities have folded. Off the
+        // runtime: it reads the manifest and snapshots, and a rebuild reads the sealed corpus.
+        if self
+            .entities
+            .iter()
+            .any(|e| !e.offchain_tables().is_empty())
+        {
+            let (dir, store, registry, entities) = (
+                self.dir.clone(),
+                self.store.clone(),
+                self.registry.clone(),
+                self.entities.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                refresh_offchain(&dir, store.as_ref(), &registry, &entities, to)
+            })
+            .await
+            .context("the offchain refresh task did not complete")??;
+        }
         self.metrics.set_last_block(to);
         self.metrics.add_rows_decoded(stored as u64);
         if stored > 0 {
@@ -18277,6 +18432,134 @@ rpc_urls = ["https://rpc.example"]
             events: Vec::new(),
         }])
         .unwrap()
+    }
+
+    /// #1437: an offchain column the snapshots do not have, or an entity named inside the offchain
+    /// namespace, is refused when the nest starts.
+    #[test]
+    fn an_offchain_entity_is_refused_at_start_for_a_bad_column_or_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("tiers.csv");
+        std::fs::write(
+            &csv,
+            "account,tier\n0x2222222222222222222222222222222222222222,1\n",
+        )
+        .unwrap();
+        crate::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
+        let registry = Arc::new(erc20_registry());
+        // Inline, because that is what `start_entities` lowers today; `check` wants a path (#1449).
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
+             sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+             JOIN offchain__tiers t ON x.\"to\" = t.wallet GROUP BY t.tier'\n",
+        )
+        .unwrap();
+        let unbound = match start_entities(dir.path(), &registry, false) {
+            Ok(_) => panic!("an entity naming a missing offchain column must not start"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            unbound.contains("no column wallet in offchain__tiers"),
+            "{unbound}"
+        );
+
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='offchain__x'\nkey=['to']\nmax_rows=100\n\
+             sql='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n",
+        )
+        .unwrap();
+        let named = match start_entities(dir.path(), &registry, false) {
+            Ok(_) => panic!("an entity named inside offchain__ must not start"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(named.contains("namespace"), "{named}");
+    }
+
+    /// #1437 slice 2: a cold entity starts with every snapshot applied, takes an appended one as a
+    /// delta, takes nothing twice, and is rebuilt from stored history when a snapshot is removed.
+    #[test]
+    fn an_offchain_entity_takes_appends_as_deltas_and_rebuilds_when_a_snapshot_goes() {
+        use crate::entity_row::{Row, Scalar};
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        let tiers = |name: &str, account: &str, tier: &str| {
+            let csv = dir.path().join(format!("{name}.csv"));
+            std::fs::write(&csv, format!("account,tier\n{account},{tier}\n")).unwrap();
+            crate::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
+        };
+        tiers("first", BOB, "gold");
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
+             sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+             JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier'\n",
+        )
+        .unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+        let entity = &views[0];
+
+        let stored = vec![
+            (
+                Store::entity_key(10, 0),
+                transfer_row(10, 0, ALICE, Some(BOB), "100"),
+            ),
+            (
+                Store::entity_key(11, 0),
+                transfer_row(11, 0, BOB, Some(ALICE), "7"),
+            ),
+        ];
+        store.commit_window(&stored, Some((11, "aa")), 11).unwrap();
+        let json: Vec<String> = stored.iter().map(|(_, j)| j.clone()).collect();
+        let rows = decode_stored_rows(&registry.schema(), &json).unwrap();
+        entity.apply_window(&rows, 1, 11).unwrap();
+        entity.flush();
+        let tier = |t: &str| Row(vec![Scalar::Str(t.into())]);
+        let sum = |v: i128| Some(Row(vec![Scalar::Int(v)]));
+        assert_eq!(entity.relation().get(&tier("gold")).cloned(), sum(100));
+        assert_eq!(entity.relation().len(), 1, "alice has no tier yet");
+
+        tiers("second", ALICE, "silver");
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+        entity.flush();
+        assert_eq!(entity.relation().get(&tier("silver")).cloned(), sum(7));
+        let (_, applied) = entity.len_and_watermark();
+        assert_eq!(
+            (applied.through, applied.offchain["tiers"].snapshots),
+            (11, 2)
+        );
+
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+        entity.flush();
+        assert_eq!(
+            entity.relation().get(&tier("silver")).cloned(),
+            sum(7),
+            "an unchanged manifest feeds nothing"
+        );
+
+        let catalogue = crate::offchain::load(dir.path()).unwrap();
+        std::fs::remove_file(crate::offchain::segment_path(
+            dir.path(),
+            &catalogue.tables["tiers"][0],
+        ))
+        .unwrap();
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+        assert_eq!(
+            entity.relation().get(&tier("gold")),
+            None,
+            "bob's tier went"
+        );
+        assert_eq!(entity.relation().get(&tier("silver")).cloned(), sum(7));
+        let (_, applied) = entity.len_and_watermark();
+        assert_eq!(
+            (applied.through, applied.offchain["tiers"].snapshots),
+            (11, 1)
+        );
+        assert!(entity.is_healthy());
     }
 
     /// A `LabelSet` containing `pairs`, built the only way one can be: written to disk and loaded.

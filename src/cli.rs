@@ -286,6 +286,9 @@ pub struct OffchainArgs {
 pub enum OffchainWhat {
     /// Import one CSV, JSON array, or Parquet file as an immutable, content-addressed snapshot.
     Drop(OffchainDropArgs),
+    /// Fetch a JSON-array price feed once. Schedule this command on the host; it never runs in the
+    /// chain cursor or the query path.
+    Pull(OffchainPullArgs),
 }
 
 #[derive(Args)]
@@ -298,6 +301,48 @@ pub struct OffchainDropArgs {
     /// Nest directory containing the offchain namespace.
     #[arg(long, default_value = ".")]
     pub dir: String,
+}
+
+#[derive(Args)]
+pub struct OffchainPullArgs {
+    /// HTTPS URL of the feed. Recorded without its query string, and never part of the nest's
+    /// identity.
+    pub source: String,
+    /// SQL table name beneath the `offchain__` namespace.
+    #[arg(long)]
+    pub table: String,
+    /// The feed's format, declared rather than guessed from the URL.
+    #[arg(long, value_enum)]
+    pub format: PullFormat,
+    /// Nest directory containing the offchain namespace.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Refuse a response larger than this many bytes.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    pub max_bytes: u64,
+    /// Give up on one attempt after this many seconds, response body included.
+    #[arg(long, default_value_t = 30)]
+    pub timeout_secs: u64,
+    /// Attempts for a transient failure (connect, timeout, HTTP 429 or 5xx), backing off 1s, 2s,
+    /// 4s. Anything else fails at once.
+    #[arg(long, default_value_t = 3)]
+    pub attempts: u32,
+    /// `NAME=ENV_VAR`: send header NAME with ENV_VAR's value. Read at run time, never stored.
+    #[arg(long = "header-env", value_name = "NAME=ENV_VAR")]
+    pub header_env: Vec<String>,
+    /// Report the table stale once its last success is older than this, even with no failure
+    /// recorded, so a timer that stopped firing shows. Set it a little above the timer's period.
+    #[arg(long)]
+    pub stale_after_secs: Option<u64>,
+    /// Permit plain http to a loopback address, for a local fixture. Never for a real feed.
+    #[arg(long)]
+    pub allow_loopback_http: bool,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum PullFormat {
+    /// A JSON array of objects, one row each.
+    Json,
 }
 
 #[derive(Args)]
