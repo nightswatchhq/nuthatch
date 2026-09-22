@@ -178,6 +178,20 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "RFC-0054's opt-in prompt is product copy that opens `nuthatch has no idea how many people \
          use it`; the fence is a prompt, not a subcommand",
     ),
+    (
+        "docs/rfcs/0059-checkpointed-folds.md",
+        "fold",
+        1,
+        "RFC-0059 S1 proposes the not-yet-shipped `nuthatch fold build`; delete this entry in the PR \
+         that ships it",
+    ),
+    (
+        "docs/rfcs/0059-checkpointed-folds.md",
+        "--folds",
+        1,
+        "RFC-0059 §5 proposes the not-yet-shipped `nuthatch check --folds`; delete this entry in the \
+         PR that ships it",
+    ),
 ];
 
 /// A finding: an unresolved subcommand word or flag, where it was found, and what was wrong.
