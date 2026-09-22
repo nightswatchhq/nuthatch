@@ -209,6 +209,19 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > because S0 is the only slice that can falsify the others. Accepting the direction is not accepting
 > the build-out sight unseen.
 >
+> **RFC-0059 and RFC-0060 are accepted, and this line is the record RFC-0044 §8 asks for.** Chief
+> accepted [RFC-0059](docs/rfcs/0059-checkpointed-folds.md) (checkpointed folds) and
+> [RFC-0060](docs/rfcs/0060-the-network-subgraph-endpoint.md) (the Network Subgraph endpoint) on
+> 2026-09-21, on one condition that binds every slice: **all of it stays outside the default binary,
+> behind cargo features that are off by default** (`folds`, and `graph`, which enables it). No
+> regular nuthatch user sees any graph-facing surface unless they opt in. The test is RFC-0046 §1's
+> deletion test: a default build's CLI help, the config `init` writes, its on-disk layout and its
+> behaviour are what they would be had neither RFC been written. RFC-0060 is the named consumer
+> RFC-0053's unpark trigger asks for. It unparks 0053 for its 21 client operations only, and the
+> "not a drop-in replacement" rule above still stands. Order of work: the ThinkPad-only facade code
+> goes under version control first (done as `pete/network-facade-rescue`, 2026-09-21), then
+> RFC-0059's S0 spike, which can stop the programme, and only then the runtime.
+>
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
 > the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred
