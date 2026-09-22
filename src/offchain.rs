@@ -37,6 +37,13 @@ pub struct Refresh {
     /// failure recorded, so a timer that stopped firing is visible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_after_secs: Option<u64>,
+    /// The last successful pull's served-bytes SHA-256 and the snapshot it resolved to. Recorded here
+    /// as well as on a snapshot the pull creates, because identical content deduplicates onto an
+    /// existing snapshot, possibly a dropped file's, whose record says nothing about this fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +86,7 @@ pub fn drop_file(dir: &Path, source: &Path, table: &str) -> Result<()> {
         rows,
         columns,
     )
+    .map(|_| ())
 }
 
 /// Runtime settings for one pull. None of it is written to the nest: a provider URL, key or header
@@ -121,12 +129,26 @@ pub async fn pull_json(dir: &Path, source: &str, table: &str, opts: &PullOptions
         let body = fetch_bounded(&url, opts).await?;
         let fetched = hex::encode(Sha256::digest(&body));
         let (bytes, rows, columns) = read_json_bytes(&body)?;
-        seal_snapshot(dir, table, &recorded, Some(fetched), bytes, rows, columns)
+        let snapshot = seal_snapshot(
+            dir,
+            table,
+            &recorded,
+            Some(fetched.clone()),
+            bytes,
+            rows,
+            columns,
+        )?;
+        anyhow::Ok((fetched, snapshot))
     }
     .await;
-    let error = result.as_ref().err().map(|e| format!("{e:#}"));
-    record_refresh(dir, table, &recorded, error, opts.stale_after_secs)?;
-    result.with_context(|| format!("pulling offchain__{table} from {recorded}"))
+    let outcome = match &result {
+        Ok(fetch) => Ok(fetch.clone()),
+        Err(e) => Err(format!("{e:#}")),
+    };
+    record_refresh(dir, table, &recorded, outcome, opts.stale_after_secs)?;
+    result
+        .map(|_| ())
+        .with_context(|| format!("pulling offchain__{table} from {recorded}"))
 }
 
 /// Resolve `NAME=ENV_VAR` pairs at run time. The error names the variable, never a value.
@@ -291,7 +313,7 @@ fn seal_snapshot(
     bytes: Vec<u8>,
     rows: usize,
     columns: Vec<String>,
-) -> Result<()> {
+) -> Result<String> {
     if columns.is_empty() {
         bail!("offchain source {source} has no columns");
     }
@@ -304,6 +326,7 @@ fn seal_snapshot(
     if !out.exists() {
         std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
     }
+    let resolved = hash.clone();
     with_manifest(dir, |catalogue| {
         refuse_case_collision(catalogue, table)?;
         let snapshots = catalogue.tables.entry(table.to_string()).or_default();
@@ -323,7 +346,7 @@ fn seal_snapshot(
         Ok(true)
     })?;
     println!("sealed offchain snapshot for offchain__{table}");
-    Ok(())
+    Ok(resolved)
 }
 
 /// **A case-insensitive collision is refused, not merged.**
@@ -519,32 +542,38 @@ fn save(dir: &Path, catalogue: &Catalogue) -> Result<()> {
     std::fs::rename(tmp, path).context("installing offchain provenance manifest")
 }
 
+/// `outcome` is the served-bytes hash and resolved snapshot on success, or the error text. A failure
+/// keeps the last success's time and fetch, so the status still names what is being served.
 fn record_refresh(
     dir: &Path,
     table: &str,
     source: &str,
-    error: Option<String>,
+    outcome: std::result::Result<(String, String), String>,
     stale_after_secs: Option<u64>,
 ) -> Result<()> {
     with_manifest(dir, |catalogue| {
         refuse_case_collision(catalogue, table)?;
         let now = now_stamp();
-        let previous_success = catalogue
-            .refreshes
-            .get(table)
-            .and_then(|refresh| refresh.succeeded_at.clone());
+        let previous = catalogue.refreshes.get(table);
+        let (succeeded_at, fetched_sha256, snapshot, error) = match outcome {
+            Ok((fetched, snapshot)) => (Some(now.clone()), Some(fetched), Some(snapshot), None),
+            Err(error) => (
+                previous.and_then(|r| r.succeeded_at.clone()),
+                previous.and_then(|r| r.fetched_sha256.clone()),
+                previous.and_then(|r| r.snapshot.clone()),
+                Some(error),
+            ),
+        };
         catalogue.refreshes.insert(
             table.to_string(),
             Refresh {
                 source: source.to_string(),
-                attempted_at: now.clone(),
-                succeeded_at: if error.is_some() {
-                    previous_success
-                } else {
-                    Some(now)
-                },
+                attempted_at: now,
+                succeeded_at,
                 error,
                 stale_after_secs,
+                fetched_sha256,
+                snapshot,
             },
         );
         Ok(true)
@@ -622,6 +651,41 @@ mod tests {
         assert_eq!(rows[0]["price"], "3210");
     }
 
+    /// Identical content deduplicates onto an existing snapshot, here a dropped file's. The pull must
+    /// still record what the source served, without rewriting the drop's own record (Jules on #1448).
+    #[tokio::test]
+    async fn a_pull_deduplicated_onto_a_dropped_snapshot_still_records_its_fetch() {
+        use axum::{routing::get, Router};
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("prices.json");
+        std::fs::write(&input, PRICES).unwrap();
+        drop_file(dir.path(), &input, "prices").unwrap();
+        let (base, server) = serve(Router::new().route("/p", get(|| async { PRICES }))).await;
+        pull_json(dir.path(), &format!("{base}/p"), "prices", &local())
+            .await
+            .unwrap();
+        server.abort();
+
+        let catalogue = load(dir.path()).unwrap();
+        let snapshots = &catalogue.tables["prices"];
+        assert_eq!(snapshots.len(), 1, "identical content is one snapshot");
+        assert_eq!(
+            snapshots[0].source,
+            input.display().to_string(),
+            "the drop's record is untouched"
+        );
+        let refresh = &catalogue.refreshes["prices"];
+        assert_eq!(
+            refresh.snapshot.as_deref(),
+            Some(snapshots[0].hash.as_str())
+        );
+        assert_eq!(
+            refresh.fetched_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(PRICES.as_bytes())).as_str()),
+            "the served bytes' hash must be in the manifest even when no snapshot was appended"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_refresh_keeps_the_last_snapshot_and_reads_stale() {
         use axum::{http::StatusCode, routing::get, Router};
@@ -652,13 +716,17 @@ mod tests {
         );
         let status = crate::analytics::query(
             dir.path(),
-            "SELECT stale, succeeded_at, error FROM offchain__prices__status",
+            "SELECT stale, succeeded_at, error, snapshot FROM offchain__prices__status",
         )
         .unwrap();
         assert_eq!(status[0]["stale"], true);
         assert!(
             status[0]["succeeded_at"].is_string(),
             "the last success stays named"
+        );
+        assert!(
+            status[0]["snapshot"].is_string(),
+            "and so does the snapshot being served"
         );
         assert!(status[0]["error"].as_str().unwrap().contains("HTTP 500"));
     }
@@ -870,6 +938,8 @@ mod tests {
             succeeded_at: Some(succeeded.to_string()),
             error: None,
             stale_after_secs: Some(3600),
+            fetched_sha256: None,
+            snapshot: None,
         };
         with_manifest(dir.path(), |c| {
             c.refreshes.insert("old".into(), refresh("unix:1"));
@@ -900,8 +970,14 @@ mod tests {
                 let d = dir.path().to_path_buf();
                 std::thread::spawn(move || {
                     for _ in 0..5 {
-                        record_refresh(&d, &format!("t{i}"), "https://feed.example/p", None, None)
-                            .unwrap();
+                        record_refresh(
+                            &d,
+                            &format!("t{i}"),
+                            "https://feed.example/p",
+                            Ok(("fetched".into(), "snapshot".into())),
+                            None,
+                        )
+                        .unwrap();
                     }
                 })
             })

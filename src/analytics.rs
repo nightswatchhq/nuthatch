@@ -3052,12 +3052,15 @@ fn offchain_status_ddl(view: &str, table: &str, refresh: &crate::offchain::Refre
         "CREATE OR REPLACE VIEW \"{view}\" AS SELECT \
          {table_lit} AS \"table\", {source} AS source, {attempted} AS attempted_at, \
          {succeeded} AS succeeded_at, {error} AS error, {stale_after} AS stale_after_secs, \
-         {age} AS age_secs, {stale} AS stale",
+         {age} AS age_secs, {stale} AS stale, {snapshot} AS snapshot, \
+         {fetched} AS fetched_sha256",
         table_lit = text(Some(table)),
         source = text(Some(&refresh.source)),
         attempted = text(Some(&refresh.attempted_at)),
         succeeded = text(refresh.succeeded_at.as_deref()),
         error = text(refresh.error.as_deref()),
+        snapshot = text(refresh.snapshot.as_deref()),
+        fetched = text(refresh.fetched_sha256.as_deref()),
         stale_after = int(stale_after),
         age = int(age),
     )
