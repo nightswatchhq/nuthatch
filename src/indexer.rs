@@ -845,7 +845,7 @@ fn seed_entities(
         // `seal::read_table_rows_by_segment` for what that is worth in peak RSS. The hot tail is
         // fed by reference for the same reason: it used to be cloned once per entity on the nest.
         let mut sealed = 0usize;
-        for table in entity.tables() {
+        for table in entity.chain_tables() {
             let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
                 anyhow::bail!(TerminalFault(format!(
                     "entity `{}` reads `{table}`, which this nest's registry does not describe",
@@ -1577,11 +1577,43 @@ fn start_entities(
                 t.table
             )
         }
-        views.push(EntityView::start(
+        if crate::entity_offchain::table_of(&decl.name).is_some() {
+            anyhow::bail!(
+                "entity `{}` is named inside the `{}` namespace, where it would shadow an offchain \
+                 table on the SQL surface. Rename the entity",
+                decl.name,
+                crate::entity_offchain::OFFCHAIN_NAMESPACE
+            )
+        }
+        // The manifest is read only for an entity that names an offchain table, so a damaged one
+        // cannot stop a chain-only nest from starting.
+        let offchain = if std::iter::once(&plan.left)
+            .chain(plan.join.as_ref().map(|j| &j.right))
+            .any(|s| crate::entity_offchain::table_of(&s.table).is_some())
+        {
+            crate::entity_offchain::Tables::load(dir)?
+        } else {
+            crate::entity_offchain::Tables::none()
+        };
+        let binding =
+            crate::entity_bind::Binding::bind_with_offchain(&plan, registry, &offchain)
+                .with_context(|| format!("binding entity `{}` to this nest's tables", decl.name))?;
+        // Bound and validated, but nothing feeds snapshots to a running circuit until #1437's
+        // second slice, and an entity fed only its chain side would serve a partial join as current.
+        if let Some(table) = binding.offchain_tables().first() {
+            anyhow::bail!(
+                "entity `{}` reads {}{table}. Its offchain source binds, but maintaining an entity \
+                 from offchain snapshots is not implemented yet (#1437). Keep it as views/*.sql \
+                 until then",
+                decl.name,
+                crate::entity_offchain::OFFCHAIN_NAMESPACE
+            )
+        }
+        views.push(EntityView::start_bound(
             &decl.name,
             &plan,
+            binding,
             &columns,
-            registry,
             decl.max_rows,
             warm,
         )?);
@@ -17732,6 +17764,56 @@ rpc_urls = ["https://rpc.example"]
             events: Vec::new(),
         }])
         .unwrap()
+    }
+
+    /// #1437 slice 1: an entity over an offchain table is bound against the snapshot's schema, so a
+    /// bad column is diagnosed, and is then refused rather than started with only its chain side fed.
+    #[test]
+    fn an_offchain_entity_binds_and_is_refused_at_start_until_it_can_be_fed() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("tiers.csv");
+        std::fs::write(
+            &csv,
+            "account,tier\n0x2222222222222222222222222222222222222222,1\n",
+        )
+        .unwrap();
+        crate::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
+        let registry = Arc::new(erc20_registry());
+        let start = |join_on: &str| {
+            // Inline, because that is what `start_entities` lowers today; `check` wants a path (#1449).
+            std::fs::write(
+                dir.path().join("entities.toml"),
+                format!(
+                    "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
+                     sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+                     JOIN offchain__tiers t ON x.\"to\" = t.{join_on} GROUP BY t.tier'\n"
+                ),
+            )
+            .unwrap();
+            match start_entities(dir.path(), &registry, false) {
+                Ok(_) => panic!("an offchain entity must not start before it can be fed"),
+                Err(e) => format!("{e:#}"),
+            }
+        };
+        let refused = start("account");
+        assert!(refused.contains("not implemented yet (#1437)"), "{refused}");
+        let unbound = start("wallet");
+        assert!(
+            unbound.contains("no column wallet in offchain__tiers"),
+            "{unbound}"
+        );
+
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='offchain__x'\nkey=['to']\nmax_rows=100\n\
+             sql='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n",
+        )
+        .unwrap();
+        let named = match start_entities(dir.path(), &registry, false) {
+            Ok(_) => panic!("an entity named inside offchain__ must not start"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(named.contains("namespace"), "{named}");
     }
 
     /// A `LabelSet` containing `pairs`, built the only way one can be: written to disk and loaded.

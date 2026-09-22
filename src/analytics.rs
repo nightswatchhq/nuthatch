@@ -3452,6 +3452,7 @@ pub fn entity_output_columns(
         schema,
         None,
     );
+    define_offchain_views(&conn, dir, None);
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
     let mut stmt = conn.prepare(sql)?;
