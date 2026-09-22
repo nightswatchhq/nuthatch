@@ -4098,21 +4098,27 @@ pub(crate) async fn resolve_calls_for_window(
     use futures::stream::StreamExt;
     let batches = futures::stream::iter(planned.into_iter().map(
         |(block, items, pairs, hash, canonical, ts)| async move {
-            let results = retry_transient(
-                &format!("seal-direct pinned eth_call batch at block {block}"),
-                BACKFILL_RETRY_BASE,
-                || async {
-                    if canonical {
-                        crate::calls::resolve_pairs_at_hash(
-                            state_rpc, chain_id, &pairs, block, &hash,
-                        )
-                        .await
-                    } else {
+            let results = if canonical {
+                resolve_canonical_batch(
+                    source,
+                    state_rpc,
+                    chain_id,
+                    &pairs,
+                    block,
+                    &hash,
+                    BACKFILL_RETRY_BASE,
+                )
+                .await?
+            } else {
+                retry_transient(
+                    &format!("seal-direct pinned eth_call batch at block {block}"),
+                    BACKFILL_RETRY_BASE,
+                    || async {
                         crate::calls::resolve_pairs_at(state_rpc, chain_id, &pairs, block).await
-                    }
-                },
-            )
-            .await?;
+                    },
+                )
+                .await?
+            };
             Ok::<_, anyhow::Error>(
                 items
                     .iter()
@@ -4134,6 +4140,59 @@ pub(crate) async fn resolve_calls_for_window(
     }
     out.sort_by_key(|r| (r.block_number, r.log_index));
     Ok(out)
+}
+
+/// A hash-pinned batch, retried as [`retry_transient`] retries, except where retrying cannot help.
+/// A pin the chain has moved off never becomes canonical again, so that is a plain error and the
+/// window is re-read from its logs. A provider refusing the EIP-1898 selector will refuse it again,
+/// so that is terminal. Neither falls back to a block number.
+async fn resolve_canonical_batch(
+    source: &dyn Source,
+    state_rpc: &crate::rpc::RpcClient,
+    chain_id: u64,
+    pairs: &[(String, String)],
+    block: u64,
+    hash: &str,
+    base: std::time::Duration,
+) -> Result<Vec<crate::calls::CallResult>> {
+    let label = format!("seal-direct canonical eth_call batch at block {block}");
+    let mut attempt = 1usize;
+    loop {
+        let err = match crate::calls::resolve_pairs_at_hash(state_rpc, chain_id, pairs, block, hash)
+            .await
+        {
+            Ok(results) => return Ok(results),
+            Err(e) => e,
+        };
+        // `None` is a chain momentarily shorter than `block`, which it will grow past.
+        if let Ok(Some(now)) = source.block_hash(block).await {
+            if !now.eq_ignore_ascii_case(hash) {
+                anyhow::bail!(
+                    "block {block} moved from {hash} to {now} under a canonical call; the window \
+                     is re-read from its logs"
+                );
+            }
+        }
+        if rejects_block_hash_selector(&err) {
+            anyhow::bail!(TerminalFault(format!(
+                "the state RPC refuses EIP-1898 block-hash calls, which canonical calls require: \
+                 {err:#}"
+            )));
+        }
+        let backoff = backfill_backoff(base, attempt);
+        log_backfill_retry(&label, attempt, &err, backoff);
+        tokio::time::sleep(backoff).await;
+        attempt += 1;
+    }
+}
+
+/// Invalid params on a pin that is still canonical: the selector itself is what is refused.
+fn rejects_block_hash_selector(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::rpc::ClassifiedError>()
+            .is_some_and(|c| c.detail.contains("\"code\":-32602"))
+    })
 }
 
 /// Stream a *finalized* block range straight to sealed Parquet, bypassing the hot store entirely
@@ -16101,6 +16160,116 @@ template="pool"
             .unwrap();
             let error = format!("{:#}", result.unwrap_err());
             assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    /// A state RPC answering every `eth_call` in a batch with `error`.
+    async fn stub_failing_state_rpc(error: serde_json::Value) -> String {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/",
+            post(move |body: String| {
+                let error = error.clone();
+                async move {
+                    let req: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::json!([]));
+                    let one = |r: &serde_json::Value| {
+                        serde_json::json!({"jsonrpc": "2.0", "id": r["id"].clone(), "error": error})
+                    };
+                    axum::Json(match req.as_array() {
+                        Some(rs) => serde_json::Value::Array(rs.iter().map(one).collect()),
+                        None => one(&req),
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Jules on #1463: a canonical call retries only while retrying can help. A pin the chain has
+    /// moved off ends the window for a re-read, a refused EIP-1898 selector is terminal, and any
+    /// other failure on a live pin keeps retrying. None of them falls back to a block number.
+    #[tokio::test]
+    async fn a_canonical_call_stops_retrying_only_when_retrying_cannot_help() {
+        struct Chain(String);
+        #[async_trait::async_trait]
+        impl Source for Chain {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(Some(self.0.clone()))
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+        }
+        let decl: crate::calls::CallDecl = toml::from_str(
+            r#"
+            name = "clock"
+            contract = "0x1111111111111111111111111111111111111111"
+            on = "token__transfer"
+            signature = "blockNum()"
+            canonical = true
+        "#,
+        )
+        .unwrap();
+        let pinned = format!("0x{:064x}", 5);
+        let row = crate::registry::DecodedRow {
+            table: "token__transfer".into(),
+            params: Vec::new(),
+            block_number: 5,
+            block_hash: pinned.clone(),
+            block_timestamp: 1_700_000_005,
+            timestamps: true,
+            log_index: 0,
+            tx_hash: String::new(),
+            address: "0x1111111111111111111111111111111111111111".into(),
+        };
+        let headers = LogCountingSource::new().block_headers(&[5]).await.unwrap();
+        let not_canonical =
+            serde_json::json!({"code": -32000, "message": "hash is not currently canonical"});
+        let refused = serde_json::json!({"code": -32602, "message": "invalid block selector"});
+        for (error, now, outcome) in [
+            (not_canonical.clone(), format!("0x{:064x}", 6), Some(false)),
+            (refused, pinned.clone(), Some(true)),
+            (not_canonical, pinned.clone(), None),
+        ] {
+            let rpc =
+                crate::rpc::RpcClient::new(vec![stub_failing_state_rpc(error).await]).unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                resolve_calls_for_window(
+                    &Chain(now),
+                    std::slice::from_ref(&decl),
+                    &rpc,
+                    42161,
+                    std::slice::from_ref(&row),
+                    5,
+                    5,
+                    &std::collections::HashMap::from([(5, 1_700_000_005)]),
+                    true,
+                    Some(&headers),
+                ),
+            )
+            .await;
+            match outcome {
+                Some(terminal) => {
+                    let e = result.expect("must stop rather than retry").unwrap_err();
+                    assert_eq!(is_terminal(&e), terminal, "{e:#}");
+                }
+                None => assert!(result.is_err(), "a live pin must keep retrying"),
+            }
         }
     }
 
