@@ -232,23 +232,7 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
             issues.push(issue(&name, e.to_string()));
         } else {
             match dependencies(&sql) {
-                Ok(deps) => {
-                    // The same refusal `dev` makes at start, so `check` does not pass what `dev`
-                    // then declines.
-                    if let Some(t) = deps
-                        .iter()
-                        .find(|d| crate::entity_offchain::table_of(d).is_some())
-                    {
-                        issues.push(issue(
-                            &name,
-                            format!(
-                                "reads {t}; maintaining an entity from offchain snapshots is not \
-                                 implemented yet (#1437). Keep it as views/*.sql until then"
-                            ),
-                        ));
-                    }
-                    graph.push((name.clone(), deps))
-                }
+                Ok(deps) => graph.push((name.clone(), deps)),
                 Err(e) => issues.push(issue(
                     &name,
                     format!("cannot determine entity dependencies: {e}"),
@@ -1178,41 +1162,32 @@ mod tests {
         );
     }
 
-    /// #1437 slice 1: an entity over an offchain table binds under `check` (the view is defined, so
-    /// its SQL resolves) and is then refused for the same reason `dev` refuses it.
+    /// #1437: `check` validates an entity over an offchain table against its snapshots, reference
+    /// query included. `by_count` is only non-unique if that query really ran over the offchain rows.
     #[test]
-    fn check_binds_an_offchain_entity_and_refuses_it_as_dev_does() {
+    fn check_validates_an_offchain_entity_against_its_snapshots() {
         let dir = configured_nest();
         let csv = dir.path().join("prices.csv");
-        std::fs::write(&csv, "symbol,price_e8\nETH,250000000000\n").unwrap();
+        std::fs::write(&csv, "symbol,price_e8\nETH,250000000000\nBTC,7\n").unwrap();
         crate::offchain::drop_file(dir.path(), &csv, "prices").unwrap();
         std::fs::write(
             dir.path().join(ENTITY_FILE),
             "[[entities]]\nname='quotes'\nsql='entities/quotes.sql'\nkey=['symbol']\nmax_rows=10\n\
+             [[entities]]\nname='by_count'\nsql='entities/by_count.sql'\nkey=['n']\nmax_rows=10\n\
              [[entities]]\nname='offchain__x'\nsql='entities/offchain__x.sql'\nkey=['k']\nmax_rows=1\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("entities/quotes.sql"),
-            "SELECT symbol, count(*) AS n FROM offchain__prices GROUP BY symbol",
-        )
-        .unwrap();
+        let grouped = "SELECT symbol, count(*) AS n FROM offchain__prices GROUP BY symbol";
+        std::fs::write(dir.path().join("entities/quotes.sql"), grouped).unwrap();
+        std::fs::write(dir.path().join("entities/by_count.sql"), grouped).unwrap();
         std::fs::write(dir.path().join("entities/offchain__x.sql"), "SELECT 1 AS k").unwrap();
 
         let issues = validate(dir.path());
-        let quotes: Vec<&str> = issues
-            .iter()
-            .filter(|i| i.name == "quotes")
-            .map(|i| i.error.as_str())
-            .collect();
+        assert!(!issues.iter().any(|i| i.name == "quotes"), "{issues:?}");
         assert!(
-            quotes
+            issues
                 .iter()
-                .any(|e| e.contains("reads offchain__prices") && e.contains("#1437")),
-            "{issues:?}"
-        );
-        assert!(
-            !quotes.iter().any(|e| e.contains("does not bind")),
+                .any(|i| i.name == "by_count" && i.error.contains("not unique")),
             "{issues:?}"
         );
         assert!(

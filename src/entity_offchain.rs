@@ -223,29 +223,59 @@ impl Tables {
     /// `table` as the `/sql` view defines it, or `None` when that view would not exist: no such
     /// table, or none of its snapshots present.
     pub fn table(&self, table: &str) -> Result<Option<Table>> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        let Some(retained) = self.catalogue.tables.get(table) else {
-            return Ok(None);
-        };
-        let mut snapshots = Vec::with_capacity(retained.len());
-        for s in retained {
-            let path = crate::offchain::segment_path(&self.dir, s);
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
-            };
-            let schema = ParquetRecordBatchReaderBuilder::try_new(file)
-                .with_context(|| format!("reading the schema of {}", path.display()))?
-                .schema()
-                .clone();
-            snapshots.push(Snapshot {
-                hash: s.hash.clone(),
-                path,
-                schema,
-            });
+        let mut snapshots = Vec::new();
+        for s in self.retained(table) {
+            snapshots.extend(self.open(s)?);
         }
         Ok((!snapshots.is_empty()).then_some(Table { snapshots }))
+    }
+
+    /// The content hashes of `table`'s present snapshots, in append order: what [`Table::version`]
+    /// returns, without reading any snapshot's footer.
+    pub fn version(&self, table: &str) -> Result<Vec<String>> {
+        let mut version = Vec::new();
+        for s in self.retained(table) {
+            let path = crate::offchain::segment_path(&self.dir, s);
+            match std::fs::metadata(&path) {
+                Ok(_) => version.push(s.hash.clone()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            }
+        }
+        Ok(version)
+    }
+
+    /// The present snapshots of `table` among `hashes`, in append order.
+    pub fn snapshots(&self, table: &str, hashes: &[String]) -> Result<Vec<Snapshot>> {
+        let mut out = Vec::new();
+        for s in self.retained(table).filter(|s| hashes.contains(&s.hash)) {
+            out.extend(self.open(s)?);
+        }
+        Ok(out)
+    }
+
+    fn retained(&self, table: &str) -> impl Iterator<Item = &crate::offchain::Snapshot> {
+        self.catalogue.tables.get(table).into_iter().flatten()
+    }
+
+    /// A retained snapshot, or `None` when its segment is absent, as the `/sql` view treats it.
+    fn open(&self, s: &crate::offchain::Snapshot) -> Result<Option<Snapshot>> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let path = crate::offchain::segment_path(&self.dir, s);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        };
+        let schema = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading the schema of {}", path.display()))?
+            .schema()
+            .clone();
+        Ok(Some(Snapshot {
+            hash: s.hash.clone(),
+            path,
+            schema,
+        }))
     }
 
     pub fn names(&self) -> Vec<&str> {

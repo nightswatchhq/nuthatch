@@ -141,7 +141,7 @@ pub struct Inputs<'a> {
     pub max_rows: usize,
     pub sealed_through: u64,
     pub write_generation: u64,
-    pub entity_watermarks: &'a BTreeMap<String, u64>,
+    pub entity_watermarks: &'a crate::entity_view::Watermarks,
     pub files: &'a BTreeMap<PathBuf, String>,
 }
 
@@ -158,9 +158,14 @@ impl Inputs<'_> {
         field(&(self.max_rows as u64).to_le_bytes());
         field(&self.sealed_through.to_le_bytes());
         field(&self.write_generation.to_le_bytes());
-        for (name, through) in self.entity_watermarks {
+        for (name, applied) in self.entity_watermarks {
             field(name.as_bytes());
-            field(&through.to_le_bytes());
+            field(&applied.through.to_le_bytes());
+            // An appended offchain snapshot changes the rows without moving the block (#1437).
+            for (table, mark) in &applied.offchain {
+                field(table.as_bytes());
+                field(mark.digest.as_bytes());
+            }
         }
         for (path, stamp) in self.files {
             field(path.to_string_lossy().as_bytes());
@@ -174,7 +179,7 @@ impl Inputs<'_> {
 /// in the provenance exactly as they did the first time.
 pub struct Entry {
     pub out: QueryOutput,
-    pub watermarks: BTreeMap<String, u64>,
+    pub watermarks: crate::entity_view::Watermarks,
     /// The tables this answer read, and a stamp of every sealed segment behind them at the moment it
     /// was computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
     pub tables: Option<std::collections::BTreeSet<String>>,
@@ -254,7 +259,7 @@ impl Memo {
         &self,
         key: Key,
         out: &QueryOutput,
-        watermarks: &BTreeMap<String, u64>,
+        watermarks: &crate::entity_view::Watermarks,
         provenance: (Option<u64>, u64),
         segments: Vec<(PathBuf, u64, i64)>,
         cap: usize,
@@ -335,7 +340,7 @@ pub fn get(key: &Key) -> Option<Arc<Entry>> {
 pub fn put(
     key: Key,
     out: &QueryOutput,
-    watermarks: &BTreeMap<String, u64>,
+    watermarks: &crate::entity_view::Watermarks,
     provenance: (Option<u64>, u64),
     segments: Vec<(PathBuf, u64, i64)>,
 ) -> bool {
@@ -368,7 +373,7 @@ mod tests {
         dir: &'a Path,
         sql: &'a str,
         generation: u64,
-        wm: &'a BTreeMap<String, u64>,
+        wm: &'a crate::entity_view::Watermarks,
         files: &'a BTreeMap<PathBuf, String>,
     ) -> Inputs<'a> {
         Inputs {
@@ -396,7 +401,21 @@ mod tests {
     #[test]
     fn every_input_changes_the_key() {
         let d = std::path::PathBuf::from("/n");
-        let wm: BTreeMap<String, u64> = [("e".to_string(), 5)].into_iter().collect();
+        let at = |through: u64, snapshots: &[&str]| -> crate::entity_view::Watermarks {
+            let mut applied = crate::entity_view::Applied {
+                through,
+                ..Default::default()
+            };
+            if !snapshots.is_empty() {
+                let version: Vec<String> = snapshots.iter().map(|s| s.to_string()).collect();
+                applied.offchain.insert(
+                    "prices".into(),
+                    crate::entity_view::OffchainMark::of(&version),
+                );
+            }
+            [("e".to_string(), applied)].into_iter().collect()
+        };
+        let wm = at(5, &[]);
         let files: BTreeMap<PathBuf, String> =
             [(PathBuf::from("/n/views/a.sql"), "h1".to_string())]
                 .into_iter()
@@ -423,11 +442,21 @@ mod tests {
         let mut i = inputs(&d, "SELECT 1", 3, &wm, &files);
         i.max_rows = 101;
         assert_ne!(base, i.key(), "row cap");
-        let wm2: BTreeMap<String, u64> = [("e".to_string(), 6)].into_iter().collect();
+        let wm2 = at(6, &[]);
         assert_ne!(
             base,
             inputs(&d, "SELECT 1", 3, &wm2, &files).key(),
             "entity watermark"
+        );
+        // #1437: offchain snapshots change the rows without moving the block.
+        let one = inputs(&d, "SELECT 1", 3, &at(5, &["a"]), &files).key();
+        assert_ne!(base, one, "an applied snapshot");
+        let two = inputs(&d, "SELECT 1", 3, &at(5, &["a", "b"]), &files).key();
+        assert_ne!(one, two, "an appended snapshot");
+        assert_ne!(
+            two,
+            inputs(&d, "SELECT 1", 3, &at(5, &["c", "b"]), &files).key(),
+            "a replaced snapshot, with the same count and latest"
         );
         let files2: BTreeMap<PathBuf, String> =
             [(PathBuf::from("/n/views/a.sql"), "h2".to_string())]
