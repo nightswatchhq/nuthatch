@@ -3,8 +3,17 @@ use nuthatch::{analytics, config::Config, registry};
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
 
+// These are whole-view correctness replays, not a concurrent-load benchmark. Keep their
+// independent DuckDB instances from competing for the runner while a query deadline runs.
+fn replay_slot() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn sparse_delegation_fold_matches_the_original_event_by_event() {
+    let _replay = replay_slot();
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("views")).unwrap();
     let mut rows = Vec::new();
@@ -56,6 +65,7 @@ fn sparse_delegation_fold_matches_the_original_event_by_event() {
 
 #[test]
 fn sparse_lock_fold_matches_the_original_event_by_event() {
+    let _replay = replay_slot();
     let conn = duckdb::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE indexer_lock_event (indexer VARCHAR, block_number UBIGINT, log_index UBIGINT, kind VARCHAR, tokens VARCHAR, until INTEGER)").unwrap();
     let kinds = [
@@ -114,6 +124,7 @@ fn sparse_lock_fold_matches_the_original_event_by_event() {
 
 #[test]
 fn network_startup_validator_binds_the_same_scalar_functions_as_queries() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -124,6 +135,7 @@ fn network_startup_validator_binds_the_same_scalar_functions_as_queries() {
 
 #[test]
 fn allocation_clock_only_defaults_empty_or_reverted_reads() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -169,6 +181,7 @@ fn allocation_clock_only_defaults_empty_or_reverted_reads() {
 #[test]
 #[ignore = "operator check: requires NETWORK_COLD_REPLAY_DIR holding independently ingested genesis segments"]
 fn independently_ingested_cold_history_matches_genesis_reference() {
+    let _replay = replay_slot();
     let replay = PathBuf::from(std::env::var_os("NETWORK_COLD_REPLAY_DIR").expect(
         "set NETWORK_COLD_REPLAY_DIR to the retained first-million-block ingestion directory",
     ));
@@ -303,6 +316,7 @@ fn independently_ingested_cold_history_matches_genesis_reference() {
 
 #[test]
 fn capacity_uses_the_last_refresh_event_and_its_protocol_parameters() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -434,6 +448,7 @@ fn capacity_uses_the_last_refresh_event_and_its_protocol_parameters() {
 
 #[test]
 fn independently_indexed_allocations_match_reference_including_arbitrum_l1_numbers() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -501,6 +516,7 @@ fn independently_indexed_allocations_match_reference_including_arbitrum_l1_numbe
 
 #[test]
 fn captured_genesis_facts_match_same_block_network_subgraph() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -593,6 +609,7 @@ fn captured_genesis_facts_match_same_block_network_subgraph() {
 
 #[test]
 fn network_contract_addresses_and_supply_follow_historical_events() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -651,6 +668,7 @@ fn network_contract_addresses_and_supply_follow_historical_events() {
 
 #[test]
 fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -859,6 +877,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
 
 #[test]
 fn disputes_apply_linked_rejection_draw_and_horizon_cancellation_at_their_blocks() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -970,6 +989,7 @@ fn disputes_apply_linked_rejection_draw_and_horizon_cancellation_at_their_blocks
 
 #[test]
 fn protocol_parameters_require_matching_reads_and_horizon_clear_wins_in_order() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -1038,6 +1058,7 @@ fn protocol_parameters_require_matching_reads_and_horizon_clear_wins_in_order() 
 
 #[test]
 fn controller_pause_and_ownership_are_independent_historical_state() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -1105,6 +1126,7 @@ fn controller_pause_and_ownership_are_independent_historical_state() {
 
 #[test]
 fn epoch_length_changes_keep_the_old_epoch_start_and_require_pinned_l1_reads() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -1161,6 +1183,7 @@ fn epoch_length_changes_keep_the_old_epoch_start_and_require_pinned_l1_reads() {
 
 #[test]
 fn delegation_rewards_use_the_pool_and_cut_at_the_event_not_the_query_head() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -1360,6 +1383,7 @@ fn delegation_rewards_use_the_pool_and_cut_at_the_event_not_the_query_head() {
 
 #[test]
 fn indexer_registration_migration_and_stake_are_reconstructed_at_each_block() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -1541,6 +1565,7 @@ fn indexer_registration_migration_and_stake_are_reconstructed_at_each_block() {
 
 #[test]
 fn publishing_versions_and_deployment_creation_follow_the_upstream_event_sequence() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -1656,6 +1681,7 @@ fn publishing_versions_and_deployment_creation_follow_the_upstream_event_sequenc
 
 #[test]
 fn fee_splits_curation_and_rewards_preserve_event_order_without_double_counting() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -1923,6 +1949,7 @@ fn fee_splits_curation_and_rewards_preserve_event_order_without_double_counting(
 
 #[test]
 fn provision_history_separates_thawing_deprovisioning_and_staged_parameters() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -2139,6 +2166,7 @@ fn provision_history_separates_thawing_deprovisioning_and_staged_parameters() {
 
 #[test]
 fn issuance_follows_the_allocator_and_denylist_changes_are_historical() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -2252,6 +2280,7 @@ fn issuance_follows_the_allocator_and_denylist_changes_are_historical() {
 
 #[test]
 fn escrow_history_matches_the_upstream_balance_signer_and_redemption_rules() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let schema = registry::from_nest(&source, &config).unwrap().schema();
@@ -2380,6 +2409,7 @@ fn escrow_history_matches_the_upstream_balance_signer_and_redemption_rules() {
 
 #[test]
 fn allocation_lifecycle_keeps_legacy_history_and_uses_the_closure_block_epoch() {
+    let _replay = replay_slot();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network-nest");
     let config = Config::load(&source).unwrap();
     let mut schema = registry::from_nest(&source, &config).unwrap().schema();
