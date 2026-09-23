@@ -2,12 +2,14 @@
 //! phones home. This is where the MCP server and SQL surface will grow in later slices.
 
 use anyhow::{Context, Result};
+#[cfg(feature = "graph")]
+use axum::routing::post;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use futures::stream;
@@ -350,10 +352,17 @@ pub fn router(backing: SharedNest) -> Router {
     // (`indexer::admin_enabled`), so it is constant for the life of the endpoint - a hot swap (RFC-0020
     // slice 2) re-points the *data*, never the admin decision.
     let admin_enabled = backing.current().admin_enabled;
-    // RFC-0060 §5.6: the network facade's own routes, registered only in a `graph` build.
+    // RFC-0060 §5.6: graph-facing routes are registered only in a `graph` build. That includes the
+    // RFC-0053 GraphQL routes (#1440); the porting commands stay in the default build.
     let graph_facade = |r: Router<SharedNest>| {
         #[cfg(feature = "graph")]
-        let r = r.route("/graph/status", get(graph_status));
+        let r = r
+            .route("/graph/status", get(graph_status))
+            // RFC-0053 S1 (#1265). Both shapes: a plain endpoint an operator points people at, and
+            // the subgraph URL form so a client's existing URL needs only its host changed.
+            .route("/graphql", post(graph_graphql))
+            .route("/subgraphs/id/{id}", post(graph_graphql))
+            .route("/subgraphs/name/{*name}", post(graph_graphql));
         r
     };
     let admin = |r: Router<SharedNest>| {
@@ -372,11 +381,6 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/metrics", get(metrics_handler))
             .route("/tables", get(tables))
             .route("/schema", get(schema_doc))
-            // RFC-0053 S1 (#1265). Both shapes: a plain endpoint an operator points people at, and
-            // the subgraph URL form so a client's existing URL needs only its host changed.
-            .route("/graphql", post(graph_graphql))
-            .route("/subgraphs/id/{id}", post(graph_graphql))
-            .route("/subgraphs/name/{*name}", post(graph_graphql))
             .route("/table/{name}", get(table))
             .route("/entities", get(entities))
             .route("/ipfs/gave-up", get(ipfs_gave_up))
@@ -1945,6 +1949,7 @@ struct TableQuery {
 /// The generated schema comes from `graph/schema.graphql` in the nest, written there by `port-emit`.
 /// A nest that was not produced from a subgraph has no such file and this endpoint says so rather
 /// than inventing a schema.
+#[cfg(feature = "graph")]
 async fn graph_graphql(
     State(s): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -2245,6 +2250,7 @@ async fn graph_graphql(
 /// Arguments on an introspection field are ignored on purpose. The only one a client sends is
 /// `includeDeprecated`, and a generated subgraph schema deprecates nothing, so both values answer the
 /// same list.
+#[cfg(feature = "graph")]
 fn project(value: &serde_json::Value, sel: &[crate::graph_query::Selection]) -> serde_json::Value {
     if sel.is_empty() {
         return value.clone();
@@ -2276,6 +2282,7 @@ fn project(value: &serde_json::Value, sel: &[crate::graph_query::Selection]) -> 
 /// A to-one reference whose target row is missing comes back as all-null from the `LEFT JOIN`, and the
 /// relation is then `null` rather than an object of nulls - which is what graph-node answers, and the
 /// difference a client can actually see.
+#[cfg(feature = "graph")]
 fn graph_shape(
     compiled: &crate::graph_query::Compiled,
     row: &serde_json::Map<String, serde_json::Value>,
@@ -2363,6 +2370,7 @@ fn graph_shape(
 
 /// The Graph error envelope. A client reads `errors` and does not read an HTTP status, which is why
 /// every refusal here returns `200` with this body rather than a 4xx.
+#[cfg(feature = "graph")]
 fn gql_error(message: &str) -> serde_json::Value {
     serde_json::json!({"errors":[{"message": message}]})
 }
@@ -2374,6 +2382,7 @@ fn gql_error(message: &str) -> serde_json::Value {
 ///
 /// A nest with no head has indexed nothing, so it has not reached any block: reported as 0, which is
 /// what the message then says.
+#[cfg(feature = "graph")]
 fn unmet_minimum_block(s: &AppState, min: u64) -> Option<String> {
     let head = s
         .store
@@ -2457,6 +2466,7 @@ async fn graph_status(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+#[cfg(feature = "graph")]
 fn graph_history_head(
     state: &AppState,
     policy: &crate::graph_history::Policy,
@@ -2480,6 +2490,7 @@ fn graph_history_head(
 
 /// Run a compiled query through the same analytical path `/sql` uses, so a Graph query inherits
 /// RFC-0034's admission bounds rather than opening a second unbounded door into DuckDB.
+#[cfg(feature = "graph")]
 async fn graph_rows(
     s: &AppState,
     compiled: &crate::graph_query::Compiled,
@@ -2496,6 +2507,7 @@ async fn graph_rows(
 
 /// SQL may return a useful partial answer with explicit warnings. GraphQL clients do not see that
 /// envelope, so stripping its warnings would turn incomplete data into truth.
+#[cfg(feature = "graph")]
 fn graph_result_rows(
     v: &serde_json::Value,
 ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
@@ -4120,6 +4132,7 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
+    #[cfg(feature = "graph")]
     #[test]
     fn a_related_derived_list_is_shaped_inside_its_parent_object() {
         use crate::graph_query::{Compiled, Shape};
@@ -4626,6 +4639,7 @@ mod tests {
         assert!(stale.get("data").is_none());
     }
 
+    #[cfg(feature = "graph")]
     #[test]
     fn graph_history_freshness_uses_its_own_cursor_and_refuses_quarantine() {
         let dir = tempfile::tempdir().unwrap();
@@ -7596,10 +7610,12 @@ mod tests {
     }
 
     /// POST one GraphQL operation and decode the envelope.
+    #[cfg(feature = "graph")]
     async fn graph_ask(uri: &str, q: &str, st: AppState) -> serde_json::Value {
         graph_ask_variables(uri, q, json!({}), st).await
     }
 
+    #[cfg(feature = "graph")]
     async fn graph_ask_variables(
         uri: &str,
         q: &str,
@@ -8123,6 +8139,7 @@ type Signer @entity {
     /// proves a client can actually fetch it, at the subgraph URL shape as well as the plain one, and
     /// that anything which is not introspection is refused inside the Graph error envelope rather
     /// than as a bare status a client cannot read.
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn a_client_can_introspect_the_nest_over_http() {
         // Two requests below are built inline rather than through `graph_ask`, because they carry a
@@ -8286,6 +8303,7 @@ type Signer @entity {
     /// graph-node answers.
     ///
     /// `number` and `hash` are real time travel and stay refused.
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn a_block_number_gte_within_the_head_is_answered() {
         let (_d, state) = graph_fixture();
@@ -8371,6 +8389,7 @@ type Signer @entity {
 
     /// `_meta` takes the same `block` argument. Ignoring it answered a past or future block with
     /// today's head.
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn graph_meta_never_discards_a_block_argument() {
         let (_d, state) = graph_fixture();
@@ -8412,6 +8431,7 @@ type Signer @entity {
         }
     }
 
+    #[cfg(feature = "graph")]
     #[test]
     fn graph_results_never_hide_partial_or_malformed_sql_answers() {
         for flag in ["truncated", "degraded", "tip_unavailable"] {
@@ -8436,6 +8456,7 @@ type Signer @entity {
     /// variable used to be dropped by `filter_map` and re-surfaced as `unbound variable`, which is a
     /// refusal naming the wrong cause.
     #[cfg(not(feature = "graph"))]
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn a_null_filter_value_is_refused_by_name() {
         let (_d, state) = graph_fixture();
@@ -8554,6 +8575,7 @@ type Signer @entity {
     /// `operationName` at all - so `{"query": "query A {…} query B {…}", "operationName": "B"}`, which
     /// graph-node answers, came back refused. Asserted over HTTP because the finding was about the
     /// handler rather than the parser: a parser test passes with the field still ignored.
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn the_request_operation_name_selects_among_several_operations() {
         let (_d, state) = graph_fixture();
@@ -8705,7 +8727,33 @@ type Signer @entity {
             );
         }
 
-        // And the lane refuses by name rather than answering an empty success.
+        // A default build has no GraphQL routes at all (#1440, RFC-0060 §5.6's deletion test).
+        #[cfg(not(feature = "graph"))]
+        for uri in [
+            "/graphql",
+            "/subgraphs/id/QmWhatever",
+            "/subgraphs/name/a/b",
+        ] {
+            let res = router(SharedNest::new(state.clone()))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"query":"{ pools { id } }"}"#))
+                        .unwrap(),
+                )
+                .await
+                .expect("request");
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must not exist in a default build"
+            );
+        }
+
+        // In a `graph` build the lane refuses by name rather than answering an empty success.
+        #[cfg(feature = "graph")]
         for uri in ["/graphql", "/subgraphs/id/QmWhatever"] {
             let body = graph_ask(uri, "{ pools { id } }", state.clone()).await;
             let msg = body["errors"][0]["message"]
@@ -8732,6 +8780,7 @@ type Signer @entity {
     /// `{ _meta { b: block { number } } }` answers `internal error resolving _Block_.block: expected
     /// prefetched result, but found nothing`. Projecting uniformly answers it, which is strictly more
     /// useful and which no client can be relying on the absence of.
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn the_meta_root_is_narrowed_to_the_selection() {
         let (_d, state) = graph_fixture();
@@ -8803,6 +8852,7 @@ type Signer @entity {
         );
     }
 
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn a_fragment_document_and_a_mixed_operation_answer_over_http() {
         let (d, state) = graph_fixture();
@@ -8956,6 +9006,7 @@ type Signer @entity {
     /// yields the same document either way. Projection is covered where it can be seen - narrow
     /// selections, in `a_fragment_document_and_a_mixed_operation_answer_over_http`. Two tests, two
     /// properties: this one says the document is *complete*, that one says it is *no wider than asked*.
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn the_canonical_introspection_document_answers_with_the_references_shape() {
         // The **recorded Uniswap V4 schema**, not the small fixture nest: the reference document was
@@ -9087,6 +9138,7 @@ type Signer @entity {
     }
 
     /// `__type`, the traversals, the text operators and every refusal, each in the Graph envelope.
+    #[cfg(feature = "graph")]
     #[tokio::test]
     async fn the_graph_endpoint_answers_types_traversals_and_refusals() {
         let (d, state) = graph_fixture();

@@ -103,6 +103,7 @@ mod eval_harness;
 mod eval_runner_self_test;
 #[path = "gate_audit_cases.rs"]
 mod gate_audit_cases;
+#[cfg(feature = "graph")]
 #[path = "graph_over_indexed_data.rs"]
 mod graph_over_indexed_data;
 #[path = "graph_schema_golden.rs"]
