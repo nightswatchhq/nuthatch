@@ -1,8 +1,8 @@
 # RFC-0047: Nuthatch and the lakehouse pattern
 
-- Status: **Implemented, except C1b.** C1 (#1221), C2 (#1223), C3 (#1224) and C4 (#1225) shipped
-  2026-09-08. C1b (#1222), the physical Parquet type of 256-bit values, is a segment-format version
-  and stays deliberately deferred. Tracker #1208 is closed.
+- Status: **Implemented.** C1 (#1221), C2 (#1223), C3 (#1224) and C4 (#1225) shipped 2026-09-08.
+  C1b (#1222), the physical Parquet type of 256-bit values, was decided by RFC-0061, accepted
+  2026-09-23: 256-bit values stay canonical decimal text and no segment-format version is cut. Tracker #1208 is closed.
 - Author: Jenny
 - Date: 2026-09-02
 - Origin: a board draft of this title, read against the tree the same day. §1 records where the

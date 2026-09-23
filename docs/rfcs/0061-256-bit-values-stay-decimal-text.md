@@ -1,6 +1,7 @@
 # RFC-0061: 256-bit values stay decimal text - the C1b decision, measured
 
-**Status:** **Draft** - the decision `durable-dipper` item 2 asks for, awaiting Chief's acceptance.
+**Status:** **Accepted 2026-09-23 (Chief).** The decision `durable-dipper` item 2 asks for. Its only
+deliverable, the per-engine conversion in `reading-segments.md`, shipped with it in #1447.
 Tracking #1222.
 
 **Date:** 2026-09-21
