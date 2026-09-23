@@ -953,21 +953,26 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
     let q = format!("SELECT block_number FROM \"{table}\" ORDER BY block_number");
 
     // The Graph lane reads through the same `/sql` path but has no envelope to carry the flag, so a
-    // reduced answer must be refused there rather than served as complete.
-    std::fs::create_dir_all(dir.path().join("graph")).unwrap();
-    std::fs::write(
-        dir.path().join("graph/schema.graphql"),
-        "type Payment @entity { id: ID! }\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.path().join("views")).unwrap();
-    std::fs::write(
-        dir.path().join("views/payment.sql"),
-        format!(
+    // reduced answer must be refused there rather than served as complete. Its routes exist only in a
+    // `graph` build (#1440).
+    #[cfg(feature = "graph")]
+    {
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Payment @entity { id: ID! }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/payment.sql"),
+            format!(
             "CREATE VIEW payment AS SELECT CAST(block_number AS VARCHAR) AS id FROM \"{table}\";\n"
         ),
-    )
-    .unwrap();
+        )
+        .unwrap();
+    }
+    #[cfg(feature = "graph")]
     let payments_over_graphql = |client: reqwest::Client, base: String| async move {
         client
             .post(format!("{base}/graphql"))
@@ -1020,12 +1025,15 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
         serde_json::json!([]),
         "and name nothing: {healthy}"
     );
-    let graph = payments_over_graphql(client.clone(), base.clone()).await;
-    assert!(graph["errors"].is_null(), "{graph}");
-    assert!(
-        !graph["data"]["payments"].as_array().unwrap().is_empty(),
-        "{graph}"
-    );
+    #[cfg(feature = "graph")]
+    {
+        let graph = payments_over_graphql(client.clone(), base.clone()).await;
+        assert!(graph["errors"].is_null(), "{graph}");
+        assert!(
+            !graph["data"]["payments"].as_array().unwrap().is_empty(),
+            "{graph}"
+        );
+    }
 
     // Destroy the segment carrying blocks [4,6], leaving the file present and the manifest untouched
     // - exactly what a bad sector or a half-written restore looks like.
@@ -1066,14 +1074,17 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
         serde_json::json!([table]),
         "and name the table whose totals are now understated: {reduced}"
     );
-    let graph = payments_over_graphql(client.clone(), base.clone()).await;
-    assert!(graph["data"].is_null(), "{graph}");
-    assert!(
-        graph["errors"][0]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("degraded")),
-        "a reduced answer must not reach a GraphQL client as complete: {graph}"
-    );
+    #[cfg(feature = "graph")]
+    {
+        let graph = payments_over_graphql(client.clone(), base.clone()).await;
+        assert!(graph["data"].is_null(), "{graph}");
+        assert!(
+            graph["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("degraded")),
+            "a reduced answer must not reach a GraphQL client as complete: {graph}"
+        );
+    }
 
     server.abort();
 }

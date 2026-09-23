@@ -326,7 +326,8 @@ It does not make a partial schema or incomplete entity derivation a Network Subg
 ## Where the surface is reachable
 
 `POST /graphql`, `POST /subgraphs/id/{id}`, `POST /subgraphs/name/{*name}`. The three shapes exist so
-an existing client's URL can be swapped host-for-host without rewriting the path.
+an existing client's URL can be swapped host-for-host without rewriting the path. They are
+registered only in a build with `--features graph` (#1440); a default build answers them 404.
 
 Queries run through `run_sql_query`, so they inherit the node's admission bounds and row cap rather
 than opening a second unmetered way into DuckDB. An answer `/sql` would flag as truncated, degraded or
