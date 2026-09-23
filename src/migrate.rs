@@ -274,7 +274,7 @@ fn breaking_against_current(
 /// A nest installed from a bundle carries `manifest.json`. If the inputs have drifted from it, the
 /// nest is not the nest it claims to be, and silently giving it a fresh identity would hide an edit
 /// somebody made to a supposedly-pinned deploy unit.
-fn nid_of(nest: &Path) -> Result<String> {
+pub fn nid_of(nest: &Path) -> Result<String> {
     let manifest_path = nest.join("manifest.json");
     if manifest_path.is_file() {
         let raw = std::fs::read_to_string(&manifest_path)

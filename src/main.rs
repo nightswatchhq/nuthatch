@@ -264,6 +264,10 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            cli::NestWhat::Nid(a) => {
+                println!("{}", nuthatch::migrate::nid_of(std::path::Path::new(&a.dir))?);
+                Ok(())
+            }
             cli::NestWhat::RenameAlias(a) => {
                 project::rename_alias(std::path::Path::new(&a.dir), &a.old, &a.new)
             }
