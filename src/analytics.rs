@@ -3795,6 +3795,49 @@ fn value_to_json(v: ValueRef<'_>) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token(id VARCHAR, symbol VARCHAR);\
+             INSERT INTO token VALUES ('yes', 'WETH'), ('yes', 'WETH'),\
+                 ('no', 'OTHER'), (NULL, 'WETH');\
+             CREATE TABLE pool(id VARCHAR, token0 VARCHAR);\
+             INSERT INTO pool VALUES ('a', 'yes'), ('b', 'no'), ('c', 'missing'), ('d', NULL);",
+        )
+        .unwrap();
+        let schema = crate::graph_schema::parse("type Pool @entity { id: ID! token0: Token! } type Token @entity { id: ID! symbol: String! }").unwrap();
+        let roots = crate::graph_query::parse(
+            r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#,
+        )
+        .unwrap();
+        let compiled = crate::graph_query::compile(&schema, &roots[0]).unwrap();
+        let mut stmt = conn.prepare(&compiled.sql).unwrap();
+        let actual: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(actual, ["a"]);
+        // SQL NULL must be false just as EXISTS is, even when the child set contains NULL.
+        let predicate = compiled
+            .sql
+            .split_once(" WHERE ")
+            .unwrap()
+            .1
+            .rsplit_once(" ORDER BY ")
+            .unwrap()
+            .0;
+        let sql = format!("SELECT b.id FROM pool b WHERE NOT ({predicate}) ORDER BY b.id");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rejected: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rejected, ["b", "c", "d"]);
+    }
+
     use super::*;
 
     #[test]
