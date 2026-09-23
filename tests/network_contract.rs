@@ -3,6 +3,11 @@ use nuthatch::{analytics, config::Config, registry};
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
 
+// Whole-history fixture correctness is not the production request-latency contract.
+// Serialized replays still exceeded five seconds on CI. Keep a bounded test-only
+// allowance; production guards and their deadline tests remain unchanged.
+const REPLAY_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 // These are whole-view correctness replays, not a concurrent-load benchmark. Keep their
 // independent DuckDB instances from competing for the runner while a query deadline runs.
 fn replay_slot() -> std::sync::MutexGuard<'static, ()> {
@@ -45,14 +50,14 @@ fn sparse_delegation_fold_matches_the_original_event_by_event() {
         include_str!("fixtures/network-clients/delegation-ledger-reference.sql"),
     )
     .unwrap();
-    let result = analytics::query_hot_cold(dir.path(), "SELECT count(*) AS differing FROM ((SELECT * FROM delegation_ledger EXCEPT ALL SELECT * FROM delegation_ledger_reference) UNION ALL (SELECT * FROM delegation_ledger_reference EXCEPT ALL SELECT * FROM delegation_ledger))", analytics::QueryGuard { timeout: Duration::from_secs(10), max_rows: 1 }, &analytics::HotRows::new(), 0, &[]).unwrap();
+    let result = analytics::query_hot_cold(dir.path(), "SELECT count(*) AS differing FROM ((SELECT * FROM delegation_ledger EXCEPT ALL SELECT * FROM delegation_ledger_reference) UNION ALL (SELECT * FROM delegation_ledger_reference EXCEPT ALL SELECT * FROM delegation_ledger))", analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 1 }, &analytics::HotRows::new(), 0, &[]).unwrap();
     assert!(!result.degraded(), "{result:?}");
     assert_eq!(result.rows, vec![json!({"differing":0})]);
     let count = analytics::query_hot_cold(
         dir.path(),
         "SELECT count(*) AS rows FROM delegation_ledger",
         analytics::QueryGuard {
-            timeout: Duration::from_secs(10),
+            timeout: REPLAY_QUERY_TIMEOUT,
             max_rows: 1,
         },
         &analytics::HotRows::new(),
@@ -153,7 +158,7 @@ fn allocation_clock_only_defaults_empty_or_reverted_reads() {
             &source,
             "SELECT block_number, l1_block FROM allocation_l1_clock ORDER BY block_number",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 10,
             },
             hot,
@@ -264,7 +269,7 @@ fn independently_ingested_cold_history_matches_genesis_reference() {
                 dir.path(),
                 &format!("SELECT {fields} FROM {table} ORDER BY id"),
                 analytics::QueryGuard {
-                    timeout: Duration::from_secs(10),
+                    timeout: REPLAY_QUERY_TIMEOUT,
                     max_rows: 1000,
                 },
                 &analytics::HotRows::new(),
@@ -303,7 +308,7 @@ fn independently_ingested_cold_history_matches_genesis_reference() {
         dir.path(),
         "SELECT count(*) AS clocks FROM allocation_l1_clock WHERE l1_block >= 0",
         analytics::QueryGuard {
-            timeout: Duration::from_secs(10),
+            timeout: REPLAY_QUERY_TIMEOUT,
             max_rows: 1,
         },
         &analytics::HotRows::new(),
@@ -411,7 +416,7 @@ fn capacity_uses_the_last_refresh_event_and_its_protocol_parameters() {
             dir.path(),
             "SELECT \"delegatedCapacity\", \"tokenCapacity\", \"availableStake\" FROM indexer",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 10,
             },
             &hot,
@@ -476,7 +481,7 @@ fn independently_indexed_allocations_match_reference_including_arbitrum_l1_numbe
             dir.path(),
             sql,
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             hot,
@@ -558,7 +563,7 @@ fn captured_genesis_facts_match_same_block_network_subgraph() {
             dir.path(),
             &format!("SELECT {fields} FROM {table} ORDER BY id"),
             analytics::QueryGuard {
-                timeout: Duration::from_secs(10),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 1000,
             },
             &hot,
@@ -587,7 +592,7 @@ fn captured_genesis_facts_match_same_block_network_subgraph() {
             dir.path(),
             "SELECT id, controller, governor, \"pauseGuardian\" FROM graph_network",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 10,
             },
             hot,
@@ -646,7 +651,7 @@ fn network_contract_addresses_and_supply_follow_historical_events() {
     let query = |block| {
         analytics::query_hot_cold_at(dir.path(),
         "SELECT staking, \"totalSupply\", \"totalGRTMinted\", \"totalGRTBurned\" FROM graph_network",
-        analytics::QueryGuard { timeout: Duration::from_secs(5), max_rows: 100 }, &hot, 0, &schema, block).unwrap().rows
+        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100 }, &hot, 0, &schema, block).unwrap().rows
     };
     assert!(query(0).is_empty());
     assert_eq!(
@@ -709,7 +714,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
             dir.path(),
             "SELECT * FROM epoch_bounds ORDER BY epoch",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             hot,
@@ -738,7 +743,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
     );
     let financial = analytics::query_hot_cold_at(dir.path(),
         "SELECT id, \"signalledTokens\", \"stakeDeposited\", \"totalRewards\" FROM epoch ORDER BY id",
-        analytics::QueryGuard { timeout: Duration::from_secs(5), max_rows: 100 }, &hot, 0, &schema, 3000).unwrap();
+        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100 }, &hot, 0, &schema, 3000).unwrap();
     assert!(!financial.degraded(), "{financial:?}");
     assert_eq!(
         financial.rows,
@@ -750,7 +755,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
     );
     let network = analytics::query_hot_cold_at(
         dir.path(), "SELECT id, \"currentEpoch\", \"epochLength\", \"epochCount\", \"currentL1BlockNumber\", \"totalTokensStaked\", \"isPaused\" FROM graph_network",
-        analytics::QueryGuard { timeout: Duration::from_secs(5), max_rows: 100 }, &hot, 0, &schema, 3000).unwrap();
+        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100 }, &hot, 0, &schema, 3000).unwrap();
     assert!(!network.degraded(), "{network:?}");
     assert_eq!(
         network.rows,
@@ -856,7 +861,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
             dir.path(),
             "SELECT \"currentL1BlockNumber\" FROM graph_network",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 10,
             },
             &saved_clock,
@@ -957,7 +962,7 @@ fn disputes_apply_linked_rejection_draw_and_horizon_cancellation_at_their_blocks
             dir.path(),
             "SELECT * FROM dispute ORDER BY id",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -1031,7 +1036,7 @@ fn protocol_parameters_require_matching_reads_and_horizon_clear_wins_in_order() 
             dir.path(),
             "SELECT * FROM protocol_parameters ORDER BY parameter",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             hot,
@@ -1101,7 +1106,7 @@ fn controller_pause_and_ownership_are_independent_historical_state() {
             dir.path(),
             "SELECT * FROM controller_state",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -1156,7 +1161,7 @@ fn epoch_length_changes_keep_the_old_epoch_start_and_require_pinned_l1_reads() {
             dir.path(),
             "SELECT epoch, length, start_block FROM epoch_schedule ORDER BY seq",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             hot,
@@ -1327,7 +1332,7 @@ fn delegation_rewards_use_the_pool_and_cut_at_the_event_not_the_query_head() {
             dir.path(),
             sql,
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -1509,7 +1514,7 @@ fn indexer_registration_migration_and_stake_are_reconstructed_at_each_block() {
             dir.path(),
             "SELECT * FROM indexer",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -1639,7 +1644,7 @@ fn publishing_versions_and_deployment_creation_follow_the_upstream_event_sequenc
             dir.path(),
             sql,
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -1864,7 +1869,7 @@ fn fee_splits_curation_and_rewards_preserve_event_order_without_double_counting(
             dir.path(),
             sql,
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -2083,7 +2088,7 @@ fn provision_history_separates_thawing_deprovisioning_and_staged_parameters() {
             dir.path(),
             "SELECT * FROM provision ORDER BY id",
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -2244,7 +2249,7 @@ fn issuance_follows_the_allocator_and_denylist_changes_are_historical() {
             dir.path(),
             sql,
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -2356,7 +2361,7 @@ fn escrow_history_matches_the_upstream_balance_signer_and_redemption_rules() {
             dir.path(),
             sql,
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -2491,7 +2496,7 @@ fn allocation_lifecycle_keeps_legacy_history_and_uses_the_closure_block_epoch() 
             dir.path(),
             sql,
             analytics::QueryGuard {
-                timeout: Duration::from_secs(5),
+                timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
             },
             &hot,
@@ -2537,7 +2542,7 @@ fn allocation_lifecycle_keeps_legacy_history_and_uses_the_closure_block_epoch() 
         dir.path(),
         "SELECT \"closedAtEpoch\" FROM allocation WHERE id = 'new'",
         analytics::QueryGuard {
-            timeout: Duration::from_secs(5),
+            timeout: REPLAY_QUERY_TIMEOUT,
             max_rows: 100,
         },
         &hot,
