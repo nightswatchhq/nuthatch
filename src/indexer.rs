@@ -1566,7 +1566,10 @@ fn start_entities(
     }
     let mut views = Vec::with_capacity(declared.len());
     for decl in declared {
-        let (plan, columns) = crate::entity_lower::lower_with_columns(&decl.sql)
+        let sql = decl
+            .read_sql(dir)
+            .with_context(|| format!("reading SQL for entity `{}`", decl.name))?;
+        let (plan, columns) = crate::entity_lower::lower_with_columns(&sql)
             .with_context(|| format!("lowering entity `{}`", decl.name))?;
         // An entity that shadows a decoded table would silently take that table's name on the
         // analytical surface, so `SELECT * FROM usdc__transfer` would answer from a maintained
@@ -1590,10 +1593,7 @@ fn start_entities(
         }
         // The manifest is read only for an entity that names an offchain table, so a damaged one
         // cannot stop a chain-only nest from starting.
-        let offchain = if std::iter::once(&plan.left)
-            .chain(plan.join.as_ref().map(|j| &j.right))
-            .any(|s| crate::entity_offchain::table_of(&s.table).is_some())
-        {
+        let offchain = if crate::entity_offchain::reads_offchain(&plan) {
             crate::entity_offchain::Tables::load(dir)?
         } else {
             crate::entity_offchain::Tables::none()
@@ -1648,7 +1648,9 @@ fn refresh_offchain(
     use crate::entity_offchain::{advance, Advance, Tables};
     let reading: Vec<&EntityView> = entities
         .iter()
-        .filter(|e| e.unavailable().is_none() && !e.offchain_tables().is_empty())
+        .filter(|e| {
+            e.unavailable().is_none() && e.fault().is_none() && !e.offchain_tables().is_empty()
+        })
         .collect();
     if reading.is_empty() {
         return Ok(());
@@ -1680,7 +1682,14 @@ fn refresh_offchain(
                 )?);
             }
             let rows = hot.as_deref().unwrap_or_default();
-            rebuild_entity(dir, &schema, rows, &tables, entity, through)?;
+            // An entity that faults while rebuilding reports it as its own fault. Failing the window
+            // would stall every table on the chain behind one entity.
+            if let Err(e) = rebuild_entity(dir, &schema, rows, &tables, entity, through) {
+                if entity.fault().is_none() {
+                    return Err(e);
+                }
+                tracing::error!("entity `{}`: {e:#}", entity.name());
+            }
             continue;
         }
         for (table, snapshots, version) in appends {
@@ -7854,6 +7863,10 @@ fn webhook_host(url: &str) -> String {
         (false, false) => format!("{scheme}://{host}"),
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/entity_fixture.rs"]
+mod entity_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -18434,6 +18447,79 @@ rpc_urls = ["https://rpc.example"]
         .unwrap()
     }
 
+    #[test]
+    fn entity_sql_files_validate_and_start_from_the_same_directory() {
+        use crate::entity_row::{Row, Scalar};
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        std::fs::create_dir(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='received'\nsql='entities/received.sql'\nkey=['to']\nmax_rows=100\n",
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("entities/received.sql"),
+            "SELECT \"to\", SUM(value) AS total FROM usdc__transfer GROUP BY \"to\"",
+        )
+        .unwrap();
+        let issues = crate::entities::validate(dir.path());
+        assert!(issues.is_empty(), "{issues:?}");
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+        assert_eq!(views.len(), 1);
+        let recipient = "0x2222222222222222222222222222222222222222";
+        let rows = decode_stored_rows(
+            &registry.schema(),
+            &[transfer_row(
+                1,
+                0,
+                "0x1111111111111111111111111111111111111111",
+                Some(recipient),
+                "37",
+            )],
+        )
+        .unwrap();
+        views[0].apply_window(&rows, 1, 1).unwrap();
+        views[0].flush();
+        assert_eq!(
+            views[0]
+                .relation()
+                .get(&Row(vec![Scalar::Str(recipient.into())]))
+                .cloned(),
+            Some(Row(vec![Scalar::Int(37)]))
+        );
+    }
+
+    #[test]
+    fn entity_sql_file_errors_agree_between_validation_and_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        for (sql, expected) in [
+            ("SELECT 1", "move the SQL into entities/received.sql"),
+            (
+                "../received.sql",
+                "sql must name one entities/<name>.sql file",
+            ),
+            ("entities/other.sql", "entity name must match"),
+            ("entities/received.sql", "cannot read entities/received.sql"),
+        ] {
+            std::fs::write(
+                dir.path().join("entities.toml"),
+                format!("[[entities]]\nname='received'\nsql='{sql}'\nkey=['to']\nmax_rows=100\n"),
+            )
+            .unwrap();
+            let issues = crate::entities::validate(dir.path());
+            assert!(
+                issues.iter().any(|i| i.error.contains(expected)),
+                "{issues:?}"
+            );
+            let error = match start_entities(dir.path(), &registry, false) {
+                Ok(_) => panic!("invalid SQL declaration started: {sql}"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
     /// #1437: an offchain column the snapshots do not have, or an entity named inside the offchain
     /// namespace, is refused when the nest starts.
     #[test]
@@ -18447,11 +18533,11 @@ rpc_urls = ["https://rpc.example"]
         .unwrap();
         crate::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
         let registry = Arc::new(erc20_registry());
-        // Inline, because that is what `start_entities` lowers today; `check` wants a path (#1449).
-        std::fs::write(
-            dir.path().join("entities.toml"),
+        // Write the authored SQL files used by both validation and startup.
+        entity_fixture::write(
+            dir.path(),
             "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
-             sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+             query='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
              JOIN offchain__tiers t ON x.\"to\" = t.wallet GROUP BY t.tier'\n",
         )
         .unwrap();
@@ -18464,10 +18550,10 @@ rpc_urls = ["https://rpc.example"]
             "{unbound}"
         );
 
-        std::fs::write(
-            dir.path().join("entities.toml"),
+        entity_fixture::write(
+            dir.path(),
             "[[entities]]\nname='offchain__x'\nkey=['to']\nmax_rows=100\n\
-             sql='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n",
+             query='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n",
         )
         .unwrap();
         let named = match start_entities(dir.path(), &registry, false) {
@@ -18493,10 +18579,10 @@ rpc_urls = ["https://rpc.example"]
             crate::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
         };
         tiers("first", BOB, "gold");
-        std::fs::write(
-            dir.path().join("entities.toml"),
+        entity_fixture::write(
+            dir.path(),
             "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
-             sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+             query='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
              JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier'\n",
         )
         .unwrap();
@@ -18560,6 +18646,201 @@ rpc_urls = ["https://rpc.example"]
             (11, 1)
         );
         assert!(entity.is_healthy());
+    }
+
+    const BY_TIER_AND_TOTALS: &str = "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
+         query='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+         JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier'\n\
+         [[entities]]\nname='totals'\nkey=['to']\nmax_rows=100\n\
+         query='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n";
+
+    fn drop_tiers(dir: &std::path::Path, name: &str, account: &str, tier: &str) {
+        let csv = dir.join(format!("{name}.csv"));
+        std::fs::write(&csv, format!("account,tier\n{account},{tier}\n")).unwrap();
+        crate::offchain::drop_file(dir, &csv, "tiers").unwrap();
+    }
+
+    /// A tiers snapshot of `rows` identical rows, written as Parquet so a large one is quick.
+    fn drop_big_tiers(dir: &std::path::Path, rows: usize) {
+        use arrow::array::{RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("account", DataType::Utf8, false),
+            Field::new("tier", DataType::Utf8, false),
+        ]));
+        let column =
+            |v: &str| Arc::new(StringArray::from_iter_values(std::iter::repeat_n(v, rows)));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                column("0x3333333333333333333333333333333333333333"),
+                column("bronze"),
+            ],
+        )
+        .unwrap();
+        let path = dir.join("big.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        crate::offchain::drop_file(dir, &path, "tiers").unwrap();
+    }
+
+    fn view<'a>(views: &'a [EntityView], name: &str) -> &'a EntityView {
+        views.iter().find(|v| v.name() == name).unwrap()
+    }
+
+    /// #1437: a warm entity is unavailable until seeded, and its seed takes every present snapshot,
+    /// so after a restart it answers as a cold start would.
+    #[test]
+    fn a_warm_entity_takes_its_offchain_snapshots_in_its_seed() {
+        use crate::entity_row::{Row, Scalar};
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(dir.path(), "first", BOB, "gold");
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
+        let stored = vec![(
+            Store::entity_key(10, 0),
+            transfer_row(10, 0, ALICE, Some(BOB), "100"),
+        )];
+        store.commit_window(&stored, Some((11, "aa")), 11).unwrap();
+
+        let mut views = start_entities(dir.path(), &registry, true).unwrap();
+        assert!(view(&views, "by_tier").unavailable().is_some());
+        seed_entities(dir.path(), &store, &registry, &mut views, 11).unwrap();
+        let entity = view(&views, "by_tier");
+        assert!(entity.unavailable().is_none());
+        assert_eq!(
+            entity
+                .relation()
+                .get(&Row(vec![Scalar::Str("gold".into())]))
+                .cloned(),
+            Some(Row(vec![Scalar::Int(100)])),
+            "the seed must apply bob's tier"
+        );
+        let (_, applied) = entity.len_and_watermark();
+        assert_eq!(
+            (applied.through, applied.offchain["tiers"].snapshots),
+            (11, 1)
+        );
+    }
+
+    /// An offchain table larger than one entity may hold faults that entity alone, before a row of
+    /// it is read. The window succeeds and the chain-only entity beside it carries on.
+    #[test]
+    fn an_offchain_append_over_the_bound_faults_only_its_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(
+            dir.path(),
+            "first",
+            "0x2222222222222222222222222222222222222222",
+            "gold",
+        );
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+        assert!(view(&views, "by_tier").fault().is_none());
+
+        // `by_tier` declares max_rows = 100, and one row is already held.
+        drop_big_tiers(dir.path(), 100);
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+        let fault = view(&views, "by_tier").fault().expect("by_tier must fault");
+        assert!(fault.contains("offchain__tiers"), "{fault}");
+        assert!(fault.contains("101 rows"), "{fault}");
+        assert!(view(&views, "totals").fault().is_none());
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+    }
+
+    /// The same bound met while rebuilding. A faulted rebuild is the entity's, not the window's:
+    /// failing the window would stall every table on the chain behind one entity.
+    #[test]
+    fn an_offchain_rebuild_over_the_bound_faults_only_its_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(
+            dir.path(),
+            "first",
+            "0x2222222222222222222222222222222222222222",
+            "gold",
+        );
+        drop_tiers(
+            dir.path(),
+            "second",
+            "0x1111111111111111111111111111111111111111",
+            "silver",
+        );
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+
+        let catalogue = crate::offchain::load(dir.path()).unwrap();
+        std::fs::remove_file(crate::offchain::segment_path(
+            dir.path(),
+            &catalogue.tables["tiers"][0],
+        ))
+        .unwrap();
+        drop_big_tiers(dir.path(), 100);
+        refresh_offchain(dir.path(), &store, &registry, &views, 11)
+            .expect("an entity's fault must not fail the window");
+        let fault = view(&views, "by_tier").fault().expect("by_tier must fault");
+        assert!(fault.contains("offchain__tiers"), "{fault}");
+        assert!(view(&views, "totals").fault().is_none());
+    }
+
+    /// The allowance is the entity's, not each table's: two tables of sixty rows are 120 held.
+    #[test]
+    fn an_entitys_offchain_allowance_spans_all_its_offchain_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        for table in ["a", "b"] {
+            let csv = dir.path().join(format!("{table}.csv"));
+            let rows: String = (0..60).map(|i| format!("k{i},{i}\n")).collect();
+            std::fs::write(&csv, format!("k,v\n{rows}")).unwrap();
+            crate::offchain::drop_file(dir.path(), &csv, table).unwrap();
+        }
+        entity_fixture::write(
+            dir.path(),
+            "[[entities]]\nname='paired'\nkey=['k']\nmax_rows=100\n\
+             query='SELECT a.k, sum(b.v) AS v FROM offchain__a a \
+             JOIN offchain__b b ON a.k = b.k GROUP BY a.k'\n",
+        )
+        .unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+        let fault = view(&views, "paired").fault().expect("paired must fault");
+        assert!(fault.contains("120 rows"), "{fault}");
+    }
+
+    /// Rows are not the only measure: two rows can carry more bytes than a hundred rows are charged
+    /// for at admission, and the allowance counts both.
+    #[test]
+    fn an_offchain_row_too_wide_for_the_allowance_faults_its_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(
+            dir.path(),
+            "first",
+            "0x2222222222222222222222222222222222222222",
+            "gold",
+        );
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+
+        let wide = "x".repeat(100 * crate::runtime::ENTITY_RSS_BYTES_PER_ROW as usize);
+        drop_tiers(
+            dir.path(),
+            "wide",
+            "0x1111111111111111111111111111111111111111",
+            &wide,
+        );
+        refresh_offchain(dir.path(), &store, &registry, &views, 11).unwrap();
+        let fault = view(&views, "by_tier").fault().expect("by_tier must fault");
+        assert!(fault.contains("2 rows"), "{fault}");
+        assert!(view(&views, "totals").fault().is_none());
     }
 
     /// A `LabelSet` containing `pairs`, built the only way one can be: written to disk and loaded.

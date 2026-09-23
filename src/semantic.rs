@@ -475,6 +475,8 @@ pub struct MaintainedRelation {
     /// Why the relation stopped, if it has. Terminal.
     pub fault: Option<String>,
     pub rows: usize,
+    /// The offchain views it reads (#1437). Non-empty makes it reproducible by snapshot.
+    pub offchain: Vec<String>,
 }
 
 pub fn compose(
@@ -587,6 +589,13 @@ pub fn compose(
             }
             out.push_str(&format!("; {} row(s)\n", r.rows));
             out.push_str(&format!("    columns: {}\n", r.columns.join(", ")));
+            if !r.offchain.is_empty() {
+                out.push_str(&format!(
+                    "    reads {}: reproducible by snapshot, NOT re-derivable from chain; a reorg \
+                     retracts its chain rows only\n",
+                    r.offchain.join(", ")
+                ));
+            }
             if let Some(why) = &r.unavailable {
                 out.push_str(&format!(
                     "    ⚠ unavailable, and NOT queryable from `sql`: {why}\n"
@@ -1052,6 +1061,37 @@ mod tests {
         let doc = compose(&schema, Some(&sem), None, &[]);
         assert!(doc.contains("AUTHORED VIEWS"));
         assert!(doc.contains("top_recipients - The addresses that received the most transfers."));
+    }
+
+    /// #1437: an agent reading `/schema` learns which maintained relations rest on offchain
+    /// snapshots before it cites one as chain-derived.
+    #[test]
+    fn compose_says_which_relations_are_reproducible_by_snapshot() {
+        let relation = |name: &str, offchain: &[&str]| MaintainedRelation {
+            name: name.into(),
+            columns: vec!["k".into()],
+            applied_through: 1,
+            current: true,
+            unavailable: None,
+            fault: None,
+            rows: 1,
+            offchain: offchain.iter().map(|s| s.to_string()).collect(),
+        };
+        let doc = compose(
+            &[transfer_table()],
+            None,
+            None,
+            &[
+                relation("priced", &["offchain__prices"]),
+                relation("plain", &[]),
+            ],
+        );
+        let line = doc
+            .lines()
+            .find(|l| l.contains("reproducible by snapshot"))
+            .unwrap_or_else(|| panic!("no snapshot label in:\n{doc}"));
+        assert!(line.contains("offchain__prices"), "{line}");
+        assert_eq!(doc.matches("reproducible by snapshot").count(), 1, "{doc}");
     }
 
     #[test]

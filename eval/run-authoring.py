@@ -526,6 +526,26 @@ def spawn_group(command, **kwargs) -> tuple[subprocess.Popen, int]:
     return proc, os.getpgid(proc.pid)
 
 
+def group_has_live_members(pgid: int) -> bool:
+    """Disambiguate EPERM: zombies hold no descriptors, but a live forbidden group may do so.
+
+    Inspect all processes on both macOS and Linux. A failed or malformed inspection is an error,
+    never evidence of absence. State modifiers such as Z+ still describe a zombie.
+    """
+    result = subprocess.run(["ps", "-axo", "pgid=,stat="], check=True,
+                            capture_output=True, text=True, timeout=5)
+    live = False
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            raise RuntimeError(f"cannot inspect process group {pgid}: malformed ps row {line!r}")
+        if int(fields[0]) == pgid and not fields[1].startswith("Z"):
+            live = True
+    return live
+
+
 def reap_group(proc: subprocess.Popen, pgid: int, grace: float = 5.0) -> None:
     """Kill a subject's entire process group and wait for it to be gone.
 
@@ -548,10 +568,18 @@ def reap_group(proc: subprocess.Popen, pgid: int, grace: float = 5.0) -> None:
             os.killpg(pgid, 0)
         except ProcessLookupError:
             return
+        except PermissionError:
+            # macOS can report EPERM for a zombie-only group (#1462). It can also mean a live
+            # group we cannot signal, so permission denial alone never proves cleanup succeeded.
+            if not group_has_live_members(pgid):
+                return
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         pass
+    except PermissionError:
+        if group_has_live_members(pgid):
+            raise
 
 
 def subject_run(scenario, workdir: Path, rpc: str, abi: Path, nest: Path, rpc_port: int, args,
@@ -1092,6 +1120,45 @@ def self_test() -> int:
                              "canned-question": False}, str(passed))
         except ScoringUnavailable as error:
             check("an unservable nest scores rather than aborting", False, f"aborted: {error}")
+
+    # EPERM is reproducible without changing ownership or relying on launchd's reaping schedule.
+    check("the process inspector sees its own live group", group_has_live_members(os.getpgrp()))
+    from unittest.mock import Mock, patch
+    for label, listing, denied in [
+        ("zombie-only", "42 Z\n42 Z+\n99 ?E\n", False),
+        ("absent", "99 S\n", False),
+        ("live", "42 S\n", True),
+        ("mixed", "42 Z\n42 S+\n", True),
+        ("unknown-state", "42 ?E\n", True),
+    ]:
+        with patch.object(os, "killpg", side_effect=PermissionError("denied")) as kill, \
+                patch.object(subprocess, "run", return_value=Mock(stdout=listing)) as inspect:
+            raised = False
+            try:
+                reap_group(Mock(), 42)
+            except PermissionError:
+                raised = True
+            signals = [call.args[1] for call in kill.call_args_list]
+            check(f"an EPERM {label} group is classified safely",
+                  raised == denied and (signal.SIGKILL in signals) == denied)
+            inspect.assert_called_with(["ps", "-axo", "pgid=,stat="], check=True,
+                                       capture_output=True, text=True, timeout=5)
+
+    for label, response in [
+        ("failed", subprocess.CalledProcessError(1, "ps")),
+        ("timed-out", subprocess.TimeoutExpired("ps", 5)),
+        ("malformed", Mock(stdout="42\n")),
+    ]:
+        kwargs = ({"side_effect": response} if isinstance(response, Exception)
+                  else {"return_value": response})
+        with patch.object(os, "killpg", side_effect=PermissionError("denied")), \
+                patch.object(subprocess, "run", **kwargs):
+            raised = False
+            try:
+                reap_group(Mock(), 42)
+            except (subprocess.SubprocessError, RuntimeError):
+                raised = True
+            check(f"a {label} process inspection does not claim cleanup", raised)
 
     # The high-severity case review found: a subject that backgrounds a long-lived child must not
     # leave it alive holding the nest's redb lock. `start_new_session=True` alone does not do this -

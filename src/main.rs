@@ -697,6 +697,7 @@ impl SqlBackend {
                     // This backend did not parse the SQL - a remote node did - and the response
                     // does not carry the set. `None` says "not known" rather than "none".
                     referenced_tables: None,
+                    offchain: None,
                     scan_bound: None,
                 })
             }
@@ -914,6 +915,7 @@ mod tests {
             degraded_tables: degraded.iter().map(|s| s.to_string()).collect(),
             tip_unavailable: false,
             referenced_tables: None,
+            offchain: None,
             scan_bound: None,
         }
     }

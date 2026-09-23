@@ -30,10 +30,21 @@ keeps growing.
 ```toml
 [[entities]]
 name = "indexer_rewards"
-sql = "SELECT indexer, SUM(tokensRewards) FROM service__indexing_rewards_collected GROUP BY indexer"
+sql = "entities/indexer_rewards.sql"
 key = ["indexer"]
 max_rows = 100000
 ```
+
+Put the query in `entities/indexer_rewards.sql`:
+
+```sql
+SELECT indexer, SUM(CAST(tokensRewards AS HUGEINT))
+FROM service__indexing_rewards_collected
+GROUP BY indexer
+```
+
+`sql` must name `entities/<name>.sql`, with the filename matching the entity name. Both `check`
+and `dev` read that file. Inline SQL is refused; move existing inline queries into the named file.
 
 - **`name`** is the relation's name. It is how you query it, and it **must not collide with a decoded
   table** - the nest refuses to start rather than shadow one.
@@ -95,11 +106,20 @@ An entity may read or join `offchain__<table>`, the snapshots `nuthatch offchain
   snapshot still present. It runs beside the live relation and is swapped in whole, so until it
   lands the entity answers from the old snapshots and says so.
 - **Offchain rows never retract.** A reorg retracts the chain side only.
+- **What an entity holds from its offchain tables is bounded by its own `max_rows`,** in rows and
+  at 3,200 bytes a row, across all of them. Past that the entity faults, naming the table, and the
+  rest of the nest carries on. Admission charges such an entity twice its `max_rows`, so declare a
+  larger one to hold a larger table.
 - **New snapshots are picked up at window boundaries.** A chain that stops producing blocks also
   stops the entity picking up snapshots.
 
 `/ready`, `/derived` and `/sql` provenance name what was applied:
 `"offchain": {"offchain__prices": {"snapshots": 12, "latest": "<hash>"}}`.
+
+**Such an entity is reproducible by snapshot, not re-derivable from chain,** and every surface says
+so with `"reproducibility": "snapshot"`, as does any `/sql` answer that reads `offchain__<table>`
+directly. The label follows from what the entity reads, so no configuration removes it. Do not cite
+one of these answers as chain-derived.
 
 ## Watching one
 
