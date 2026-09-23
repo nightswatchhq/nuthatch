@@ -2717,8 +2717,9 @@ mod tests {
     /// on a real endpoint and is impractical to reproduce deterministically.
     #[tokio::test]
     async fn a_timestamp_batch_halves_instead_of_retrying_the_same_size() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Refuses batches larger than 50 with a cap error; serves anything smaller.
         static SEEN_MAX: AtomicUsize = AtomicUsize::new(0);
@@ -2728,40 +2729,26 @@ mod tests {
 
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = l.accept().await else {
-                    return;
-                };
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 1 << 20];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let n_items = req.matches("eth_getBlockByNumber").count();
+        let app = Router::new().route(
+            "/",
+            post(|Json(req): Json<Vec<Value>>| async move {
+                    let n_items = req.len();
                     CALLS.fetch_add(1, Ordering::SeqCst);
                     SEEN_MAX.fetch_max(n_items, Ordering::SeqCst);
-                    let body = if n_items > 50 {
+                    if n_items > 50 {
                         // The shape a provider uses for "your response would be too big".
-                        r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Log response size exceeded"}}"#.to_string()
+                        Json(json!({"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Log response size exceeded"}}))
                     } else {
                         // `id` is the index within the batch, which is what the client maps back.
-                        let items: Vec<String> = (0..n_items)
-                            .map(|i| {
-                                format!(
-                                    r#"{{"jsonrpc":"2.0","id":{i},"result":{{"timestamp":"0x1"}}}}"#
-                                )
-                            })
+                        let items: Vec<Value> = req.iter()
+                            .map(|item| json!({"jsonrpc":"2.0","id":item["id"],"result":{"timestamp":"0x1"}}))
                             .collect();
-                        format!("[{}]", items.join(","))
-                    };
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                        body.len(), body
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.flush().await;
-                });
-            }
+                        Json(Value::Array(items))
+                    }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
         });
 
         let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
@@ -2772,6 +2759,7 @@ mod tests {
             .expect("a batch that is merely too large must be split, not fatal");
 
         assert_eq!(got.len(), 200, "every block must come back after splitting");
+        server.abort();
         assert!(
             CALLS.load(Ordering::SeqCst) > 1,
             "it must have split at all - one call means it never narrowed"
