@@ -220,6 +220,9 @@ const NON_DATA_INPUTS: &[&str] = &[
     // would re-index the chain, which is precisely what phase 2 was sequenced behind early cutoff to
     // avoid.
     "queries.toml",
+    // RFC-0060: the Graph history read policy, read by serving alone. Excluded in every build so the
+    // data identity never depends on compile features; a default build refuses the nest anyway.
+    "graph/history.toml",
     "entities.toml",
     "semantic.toml",
     "llms.txt",
@@ -1048,6 +1051,7 @@ abi = "abis/c.json"
         for excluded in [
             "views/10-a.sql",
             "queries.toml",
+            "graph/history.toml",
             "entities.toml",
             "entities/delegations.sql",
             "views/nested/deep.sql",

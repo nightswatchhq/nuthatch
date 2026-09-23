@@ -1,0 +1,14 @@
+
+          query epochs($epochs: [Int!]!) {
+            epoches(where: { id_in: $epochs }, first: 1000) {
+              id
+              startBlock
+              endBlock
+              signalledTokens
+              stakeDeposited
+              queryFeeRebates
+              totalRewards
+              totalIndexerRewards
+              totalDelegatorRewards
+            }
+          }

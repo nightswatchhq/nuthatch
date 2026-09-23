@@ -1,0 +1,240 @@
+{
+  "source": "Independent Horizon nest, sealed history through block 502165911, read on 2026-09-18. Nine authorizations and one thaw; no cancellation or revocation rows at this checkpoint. Nine earliest deposits from Lodestar establish payer identities only; this is not complete account balance history.",
+  "block": 502165911,
+  "tables": {
+    "escrow__deposit": [
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0xd0a2e64d435aa0899b710261d6d5827b3be052cab73e851868ca86aa654819c5",
+        "block_number": 495531839,
+        "block_timestamp": 1786982232,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 5,
+        "payer": "0x02526499ae2879a94090267017c3816f733825bb",
+        "receiver": "0x02526499ae2879a94090267017c3816f733825bb",
+        "table": "escrow__deposit",
+        "tokens": "4000000000000",
+        "tx_hash": "0xd619dbc78962d0b3109e1ea5e553cc6b28c97e181d201258e1b7e851e5c6ed10"
+      },
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0x5277acb8aaa061afb7c793fd47f1686e728e17dcf395d9b3dd896f36ec78ad77",
+        "block_number": 491453926,
+        "block_timestamp": 1785956512,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 3,
+        "payer": "0x55a6e41e923566ada567d68e07a7415d0d5724c8",
+        "receiver": "0xf92f430dd8567b0d466358c79594ab58d919a6d4",
+        "table": "escrow__deposit",
+        "tokens": "10000000000000000000",
+        "tx_hash": "0xe756512fc9f6439795d05babf8aa070370aec0611fec2dd52896e0a032313251"
+      },
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0x8957535643a7eaf078c082c7299f19d3592a4b33feeb0e7abc344383f77ad9f2",
+        "block_number": 453142079,
+        "block_timestamp": 1776354334,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 5,
+        "payer": "0x7d14ae5f20cc2f6421317386aa8e79e8728353d9",
+        "receiver": "0xb43b2cccceada5292732a8c58ae134adefce09bb",
+        "table": "escrow__deposit",
+        "tokens": "10000000000000000000",
+        "tx_hash": "0xaa8fa255e9a52d04bd1f4cf027ed49fd87ef55ecbf8f49854fd1e7f5cda2ba41"
+      },
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0xf363d4325e012ec63b4623c8db018d242aace91939a85fe6d9e2e76b16f8eafa",
+        "block_number": 479669636,
+        "block_timestamp": 1783008796,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 2,
+        "payer": "0x89e7ad20521c351877b926d944a4fc3deb724ee0",
+        "receiver": "0x0058223c6617cca7ce76fc929ec9724cd43d4542",
+        "table": "escrow__deposit",
+        "tokens": "2000000000000000000",
+        "tx_hash": "0x1cb31c7b05634679682a2b405156efb88ac106d2bb55c49aba1c2ec62d8c51c9"
+      },
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0x465b2400efc796e9af9c7768683eaa40c93adef090c89cbb5bc156e435184964",
+        "block_number": 469999996,
+        "block_timestamp": 1780585059,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 32,
+        "payer": "0x8eec11cf2ce7e2872c37f8dccfc071923183326e",
+        "receiver": "0x82a4a06df453ac30e5ceb9f1308f845bb128045e",
+        "table": "escrow__deposit",
+        "tokens": "1000000000000000000",
+        "tx_hash": "0x8c3ddf39da6fca99a9a03e8ef95db3a35f6b158e7a81a76a19ada8bfa1c7070b"
+      },
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0x893c1902b8d7d07d3f5a5ed024e1055ace498ee760fafe4cf4a38db7e085f80d",
+        "block_number": 482085782,
+        "block_timestamp": 1783612583,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 8,
+        "payer": "0xa59a262716a0d6ecd58e937f4992d38b83183713",
+        "receiver": "0x0058223c6617cca7ce76fc929ec9724cd43d4542",
+        "table": "escrow__deposit",
+        "tokens": "2000000000000000000",
+        "tx_hash": "0xa95f0f584dd2a30e51f92119a786ef53e389ed574ece7419f8d2560e868bcfbb"
+      },
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0x2bcc4bb40c7e9b7c9748ed86b9b673942794097b1b8fe73cd10c904439060668",
+        "block_number": 459612154,
+        "block_timestamp": 1777977958,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 4,
+        "payer": "0xb70781305939a39e74aa918416df1b893e1bd904",
+        "receiver": "0xb43b2cccceada5292732a8c58ae134adefce09bb",
+        "table": "escrow__deposit",
+        "tokens": "500000000000000000000",
+        "tx_hash": "0xc273b2369592b849ba3d087b118770d69cc421e73791d5b5f8ba9491fe4c9450"
+      },
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0xa72b68e2c17f06140652788d02a6a6bd9f7c4ee3db0fd820de2ad41f947a42ff",
+        "block_number": 408630770,
+        "block_timestamp": 1765237163,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 2,
+        "payer": "0xdd6a6f76eb36b873c1c184e8b9b9e762fe216490",
+        "receiver": "0x0058223c6617cca7ce76fc929ec9724cd43d4542",
+        "table": "escrow__deposit",
+        "tokens": "2000000000000000000",
+        "tx_hash": "0xc694805b7bfecb03ff175318194fe8012fd70d74b3901b5806d4257751ea6404"
+      },
+      {
+        "address": "0xf6fcc27aaf1fcd8b254498c9794451d82afc673e",
+        "block_hash": "0x8be4b88a8c4db206e29281af63e8744aa1dc6ee141451981c614e2b0b108653b",
+        "block_number": 408874230,
+        "block_timestamp": 1765297894,
+        "collector": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "log_index": 6,
+        "payer": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467",
+        "receiver": "0xbdfb5ee5a2abf4fc7bb1bd1221067aef7f9de491",
+        "table": "escrow__deposit",
+        "tokens": "10002000000000000000000",
+        "tx_hash": "0xf4924bb3adf7d8f002f32d8691cc8b10048d39f46647af21a1aa081fe5ed3e10"
+      }
+    ],
+    "tally__signer_authorized": [
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0xdd6a6f76eb36b873c1c184e8b9b9e762fe216490",
+        "block_hash": "0x1b9e95196a9493144fde4c96413b37cf7ed288d1e0e3360a15d37beb97dd6df1",
+        "block_number": 408630698,
+        "block_timestamp": 1765237145,
+        "log_index": 1,
+        "signer": "0x15113132bc8dacbf42596e38664604bac02d3a62",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0x04b40261873330f779de8a7f2c5baeae5fd0111e0a3243ce5d3fd03b3d8cb371"
+      },
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467",
+        "block_hash": "0xe17227cd9983bc141e4c2dac7e5afe7359cd9a96581e22e629c0ba5ad88ef63e",
+        "block_number": 408830156,
+        "block_timestamp": 1765286907,
+        "log_index": 0,
+        "signer": "0xff4b7a5efd00ff2ec3518d4f250a27e4c29a2211",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0x7668bcb414816c77a29525c3c9e571caf0f23e4df3a4399b9b67e4f69a5244c4"
+      },
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0x7d14ae5f20cc2f6421317386aa8e79e8728353d9",
+        "block_hash": "0x299334d0e144fde8ac8a85d1e2a03ad20440852fe8f5d0af905011207ca16380",
+        "block_number": 453118873,
+        "block_timestamp": 1776348540,
+        "log_index": 34,
+        "signer": "0x7d14ae5f20cc2f6421317386aa8e79e8728353d9",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0xc5f24ebc63722464c94d809f1ed829d45d2a333dd157df0c979dc2ffbdea82d9"
+      },
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0xb70781305939a39e74aa918416df1b893e1bd904",
+        "block_hash": "0xf94cc812f3d861d8a8de7b01b16b83e7f4ded44887e0681361f061bb6e667778",
+        "block_number": 461450951,
+        "block_timestamp": 1778438972,
+        "log_index": 0,
+        "signer": "0x88e8f78d8992206496d3561919b29420e9acf08b",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0xf01bc9909d33284b584d529d354fd88bb1945b1843c0ab97839194fc724d5a8e"
+      },
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0x8eec11cf2ce7e2872c37f8dccfc071923183326e",
+        "block_hash": "0xf1065c0fef0f07e98beccf53b2f1fa32eb4a9c8cd680f43bbfa4857b973c6b64",
+        "block_number": 470000445,
+        "block_timestamp": 1780585172,
+        "log_index": 0,
+        "signer": "0xada0dec1f50dc4044ca84afacb74cbaf9a2c4853",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0xee7a9b9134a20bf110eea425216501b3ee3aa73238b2bc764be4b7b6bcb8babd"
+      },
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0x89e7ad20521c351877b926d944a4fc3deb724ee0",
+        "block_hash": "0x9ea6947aa43be868ebad81b52135cf132c339f6a7236625c19b15f2e3709aa97",
+        "block_number": 479273017,
+        "block_timestamp": 1782909769,
+        "log_index": 2,
+        "signer": "0x6164e7026756c8a5f6eb2414b8adef5e884e11d4",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0xc47440816ed476e6abd990224be425d364dd7e7817af14f05a56a8b3ea4da356"
+      },
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0xa59a262716a0d6ecd58e937f4992d38b83183713",
+        "block_hash": "0xab9561d5936c511ce7fa2fb48b20412f3a35a60b63bfe131d5f2e804a60f9cac",
+        "block_number": 482085440,
+        "block_timestamp": 1783612498,
+        "log_index": 10,
+        "signer": "0xde85a56136fd3696a52e9d3f318b6a84ba464c13",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0x802b61a89c931958a8903439934bd2871fb7bf1dbce5c9ba2066e3598328d1a9"
+      },
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0x55a6e41e923566ada567d68e07a7415d0d5724c8",
+        "block_hash": "0x8289e45293d450c956f748bd40fb16a3c017a7adf289beb8c1bf201587595c19",
+        "block_number": 491453895,
+        "block_timestamp": 1785956504,
+        "log_index": 7,
+        "signer": "0x0f05c7a4bfd4cc10cdb9c7dfe0f6084b433a6f64",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0x404304d01c041d6fd723541840193418569f096589f62aa081961a8aee1c31da"
+      },
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0x02526499ae2879a94090267017c3816f733825bb",
+        "block_hash": "0x2158df94fe4e6e73db1c0286b6bd2976ee3aaf95ce65fd6c0d8398529dd70130",
+        "block_number": 495531853,
+        "block_timestamp": 1786982236,
+        "log_index": 4,
+        "signer": "0x02526499ae2879a94090267017c3816f733825bb",
+        "table": "tally__signer_authorized",
+        "tx_hash": "0xd18dcf40d6d7c785e02dc5f8d22f1d467e68e2699b098c02165caa577f9e38f0"
+      }
+    ],
+    "tally__signer_thawing": [
+      {
+        "address": "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e",
+        "authorizer": "0x7d14ae5f20cc2f6421317386aa8e79e8728353d9",
+        "block_hash": "0x3a109a851d9ffe7bacbbbe7f10edcebf0f77289b49efd6c8f823718318b39c0e",
+        "block_number": 461423977,
+        "block_timestamp": 1778432227,
+        "log_index": 6,
+        "signer": "0x7d14ae5f20cc2f6421317386aa8e79e8728353d9",
+        "table": "tally__signer_thawing",
+        "thawEndTimestamp": "1781024227",
+        "tx_hash": "0x7650a3875731362ecb8fb970a681e0e3c93b845d3789df5c28ed6547be7f08ba"
+      }
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+
+            query subgraphs($subgraphs: [String!]!) {
+              subgraphs(where: { id_in: $subgraphs }, orderBy: id, orderDirection: asc) {
+                id
+                createdAt
+                versionCount
+                versions {
+                  version
+                  createdAt
+                  subgraphDeployment {
+                    id
+                  }
+                }
+              }
+            }

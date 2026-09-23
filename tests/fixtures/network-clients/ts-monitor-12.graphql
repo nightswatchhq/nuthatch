@@ -1,0 +1,36 @@
+
+          query allocations(
+            $indexer: String!
+            $disputableEpoch: Int!
+            $minimumQueryFeesCollected: BigInt!
+          ) {
+            allocations(
+              where: {
+                indexer: $indexer
+                closedAtEpoch_lte: $disputableEpoch
+                queryFeesCollected_gte: $minimumQueryFeesCollected
+                status: Closed
+              }
+              first: 1000
+            ) {
+              id
+              isLegacy
+              indexer {
+                id
+              }
+              queryFeesCollected
+              allocatedTokens
+              createdAt
+              createdAtEpoch
+              closedAt
+              closedAtEpoch
+              createdAtBlockHash
+              closedAtBlockHash
+              subgraphDeployment {
+                id
+                stakedTokens
+                signalledTokens
+                queryFeesAmount
+              }
+            }
+          }

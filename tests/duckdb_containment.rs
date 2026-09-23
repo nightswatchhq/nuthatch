@@ -60,6 +60,7 @@ use std::path::PathBuf;
 /// `docs/rfcs/0042-slice0-bom.md`.
 const KNOWN: &[&str] = &[
     "analytics.rs",             // general SQL, views, hot+cold federation
+    "analytics_scalars.rs",     // bounded pure Arrow scalar conversions, registered by analytics
     "entities.rs",              // the admissible function vocabulary, from duckdb_functions()
     "entity_lower.rs",          // AST for lowering authored SQL to a circuit
     "graft.rs",                 // canonical plan, engine version, determinism gate
@@ -78,6 +79,7 @@ const KNOWN: &[&str] = &[
 ///
 /// The list may **shrink**. Growth is a deliberate edit and a question in review.
 const INTERNAL_EXPOSURE: &[(&str, &str)] = &[
+    ("analytics_scalars.rs", "register"),
     ("graft.rs", "canonical_plan"),
     ("graft.rs", "engine_version"),
     ("graft.rs", "parser_connection"),
@@ -458,7 +460,7 @@ fn no_public_signature_anywhere_exposes_a_duckdb_type() {
     );
 }
 
-/// Rule 2: `pub(crate)` exposure is allowed but pinned, with the number the old comment promised.
+/// Rule 2: crate-internal exposure is pinned to the explicitly inventoried roles.
 #[test]
 fn internal_duckdb_exposure_is_pinned_and_may_only_shrink() {
     let mut found: BTreeSet<(String, String)> = BTreeSet::new();
@@ -496,9 +498,9 @@ fn internal_duckdb_exposure_is_pinned_and_may_only_shrink() {
     );
     assert_eq!(
         found.len(),
-        5,
-        "the internal-exposure count changed. It was five, all in `graft.rs`, all `&Connection` - \
-         the parser/canonicalisation role RFC-0042 §14 keeps. Found: {found:#?}"
+        6,
+        "the internal-exposure count changed: five graft parser/canonicalisation sites and one \
+         pure analytical-scalar registration site. Found: {found:#?}"
     );
 }
 

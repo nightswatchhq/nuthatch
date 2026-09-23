@@ -1,0 +1,17 @@
+
+            query subgraphDeployments($first: Int!, $lastId: String!) {
+              subgraphDeployments(
+                where: { id_gt: $lastId }
+                orderBy: id
+                orderDirection: asc
+                first: $first
+              ) {
+                createdAt
+                id
+                ipfsHash
+                deniedAt
+                stakedTokens
+                signalledTokens
+                queryFeesAmount
+              }
+            }
