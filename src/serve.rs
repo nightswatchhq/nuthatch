@@ -7868,7 +7868,10 @@ mod tests {
             )
             .unwrap();
         state.store.set_block_hash(30, &next_hash).unwrap();
-        state.store.set_block_timestamp(30, now).unwrap();
+        state
+            .store
+            .set_block_timestamp(30, crate::metrics::now_unix())
+            .unwrap();
         state.store.set_meta("last_block", "30").unwrap();
         variables["last"] = json!(ids[0]);
         variables["first"] = json!(100);
@@ -7880,6 +7883,12 @@ mod tests {
         assert_eq!(second["data"]["allocations"][0]["id"], ids[1]);
         assert_eq!(second["data"]["meta"]["block"]["number"], 20);
         variables["block"] = serde_json::Value::Null;
+        // Prior queries may take longer than the fixture's freshness window on a busy runner.
+        // Refresh admission metadata only; block hashes and allocation history remain fixed.
+        state
+            .store
+            .set_block_timestamp(30, crate::metrics::now_unix())
+            .unwrap();
         let latest = graph_ask_variables("/graphql", document, variables, state).await;
         assert!(latest.get("errors").is_none(), "{latest}");
         assert_eq!(latest["data"]["allocations"].as_array().unwrap().len(), 2);
