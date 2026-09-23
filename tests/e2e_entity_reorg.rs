@@ -11,6 +11,8 @@
 //! through `spawn_nest`, `entities_in_range` and a real fork.
 
 mod common;
+#[path = "common/entity_fixture.rs"]
+mod entity_fixture;
 
 use proptest::prelude::*;
 
@@ -53,7 +55,7 @@ fn replacement_block(b: u64) -> BlockFixture {
 /// does not use is one that cannot mask a divergence by discarding the row that carries it.
 const RECEIVED: &str = r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(CAST(t.value AS HUGEINT)) AS sum_value FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
 "#;
@@ -62,7 +64,7 @@ max_rows = 10000
 const BY_TIER: &str = r#"
 [[entities]]
 name = "by_tier"
-sql = "SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier"
+query = "SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier"
 key = ["tier"]
 max_rows = 10000
 "#;
@@ -72,10 +74,46 @@ fn declare_entity(dir: &std::path::Path) {
 }
 
 fn declare(dir: &std::path::Path, toml: &str) {
-    std::fs::write(dir.join("entities.toml"), toml).expect("write entities.toml");
+    entity_fixture::write(dir, toml).expect("write entities.toml");
 }
 
 const CHAIN_LEN: u64 = 8;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checked_entity_file_starts_and_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_nest(dir.path(), "usdc", USDC);
+    declare_entity(dir.path());
+    nuthatch::project::regen(nuthatch::cli::SchemaArgs {
+        dir: dir.path().to_str().unwrap().into(),
+    })
+    .unwrap();
+    nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: dir.path().to_str().unwrap().into(),
+        update: false,
+    })
+    .expect("the authored file must pass check before startup");
+    let manifest = std::fs::read(dir.path().join("entities.toml")).unwrap();
+    let sql = std::fs::read(dir.path().join("entities/received.sql")).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for block in 1..=CHAIN_LEN {
+        tape.insert_block(block, canonical_block(block));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+    assert!(!relation(&rt).is_empty());
+    assert_eq!(
+        std::fs::read(dir.path().join("entities.toml")).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("entities/received.sql")).unwrap(),
+        sql
+    );
+    shutdown_and_settle(rt).await;
+}
 
 async fn spawn_with_entity(
     dir: &std::path::Path,
@@ -366,11 +404,11 @@ async fn a_dead_entity_circuit_ends_the_nest_rather_than_freezing_it() {
 
     let cfg = scaffold_nest(dir.path(), "usdc", USDC);
     // One row admitted, and the first window carries two.
-    std::fs::write(
-        dir.path().join("entities.toml"),
+    entity_fixture::write(
+        dir.path(),
         r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 1
 "#,
@@ -455,11 +493,11 @@ async fn a_faulted_entity_pushes_an_alert_to_a_configured_sink() {
         format: nuthatch::config::AlertFormat::Raw,
     }];
     // One row admitted, and the first window carries two - the same fault the test above uses.
-    std::fs::write(
-        dir.path().join("entities.toml"),
+    entity_fixture::write(
+        dir.path(),
         r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 1
 "#,
@@ -561,11 +599,11 @@ async fn a_faulted_entity_quarantines_its_own_nest_and_leaves_its_neighbour_inde
     //
     // The contract alias moves with the name, so the doomed nest's table is `doomed__transfer`.
     let doomed_cfg = scaffold_nest(doomed_dir.path(), "doomed", USDC);
-    std::fs::write(
-        doomed_dir.path().join("entities.toml"),
+    entity_fixture::write(
+        doomed_dir.path(),
         r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM doomed__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(t.value) FROM doomed__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 1
 "#,
@@ -932,7 +970,7 @@ async fn the_metrics_endpoint_carries_the_entity_series() {
 async fn a_capped_query_over_a_maintained_relation_is_still_capped() {
     const PER_BLOCK: &str = r#"[[entities]]
 name = "per_block"
-sql = "SELECT t.block_number, SUM(t.value) FROM usdc__transfer t GROUP BY t.block_number"
+query = "SELECT t.block_number, SUM(t.value) FROM usdc__transfer t GROUP BY t.block_number"
 key = ["block_number"]
 max_rows = 10000
 "#;
@@ -994,7 +1032,7 @@ max_rows = 10000
 async fn editing_an_entity_rebuilds_from_stored_facts_without_refetching_them() {
     const SENT: &str = r#"[[entities]]
 name = "sent"
-sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+query = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
 key = ["from"]
 max_rows = 10000
 "#;
@@ -1071,26 +1109,26 @@ max_rows = 10000
 async fn editing_one_entity_leaves_its_neighbour_answering() {
     const BOTH: &str = r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
 
 [[entities]]
 name = "senders"
-sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+query = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
 key = ["from"]
 max_rows = 10000
 "#;
     // Only `received` changes: SUM becomes COUNT. `senders` is byte-identical.
     const EDITED: &str = r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, COUNT(*) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, COUNT(*) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
 
 [[entities]]
 name = "senders"
-sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+query = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
 key = ["from"]
 max_rows = 10000
 "#;
@@ -1543,7 +1581,7 @@ async fn an_offchain_entity_equals_duckdb_after_each_appended_snapshot() {
     const PRICED: &str = r#"
 [[entities]]
 name = "priced"
-sql = "SELECT p.symbol, SUM(x.value * p.price_e8) AS usd_e8 FROM usdc__transfer x JOIN offchain__prices p ON x.address = p.token GROUP BY p.symbol"
+query = "SELECT p.symbol, SUM(x.value * p.price_e8) AS usd_e8 FROM usdc__transfer x JOIN offchain__prices p ON x.address = p.token GROUP BY p.symbol"
 key = ["symbol"]
 max_rows = 10000
 "#;
