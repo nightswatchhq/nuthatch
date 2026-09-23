@@ -62,6 +62,11 @@ name = "network_contract"
 path = "tests/network_contract.rs"
 required-features = ["graph"]
 
+[[test]]
+name = "delegation_fold_corpus"
+path = "tests/delegation_fold_corpus.rs"
+required-features = ["graph"]
+
 [dependencies]
 # graph-node's own pluralisation, so a generated root field name matches it by construction rather
 # than by a rule reimplemented here (`graph/src/data/graphql/ext.rs:360` calls `to_plural`).
