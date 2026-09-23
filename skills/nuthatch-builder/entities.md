@@ -30,10 +30,21 @@ keeps growing.
 ```toml
 [[entities]]
 name = "indexer_rewards"
-sql = "SELECT indexer, SUM(tokensRewards) FROM service__indexing_rewards_collected GROUP BY indexer"
+sql = "entities/indexer_rewards.sql"
 key = ["indexer"]
 max_rows = 100000
 ```
+
+Put the query in `entities/indexer_rewards.sql`:
+
+```sql
+SELECT indexer, SUM(CAST(tokensRewards AS HUGEINT))
+FROM service__indexing_rewards_collected
+GROUP BY indexer
+```
+
+`sql` must name `entities/<name>.sql`, with the filename matching the entity name. Both `check`
+and `dev` read that file. Inline SQL is refused; move existing inline queries into the named file.
 
 - **`name`** is the relation's name. It is how you query it, and it **must not collide with a decoded
   table** - the nest refuses to start rather than shadow one.

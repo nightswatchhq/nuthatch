@@ -1566,7 +1566,10 @@ fn start_entities(
     }
     let mut views = Vec::with_capacity(declared.len());
     for decl in declared {
-        let (plan, columns) = crate::entity_lower::lower_with_columns(&decl.sql)
+        let sql = decl
+            .read_sql(dir)
+            .with_context(|| format!("reading SQL for entity `{}`", decl.name))?;
+        let (plan, columns) = crate::entity_lower::lower_with_columns(&sql)
             .with_context(|| format!("lowering entity `{}`", decl.name))?;
         // An entity that shadows a decoded table would silently take that table's name on the
         // analytical surface, so `SELECT * FROM usdc__transfer` would answer from a maintained
@@ -7860,6 +7863,10 @@ fn webhook_host(url: &str) -> String {
         (false, false) => format!("{scheme}://{host}"),
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/entity_fixture.rs"]
+mod entity_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -18440,6 +18447,79 @@ rpc_urls = ["https://rpc.example"]
         .unwrap()
     }
 
+    #[test]
+    fn entity_sql_files_validate_and_start_from_the_same_directory() {
+        use crate::entity_row::{Row, Scalar};
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        std::fs::create_dir(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='received'\nsql='entities/received.sql'\nkey=['to']\nmax_rows=100\n",
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("entities/received.sql"),
+            "SELECT \"to\", SUM(value) AS total FROM usdc__transfer GROUP BY \"to\"",
+        )
+        .unwrap();
+        let issues = crate::entities::validate(dir.path());
+        assert!(issues.is_empty(), "{issues:?}");
+        let views = start_entities(dir.path(), &registry, false).unwrap();
+        assert_eq!(views.len(), 1);
+        let recipient = "0x2222222222222222222222222222222222222222";
+        let rows = decode_stored_rows(
+            &registry.schema(),
+            &[transfer_row(
+                1,
+                0,
+                "0x1111111111111111111111111111111111111111",
+                Some(recipient),
+                "37",
+            )],
+        )
+        .unwrap();
+        views[0].apply_window(&rows, 1, 1).unwrap();
+        views[0].flush();
+        assert_eq!(
+            views[0]
+                .relation()
+                .get(&Row(vec![Scalar::Str(recipient.into())]))
+                .cloned(),
+            Some(Row(vec![Scalar::Int(37)]))
+        );
+    }
+
+    #[test]
+    fn entity_sql_file_errors_agree_between_validation_and_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        for (sql, expected) in [
+            ("SELECT 1", "move the SQL into entities/received.sql"),
+            (
+                "../received.sql",
+                "sql must name one entities/<name>.sql file",
+            ),
+            ("entities/other.sql", "entity name must match"),
+            ("entities/received.sql", "cannot read entities/received.sql"),
+        ] {
+            std::fs::write(
+                dir.path().join("entities.toml"),
+                format!("[[entities]]\nname='received'\nsql='{sql}'\nkey=['to']\nmax_rows=100\n"),
+            )
+            .unwrap();
+            let issues = crate::entities::validate(dir.path());
+            assert!(
+                issues.iter().any(|i| i.error.contains(expected)),
+                "{issues:?}"
+            );
+            let error = match start_entities(dir.path(), &registry, false) {
+                Ok(_) => panic!("invalid SQL declaration started: {sql}"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
     /// #1437: an offchain column the snapshots do not have, or an entity named inside the offchain
     /// namespace, is refused when the nest starts.
     #[test]
@@ -18453,11 +18533,11 @@ rpc_urls = ["https://rpc.example"]
         .unwrap();
         crate::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
         let registry = Arc::new(erc20_registry());
-        // Inline, because that is what `start_entities` lowers today; `check` wants a path (#1449).
-        std::fs::write(
-            dir.path().join("entities.toml"),
+        // Write the authored SQL files used by both validation and startup.
+        entity_fixture::write(
+            dir.path(),
             "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
-             sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+             query='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
              JOIN offchain__tiers t ON x.\"to\" = t.wallet GROUP BY t.tier'\n",
         )
         .unwrap();
@@ -18470,10 +18550,10 @@ rpc_urls = ["https://rpc.example"]
             "{unbound}"
         );
 
-        std::fs::write(
-            dir.path().join("entities.toml"),
+        entity_fixture::write(
+            dir.path(),
             "[[entities]]\nname='offchain__x'\nkey=['to']\nmax_rows=100\n\
-             sql='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n",
+             query='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n",
         )
         .unwrap();
         let named = match start_entities(dir.path(), &registry, false) {
@@ -18499,10 +18579,10 @@ rpc_urls = ["https://rpc.example"]
             crate::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
         };
         tiers("first", BOB, "gold");
-        std::fs::write(
-            dir.path().join("entities.toml"),
+        entity_fixture::write(
+            dir.path(),
             "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
-             sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+             query='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
              JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier'\n",
         )
         .unwrap();
@@ -18569,10 +18649,10 @@ rpc_urls = ["https://rpc.example"]
     }
 
     const BY_TIER_AND_TOTALS: &str = "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=100\n\
-         sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
+         query='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
          JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier'\n\
          [[entities]]\nname='totals'\nkey=['to']\nmax_rows=100\n\
-         sql='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n";
+         query='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n";
 
     fn drop_tiers(dir: &std::path::Path, name: &str, account: &str, tier: &str) {
         let csv = dir.join(format!("{name}.csv"));
@@ -18621,7 +18701,7 @@ rpc_urls = ["https://rpc.example"]
         let registry = Arc::new(erc20_registry());
         let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
         drop_tiers(dir.path(), "first", BOB, "gold");
-        std::fs::write(dir.path().join("entities.toml"), BY_TIER_AND_TOTALS).unwrap();
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
         let stored = vec![(
             Store::entity_key(10, 0),
             transfer_row(10, 0, ALICE, Some(BOB), "100"),
@@ -18661,7 +18741,7 @@ rpc_urls = ["https://rpc.example"]
             "0x2222222222222222222222222222222222222222",
             "gold",
         );
-        std::fs::write(dir.path().join("entities.toml"), BY_TIER_AND_TOTALS).unwrap();
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
         let views = start_entities(dir.path(), &registry, false).unwrap();
         assert!(view(&views, "by_tier").fault().is_none());
 
@@ -18694,7 +18774,7 @@ rpc_urls = ["https://rpc.example"]
             "0x1111111111111111111111111111111111111111",
             "silver",
         );
-        std::fs::write(dir.path().join("entities.toml"), BY_TIER_AND_TOTALS).unwrap();
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
         let views = start_entities(dir.path(), &registry, false).unwrap();
 
         let catalogue = crate::offchain::load(dir.path()).unwrap();
@@ -18722,10 +18802,10 @@ rpc_urls = ["https://rpc.example"]
             std::fs::write(&csv, format!("k,v\n{rows}")).unwrap();
             crate::offchain::drop_file(dir.path(), &csv, table).unwrap();
         }
-        std::fs::write(
-            dir.path().join("entities.toml"),
+        entity_fixture::write(
+            dir.path(),
             "[[entities]]\nname='paired'\nkey=['k']\nmax_rows=100\n\
-             sql='SELECT a.k, sum(b.v) AS v FROM offchain__a a \
+             query='SELECT a.k, sum(b.v) AS v FROM offchain__a a \
              JOIN offchain__b b ON a.k = b.k GROUP BY a.k'\n",
         )
         .unwrap();
@@ -18747,7 +18827,7 @@ rpc_urls = ["https://rpc.example"]
             "0x2222222222222222222222222222222222222222",
             "gold",
         );
-        std::fs::write(dir.path().join("entities.toml"), BY_TIER_AND_TOTALS).unwrap();
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
         let views = start_entities(dir.path(), &registry, false).unwrap();
 
         let wide = "x".repeat(100 * crate::runtime::ENTITY_RSS_BYTES_PER_ROW as usize);

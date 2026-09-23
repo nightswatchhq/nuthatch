@@ -447,7 +447,9 @@ pub fn declared_entities(dir: &Path) -> (usize, u64) {
             .map(|e| {
                 // An entity reading an offchain table may also hold `max_rows` of offchain input
                 // (#1437), which `EntityView::admit_offchain` enforces at runtime.
-                let reads_offchain = crate::entity_lower::lower_with_columns(&e.sql)
+                let reads_offchain = e
+                    .read_sql(dir)
+                    .and_then(|sql| crate::entity_lower::lower_with_columns(&sql))
                     .is_ok_and(|(plan, _)| crate::entity_offchain::reads_offchain(&plan));
                 e.max_rows as u64 * if reads_offchain { 2 } else { 1 }
             })
@@ -3965,13 +3967,20 @@ mod tests {
     #[test]
     fn an_offchain_entity_is_charged_for_its_offchain_allowance() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("entities")).unwrap();
+        std::fs::write(dir.path().join("entities/by_tier.sql"),
+            "SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier").unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("entities.toml"),
             "[[entities]]\nname='by_tier'\nkey=['tier']\nmax_rows=10\n\
-             sql='SELECT t.tier, sum(x.value) AS v FROM usdc__transfer x \
-             JOIN offchain__tiers t ON x.\"to\" = t.account GROUP BY t.tier'\n\
+             sql='entities/by_tier.sql'\n\
              [[entities]]\nname='totals'\nkey=['to']\nmax_rows=5\n\
-             sql='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n",
+             sql='entities/totals.sql'\n",
         )
         .unwrap();
         assert_eq!(declared_entities(dir.path()), (2, 2 * 10 + 5));

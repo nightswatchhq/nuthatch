@@ -122,6 +122,26 @@ pub struct EntityDecl {
     pub max_rows: usize,
 }
 
+impl EntityDecl {
+    /// Resolve the same authored SQL file for validation and runtime startup.
+    pub fn read_sql(&self, dir: &Path) -> Result<String> {
+        let rel = Path::new(&self.sql);
+        if rel.components().count() != 2
+            || rel.parent() != Some(Path::new("entities"))
+            || rel.extension().and_then(|x| x.to_str()) != Some("sql")
+        {
+            bail!(
+                "sql must name one entities/<name>.sql file; move the SQL into entities/{}.sql and set sql = \"entities/{}.sql\"",
+                self.name, self.name
+            );
+        }
+        if rel.file_stem().and_then(|s| s.to_str()) != Some(self.name.as_str()) {
+            bail!("entity name must match the declared SQL filename");
+        }
+        std::fs::read_to_string(dir.join(rel)).with_context(|| format!("cannot read {}", self.sql))
+    }
+}
+
 /// Validation failures are collected so `nuthatch check` names every bad declaration at once.
 #[derive(Debug, Clone)]
 pub struct EntityIssue {
@@ -205,26 +225,11 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
         if entity.max_rows == 0 {
             issues.push(issue(&name, "max_rows must be greater than zero"));
         }
-        let rel = Path::new(&entity.sql);
-        if rel.components().count() != 2
-            || rel.parent() != Some(Path::new("entities"))
-            || rel.extension().and_then(|x| x.to_str()) != Some("sql")
-        {
-            issues.push(issue(&name, "sql must name one entities/<name>.sql file"));
-            continue;
-        }
         declared.insert(entity.sql.clone());
-        if rel.file_stem().and_then(|s| s.to_str()) != Some(name.as_str()) {
-            issues.push(issue(
-                &name,
-                "entity name must match the declared SQL filename",
-            ));
-        }
-        let sql_path = dir.join(rel);
-        let sql = match std::fs::read_to_string(&sql_path) {
+        let sql = match entity.read_sql(dir) {
             Ok(sql) => sql,
             Err(e) => {
-                issues.push(issue(&name, format!("cannot read {}: {e}", entity.sql)));
+                issues.push(issue(&name, format!("{e:#}")));
                 continue;
             }
         };
