@@ -7686,6 +7686,12 @@ mod tests {
                 continue;
             }
             let document = std::fs::read_to_string(&path).unwrap();
+            // This corpus checks document compatibility, not elapsed freshness. Keep the synthetic
+            // head current for each request: on CI the preceding documents can take over 60 seconds.
+            state
+                .store
+                .set_block_timestamp(42_460_000, crate::metrics::now_unix())
+                .unwrap();
             let response =
                 graph_ask_variables("/graphql", &document, variables.clone(), state.clone()).await;
             assert!(

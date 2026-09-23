@@ -58,3 +58,9 @@ DuckDB optimiser defect has not been reduced to a standalone upstream SQL fixtur
   reruns (`fee_splits_curation_and_rewards_preserve_event_order_without_double_counting` and
   `captured_genesis_facts_match_same_block_network_subgraph`). This is not a clean concurrent
   suite pass.
+
+On the review branch based on #1466, CI passed the allocation regression but failed
+`every_captured_network_document_binds_through_http`: its synthetic checkpoint was 62 seconds
+old by the time the batch reached `ts-monitor-06`, beyond the fixture's 60-second freshness
+limit. Refresh the synthetic admission timestamp before each document. Production freshness
+checks and the recorded event timestamps are unchanged.
