@@ -1091,3 +1091,167 @@ async fn the_lifecycle_routes_demand_the_admin_token_before_they_act() {
         "with the token the unmount must reach the handler: {body}"
     );
 }
+
+/// #1475: a second name mounted live onto a dataset another mount already holds shares that mount's
+/// store, as boot does, and unmounting the mount that indexes it leaves the other one indexing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unmount() {
+    use nuthatch::store::HotStore;
+
+    let roost_dir = tempfile::tempdir().unwrap();
+    let nid = "dd44".repeat(16);
+    let data_dir = runtime::MountTable::data_dir(roost_dir.path(), &nid);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(
+        roost_dir.path().join(runtime::MOUNTS_FILE),
+        format!(
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[mounts]]\nalias = \"v1\"\nnid = \"{nid}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let tape = Arc::new(TapeSource::new());
+    let (a1, a2) = (account(1), account(2));
+    let block = |b: u64| {
+        transfers_block(
+            b,
+            0,
+            1_700_000_000 + b,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
+        )
+    };
+    for b in 1..=3u64 {
+        tape.insert_block(b, block(b));
+    }
+    tape.advance_tip_to(3);
+
+    let cfg = scaffold_nest(&data_dir, "usdc", USDC);
+    let health = Arc::new(RuntimeHealth::new());
+    health.register("v1", "arbitrum-one");
+    let cursor = indexer::spawn_runtime(
+        tape.clone(),
+        vec![("v1".to_string(), data_dir.clone(), cfg)],
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+
+    let roster = serde_json::json!({"runtime": "test", "nests": [{"name": "v1"}]});
+    let live = serve::LiveRuntime::new(serve::compose_runtime(
+        roster.clone(),
+        cursor.states.clone(),
+        health.clone(),
+    ));
+    let mut handles = runtime::RuntimeHandles {
+        live,
+        states: cursor.states,
+        alert_workers: cursor.alert_workers,
+        publishers: Vec::new(),
+        lifecycle: std::collections::HashMap::from([(
+            "arbitrum-one".to_string(),
+            cursor.lifecycle.clone(),
+        )]),
+        health,
+        roster,
+        estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
+        multi_tenant: false,
+        mount_ctx: runtime::MountContext {
+            dir: roost_dir.path().to_path_buf(),
+            mounts: vec![runtime::Mount {
+                tenant: "default".to_string(),
+                alias: "v1".to_string(),
+                nid: nid.clone(),
+                sql: Default::default(),
+                queries: Vec::new(),
+                publish: None,
+                #[cfg(feature = "counter")]
+                counter: None,
+            }],
+            sources: std::collections::HashMap::from([(
+                "arbitrum-one".to_string(),
+                tape.clone() as Arc<dyn nuthatch::source::Source>,
+            )]),
+            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
+            backfill: None,
+            seal_direct: false,
+            concurrency: 1,
+            ipfs_window_deadline: nuthatch::ipfs_resolve::WINDOW_DEADLINE,
+            window_override: Some(2),
+            admin_enabled: false,
+            admin_token: None,
+            max_rss_mb: 2048,
+            freshness: Default::default(),
+        },
+    };
+    std::mem::forget(cursor.ingest);
+
+    let last_block = |h: &runtime::RuntimeHandles, name: &str| {
+        h.states
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
+    };
+    assert!(
+        wait_until(POLL_TIMEOUT, || last_block(&handles, "v1").as_deref()
+            == Some("3"))
+        .await,
+        "premise: v1 indexes to the tip"
+    );
+
+    handles
+        .mount("v2", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("a second name onto a mounted nid must share the open store, not reopen it");
+    let store_of = |h: &runtime::RuntimeHandles, name: &str| {
+        h.states
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.store.clone())
+            .unwrap()
+    };
+    assert!(
+        Arc::ptr_eq(&store_of(&handles, "v1"), &store_of(&handles, "v2")),
+        "two mounts of one dataset must hold one store"
+    );
+    let v1 = body_json(&handles.live, "/v1/sql?q=SELECT%201").await;
+    let v2 = body_json(&handles.live, "/v2/sql?q=SELECT%201").await;
+    assert!(v1["provenance"]["nid"].is_string(), "{v1}");
+    assert_eq!(
+        v2["provenance"]["nid"], v1["provenance"]["nid"],
+        "both mounts must name the dataset that answered"
+    );
+
+    // Unmount the mount the cursor indexes under. v2 must keep serving and keep following the tip.
+    handles.unmount("v1").await.expect("unmount v1");
+    assert_eq!(
+        status(&handles.live, "/v1/health").await,
+        axum::http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status(&handles.live, "/v2/health").await,
+        axum::http::StatusCode::OK
+    );
+    tape.insert_block(4, block(4));
+    tape.advance_tip_to(4);
+    assert!(
+        wait_until(POLL_TIMEOUT, || last_block(&handles, "v2").as_deref()
+            == Some("4"))
+        .await,
+        "unmounting v1 stopped the cursor under v2: last_block {:?}",
+        last_block(&handles, "v2")
+    );
+
+    // The last mount out releases every holder.
+    handles.unmount("v2").await.expect("unmount v2");
+    Store::open(&data_dir.join("nuthatch.redb"))
+        .expect("after the last mount goes, the shared store must be reopenable");
+}
