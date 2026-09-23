@@ -19,7 +19,10 @@ unless they opt in (§ Packaging). Tracking #1441. S0 is #1439; S1 to S4 are fil
 > - head cost is measured in process;
 > - large set carries need pruning.
 >
-> The recursive delegation ledger remains untested.
+> **Follow-up 2026-09-23:** the recursive delegation ledger passed an exact-scalar operator test
+> on 181 real events in three window partitions, with a dropped-carry mutation detected (#1476).
+> A redb hot-tail clock probe also passed, but peaked at 288.6 MiB in a cold process. Neither
+> result is a resident-runtime measurement or a full hot-tail differential.
 
 **Date:** 2026-09-21
 
@@ -379,8 +382,12 @@ Each slice's acceptance is written so it can fail.
   | Head evaluation targets | The fold's statements met them (0.135 to 0.146 s). A cold process did not (0.85 to 1.12 s and 252 to 313 MiB, of which 0.64 s and about 275 MiB is an empty window) |
   | No step over 512 MiB | Met at 5M-block windows, not at 10M |
 
-  The recursive delegation ledger was not covered. It needs `nuthatch_mul_div`, which plain DuckDB
-  cannot reproduce, so it moves into S1.
+  The original sealed-history harness did not cover the recursive delegation ledger. A 2026-09-23
+  operator test on nuthatch's connection and its exact `nuthatch_mul_div` compared the original
+  ledger with three window partitions after every one of 181 recorded events. All agreed, and
+  dropping the delegated carry turned the test red (#1476). S1 must still measure and integrate
+  that fold in the resident runtime. The separate redb hot-tail clock probe in
+  nightswatchhq/graph-network-nest#1 peaked at 288.6 MiB, above S0's 256 MiB target.
 - **S1 - folds in the runtime.** Load `folds/`, bind carries and window-scoped facts, check the schema
   and volatility at load, declare keys, and read at `n` on demand from a checkpoint built by
   `nuthatch fold build`. *Accept when:*
