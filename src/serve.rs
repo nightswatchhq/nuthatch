@@ -7686,6 +7686,12 @@ mod tests {
                 continue;
             }
             let document = std::fs::read_to_string(&path).unwrap();
+            // This corpus checks document compatibility, not elapsed freshness. Keep the synthetic
+            // head current for each request: on CI the preceding documents can take over 60 seconds.
+            state
+                .store
+                .set_block_timestamp(42_460_000, crate::metrics::now_unix())
+                .unwrap();
             let response =
                 graph_ask_variables("/graphql", &document, variables.clone(), state.clone()).await;
             assert!(
@@ -7777,7 +7783,6 @@ mod tests {
     }
 
     #[cfg(feature = "graph")]
-    #[ignore = "never passed: DuckDB binder assertion on the historical allocation query (#1458)"]
     #[tokio::test]
     async fn network_rust_allocation_pages_keep_the_first_page_snapshot_when_the_tip_advances() {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -7863,7 +7868,10 @@ mod tests {
             )
             .unwrap();
         state.store.set_block_hash(30, &next_hash).unwrap();
-        state.store.set_block_timestamp(30, now).unwrap();
+        state
+            .store
+            .set_block_timestamp(30, crate::metrics::now_unix())
+            .unwrap();
         state.store.set_meta("last_block", "30").unwrap();
         variables["last"] = json!(ids[0]);
         variables["first"] = json!(100);
@@ -7875,6 +7883,12 @@ mod tests {
         assert_eq!(second["data"]["allocations"][0]["id"], ids[1]);
         assert_eq!(second["data"]["meta"]["block"]["number"], 20);
         variables["block"] = serde_json::Value::Null;
+        // Prior queries may take longer than the fixture's freshness window on a busy runner.
+        // Refresh admission metadata only; block hashes and allocation history remain fixed.
+        state
+            .store
+            .set_block_timestamp(30, crate::metrics::now_unix())
+            .unwrap();
         let latest = graph_ask_variables("/graphql", document, variables, state).await;
         assert!(latest.get("errors").is_none(), "{latest}");
         assert_eq!(latest["data"]["allocations"].as_array().unwrap().len(), 2);
