@@ -264,12 +264,12 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
 
 ## Out of scope - do not build, do not suggest
 
-- In this tree: hosted service, billing, metering, **hosted-SaaS multi-tenancy** (per-tenant authz/quotas,
-  isolation between mutually-untrusting paying customers - that's the become-a-data-service-
-  company path, and the gateway's job regardless). Note: **multi-nest tenancy in the runtime**
-  (a tenant is an opaque ownership label plus refcounting - no identity, no authn, no quotas, no
-  metering) and *distributed **self-hosted** scaled mode* (one operator's writer pool + query-FE
-  tier + control-plane, RFC-0022) are both **in scope** - see Architecture. **The line is what
+- In this tree: hosted service, billing, metering, **hosted-SaaS multi-tenancy** (per-tenant
+  authz/quotas, isolation between mutually-untrusting paying customers - that's the
+  become-a-data-service-company path, and the gateway's job regardless). Note: **multi-nest
+  tenancy in the runtime** (a tenant is an opaque ownership label plus refcounting - no identity,
+  no authn, no quotas, no metering) and *distributed **self-hosted** scaled mode* (one
+  operator's writer pool + query-FE tier + control-plane, RFC-0022) are both **in scope** - see Architecture. **The line is what
   nuthatch does about tenants, not who they are** (amended 2026-08-04): it sees a string, refcounts
   it, and knows nothing else, so an operator's tenants may well be paying customers and nuthatch
   has no concept of it. Per-tenant billing and authz stay out and are the gateway's job. The
@@ -277,11 +277,12 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
   which asked a question nobody could answer from the code.
   **Amended 2026-09-23, overriding this bullet for one case: Chief decided that Nightswatch runs a
   hosted nest service** (`app.nuthatch-indexer.com`, private repo `nightswatchhq/nuthatch-hosted`).
-  Building and operating that service is approved work. Our first real user, Arcaidia, asked for it. We operate the stock binary like any other operator. Sign-in, plans,
-  billing and per-tenant authz all live in that repo, and **none of it enters this tree**. The test
-  is RFC-0046 §1's: delete the platform and a self-hoster loses nothing, and the binary's CLI,
-  config, layout and behaviour are what they would be had it never existed. A platform need that
-  would require a change here is a normal nuthatch feature on its own merits, or it is not built.
+  Building and operating that service is approved work. Our first real user, Arcaidia, asked for
+  it. We operate the stock binary like any other operator. Sign-in, plans, billing and per-tenant
+  authz all live in that repo, and **none of it enters this tree**. The test is RFC-0046 §1's:
+  delete the platform and a self-hoster loses nothing, and the binary's CLI, config, layout and
+  behaviour are what they would be had it never existed. A platform need that would require a
+  change here is a normal nuthatch feature on its own merits, or it is not built.
 - Token, staking, decentralized network features (a possible future Graph Horizon data
   service is explicitly deferred).
 - Non-EVM chains before EVM is airtight.
