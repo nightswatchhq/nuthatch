@@ -3,6 +3,10 @@
 **Make nuthatch tell an operator what it is doing and which data it served, then make the gate that
 proves it reliable enough to use every day.**
 
+**Closed 2026-09-23.** Every issue carrying `measured-merlin` is closed and no open PR is for one of
+them. #1396 closed on its before-and-after report: the full gate on main went from 59m 26s and
+48m 28s to 12m 37s to 13m 24s over four quiet runs, with no job removed and more tests passing.
+
 ## Definition of done
 
 Every issue carrying the **`measured-merlin`** label is closed, and no open PR is for one of them.

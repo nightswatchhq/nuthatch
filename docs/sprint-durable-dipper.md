@@ -3,8 +3,7 @@
 **Make external and incomplete data visible, bounded, and versioned before it becomes a quiet
 property of a sealed answer.**
 
-This sprint begins after `measured-merlin` closes. Its label marks committed scope early; it does
-not pretend that Merlin's CI timing work is already done.
+This sprint began when `measured-merlin` closed on 2026-09-23.
 
 ## Definition of done
 
