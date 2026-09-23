@@ -2391,118 +2391,157 @@ impl RuntimeHandles {
             Some(nid) => MountTable::data_dir(&self.mount_ctx.dir, nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
         };
-        let mut config = Config::load(&dir)
-            .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
-        stamp_operator_settings(
-            &mut config,
-            self.mount_ctx.freshness,
-            self.mount_ctx.ipfs_window_deadline,
-        );
-        let chain = config.nest.chain.clone();
-
-        let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
-            return Err(MountRefusal::UndeclaredChain {
-                nest: name.to_string(),
-                chain,
-            }
-            .into());
-        };
-        let Some(lifecycle) = self.lifecycle.get(&chain).cloned() else {
-            return Err(MountRefusal::UndeclaredChain {
-                nest: name.to_string(),
-                chain,
-            }
-            .into());
-        };
-
-        // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
-        // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
-        // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
-        let has_labels = !crate::labels::load(&dir).is_empty();
-        let (entity_count, entity_rows) = declared_entities(&dir);
-        let incoming = estimate_nest_rss_mb(&config, has_labels, entity_count, entity_rows);
-        let existing: u64 = self
+        // A dataset another live mount already holds is served through a clone of that mount's state,
+        // as `fan_out_aliases` does at boot. Opening its store again is refused by redb (#1475).
+        let shared = self
             .states
             .iter()
-            .filter(|(_, s)| s.chain == chain)
-            .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
-            .sum();
-        let projected = RUNTIME_BASE_RSS_MB + existing + incoming;
-        if projected > self.mount_ctx.max_rss_mb {
-            return Err(MountRefusal::OverBudget {
-                nest: name.to_string(),
-                chain,
-                projected_mb: projected,
-                ceiling_mb: self.mount_ctx.max_rss_mb,
+            .find(|(_, s)| s.dir == dir)
+            .map(|(n, s)| (n.clone(), s.clone()));
+        let (state, worker, incoming, cursor_key) = match shared {
+            Some((holder, mut state)) => {
+                let cursor_key = state
+                    .runtime_health
+                    .as_ref()
+                    .map_or(holder, |(n, _)| n.clone());
+                self.health.register_alias(name, &cursor_key, &state.chain);
+                tracing::info!(
+                    "nest '{name}' mounted onto the dataset '{cursor_key}' already indexes"
+                );
+                // The surface is the mount's own, never its co-tenant's (RFC-0034 §2).
+                let record = self
+                    .mount_ctx
+                    .mounts
+                    .iter()
+                    .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t));
+                state.surface = Arc::new(record.map(Mount::surface).unwrap_or_default());
+                #[cfg(feature = "counter")]
+                {
+                    state.counter = record.and_then(|m| m.counter.clone()).map(Arc::new);
+                }
+                (state, None, 0, cursor_key)
             }
-            .into());
-        }
+            None => {
+                let mut config = Config::load(&dir)
+                    .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
+                stamp_operator_settings(
+                    &mut config,
+                    self.mount_ctx.freshness,
+                    self.mount_ctx.ipfs_window_deadline,
+                );
+                let chain = config.nest.chain.clone();
 
-        // The early cutoff (RFC-0033 §5), which this path did not apply until #414: an operator who
-        // edits a nest cosmetically and mounts it into a running runtime re-indexed from the start
-        // block, where a restart would have adopted the predecessor's dataset and re-indexed
-        // nothing. The mount API exists precisely so operators need not restart, so the cheaper path
-        // was the one that paid.
-        //
-        // After the budget refusal deliberately: an over-budget mount is turned away without first
-        // copying a dataset for a nest that is not going to run.
-        let prepared = prepare_dataset(&self.mount_ctx.dir, dir, nid.as_deref(), name);
+                let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
+                    return Err(MountRefusal::UndeclaredChain {
+                        nest: name.to_string(),
+                        chain,
+                    }
+                    .into());
+                };
+                let Some(lifecycle) = self.lifecycle.get(&chain).cloned() else {
+                    return Err(MountRefusal::UndeclaredChain {
+                        nest: name.to_string(),
+                        chain,
+                    }
+                    .into());
+                };
 
-        // Guarded by the chain's endpoints, as at boot. A chain missing from the count is capped to one.
-        let concurrency = indexer::backfill_concurrency_for(
-            self.mount_ctx
-                .endpoint_counts
-                .get(&chain)
-                .copied()
-                .unwrap_or(1),
-            self.mount_ctx.concurrency,
-            self.mount_ctx.seal_direct,
-            &[name],
-        );
-        config.route = Some(name.to_string());
+                // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
+                // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
+                // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
+                let has_labels = !crate::labels::load(&dir).is_empty();
+                let (entity_count, entity_rows) = declared_entities(&dir);
+                let incoming = estimate_nest_rss_mb(&config, has_labels, entity_count, entity_rows);
+                let existing: u64 = self
+                    .states
+                    .iter()
+                    .filter(|(_, s)| s.chain == chain)
+                    .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
+                    .sum();
+                let projected = RUNTIME_BASE_RSS_MB + existing + incoming;
+                if projected > self.mount_ctx.max_rss_mb {
+                    return Err(MountRefusal::OverBudget {
+                        nest: name.to_string(),
+                        chain,
+                        projected_mb: projected,
+                        ceiling_mb: self.mount_ctx.max_rss_mb,
+                    }
+                    .into());
+                }
 
-        // Phase 1: build and catch up, off to one side of the cursor.
-        let (nest, mut state, worker, next) = indexer::build_and_prepare_nest(
-            &source,
-            prepared,
-            &config,
-            self.mount_ctx.backfill,
-            self.mount_ctx.seal_direct,
-            concurrency,
-            self.mount_ctx.window_override,
-            self.mount_ctx.admin_enabled,
-            self.mount_ctx.admin_token.clone(),
-            None,
-        )
-        .await
-        .with_context(|| format!("preparing nest '{name}' for mount"))?;
-        state.runtime_health = Some((name.to_string(), self.health.clone()));
-        // `/sql` provenance names the dataset that answered (RFC-0035 §3, src/serve.rs:1161-1172), and
-        // this is the only place that knows it at mount time: `nid` above is already the resolved
-        // identity (the caller's, or the record's for a remount), the same one `dir` was derived from
-        // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
-        // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
-        // it here or serve `nid: null` until the next restart (#557).
-        state.nid = nid.as_deref().map(Arc::from);
+                // The early cutoff (RFC-0033 §5), which this path did not apply until #414: an operator who
+                // edits a nest cosmetically and mounts it into a running runtime re-indexed from the start
+                // block, where a restart would have adopted the predecessor's dataset and re-indexed
+                // nothing. The mount API exists precisely so operators need not restart, so the cheaper path
+                // was the one that paid.
+                //
+                // After the budget refusal deliberately: an over-budget mount is turned away without first
+                // copying a dataset for a nest that is not going to run.
+                let prepared = prepare_dataset(&self.mount_ctx.dir, dir, nid.as_deref(), name);
 
-        // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        lifecycle
-            .send(indexer::CursorCommand::Mount {
-                nest: Box::new(nest),
-                next,
-                ack: Some(ack_tx),
-            })
-            .map_err(|_| anyhow::anyhow!("cursor on {chain} is gone; cannot mount '{name}'"))?;
-        tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx)
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "cursor on {chain} did not acknowledge mounting '{name}' within {}s",
-                    UNMOUNT_ACK_TIMEOUT.as_secs()
+                // Guarded by the chain's endpoints, as at boot. A chain missing from the count is capped to one.
+                let concurrency = indexer::backfill_concurrency_for(
+                    self.mount_ctx
+                        .endpoint_counts
+                        .get(&chain)
+                        .copied()
+                        .unwrap_or(1),
+                    self.mount_ctx.concurrency,
+                    self.mount_ctx.seal_direct,
+                    &[name],
+                );
+                config.route = Some(name.to_string());
+
+                // Phase 1: build and catch up, off to one side of the cursor.
+                let (nest, mut state, worker, next) = indexer::build_and_prepare_nest(
+                    &source,
+                    prepared,
+                    &config,
+                    self.mount_ctx.backfill,
+                    self.mount_ctx.seal_direct,
+                    concurrency,
+                    self.mount_ctx.window_override,
+                    self.mount_ctx.admin_enabled,
+                    self.mount_ctx.admin_token.clone(),
+                    None,
                 )
-            })?
-            .map_err(|_| anyhow::anyhow!("cursor on {chain} stopped while mounting '{name}'"))?;
+                .await
+                .with_context(|| format!("preparing nest '{name}' for mount"))?;
+                state.runtime_health = Some((name.to_string(), self.health.clone()));
+                // `/sql` provenance names the dataset that answered (RFC-0035 §3, src/serve.rs:1161-1172), and
+                // this is the only place that knows it at mount time: `nid` above is already the resolved
+                // identity (the caller's, or the record's for a remount), the same one `dir` was derived from
+                // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
+                // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
+                // it here or serve `nid: null` until the next restart (#557).
+                state.nid = nid.as_deref().map(Arc::from);
+
+                // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                lifecycle
+                    .send(indexer::CursorCommand::Mount {
+                        nest: Box::new(nest),
+                        next,
+                        ack: Some(ack_tx),
+                    })
+                    .map_err(|_| {
+                        anyhow::anyhow!("cursor on {chain} is gone; cannot mount '{name}'")
+                    })?;
+                tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "cursor on {chain} did not acknowledge mounting '{name}' within {}s",
+                            UNMOUNT_ACK_TIMEOUT.as_secs()
+                        )
+                    })?
+                    .map_err(|_| {
+                        anyhow::anyhow!("cursor on {chain} stopped while mounting '{name}'")
+                    })?;
+                tracing::info!("nest '{name}' mounted onto the {chain} cursor at block {next}");
+                (state, worker, incoming, name.to_string())
+            }
+        };
 
         // Only now do the routes appear.
         if let Some(worker) = worker {
@@ -2522,7 +2561,7 @@ impl RuntimeHandles {
                     record,
                     publish,
                     self.multi_tenant,
-                    name,
+                    &cursor_key,
                 ) {
                     Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
                     Err(e) => {
@@ -2574,7 +2613,6 @@ impl RuntimeHandles {
             self.health.clone(),
         ));
         self.persist();
-        tracing::info!("nest '{name}' mounted onto the {chain} cursor at block {next}");
         Ok(())
     }
 
@@ -2617,6 +2655,25 @@ impl RuntimeHandles {
             Some(m) => MountTable::data_dir(&self.mount_ctx.dir, &m.nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, name),
         };
+        // The cursor and alert worker know a shared dataset by the mount that first indexed it, which
+        // may be this one or another. While any other mount still holds the store, both stay running
+        // (RFC-0032 §5): only this mount's routes go.
+        let cursor_key = self.states[idx]
+            .1
+            .runtime_health
+            .as_ref()
+            .map_or_else(|| name.to_string(), |(n, _)| n.clone());
+        let still_held = self
+            .states
+            .iter()
+            .enumerate()
+            .any(|(i, (_, s))| i != idx && Arc::ptr_eq(&s.store, &self.states[idx].1.store));
+        if still_held {
+            self.publishers.retain(|(n, _)| n != name);
+            self.states.remove(idx);
+            self.recompose_after_unmount(name);
+            return Ok(());
+        }
 
         // 1. Drain the cursor and wait for it to let go.
         //
@@ -2634,7 +2691,7 @@ impl RuntimeHandles {
             let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             if tx
                 .send(indexer::CursorCommand::Unmount {
-                    name: name.to_string(),
+                    name: cursor_key.clone(),
                     ack: Some(ack_tx),
                 })
                 .is_ok()
@@ -2654,7 +2711,11 @@ impl RuntimeHandles {
         }
 
         // 2. Stop and drop the nest's alert worker - the second holder of its store.
-        if let Some(pos) = self.alert_workers.iter().position(|(n, _)| n == name) {
+        if let Some(pos) = self
+            .alert_workers
+            .iter()
+            .position(|(n, _)| *n == cursor_key)
+        {
             let (_, worker) = self.alert_workers.remove(pos);
             worker.abort();
             // `abort()` only *requests* cancellation - the task keeps its `Store` clone until the
@@ -2669,7 +2730,13 @@ impl RuntimeHandles {
         //    flight finish against the old composition; new ones 404.
         self.states.remove(idx);
         crate::analytics::invalidate_duck_cache(&dataset_dir);
+        crate::metrics::METRICS.remove_nest(&cursor_key);
         crate::metrics::METRICS.remove_nest(name);
+        self.recompose_after_unmount(name);
+        Ok(())
+    }
+
+    fn recompose_after_unmount(&mut self, name: &str) {
         // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
         // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
         let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
@@ -2686,7 +2753,6 @@ impl RuntimeHandles {
         ));
         self.persist();
         tracing::info!("nest '{name}' unmounted from the runtime");
-        Ok(())
     }
 }
 
