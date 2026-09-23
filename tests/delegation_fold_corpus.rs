@@ -60,7 +60,7 @@ fn events(corpus: &Path) -> Vec<Event> {
     assert_eq!(events.len(), 181, "the pinned corpus changed");
     assert_eq!(events.first().unwrap().block, 155_504_998);
     assert_eq!(events.last().unwrap().block, 394_174_357);
-    assert_eq!(events.iter().filter(|e| e.reward != "0").count(), 2);
+    assert_eq!(events.iter().filter(|e| e.reward != "0").count(), 43);
     assert!(events.iter().any(|e| e.reward != "0" && e.cut != "1000000"));
     assert!(events
         .windows(2)
