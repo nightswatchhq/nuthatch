@@ -8,6 +8,8 @@ not to infer work that remains.
 
 - [Backlog guide](backlog.md) - GitHub is the live queue; this explains its labels and settled
   decisions.
+- [Sprint: temperate-tern](sprint-temperate-tern.md) - checkpointed folds into the runtime against
+  their head targets, and the nuthatch release hosted nests depends on.
 - [Frozen for 2027](frozen-for-2027.md) - capability work deliberately deferred during the 2026
   feature freeze. These issues are closed, with an explicit reopening rule.
 - [RFC index](rfcs/README.md) - design and implementation status for each RFC.

@@ -42,8 +42,9 @@ The label, not this document, is the record of scope.
 
 ## Not in this sprint
 
-- Dune-assisted ingestion (#1381), the Dune row-insert sidecar and recorded Dune run (#1362, #1360),
-  warehouse recipes (#1263), and cross-nest SQL (#1324) remain parked.
+- Dune-assisted ingestion (#1381) stays out at `p2`; it was never parked. The Dune row-insert sidecar
+  and recorded Dune run (#1362, #1360), warehouse recipes (#1263), and cross-nest SQL (#1324) remain
+  parked.
 - The accumulator, block-string, and `tx_from` RFC gaps (#1313, #1288, #1280) remain parked.
 - Crates.io (#1299) is board-only.
 - `measured-merlin`'s #1396 remains its own release-gate accounting work until its before-and-after
