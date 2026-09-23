@@ -7777,7 +7777,6 @@ mod tests {
     }
 
     #[cfg(feature = "graph")]
-    #[ignore = "never passed: DuckDB binder assertion on the historical allocation query (#1458)"]
     #[tokio::test]
     async fn network_rust_allocation_pages_keep_the_first_page_snapshot_when_the_tip_advances() {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

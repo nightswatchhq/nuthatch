@@ -1772,10 +1772,12 @@ fn lower_predicate(
             .iter()
             .map(|(k, vv)| lower_predicate(schema, child, k, vv, &alias, depth + 1, caps))
             .collect();
-        // `EXISTS` rather than a join: the parent's row count must not change, and `first` still means
-        // what it says.
+        // Membership preserves parent row counts even with duplicate child IDs. Avoid correlated
+        // EXISTS: combined with a selected relation over the recursive network indexer view, DuckDB
+        // produces an invalid HUGEINT/VARCHAR binding (#1458). Coalesce preserves EXISTS semantics
+        // for null references and null child IDs, including beneath another boolean expression.
         return Ok(format!(
-            "EXISTS (SELECT 1 FROM \"{view}\" {alias} WHERE {alias}.\"id\" = {base}.\"{field_name}\" AND {})",
+            "coalesce({base}.\"{field_name}\" IN (SELECT {alias}.\"id\" FROM \"{view}\" {alias} WHERE {}), false)",
             parts?.join(" AND ")
         ));
     }
@@ -2835,20 +2837,61 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
         );
     }
 
+    #[test]
+    fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token(id VARCHAR, symbol VARCHAR);\
+             INSERT INTO token VALUES ('yes', 'WETH'), ('yes', 'WETH'),\
+                 ('no', 'OTHER'), (NULL, 'WETH');\
+             CREATE TABLE pool(id VARCHAR, token0 VARCHAR);\
+             INSERT INTO pool VALUES ('a', 'yes'), ('b', 'no'), ('c', 'missing'), ('d', NULL);",
+        )
+        .unwrap();
+        let compiled = compile(
+            &schema(),
+            &one(r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#),
+        )
+        .unwrap();
+        let mut stmt = conn.prepare(&compiled.sql).unwrap();
+        let actual: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(actual, ["a"]);
+        // SQL NULL must be false just as EXISTS is, even when the child set contains NULL.
+        let predicate = compiled
+            .sql
+            .split_once(" WHERE ")
+            .unwrap()
+            .1
+            .rsplit_once(" ORDER BY ")
+            .unwrap()
+            .0;
+        let sql = format!("SELECT b.id FROM pool b WHERE NOT ({predicate}) ORDER BY b.id");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rejected: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rejected, ["b", "c", "d"]);
+    }
+
     /// `token0_: Token_filter` - a nested filter on a related entity, which the generated schema
     /// advertises for every relation.
     #[test]
-    fn a_nested_relation_filter_lowers_to_an_exists_subquery() {
+    fn a_nested_relation_filter_lowers_to_a_membership_subquery() {
         let c = compile(
             &schema(),
             &one(r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#),
         )
         .expect("a nested relation filter lowers");
-        // EXISTS rather than a join: the parent's row count must not change, or `first` stops meaning
-        // what it says.
+        // Membership must not multiply parent rows.
         assert!(
             c.sql.contains(
-                r#"EXISTS (SELECT 1 FROM "token" n0 WHERE n0."id" = b."token0" AND n0."symbol" = 'WETH')"#
+                r#"coalesce(b."token0" IN (SELECT n0."id" FROM "token" n0 WHERE n0."symbol" = 'WETH'), false)"#
             ),
             "{}",
             c.sql
