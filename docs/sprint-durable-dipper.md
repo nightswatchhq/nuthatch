@@ -3,8 +3,12 @@
 **Make external and incomplete data visible, bounded, and versioned before it becomes a quiet
 property of a sealed answer.**
 
-This sprint begins after `measured-merlin` closes. Its label marks committed scope early; it does
-not pretend that Merlin's CI timing work is already done.
+This sprint began when `measured-merlin` closed on 2026-09-23.
+
+**Closed 2026-09-23.** Every issue carrying `durable-dipper` is closed and no open PR is for one of
+them. #1410 records what seal-direct gave up on; #1222 was decided by RFC-0061, accepted by Chief, with
+no segment-format change; #1216 closed on #1448 and #1453, with the offchain entity checked against
+the DuckDB oracle.
 
 ## Definition of done
 

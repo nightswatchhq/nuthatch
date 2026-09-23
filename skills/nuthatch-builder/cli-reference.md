@@ -259,6 +259,12 @@ Load a bundle: verify a `.bundle` (or a URL to one, or an unpacked bundle dir) a
 - `--expect <EXPECT>` - Assert the bundle's content-address hash equals this value before installing
 - `--registry <REGISTRY>` - Resolve the positional as a `name[@version]` reference against this registry (RFC-0019). A filesystem path, or `s3://bucket/prefix` (S3/MinIO/R2, via the usual `AWS_*` env). The pulled blob is hash-verified on install
 
+## `nuthatch nest nid`
+
+Print the nest's NID: the identity its data is stored under, `data/<nid>/` (RFC-0032 §3)
+
+- `--dir <DIR>` - Nest directory (must contain a nuthatch.toml)
+
 ## `nuthatch nest publish`
 
 Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `latest`. The registry is a decoupled, optional store: a filesystem path, or S3-compatible object storage (`s3://bucket/prefix`, configured with the usual `AWS_*` env - needs a build with on by default). A self-built bundle and `nest load <file|dir>` never need one. Prints the content address

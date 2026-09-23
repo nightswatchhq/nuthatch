@@ -59,6 +59,8 @@ mod e2e_fencing;
 mod e2e_migrate_parity;
 #[path = "e2e_minio_publish.rs"]
 mod e2e_minio_publish;
+#[path = "e2e_nest_nid.rs"]
+mod e2e_nest_nid;
 #[path = "e2e_plane_split.rs"]
 mod e2e_plane_split;
 #[path = "e2e_prune_lifecycle.rs"]

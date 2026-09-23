@@ -549,6 +549,18 @@ pub enum NestWhat {
     /// Declared, not inferred. `nuthatch schema` will not guess a rename, because it cannot tell
     /// one from a removal, and silent deletion of authored prose is worse than a warning.
     RenameAlias(RenameAliasArgs),
+    /// Print the nest's NID: the identity its data is stored under, `data/<nid>/` (RFC-0032 §3).
+    ///
+    /// Run `nuthatch schema` first. The derived files it writes are part of the identity, and a nest
+    /// under `data/<nid>/` never regenerates them.
+    Nid(NestNidArgs),
+}
+
+#[derive(Args)]
+pub struct NestNidArgs {
+    /// Nest directory (must contain a nuthatch.toml).
+    #[arg(long, default_value = ".")]
+    pub dir: String,
 }
 
 #[derive(Args)]

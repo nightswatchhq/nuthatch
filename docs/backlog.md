@@ -55,8 +55,8 @@ The 2026 capability-freeze items were closed into [frozen-for-2027.md](frozen-fo
 | `good first issue` | Small, self-contained, and does not need the whole architecture in your head first |
 
 **Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
-remain afterwards as provenance. The current sprint is
-[`measured-merlin`](sprint-measured-merlin.md). A sprint label on any other closed issue is historical;
+remain afterwards as provenance. No sprint is open; `durable-dipper` closed on 2026-09-23. A sprint
+label on a closed issue is historical;
 do not use it to infer that work remains. The [documentation guide](README.md) separates the live
 sprint from the dated records.
 
