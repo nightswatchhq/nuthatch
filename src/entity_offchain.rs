@@ -20,13 +20,21 @@ pub use crate::registry::OFFCHAIN_NAMESPACE;
 
 /// The offchain table an entity source names, if it names one.
 ///
-/// Case-insensitive, as DuckDB resolves it; the table after the prefix is matched exactly, as a
-/// decoded table is.
+/// Case-insensitive, as DuckDB resolves it. The table after the prefix is returned as written, and
+/// [`Tables`] resolves it case-insensitively too.
 pub fn table_of(source: &str) -> Option<&str> {
     // `get`, not indexing: a quoted identifier may put a multibyte character across the boundary.
     let head = source.get(..OFFCHAIN_NAMESPACE.len())?;
     let table = &source[OFFCHAIN_NAMESPACE.len()..];
     (head.eq_ignore_ascii_case(OFFCHAIN_NAMESPACE) && !table.is_empty()).then_some(table)
+}
+
+/// Whether an entity's SQL reads an offchain table. Admission charges such an entity for the
+/// offchain input it may hold (RFC-0041 §7), so it must agree with what `start_entities` binds.
+pub fn reads_offchain(plan: &crate::entity_plan::Plan) -> bool {
+    std::iter::once(&plan.left)
+        .chain(plan.join.as_ref().map(|j| &j.right))
+        .any(|s| table_of(&s.table).is_some())
 }
 
 /// What an offchain column's values become in an entity. §3.3 has no float, and there is no
@@ -92,6 +100,8 @@ pub struct Snapshot {
     pub hash: String,
     path: PathBuf,
     schema: SchemaRef,
+    rows: u64,
+    bytes: u64,
 }
 
 /// An offchain table as the entity binder sees it: its present snapshots, in manifest order.
@@ -170,6 +180,16 @@ impl Table {
 }
 
 impl Snapshot {
+    /// From the Parquet footer, so a feed can be bounded before any row is read.
+    pub fn row_count(&self) -> u64 {
+        self.rows
+    }
+
+    /// Uncompressed, from the Parquet footer, for the same reason.
+    pub fn byte_size(&self) -> u64 {
+        self.bytes
+    }
+
     /// This snapshot's rows as entity rows of `columns`, in order.
     ///
     /// The bytes are checked against the content hash first. An entity reports the hashes it has
@@ -254,8 +274,16 @@ impl Tables {
         Ok(out)
     }
 
+    /// Case-insensitive, as DuckDB resolves `offchain__<table>`. `offchain drop` refuses a case-only
+    /// variant, so at most one name matches.
     fn retained(&self, table: &str) -> impl Iterator<Item = &crate::offchain::Snapshot> {
-        self.catalogue.tables.get(table).into_iter().flatten()
+        self.catalogue
+            .tables
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(table))
+            .map(|(_, snapshots)| snapshots)
+            .into_iter()
+            .flatten()
     }
 
     /// A retained snapshot, or `None` when its segment is absent, as the `/sql` view treats it.
@@ -267,14 +295,19 @@ impl Tables {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
         };
-        let schema = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("reading the schema of {}", path.display()))?
-            .schema()
-            .clone();
+        let footer = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading the schema of {}", path.display()))?;
         Ok(Some(Snapshot {
             hash: s.hash.clone(),
+            schema: footer.schema().clone(),
+            rows: u64::try_from(footer.metadata().file_metadata().num_rows()).unwrap_or(u64::MAX),
+            bytes: footer
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|g| u64::try_from(g.total_byte_size()).unwrap_or(u64::MAX))
+                .fold(0, u64::saturating_add),
             path,
-            schema,
         }))
     }
 
@@ -622,6 +655,21 @@ mod tests {
             .table("absent")
             .unwrap()
             .is_none());
+    }
+
+    /// `/sql` reads `offchain__prices` for a table dropped as `Prices`, so an entity must too.
+    #[test]
+    fn an_offchain_table_resolves_case_insensitively_as_duckdb_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = seal(dir.path(), "Prices", &prices(&["ETH"], &[1]));
+        let tables = Tables::load(dir.path()).unwrap();
+        let table = tables
+            .table("prices")
+            .unwrap()
+            .expect("found despite the case");
+        assert_eq!(table.version(), vec![hash.clone()]);
+        assert_eq!(tables.version("prices").unwrap(), vec![hash.clone()]);
+        assert_eq!(tables.snapshots("PRICES", &[hash]).unwrap().len(), 1);
     }
 
     #[test]

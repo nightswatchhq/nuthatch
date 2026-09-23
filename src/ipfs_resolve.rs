@@ -524,7 +524,15 @@ async fn attempt(
     tried_for: Duration,
 ) -> Result<String> {
     let fetching = fetch(cid, gateways, policy.timeout(failures));
-    let Some(deadline) = policy.deadline else {
+    within_deadline(fetching, policy.deadline, tried_for).await
+}
+
+async fn within_deadline(
+    fetching: impl std::future::Future<Output = Result<String>>,
+    deadline: Option<Duration>,
+    tried_for: Duration,
+) -> Result<String> {
+    let Some(deadline) = deadline else {
         return fetching.await;
     };
     tokio::time::timeout(deadline.saturating_sub(tried_for), fetching)
@@ -1245,22 +1253,21 @@ mod tests {
     async fn a_gateway_that_stalls_mid_body_holds_a_document_no_longer_than_its_deadline() {
         let (cid, gateway, _requests, server) = stalls_mid_body().await;
         let metrics = NestMetrics::default();
-        let policy = quick(100, 800, Some(Duration::from_secs(1)));
-        assert!(
-            (0..policy.attempts)
-                .map(|f| policy.timeout(f))
-                .sum::<Duration>()
-                > Duration::from_secs(6),
-            "premise: every attempt run to its timeout takes over six seconds"
-        );
-        let started = Instant::now();
+        // The document deadline, not a shorter request timeout, must end this fetch. Retry count
+        // is not a contract here: a busy executor may use the whole deadline on its first attempt.
+        let policy = quick(10_000, 10_000, Some(Duration::from_secs(1)));
         let (rows, given_up) = resolve_one(gateway, &cid, &policy, &metrics).await;
-        let held = started.elapsed();
-        assert!(held < Duration::from_secs(3), "held for {held:?}");
         assert!(rows.is_empty());
         assert_eq!(given_up.len(), 1);
         assert_eq!(metrics.ipfs_given_up(), 1);
-        assert!(metrics.ipfs_retries() >= 1, "the first attempt is retried");
+        assert!(
+            given_up[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not fetched within the 1s"),
+            "the document deadline must end the fetch: {given_up:?}"
+        );
         server.abort();
     }
 
@@ -1290,7 +1297,7 @@ mod tests {
     /// attempts run out, as it was before a seal-direct window had a deadline.
     #[tokio::test]
     async fn a_zero_window_deadline_gives_up_only_after_every_attempt() {
-        let (cid, gateway, requests, server) = stalls_mid_body().await;
+        let (cid, gateway, _requests, server) = stalls_mid_body().await;
         let metrics = NestMetrics::default();
         let policy = Policy {
             attempts: 4,
@@ -1309,8 +1316,58 @@ mod tests {
             3,
             "every attempt but the last is retried"
         );
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 4);
+        // Count client attempts via retries, not requests accepted by the server: under load an
+        // attempt can time out before the server accepts it. All four attempts still took place.
         server.abort();
+    }
+
+    /// Socket-free timing: elapsed budget is subtracted, not reset for each fetch.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_fetch_gets_only_the_remaining_document_budget() {
+        for (spent, remaining) in [(0, 5), (3, 2), (5, 0), (8, 0)] {
+            let start = tokio::time::Instant::now();
+            let error = within_deadline(
+                async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok("late document".into())
+                },
+                Some(Duration::from_secs(5)),
+                Duration::from_secs(spent),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("not fetched within the 5s"));
+            assert_eq!(start.elapsed(), Duration::from_secs(remaining));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_document_deadline_leaves_every_attempt_its_request_timeout() {
+        let policy = Policy {
+            attempts: 4,
+            ..quick(50, 100, Policy::seal_direct_within(Duration::ZERO).deadline)
+        };
+        let start = tokio::time::Instant::now();
+        // Even a document already pending for an hour must retain all its attempts when disabled.
+        let already_spent = Duration::from_secs(3_600);
+        let mut failures = 0;
+        loop {
+            let fetching = async {
+                tokio::time::sleep(policy.timeout(failures)).await;
+                Err(anyhow::anyhow!("request timeout"))
+            };
+            let error = within_deadline(fetching, policy.deadline, already_spent + start.elapsed())
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "request timeout");
+            failures += 1;
+            let Some(wait) = policy.retry_in(failures, already_spent + start.elapsed()) else {
+                break;
+            };
+            tokio::time::sleep(wait).await;
+        }
+        assert_eq!(failures, 4);
+        assert_eq!(start.elapsed(), Duration::from_millis(350));
     }
 
     /// A 204 for a document that is not empty proves nothing. It is retried to its attempts and given up

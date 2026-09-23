@@ -182,10 +182,14 @@ TOML
     # One entity per nest when asked: a grouped sum over the widest event this ABI has, which is the
     # shape §3.3 admits and the one an author would actually write.
     if [ "$ENTITY_MAX_ROWS" -gt 0 ]; then
+      mkdir -p "$nest/entities"
+      cat > "$nest/entities/approved.sql" <<'SQL'
+SELECT a.owner, SUM(a.amount) FROM pool_manager__approval a GROUP BY a.owner
+SQL
       cat > "$nest/entities.toml" <<TOML
 [[entities]]
 name = "approved"
-sql = "SELECT a.owner, SUM(a.amount) FROM pool_manager__approval a GROUP BY a.owner"
+sql = "entities/approved.sql"
 key = ["owner"]
 max_rows = $ENTITY_MAX_ROWS
 TOML

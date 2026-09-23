@@ -1379,6 +1379,7 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
                     "unavailable": unavailable,
                     "seconds_since_progress": (progress != 0).then(|| now.saturating_sub(progress)),
                 }),
+                e,
                 &applied,
             )
         })
@@ -1386,13 +1387,44 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
     (Value::Array(entities), stalled)
 }
 
-/// Name the offchain snapshots an entity's rows were applied through (#1437). Absent, not null, for
-/// an entity that reads no offchain table, so a chain-only entity reads exactly as it did.
-fn with_offchain(mut v: Value, applied: &crate::entity_view::Applied) -> Value {
-    if let (Some(offchain), Some(obj)) = (applied.offchain_json(), v.as_object_mut()) {
-        obj.insert("offchain".into(), offchain);
+/// RFC-0045 §6's second guarantee: rows that can be re-checked given the snapshots, but not
+/// re-derived from chain.
+const SNAPSHOT_REPRODUCIBLE: &str = "snapshot";
+
+/// Label an entity that reads an offchain table as reproducible by snapshot, and name the snapshots
+/// its rows were applied through (#1437). The label follows from what the entity reads, not from
+/// what it has applied, so it is there before the first snapshot lands and nothing turns it off.
+/// Both are absent, not null, for an entity that reads no offchain table.
+fn with_offchain(
+    mut v: Value,
+    entity: &crate::entity_view::EntityView,
+    applied: &crate::entity_view::Applied,
+) -> Value {
+    if let Some(obj) = v.as_object_mut() {
+        if !entity.offchain_tables().is_empty() {
+            obj.insert("reproducibility".into(), json!(SNAPSHOT_REPRODUCIBLE));
+        }
+        if let Some(offchain) = applied.offchain_json() {
+            obj.insert("offchain".into(), offchain);
+        }
     }
     v
+}
+
+/// The offchain views an answer read directly, each with the snapshots behind it.
+fn read_offchain_json(read: &std::collections::BTreeMap<String, Vec<String>>) -> Option<Value> {
+    (!read.is_empty()).then(|| {
+        read.iter()
+            .map(|(view, hashes)| {
+                let mark = crate::entity_view::OffchainMark::of(hashes);
+                (
+                    view.clone(),
+                    json!({ "snapshots": mark.snapshots, "latest": mark.latest }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    })
 }
 
 /// One nest's readiness verdict, and the counters it was reached from.
@@ -2525,6 +2557,11 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
                 unavailable: e.unavailable().map(str::to_string),
                 fault: e.fault(),
                 rows,
+                offchain: e
+                    .offchain_tables()
+                    .iter()
+                    .map(|t| format!("{}{t}", crate::entity_offchain::OFFCHAIN_NAMESPACE))
+                    .collect(),
             }
         })
         .collect();
@@ -3601,6 +3638,7 @@ async fn derived_index(State(s): State<AppState>) -> impl IntoResponse {
                     "current": applied.through >= head,
                     "available": e.unavailable().is_none() && e.fault().is_none(),
                 }),
+                e,
                 &applied,
             )
         })
@@ -3683,7 +3721,7 @@ fn sql_response(
     (as_of, sealed_through): (Option<u64>, u64),
     cached: bool,
 ) -> axum::response::Response {
-    Json(json!({
+    let mut response = json!({
         "count": out.rows.len(),
         "truncated": out.truncated,
         // Cold data was incomplete when this answer was computed (#435): a sealed segment the
@@ -3728,8 +3766,24 @@ fn sql_response(
             // `QueryOutput::referenced_tables`, which is why this is not an empty array.
             "entities": sql_entity_provenance(s, out.referenced_tables.as_ref(), watermarks),
         },
-    }))
-    .into_response()
+    });
+    // #1437, RFC-0045 stage 1's "provenance visible in the result": an answer that read an offchain
+    // table, directly or through an entity, is reproducible by snapshot and says which snapshots.
+    let read = out.offchain.as_ref().and_then(read_offchain_json);
+    let through_entity = out.referenced_tables.as_ref().is_some_and(|names| {
+        s.entities.iter().any(|e| {
+            names.contains(&e.name().to_ascii_lowercase()) && !e.offchain_tables().is_empty()
+        })
+    });
+    if let Some(provenance) = response["provenance"].as_object_mut() {
+        if read.is_some() || through_entity {
+            provenance.insert("reproducibility".into(), json!(SNAPSHOT_REPRODUCIBLE));
+        }
+        if let Some(read) = read {
+            provenance.insert("offchain".into(), read);
+        }
+    }
+    Json(response).into_response()
 }
 
 fn sql_entity_provenance(
@@ -3759,10 +3813,11 @@ fn sql_entity_provenance(
                 "applied_through": through,
                 "current": through >= head,
             });
-            match captured {
-                Some(applied) => with_offchain(v, applied),
-                None => v,
-            }
+            with_offchain(
+                v,
+                e,
+                captured.unwrap_or(&crate::entity_view::Applied::default()),
+            )
         })
         .collect();
     if used.is_empty() {
@@ -3793,6 +3848,7 @@ fn derived_provenance(
             "dataset_head": head,
             "current": applied.through >= head,
         }),
+        entity,
         applied,
     )
 }
@@ -4398,13 +4454,57 @@ mod tests {
         let sql = sql_entity_provenance(&state, Some(&referenced), &captured);
         assert_eq!(sql[0]["offchain"], ready[0]["offchain"], "{sql}");
 
-        let chain_only = derived_provenance(
+        assert_eq!(ready[0]["reproducibility"], "snapshot", "{ready}");
+        assert_eq!(provenance["reproducibility"], "snapshot", "{provenance}");
+        // The label follows from what the entity reads, so it is there before anything is applied.
+        let unapplied = derived_provenance(
             &state,
             &state.entities[0],
             0,
             &crate::entity_view::Applied::default(),
         );
-        assert!(chain_only.get("offchain").is_none(), "{chain_only}");
+        assert_eq!(unapplied["reproducibility"], "snapshot", "{unapplied}");
+        assert!(unapplied.get("offchain").is_none(), "{unapplied}");
+
+        let erc20: alloy_json_abi::JsonAbi = serde_json::from_str(
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let chain_reg =
+            crate::registry::DecodeRegistry::build(vec![crate::registry::ContractSpec {
+                alias: "usdc".into(),
+                address: alloy_primitives::Address::from([0x11; 20]),
+                abi: erc20,
+                events: Vec::new(),
+            }])
+            .unwrap();
+        let chain_plan = Plan {
+            left: Source {
+                table: "usdc__transfer".into(),
+                columns: vec!["to".into()],
+            },
+            ..plan
+        };
+        let chain_only = crate::entity_view::EntityView::start(
+            "e",
+            &chain_plan,
+            &columns,
+            &chain_reg,
+            100,
+            false,
+        )
+        .unwrap();
+        let chain = derived_provenance(
+            &state,
+            &chain_only,
+            0,
+            &crate::entity_view::Applied::default(),
+        );
+        assert!(chain.get("reproducibility").is_none(), "{chain}");
+        assert!(chain.get("offchain").is_none(), "{chain}");
     }
 
     fn test_state(dir: &std::path::Path, permits: usize) -> AppState {
@@ -7686,6 +7786,12 @@ mod tests {
                 continue;
             }
             let document = std::fs::read_to_string(&path).unwrap();
+            // This corpus checks document compatibility, not elapsed freshness. Keep the synthetic
+            // head current for each request: on CI the preceding documents can take over 60 seconds.
+            state
+                .store
+                .set_block_timestamp(42_460_000, crate::metrics::now_unix())
+                .unwrap();
             let response =
                 graph_ask_variables("/graphql", &document, variables.clone(), state.clone()).await;
             assert!(
@@ -7777,7 +7883,6 @@ mod tests {
     }
 
     #[cfg(feature = "graph")]
-    #[ignore = "never passed: DuckDB binder assertion on the historical allocation query (#1458)"]
     #[tokio::test]
     async fn network_rust_allocation_pages_keep_the_first_page_snapshot_when_the_tip_advances() {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -7863,7 +7968,10 @@ mod tests {
             )
             .unwrap();
         state.store.set_block_hash(30, &next_hash).unwrap();
-        state.store.set_block_timestamp(30, now).unwrap();
+        state
+            .store
+            .set_block_timestamp(30, crate::metrics::now_unix())
+            .unwrap();
         state.store.set_meta("last_block", "30").unwrap();
         variables["last"] = json!(ids[0]);
         variables["first"] = json!(100);
@@ -7875,6 +7983,12 @@ mod tests {
         assert_eq!(second["data"]["allocations"][0]["id"], ids[1]);
         assert_eq!(second["data"]["meta"]["block"]["number"], 20);
         variables["block"] = serde_json::Value::Null;
+        // Prior queries may take longer than the fixture's freshness window on a busy runner.
+        // Refresh admission metadata only; block hashes and allocation history remain fixed.
+        state
+            .store
+            .set_block_timestamp(30, crate::metrics::now_unix())
+            .unwrap();
         let latest = graph_ask_variables("/graphql", document, variables, state).await;
         assert!(latest.get("errors").is_none(), "{latest}");
         assert_eq!(latest["data"]["allocations"].as_array().unwrap().len(), 2);

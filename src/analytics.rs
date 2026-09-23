@@ -423,6 +423,10 @@ pub struct QueryOutput {
     /// `None` leaves that block off the response entirely rather than reporting an empty set, since
     /// "we did not parse it" and "it touched no entity" are different facts.
     pub referenced_tables: Option<std::collections::BTreeSet<String>>,
+    /// The offchain views this answer read (#1437), each with the content hashes of the snapshots
+    /// it was defined over, or `None` where that is not known. Such an answer is reproducible by
+    /// snapshot, not re-derivable from chain (RFC-0045 §6).
+    pub offchain: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// The bound a declared query was admitted against; `None` on every other path.
     pub scan_bound: Option<ScanBound>,
 }
@@ -1281,7 +1285,7 @@ fn attempt(
     }
     let mut slot = slot.expect("just inserted");
     slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
-    let (referenced, degraded_tables, interrupted, outcome, cap, scan) = {
+    let (referenced, offchain, degraded_tables, interrupted, outcome, cap, scan) = {
         let conn = &slot.conn;
         let walked = reject_unknown_table_refs(conn, sql)?;
         // No parse means no idea what the statement reaches, and the safe answer to that is "all of
@@ -1315,9 +1319,11 @@ fn attempt(
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
         define_nest_views(conn, dir, wanted.as_ref());
-        if as_of.is_none() {
-            define_offchain_views(conn, dir, wanted.as_ref());
-        }
+        let offchain = if as_of.is_none() {
+            define_offchain_views(conn, dir, wanted.as_ref())
+        } else {
+            Default::default()
+        };
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
         // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
         if as_of.is_none() {
@@ -1331,6 +1337,15 @@ fn attempt(
         // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
         // happen here rather than beside the security walk: at that point the catalogue was empty.
         let referenced = referenced.map(|names| expand_through_views(conn, &names));
+        // What the answer read from offchain snapshots (#1437). Unparsed, every defined view counts:
+        // an over-reported snapshot label claims less than the answer has, never more.
+        let offchain = Some(match &referenced {
+            Some(names) => offchain
+                .into_iter()
+                .filter(|(view, _)| names.contains(&view.to_ascii_lowercase()))
+                .collect(),
+            None => offchain,
+        });
 
         // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
         // query once it outlives `deadline` (a cartesian blow-up can't be stopped by the memory cap
@@ -1398,7 +1413,15 @@ fn attempt(
             let _ = tx.send(());
             let _ = join.join();
         }
-        (referenced, degraded_tables, interrupted, outcome, cap, scan)
+        (
+            referenced,
+            offchain,
+            degraded_tables,
+            interrupted,
+            outcome,
+            cap,
+            scan,
+        )
     };
     if interrupted.load(Ordering::SeqCst) {
         drop(slot);
@@ -1419,6 +1442,7 @@ fn attempt(
         return Ok(Attempt::Ok(QueryOutput {
             degraded_tables,
             referenced_tables: referenced,
+            offchain,
             scan_bound: scan,
             ..Default::default()
         }));
@@ -1470,6 +1494,7 @@ fn attempt(
         tip_unavailable: false,
         referenced_tables: referenced,
         scan_bound: scan,
+        offchain,
     }))
 }
 
@@ -3160,41 +3185,46 @@ fn define_nest_views(
 
 /// Bind immutable offchain snapshots beneath an explicit namespace. They deliberately have no hot
 /// half, no watermark, and no path back into chain replay: they are query inputs only.
+/// Returns each view it defined and the content hashes of the snapshots behind it, in append order,
+/// so an answer can name what it read (#1437).
 fn define_offchain_views(
     conn: &Connection,
     dir: &Path,
     wanted: Option<&std::collections::BTreeSet<String>>,
-) {
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut defined = std::collections::BTreeMap::new();
     let Ok(catalogue) = crate::offchain::load(dir) else {
         tracing::warn!(
             "offchain provenance manifest is unreadable; no offchain views were defined"
         );
-        return;
+        return defined;
     };
     for (table, snapshots) in &catalogue.tables {
         let view = format!("offchain__{table}");
         if wanted.is_some_and(|set| !set.contains(&view.to_ascii_lowercase())) {
             continue;
         }
-        let files: Vec<String> = snapshots
+        let present: Vec<(&crate::offchain::Snapshot, PathBuf)> = snapshots
             .iter()
-            .map(|s| {
-                dir.join(crate::offchain::DIR)
-                    .join("segments")
-                    .join(&s.file)
-            })
-            .filter(|p| p.exists())
-            .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+            .map(|s| (s, crate::offchain::segment_path(dir, s)))
+            .filter(|(_, p)| p.exists())
             .collect();
-        if files.is_empty() {
+        if present.is_empty() {
             continue;
         }
+        let files: Vec<String> = present
+            .iter()
+            .map(|(_, p)| format!("'{}'", p.display().to_string().replace('\'', "''")))
+            .collect();
         let ddl = format!(
             "CREATE OR REPLACE VIEW \"{view}\" AS SELECT * FROM read_parquet([{}], union_by_name=true)",
             files.join(", ")
         );
-        if let Err(e) = conn.execute_batch(&ddl) {
-            tracing::warn!("offchain view {view} skipped: {e}");
+        match conn.execute_batch(&ddl) {
+            Ok(()) => {
+                defined.insert(view, present.iter().map(|(s, _)| s.hash.clone()).collect());
+            }
+            Err(e) => tracing::warn!("offchain view {view} skipped: {e}"),
         }
     }
     // Keyed on pulls, not snapshots: a pull that has never succeeded has no snapshot, and its status
@@ -3209,6 +3239,7 @@ fn define_offchain_views(
             tracing::warn!("offchain status view {view} skipped: {e}");
         }
     }
+    defined
 }
 
 /// `stale` is true on a recorded failure, before any success, or past the declared cadence. Views
@@ -3632,7 +3663,7 @@ pub fn entity_output_columns(
         schema,
         None,
     );
-    define_offchain_views(&conn, dir, None);
+    let _ = define_offchain_views(&conn, dir, None);
     define_labels_view(&conn, dir);
     define_children_views(&conn, dir);
     let mut stmt = conn.prepare(sql)?;
@@ -3795,6 +3826,49 @@ fn value_to_json(v: ValueRef<'_>) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token(id VARCHAR, symbol VARCHAR);\
+             INSERT INTO token VALUES ('yes', 'WETH'), ('yes', 'WETH'),\
+                 ('no', 'OTHER'), (NULL, 'WETH');\
+             CREATE TABLE pool(id VARCHAR, token0 VARCHAR);\
+             INSERT INTO pool VALUES ('a', 'yes'), ('b', 'no'), ('c', 'missing'), ('d', NULL);",
+        )
+        .unwrap();
+        let schema = crate::graph_schema::parse("type Pool @entity { id: ID! token0: Token! } type Token @entity { id: ID! symbol: String! }").unwrap();
+        let roots = crate::graph_query::parse(
+            r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#,
+        )
+        .unwrap();
+        let compiled = crate::graph_query::compile(&schema, &roots[0]).unwrap();
+        let mut stmt = conn.prepare(&compiled.sql).unwrap();
+        let actual: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(actual, ["a"]);
+        // SQL NULL must be false just as EXISTS is, even when the child set contains NULL.
+        let predicate = compiled
+            .sql
+            .split_once(" WHERE ")
+            .unwrap()
+            .1
+            .rsplit_once(" ORDER BY ")
+            .unwrap()
+            .0;
+        let sql = format!("SELECT b.id FROM pool b WHERE NOT ({predicate}) ORDER BY b.id");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rejected: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rejected, ["b", "c", "d"]);
+    }
+
     use super::*;
 
     #[test]
@@ -3942,6 +4016,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(current.rows[0]["total"], Value::String("23".into()));
+    }
+
+    #[test]
+    fn historical_reads_exclude_unversioned_offchain_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("prices.csv");
+        std::fs::write(&source, "symbol,price\nGRT,2\n").unwrap();
+        crate::offchain::drop_file(dir.path(), &source, "prices").unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 100,
+        };
+        let hot = HotRows::new();
+        let sql = "SELECT symbol FROM offchain__prices";
+        let current = query_hot_cold(dir.path(), sql, guard, &hot, 0, &[]).unwrap();
+        assert_eq!(current.rows[0]["symbol"], "GRT");
+        let catalogue = crate::offchain::load(dir.path()).unwrap();
+        assert_eq!(
+            current.offchain.unwrap()["offchain__prices"],
+            vec![catalogue.tables["prices"][0].hash.clone()]
+        );
+        let error = query_hot_cold_at(dir.path(), sql, guard, &hot, 0, &[], 10).unwrap_err();
+        assert!(format!("{error:#}").contains("offchain__prices"));
+        let historical =
+            query_hot_cold_at(dir.path(), "SELECT 1 AS value", guard, &hot, 0, &[], 10).unwrap();
+        assert!(historical.offchain.unwrap().is_empty());
+        // Switching back to current reads must restore both the view and its provenance.
+        let current = query_hot_cold(dir.path(), sql, guard, &hot, 0, &[]).unwrap();
+        assert_eq!(current.rows[0]["symbol"], "GRT");
+        assert!(current.offchain.unwrap().contains_key("offchain__prices"));
     }
 
     #[test]

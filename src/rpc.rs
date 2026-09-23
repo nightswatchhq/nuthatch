@@ -14,6 +14,23 @@ use std::time::{Duration, Instant};
 /// than silently yielding an all-zeros timestamp map into the sealed path.
 const TIMESTAMP_ATTEMPTS: usize = 4;
 
+#[cfg(test)]
+tokio::task_local! {
+    // Scoped to one test future: concurrent clients cannot contaminate its observations.
+    static RETRY_PAUSES: std::cell::RefCell<Vec<Duration>>;
+}
+
+async fn retry_pause(pause: Duration) {
+    #[cfg(test)]
+    if RETRY_PAUSES
+        .try_with(|pauses| pauses.borrow_mut().push(pause))
+        .is_ok()
+    {
+        return;
+    }
+    tokio::time::sleep(pause).await;
+}
+
 /// Max block numbers per `eth_getBlockByNumber` JSON-RPC batch. Many providers cap batch size and
 /// **silently drop** an oversized batch (returning nothing), which the strict no-partial-map guard
 /// then correctly rejects - so a dense window that needs 1000+ distinct timestamps would fail on such
@@ -1446,7 +1463,7 @@ impl RpcClient {
                 // No hint, or a failure that was not a rate limit: our own pacing stands.
                 _ => linear,
             };
-            tokio::time::sleep(pause).await;
+            retry_pause(pause).await;
         }
         // Same COR-3 reasoning as `block_timestamps`: a partial map must be an error rather than a
         // short map. A missing header would seal a *missing block row*, and "no row" is
@@ -1609,7 +1626,7 @@ impl RpcClient {
                         _ => own_pacing,
                     };
                     last_err = Some(e);
-                    tokio::time::sleep(pause).await;
+                    retry_pause(pause).await;
                 }
             }
         }
@@ -2700,8 +2717,9 @@ mod tests {
     /// on a real endpoint and is impractical to reproduce deterministically.
     #[tokio::test]
     async fn a_timestamp_batch_halves_instead_of_retrying_the_same_size() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Refuses batches larger than 50 with a cap error; serves anything smaller.
         static SEEN_MAX: AtomicUsize = AtomicUsize::new(0);
@@ -2711,40 +2729,26 @@ mod tests {
 
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = l.accept().await else {
-                    return;
-                };
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 1 << 20];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let n_items = req.matches("eth_getBlockByNumber").count();
+        let app = Router::new().route(
+            "/",
+            post(|Json(req): Json<Vec<Value>>| async move {
+                    let n_items = req.len();
                     CALLS.fetch_add(1, Ordering::SeqCst);
                     SEEN_MAX.fetch_max(n_items, Ordering::SeqCst);
-                    let body = if n_items > 50 {
+                    if n_items > 50 {
                         // The shape a provider uses for "your response would be too big".
-                        r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Log response size exceeded"}}"#.to_string()
+                        Json(json!({"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Log response size exceeded"}}))
                     } else {
                         // `id` is the index within the batch, which is what the client maps back.
-                        let items: Vec<String> = (0..n_items)
-                            .map(|i| {
-                                format!(
-                                    r#"{{"jsonrpc":"2.0","id":{i},"result":{{"timestamp":"0x1"}}}}"#
-                                )
-                            })
+                        let items: Vec<Value> = req.iter()
+                            .map(|item| json!({"jsonrpc":"2.0","id":item["id"],"result":{"timestamp":"0x1"}}))
                             .collect();
-                        format!("[{}]", items.join(","))
-                    };
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                        body.len(), body
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.flush().await;
-                });
-            }
+                        Json(Value::Array(items))
+                    }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
         });
 
         let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
@@ -2755,6 +2759,7 @@ mod tests {
             .expect("a batch that is merely too large must be split, not fatal");
 
         assert_eq!(got.len(), 200, "every block must come back after splitting");
+        server.abort();
         assert!(
             CALLS.load(Ordering::SeqCst) > 1,
             "it must have split at all - one call means it never narrowed"
@@ -3333,6 +3338,13 @@ mod rfc0036_tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn retry_pause_without_an_observer_really_sleeps() {
+        let start = tokio::time::Instant::now();
+        retry_pause(Duration::from_secs(5)).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+    }
+
     /// The hint is actually **wired to the pause** - the half of #361 the parser tests do not reach.
     ///
     /// Deleting the honouring at both call sites, leaving parser, cap and classifier intact, left the
@@ -3340,18 +3352,10 @@ mod rfc0036_tests {
     /// That is our most-repeated failure - a criterion phrased as the absence of an effect passes
     /// trivially when the mechanism is missing - so this asserts the effect instead.
     ///
-    /// **Self-calibrating, deliberately.** The obvious version - one mock, assert elapsed exceeds a
-    /// fixed threshold - does not work under `start_paused`: reqwest's own 20s timeout is a tokio
-    /// timer too, so virtual time leaps through it while the runtime waits on a real socket and the
-    /// measurement is swamped (observed: 721s where the arithmetic says 35s). So run the same
-    /// scenario twice against mocks identical but for the header. Whatever the timeouts contribute,
-    /// they contribute to both, and the difference is the hint. Measured with the wiring deleted:
-    /// 467.168s vs 466.944s, a gap of 224ms.
-    ///
-    /// `block_headers` runs `ROUNDS = 8`, so seven pauses: ~7s of linear pacing without the hint,
-    /// ~35s with a 5s hint honoured. This also covers the `Retry-After` **header** path, which
-    /// nothing else exercises - neither mock sends `try_again_in`, so the header is the only source.
-    #[tokio::test(start_paused = true)]
+    /// Observe the requested pauses, not elapsed time (#1454). Paused Tokio time can advance through
+    /// reqwest's timeouts while real sockets wait on the OS. Two such runs do not cancel that noise.
+    /// The request, header parsing and both retry loops remain real; only their sleeps are recorded.
+    #[tokio::test]
     async fn a_provider_retry_hint_actually_lengthens_the_pause() {
         use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
 
@@ -3365,45 +3369,51 @@ mod rfc0036_tests {
         async fn bare() -> impl IntoResponse {
             (StatusCode::TOO_MANY_REQUESTS, "rate limited")
         }
-        async fn time_a_run(app: Router) -> Duration {
+        async fn pauses_for(app: Router) -> Vec<Duration> {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
             });
             let client = RpcClient::new(vec![format!("http://{addr}/")]).unwrap();
-            let start = tokio::time::Instant::now();
-            client
-                .block_headers(&[1])
-                .await
-                .expect_err("a permanently rate-limited endpoint must exhaust its rounds");
-            let elapsed = start.elapsed();
+            let pauses = RETRY_PAUSES
+                .scope(std::cell::RefCell::new(Vec::new()), async {
+                    client
+                        .block_headers(&[1])
+                        .await
+                        .expect_err("a permanently rate-limited endpoint must exhaust its rounds");
+                    assert_eq!(client.requests.load(Ordering::Relaxed), 32);
+                    RETRY_PAUSES.with(|pauses| pauses.borrow().clone())
+                })
+                .await;
             server.abort();
-            elapsed
+            let _ = server.await;
+            pauses
         }
 
-        let with_hint = time_a_run(
+        let with_hint = pauses_for(
             Router::new()
                 .route("/", post(hinted))
                 .route("/{*rest}", post(hinted)),
         )
         .await;
-        let without_hint = time_a_run(
+        let without_hint = pauses_for(
             Router::new()
                 .route("/", post(bare))
                 .route("/{*rest}", post(bare)),
         )
         .await;
 
-        // Seven pauses of (5s - linear) extra; worst case 7 x (5s - 1.75s) = 22.75s. Half of that is
-        // a wide margin that still cannot be reached by ignoring the hint.
-        let gap = with_hint.saturating_sub(without_hint);
-        assert!(
-            gap >= Duration::from_secs(11),
-            "the provider's 5s Retry-After was not honoured: hinted {with_hint:?} vs unhinted \
-             {without_hint:?} (gap {gap:?}). Identical mocks but for the header, so a real gap is \
-             the hint and no gap means the wiring is missing."
-        );
+        // Eight rounds of four inner attempts, with seven outer pauses between rounds.
+        assert_eq!(with_hint, vec![Duration::from_secs(5); 39]);
+        let mut expected = Vec::new();
+        for round in 1..=8 {
+            expected.extend([200, 400, 600, 800].map(Duration::from_millis));
+            if round < 8 {
+                expected.push(Duration::from_millis(250 * round));
+            }
+        }
+        assert_eq!(without_hint, expected);
     }
 
     /// A rate limit that carries no hint stays `None`, so the caller keeps its own pacing. This is

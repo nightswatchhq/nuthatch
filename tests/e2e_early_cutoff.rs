@@ -595,10 +595,16 @@ async fn declaring_an_entity_adopts_the_facts_instead_of_re_indexing_them() {
 
     // The edit: declare an incremental entity over the facts this nest already holds.
     let new_nid = install_edited(root, "alpha", &alpha_nid, |dir| {
+        std::fs::create_dir_all(dir.join("entities")).unwrap();
+        std::fs::write(
+            dir.join("entities/received.sql"),
+            "SELECT t.to, SUM(t.value) FROM alpha__transfer t GROUP BY t.to",
+        )
+        .unwrap();
         std::fs::write(
             dir.join("entities.toml"),
             "[[entities]]\nname = \"received\"\n\
-             sql = \"SELECT t.to, SUM(t.value) FROM alpha__transfer t GROUP BY t.to\"\n\
+             sql = \"entities/received.sql\"\n\
              key = [\"to\"]\nmax_rows = 10000\n",
         )
         .unwrap();

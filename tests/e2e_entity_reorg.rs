@@ -11,6 +11,8 @@
 //! through `spawn_nest`, `entities_in_range` and a real fork.
 
 mod common;
+#[path = "common/entity_fixture.rs"]
+mod entity_fixture;
 
 use proptest::prelude::*;
 
@@ -53,8 +55,17 @@ fn replacement_block(b: u64) -> BlockFixture {
 /// does not use is one that cannot mask a divergence by discarding the row that carries it.
 const RECEIVED: &str = r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(CAST(t.value AS HUGEINT)) AS sum_value FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
+max_rows = 10000
+"#;
+
+/// #1437: an entity joining chain transfers to an offchain `tiers` table.
+const BY_TIER: &str = r#"
+[[entities]]
+name = "by_tier"
+query = "SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier"
+key = ["tier"]
 max_rows = 10000
 "#;
 
@@ -63,10 +74,46 @@ fn declare_entity(dir: &std::path::Path) {
 }
 
 fn declare(dir: &std::path::Path, toml: &str) {
-    std::fs::write(dir.join("entities.toml"), toml).expect("write entities.toml");
+    entity_fixture::write(dir, toml).expect("write entities.toml");
 }
 
 const CHAIN_LEN: u64 = 8;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checked_entity_file_starts_and_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_nest(dir.path(), "usdc", USDC);
+    declare_entity(dir.path());
+    nuthatch::project::regen(nuthatch::cli::SchemaArgs {
+        dir: dir.path().to_str().unwrap().into(),
+    })
+    .unwrap();
+    nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: dir.path().to_str().unwrap().into(),
+        update: false,
+    })
+    .expect("the authored file must pass check before startup");
+    let manifest = std::fs::read(dir.path().join("entities.toml")).unwrap();
+    let sql = std::fs::read(dir.path().join("entities/received.sql")).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for block in 1..=CHAIN_LEN {
+        tape.insert_block(block, canonical_block(block));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+    assert!(!relation(&rt).is_empty());
+    assert_eq!(
+        std::fs::read(dir.path().join("entities.toml")).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("entities/received.sql")).unwrap(),
+        sql
+    );
+    shutdown_and_settle(rt).await;
+}
 
 async fn spawn_with_entity(
     dir: &std::path::Path,
@@ -357,11 +404,11 @@ async fn a_dead_entity_circuit_ends_the_nest_rather_than_freezing_it() {
 
     let cfg = scaffold_nest(dir.path(), "usdc", USDC);
     // One row admitted, and the first window carries two.
-    std::fs::write(
-        dir.path().join("entities.toml"),
+    entity_fixture::write(
+        dir.path(),
         r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 1
 "#,
@@ -446,11 +493,11 @@ async fn a_faulted_entity_pushes_an_alert_to_a_configured_sink() {
         format: nuthatch::config::AlertFormat::Raw,
     }];
     // One row admitted, and the first window carries two - the same fault the test above uses.
-    std::fs::write(
-        dir.path().join("entities.toml"),
+    entity_fixture::write(
+        dir.path(),
         r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 1
 "#,
@@ -552,11 +599,11 @@ async fn a_faulted_entity_quarantines_its_own_nest_and_leaves_its_neighbour_inde
     //
     // The contract alias moves with the name, so the doomed nest's table is `doomed__transfer`.
     let doomed_cfg = scaffold_nest(doomed_dir.path(), "doomed", USDC);
-    std::fs::write(
-        doomed_dir.path().join("entities.toml"),
+    entity_fixture::write(
+        doomed_dir.path(),
         r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM doomed__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(t.value) FROM doomed__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 1
 "#,
@@ -923,7 +970,7 @@ async fn the_metrics_endpoint_carries_the_entity_series() {
 async fn a_capped_query_over_a_maintained_relation_is_still_capped() {
     const PER_BLOCK: &str = r#"[[entities]]
 name = "per_block"
-sql = "SELECT t.block_number, SUM(t.value) FROM usdc__transfer t GROUP BY t.block_number"
+query = "SELECT t.block_number, SUM(t.value) FROM usdc__transfer t GROUP BY t.block_number"
 key = ["block_number"]
 max_rows = 10000
 "#;
@@ -985,7 +1032,7 @@ max_rows = 10000
 async fn editing_an_entity_rebuilds_from_stored_facts_without_refetching_them() {
     const SENT: &str = r#"[[entities]]
 name = "sent"
-sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+query = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
 key = ["from"]
 max_rows = 10000
 "#;
@@ -1062,26 +1109,26 @@ max_rows = 10000
 async fn editing_one_entity_leaves_its_neighbour_answering() {
     const BOTH: &str = r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
 
 [[entities]]
 name = "senders"
-sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+query = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
 key = ["from"]
 max_rows = 10000
 "#;
     // Only `received` changes: SUM becomes COUNT. `senders` is byte-identical.
     const EDITED: &str = r#"[[entities]]
 name = "received"
-sql = "SELECT t.to, COUNT(*) FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, COUNT(*) FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
 
 [[entities]]
 name = "senders"
-sql = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
+query = "SELECT t.from, COUNT(*) FROM usdc__transfer t GROUP BY t.from"
 key = ["from"]
 max_rows = 10000
 "#;
@@ -1260,6 +1307,10 @@ async fn the_sql_route_serves_the_relation_by_name_and_says_where_it_came_from()
         axum::http::StatusCode::OK,
         "/sql over the entity: {body}"
     );
+    assert!(
+        body["provenance"].get("reproducibility").is_none(),
+        "a chain-only entity's answer is not labelled as snapshot data (#1437): {body}"
+    );
     let rows = body["rows"].as_array().expect("rows").clone();
     assert_eq!(
         rows.len(),
@@ -1384,13 +1435,6 @@ async fn a_derived_keyed_read_answers_from_maintained_state_with_provenance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_offchain_snapshot_dropped_while_running_reaches_the_entity_and_survives_a_restart() {
     use nuthatch::entity_row::{Row, Scalar};
-    const BY_TIER: &str = r#"
-[[entities]]
-name = "by_tier"
-sql = "SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier"
-key = ["tier"]
-max_rows = 10000
-"#;
     let dir = tempfile::tempdir().unwrap();
     let drop = |name: &str, tier: &str| {
         let csv = dir.path().join(format!("{name}.csv"));
@@ -1442,4 +1486,214 @@ max_rows = 10000
     shutdown_and_settle(warm).await;
     assert_eq!(after, before, "a warm restart seeds the snapshots back");
     assert_eq!(applied.offchain["tiers"].snapshots, 2);
+}
+
+/// #1437 slice 3, through the routes. An answer that read an offchain table, directly or through an
+/// entity, says it is reproducible by snapshot and names the snapshots; a remembered answer says so
+/// too; a chain-only answer asserts nothing of the kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_read_offchain_data_says_it_is_reproducible_by_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("tiers.csv");
+    std::fs::write(&csv, format!("account,tier\n{},gold\n", account(2))).unwrap();
+    nuthatch::offchain::drop_file(dir.path(), &csv, "tiers").unwrap();
+    let hash = nuthatch::offchain::load(dir.path()).unwrap().tables["tiers"][0]
+        .hash
+        .clone();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=4 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(4);
+    let rt = spawn_declared(dir.path(), tape, 4, BY_TIER).await;
+    rt.state.entities[0].flush();
+    let sql = |q: &str| format!("/sql?q={}", urlencoding_lite(q));
+
+    let (status, direct) = get_json(&rt, &sql("SELECT * FROM offchain__tiers")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{direct}");
+    let provenance = &direct["provenance"];
+    assert_eq!(provenance["reproducibility"], "snapshot", "{direct}");
+    assert_eq!(provenance["offchain"]["offchain__tiers"]["snapshots"], 1);
+    assert_eq!(
+        provenance["offchain"]["offchain__tiers"]["latest"],
+        hash.as_str()
+    );
+    let (_, again) = get_json(&rt, &sql("SELECT * FROM offchain__tiers")).await;
+    assert_eq!(again["cached"], true, "{again}");
+    assert_eq!(
+        again["provenance"]["reproducibility"], "snapshot",
+        "{again}"
+    );
+
+    let (_, through) = get_json(&rt, &sql("SELECT * FROM by_tier")).await;
+    assert_eq!(
+        through["provenance"]["reproducibility"], "snapshot",
+        "{through}"
+    );
+    assert_eq!(
+        through["provenance"]["entities"][0]["reproducibility"],
+        "snapshot"
+    );
+
+    let (_, derived) = get_json(&rt, "/derived").await;
+    assert_eq!(
+        derived["entities"][0]["reproducibility"], "snapshot",
+        "{derived}"
+    );
+
+    let (_, chain) = get_json(&rt, &sql("SELECT count(*) AS n FROM usdc__transfer")).await;
+    assert!(
+        chain["provenance"].get("reproducibility").is_none(),
+        "{chain}"
+    );
+    assert!(chain["provenance"].get("offchain").is_none(), "{chain}");
+
+    // A catalogue survey defines every view, offchain ones included, but reads none of their rows.
+    let (status, survey) = get_json(
+        &rt,
+        &sql("SELECT count(*) AS n FROM information_schema.tables"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{survey}");
+    assert_eq!(survey["count"], 1, "{survey}");
+    assert!(
+        survey["provenance"].get("reproducibility").is_none(),
+        "{survey}"
+    );
+
+    let (_, schema) = get_json(&rt, "/schema").await;
+    let doc = schema["raw"].as_str().unwrap_or_default();
+    assert!(
+        doc.contains("reads offchain__tiers: reproducible by snapshot"),
+        "{doc}"
+    );
+    shutdown_and_settle(rt).await;
+}
+
+/// #1437's proof. Sealed chain facts, a hot tail, and two append-only price snapshots: after each
+/// snapshot the maintained relation must equal DuckDB's answer to the same SQL over the same sealed,
+/// hot and offchain inputs. The second snapshot both adds a group and changes an existing one, and it
+/// lands before two windows, so re-feeding it on the second would double it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offchain_entity_equals_duckdb_after_each_appended_snapshot() {
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    const PRICED: &str = r#"
+[[entities]]
+name = "priced"
+query = "SELECT p.symbol, SUM(x.value * p.price_e8) AS usd_e8 FROM usdc__transfer x JOIN offchain__prices p ON x.address = p.token GROUP BY p.symbol"
+key = ["symbol"]
+max_rows = 10000
+"#;
+    const REFERENCE: &str = "SELECT p.symbol AS k, SUM(x.value_dec * p.price_e8) AS v \
+         FROM usdc__transfer x JOIN offchain__prices p ON x.address = p.token GROUP BY p.symbol";
+    const MAINTAINED: &str = "SELECT symbol AS k, usd_e8 AS v FROM priced";
+
+    let dir = tempfile::tempdir().unwrap();
+    let token = USDC.to_ascii_lowercase();
+    let prices = |name: &str, rows: &[(&str, i64)]| {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("token", DataType::Utf8, false),
+                Field::new("symbol", DataType::Utf8, false),
+                Field::new("price_e8", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![token.as_str(); rows.len()])),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let path = dir.path().join(format!("{name}.parquet"));
+        std::fs::write(&path, bytes).unwrap();
+        nuthatch::offchain::drop_file(dir.path(), &path, "prices").unwrap();
+    };
+    let agree = |step: &str, maintained: &[(String, String)], reference: &[(String, String)]| {
+        assert!(
+            !reference.is_empty(),
+            "{step}: the reference is empty, so it proves nothing"
+        );
+        assert_eq!(
+            maintained, reference,
+            "{step}: the entity and DuckDB disagree"
+        );
+    };
+
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=10u64 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(10);
+    prices("first", &[("USDC", 100_000_000)]);
+    let first = spawn_declared(dir.path(), tape.clone(), 10, PRICED).await;
+    shutdown_and_settle(first).await;
+    {
+        let store = nuthatch::store::Store::open(&dir.path().join("nuthatch.redb")).unwrap();
+        let rows = store.entities_in_range(1, 8).unwrap();
+        assert_eq!(
+            rows.len(),
+            8,
+            "fixture must hold [1,8] hot before we seal it"
+        );
+        nuthatch::seal::seal_range(dir.path(), &rows, 1, 8)
+            .unwrap()
+            .expect("range holds rows");
+        store
+            .prune_and_set_meta(1, 8, "sealed_through", "8")
+            .unwrap();
+        assert!(store.entities_in_range(1, 8).unwrap().is_empty());
+    }
+
+    for b in 11..=12u64 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(12);
+    let rt = spawn_declared(dir.path(), tape.clone(), 12, PRICED).await;
+    assert_eq!(
+        rt.state.store.sealed_through(),
+        8,
+        "the chain facts are sealed"
+    );
+    rt.state.entities[0].flush();
+    let one = sql_pairs(&rt, MAINTAINED).await;
+    agree(
+        "after the first snapshot",
+        &one,
+        &sql_pairs(&rt, REFERENCE).await,
+    );
+
+    prices("second", &[("USDC", 100_010_000), ("USDCe", 99_990_000)]);
+    for b in 13..=16u64 {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(16);
+    let entity = &rt.state.entities[0];
+    let applied = wait_until(POLL_TIMEOUT, || {
+        let (_, a) = entity.len_and_watermark();
+        a.through == 16 && a.offchain.get("prices").is_some_and(|m| m.snapshots == 2)
+    })
+    .await;
+    assert!(applied, "the second snapshot never reached the entity");
+    entity.flush();
+    let two = sql_pairs(&rt, MAINTAINED).await;
+    agree(
+        "after the second snapshot",
+        &two,
+        &sql_pairs(&rt, REFERENCE).await,
+    );
+    assert_ne!(
+        one, two,
+        "the second snapshot changed nothing, so the comparison is vacuous"
+    );
+    assert!(two.iter().any(|(k, _)| k == "USDCe"), "{two:?}");
+    shutdown_and_settle(rt).await;
 }
