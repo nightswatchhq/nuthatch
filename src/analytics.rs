@@ -288,7 +288,7 @@ fn new_spill_dir() -> Result<SpillDir> {
 
 /// RFC-0060 §5.6: what a `graph` build adds to every connection. A default build adds nothing, so its
 /// connections behave exactly as they did before the feature existed.
-pub(crate) fn register_extensions(conn: &Connection) -> Result<()> {
+fn register_extensions(conn: &Connection) -> Result<()> {
     #[cfg(feature = "graph")]
     {
         crate::analytics_scalars::register(conn)?;
@@ -2202,7 +2202,7 @@ pub(crate) fn view_name(create_view_sql: &str) -> Option<String> {
 /// a view body that will not parse, and for any `…__children` name: those views are built by
 /// `define_children_views` after this point, out of factory tables enumerated from the config, and
 /// working out which ones here would be a second copy of that logic to keep in step.
-pub(crate) fn reachable_tables(
+fn reachable_tables(
     conn: &Connection,
     dir: &Path,
     referenced: &std::collections::BTreeSet<String>,
@@ -2251,10 +2251,7 @@ pub(crate) fn nest_view_bodies(dir: &Path) -> std::collections::BTreeMap<String,
 
 /// The base tables a statement reads, lowercased. The security walk collects the same set for the
 /// caller's own query; this is for SQL we hand ourselves, like a view's stored definition.
-pub(crate) fn base_tables_in(
-    conn: &Connection,
-    sql: &str,
-) -> Option<std::collections::BTreeSet<String>> {
+fn base_tables_in(conn: &Connection, sql: &str) -> Option<std::collections::BTreeSet<String>> {
     table_refs_in(conn, sql, "BASE_TABLE")
 }
 
@@ -2728,7 +2725,7 @@ pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> 
 /// view, or a view that could not be defined at all. Every reduction below is already logged, but a
 /// log is not reachable by the caller who is about to sum the reduced column, so the same decision is
 /// handed back as data and rides out on [`QueryOutput::degraded_tables`] (#435).
-pub(crate) fn define_views(
+fn define_views(
     conn: &Connection,
     dir: &Path,
     hot: &HotRows,
@@ -3165,7 +3162,7 @@ fn json_to_duck(v: Option<&Value>, col: &str) -> DuckValue {
 /// `reachable_tables` already carries the intermediate view names in its closure, so a view a
 /// statement reaches through another view is still defined, in file order, before the one that
 /// reads it.
-pub(crate) fn define_nest_views(
+fn define_nest_views(
     conn: &Connection,
     dir: &Path,
     wanted: Option<&std::collections::BTreeSet<String>>,
@@ -3679,6 +3676,97 @@ pub fn entity_output_columns(
     let rows = stmt.query([])?;
     drop(rows);
     Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
+}
+
+/// RFC-0059: binds folds against the nest's surface without reading a row. It lives here so the
+/// engine stays inside this module (RFC-0042 §6): every method takes and returns plain data.
+#[cfg(feature = "folds")]
+pub(crate) struct FoldBinder {
+    conn: Connection,
+}
+
+#[cfg(feature = "folds")]
+impl FoldBinder {
+    pub(crate) fn new(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        register_extensions(&conn)?;
+        define_views(
+            &conn,
+            dir,
+            &HotRows::new(),
+            u64::MAX,
+            &Default::default(),
+            schema,
+            None,
+        )?;
+        define_nest_views(&conn, dir, None);
+        Ok(Self { conn })
+    }
+
+    /// Every table and view currently defined, lowercased.
+    pub(crate) fn relations(&self) -> Result<std::collections::BTreeSet<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT lower(view_name) FROM duckdb_views() WHERE NOT internal")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The statement's top-level node type, or the parser's error.
+    pub(crate) fn statement_kinds(&self, sql: &str) -> Result<Vec<String>> {
+        let literal = format!("'{}'", sql.replace('\'', "''"));
+        let ast: String =
+            self.conn
+                .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+                    r.get(0)
+                })?;
+        let ast: Value = serde_json::from_str(&ast)?;
+        if ast.get("error").and_then(Value::as_bool) == Some(true) {
+            bail!(
+                "does not parse: {}",
+                ast.get("error_message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+        Ok(ast
+            .pointer("/statements")
+            .and_then(Value::as_array)
+            .map(|s| {
+                s.iter()
+                    .filter_map(|st| st.pointer("/node/type").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn base_tables(&self, sql: &str) -> Option<std::collections::BTreeSet<String>> {
+        base_tables_in(&self.conn, sql)
+    }
+
+    pub(crate) fn reachable(
+        &self,
+        dir: &Path,
+        referenced: &std::collections::BTreeSet<String>,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        reachable_tables(&self.conn, dir, referenced)
+    }
+
+    pub(crate) fn refusals(&self, sql: &str) -> Vec<crate::graft::Refusal> {
+        crate::graft::static_refusals(&crate::graft::canonical_plan(&self.conn, sql))
+    }
+
+    /// `(column, type)` of a query's output, as DuckDB spells the type.
+    pub(crate) fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(&format!("DESCRIBE {sql}"))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub(crate) fn execute(&self, sql: &str) -> Result<()> {
+        Ok(self.conn.execute_batch(sql)?)
+    }
 }
 
 /// The table name out of a DuckDB catalog error, if that is what this is.

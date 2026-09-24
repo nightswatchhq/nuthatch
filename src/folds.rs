@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use duckdb::Connection;
 use serde::Deserialize;
 
 use crate::analytics;
@@ -139,11 +138,8 @@ impl FoldSet {
             }
         }
 
-        let conn = binding_surface(dir, schema)?;
-        let surface: BTreeSet<String> = conn
-            .prepare("SELECT lower(view_name) FROM duckdb_views() WHERE NOT internal")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<_, _>>()?;
+        let binder = analytics::FoldBinder::new(dir, schema)?;
+        let surface = binder.relations()?;
         let view_bodies = analytics::nest_view_bodies(dir);
 
         let mut set = FoldSet::default();
@@ -155,7 +151,7 @@ impl FoldSet {
                 .with_context(|| format!("{at} has no [[fold]] in {FOLDS_DIR}/{FOLDS_TOML}"))?;
             let sql = std::fs::read_to_string(root.join(file))?;
             let fold = load_one(
-                &conn,
+                &binder,
                 dir,
                 &surface,
                 &view_bodies,
@@ -166,7 +162,7 @@ impl FoldSet {
                 sql,
             )?;
             // Later folds bind against this one at `hi`, and against its carry.
-            conn.execute_batch(&format!(
+            binder.execute(&format!(
                 "CREATE TABLE \"{0}\" AS {1}; CREATE TABLE \"{0}__carry\" AS {1};",
                 fold.name,
                 empty_relation(&fold.carry)
@@ -180,23 +176,6 @@ impl FoldSet {
     }
 }
 
-/// The nest's fact tables and authored views, with no hot rows. No row is read to bind.
-fn binding_surface(dir: &Path, schema: &[TableSchema]) -> Result<Connection> {
-    let conn = Connection::open_in_memory()?;
-    analytics::register_extensions(&conn)?;
-    analytics::define_views(
-        &conn,
-        dir,
-        &analytics::HotRows::new(),
-        u64::MAX,
-        &Default::default(),
-        schema,
-        None,
-    )?;
-    analytics::define_nest_views(&conn, dir, None);
-    Ok(conn)
-}
-
 fn empty_relation(cols: &[(String, String)]) -> String {
     let select: Vec<String> = cols
         .iter()
@@ -207,7 +186,7 @@ fn empty_relation(cols: &[(String, String)]) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn load_one(
-    conn: &Connection,
+    binder: &analytics::FoldBinder,
     dir: &Path,
     surface: &BTreeSet<String>,
     view_bodies: &BTreeMap<String, String>,
@@ -226,38 +205,21 @@ fn load_one(
 
     // Exactly one SELECT, parsed. SQL that will not parse cannot be checked for volatility, so it is
     // refused rather than waved through.
-    let literal = format!("'{}'", sql.replace('\'', "''"));
-    let ast: String = conn
-        .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-            r.get(0)
-        })
-        .with_context(|| format!("{at}: parsing"))?;
-    let ast: serde_json::Value = serde_json::from_str(&ast)?;
-    if ast.get("error").and_then(serde_json::Value::as_bool) == Some(true) {
-        bail!(
-            "{at}: does not parse: {}",
-            ast.get("error_message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown error")
-        );
-    }
-    if ast
-        .pointer("/statements")
-        .and_then(serde_json::Value::as_array)
-        .is_none_or(|s| s.len() != 1)
-        || !matches!(
-            ast.pointer("/statements/0/node/type")
-                .and_then(serde_json::Value::as_str),
-            Some("SELECT_NODE" | "SET_OPERATION_NODE")
-        )
-    {
+    let kinds = binder
+        .statement_kinds(&sql)
+        .with_context(|| at.to_string())?;
+    if !matches!(
+        kinds.as_slice(),
+        [k] if k == "SELECT_NODE" || k == "SET_OPERATION_NODE"
+    ) {
         bail!("{at}: a fold is exactly one SELECT");
     }
     analytics::reject_file_access(&sql).with_context(|| at.to_string())?;
     analytics::reject_replacement_scan(&sql).with_context(|| at.to_string())?;
 
     // What it reads. A fold whose inputs cannot be enumerated cannot be content-addressed.
-    let referenced = analytics::base_tables_in(conn, &sql)
+    let referenced = binder
+        .base_tables(&sql)
         .with_context(|| format!("{at}: cannot enumerate the tables it reads"))?;
     let mut deps = BTreeSet::new();
     let mut direct = BTreeSet::new();
@@ -275,7 +237,7 @@ fn load_one(
         }
         direct.insert(t.clone());
     }
-    let reaches = analytics::reachable_tables(conn, dir, &direct).with_context(|| {
+    let reaches = binder.reachable(dir, &direct).with_context(|| {
         format!(
             "{at}: cannot enumerate what it reads through views \
              (factory `__children` views are not bound inside a fold)"
@@ -298,13 +260,12 @@ fn load_one(
         }
     }
     for (what, text) in &sources {
-        let plan = crate::graft::canonical_plan(conn, text);
-        if let Some(r) = crate::graft::static_refusals(&plan).first() {
+        if let Some(r) = binder.refusals(text).first() {
             bail!("{at}: {what} {r}; a checkpoint must be reproducible");
         }
     }
 
-    let carry = declared_carry(conn, at, &decl)?;
+    let carry = declared_carry(binder, at, &decl)?;
     let key = match decl.key {
         KeyDecl::Word(w) if w == "singleton" => FoldKey::Singleton,
         KeyDecl::Word(w) if w == "unkeyed" => FoldKey::Unkeyed,
@@ -328,12 +289,14 @@ fn load_one(
     }
 
     // The output is the carry: same names, same types, same order. Bound with its own carry in place.
-    conn.execute_batch(&format!(
+    binder.execute(&format!(
         "CREATE OR REPLACE TEMP VIEW \"{carry_name}\" AS {}",
         empty_relation(&carry)
     ))?;
-    let output = describe(conn, &sql).with_context(|| format!("{at}: does not bind"))?;
-    conn.execute_batch(&format!("DROP VIEW \"{carry_name}\""))?;
+    let output = binder
+        .describe(&sql)
+        .with_context(|| format!("{at}: does not bind"))?;
+    binder.execute(&format!("DROP VIEW \"{carry_name}\""))?;
     if output != carry {
         bail!("{at}: {}", schema_mismatch(&carry, &output));
     }
@@ -350,7 +313,11 @@ fn load_one(
     })
 }
 
-fn declared_carry(conn: &Connection, at: &str, decl: &FoldDecl) -> Result<Vec<(String, String)>> {
+fn declared_carry(
+    binder: &analytics::FoldBinder,
+    at: &str,
+    decl: &FoldDecl,
+) -> Result<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();
     for spec in &decl.carry {
         let (col, ty) = spec
@@ -364,7 +331,8 @@ fn declared_carry(conn: &Connection, at: &str, decl: &FoldDecl) -> Result<Vec<(S
             bail!("{at}: carry column `{col}` is declared twice");
         }
         // DuckDB's own spelling, so `INT` and `INTEGER` compare equal.
-        let canonical = describe(conn, &format!("SELECT CAST(NULL AS {}) AS c", ty.trim()))
+        let canonical = binder
+            .describe(&format!("SELECT CAST(NULL AS {}) AS c", ty.trim()))
             .with_context(|| format!("{at}: carry column `{col}` has an unknown type `{ty}`"))?
             .remove(0)
             .1;
@@ -386,12 +354,6 @@ fn declared_carry(conn: &Connection, at: &str, decl: &FoldDecl) -> Result<Vec<(S
         bail!("{at}: an empty carry");
     }
     Ok(out)
-}
-
-fn describe(conn: &Connection, sql: &str) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(&format!("DESCRIBE {sql}"))?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 fn schema_mismatch(carry: &[(String, String)], output: &[(String, String)]) -> String {
