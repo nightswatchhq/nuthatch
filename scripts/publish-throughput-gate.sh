@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# RFC-0052 S2's throughput gate: `bench backfill` with and without a mirror publishing to MinIO behind
+# RFC-0052 S2's throughput gate: `bench backfill` with and without a mirror publishing to an S3 server (versitygw, #1492) behind
 # a Toxiproxy bandwidth limit, on the deterministic chain footprint-rpc.py serves. Four batches,
 # alternated so drift on the box lands on both arms. Results: docs/bench/publish-throttled.md.
 #
-# Needs minio, toxiproxy-server, toxiproxy-cli, python3, jq, and a curl with --aws-sigv4.
-# Env: BIN (target/release/nuthatch), MINIO (minio), RUNS (15), RATE_KB (1024), OUT (a temp dir)
+# Needs versitygw, toxiproxy-server, toxiproxy-cli, python3, jq, and a curl with --aws-sigv4.
+# Env: BIN (target/release/nuthatch), VERSITYGW (versitygw), RUNS (15), RATE_KB (1024), OUT (a temp dir)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/release/nuthatch}"
-MINIO="${MINIO:-minio}"
+VERSITYGW="${VERSITYGW:-versitygw}"
 RUNS="${RUNS:-15}"
 RATE_KB="${RATE_KB:-1024}"
 WORK="$(mktemp -d)"
 OUT="${OUT:-$WORK/out}"
 RPC_PORT=18545 MINIO_PORT=19000 PROXY_PORT=19001 TOXI_PORT=18474
 KEY=gateadmin SECRET=gateadmin-secret BUCKET=mirror
-mkdir -p "$OUT" "$WORK/minio-data" "$WORK/nest/abis"
+mkdir -p "$OUT" "$WORK/s3-data" "$WORK/nest/abis"
 
 pids=()
 cleanup() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
 python3 "$ROOT/.github/workflows/footprint-rpc.py" "$RPC_PORT" > "$OUT/rpc.log" 2>&1 & pids+=($!)
-MINIO_ROOT_USER=$KEY MINIO_ROOT_PASSWORD=$SECRET "$MINIO" server "$WORK/minio-data" \
-  --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:19002" > "$OUT/minio.log" 2>&1 & pids+=($!)
+ROOT_ACCESS_KEY=$KEY ROOT_SECRET_KEY=$SECRET "$VERSITYGW" --port "127.0.0.1:$MINIO_PORT" \
+  --health /health posix "$WORK/s3-data" > "$OUT/s3.log" 2>&1 & pids+=($!)
 toxiproxy-server -host 127.0.0.1 -port "$TOXI_PORT" > "$OUT/toxiproxy.log" 2>&1 & pids+=($!)
 
 wait_for() {
@@ -32,7 +32,7 @@ wait_for() {
   exit 1
 }
 wait_for "curl -fsS -X POST -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}' 127.0.0.1:$RPC_PORT"
-wait_for "curl -fsS 127.0.0.1:$MINIO_PORT/minio/health/live"
+wait_for "curl -fsS 127.0.0.1:$MINIO_PORT/health"
 wait_for "curl -fsS 127.0.0.1:$TOXI_PORT/version"
 
 sign=(--aws-sigv4 "aws:amz:us-east-1:s3" --user "$KEY:$SECRET")
@@ -79,8 +79,8 @@ common=(bench backfill --dir "$WORK/nest" --from 1 --to 20000 --runs "$RUNS" --s
 mirror=(--publish-target "s3://$BUCKET/gate")
 
 "$BIN" "${common[@]}" --label "publish gate: no mirror (a)" --out "$OUT/baseline-a.json" > "$OUT/baseline-a.log" 2>&1
-"$BIN" "${common[@]}" "${mirror[@]}" --label "publish gate: MinIO at ${RATE_KB} KB/s (a)" --out "$OUT/publish-a.json" > "$OUT/publish-a.log" 2>&1
-"$BIN" "${common[@]}" "${mirror[@]}" --label "publish gate: MinIO at ${RATE_KB} KB/s (b)" --out "$OUT/publish-b.json" > "$OUT/publish-b.log" 2>&1
+"$BIN" "${common[@]}" "${mirror[@]}" --label "publish gate: S3 at ${RATE_KB} KB/s (a)" --out "$OUT/publish-a.json" > "$OUT/publish-a.log" 2>&1
+"$BIN" "${common[@]}" "${mirror[@]}" --label "publish gate: S3 at ${RATE_KB} KB/s (b)" --out "$OUT/publish-b.json" > "$OUT/publish-b.log" 2>&1
 "$BIN" "${common[@]}" --label "publish gate: no mirror (b)" --out "$OUT/baseline-b.json" > "$OUT/baseline-b.log" 2>&1
 
 for f in baseline-a publish-a publish-b baseline-b; do

@@ -25,11 +25,13 @@
 //!
 //! ## Running it
 //!
-//! Needs a MinIO (or other S3-compatible store) with an existing bucket:
+//! Needs an S3-compatible store that enforces conditional writes, with an existing bucket. CI uses
+//! versitygw (#1492; open-source MinIO was withdrawn upstream):
 //!
 //! ```sh
-//! docker run -d -p 9000:9000 -e MINIO_ROOT_USER=nuthatch -e MINIO_ROOT_PASSWORD=nuthatch-minio \
-//!   quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+//! docker run -d -p 9000:9000 -v /data -e ROOT_ACCESS_KEY=nuthatch -e ROOT_SECRET_KEY=nuthatch-minio \
+//!   versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
+//!   --port :9000 --health /health posix /data
 //! aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://nuthatch-publish-test
 //! NUTHATCH_MINIO_ENDPOINT=http://127.0.0.1:9000 AWS_ENDPOINT=http://127.0.0.1:9000 \
 //!   AWS_ACCESS_KEY_ID=nuthatch AWS_SECRET_ACCESS_KEY=nuthatch-minio AWS_REGION=us-east-1 \
@@ -262,4 +264,75 @@ async fn sync_and_verify_against_a_real_s3_compatible_store() {
         vec!["publish.json".to_string()],
         "a second sync against MinIO must upload nothing but the envelope"
     );
+}
+
+/// #1492: the catalogue's compare-and-swap is only as good as the store's enforcement of
+/// `If-None-Match` and `If-Match`, and the sync test above cannot see it: `ObjMirror`'s in-process
+/// lock means one process never reaches the server's 412. Garage and Zenko CloudServer answer both
+/// violations with a 200, and every other e2e test passed against CloudServer.
+#[tokio::test]
+async fn the_store_enforces_conditional_writes() {
+    use object_store::{
+        path::Path as ObjPath, Error, ObjectStore, PutMode, PutOptions, UpdateVersion,
+    };
+    use std::sync::Arc;
+    let Some(_) = endpoint() else { return };
+    let url = url::Url::parse(&format!("s3://{}", bucket())).expect("parse bucket url");
+    let opts = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v));
+    let (store, _) = object_store::parse_url_opts(&url, opts).expect("open S3 client");
+    let store: Arc<dyn ObjectStore> = Arc::from(store);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let key = ObjPath::from(format!("conditional-{nanos}/catalogue"));
+    let put = |mode: PutMode, body: &'static str| {
+        let (store, key) = (store.clone(), key.clone());
+        async move {
+            let opts = PutOptions {
+                mode,
+                ..Default::default()
+            };
+            store.put_opts(&key, body.into(), opts).await
+        }
+    };
+
+    let first = put(PutMode::Create, "v1").await.expect("create a new key");
+    match put(PutMode::Create, "v1-again").await {
+        Err(Error::AlreadyExists { .. }) => {}
+        other => panic!("a second create must be refused as AlreadyExists, got {other:?}"),
+    }
+    let stale = UpdateVersion {
+        e_tag: first.e_tag.clone(),
+        version: None,
+    };
+    put(PutMode::Update(stale.clone()), "v2")
+        .await
+        .expect("update with the current etag");
+    match put(PutMode::Update(stale), "v3").await {
+        Err(Error::Precondition { .. }) => {}
+        other => {
+            panic!("an update with a stale etag must be refused as Precondition, got {other:?}")
+        }
+    }
+
+    // Racing writers on one etag: exactly one may win, or two publishers can both think they own
+    // the catalogue.
+    let current = store.head(&key).await.expect("head").e_tag;
+    let racers = (0..16).map(|_| {
+        put(
+            PutMode::Update(UpdateVersion {
+                e_tag: current.clone(),
+                version: None,
+            }),
+            "race",
+        )
+    });
+    let wins = futures::future::join_all(racers)
+        .await
+        .iter()
+        .filter(|r| r.is_ok())
+        .count();
+    assert_eq!(wins, 1, "{wins} of 16 racing updates on one etag won");
+    let _ = store.delete(&key).await;
 }
