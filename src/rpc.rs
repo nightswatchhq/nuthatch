@@ -673,6 +673,8 @@ pub struct RpcClient {
     http: reqwest::Client,
     urls: Vec<String>,
     cursor: AtomicUsize,
+    /// `urls[..primaries]` share the load; the rest are asked only while every primary is cooling down.
+    primaries: usize,
     /// Per-endpoint health: the millis-since-epoch until which the endpoint is considered unhealthy
     /// (`0` = healthy). Set on a failed call, cleared on a successful one. Endpoints past their cooldown
     /// are tried first; still-unhealthy ones are the fallback of last resort (soonest-to-recover first).
@@ -699,11 +701,13 @@ impl RpcClient {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .context("failed to build HTTP client")?;
+        let n = urls.len();
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             http,
             urls,
             cursor: AtomicUsize::new(0),
+            primaries: n,
             health,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
@@ -715,17 +719,35 @@ impl RpcClient {
         self.requests.load(Ordering::Relaxed)
     }
 
-    /// The order to try endpoints for this call: healthy ones first (round-robin from the cursor for
-    /// fairness), then any still in cooldown as a last resort (soonest-to-recover first). Advances the
-    /// round-robin cursor once per call.
+    /// A pool whose `fallback` endpoints carry no load while any of `primary` is healthy: a free
+    /// endpoint in front of a paid one, say. Fallbacks already in `primary` are dropped.
+    pub fn with_fallbacks(primary: Vec<String>, fallback: Vec<String>) -> Result<Self> {
+        let primaries = primary.len();
+        let mut urls = primary;
+        for url in fallback {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        let mut client = Self::new(urls)?;
+        if primaries > 0 {
+            client.primaries = primaries;
+        }
+        Ok(client)
+    }
+
+    /// The order to try endpoints for this call: healthy primaries first (round-robin from the cursor
+    /// for fairness), then healthy fallbacks in the order given, then any still in cooldown as a last
+    /// resort (soonest-to-recover first). Advances the round-robin cursor once per call.
     fn endpoint_order(&self) -> Vec<usize> {
         let n = self.urls.len();
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let p = self.primaries;
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % p;
         let now = now_millis();
         let mut healthy = Vec::with_capacity(n);
         let mut cooling = Vec::with_capacity(n);
         for i in 0..n {
-            let j = (start + i) % n;
+            let j = if i < p { (start + i) % p } else { i };
             let until = self.health[j].load(Ordering::Relaxed);
             if until <= now {
                 healthy.push(j);
@@ -2324,7 +2346,11 @@ mod tests {
         c.get_logs(&[], &["0x01".into()], 10, 13).await.unwrap();
         let got = c.block_timestamps(&[10, 11]).await.unwrap();
         assert_eq!(got, HashMap::from([(10, 1_000), (11, 1_012)]));
-        assert_eq!(HEADERS.load(Ordering::SeqCst), 0, "the logs already said when");
+        assert_eq!(
+            HEADERS.load(Ordering::SeqCst),
+            0,
+            "the logs already said when"
+        );
 
         // A log without the field, and a removed one, still go to the header.
         let got = c.block_timestamps(&[12, 13]).await.unwrap();
@@ -2683,6 +2709,31 @@ mod tests {
             }
         }
         assert!(seen_first, "a recovered endpoint rejoins the round-robin");
+    }
+
+    #[test]
+    fn a_fallback_carries_no_load_while_a_primary_is_healthy() {
+        let c =
+            RpcClient::with_fallbacks(v(["http://a", "http://b"]), v(["http://paid", "http://a"]))
+                .unwrap();
+        assert_eq!(
+            c.urls.len(),
+            3,
+            "a fallback already in the pool is not added twice"
+        );
+        for _ in 0..4 {
+            let order = c.endpoint_order();
+            assert!(order[..2].contains(&0) && order[..2].contains(&1));
+            assert_eq!(order[2], 2);
+        }
+        c.mark_unhealthy(0);
+        assert_eq!(c.endpoint_order(), vec![1, 2, 0]);
+        c.mark_unhealthy(1);
+        assert_eq!(
+            c.endpoint_order()[0],
+            2,
+            "every primary cooling: the fallback answers"
+        );
     }
 
     #[test]

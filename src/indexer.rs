@@ -61,7 +61,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // touching the nest's config on disk.
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
     let endpoint_count = rpc_urls.len();
-    let rpc = RpcClient::new(rpc_urls)?;
+    let rpc = RpcClient::with_fallbacks(rpc_urls, args.rpc_fallback.clone())?;
     // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a
     // wrong-network endpoint in the pool corrupts silently, because failover hides it.
     rpc.verify_chain_ids(config.nest.chain_id).await?;

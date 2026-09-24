@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
                     dir,
                     args.listen,
                     args.rpc,
+                    args.rpc_fallback,
                     args.backfill,
                     args.seal_direct,
                     args.concurrency,

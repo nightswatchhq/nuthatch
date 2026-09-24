@@ -1595,6 +1595,7 @@ pub async fn dev(
     dir: PathBuf,
     listen: String,
     rpc_override: Vec<String>,
+    rpc_fallback: Vec<String>,
     backfill: Option<u64>,
     seal_direct: bool,
     concurrency: usize,
@@ -1692,9 +1693,9 @@ pub async fn dev(
 
     // `--rpc` is ambiguous once a runtime spans chains (which chain would it override?). Allow it only for
     // a single-chain runtime; a multichain runtime sets rpc_urls per chain under [[chains]].
-    if !rpc_override.is_empty() && groups.len() > 1 {
+    if !(rpc_override.is_empty() && rpc_fallback.is_empty()) && groups.len() > 1 {
         bail!(
-            "--rpc is ambiguous for a multichain runtime ({} chains) - set rpc_urls per chain under [[chains]]",
+            "--rpc and --rpc-fallback are ambiguous for a multichain runtime ({} chains) - set rpc_urls per chain under [[chains]]",
             groups.len()
         );
     }
@@ -1802,7 +1803,7 @@ pub async fn dev(
         // Verify the whole pool is on THIS chain first (issue #150). It matters more in a runtime than
         // solo: with several chains in one runtime, pasting one chain's endpoint under another's
         // `[[chains]]` entry is an easy slip, and failover would mask it indefinitely.
-        let rpc = RpcClient::new(rpc_urls)?;
+        let rpc = RpcClient::with_fallbacks(rpc_urls, rpc_fallback.clone())?;
         rpc.verify_chain_ids(group.endpoint.chain_id)
             .await
             .with_context(|| {

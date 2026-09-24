@@ -1419,6 +1419,12 @@ pub struct DevArgs {
     #[arg(long)]
     pub rpc: Vec<String>,
 
+    /// Endpoint(s) asked only while every other endpoint is failing (repeatable): a paid key kept
+    /// behind free public endpoints, so it bills only for the calls they could not answer. A flag
+    /// rather than config, because a keyed URL does not belong in the nest.
+    #[arg(long = "rpc-fallback", value_name = "URL")]
+    pub rpc_fallback: Vec<String>,
+
     /// Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a
     /// nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start
     /// blocks, else from a default recent window.
