@@ -3802,6 +3802,17 @@ impl FoldBinder {
         crate::graft::static_refusals(&crate::graft::canonical_plan(&self.conn, sql))
     }
 
+    /// The canonical plan, so formatting alone never changes a fold's identity.
+    pub(crate) fn plan_text(&self, sql: &str) -> String {
+        match crate::graft::canonical_plan(&self.conn, sql) {
+            crate::graft::CanonicalPlan::Ast(s) | crate::graft::CanonicalPlan::RawText(s) => s,
+        }
+    }
+
+    pub(crate) fn engine_version(&self) -> String {
+        crate::graft::engine_version(&self.conn)
+    }
+
     /// `(column, type)` of a query's output, as DuckDB spells the type.
     pub(crate) fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(&format!("DESCRIBE {sql}"))?;

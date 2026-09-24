@@ -42,6 +42,9 @@ pub struct Fold {
     pub reaches: BTreeSet<String>,
     /// Earlier folds this one reads, at `hi` or through their carry.
     pub deps: BTreeSet<String>,
+    /// RFC-0059 §5 `fold_hash`: the content address of everything that decides this fold's output
+    /// for a given set of facts. Its checkpoints live under `checkpoints/<hash>/`.
+    pub hash: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -405,6 +408,35 @@ fn load_one(
         bail!("{at}: {}", schema_mismatch(&carry, &output));
     }
 
+    // Identity: the plan, the declaration, every view and fact schema it reads, the folds it reads,
+    // the engine, and the scalar set a graph build registers. `max_rows` changes no output.
+    let mut h = Sha256::new();
+    let mut part = |label: &str, text: &str| {
+        h.update(label.as_bytes());
+        h.update((text.len() as u64).to_le_bytes());
+        h.update(text.as_bytes());
+    };
+    part("v", "nuthatch-fold-v1");
+    part("plan", &binder.plan_text(&sql));
+    part("key", &format!("{key:?}"));
+    part("carry", &format!("{carry:?}"));
+    for t in &reaches {
+        match view_bodies.get(t) {
+            Some(body) => part(&format!("view:{t}"), &binder.plan_text(body)),
+            None => part(
+                &format!("table:{t}"),
+                &format!("{:?}", binder.describe(&format!("SELECT * FROM \"{t}\""))?),
+            ),
+        }
+    }
+    for d in &deps {
+        let dep = earlier.folds.iter().find(|f| &f.name == d).expect("a dep is an earlier fold");
+        part(&format!("fold:{d}"), &dep.hash);
+    }
+    part("engine", &binder.engine_version());
+    part("scalars", if cfg!(feature = "graph") { "graph" } else { "core" });
+    let hash = hex::encode(h.finalize());
+
     Ok(Fold {
         name,
         file: String::new(),
@@ -414,6 +446,7 @@ fn load_one(
         max_rows: decl.max_rows,
         reaches,
         deps,
+        hash,
     })
 }
 
