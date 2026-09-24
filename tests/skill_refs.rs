@@ -282,6 +282,9 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // RFC-0060: `graph/history.toml`, the Graph history read policy. Operator config, but only a
     // `graph` build reads it; see its entries in KNOWN_UNDOCUMENTED.
     ("src/graph_history.rs", Some(&["Policy"])),
+    // RFC-0059: `folds/folds.toml`, authored nest config that only a `folds` build reads; see its
+    // entries in KNOWN_UNDOCUMENTED.
+    ("src/folds.rs", Some(&["FoldsToml", "FoldDecl"])),
 ];
 
 /// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not
@@ -381,6 +384,11 @@ const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
     ("Policy.first_block", "`graph/history.toml`, which only a `graph` build reads (RFC-0060 §5.6)"),
     ("Policy.max_head_age_seconds", "`graph/history.toml`, which only a `graph` build reads (RFC-0060 §5.6)"),
     ("Policy.max_block_distance", "`graph/history.toml`, which only a `graph` build reads (RFC-0060 §5.6)"),
+    ("FoldsToml.fold", "`folds/folds.toml`, which only a `folds` build reads (RFC-0059 packaging)"),
+    ("FoldDecl.name", "`folds/folds.toml`, which only a `folds` build reads (RFC-0059 packaging)"),
+    ("FoldDecl.key", "`folds/folds.toml`, which only a `folds` build reads (RFC-0059 packaging)"),
+    ("FoldDecl.carry", "`folds/folds.toml`, which only a `folds` build reads (RFC-0059 packaging)"),
+    ("FoldDecl.max_rows", "`folds/folds.toml`, which only a `folds` build reads (RFC-0059 packaging)"),
     // `Config.extract` is documented now (RFC-0038 §5 added `top_level_calls`, which works on
     // ordinary RPC), so its excuse is gone. The node-gated fields below keep theirs.
     ("Extract.blocks", "field of `[extract]`; sourceable from ordinary RPC (RFC-0036) but not yet written up"),
