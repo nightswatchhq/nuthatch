@@ -118,6 +118,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--ipfs <IPFS>` - IPFS gateway(s) or a local node for resolving declared `[[ipfs]]` documents (repeatable)
 - `--state-rpc <STATE_RPC>` - Archive endpoint(s) for resolving declared `[[calls]]` - RFC-0023 tier 3 (repeatable)
 - `--rpc <RPC>` - Use only these `rpc_urls` at runtime without editing the config (repeatable). Point at your own node
+- `--rpc-fallback <RPC_FALLBACK>` - Endpoint(s) asked only while every other endpoint is failing (repeatable): a paid key kept behind free public endpoints, so it bills only for the calls they could not answer. A flag rather than config, because a keyed URL does not belong in the nest
 - `--backfill <BACKFILL>` - Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start blocks, else from a default recent window
 - `--seal-direct` - Backfill finalized history straight to Parquet (skip the hot store) before tip-following. Prerequisite for `--concurrency` pipelining, which is where the measured speedup is; the storage path alone is not "faster" - see `docs/benchmarks.md`. The near-tip window still uses the hot path; the IVM view is rebuilt from the sealed segments
 - `--concurrency <CONCURRENCY>` - Concurrent window fetches during the seal-direct history backfill (overlaps RPC latency). Try 8-16 against your own node; keep low on rate-limited public RPC
