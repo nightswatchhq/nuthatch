@@ -3822,6 +3822,8 @@ pub(crate) struct FoldEvaluator {
     dir: PathBuf,
     schema: Vec<crate::registry::TableSchema>,
     views_defined: bool,
+    /// Views defined inside the open transaction: a rollback removes them, so the flag goes too.
+    views_pending: bool,
 }
 
 #[cfg(feature = "folds")]
@@ -3834,6 +3836,7 @@ impl FoldEvaluator {
             dir: dir.to_path_buf(),
             schema: schema.to_vec(),
             views_defined: false,
+            views_pending: false,
         })
     }
 
@@ -3871,6 +3874,26 @@ impl FoldEvaluator {
         if !self.views_defined {
             define_nest_views(&self.conn, &self.dir, Some(wanted));
             self.views_defined = true;
+            self.views_pending = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin(&mut self) -> Result<()> {
+        Ok(self.conn.execute_batch("BEGIN TRANSACTION")?)
+    }
+
+    pub(crate) fn commit(&mut self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        self.views_pending = false;
+        Ok(())
+    }
+
+    pub(crate) fn rollback(&mut self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        if self.views_pending {
+            self.views_defined = false;
+            self.views_pending = false;
         }
         Ok(())
     }

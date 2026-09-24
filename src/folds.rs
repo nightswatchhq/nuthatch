@@ -215,15 +215,15 @@ impl Stepper<'_> {
                 bail!("a fold steps forward: {hi} is not after {lo}");
             }
         }
-        self.eval.execute("BEGIN TRANSACTION")?;
+        self.eval.begin()?;
         match self.advance(hot, sealed_through, hi) {
             Ok(()) => {
-                self.eval.execute("COMMIT")?;
+                self.eval.commit()?;
                 self.at = Some(hi);
                 Ok(())
             }
             Err(e) => {
-                self.eval.execute("ROLLBACK")?;
+                self.eval.rollback()?;
                 Err(e)
             }
         }
@@ -798,6 +798,33 @@ mod stepping {
                 2,
                 "running advanced on a refused step"
             );
+        }
+    }
+
+    /// The views a first step defines roll back with it, so a retry has to define them again.
+    #[test]
+    fn a_refused_first_step_leaves_the_views_a_retry_needs() {
+        let (dir, hot) = corpus();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-recent.sql"),
+            "CREATE VIEW recent AS SELECT * FROM t;",
+        )
+        .unwrap();
+        fold_files(
+            dir.path(),
+            &[
+                ("10-running.sql", "SELECT CAST(count(*) AS UBIGINT) AS n FROM recent"),
+                ("20-keys.sql", "SELECT DISTINCT k FROM t"),
+            ],
+            "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n\
+             [[fold]]\nname = \"keys\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\"]\nmax_rows = 1\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        for attempt in 0..2 {
+            let err = format!("{:#}", s.step_to(&hot, 30, 30).unwrap_err());
+            assert!(err.contains("max_rows"), "attempt {attempt}: {err}");
         }
     }
 
