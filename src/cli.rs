@@ -150,6 +150,12 @@ pub enum Command {
     /// instrument, not part of the two-command story.
     #[command(hide = true)]
     GraphValidate(GraphValidateArgs),
+
+    /// Build checkpoints for a nest's folds over sealed history, or read a fold at a block
+    /// (RFC-0059). Hidden, and present only in a build with `--features folds`.
+    #[cfg(feature = "folds")]
+    #[command(hide = true, subcommand)]
+    Fold(FoldCommand),
 }
 
 #[derive(Debug, clap::Args)]
@@ -257,6 +263,28 @@ mod tests {
             visible.len()
         );
     }
+}
+
+#[cfg(feature = "folds")]
+#[derive(clap::Subcommand)]
+pub enum FoldCommand {
+    /// Walk sealed history from the latest checkpoint, checkpointing every fold about every
+    /// `--window-rows` sealed rows. Refuses while `dev` holds the nest.
+    Build {
+        #[arg(long, default_value = ".")]
+        dir: String,
+        #[arg(long, default_value_t = 2_000_000)]
+        window_rows: u64,
+    },
+    /// Print one fold's rows at a block as JSON lines, from the latest checkpoint at or before it.
+    Read {
+        #[arg(long, default_value = ".")]
+        dir: String,
+        #[arg(long)]
+        fold: String,
+        #[arg(long)]
+        at: u64,
+    },
 }
 
 #[derive(Args)]

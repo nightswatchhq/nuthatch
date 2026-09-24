@@ -598,6 +598,48 @@ impl FoldSet {
     }
 }
 
+/// `nuthatch fold ...`. Opens the store itself, so it refuses while `dev` holds the nest: in S1 this
+/// is the only writer of checkpoints.
+pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
+    use crate::cli::FoldCommand;
+    let dir = match &cmd {
+        FoldCommand::Build { dir, .. } | FoldCommand::Read { dir, .. } => {
+            std::path::PathBuf::from(dir)
+        }
+    };
+    let dir = dir.as_path();
+    let store = crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE))
+        .context("opening the nest's store (is `dev` running on it?)")?;
+    let sealed_through = store.sealed_through();
+    let set = FoldSet::load(dir, &[])?;
+    if set.folds.is_empty() {
+        bail!("{} has no folds/", dir.display());
+    }
+    match cmd {
+        FoldCommand::Build { window_rows, .. } => {
+            let cuts = set.build(dir, &[], sealed_through, window_rows)?;
+            match (cuts.first(), cuts.last()) {
+                (Some(a), Some(b)) => {
+                    println!(
+                        "checkpointed {} fold(s) at {} block(s), {a}..={b}",
+                        set.folds.len(),
+                        cuts.len()
+                    )
+                }
+                _ => println!("up to date through {sealed_through}"),
+            }
+        }
+        FoldCommand::Read { fold, at, .. } => {
+            let hot = store.hot_rows_by_table()?;
+            let s = set.read_at(dir, &[], &hot, sealed_through, at)?;
+            for row in s.rows(&fold)? {
+                println!("{row}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn empty_relation(cols: &[(String, String)]) -> String {
     let select: Vec<String> = cols
         .iter()
@@ -1439,5 +1481,54 @@ mod checkpoints_are_used {
             last[0].id, last[1].id,
             "different histories, so different ids"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli {
+    use super::stepping_support::*;
+    use super::*;
+    use crate::cli::FoldCommand;
+
+    /// The command path end to end over a real store: it reads the watermark from redb, builds, then
+    /// reads a block past the last checkpoint. It also holds redb's lock, like any other writer.
+    #[test]
+    fn fold_build_then_read_over_a_real_store() {
+        let (dir, _hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[("c.sql", "SELECT CAST(coalesce((SELECT max(n) FROM c__carry), 0) + count(*) AS UBIGINT) AS n FROM t")],
+            "[[fold]]\nname = \"c\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let db = dir.path().join(crate::config::DB_FILE);
+        crate::store::Store::open(&db)
+            .unwrap()
+            .set_meta("sealed_through", "30")
+            .unwrap();
+        let d = dir.path().display().to_string();
+        run(FoldCommand::Build {
+            dir: d.clone(),
+            window_rows: 10,
+        })
+        .unwrap();
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        assert_eq!(
+            set.latest_checkpoint(dir.path(), u64::MAX).unwrap(),
+            Some(30)
+        );
+        run(FoldCommand::Read {
+            dir: d.clone(),
+            fold: "c".into(),
+            at: 25,
+        })
+        .unwrap();
+
+        let _held = crate::store::Store::open(&db).unwrap();
+        let err = run(FoldCommand::Build {
+            dir: d,
+            window_rows: 10,
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("is `dev` running"), "{err:#}");
     }
 }

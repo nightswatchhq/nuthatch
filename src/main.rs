@@ -285,6 +285,8 @@ async fn main() -> Result<()> {
         }
         cli::Command::PortEmit(a) => nuthatch::port_emit::run(a),
         cli::Command::GraphValidate(a) => nuthatch::graph_validate::run(a).await,
+        #[cfg(feature = "folds")]
+        cli::Command::Fold(cmd) => nuthatch::folds::run(cmd),
         cli::Command::Migrate(a) => nuthatch::migrate::run(std::path::Path::new(&a.dir), a.dry_run, a.allow_breaking),
         cli::Command::Prune(a) => {
             nuthatch::prune::run(std::path::Path::new(&a.dir), a.yes)
