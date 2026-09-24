@@ -758,7 +758,13 @@ impl RpcClient {
                 .iter()
                 .take_while(|&&j| self.health[j].load(Ordering::Relaxed) <= now_millis())
                 .count();
-            order[..healthy].sort_by_key(|&j| self.heads[j].load(Ordering::Relaxed) < need);
+            // Tier before head: a fallback that holds `need` still waits behind every healthy primary.
+            order[..healthy].sort_by_key(|&j| {
+                (
+                    j >= self.primaries,
+                    self.heads[j].load(Ordering::Relaxed) < need,
+                )
+            });
         }
         order
     }
@@ -2844,6 +2850,17 @@ mod tests {
             2,
             "every primary cooling: the fallback answers"
         );
+    }
+
+    #[test]
+    fn a_fallback_ahead_of_the_primaries_still_waits_behind_them() {
+        let c = RpcClient::with_fallbacks(v(["http://a", "http://b"]), v(["http://paid"])).unwrap();
+        c.heads[0].store(99, Ordering::Relaxed);
+        c.heads[1].store(100, Ordering::Relaxed);
+        c.heads[2].store(100, Ordering::Relaxed);
+        for _ in 0..4 {
+            assert_eq!(c.endpoint_order_holding(Some(100)), vec![1, 0, 2]);
+        }
     }
 
     #[test]
