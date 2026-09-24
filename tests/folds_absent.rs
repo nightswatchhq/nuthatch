@@ -27,7 +27,11 @@ fn nest_with_folds() -> tempfile::TempDir {
 #[test]
 fn a_nest_shipping_folds_is_refused_not_served_without_them() {
     let dir = nest_with_folds();
+    #[cfg(not(feature = "folds"))]
     let err = Config::load(dir.path()).expect_err("folds/ must not load silently");
+    // A folds build loads the config and validates the folds, which here have no declaration.
+    #[cfg(feature = "folds")]
+    let err = nuthatch::folds::FoldSet::load(dir.path(), &[]).expect_err("an undeclared fold");
     let msg = format!("{err:#}");
     assert!(msg.contains("folds/"), "{msg}");
     #[cfg(not(feature = "folds"))]

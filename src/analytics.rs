@@ -2213,14 +2213,7 @@ fn reachable_tables(
     if referenced.iter().any(|n| n.ends_with("__children")) {
         return None;
     }
-    let mut bodies: std::collections::BTreeMap<String, String> = Default::default();
-    for f in nest_view_files(dir) {
-        for stmt in split_sql_statements(&f.sql) {
-            if let (Some(name), Some(body)) = (view_name(&stmt), view_body(&stmt)) {
-                bodies.insert(name, body.to_string());
-            }
-        }
-    }
+    let bodies = nest_view_bodies(dir);
 
     let mut out = referenced.clone();
     let mut frontier: Vec<String> = referenced.iter().cloned().collect();
@@ -2244,6 +2237,19 @@ fn reachable_tables(
         frontier = next;
     }
     Some(out)
+}
+
+/// Each authored view's name and body, from `views/*.sql` on disk.
+pub(crate) fn nest_view_bodies(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut bodies = std::collections::BTreeMap::new();
+    for f in nest_view_files(dir) {
+        for stmt in split_sql_statements(&f.sql) {
+            if let (Some(name), Some(body)) = (view_name(&stmt), view_body(&stmt)) {
+                bodies.insert(name, body.to_string());
+            }
+        }
+    }
+    bodies
 }
 
 /// The base tables a statement reads, lowercased. The security walk collects the same set for the
@@ -2395,7 +2401,7 @@ fn walk_table_refs(v: &Value, f: &mut impl FnMut(&str, &str)) {
 /// name is matched only when it's a real call: a word boundary before it and (after optional
 /// whitespace) a `(` after it - so a table or column merely *named* like one (e.g. `pool__glob`) is
 /// fine, while `read_text/**/('…')` and `READ_TEXT (…)` are both caught. (SEC-2, primary control.)
-fn reject_file_access(sql: &str) -> Result<()> {
+pub(crate) fn reject_file_access(sql: &str) -> Result<()> {
     // **Double quotes are removed before scanning.** DuckDB accepts a quoted function name and calls
     // it exactly as the bare form, so `"read_csv"('/etc/passwd')` executed while sailing past a check
     // that looked for `(` after optional *whitespace* - a quote is not whitespace. Verified against a
@@ -2437,7 +2443,7 @@ fn reject_file_access(sql: &str) -> Result<()> {
 /// a single-quoted string (a double-quoted identifier is fine and untouched) - so rejecting a
 /// single-quote as the first non-space token after a word-bounded FROM/JOIN closes the bypass without
 /// affecting real queries. Comments are stripped first, mirroring the denylist scan.
-fn reject_replacement_scan(sql: &str) -> Result<()> {
+pub(crate) fn reject_replacement_scan(sql: &str) -> Result<()> {
     let cleaned = strip_all_sql_comments(sql).to_ascii_lowercase();
     let b = cleaned.as_bytes();
     let is_ident = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
@@ -3715,6 +3721,97 @@ pub fn entity_output_columns(
     let rows = stmt.query([])?;
     drop(rows);
     Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
+}
+
+/// RFC-0059: binds folds against the nest's surface without reading a row. It lives here so the
+/// engine stays inside this module (RFC-0042 §6): every method takes and returns plain data.
+#[cfg(feature = "folds")]
+pub(crate) struct FoldBinder {
+    conn: Connection,
+}
+
+#[cfg(feature = "folds")]
+impl FoldBinder {
+    pub(crate) fn new(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        register_extensions(&conn)?;
+        define_views(
+            &conn,
+            dir,
+            &HotRows::new(),
+            u64::MAX,
+            &Default::default(),
+            schema,
+            None,
+        )?;
+        define_nest_views(&conn, dir, None);
+        Ok(Self { conn })
+    }
+
+    /// Every table and view currently defined, lowercased.
+    pub(crate) fn relations(&self) -> Result<std::collections::BTreeSet<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT lower(view_name) FROM duckdb_views() WHERE NOT internal")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The statement's top-level node type, or the parser's error.
+    pub(crate) fn statement_kinds(&self, sql: &str) -> Result<Vec<String>> {
+        let literal = format!("'{}'", sql.replace('\'', "''"));
+        let ast: String =
+            self.conn
+                .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+                    r.get(0)
+                })?;
+        let ast: Value = serde_json::from_str(&ast)?;
+        if ast.get("error").and_then(Value::as_bool) == Some(true) {
+            bail!(
+                "does not parse: {}",
+                ast.get("error_message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+        Ok(ast
+            .pointer("/statements")
+            .and_then(Value::as_array)
+            .map(|s| {
+                s.iter()
+                    .filter_map(|st| st.pointer("/node/type").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn base_tables(&self, sql: &str) -> Option<std::collections::BTreeSet<String>> {
+        base_tables_in(&self.conn, sql)
+    }
+
+    pub(crate) fn reachable(
+        &self,
+        dir: &Path,
+        referenced: &std::collections::BTreeSet<String>,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        reachable_tables(&self.conn, dir, referenced)
+    }
+
+    pub(crate) fn refusals(&self, sql: &str) -> Vec<crate::graft::Refusal> {
+        crate::graft::static_refusals(&crate::graft::canonical_plan(&self.conn, sql))
+    }
+
+    /// `(column, type)` of a query's output, as DuckDB spells the type.
+    pub(crate) fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(&format!("DESCRIBE {sql}"))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub(crate) fn execute(&self, sql: &str) -> Result<()> {
+        Ok(self.conn.execute_batch(sql)?)
+    }
 }
 
 /// The table name out of a DuckDB catalog error, if that is what this is.

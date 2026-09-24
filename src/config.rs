@@ -39,10 +39,7 @@ fn refuse_feature_only_files(dir: &Path) -> Result<()> {
              nuthatch built with `--features graph` honours"
         );
     }
-    if dir.join("folds").exists() {
-        if cfg!(feature = "folds") {
-            bail!("this nest ships folds/, and this build does not load folds yet (RFC-0059 S1)");
-        }
+    if !cfg!(feature = "folds") && dir.join("folds").exists() {
         bail!(
             "this nest ships folds/ (checkpointed folds, RFC-0059), which only a nuthatch built \
              with `--features folds` or `--features graph` loads"
