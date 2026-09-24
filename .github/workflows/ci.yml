@@ -425,14 +425,14 @@ jobs:
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 60m timeout-minutes ceiling. Close to 60m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
   # #1343. RFC-0052 S1's closed acceptance asked for a reconciler proof "over FsStore and S3 (MinIO
-  # in CI)", but #1335 shipped the S3 mirror with every sync test run against `memory://` and no job
+  # in CI)" - MinIO itself was withdrawn upstream in 2026 (#1492), so the server is now versitygw, but #1335 shipped the S3 mirror with every sync test run against `memory://` and no job
   # here ever started a real object store - S3 publishing had never touched one. This job does.
   minio-publish:
-    name: publish (S3 via MinIO)
+    name: publish (S3 via versitygw)
     runs-on: ubuntu-latest
     env:
-      MINIO_ROOT_USER: nuthatch
-      MINIO_ROOT_PASSWORD: nuthatch-minio-test
+      ROOT_ACCESS_KEY: nuthatch
+      ROOT_SECRET_KEY: nuthatch-minio-test
       AWS_ACCESS_KEY_ID: nuthatch
       AWS_SECRET_ACCESS_KEY: nuthatch-minio-test
       AWS_REGION: us-east-1
@@ -457,31 +457,31 @@ jobs:
           # deliberate: shared-key replaces key + job id, and check-default's key is both.
           shared-key: check-default-check-default
           save-if: false
-      # `minio/minio` needs an explicit `server /data` command, and GitHub's `services:` block has
-      # no field for that - its `options` are `docker create` flags, not the container's CMD - so
-      # this starts MinIO as an ordinary step instead of a service container.
-      - name: start MinIO
-        # `minio/minio` was pulled from Docker Hub entirely in late 2025 ("pull access denied,
-        # repository does not exist") - `quay.io/minio/minio` is the current source, same tags.
+      # Open-source MinIO was archived and its images withdrawn in 2026 (#1492). versitygw (Apache-2.0)
+      # enforces If-None-Match and If-Match, which the catalogue compare-and-swap depends on; Garage
+      # and Zenko CloudServer were measured accepting violations with a 200. Pinned by digest. The
+      # posix backend needs an existing /data that supports xattrs, hence the anonymous volume.
+      - name: start the S3 server (versitygw)
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          docker run -d --name s3 -p 9000:9000 -v /data \
+            -e ROOT_ACCESS_KEY -e ROOT_SECRET_KEY \
+            versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
+            --port :9000 --health /health posix /data
           for _ in $(seq 1 30); do
-            curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null && exit 0
+            curl -sf http://127.0.0.1:9000/health > /dev/null && exit 0
             sleep 1
           done
-          echo "::error::MinIO did not become ready within 30s"
-          docker logs minio || true
+          echo "::error::versitygw did not become ready within 30s"
+          docker logs s3 || true
           exit 1
       # The AWS CLI defaults to virtual-hosted-style addressing (bucket.host), which does not
-      # resolve against an IP-addressed MinIO; path-style (host/bucket) is what MinIO and
+      # resolve against an IP-addressed server; path-style (host/bucket) is what versitygw and
       # `object_store`'s default `aws_virtual_hosted_style_request=false` both expect.
-      - name: point the AWS CLI at MinIO (path-style)
+      - name: point the AWS CLI at the S3 server (path-style)
         run: aws configure set default.s3.addressing_style path
       - name: create the test bucket
         run: aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
-      - name: publish suite against MinIO
+      - name: publish suite against a real S3 server
         run: cargo test --locked --test it e2e_minio_publish
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
@@ -492,11 +492,11 @@ jobs:
           fi
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 30m timeout-minutes ceiling. Close to 30m: almost certainly an expiry. Well under it: almost certainly a real cancel or supersede."
-      - name: stop MinIO
+      - name: stop the S3 server
         if: always()
         run: |
-          docker logs minio 2>&1 | tail -n 100 || true
-          docker rm -f minio || true
+          docker logs s3 2>&1 | tail -n 100 || true
+          docker rm -f s3 || true
 
   # RFC-0052 S3 (#1261): Trino's Hive connector over a published prefix must read what local DuckDB
   # reads, including a table whose columns drifted across seals. Not a required check.
@@ -504,8 +504,8 @@ jobs:
     name: Trino contract (RFC-0052 S3)
     runs-on: ubuntu-latest
     env:
-      MINIO_ROOT_USER: nuthatch
-      MINIO_ROOT_PASSWORD: nuthatch-minio-test
+      ROOT_ACCESS_KEY: nuthatch
+      ROOT_SECRET_KEY: nuthatch-minio-test
       AWS_ACCESS_KEY_ID: nuthatch
       AWS_SECRET_ACCESS_KEY: nuthatch-minio-test
       AWS_REGION: us-east-1
@@ -527,19 +527,24 @@ jobs:
           # deliberate: shared-key replaces key + job id, and check-default's key is both.
           shared-key: check-default-check-default
           save-if: false
-      - name: start MinIO
+      # Open-source MinIO was archived and its images withdrawn in 2026 (#1492). versitygw (Apache-2.0)
+      # enforces If-None-Match and If-Match, which the catalogue compare-and-swap depends on; Garage
+      # and Zenko CloudServer were measured accepting violations with a 200. Pinned by digest. The
+      # posix backend needs an existing /data that supports xattrs, hence the anonymous volume.
+      - name: start the S3 server (versitygw)
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          docker run -d --name s3 -p 9000:9000 -v /data \
+            -e ROOT_ACCESS_KEY -e ROOT_SECRET_KEY \
+            versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
+            --port :9000 --health /health posix /data
           for _ in $(seq 1 30); do
-            curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null && exit 0
+            curl -sf http://127.0.0.1:9000/health > /dev/null && exit 0
             sleep 1
           done
-          echo "::error::MinIO did not become ready within 30s"
-          docker logs minio || true
+          echo "::error::versitygw did not become ready within 30s"
+          docker logs s3 || true
           exit 1
-      - name: point the AWS CLI at MinIO (path-style)
+      - name: point the AWS CLI at the S3 server (path-style)
         run: aws configure set default.s3.addressing_style path
       - name: create the test bucket
         run: aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
@@ -584,12 +589,12 @@ jobs:
           fi
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 45m timeout-minutes ceiling. Close to 45m: almost certainly an expiry. Well under it: almost certainly a real cancel or supersede."
-      - name: stop Trino and MinIO
+      - name: stop Trino and the S3 server
         if: always()
         run: |
           docker logs trino 2>&1 | tail -n 100 || true
-          docker logs minio 2>&1 | tail -n 50 || true
-          docker rm -f trino minio || true
+          docker logs s3 2>&1 | tail -n 50 || true
+          docker rm -f trino s3 || true
 
   fleet:
     name: the compose fleet comes up
