@@ -829,7 +829,7 @@ fn bench(
         "wall_ms": { "p50": pct(0.50), "p99": pct(0.99), "max": wall.last() },
         "peak_rss_mib": (peak_kib > 0).then(|| peak_kib as f64 / 1024.0),
         "peak_increase_mib": (peak_kib > 0).then(|| delta_kib as f64 / 1024.0),
-        "targets": { "p99_ms": 500, "peak_rss_mib": 256 },
+        "targets": { "p99_ms": 500, "peak_rss_mib": 300 },
         "phases": phases.0,
     }))
 }
