@@ -1658,3 +1658,35 @@ mod provenance {
         assert!(refusal(dir.path(), &set, &hot).contains("no longer holds"));
     }
 }
+
+#[cfg(test)]
+mod name_case {
+    use super::*;
+
+    /// Relation names compare lowercased, and a fold name can only be lowercase, so a case variant
+    /// can neither be declared nor slip past a clash.
+    #[test]
+    fn a_fold_name_is_lowercase_and_clashes_ignore_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"Users","columns":[{"name":"block_number","storage":"u64"}]}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("folds")).unwrap();
+        let decl = |n: &str| {
+            format!("[[fold]]\nname = \"{n}\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n")
+        };
+        let sql = "SELECT CAST(count(*) AS UBIGINT) AS n FROM \"Users\"";
+        std::fs::write(dir.path().join("folds/Users.sql"), sql).unwrap();
+        std::fs::write(dir.path().join("folds/folds.toml"), decl("Users")).unwrap();
+        let err = format!("{:#}", FoldSet::load(dir.path(), &[]).unwrap_err());
+        assert!(err.contains("is not a fold name"), "{err}");
+
+        std::fs::remove_file(dir.path().join("folds/Users.sql")).unwrap();
+        std::fs::write(dir.path().join("folds/users.sql"), sql).unwrap();
+        std::fs::write(dir.path().join("folds/folds.toml"), decl("users")).unwrap();
+        let err = format!("{:#}", FoldSet::load(dir.path(), &[]).unwrap_err());
+        assert!(err.contains("already a table or view"), "{err}");
+    }
+}
