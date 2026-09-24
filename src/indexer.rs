@@ -2016,6 +2016,7 @@ async fn runtime_index_loop(
     // Same periodic "at tip / N behind" restatement as the solo loop (issue #302), against the
     // cursor's shared `global_next` - the position every co-tenant on this chain has cleared.
     let mut heartbeat = crate::progress::TipHeartbeat::new();
+    let mut reorg_gate = ReorgGate::default();
     loop {
         // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
         // only point at which the nest set is quiescent and "every live nest has committed the same
@@ -2110,7 +2111,12 @@ async fn runtime_index_loop(
             tip,
         )
         .await;
-        if max_next > 0 && reorg_check_due(freshness, max_next, ceiling) {
+        // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
+        let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
+        if max_next > 0
+            && reorg_check_due(freshness, max_next, ceiling)
+            && reorg_gate.due(tip, max_next, global_next > ceiling)
+        {
             match detect_reorg(
                 source.as_ref(),
                 &live_ref(&nests, reference).store,
@@ -2128,10 +2134,9 @@ async fn runtime_index_loop(
                 Ok(None) => {}
                 Err(e) => tracing::debug!("mounts reorg check skipped: {e:#}"),
             }
+            reorg_gate.checked(tip, max_next);
         }
 
-        // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
-        let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
             sleep_for(freshness.poll_interval).await;
@@ -2200,6 +2205,9 @@ async fn runtime_index_loop(
                     tip,
                 )
                 .await?;
+                if let Some(max) = live.iter().map(|&i| nexts[i]).max() {
+                    reorg_gate.checked(tip, max);
+                }
                 // Caught up as of this iteration's tip: wait the interval here as well as at the
                 // top, for the reason the solo loop gives (#1190).
                 if to == ceiling {
@@ -6765,6 +6773,7 @@ async fn index_loop(
     // actually commits resets it, so a narrowing descent - which fails repeatedly on the way down and
     // then succeeds - never trips it.
     let mut no_progress = 0usize;
+    let mut reorg_gate = ReorgGate::default();
     loop {
         let tip = match source.tip().await {
             Ok(t) => {
@@ -6804,11 +6813,14 @@ async fn index_loop(
         // unfinalised rows still in its hot store - the check runs exactly as before, because those
         // rows are as exposed as they ever were.
         let ceiling = cursor_ceiling(source.as_ref(), nest.finality, nest.freshness, tip).await;
-        if reorg_check_due(nest.freshness, next, ceiling) {
+        if reorg_check_due(nest.freshness, next, ceiling)
+            && reorg_gate.due(tip, next, next > ceiling)
+        {
             if let Some(new_next) = nest.handle_reorg(source.as_ref(), next).await? {
                 next = new_next;
                 continue;
             }
+            reorg_gate.checked(tip, next);
         }
 
         heartbeat.maybe_log(next, tip);
@@ -6821,7 +6833,7 @@ async fn index_loop(
             }
             caught_up = true;
             // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
-            // when a window commits, a reorg check, a checkpoint hash and a `finalized` probe -
+            // when the tip has moved, a reorg check, a checkpoint header and a `finalized` probe -
             // whether or not any block carried an event. At two seconds that is the whole bill of a
             // sparse nest; at five minutes it is a hundredth of it, for the same rows.
             sleep_for(nest.freshness.poll_interval).await;
@@ -6873,6 +6885,7 @@ async fn index_loop(
                     Some(_stored) => {
                         next = to + 1;
                         no_progress = 0;
+                        reorg_gate.checked(tip, next);
                         if let Some(p) = progress.as_mut() {
                             p.tick(to, n);
                         }
@@ -7807,6 +7820,24 @@ async fn cursor_ceiling(
 /// boundary for one window the check is pure cost.
 fn reorg_check_due(freshness: crate::freshness::Freshness, next: u64, ceiling: u64) -> bool {
     !freshness.finality_only || next.saturating_sub(1) > ceiling
+}
+
+/// Skips the reorg check on an idle poll that sees the tip and cursor of the last check (#1493).
+///
+/// The check guards the next commit, and a poll with a window to commit always pays it. An idle one
+/// commits and seals nothing, so a same-height reorg waits for the first poll that finds a new block.
+/// A committed window counts as a check at its tip: its checkpoint header was just read there.
+#[derive(Default)]
+struct ReorgGate(Option<(u64, u64)>);
+
+impl ReorgGate {
+    fn due(&self, tip: u64, next: u64, idle: bool) -> bool {
+        !idle || self.0 != Some((tip, next))
+    }
+
+    fn checked(&mut self, tip: u64, next: u64) {
+        self.0 = Some((tip, next));
+    }
 }
 
 /// The dial a shared cursor runs at: the shortest interval any of its nests asked for, and
@@ -18326,7 +18357,7 @@ rpc_urls = ["https://rpc.example"]
             assert!(idle.tip >= 8, "the idle phase must span polls: {idle:?}");
             assert_eq!(
                 (idle.headers(), idle.logs, idle.finalized),
-                (idle.tip, 0, 0),
+                (0, 0, 0),
                 "runtime={runtime}: an idle poll's bill, {idle:?}"
             );
             assert_eq!(
@@ -18349,7 +18380,7 @@ rpc_urls = ["https://rpc.example"]
     async fn tip_bill_of_a_caught_up_nest_with_no_rows() {
         for runtime in [false, true] {
             let (idle, advancing, m) = tip_bill(Vec::new(), runtime).await;
-            assert_eq!(idle.headers(), idle.tip, "runtime={runtime}: {idle:?}");
+            assert_eq!(idle.headers(), 0, "runtime={runtime}: {idle:?}");
             assert_eq!(
                 (
                     advancing.block_hash,
