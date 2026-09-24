@@ -130,6 +130,21 @@ pub trait Source: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// Hash and timestamp of one block, for a window checkpoint. `None` when the hash is unavailable;
+    /// the timestamp is best-effort. An RPC source answers from one header (#1494); the default asks
+    /// the two methods above, in the order the checkpoint always has.
+    async fn block_record(&self, number: u64) -> Result<Option<(String, Option<u64>)>> {
+        let Some(hash) = self.block_hash(number).await? else {
+            return Ok(None);
+        };
+        let ts = self
+            .block_timestamps(&[number])
+            .await
+            .ok()
+            .and_then(|m| m.get(&number).copied());
+        Ok(Some((hash, ts)))
+    }
+
     /// Full block headers for the given blocks (RFC-0036 §4.2), for a nest with `[extract] blocks`.
     ///
     /// Default: none, which means a source that cannot answer produces **no block rows** rather than
@@ -191,6 +206,10 @@ impl Source for RpcClient {
 
     async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
         RpcClient::block_timestamps(self, blocks).await
+    }
+
+    async fn block_record(&self, number: u64) -> Result<Option<(String, Option<u64>)>> {
+        RpcClient::block_record(self, number).await
     }
 
     async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {

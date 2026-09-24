@@ -1792,6 +1792,24 @@ impl RpcClient {
         Ok(result.get("hash").and_then(Value::as_str).map(String::from))
     }
 
+    /// [`Self::block_hash`] and the same header's timestamp, from one `eth_getBlockByNumber`.
+    pub async fn block_record(&self, number: u64) -> Result<Option<(String, Option<u64>)>> {
+        let result = self
+            .call(
+                "eth_getBlockByNumber",
+                json!([format!("0x{number:x}"), false]),
+            )
+            .await?;
+        let Some(hash) = result.get("hash").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let ts = result
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| parse_hex_u64(s).ok());
+        Ok(Some((hash.to_string(), ts)))
+    }
+
     /// One combined `eth_getLogs` across all `addresses`, matching any of `topic0s`.
     pub async fn get_logs(
         &self,
@@ -1955,6 +1973,32 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// #1494: a window checkpoint's hash and timestamp are one header, so one request.
+    #[tokio::test]
+    async fn a_block_record_is_one_request() {
+        use serde_json::json;
+        let (url, server) = canned_rpc(json!({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"number": "0x10", "hash": "0xabc", "timestamp": "0x6553f100"}
+        }))
+        .await;
+        let c = super::RpcClient::new(vec![url]).unwrap();
+        let got = c.block_record(16).await.unwrap();
+        let requests = c.request_count();
+        server.abort();
+        assert_eq!(got, Some(("0xabc".to_string(), Some(0x6553f100))));
+        assert_eq!(requests, 1);
+
+        let (url, server) = canned_rpc(json!({"jsonrpc": "2.0", "id": 0, "result": null})).await;
+        let got = super::RpcClient::new(vec![url])
+            .unwrap()
+            .block_record(16)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(got, None, "a block the node does not have has no record");
     }
 
     async fn two_calls_answered_with(
