@@ -3865,6 +3865,88 @@ impl FoldBinder {
     pub(crate) fn execute(&self, sql: &str) -> Result<()> {
         Ok(self.conn.execute_batch(sql)?)
     }
+
+    /// The constructs in a statement that read across rows or reach back for earlier ones: a window
+    /// function, a recursive CTE, or a subquery over one of `facts`. Inside a fold each of them
+    /// answers over the window alone (RFC-0059 §3), which is what #1504 asks to warn about. Each is
+    /// described once. Empty when the statement does not parse: the fold loader has refused that
+    /// already.
+    pub(crate) fn lookbacks(
+        &self,
+        sql: &str,
+        facts: &std::collections::BTreeSet<String>,
+    ) -> Vec<String> {
+        let literal = format!("'{}'", sql.replace('\'', "''"));
+        let Ok(ast) =
+            self.conn
+                .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+                    r.get::<_, String>(0)
+                })
+        else {
+            return Vec::new();
+        };
+        let Ok(ast) = serde_json::from_str::<Value>(&ast) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut note = |s: String| {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        };
+        walk_ast(&ast, &mut |map| {
+            let class = map.get("class").and_then(Value::as_str);
+            let kind = map.get("type").and_then(Value::as_str);
+            if class == Some("WINDOW") {
+                let f = map
+                    .get("function_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                note(format!("a window function (`{f}() OVER`)"));
+            }
+            if kind == Some("RECURSIVE_CTE_NODE") {
+                let name = map.get("cte_name").and_then(Value::as_str).unwrap_or("?");
+                note(format!("a recursive CTE (`{name}`)"));
+            }
+            if class == Some("SUBQUERY") {
+                let how = match map.get("subquery_type").and_then(Value::as_str) {
+                    Some("EXISTS") => "an EXISTS subquery",
+                    Some("NOT_EXISTS") => "a NOT EXISTS subquery",
+                    Some("SCALAR") => "a scalar subquery",
+                    _ => "a subquery",
+                };
+                let mut over = std::collections::BTreeSet::new();
+                if let Some(inner) = map.get("subquery") {
+                    walk_ast(inner, &mut |m| {
+                        if m.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
+                            if let Some(t) = m.get("table_name").and_then(Value::as_str) {
+                                let t = t.to_ascii_lowercase();
+                                if facts.contains(&t) {
+                                    over.insert(t);
+                                }
+                            }
+                        }
+                    });
+                }
+                for t in over {
+                    note(format!("{how} over `{t}`"));
+                }
+            }
+        });
+        out
+    }
+}
+
+#[cfg(feature = "folds")]
+fn walk_ast(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
+    match v {
+        Value::Object(map) => {
+            f(map);
+            map.values().for_each(|c| walk_ast(c, f));
+        }
+        Value::Array(items) => items.iter().for_each(|c| walk_ast(c, f)),
+        _ => {}
+    }
 }
 
 /// RFC-0059: evaluates folds one window at a time on a connection of its own. Inside it a fact name
