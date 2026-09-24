@@ -34,6 +34,8 @@ fn allowed_read_dirs(dir: &Path) -> Vec<PathBuf> {
         dir.join("labels"),
         dir.join(crate::offchain::DIR).join("segments"),
     ];
+    #[cfg(feature = "folds")]
+    dirs.push(dir.join(crate::folds::CHECKPOINTS_DIR));
     // Runtime layout (RFC-0033): Parquet lives at `<root>/segments/{hash}.parquet`, not under
     // `data/<nid>/segments`. Locking only the per-dataset dir made `/sql` succeed with zero rows
     // on every mounted nest (#289 follow-up, `e2e_early_cutoff`).
@@ -3723,32 +3725,72 @@ pub fn entity_output_columns(
     Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
 }
 
+/// Every table and authored view name a nest has, lowercased, read from its files without binding
+/// anything: what a fold's own name must not collide with.
+#[cfg(feature = "folds")]
+pub(crate) fn nest_relation_names(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut names: std::collections::BTreeSet<String> = schema_columns(dir)
+        .into_iter()
+        .map(|(t, _)| t)
+        .chain(schema.iter().map(|t| t.table.clone()))
+        .chain(
+            crate::seal::load_manifest_with_hash(dir)?
+                .0
+                .tables
+                .into_keys(),
+        )
+        .chain(nest_view_bodies(dir).into_keys())
+        .map(|n| n.to_ascii_lowercase())
+        .collect();
+    names.insert("labels".into());
+    Ok(names)
+}
+
 /// RFC-0059: binds folds against the nest's surface without reading a row. It lives here so the
 /// engine stays inside this module (RFC-0042 §6): every method takes and returns plain data.
 #[cfg(feature = "folds")]
 pub(crate) struct FoldBinder {
     conn: Connection,
+    _spill: SpillDir,
 }
 
 #[cfg(feature = "folds")]
 impl FoldBinder {
-    pub(crate) fn new(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        register_extensions(&conn)?;
+    /// Bounded and locked down like `/sql`'s connection: the same memory, thread and spill limits.
+    pub(crate) fn open(dir: &Path) -> Result<Self> {
+        let (conn, spill) = open_locked_duckdb(dir)?;
+        Ok(Self {
+            conn,
+            _spill: spill,
+        })
+    }
+
+    /// Define only `wanted`: binding every table over every segment cost 12 s and 2.6 GB on the
+    /// network corpus, whatever the folds read.
+    pub(crate) fn bind(
+        &self,
+        dir: &Path,
+        schema: &[crate::registry::TableSchema],
+        wanted: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
         define_views(
-            &conn,
+            &self.conn,
             dir,
             &HotRows::new(),
             u64::MAX,
             &Default::default(),
             schema,
-            None,
+            Some(wanted),
         )?;
-        define_nest_views(&conn, dir, None);
-        Ok(Self { conn })
+        define_nest_views(&self.conn, dir, Some(wanted));
+        Ok(())
     }
 
     /// Every table and view currently defined, lowercased.
+    #[cfg(test)]
     pub(crate) fn relations(&self) -> Result<std::collections::BTreeSet<String>> {
         Ok(self
             .conn
@@ -3835,15 +3877,18 @@ pub(crate) struct FoldEvaluator {
     views_defined: bool,
     /// Views defined inside the open transaction: a rollback removes them, so the flag goes too.
     views_pending: bool,
+    _spill: SpillDir,
 }
 
 #[cfg(feature = "folds")]
 impl FoldEvaluator {
     pub(crate) fn new(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        register_extensions(&conn)?;
+        // The lockdown admits only directories that exist when the connection opens.
+        std::fs::create_dir_all(dir.join(crate::folds::CHECKPOINTS_DIR))?;
+        let (conn, spill) = open_locked_duckdb(dir)?;
         Ok(Self {
             conn,
+            _spill: spill,
             dir: dir.to_path_buf(),
             schema: schema.to_vec(),
             views_defined: false,
@@ -8603,5 +8648,61 @@ events = ["Transfer"]
             );
             let _ = std::fs::remove_dir_all(p);
         }
+    }
+}
+
+#[cfg(all(test, feature = "folds"))]
+mod fold_connections {
+    use super::*;
+
+    fn setting(conn: &Connection, name: &str) -> String {
+        conn.query_row(
+            &format!("SELECT current_setting('{name}')::VARCHAR"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Both fold connections carry `/sql`'s budget and lockdown. A bare in-memory DuckDB takes 80%
+    /// of RAM and every core, and reads any file the process can.
+    #[test]
+    fn fold_connections_are_bounded_and_locked_down_like_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reference, _spill) = open_locked_duckdb(dir.path()).unwrap();
+        let binder = FoldBinder::open(dir.path()).unwrap();
+        let eval = FoldEvaluator::new(dir.path(), &[]).unwrap();
+        for (what, conn) in [("binder", &binder.conn), ("evaluator", &eval.conn)] {
+            for name in ["memory_limit", "threads", "enable_external_access"] {
+                assert_eq!(
+                    setting(conn, name),
+                    setting(&reference, name),
+                    "{what} {name}"
+                );
+            }
+            assert!(
+                conn.execute_batch("SELECT * FROM read_text('/etc/hosts')")
+                    .is_err(),
+                "{what} reads outside the nest"
+            );
+        }
+    }
+
+    #[test]
+    fn the_binder_defines_only_what_it_is_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t","columns":[{"name":"block_number","storage":"u64"}]},{"table":"u","columns":[{"name":"block_number","storage":"u64"}]}]}"#,
+        )
+        .unwrap();
+        let binder = FoldBinder::open(dir.path()).unwrap();
+        binder
+            .bind(dir.path(), &[], &["t".to_string()].into_iter().collect())
+            .unwrap();
+        assert_eq!(
+            binder.relations().unwrap(),
+            std::collections::BTreeSet::from(["t".to_string()])
+        );
     }
 }

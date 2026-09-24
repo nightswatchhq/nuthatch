@@ -142,9 +142,24 @@ impl FoldSet {
             }
         }
 
-        let binder = analytics::FoldBinder::new(dir, schema)?;
-        let surface = binder.relations()?;
+        let binder = analytics::FoldBinder::open(dir)?;
+        let surface = analytics::nest_relation_names(dir, schema)?;
         let view_bodies = analytics::nest_view_bodies(dir);
+        // Bind only what the folds read. What a fold reaches is known from its parse alone; a fold
+        // whose reach cannot be worked out is refused by `load_one` below.
+        let mut wanted = BTreeSet::new();
+        for file in &files {
+            let sql = std::fs::read_to_string(root.join(file))?;
+            let Some(refs) = binder.base_tables(&sql) else {
+                continue;
+            };
+            let direct: BTreeSet<String> = refs
+                .into_iter()
+                .filter(|t| !by_name.contains_key(t.strip_suffix("__carry").unwrap_or(t)))
+                .collect();
+            wanted.extend(binder.reachable(dir, &direct).unwrap_or_default());
+        }
+        binder.bind(dir, schema, &wanted)?;
 
         let mut set = FoldSet::default();
         for file in &files {
@@ -1641,5 +1656,37 @@ mod provenance {
             .hash;
         std::fs::write(&path, raw.replace(old.as_str(), &"f".repeat(64))).unwrap();
         assert!(refusal(dir.path(), &set, &hot).contains("no longer holds"));
+    }
+}
+
+#[cfg(test)]
+mod name_case {
+    use super::*;
+
+    /// Relation names compare lowercased, and a fold name can only be lowercase, so a case variant
+    /// can neither be declared nor slip past a clash.
+    #[test]
+    fn a_fold_name_is_lowercase_and_clashes_ignore_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"Users","columns":[{"name":"block_number","storage":"u64"}]}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("folds")).unwrap();
+        let decl = |n: &str| {
+            format!("[[fold]]\nname = \"{n}\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n")
+        };
+        let sql = "SELECT CAST(count(*) AS UBIGINT) AS n FROM \"Users\"";
+        std::fs::write(dir.path().join("folds/Users.sql"), sql).unwrap();
+        std::fs::write(dir.path().join("folds/folds.toml"), decl("Users")).unwrap();
+        let err = format!("{:#}", FoldSet::load(dir.path(), &[]).unwrap_err());
+        assert!(err.contains("is not a fold name"), "{err}");
+
+        std::fs::remove_file(dir.path().join("folds/Users.sql")).unwrap();
+        std::fs::write(dir.path().join("folds/users.sql"), sql).unwrap();
+        std::fs::write(dir.path().join("folds/folds.toml"), decl("users")).unwrap();
+        let err = format!("{:#}", FoldSet::load(dir.path(), &[]).unwrap_err());
+        assert!(err.contains("already a table or view"), "{err}");
     }
 }
