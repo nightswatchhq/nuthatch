@@ -33,7 +33,10 @@ fn a_nest_shipping_folds_is_refused_not_served_without_them() {
     let msg = format!("{err:#}");
     assert!(msg.contains("folds/"), "{msg}");
     #[cfg(not(feature = "folds"))]
-    assert!(msg.contains("--features folds"), "must name the feature: {msg}");
+    assert!(
+        msg.contains("--features folds"),
+        "must name the feature: {msg}"
+    );
 
     std::fs::remove_dir_all(dir.path().join("folds")).unwrap();
     Config::load(dir.path()).expect("the same nest without folds/ loads");
