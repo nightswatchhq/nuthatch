@@ -61,10 +61,11 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // touching the nest's config on disk.
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
     let endpoint_count = rpc_urls.len();
-    let rpc = RpcClient::new(rpc_urls)?;
+    let rpc = RpcClient::with_fallbacks(rpc_urls, args.rpc_fallback.clone())?;
     // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a
     // wrong-network endpoint in the pool corrupts silently, because failover hides it.
     rpc.verify_chain_ids(config.nest.chain_id).await?;
+    config.freshness = config.freshness.for_chain(&config.nest.chain, &rpc).await;
     let source: Arc<dyn Source> = Arc::new(rpc);
     let concurrency = backfill_concurrency_for(
         endpoint_count,
@@ -103,10 +104,8 @@ fn apply_dev_args(config: &mut Config, args: &DevArgs) {
     config.state_rpc_urls = args.state_rpc.clone();
     config.ipfs_gateways = args.ipfs.clone();
     // The freshness dial (RFC-0040): an operator's cadence is not the nest's identity.
-    config.freshness = crate::freshness::Freshness {
-        poll_interval: args.poll_interval,
-        finality_only: args.finality_only,
-    };
+    config.freshness =
+        crate::freshness::Freshness::from_flags(args.poll_interval, args.finality_only);
     config.ipfs_window_deadline = args.ipfs_window_deadline;
 }
 
@@ -2016,6 +2015,7 @@ async fn runtime_index_loop(
     // Same periodic "at tip / N behind" restatement as the solo loop (issue #302), against the
     // cursor's shared `global_next` - the position every co-tenant on this chain has cleared.
     let mut heartbeat = crate::progress::TipHeartbeat::new();
+    let mut reorg_gate = ReorgGate::default();
     loop {
         // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
         // only point at which the nest set is quiescent and "every live nest has committed the same
@@ -2110,7 +2110,12 @@ async fn runtime_index_loop(
             tip,
         )
         .await;
-        if max_next > 0 && reorg_check_due(freshness, max_next, ceiling) {
+        // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
+        let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
+        if max_next > 0
+            && reorg_check_due(freshness, max_next, ceiling)
+            && reorg_gate.due(tip, max_next, global_next > ceiling)
+        {
             match detect_reorg(
                 source.as_ref(),
                 &live_ref(&nests, reference).store,
@@ -2128,10 +2133,9 @@ async fn runtime_index_loop(
                 Ok(None) => {}
                 Err(e) => tracing::debug!("mounts reorg check skipped: {e:#}"),
             }
+            reorg_gate.checked(tip, max_next);
         }
 
-        // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
-        let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
             sleep_for(freshness.poll_interval).await;
@@ -2200,6 +2204,9 @@ async fn runtime_index_loop(
                     tip,
                 )
                 .await?;
+                if let Some(max) = live.iter().map(|&i| nexts[i]).max() {
+                    reorg_gate.checked(tip, max);
+                }
                 // Caught up as of this iteration's tip: wait the interval here as well as at the
                 // top, for the reason the solo loop gives (#1190).
                 if to == ceiling {
@@ -6519,18 +6526,13 @@ impl NestIngest {
         }
         // Fetch the window boundary's canonical hash for future reorg detection, then commit the whole
         // window - rows + annotations + the checkpoint + the `last_block` watermark - in one atomic txn.
-        let checkpoint = match source.block_hash(to).await {
-            Ok(Some(hash)) => {
-                let ts = match timestamps.get(&to).copied() {
-                    Some(t) => Some(t),
-                    None => source
-                        .block_timestamps(&[to])
-                        .await
-                        .ok()
-                        .and_then(|m| m.get(&to).copied()),
-                };
-                Some((to, crate::store::encode_block_record(&hash, ts)))
-            }
+        // When no kept row stamped `to`, its hash and timestamp come from one header (#1494).
+        let record = match timestamps.get(&to).copied() {
+            Some(t) => source.block_hash(to).await.map(|h| h.map(|h| (h, Some(t)))),
+            None => source.block_record(to).await,
+        };
+        let checkpoint = match record {
+            Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(&hash, ts))),
             _ => None,
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
@@ -6770,6 +6772,7 @@ async fn index_loop(
     // actually commits resets it, so a narrowing descent - which fails repeatedly on the way down and
     // then succeeds - never trips it.
     let mut no_progress = 0usize;
+    let mut reorg_gate = ReorgGate::default();
     loop {
         let tip = match source.tip().await {
             Ok(t) => {
@@ -6809,11 +6812,14 @@ async fn index_loop(
         // unfinalised rows still in its hot store - the check runs exactly as before, because those
         // rows are as exposed as they ever were.
         let ceiling = cursor_ceiling(source.as_ref(), nest.finality, nest.freshness, tip).await;
-        if reorg_check_due(nest.freshness, next, ceiling) {
+        if reorg_check_due(nest.freshness, next, ceiling)
+            && reorg_gate.due(tip, next, next > ceiling)
+        {
             if let Some(new_next) = nest.handle_reorg(source.as_ref(), next).await? {
                 next = new_next;
                 continue;
             }
+            reorg_gate.checked(tip, next);
         }
 
         heartbeat.maybe_log(next, tip);
@@ -6826,7 +6832,7 @@ async fn index_loop(
             }
             caught_up = true;
             // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
-            // when a window commits, a reorg check, a checkpoint hash and a `finalized` probe -
+            // when the tip has moved, a reorg check, a checkpoint header and a `finalized` probe -
             // whether or not any block carried an event. At two seconds that is the whole bill of a
             // sparse nest; at five minutes it is a hundredth of it, for the same rows.
             sleep_for(nest.freshness.poll_interval).await;
@@ -6878,6 +6884,7 @@ async fn index_loop(
                     Some(_stored) => {
                         next = to + 1;
                         no_progress = 0;
+                        reorg_gate.checked(tip, next);
                         if let Some(p) = progress.as_mut() {
                             p.tick(to, n);
                         }
@@ -7174,6 +7181,26 @@ fn hold_for_documents(
     Ok(Some(finalized_through))
 }
 
+/// `block:hash` of the checkpoint `maybe_seal` last pinned while holding rows (#1495).
+const SEAL_PIN_KEY: &str = "seal_pin";
+
+/// Whether that pin still anchors the reorg walk: at or above the watermark (`from - 1`), at or
+/// below `ceiling`, and still the checkpoint the store holds at its block.
+fn held_pin_covers(store: &dyn crate::store::HotStore, from: u64, ceiling: u64) -> Result<bool> {
+    let Some(pin) = store.get_meta(SEAL_PIN_KEY)? else {
+        return Ok(false);
+    };
+    let Some((block, hash)) = pin
+        .split_once(':')
+        .and_then(|(b, h)| Some((b.parse::<u64>().ok()?, h)))
+    else {
+        return Ok(false);
+    };
+    Ok(block + 1 >= from
+        && block <= ceiling
+        && store.get_block_hash(block)?.as_deref() == Some(hash))
+}
+
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
 /// chosen from the data. Rows short of the threshold stay in the hot store until the next call.
 ///
@@ -7274,8 +7301,14 @@ async fn maybe_seal(
                 // sealed_through to an older sparse checkpoint and tripped the finality
                 // guard on a block the reorg never touched. The empty-range arm already
                 // pins; this one must too (#1067).
-                if let Ok(Some(hash)) = source.block_hash(ceiling).await {
-                    store.set_block_hash(ceiling, &hash)?;
+                //
+                // One pin serves until the watermark moves (#1495). The walk needs a final
+                // checkpoint at or above the watermark, not a new one per window.
+                if !held_pin_covers(store, from, ceiling)? {
+                    if let Ok(Some(hash)) = source.block_hash(ceiling).await {
+                        store.set_block_hash(ceiling, &hash)?;
+                        store.set_meta(SEAL_PIN_KEY, &format!("{ceiling}:{hash}"))?;
+                    }
                 }
                 tracing::debug!(
                     rows = scan.rows,
@@ -7814,6 +7847,32 @@ fn reorg_check_due(freshness: crate::freshness::Freshness, next: u64, ceiling: u
     !freshness.finality_only || next.saturating_sub(1) > ceiling
 }
 
+/// Skips the reorg check on an idle poll that sees the tip and cursor of the last check (#1493).
+///
+/// The check guards the next commit, and a poll with a window to commit always pays it. An idle one
+/// commits and seals nothing, so a same-height reorg can wait for the next new block, or for
+/// [`REORG_RECHECK`] on a chain whose tip has stalled, so orphaned rows are not served indefinitely.
+/// A committed window counts as a check at its tip: its checkpoint header was just read there.
+#[derive(Default)]
+struct ReorgGate(Option<(u64, u64, tokio::time::Instant)>);
+
+/// Longest an idle cursor goes without a reorg check. A 12 s L1 has usually found its next block by
+/// then, and an e2e reorg test waits 20 s for a stalled tip to reconverge.
+const REORG_RECHECK: std::time::Duration = std::time::Duration::from_secs(12);
+
+impl ReorgGate {
+    fn due(&self, tip: u64, next: u64, idle: bool) -> bool {
+        match self.0 {
+            Some((t, n, at)) if idle && (t, n) == (tip, next) => at.elapsed() >= REORG_RECHECK,
+            _ => true,
+        }
+    }
+
+    fn checked(&mut self, tip: u64, next: u64) {
+        self.0 = Some((tip, next, tokio::time::Instant::now()));
+    }
+}
+
 /// The dial a shared cursor runs at: the shortest interval any of its nests asked for, and
 /// finality-only only if every nest asked for it - a nest that wants the tip must not be held at
 /// finality by a co-tenant that does not.
@@ -7827,6 +7886,8 @@ fn cursor_freshness<'a>(
             Some(acc) => crate::freshness::Freshness {
                 poll_interval: acc.poll_interval.min(n.freshness.poll_interval),
                 finality_only: acc.finality_only && n.freshness.finality_only,
+                poll_interval_explicit: acc.poll_interval_explicit
+                    || n.freshness.poll_interval_explicit,
             },
         });
     }
@@ -8571,6 +8632,104 @@ mod tests {
             Some(pinned.as_str()),
             "a held finalized range must still pin a checkpoint at the ceiling, or a later \
              reorg walks past it to an older sparse checkpoint (#461 / #1067)"
+        );
+    }
+
+    /// Hashes that change at and above `fork_from`, counting every ask.
+    struct PinSource {
+        fork_from: std::sync::atomic::AtomicU64,
+        asks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PinSource {
+        fn hash(&self, n: u64) -> String {
+            let chain = u64::from(n >= self.fork_from.load(std::sync::atomic::Ordering::SeqCst));
+            format!("0x{n:060x}{chain:04x}")
+        }
+        fn asks(&self) -> usize {
+            self.asks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for PinSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(0)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.hash(n)))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(vec![])
+        }
+    }
+
+    /// #1495. A held range pins its ceiling once and reuses the pin while the watermark stands, and
+    /// the reused pin still anchors the reorg walk at or above the watermark (#461). The watermark
+    /// here has no checkpoint of its own, as after a pin that failed, so the held pin is the only
+    /// anchor the walk can find.
+    #[tokio::test]
+    async fn a_held_range_pins_once_and_the_pin_still_anchors_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let src = PinSource {
+            fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+            asks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let metrics = crate::metrics::NestMetrics::default();
+        let entities: Vec<(String, String)> = (51..=150)
+            .map(|i| (Store::entity_key(i, 0), entity_json(i, 0)))
+            .collect();
+        store
+            .commit_window(&entities, Some((150, src.hash(150).as_str())), 150)
+            .unwrap();
+        store.set_meta(SEALED_THROUGH_KEY, "50").unwrap();
+        let seal =
+            |ceiling: u64| maybe_seal(tmp.path(), &store, &src, ceiling, None, &metrics, SPAN_REAL);
+
+        seal(100).await.unwrap();
+        assert_eq!(src.asks(), 1, "the first held window pins its ceiling");
+        for ceiling in [110, 120, 130] {
+            seal(ceiling).await.unwrap();
+        }
+        assert_eq!(src.asks(), 1, "later held windows reuse the pin at 100");
+        assert_eq!(
+            store.get_meta(SEALED_THROUGH_KEY).unwrap().as_deref(),
+            Some("50")
+        );
+
+        // Tip windows checkpoint above finality; a reorg forking above the ceiling replaces them all.
+        for b in [135, 145] {
+            store.set_block_hash(b, &src.hash(b)).unwrap();
+        }
+        src.fork_from
+            .store(132, std::sync::atomic::Ordering::SeqCst);
+        let ancestor = detect_reorg(&src, &store, 150).await.unwrap();
+        assert_eq!(
+            ancestor,
+            Some(100),
+            "the walk must land on the reused pin, at or above the watermark 50"
+        );
+
+        // A pin whose checkpoint no longer matches, or that the watermark has passed, is re-taken.
+        src.fork_from
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        let before = src.asks();
+        store.set_block_hash(100, "0xdead").unwrap();
+        seal(130).await.unwrap();
+        assert_eq!(src.asks() - before, 1, "an overwritten pin is pinned again");
+        store.set_meta(SEALED_THROUGH_KEY, "131").unwrap();
+        seal(140).await.unwrap();
+        assert_eq!(
+            src.asks() - before,
+            2,
+            "a pin below the watermark is pinned again"
         );
     }
 
@@ -17331,6 +17490,7 @@ template="pool"
             crate::freshness::Freshness {
                 poll_interval: std::time::Duration::from_secs(300),
                 finality_only: false,
+                poll_interval_explicit: true,
             },
         )
         .await;
@@ -17489,6 +17649,7 @@ template="pool"
             crate::freshness::Freshness {
                 poll_interval: std::time::Duration::from_secs(300),
                 finality_only: false,
+                poll_interval_explicit: true,
             },
         )
         .await;
@@ -18089,6 +18250,386 @@ rpc_urls = ["https://rpc.example"]
             cfg.nest.block_timestamps,
             "absent must mean on, or upgrading silently drops a column from every table"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // What a caught-up nest pays per poll (#1493, #1494, #1495).
+    // ---------------------------------------------------------------------------------------------
+
+    /// Calls a caught-up nest makes, by method. `block_hash` and `block_record` are each one
+    /// `eth_getBlockByNumber` on an RPC source.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct TipCalls {
+        tip: usize,
+        block_hash: usize,
+        block_record: usize,
+        block_timestamps: usize,
+        finalized: usize,
+        logs: usize,
+    }
+
+    impl TipCalls {
+        fn since(self, earlier: TipCalls) -> TipCalls {
+            TipCalls {
+                tip: self.tip - earlier.tip,
+                block_hash: self.block_hash - earlier.block_hash,
+                block_record: self.block_record - earlier.block_record,
+                block_timestamps: self.block_timestamps - earlier.block_timestamps,
+                finalized: self.finalized - earlier.finalized,
+                logs: self.logs - earlier.logs,
+            }
+        }
+        fn headers(self) -> usize {
+            self.block_hash + self.block_record + self.block_timestamps
+        }
+    }
+
+    /// A chain whose tip the test moves by hand, counting every call. `fork(from)` replaces every
+    /// block at or above `from`: new hashes, and the rows of the chain it replaced are gone.
+    struct TipCostSource {
+        tip: std::sync::atomic::AtomicU64,
+        fork_from: std::sync::atomic::AtomicU64,
+        /// `(block, chain)`: a Transfer at `block` on the old chain (0) or the replacement (1).
+        rows: Vec<(u64, u64)>,
+        calls: std::sync::Mutex<TipCalls>,
+    }
+
+    impl TipCostSource {
+        const TIP: u64 = 1_000;
+        /// The `finalized` tag trails the tip by this much.
+        const FINALITY: u64 = 5;
+        const ADDR: &'static str = "0x1111111111111111111111111111111111111111";
+
+        fn new(rows: Vec<(u64, u64)>) -> Self {
+            TipCostSource {
+                tip: std::sync::atomic::AtomicU64::new(Self::TIP),
+                fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+                rows,
+                calls: std::sync::Mutex::new(TipCalls::default()),
+            }
+        }
+        fn calls(&self) -> TipCalls {
+            *self.calls.lock().unwrap()
+        }
+        fn count(&self, f: impl FnOnce(&mut TipCalls)) {
+            f(&mut self.calls.lock().unwrap())
+        }
+        fn set_tip(&self, t: u64) {
+            self.tip.store(t, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn fork(&self, from: u64) {
+            self.fork_from
+                .store(from, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn chain_of(&self, n: u64) -> u64 {
+            u64::from(n >= self.fork_from.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn hash(&self, n: u64) -> Option<String> {
+            (n <= self.tip.load(std::sync::atomic::Ordering::SeqCst))
+                .then(|| format!("0x{n:060x}{:04x}", self.chain_of(n)))
+        }
+        /// Blocks in `[from, to]` holding a Transfer on the chain as it stands now.
+        fn canonical_rows(&self, from: u64, to: u64) -> Vec<u64> {
+            self.rows
+                .iter()
+                .filter(|&&(b, c)| b >= from && b <= to && self.chain_of(b) == c)
+                .map(|&(b, _)| b)
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for TipCostSource {
+        async fn tip(&self) -> Result<u64> {
+            self.count(|c| c.tip += 1);
+            Ok(self.tip.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            self.count(|c| c.finalized += 1);
+            Ok(Some(
+                self.tip
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .saturating_sub(Self::FINALITY),
+            ))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.count(|c| c.block_hash += 1);
+            Ok(self.hash(n))
+        }
+        async fn block_record(&self, n: u64) -> Result<Option<(String, Option<u64>)>> {
+            self.count(|c| c.block_record += 1);
+            Ok(self.hash(n).map(|h| (h, Some(1_700_000_000 + n))))
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            // An empty ask sends nothing on an RPC source.
+            if !blocks.is_empty() {
+                self.count(|c| c.block_timestamps += 1);
+            }
+            Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.count(|c| c.logs += 1);
+            Ok(self
+                .canonical_rows(from, to)
+                .into_iter()
+                .map(|b| {
+                    let mut log = transfer_log(b, 0);
+                    log.address = Self::ADDR.into();
+                    log.block_hash = self.hash(b).unwrap_or_default();
+                    log.data = format!("0x{:064x}", 1_000 + self.chain_of(b));
+                    log
+                })
+                .collect())
+        }
+    }
+
+    fn last_block_of(store: &dyn crate::store::HotStore) -> Option<u64> {
+        store
+            .get_meta(LAST_BLOCK_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+    }
+
+    fn sealed_through_of(store: &dyn crate::store::HotStore) -> u64 {
+        store
+            .get_meta(SEALED_THROUGH_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A nest caught up at `TipCostSource::TIP` on a two-second poll, driven by the solo loop or by a
+    /// one-nest runtime cursor.
+    async fn caught_up(
+        dir: &std::path::Path,
+        src: Arc<TipCostSource>,
+        runtime: bool,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<dyn crate::store::HotStore>,
+    ) {
+        let nest = build_dialled_nest(
+            dir,
+            crate::freshness::Freshness {
+                poll_interval: std::time::Duration::from_secs(2),
+                poll_interval_explicit: true,
+                finality_only: false,
+            },
+        )
+        .await;
+        let store = nest.store.clone();
+        let source = src.clone() as Arc<dyn Source>;
+        let task = if runtime {
+            tokio::spawn(runtime_index_loop(
+                source,
+                vec![nest],
+                Some(50),
+                false,
+                1,
+                50,
+                Arc::new(crate::health::RuntimeHealth::new()),
+                false,
+                None,
+            ))
+        } else {
+            tokio::spawn(index_loop(source, nest, Some(50), false, 1, 50))
+        };
+        assert!(
+            within_deadline(|| last_block_of(store.as_ref()) == Some(TipCostSource::TIP)).await,
+            "the nest never caught up: last block {:?}",
+            last_block_of(store.as_ref())
+        );
+        // Past the poll that follows the catch-up commit, so the idle phase starts idle.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        (task, store)
+    }
+
+    /// Calls over `idle` idle polls and then `advancing` polls that each find one new block.
+    async fn tip_bill(rows: Vec<(u64, u64)>, runtime: bool) -> (TipCalls, TipCalls, usize) {
+        const ADVANCING: u64 = 6;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = Arc::new(TipCostSource::new(rows));
+        let (task, store) = caught_up(tmp.path(), src.clone(), runtime).await;
+
+        let before = src.calls();
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let idle = src.calls().since(before);
+
+        let before = src.calls();
+        for step in 1..=ADVANCING {
+            let t = TipCostSource::TIP + step;
+            src.set_tip(t);
+            assert!(
+                within_deadline(|| last_block_of(store.as_ref()) == Some(t)).await,
+                "block {t} was never committed"
+            );
+        }
+        let advancing = src.calls().since(before);
+        task.abort();
+        assert_eq!(
+            advancing.tip, ADVANCING as usize,
+            "each new block must be found by exactly one poll, or the per-poll figures below are \
+             not per poll: {advancing:?}"
+        );
+        (idle, advancing, ADVANCING as usize)
+    }
+
+    /// The bill of a caught-up nest holding finalized rows short of a seal, per idle poll and per
+    /// committed one-block window, through both loops. The rows put `maybe_seal` in its held arm.
+    #[tokio::test(start_paused = true)]
+    async fn tip_bill_of_a_caught_up_nest_holding_rows() {
+        for runtime in [false, true] {
+            let (idle, advancing, m) = tip_bill(vec![(960, 0)], runtime).await;
+            assert_eq!(idle.tip, 10, "the idle phase is ten polls: {idle:?}");
+            // Ten polls of a stalled tip span one `REORG_RECHECK`; before #1493 each paid a header.
+            assert_eq!(
+                (idle.headers(), idle.logs, idle.finalized),
+                (1, 0, 0),
+                "runtime={runtime}: an idle poll's bill, {idle:?}"
+            );
+            assert_eq!(
+                (
+                    advancing.block_hash,
+                    advancing.block_record,
+                    advancing.block_timestamps,
+                    advancing.finalized,
+                    advancing.logs
+                ),
+                (m, m, 0, m, m),
+                "runtime={runtime}: per committed window, {advancing:?}"
+            );
+        }
+    }
+
+    /// The same bill for a nest that has never matched a row, where `maybe_seal` takes its empty arm
+    /// and advances the watermark on every window.
+    #[tokio::test(start_paused = true)]
+    async fn tip_bill_of_a_caught_up_nest_with_no_rows() {
+        for runtime in [false, true] {
+            let (idle, advancing, m) = tip_bill(Vec::new(), runtime).await;
+            assert_eq!(idle.headers(), 1, "runtime={runtime}: {idle:?}");
+            assert_eq!(
+                (
+                    advancing.block_hash,
+                    advancing.block_record,
+                    advancing.block_timestamps
+                ),
+                (2 * m, m, 0),
+                "runtime={runtime}: per committed window, {advancing:?}"
+            );
+        }
+    }
+
+    /// A same-height reorg on a chain whose tip then stalls is still rolled back, within one
+    /// `REORG_RECHECK` and a poll, through both loops. Without the bound it would be served until the
+    /// chain moved again.
+    #[tokio::test(start_paused = true)]
+    async fn a_reorg_at_a_stalled_tip_is_caught_within_the_recheck_bound() {
+        const T: u64 = TipCostSource::TIP;
+        for runtime in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = Arc::new(TipCostSource::new(vec![(960, 0), (T, 0)]));
+            let (task, store) = caught_up(tmp.path(), src.clone(), runtime).await;
+            src.fork(T);
+            // A literal, not `REORG_RECHECK`: a test that moves with the constant cannot catch it growing.
+            tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+            let rolled = store.get_block_hash(T).ok().flatten() == src.hash(T);
+            // Only the old chain had a row at T.
+            let row_gone = store.entities_in_range(T, T).unwrap().is_empty();
+            task.abort();
+            assert!(
+                rolled && row_gone,
+                "runtime={runtime}: the replaced tip block is still the old one (checkpoint {rolled}, row gone {row_gone})"
+            );
+        }
+    }
+
+    /// A reorg that lands while the nest sits idle at the tip, at any depth above finality: one that
+    /// replaces the tip block at the same height, and one that leaves the replacement a block
+    /// shorter. The first poll that finds a new block must roll it back before committing, every
+    /// stored row and checkpoint must then match the replacement chain, and nothing above finality
+    /// may be sealed in the meantime.
+    #[tokio::test(start_paused = true)]
+    async fn a_reorg_during_idle_polls_converges_on_the_next_advancing_poll() {
+        const T: u64 = TipCostSource::TIP;
+        for runtime in [false, true] {
+            for depth in [0u64, 1, 2, 4] {
+                for idle_polls in [1u64, 3] {
+                    for shorter in [false, true] {
+                        if shorter && depth == 0 {
+                            continue;
+                        }
+                        let case = format!(
+                            "runtime={runtime} depth={depth} idle={idle_polls} shorter={shorter}"
+                        );
+                        let tmp = tempfile::tempdir().unwrap();
+                        // 960 is finalized and held; T-2 exists only on the old chain and T-1 only on
+                        // the replacement, so the rows show which chain the store ended up on.
+                        let src =
+                            Arc::new(TipCostSource::new(vec![(960, 0), (T - 2, 0), (T - 1, 1)]));
+                        let (task, store) = caught_up(tmp.path(), src.clone(), runtime).await;
+
+                        src.fork(T - depth);
+                        if shorter {
+                            src.set_tip(T - 1);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2 * idle_polls)).await;
+                        assert!(
+                            sealed_through_of(store.as_ref()) <= T - TipCostSource::FINALITY,
+                            "{case}: sealed past finality while idle"
+                        );
+
+                        let head = T + 2;
+                        src.set_tip(head);
+                        assert!(
+                            within_deadline(|| {
+                                last_block_of(store.as_ref()) == Some(head)
+                                    && store.get_block_hash(head).ok().flatten() == src.hash(head)
+                            })
+                            .await,
+                            "{case}: never reached {head} on the replacement chain: last block {:?}",
+                            last_block_of(store.as_ref())
+                        );
+                        task.abort();
+
+                        let sealed = sealed_through_of(store.as_ref());
+                        assert!(
+                            sealed < T - depth,
+                            "{case}: sealed {sealed} reaches the fork"
+                        );
+                        let stored: std::collections::BTreeSet<u64> = store
+                            .entities_in_range(sealed + 1, head)
+                            .unwrap()
+                            .iter()
+                            .filter_map(|j| block_number_of(j))
+                            .collect();
+                        let want: std::collections::BTreeSet<u64> =
+                            src.canonical_rows(sealed + 1, head).into_iter().collect();
+                        assert_eq!(
+                            stored, want,
+                            "{case}: hot rows are not the replacement chain's"
+                        );
+                        for (b, h) in store.checkpoints_desc().unwrap() {
+                            assert_eq!(
+                                Some(h),
+                                src.hash(b),
+                                "{case}: checkpoint {b} is not canonical"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------------

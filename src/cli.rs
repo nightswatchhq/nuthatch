@@ -1428,6 +1428,12 @@ pub struct DevArgs {
     #[arg(long)]
     pub rpc: Vec<String>,
 
+    /// Endpoint(s) asked only while every other endpoint is failing (repeatable): a paid key kept
+    /// behind free public endpoints, so it bills only for the calls they could not answer. A flag
+    /// rather than config, because a keyed URL does not belong in the nest.
+    #[arg(long = "rpc-fallback", value_name = "URL")]
+    pub rpc_fallback: Vec<String>,
+
     /// Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a
     /// nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start
     /// blocks, else from a default recent window.
@@ -1462,13 +1468,14 @@ pub struct DevArgs {
     pub window: Option<u64>,
 
     /// How long a caught-up cursor waits before asking for the tip again (RFC-0040 §3 knob 1).
-    /// `2s`, `5m`, `1h`, or bare seconds. The default follows the tip as closely as the chain
-    /// allows and pays for it on every poll - a tip call, a reorg check, a checkpoint and a
-    /// `finalized` probe per window, whether or not a block carried an event. A nest whose readers
-    /// refresh on a cron of minutes can wait minutes here and index the same rows for roughly a
-    /// hundredth of the requests. `/ready` reports the interval and scales its stall threshold to it.
-    #[arg(long, default_value = "2s", value_name = "DURATION", value_parser = crate::freshness::parse_duration)]
-    pub poll_interval: std::time::Duration,
+    /// `2s`, `5m`, `1h`, or bare seconds. The default is the chain's block time, never under 2s:
+    /// the registry's figure for a shipped chain, measured at startup for any other. Every poll is
+    /// paid for - a tip call, a reorg check, a checkpoint and a `finalized` probe per window,
+    /// whether or not a block carried an event. A nest whose readers refresh on a cron of minutes
+    /// can wait minutes here and index the same rows for roughly a hundredth of the requests.
+    /// `/ready` reports the interval and scales its stall threshold to it.
+    #[arg(long, value_name = "DURATION", value_parser = crate::freshness::parse_duration)]
+    pub poll_interval: Option<std::time::Duration>,
 
     /// Index only up to the chain's finality boundary, never the unfinalised tip (RFC-0040 §3 knob 2).
     /// Nothing indexed can be reorged, so the reorg check is not paid and the hot store holds only

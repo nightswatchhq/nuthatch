@@ -1737,6 +1737,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "freshness": {
             "mode": s.freshness.mode(),
             "poll_interval_secs": s.freshness.poll_interval.as_secs(),
+            "poll_interval_source": s.freshness.poll_interval_source(),
         },
         "sealed_through": sealed,
         // **How far the sealed watermark trails what the cursor has indexed** (#1199).
@@ -5171,6 +5172,12 @@ mod tests {
         assert_eq!(json["stalled"], json!(false));
         assert_eq!(json["wedged"], json!(false));
         assert_eq!(json["lag_blocks"], json!(0));
+        // An undialled test state: the interval is the chain default, and /ready says so (#1497).
+        assert_eq!(json["freshness"]["poll_interval_secs"], json!(2));
+        assert_eq!(
+            json["freshness"]["poll_interval_source"],
+            json!("block_time")
+        );
     }
 
     /// #807: a seal-direct pass that has actually sealed rows must not look like WAITING.

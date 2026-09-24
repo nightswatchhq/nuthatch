@@ -673,10 +673,15 @@ pub struct RpcClient {
     http: reqwest::Client,
     urls: Vec<String>,
     cursor: AtomicUsize,
+    /// `urls[..primaries]` share the load; the rest are asked only while every primary is cooling down.
+    primaries: usize,
     /// Per-endpoint health: the millis-since-epoch until which the endpoint is considered unhealthy
     /// (`0` = healthy). Set on a failed call, cleared on a successful one. Endpoints past their cooldown
     /// are tried first; still-unhealthy ones are the fallback of last resort (soonest-to-recover first).
     health: Vec<AtomicU64>,
+    /// The highest block each endpoint has reported from `eth_blockNumber`, so a lower bound on its
+    /// head. Pool members' heads differ by a block or two, and one behind refuses a `toBlock` it lacks.
+    heads: Vec<AtomicU64>,
     /// Total HTTP requests attempted (incl. failover retries) - a benchmark/observability metric.
     requests: AtomicU64,
     /// Block-number → unix timestamp, remembered across windows (RFC-0029 §6d).
@@ -699,12 +704,16 @@ impl RpcClient {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .context("failed to build HTTP client")?;
+        let n = urls.len();
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        let heads = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             http,
             urls,
             cursor: AtomicUsize::new(0),
+            primaries: n,
             health,
+            heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
         })
@@ -715,17 +724,60 @@ impl RpcClient {
         self.requests.load(Ordering::Relaxed)
     }
 
-    /// The order to try endpoints for this call: healthy ones first (round-robin from the cursor for
-    /// fairness), then any still in cooldown as a last resort (soonest-to-recover first). Advances the
-    /// round-robin cursor once per call.
+    /// A pool whose `fallback` endpoints carry no load while any of `primary` is healthy: a free
+    /// endpoint in front of a paid one, say. Fallbacks already in `primary` are dropped.
+    pub fn with_fallbacks(primary: Vec<String>, fallback: Vec<String>) -> Result<Self> {
+        let primaries = primary.len();
+        let mut urls = primary;
+        for url in fallback {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        let mut client = Self::new(urls)?;
+        if primaries > 0 {
+            client.primaries = primaries;
+        }
+        Ok(client)
+    }
+
+    /// The order to try endpoints for this call: healthy primaries first (round-robin from the cursor
+    /// for fairness), then healthy fallbacks in the order given, then any still in cooldown as a last
+    /// resort (soonest-to-recover first). Advances the round-robin cursor once per call.
     fn endpoint_order(&self) -> Vec<usize> {
+        self.endpoint_order_holding(None)
+    }
+
+    /// [`Self::endpoint_order`], with healthy endpoints known to hold block `need` moved to the front.
+    /// At the tip that is the endpoint which just reported the tip, so its `eth_getLogs` is not first
+    /// refused by a pool member a block behind (#1498).
+    fn endpoint_order_holding(&self, need: Option<u64>) -> Vec<usize> {
+        let mut order = self.endpoint_order_by_health();
+        if let Some(need) = need {
+            let healthy = order
+                .iter()
+                .take_while(|&&j| self.health[j].load(Ordering::Relaxed) <= now_millis())
+                .count();
+            // Tier before head: a fallback that holds `need` still waits behind every healthy primary.
+            order[..healthy].sort_by_key(|&j| {
+                (
+                    j >= self.primaries,
+                    self.heads[j].load(Ordering::Relaxed) < need,
+                )
+            });
+        }
+        order
+    }
+
+    fn endpoint_order_by_health(&self) -> Vec<usize> {
         let n = self.urls.len();
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let p = self.primaries;
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % p;
         let now = now_millis();
         let mut healthy = Vec::with_capacity(n);
         let mut cooling = Vec::with_capacity(n);
         for i in 0..n {
-            let j = (start + i) % n;
+            let j = if i < p { (start + i) % p } else { i };
             let until = self.health[j].load(Ordering::Relaxed);
             if until <= now {
                 healthy.push(j);
@@ -784,10 +836,23 @@ impl RpcClient {
     /// it exists to interrogate an endpoint's limits, which is not expressible through the typed
     /// helpers.
     pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_holding(method, params, None)
+            .await
+            .map(|(v, _)| v)
+    }
+
+    /// [`Self::call`], preferring endpoints known to hold block `need`; also returns which endpoint
+    /// answered.
+    async fn call_holding(
+        &self,
+        method: &str,
+        params: Value,
+        need: Option<u64>,
+    ) -> Result<(Value, usize)> {
         let mut last_err = anyhow!("all RPC endpoints failed");
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
-        for j in self.endpoint_order() {
+        for j in self.endpoint_order_holding(need) {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
@@ -803,7 +868,7 @@ impl RpcClient {
                         attempts > 1,
                     );
                     self.mark_healthy(j);
-                    return Ok(v);
+                    return Ok((v, j));
                 }
                 Err(e) => {
                     crate::metrics::METRICS.observe_rpc(
@@ -1025,8 +1090,12 @@ impl RpcClient {
     }
 
     pub async fn block_number(&self) -> Result<u64> {
-        let result = self.call("eth_blockNumber", json!([])).await?;
-        parse_hex_u64(result.as_str().unwrap_or_default())
+        let (result, j) = self
+            .call_holding("eth_blockNumber", json!([]), None)
+            .await?;
+        let head = parse_hex_u64(result.as_str().unwrap_or_default())?;
+        self.heads[j].fetch_max(head, Ordering::Relaxed);
+        Ok(head)
     }
 
     /// `eth_chainId`, once, with the same failover as any other call. Used to identify a chain
@@ -1723,6 +1792,24 @@ impl RpcClient {
         Ok(result.get("hash").and_then(Value::as_str).map(String::from))
     }
 
+    /// [`Self::block_hash`] and the same header's timestamp, from one `eth_getBlockByNumber`.
+    pub async fn block_record(&self, number: u64) -> Result<Option<(String, Option<u64>)>> {
+        let result = self
+            .call(
+                "eth_getBlockByNumber",
+                json!([format!("0x{number:x}"), false]),
+            )
+            .await?;
+        let Some(hash) = result.get("hash").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let ts = result
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| parse_hex_u64(s).ok());
+        Ok(Some((hash.to_string(), ts)))
+    }
+
     /// One combined `eth_getLogs` across all `addresses`, matching any of `topic0s`.
     pub async fn get_logs(
         &self,
@@ -1743,13 +1830,36 @@ impl RpcClient {
         }
         filter.insert("fromBlock".into(), json!(format!("0x{from:x}")));
         filter.insert("toBlock".into(), json!(format!("0x{to:x}")));
-        let result = self
-            .call("eth_getLogs", json!([Value::Object(filter)]))
+        let (result, _) = self
+            .call_holding("eth_getLogs", json!([Value::Object(filter)]), Some(to))
             .await?;
         let arr = result
             .as_array()
             .ok_or_else(|| anyhow!("eth_getLogs did not return an array"))?;
+        self.remember_log_timestamps(arr);
         arr.iter().map(parse_log).collect()
+    }
+
+    /// Nodes that carry `blockTimestamp` on each log (execution-apis, 2025) answer the header
+    /// `block_timestamps` would otherwise buy per block: on a backfill, most of the RPC bill.
+    fn remember_log_timestamps(&self, logs: &[Value]) {
+        let found: HashMap<u64, u64> = logs
+            .iter()
+            .filter(|l| l.get("removed").and_then(Value::as_bool) != Some(true))
+            .filter_map(|l| {
+                let block = parse_hex_u64(l.get("blockNumber")?.as_str()?).ok()?;
+                let ts = parse_hex_u64(l.get("blockTimestamp")?.as_str()?).ok()?;
+                Some((block, ts))
+            })
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        let mut cache = self.timestamps.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() + found.len() > TIMESTAMP_CACHE_MAX {
+            cache.clear();
+        }
+        cache.extend(found);
     }
 }
 
@@ -1863,6 +1973,32 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// #1494: a window checkpoint's hash and timestamp are one header, so one request.
+    #[tokio::test]
+    async fn a_block_record_is_one_request() {
+        use serde_json::json;
+        let (url, server) = canned_rpc(json!({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"number": "0x10", "hash": "0xabc", "timestamp": "0x6553f100"}
+        }))
+        .await;
+        let c = super::RpcClient::new(vec![url]).unwrap();
+        let got = c.block_record(16).await.unwrap();
+        let requests = c.request_count();
+        server.abort();
+        assert_eq!(got, Some(("0xabc".to_string(), Some(0x6553f100))));
+        assert_eq!(requests, 1);
+
+        let (url, server) = canned_rpc(json!({"jsonrpc": "2.0", "id": 0, "result": null})).await;
+        let got = super::RpcClient::new(vec![url])
+            .unwrap()
+            .block_record(16)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(got, None, "a block the node does not have has no record");
     }
 
     async fn two_calls_answered_with(
@@ -2249,6 +2385,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn timestamps_carried_on_logs_cost_no_header_calls() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static HEADERS: AtomicUsize = AtomicUsize::new(0);
+        HEADERS.store(0, Ordering::SeqCst);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let log = |block: u64, ts: Option<u64>, removed: bool| {
+            let mut v = json!({"address":"0xaa","topics":["0x01"],"data":"0x",
+                "blockNumber":format!("0x{block:x}"),"blockHash":"0xbh","transactionHash":"0xtx",
+                "logIndex":"0x0","removed":removed});
+            if let Some(ts) = ts {
+                v["blockTimestamp"] = json!(format!("0x{ts:x}"));
+            }
+            v
+        };
+        let logs = json!([
+            log(10, Some(1_000), false),
+            log(11, Some(1_012), false),
+            log(12, None, false),
+            log(13, Some(9_999), true),
+        ]);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let logs = logs.clone();
+                async move {
+                    let one = |item: &Value| {
+                        if item["method"] == "eth_getLogs" {
+                            json!({"jsonrpc":"2.0","id":item["id"],"result":logs})
+                        } else {
+                            HEADERS.fetch_add(1, Ordering::SeqCst);
+                            json!({"jsonrpc":"2.0","id":item["id"],"result":{"timestamp":"0x7"}})
+                        }
+                    };
+                    match req {
+                        Value::Array(items) => Json(Value::Array(items.iter().map(one).collect())),
+                        item => Json(one(&item)),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
+        c.get_logs(&[], &["0x01".into()], 10, 13).await.unwrap();
+        let got = c.block_timestamps(&[10, 11]).await.unwrap();
+        assert_eq!(got, HashMap::from([(10, 1_000), (11, 1_012)]));
+        assert_eq!(
+            HEADERS.load(Ordering::SeqCst),
+            0,
+            "the logs already said when"
+        );
+
+        // A log without the field, and a removed one, still go to the header.
+        let got = c.block_timestamps(&[12, 13]).await.unwrap();
+        server.abort();
+        assert_eq!(got, HashMap::from([(12, 7), (13, 7)]));
+        assert_eq!(HEADERS.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn an_auth_rejection_is_terminal_however_it_arrives() {
         // Over HTTP status…
@@ -2406,6 +2607,75 @@ mod tests {
 
         broken_h.abort();
         good_h.abort();
+    }
+
+    #[tokio::test]
+    async fn a_tip_get_logs_goes_to_an_endpoint_that_holds_its_to_block() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        // Arc's public endpoints, measured 2026-09-24: a `toBlock` past their own head is refused
+        // with -32014 while Alchemy, a block ahead, answered the tip.
+        async fn endpoint(head: u64) -> (String, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+            async fn handler(
+                State((head, refused)): State<(u64, Arc<AtomicU64>)>,
+                Json(req): Json<Value>,
+            ) -> Json<Value> {
+                let body = match req["method"].as_str().unwrap_or("") {
+                    "eth_blockNumber" => json!({"result": format!("0x{head:x}")}),
+                    "eth_getLogs" => {
+                        let to = req["params"][0]["toBlock"].as_str().unwrap();
+                        if u64::from_str_radix(&to[2..], 16).unwrap() > head {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                            json!({"error": {"code": -32014, "message": "requested data not available"}})
+                        } else {
+                            json!({"result": []})
+                        }
+                    }
+                    _ => json!({"result": null}),
+                };
+                let mut body = body;
+                body["jsonrpc"] = json!("2.0");
+                body["id"] = json!(1);
+                Json(body)
+            }
+            let refused = Arc::new(AtomicU64::new(0));
+            let app = Router::new()
+                .route("/", post(handler))
+                .with_state((head, refused.clone()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let h = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            (format!("http://{addr}/"), refused, h)
+        }
+
+        let (ahead, ahead_refused, h1) = endpoint(1_000).await;
+        let (behind, behind_refused, h2) = endpoint(999).await;
+        // Two calls per poll over two endpoints: plain round-robin sends every getLogs to `behind`.
+        let c = RpcClient::new(vec![ahead, behind]).unwrap();
+
+        for _ in 0..6 {
+            let before = c.request_count();
+            let tip = c.block_number().await.unwrap();
+            c.get_logs(&[], &["0xaa".into()], tip - 10, tip)
+                .await
+                .unwrap();
+            assert_eq!(
+                c.request_count() - before,
+                2,
+                "one tip call and one getLogs per poll"
+            );
+        }
+        assert_eq!(ahead_refused.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            behind_refused.load(Ordering::Relaxed),
+            0,
+            "a getLogs was sent to an endpoint not known to hold its toBlock"
+        );
+        h1.abort();
+        h2.abort();
     }
 
     /// Issue #150: the failover path itself, not just the ordering maths. The first endpoint is broken,
@@ -2599,6 +2869,42 @@ mod tests {
             }
         }
         assert!(seen_first, "a recovered endpoint rejoins the round-robin");
+    }
+
+    #[test]
+    fn a_fallback_carries_no_load_while_a_primary_is_healthy() {
+        let c =
+            RpcClient::with_fallbacks(v(["http://a", "http://b"]), v(["http://paid", "http://a"]))
+                .unwrap();
+        assert_eq!(
+            c.urls.len(),
+            3,
+            "a fallback already in the pool is not added twice"
+        );
+        for _ in 0..4 {
+            let order = c.endpoint_order();
+            assert!(order[..2].contains(&0) && order[..2].contains(&1));
+            assert_eq!(order[2], 2);
+        }
+        c.mark_unhealthy(0);
+        assert_eq!(c.endpoint_order(), vec![1, 2, 0]);
+        c.mark_unhealthy(1);
+        assert_eq!(
+            c.endpoint_order()[0],
+            2,
+            "every primary cooling: the fallback answers"
+        );
+    }
+
+    #[test]
+    fn a_fallback_ahead_of_the_primaries_still_waits_behind_them() {
+        let c = RpcClient::with_fallbacks(v(["http://a", "http://b"]), v(["http://paid"])).unwrap();
+        c.heads[0].store(99, Ordering::Relaxed);
+        c.heads[1].store(100, Ordering::Relaxed);
+        c.heads[2].store(100, Ordering::Relaxed);
+        for _ in 0..4 {
+            assert_eq!(c.endpoint_order_holding(Some(100)), vec![1, 0, 2]);
+        }
     }
 
     #[test]
