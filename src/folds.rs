@@ -201,6 +201,8 @@ pub struct Stepper<'a> {
     set: &'a FoldSet,
     eval: analytics::FoldEvaluator,
     wanted: BTreeSet<String>,
+    /// The fact tables among `wanted`: what a window's inputs are digested over.
+    facts: BTreeSet<String>,
     dir: std::path::PathBuf,
     /// Where the last window started, so a checkpoint knows its predecessor and its inputs.
     from: Option<u64>,
@@ -209,10 +211,18 @@ pub struct Stepper<'a> {
 
 impl FoldSet {
     pub fn stepper<'a>(&'a self, dir: &Path, schema: &[TableSchema]) -> Result<Stepper<'a>> {
+        let wanted: BTreeSet<String> = self.folds.iter().flat_map(|f| f.reaches.clone()).collect();
+        let views = analytics::nest_view_bodies(dir);
+        let facts = wanted
+            .iter()
+            .filter(|t| !views.contains_key(*t))
+            .cloned()
+            .collect();
         Ok(Stepper {
             set: self,
             eval: analytics::FoldEvaluator::new(dir, schema)?,
-            wanted: self.folds.iter().flat_map(|f| f.reaches.clone()).collect(),
+            wanted,
+            facts,
             dir: dir.to_path_buf(),
             from: None,
             at: None,
@@ -346,18 +356,28 @@ pub const CHECKPOINTS_DIR: &str = "checkpoints";
 const CHECKPOINT_LOG: &str = "manifest.json";
 
 /// One fold's state at `block`, as a content address of its definition and every sealed fact up to
-/// `block` (RFC-0059 §5). Identity rests on inputs and logical rows, never on Parquet bytes.
+/// `block` (RFC-0059 §5). Identity rests on inputs and logical rows, never on Parquet bytes: a
+/// provisional segment folded into a wider one (#1150) changes the catalogue and not one row a
+/// window read, so the inputs are the rows themselves, digested per table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub block: u64,
-    /// `H(fold_hash, id(prev), the sealed segments the window (prev, block] read)`.
+    /// `H(fold_hash, id(prev), the rows of each fact table in the window (prev, block])`.
     pub id: String,
     pub prev: Option<u64>,
     pub rows: u64,
     /// Order-independent digest of the rows: the sum, mod 2^256, of each row's sha256.
     pub row_digest: String,
-    /// `(table, segment hash)` for every sealed segment overlapping `(prev, block]`.
-    pub inputs: Vec<(String, String)>,
+    /// Every fact table the fold reaches that had a row in `(prev, block]`, in name order.
+    pub inputs: Vec<WindowInput>,
+}
+
+/// The rows one fact table contributed to a window, digested as a checkpoint's own rows are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowInput {
+    pub table: String,
+    pub rows: u64,
+    pub digest: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -427,82 +447,75 @@ fn row_digest(fold: &Fold, rows: &[serde_json::Value]) -> String {
     hex::encode(sum)
 }
 
-fn checkpoint_id(fold: &Fold, prev: Option<&Checkpoint>, inputs: &[(String, String)]) -> String {
+fn checkpoint_id(fold: &Fold, prev: Option<&Checkpoint>, inputs: &[WindowInput]) -> String {
     let mut h = Sha256::new();
     h.update(fold.hash.as_bytes());
     match prev {
         Some(p) => h.update(p.id.as_bytes()),
         None => h.update(b"genesis"),
     }
-    for (table, seg) in inputs {
-        h.update(table.as_bytes());
+    for i in inputs {
+        h.update(i.table.as_bytes());
         h.update([0]);
-        h.update(seg.as_bytes());
+        h.update(i.rows.to_le_bytes());
+        h.update(i.digest.as_bytes());
         h.update([0]);
     }
     hex::encode(h.finalize())
 }
 
-/// Sealed segments of `tables` overlapping `(after, through]`, sorted.
-fn window_inputs(
-    dir: &Path,
-    tables: &BTreeSet<String>,
-    after: Option<u64>,
-    through: u64,
-) -> Result<Vec<(String, String)>> {
-    let manifest = crate::seal::load_manifest_with_hash(dir)?.0;
-    Ok(inputs_in(&manifest, tables, after, through))
-}
-
-fn inputs_in(
-    manifest: &crate::seal::Manifest,
-    tables: &BTreeSet<String>,
-    after: Option<u64>,
-    through: u64,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = manifest
-        .tables
-        .iter()
-        .filter(|(t, _)| tables.contains(&t.to_ascii_lowercase()))
-        .flat_map(|(t, segs)| {
-            segs.iter()
-                .filter(|s| after.is_none_or(|lo| s.to_block > lo) && s.from_block <= through)
-                .map(|s| (t.clone(), s.hash.clone()))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-/// Walk a fold's log from genesis to `block`: every link must name its predecessor, recompute to its
-/// id, and have read exactly the sealed segments the catalogue now holds for its window. A checkpoint
-/// whose history cannot be shown is not resumed from, however well its rows match their digest.
-fn verify_chain(dir: &Path, fold: &Fold, log: &CheckpointLog, block: u64) -> Result<()> {
-    let manifest = crate::seal::load_manifest_with_hash(dir)?.0;
+/// How many leading checkpoints of a log form a chain: each names the one before it and recomputes
+/// to its recorded id. Whatever follows the first broken link is not history anyone can resume from,
+/// however well its rows match their digest.
+fn verified_prefix(fold: &Fold, log: &CheckpointLog) -> usize {
     let mut prev: Option<&Checkpoint> = None;
-    for c in log.checkpoints.iter().take_while(|c| c.block <= block) {
-        let why = if c.prev != prev.map(|p| p.block) {
-            Some("does not follow the checkpoint before it")
-        } else if c.inputs != inputs_in(&manifest, &fold.reaches, c.prev, c.block) {
-            Some("read segments the catalogue no longer holds for its window")
-        } else if c.id != checkpoint_id(fold, prev, &c.inputs) {
-            Some("does not recompute to its recorded id")
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            bail!("fold `{}`: the checkpoint at {} {why}", fold.name, c.block);
+    for (i, c) in log.checkpoints.iter().enumerate() {
+        if c.prev != prev.map(|p| p.block) || c.id != checkpoint_id(fold, prev, &c.inputs) {
+            return i;
         }
         prev = Some(c);
     }
-    if prev.map(|p| p.block) != Some(block) {
+    log.checkpoints.len()
+}
+
+fn verify_chain(fold: &Fold, log: &CheckpointLog, block: u64) -> Result<()> {
+    let ok = verified_prefix(fold, log);
+    if let Some(c) = log.checkpoints.get(ok).filter(|c| c.block <= block) {
+        let why = if c.prev != log.checkpoints[..ok].last().map(|p| p.block) {
+            "does not follow the checkpoint before it"
+        } else {
+            "does not recompute to its recorded id"
+        };
+        bail!("fold `{}`: the checkpoint at {} {why}", fold.name, c.block);
+    }
+    if !log.checkpoints[..ok].iter().any(|c| c.block == block) {
         bail!("fold `{}` has no checkpoint at {block}", fold.name);
     }
     Ok(())
 }
 
 impl Stepper<'_> {
+    /// What the last window fed `fold`: each reached fact table's rows in it, digested. Tables with no
+    /// row in the window are left out, so the answer does not depend on which tables the catalogue
+    /// happens to list yet.
+    fn window_inputs(&self, fold: &Fold) -> Result<Vec<WindowInput>> {
+        let mut out = Vec::new();
+        for t in &fold.reaches {
+            if !self.facts.contains(t) {
+                continue;
+            }
+            let (rows, digest) = self.eval.digest(&format!("SELECT * FROM \"{t}\""))?;
+            if rows > 0 {
+                out.push(WindowInput {
+                    table: t.clone(),
+                    rows,
+                    digest,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Write every fold's current state as a checkpoint at the block it was last evaluated at.
     pub fn checkpoint(&self) -> Result<()> {
         let at = self
@@ -522,7 +535,7 @@ impl Stepper<'_> {
                     self.from
                 );
             }
-            let inputs = window_inputs(&self.dir, &f.reaches, self.from, at)?;
+            let inputs = self.window_inputs(f)?;
             let (rows, row_digest) = self.eval.digest(&carry_select(f))?;
             let entry = Checkpoint {
                 block: at,
@@ -566,7 +579,7 @@ impl Stepper<'_> {
                 .iter()
                 .find(|c| c.block == block)
                 .with_context(|| format!("fold `{}` has no checkpoint at {block}", f.name))?;
-            verify_chain(&self.dir, f, &log, block)?;
+            verify_chain(f, &log, block)?;
             let path = checkpoint_dir(&self.dir, f).join(format!("{block}.parquet"));
             let cols: Vec<String> = f
                 .carry
@@ -611,17 +624,75 @@ impl FoldSet {
         Ok(common.and_then(|c| c.last().copied()))
     }
 
-    /// Walk sealed history from the latest checkpoint to `sealed_through`, checkpointing every fold
-    /// each time about `window_rows` sealed rows have been read. One window in memory at a time, and
-    /// no RPC. Returns the blocks checkpointed.
-    pub fn build(
+    /// Bring every fold's log back to history a writer can continue from, and say where that is.
+    ///
+    /// A writer killed between one fold's log and the next leaves the folds disagreeing about the
+    /// latest checkpoint; a crash inside a log write leaves a link that does not chain. Each log is
+    /// cut back to its verified prefix, then every log to the latest block all of them still share,
+    /// and the Parquet files nothing names any more go. What is left is exactly what a fresh walk
+    /// would have written, so the next step continues from it.
+    pub fn reconcile(&self, dir: &Path) -> Result<Option<u64>> {
+        let mut logs: Vec<(usize, CheckpointLog)> = Vec::new();
+        for (i, f) in self.folds.iter().enumerate() {
+            let mut log = load_log(dir, f)?;
+            log.checkpoints.truncate(verified_prefix(f, &log));
+            logs.push((i, log));
+        }
+        let mut common: Option<BTreeSet<u64>> = None;
+        for (_, log) in &logs {
+            let blocks: BTreeSet<u64> = log.checkpoints.iter().map(|c| c.block).collect();
+            common = Some(match common {
+                None => blocks,
+                Some(c) => c.intersection(&blocks).copied().collect(),
+            });
+        }
+        let latest = common.and_then(|c| c.last().copied());
+        for (i, mut log) in logs {
+            let f = &self.folds[i];
+            log.checkpoints
+                .retain(|c| latest.is_some_and(|l| c.block <= l));
+            let cdir = checkpoint_dir(dir, f);
+            if !cdir.exists() {
+                continue;
+            }
+            let recorded = load_log(dir, f)?;
+            if recorded.checkpoints != log.checkpoints {
+                tracing::warn!(
+                    "fold `{}`: {} checkpoint(s) after {:?} did not survive a crash; rebuilding them",
+                    f.name,
+                    recorded.checkpoints.len() - log.checkpoints.len(),
+                    latest
+                );
+                write_atomically(
+                    &cdir.join(CHECKPOINT_LOG),
+                    &serde_json::to_vec_pretty(&log)?,
+                )?;
+            }
+            let named: BTreeSet<String> = log
+                .checkpoints
+                .iter()
+                .map(|c| format!("{}.parquet", c.block))
+                .collect();
+            for entry in std::fs::read_dir(&cdir)?.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if (name.ends_with(".parquet") && !named.contains(&name)) || name.ends_with(".tmp")
+                {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Where a walk from `start` to `sealed_through` checkpoints: at the end of about every
+    /// `window_rows` sealed rows the folds read, and at the last sealed block they read.
+    pub fn cuts(
         &self,
         dir: &Path,
-        schema: &[TableSchema],
+        start: Option<u64>,
         sealed_through: u64,
         window_rows: u64,
     ) -> Result<Vec<u64>> {
-        let start = self.latest_checkpoint(dir, sealed_through)?;
         let reached: BTreeSet<String> = self.folds.iter().flat_map(|f| f.reaches.clone()).collect();
         let manifest = crate::seal::load_manifest_with_hash(dir)?.0;
         let mut ends: Vec<(u64, usize)> = manifest
@@ -647,6 +718,21 @@ impl FoldSet {
                 cuts.push(*to);
             }
         }
+        Ok(cuts)
+    }
+
+    /// Walk sealed history from the latest checkpoint to `sealed_through`, checkpointing every fold
+    /// each time about `window_rows` sealed rows have been read. One window in memory at a time, and
+    /// no RPC. Returns the blocks checkpointed.
+    pub fn build(
+        &self,
+        dir: &Path,
+        schema: &[TableSchema],
+        sealed_through: u64,
+        window_rows: u64,
+    ) -> Result<Vec<u64>> {
+        let start = self.reconcile(dir)?.filter(|b| *b <= sealed_through);
+        let cuts = self.cuts(dir, start, sealed_through, window_rows)?;
         let mut s = self.stepper(dir, schema)?;
         if let Some(b) = start {
             s.resume(b)?;
@@ -657,6 +743,80 @@ impl FoldSet {
             s.checkpoint()?;
         }
         Ok(cuts)
+    }
+
+    /// `nuthatch check --folds`: recompute checkpoints from sealed facts and compare them with what
+    /// the logs record, window inputs and rows alike. The last window from its predecessor, or every
+    /// window from genesis. Reads only; a writer holding the nest is not disturbed. Returns one line
+    /// per checkpoint that does not recompute, empty when every one does.
+    pub fn verify(
+        &self,
+        dir: &Path,
+        schema: &[TableSchema],
+        from_genesis: bool,
+    ) -> Result<Vec<String>> {
+        let mut logs = Vec::new();
+        let mut common: Option<BTreeSet<u64>> = None;
+        for f in &self.folds {
+            let log = load_log(dir, f)?;
+            let blocks: BTreeSet<u64> = log.checkpoints.iter().map(|c| c.block).collect();
+            common = Some(match common {
+                None => blocks,
+                Some(c) => c.intersection(&blocks).copied().collect(),
+            });
+            logs.push(log);
+        }
+        let blocks: Vec<u64> = common.unwrap_or_default().into_iter().collect();
+        if blocks.is_empty() {
+            bail!("no checkpoint every fold shares; nothing to verify");
+        }
+        // Every checkpointed block is sealed, so the sealed ceiling the walk needs is the catalogue's.
+        let manifest = crate::seal::load_manifest_with_hash(dir)?.0;
+        let sealed_through = manifest
+            .tables
+            .values()
+            .flatten()
+            .map(|s| s.to_block)
+            .max()
+            .unwrap_or(0);
+        let mut s = self.stepper(dir, schema)?;
+        let walk: &[u64] = if from_genesis {
+            &blocks
+        } else {
+            let n = blocks.len();
+            if n > 1 {
+                s.resume(blocks[n - 2])?;
+            }
+            &blocks[n - 1..]
+        };
+        let empty = analytics::HotRows::new();
+        let mut out = Vec::new();
+        for &b in walk {
+            s.step_to(&empty, sealed_through, b)?;
+            for (f, log) in self.folds.iter().zip(&logs) {
+                let recorded = log
+                    .checkpoints
+                    .iter()
+                    .find(|c| c.block == b)
+                    .expect("a shared block is in every log");
+                let inputs = s.window_inputs(f)?;
+                if inputs != recorded.inputs {
+                    out.push(format!(
+                        "fold `{}` at {b}: the window read other rows than the checkpoint recorded",
+                        f.name
+                    ));
+                }
+                let (rows, digest) = s.eval.digest(&carry_select(f))?;
+                if rows != recorded.rows || digest != recorded.row_digest {
+                    out.push(format!(
+                        "fold `{}` at {b}: recomputed to {rows} row(s), digest {digest}; the \
+                         checkpoint records {} row(s), digest {}",
+                        f.name, recorded.rows, recorded.row_digest
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Every fold's state at `n`: the latest checkpoint at or before it, stepped forward over the
@@ -974,7 +1134,7 @@ fn load_one(
         h.update((text.len() as u64).to_le_bytes());
         h.update(text.as_bytes());
     };
-    part("v", "nuthatch-fold-v1");
+    part("v", "nuthatch-fold-v2");
     part("plan", &binder.plan_text(&sql));
     part("key", &format!("{key:?}"));
     part("carry", &format!("{carry:?}"));
@@ -1582,16 +1742,70 @@ mod checkpoints {
         let blocks: Vec<(Option<u64>, u64)> =
             log.checkpoints.iter().map(|c| (c.prev, c.block)).collect();
         assert_eq!(blocks, [(None, 10), (Some(10), 20), (Some(20), 30)]);
-        // Each window read exactly one sealed segment of `t`, and the ids chain.
+        // Each window read ten rows of `t` and nothing else, and the ids chain.
         assert!(log
             .checkpoints
             .iter()
-            .all(|c| c.inputs.len() == 1 && c.inputs[0].0 == "t"));
+            .all(|c| c.inputs.len() == 1 && c.inputs[0].table == "t" && c.inputs[0].rows == 10));
+        assert_ne!(
+            log.checkpoints[0].inputs[0].digest,
+            log.checkpoints[1].inputs[0].digest
+        );
         let mut prev = None;
         for c in &log.checkpoints {
             assert_eq!(c.id, checkpoint_id(&set.folds[0], prev, &c.inputs));
             prev = Some(c);
         }
+    }
+
+    /// A writer dies between one fold's log and the next, or inside a log write. The next build
+    /// cuts every log back to what all folds share, drops the files nothing names, and rewrites the
+    /// missing checkpoints exactly as they were.
+    #[test]
+    fn a_writer_killed_mid_checkpoint_is_repaired_by_the_next_build() {
+        let (dir, _hot, set) = nest();
+        set.build(dir.path(), &[], 30, 10).unwrap();
+        let intact: Vec<CheckpointLog> = set
+            .folds
+            .iter()
+            .map(|f| load_log(dir.path(), f).unwrap())
+            .collect();
+        // `running` logged 30; `latest` wrote its file and died before its log named it.
+        let cdir = checkpoint_dir(dir.path(), &set.folds[1]);
+        let mut log = load_log(dir.path(), &set.folds[1]).unwrap();
+        log.checkpoints.pop();
+        std::fs::write(cdir.join(CHECKPOINT_LOG), serde_json::to_vec(&log).unwrap()).unwrap();
+        std::fs::write(cdir.join("30.parquet.tmp"), b"half").unwrap();
+
+        assert_eq!(set.reconcile(dir.path()).unwrap(), Some(20));
+        for f in &set.folds {
+            let log = load_log(dir.path(), f).unwrap();
+            assert_eq!(log.checkpoints.len(), 2, "{}", f.name);
+            let cdir = checkpoint_dir(dir.path(), f);
+            assert!(!cdir.join("30.parquet").exists(), "{}", f.name);
+            assert!(!cdir.join("30.parquet.tmp").exists());
+            assert!(cdir.join("20.parquet").exists());
+        }
+        assert_eq!(set.build(dir.path(), &[], 30, 10).unwrap(), [30]);
+        for (f, before) in set.folds.iter().zip(&intact) {
+            let after = load_log(dir.path(), f).unwrap();
+            assert_eq!(after.checkpoints, before.checkpoints, "{}", f.name);
+        }
+    }
+
+    #[test]
+    fn a_link_that_does_not_chain_is_cut_away_with_everything_after_it() {
+        let (dir, _hot, set) = nest();
+        set.build(dir.path(), &[], 30, 10).unwrap();
+        let mut log = load_log(dir.path(), &set.folds[0]).unwrap();
+        log.checkpoints[1].id = "0".repeat(64);
+        let path = checkpoint_dir(dir.path(), &set.folds[0]).join(CHECKPOINT_LOG);
+        std::fs::write(path, serde_json::to_vec(&log).unwrap()).unwrap();
+        assert_eq!(set.reconcile(dir.path()).unwrap(), Some(10));
+        for f in &set.folds {
+            assert_eq!(load_log(dir.path(), f).unwrap().checkpoints.len(), 1);
+        }
+        assert_eq!(set.build(dir.path(), &[], 30, 10).unwrap(), [20, 30]);
     }
 
     #[test]
@@ -1842,24 +2056,137 @@ mod provenance {
         assert!(refusal(dir.path(), &set, &hot).contains("recorded id"));
     }
 
-    /// Rows and digest can be perfect and the history still wrong: a segment in its window has since
-    /// been replaced, so the checkpoint no longer describes these facts.
+    /// #1150 folds a table's provisional segment into its next one, so the catalogue names a
+    /// different file for a window whose rows have not changed. Identity rests on the rows, so the
+    /// checkpoints written before the fold still resume, and the walk continues from them.
     #[test]
-    fn a_checkpoint_over_segments_the_catalogue_no_longer_holds_is_refused() {
-        let (dir, hot, set) = built();
-        let path = dir
-            .path()
-            .join(crate::seal::SEGMENTS_DIR)
-            .join(crate::seal::MANIFEST_FILE);
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let manifest = crate::seal::load_manifest_with_hash(dir.path()).unwrap().0;
-        let old = &manifest.tables["t"]
-            .iter()
-            .find(|s| s.from_block == 11)
+    fn a_provisional_segment_folded_into_a_wider_one_leaves_the_checkpoints_valid() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), super::tests::SCHEMA).unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 1_000);
+        let seal = |from: u64, to: u64| {
+            let rows: Vec<String> = (from..=to)
+                .map(|b| {
+                    json!({"table": "t", "block_number": b, "k": (["a", "b", "c"][(b % 3) as usize]), "v": b.to_string()})
+                        .to_string()
+                })
+                .collect();
+            crate::seal::seal_range(dir.path(), &rows, from, to).unwrap();
+        };
+        seal(1, 10);
+        fold_files(
+            dir.path(),
+            &[(
+                "running.sql",
+                "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+            )],
+            "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        assert_eq!(set.build(dir.path(), &[], 10, 5).unwrap(), [10]);
+        let before = load_log(dir.path(), &set.folds[0]).unwrap();
+
+        seal(11, 20);
+        let segments = &crate::seal::load_manifest_with_hash(dir.path())
             .unwrap()
-            .hash;
-        std::fs::write(&path, raw.replace(old.as_str(), &"f".repeat(64))).unwrap();
-        assert!(refusal(dir.path(), &set, &hot).contains("no longer holds"));
+            .0
+            .tables["t"];
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| (s.from_block, s.to_block))
+                .collect::<Vec<_>>(),
+            [(1, 20)],
+            "the first segment was folded into the second"
+        );
+
+        let hot = analytics::HotRows::new();
+        let s = set.read_at(dir.path(), &[], &hot, 20, 15).unwrap();
+        assert_eq!(s.rows("running").unwrap()[0]["n"], 15);
+        assert_eq!(set.build(dir.path(), &[], 20, 5).unwrap(), [20]);
+        let after = load_log(dir.path(), &set.folds[0]).unwrap();
+        assert_eq!(after.checkpoints[0], before.checkpoints[0]);
+        assert!(set.verify(dir.path(), &[], true).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod verification {
+    use super::stepping_support::*;
+    use super::*;
+
+    const FOLDS: &[(&str, &str)] = &[
+        (
+            "10-running.sql",
+            "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+        ),
+        (
+            "20-latest.sql",
+            "SELECT k, v FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY block_number DESC) = 1",
+        ),
+    ];
+    const DECLS: &str = "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n\
+                         [[fold]]\nname = \"latest\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\", \"v VARCHAR\"]\nmax_rows = 3\n";
+
+    fn built() -> (tempfile::TempDir, FoldSet) {
+        let (dir, _hot) = corpus();
+        fold_files(dir.path(), FOLDS, DECLS);
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        assert_eq!(set.build(dir.path(), &[], 30, 10).unwrap(), [10, 20, 30]);
+        (dir, set)
+    }
+
+    fn edit_log(dir: &Path, fold: &Fold, f: impl FnOnce(&mut CheckpointLog)) {
+        let mut log = load_log(dir, fold).unwrap();
+        f(&mut log);
+        let path = checkpoint_dir(dir, fold).join(CHECKPOINT_LOG);
+        std::fs::write(path, serde_json::to_vec(&log).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn check_folds_recomputes_the_last_window_and_names_what_differs() {
+        let (dir, set) = built();
+        assert!(set.verify(dir.path(), &[], false).unwrap().is_empty());
+        // The chain still verifies with the last entry's rows misrecorded: that is what recomputing
+        // the window is for.
+        edit_log(dir.path(), &set.folds[1], |log| {
+            log.checkpoints[2].row_digest = "0".repeat(64)
+        });
+        edit_log(dir.path(), &set.folds[0], |log| {
+            log.checkpoints[2].inputs[0].rows += 1
+        });
+        let out = set.verify(dir.path(), &[], false).unwrap();
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(
+            out[0].starts_with("fold `running` at 30: the window read other rows"),
+            "{out:?}"
+        );
+        assert!(
+            out[1].starts_with("fold `latest` at 30: recomputed to 3 row(s)"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn check_folds_from_genesis_walks_every_window() {
+        let (dir, set) = built();
+        assert!(set.verify(dir.path(), &[], true).unwrap().is_empty());
+        edit_log(dir.path(), &set.folds[0], |log| {
+            log.checkpoints[1].row_digest = "0".repeat(64)
+        });
+        // The last window resumes from that checkpoint, and resuming checks its rows first.
+        let err = set.verify(dir.path(), &[], false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match its recorded digest"),
+            "{err:#}"
+        );
+        let out = set.verify(dir.path(), &[], true).unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(
+            out[0].starts_with("fold `running` at 20: recomputed to 1 row(s)"),
+            "{out:?}"
+        );
     }
 }
 

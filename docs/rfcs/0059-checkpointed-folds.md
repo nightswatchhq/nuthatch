@@ -270,12 +270,14 @@ delay sealing. If one lags, reads stay correct and simply see a longer window. T
 written by atomic rename as the catalogue is. Only the ingestion process writes checkpoints. Queries
 read them read-only, as they read segments, so the single-writer rule is unchanged.
 
-**Identity.** `id(S') = H(fold_hash, id(S), content hashes of the catalogue segments covering (S, S'])`,
+**Identity.** `id(S') = H(fold_hash, id(S), per-table digests of the rows each fact table contributed to (S, S'])`,
 with `id(genesis) = H(fold_hash, ∅)`. The chain makes checkpoint(`S'`) a content address of the fold
 definition and every sealed fact up to `S'`. `fold_hash` covers the fold's SQL, every fold and view it
 references transitively, and the schemas of the fact tables it binds. Each checkpoint also records an
 order-independent digest of its rows for verification. Identity rests on the inputs and the logical
-rows, not on Parquet bytes.
+rows, not on Parquet bytes: the inputs are row digests rather than segment hashes because #1150 folds
+a provisional segment into a wider one, which changes the catalogue and not one row a window read
+(S2, 2026-09-24).
 
 **Rebuild.** A new `fold_hash` has no checkpoints. The runtime walks forward from genesis over the
 sealed segments one window at a time. This makes no RPC calls and never evaluates more than one window

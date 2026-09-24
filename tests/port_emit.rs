@@ -730,6 +730,10 @@ fn emitted_nest_loads_and_views_validate() {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         result.is_ok(),
@@ -917,6 +921,10 @@ fn the_generated_check_fails_if_a_promised_column_is_missing() {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         clean.is_ok(),
@@ -937,6 +945,10 @@ fn the_generated_check_fails_if_a_promised_column_is_missing() {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         result.is_err(),
@@ -989,6 +1001,10 @@ export function handlePoolCreated(event: PoolCreated): void {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         check.is_ok(),
@@ -1051,6 +1067,10 @@ export function handlePoolCreated(event: PoolCreated): void {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         check.is_ok(),
@@ -1289,6 +1309,10 @@ fn an_accumulated_field_is_emitted_as_an_incremental_entity_that_validates() {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(check.is_ok(), "the ported nest must still check: {check:?}");
 }
@@ -1347,6 +1371,10 @@ fn a_port_with_no_running_totals_leaves_no_entities_file() {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         check.is_ok(),
@@ -1804,6 +1832,10 @@ export function handlePoolCreated(event: PoolCreated): void {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         check.is_ok(),
@@ -2087,6 +2119,10 @@ fn a_field_the_mappings_only_ever_set_to_a_constant_is_projected_as_that_constan
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         check.is_ok(),
@@ -2233,6 +2269,10 @@ export function handlePoolCreated(event: PoolCreated): void {
         name: None,
         dir: nest.path().display().to_string(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     });
     assert!(
         check.is_ok(),

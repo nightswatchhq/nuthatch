@@ -58,7 +58,9 @@ fn a_default_build_has_no_fold_command() {
         }
         for arg in cmd.get_arguments() {
             assert!(
-                !arg.get_id().as_str().contains("fold"),
+                !["fold", "genesis"]
+                    .iter()
+                    .any(|w| arg.get_id().as_str().contains(w)),
                 "`{path} --{}` is folds surface",
                 arg.get_id()
             );

@@ -21,6 +21,11 @@ use crate::cli::CheckArgs;
 pub fn check(args: CheckArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
 
+    #[cfg(feature = "folds")]
+    if args.folds {
+        return check_folds(&dir, args.from_genesis);
+    }
+
     // Grafting (RFC-0033) is reported **before** the parity checks, and before the no-checks bail: a
     // nest with no `checks/*.sql` is the common case, and its author still deserves to know which of
     // their views can never be reused. Reporting it after the bail made this dead code for most
@@ -147,6 +152,34 @@ pub fn check(args: CheckArgs) -> Result<()> {
     Ok(())
 }
 
+/// `nuthatch check --folds`: every fold's checkpoints recompute from the sealed facts, or the ones
+/// that do not are named.
+#[cfg(feature = "folds")]
+fn check_folds(dir: &Path, from_genesis: bool) -> Result<()> {
+    let schema = nest_schema(dir).unwrap_or_default();
+    let set = crate::folds::FoldSet::load(dir, &schema)?;
+    if set.folds.is_empty() {
+        bail!("{} has no folds/", dir.display());
+    }
+    let failures = set.verify(dir, &schema, from_genesis)?;
+    for line in &failures {
+        println!("✗ {line}");
+    }
+    if !failures.is_empty() {
+        bail!("{} checkpoint(s) do not recompute", failures.len());
+    }
+    println!(
+        "✓ {} fold(s) recompute {}",
+        set.folds.len(),
+        if from_genesis {
+            "from genesis"
+        } else {
+            "over the last window"
+        }
+    );
+    Ok(())
+}
+
 /// The nest's decode-registry table schemas, for view drift-validation. `None` if the dir isn't a
 /// nest (no config) - view validation is then skipped, not fatal.
 fn nest_schema(dir: &Path) -> Option<Vec<crate::registry::TableSchema>> {
@@ -239,6 +272,10 @@ mod tests {
             name: None,
             dir: dir.path().display().to_string(),
             update: false,
+            #[cfg(feature = "folds")]
+            folds: false,
+            #[cfg(feature = "folds")]
+            from_genesis: false,
         });
         assert!(
             result.is_ok(),
@@ -263,6 +300,10 @@ mod tests {
             name: None,
             dir: dir.path().display().to_string(),
             update: false,
+            #[cfg(feature = "folds")]
+            folds: false,
+            #[cfg(feature = "folds")]
+            from_genesis: false,
         })
         .unwrap_err()
         .to_string();
@@ -283,6 +324,10 @@ mod tests {
             name: None,
             dir: dir.path().display().to_string(),
             update: false,
+            #[cfg(feature = "folds")]
+            folds: false,
+            #[cfg(feature = "folds")]
+            from_genesis: false,
         })
         .unwrap_err()
         .to_string();
@@ -305,6 +350,10 @@ mod tests {
             name: None,
             dir: dir.path().display().to_string(),
             update: false,
+            #[cfg(feature = "folds")]
+            folds: false,
+            #[cfg(feature = "folds")]
+            from_genesis: false,
         });
         assert!(
             result.is_ok(),
