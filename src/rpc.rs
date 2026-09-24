@@ -679,6 +679,9 @@ pub struct RpcClient {
     /// (`0` = healthy). Set on a failed call, cleared on a successful one. Endpoints past their cooldown
     /// are tried first; still-unhealthy ones are the fallback of last resort (soonest-to-recover first).
     health: Vec<AtomicU64>,
+    /// The highest block each endpoint has reported from `eth_blockNumber`, so a lower bound on its
+    /// head. Pool members' heads differ by a block or two, and one behind refuses a `toBlock` it lacks.
+    heads: Vec<AtomicU64>,
     /// Total HTTP requests attempted (incl. failover retries) - a benchmark/observability metric.
     requests: AtomicU64,
     /// Block-number → unix timestamp, remembered across windows (RFC-0029 §6d).
@@ -703,12 +706,14 @@ impl RpcClient {
             .context("failed to build HTTP client")?;
         let n = urls.len();
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        let heads = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             http,
             urls,
             cursor: AtomicUsize::new(0),
             primaries: n,
             health,
+            heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
         })
@@ -740,6 +745,25 @@ impl RpcClient {
     /// for fairness), then healthy fallbacks in the order given, then any still in cooldown as a last
     /// resort (soonest-to-recover first). Advances the round-robin cursor once per call.
     fn endpoint_order(&self) -> Vec<usize> {
+        self.endpoint_order_holding(None)
+    }
+
+    /// [`Self::endpoint_order`], with healthy endpoints known to hold block `need` moved to the front.
+    /// At the tip that is the endpoint which just reported the tip, so its `eth_getLogs` is not first
+    /// refused by a pool member a block behind (#1498).
+    fn endpoint_order_holding(&self, need: Option<u64>) -> Vec<usize> {
+        let mut order = self.endpoint_order_by_health();
+        if let Some(need) = need {
+            let healthy = order
+                .iter()
+                .take_while(|&&j| self.health[j].load(Ordering::Relaxed) <= now_millis())
+                .count();
+            order[..healthy].sort_by_key(|&j| self.heads[j].load(Ordering::Relaxed) < need);
+        }
+        order
+    }
+
+    fn endpoint_order_by_health(&self) -> Vec<usize> {
         let n = self.urls.len();
         let p = self.primaries;
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % p;
@@ -806,10 +830,23 @@ impl RpcClient {
     /// it exists to interrogate an endpoint's limits, which is not expressible through the typed
     /// helpers.
     pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_holding(method, params, None)
+            .await
+            .map(|(v, _)| v)
+    }
+
+    /// [`Self::call`], preferring endpoints known to hold block `need`; also returns which endpoint
+    /// answered.
+    async fn call_holding(
+        &self,
+        method: &str,
+        params: Value,
+        need: Option<u64>,
+    ) -> Result<(Value, usize)> {
         let mut last_err = anyhow!("all RPC endpoints failed");
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
-        for j in self.endpoint_order() {
+        for j in self.endpoint_order_holding(need) {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
@@ -825,7 +862,7 @@ impl RpcClient {
                         attempts > 1,
                     );
                     self.mark_healthy(j);
-                    return Ok(v);
+                    return Ok((v, j));
                 }
                 Err(e) => {
                     crate::metrics::METRICS.observe_rpc(
@@ -1047,8 +1084,12 @@ impl RpcClient {
     }
 
     pub async fn block_number(&self) -> Result<u64> {
-        let result = self.call("eth_blockNumber", json!([])).await?;
-        parse_hex_u64(result.as_str().unwrap_or_default())
+        let (result, j) = self
+            .call_holding("eth_blockNumber", json!([]), None)
+            .await?;
+        let head = parse_hex_u64(result.as_str().unwrap_or_default())?;
+        self.heads[j].fetch_max(head, Ordering::Relaxed);
+        Ok(head)
     }
 
     /// `eth_chainId`, once, with the same failover as any other call. Used to identify a chain
@@ -1765,8 +1806,8 @@ impl RpcClient {
         }
         filter.insert("fromBlock".into(), json!(format!("0x{from:x}")));
         filter.insert("toBlock".into(), json!(format!("0x{to:x}")));
-        let result = self
-            .call("eth_getLogs", json!([Value::Object(filter)]))
+        let (result, _) = self
+            .call_holding("eth_getLogs", json!([Value::Object(filter)]), Some(to))
             .await?;
         let arr = result
             .as_array()
@@ -2516,6 +2557,75 @@ mod tests {
 
         broken_h.abort();
         good_h.abort();
+    }
+
+    #[tokio::test]
+    async fn a_tip_get_logs_goes_to_an_endpoint_that_holds_its_to_block() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        // Arc's public endpoints, measured 2026-09-24: a `toBlock` past their own head is refused
+        // with -32014 while Alchemy, a block ahead, answered the tip.
+        async fn endpoint(head: u64) -> (String, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+            async fn handler(
+                State((head, refused)): State<(u64, Arc<AtomicU64>)>,
+                Json(req): Json<Value>,
+            ) -> Json<Value> {
+                let body = match req["method"].as_str().unwrap_or("") {
+                    "eth_blockNumber" => json!({"result": format!("0x{head:x}")}),
+                    "eth_getLogs" => {
+                        let to = req["params"][0]["toBlock"].as_str().unwrap();
+                        if u64::from_str_radix(&to[2..], 16).unwrap() > head {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                            json!({"error": {"code": -32014, "message": "requested data not available"}})
+                        } else {
+                            json!({"result": []})
+                        }
+                    }
+                    _ => json!({"result": null}),
+                };
+                let mut body = body;
+                body["jsonrpc"] = json!("2.0");
+                body["id"] = json!(1);
+                Json(body)
+            }
+            let refused = Arc::new(AtomicU64::new(0));
+            let app = Router::new()
+                .route("/", post(handler))
+                .with_state((head, refused.clone()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let h = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            (format!("http://{addr}/"), refused, h)
+        }
+
+        let (ahead, ahead_refused, h1) = endpoint(1_000).await;
+        let (behind, behind_refused, h2) = endpoint(999).await;
+        // Two calls per poll over two endpoints: plain round-robin sends every getLogs to `behind`.
+        let c = RpcClient::new(vec![ahead, behind]).unwrap();
+
+        for _ in 0..6 {
+            let before = c.request_count();
+            let tip = c.block_number().await.unwrap();
+            c.get_logs(&[], &["0xaa".into()], tip - 10, tip)
+                .await
+                .unwrap();
+            assert_eq!(
+                c.request_count() - before,
+                2,
+                "one tip call and one getLogs per poll"
+            );
+        }
+        assert_eq!(ahead_refused.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            behind_refused.load(Ordering::Relaxed),
+            0,
+            "a getLogs was sent to an endpoint not known to hold its toBlock"
+        );
+        h1.abort();
+        h2.abort();
     }
 
     /// Issue #150: the failover path itself, not just the ordering maths. The first endpoint is broken,

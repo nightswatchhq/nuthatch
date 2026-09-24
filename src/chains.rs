@@ -77,6 +77,15 @@ pub struct Chain {
     /// near-empty segments all day (the sub-20 KB segment problem `SEAL_DIRECT_BATCH` was added to
     /// fix), short enough that a tattler receipt pins a watermark within a working morning.
     pub seal_span: u64,
+    /// Measured block time, the same 2026-09-07 sample `seal_span` is sized from. An undialled
+    /// cursor polls this often, floored at two seconds (#1497).
+    pub block_time_ms: u64,
+}
+
+impl Chain {
+    pub fn block_time(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.block_time_ms)
+    }
 }
 
 /// `seal_span` for a chain not in this registry.
@@ -117,6 +126,7 @@ const MAINNET: Chain = Chain {
     topic0_only_getlogs: true,
     // 12.05 s measured, so 1,800 blocks is 6.0 h (#1199).
     seal_span: 1_800,
+    block_time_ms: 12_050,
 };
 
 const ARBITRUM_ONE: Chain = Chain {
@@ -152,6 +162,7 @@ const ARBITRUM_ONE: Chain = Chain {
     topic0_only_getlogs: true,
     // 0.2509 s measured, so 86,400 blocks is 6.0 h (#1199).
     seal_span: 86_400,
+    block_time_ms: 251,
 };
 
 const BASE: Chain = Chain {
@@ -181,6 +192,7 @@ const BASE: Chain = Chain {
     topic0_only_getlogs: true,
     // 2.000 s measured, so 10,800 blocks is 6.0 h (#1199).
     seal_span: 10_800,
+    block_time_ms: 2_000,
 };
 
 /// BNB Smart Chain. **Tip-following of a static contract works out of the box; a from-deployment
@@ -213,6 +225,7 @@ const BSC: Chain = Chain {
     topic0_only_getlogs: false,
     // 0.4501 s measured - not the 3 s of the old cadence - so 48,000 blocks is 6.0 h (#1199).
     seal_span: 48_000,
+    block_time_ms: 450,
 };
 
 /// Polygon PoS. Archive is available but narrow; the wide endpoint is not archive.
@@ -243,6 +256,7 @@ const POLYGON: Chain = Chain {
     topic0_only_getlogs: true,
     // 1.500 s measured, so 14,400 blocks is 6.0 h (#1199).
     seal_span: 14_400,
+    block_time_ms: 1_500,
 };
 
 /// Gnosis. The best-served of the four chains added here: two keyless **archive** endpoints, both
@@ -267,6 +281,7 @@ const GNOSIS: Chain = Chain {
     topic0_only_getlogs: true,
     // 5.088 s measured, so 4,250 blocks is 6.0 h (#1199).
     seal_span: 4_250,
+    block_time_ms: 5_088,
 };
 
 /// Optimism. OP-stack L2, so the same finality reasoning as Base: the `finalized` tag is L1-aware.
@@ -306,6 +321,7 @@ const OPTIMISM: Chain = Chain {
     topic0_only_getlogs: true,
     // 2.000 s measured, so 10,800 blocks is 6.0 h (#1199).
     seal_span: 10_800,
+    block_time_ms: 2_000,
 };
 
 /// Monad. A full-EVM-bytecode L1 with MonadBFT single-slot finality, and the first chain here whose
@@ -380,6 +396,7 @@ const MONAD: Chain = Chain {
     topic0_only_getlogs: true,
     // 0.3020 s measured, so 72,000 blocks is 6.0 h (#1199).
     seal_span: 72_000,
+    block_time_ms: 302,
 };
 
 /// Robinhood Chain. Robinhood's Arbitrum Orbit L2 on the Nitro stack - the same execution stack and
@@ -434,6 +451,7 @@ const ROBINHOOD: Chain = Chain {
     topic0_only_getlogs: true,
     // 0.1008 s measured, so 216,000 blocks is 6.0 h (#1199).
     seal_span: 216_000,
+    block_time_ms: 101,
 };
 
 /// The registry entry for a chain id, if we ship one.

@@ -110,10 +110,10 @@ async fn main() -> Result<()> {
                     args.window,
                     args.no_admin,
                     args.fail_fast,
-                    nuthatch::freshness::Freshness {
-                        poll_interval: args.poll_interval,
-                        finality_only: args.finality_only,
-                    },
+                    nuthatch::freshness::Freshness::from_flags(
+                        args.poll_interval,
+                        args.finality_only,
+                    ),
                     args.cors,
                 )
                 .await
