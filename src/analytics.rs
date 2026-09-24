@@ -1312,7 +1312,10 @@ fn attempt(
             excluded,
             declared,
             wanted.as_ref(),
-            as_of,
+            FactWindow {
+                after: None,
+                through: as_of,
+            },
         )?;
         let degraded_tables = defined.degraded.clone();
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
@@ -2751,9 +2754,41 @@ fn define_views(
         excluded,
         declared,
         wanted,
-        None,
+        FactWindow::default(),
     )?
     .degraded)
+}
+
+/// The block range fact views expose: rows with `after < block_number <= through`. `/sql` bounds only
+/// `through`, for a historical read. RFC-0059 folds bound both sides, so a fact name inside a fold means
+/// its window rather than its history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FactWindow {
+    pub(crate) after: Option<u64>,
+    pub(crate) through: Option<u64>,
+}
+
+impl FactWindow {
+    fn is_bounded(&self) -> bool {
+        self.after.is_some() || self.through.is_some()
+    }
+
+    fn holds(&self, block: u64) -> bool {
+        self.after.is_none_or(|lo| block > lo) && self.through.is_none_or(|hi| block <= hi)
+    }
+
+    fn overlaps(&self, from: u64, to: u64) -> bool {
+        self.after.is_none_or(|lo| to > lo) && self.through.is_none_or(|hi| from <= hi)
+    }
+
+    fn predicate(&self) -> String {
+        match (self.after, self.through) {
+            (Some(lo), Some(hi)) => format!("block_number > {lo} AND block_number <= {hi}"),
+            (Some(lo), None) => format!("block_number > {lo}"),
+            (None, Some(hi)) => format!("block_number <= {hi}"),
+            (None, None) => "true".to_string(),
+        }
+    }
 }
 
 /// What [`define_views_bound`] built: the degraded tables, each defined table's sealed segments as
@@ -2773,7 +2808,7 @@ fn define_views_bound(
     excluded: &std::collections::BTreeSet<String>,
     declared: &[crate::registry::TableSchema],
     wanted: Option<&std::collections::BTreeSet<String>>,
-    as_of: Option<u64>,
+    window: FactWindow,
 ) -> Result<DefinedViews> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
@@ -2848,7 +2883,7 @@ fn define_views_bound(
 
     for table in &tables {
         let cols = cols_of(table);
-        if as_of.is_some() {
+        if window.is_bounded() {
             if !cols.iter().any(|(name, _)| name == "block_number") {
                 bail!("historical query requires block-stamped facts: {table} has no declared block_number");
             }
@@ -2866,6 +2901,7 @@ fn define_views_bound(
             .map(|segs| {
                 segs.iter()
                     .filter(|s| s.to_block <= sealed_through)
+                    .filter(|s| window.overlaps(s.from_block, s.to_block))
                     .filter_map(|s| {
                         // Resolve through the shared store when this dataset belongs to a runtime
                         // (RFC-0033 §11a), falling back to the per-dataset path.
@@ -2935,6 +2971,13 @@ fn define_views_bound(
                 sealed_files.is_empty()
                     || r.get("block_number").and_then(Value::as_u64).unwrap_or(0) > sealed_through
             })
+            // Unstamped rows were refused above for any bounded window.
+            .filter(|r| {
+                !window.is_bounded()
+                    || r.get("block_number")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|b| window.holds(b))
+            })
             .collect();
 
         // The hot tip: load this table's unsealed rows into a temp table, then union it in. Columns are
@@ -2989,13 +3032,15 @@ fn define_views_bound(
                 // all-null over the sealed range is dropped from its Parquet schema; hot may still
                 // carry it).
                 let union = parts.join(" UNION ALL BY NAME ");
-                let select = match as_of {
-                    Some(block) => format!(
+                let select = if window.is_bounded() {
+                    format!(
                         "SELECT * FROM ({union}) historical_facts WHERE CASE \
                          WHEN block_number IS NULL THEN error('historical query requires block-stamped facts: unstamped archived row') \
-                         ELSE block_number <= {block} END"
-                    ),
-                    None => union,
+                         ELSE {} END",
+                        window.predicate()
+                    )
+                } else {
+                    union
                 };
                 Some(format!("CREATE OR REPLACE VIEW \"{table}\" AS {select}"))
             }
@@ -3958,6 +4003,71 @@ mod tests {
             .collect();
         assert_eq!(reachable_tables(&conn, dir.path(), &cycle).unwrap(), cycle);
     }
+    /// RFC-0059: a two-sided window exposes only `(after, through]`, across sealed and hot, and names
+    /// only the segments that overlap it. The count alone cannot tell pruning from the predicate.
+    #[test]
+    fn a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t","columns":[{"name":"block_number","storage":"u64"}]}]}"#,
+        )
+        .unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        for (from, to) in [(1, 10), (11, 20), (21, 30)] {
+            let rows: Vec<String> = (from..=to)
+                .map(|b| format!(r#"{{"table":"t","block_number":{b}}}"#))
+                .collect();
+            crate::seal::seal_range(dir.path(), &rows, from, to).unwrap();
+        }
+        let mut hot = HotRows::new();
+        hot.insert(
+            "t".into(),
+            (21..=35)
+                .map(|b| serde_json::json!({ "block_number": b }))
+                .collect(),
+        );
+        let count = |after: Option<u64>, through: Option<u64>| {
+            let conn = Connection::open_in_memory().unwrap();
+            let defined = define_views_bound(
+                &conn,
+                dir.path(),
+                &hot,
+                30,
+                &Default::default(),
+                &[],
+                None,
+                FactWindow { after, through },
+            )
+            .unwrap();
+            let n: u64 = conn
+                .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+                .unwrap();
+            let hot_loaded: u64 = conn
+                .query_row("SELECT count(*) FROM \"__hot_t\"", [], |r| r.get(0))
+                .unwrap_or(0);
+            (n, defined.tables["t"].segments, hot_loaded)
+        };
+        assert_eq!(
+            count(Some(15), Some(25)),
+            (10, 2, 0),
+            "(15, 25] spans two segments"
+        );
+        assert_eq!(
+            count(Some(20), Some(30)),
+            (10, 1, 0),
+            "(20, 30] is the third segment alone"
+        );
+        // Hot rows 21..=30 were sealed but not yet pruned: the watermark keeps them out.
+        assert_eq!(
+            count(Some(25), Some(33)),
+            (8, 1, 3),
+            "5 sealed + 3 hot, and only those 3 loaded"
+        );
+        assert_eq!(count(Some(30), Some(35)), (5, 0, 5), "hot alone");
+        assert_eq!(count(None, None), (35, 3, 5), "unbounded is history");
+    }
+
     #[test]
     fn historical_facts_are_filtered_before_aggregation_across_hot_and_cold() {
         let dir = tempfile::tempdir().unwrap();
