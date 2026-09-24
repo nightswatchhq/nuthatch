@@ -1,4 +1,10 @@
 {
+  "gate": {
+    "p99_ms": 500,
+    "peak_rss_mib": 300,
+    "set_by": "Chief 2026-09-24 (#1479), raised from 256 MiB after run 2",
+    "verdict": "pass: 115.6 ms p99, 280.0 MiB peak"
+  },
   "what": "RFC-0059 S1 gate: head evaluation of the nine S0 network carries, ported to folds, in one warm process on the ThinkPad",
   "date": "2026-09-24",
   "corpus": "nest-parity-20260920 (10,286 segments through 507,179,123), checkpoint 507,179,123, 88 hot heads to 507,197,663",
@@ -64,14 +70,14 @@
         "rss_mib": 200.73828125
       }
     ],
-    "targets": {
-      "p99_ms": 500,
-      "peak_rss_mib": 256
-    },
     "wall_ms": {
       "max": 134.26334400000002,
       "p50": 98.70635399999999,
       "p99": 115.558526
+    },
+    "targets_at_run_time": {
+      "p99_ms": 500,
+      "peak_rss_mib": 256
     }
   }
 }

@@ -402,6 +402,13 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The carry columns, in carry order: what a digest covers. Load already requires the output to be
+/// exactly the carry, but the digest should not depend on that holding.
+fn carry_select(fold: &Fold) -> String {
+    let cols: Vec<String> = fold.carry.iter().map(|(c, _)| format!("\"{c}\"")).collect();
+    format!("SELECT {} FROM \"{}\"", cols.join(", "), fold.name)
+}
+
 /// The digest by materialising every row: the reference the streamed one must match exactly.
 #[cfg(test)]
 fn row_digest(fold: &Fold, rows: &[serde_json::Value]) -> String {
@@ -516,7 +523,7 @@ impl Stepper<'_> {
                 );
             }
             let inputs = window_inputs(&self.dir, &f.reaches, self.from, at)?;
-            let (rows, row_digest) = self.eval.digest(&format!("SELECT * FROM \"{}\"", f.name))?;
+            let (rows, row_digest) = self.eval.digest(&carry_select(f))?;
             let entry = Checkpoint {
                 block: at,
                 id: checkpoint_id(f, prev, &inputs),
@@ -572,7 +579,7 @@ impl Stepper<'_> {
                 cols.join(", "),
                 path.display().to_string().replace('\'', "''")
             ))?;
-            let (rows, digest) = self.eval.digest(&format!("SELECT * FROM \"{}\"", f.name))?;
+            let (rows, digest) = self.eval.digest(&carry_select(f))?;
             if rows != entry.rows || digest != entry.row_digest {
                 bail!(
                     "fold `{}`: the checkpoint at {block} does not match its recorded digest",
@@ -1878,7 +1885,7 @@ mod streamed_digest {
         s.step_to(&hot, 30, 33).unwrap();
         let rows = s.rows("latest").unwrap();
         assert_eq!(rows.len(), 3);
-        let (n, streamed) = s.eval.digest("SELECT * FROM \"latest\"").unwrap();
+        let (n, streamed) = s.eval.digest(&carry_select(&set.folds[0])).unwrap();
         assert_eq!(n, 3);
         assert_eq!(streamed, row_digest(&set.folds[0], &rows));
     }
