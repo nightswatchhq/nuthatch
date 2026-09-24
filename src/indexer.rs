@@ -18537,7 +18537,8 @@ rpc_urls = ["https://rpc.example"]
             let src = Arc::new(TipCostSource::new(vec![(960, 0), (T, 0)]));
             let (task, store) = caught_up(tmp.path(), src.clone(), runtime).await;
             src.fork(T);
-            tokio::time::sleep(REORG_RECHECK + std::time::Duration::from_secs(4)).await;
+            // A literal, not `REORG_RECHECK`: a test that moves with the constant cannot catch it growing.
+            tokio::time::sleep(std::time::Duration::from_secs(16)).await;
             let rolled = store.get_block_hash(T).ok().flatten() == src.hash(T);
             // Only the old chain had a row at T.
             let row_gone = store.entities_in_range(T, T).unwrap().is_empty();
