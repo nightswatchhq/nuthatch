@@ -288,7 +288,7 @@ fn new_spill_dir() -> Result<SpillDir> {
 
 /// RFC-0060 §5.6: what a `graph` build adds to every connection. A default build adds nothing, so its
 /// connections behave exactly as they did before the feature existed.
-fn register_extensions(conn: &Connection) -> Result<()> {
+pub(crate) fn register_extensions(conn: &Connection) -> Result<()> {
     #[cfg(feature = "graph")]
     {
         crate::analytics_scalars::register(conn)?;
@@ -2202,7 +2202,7 @@ pub(crate) fn view_name(create_view_sql: &str) -> Option<String> {
 /// a view body that will not parse, and for any `…__children` name: those views are built by
 /// `define_children_views` after this point, out of factory tables enumerated from the config, and
 /// working out which ones here would be a second copy of that logic to keep in step.
-fn reachable_tables(
+pub(crate) fn reachable_tables(
     conn: &Connection,
     dir: &Path,
     referenced: &std::collections::BTreeSet<String>,
@@ -2210,14 +2210,7 @@ fn reachable_tables(
     if referenced.iter().any(|n| n.ends_with("__children")) {
         return None;
     }
-    let mut bodies: std::collections::BTreeMap<String, String> = Default::default();
-    for f in nest_view_files(dir) {
-        for stmt in split_sql_statements(&f.sql) {
-            if let (Some(name), Some(body)) = (view_name(&stmt), view_body(&stmt)) {
-                bodies.insert(name, body.to_string());
-            }
-        }
-    }
+    let bodies = nest_view_bodies(dir);
 
     let mut out = referenced.clone();
     let mut frontier: Vec<String> = referenced.iter().cloned().collect();
@@ -2243,9 +2236,25 @@ fn reachable_tables(
     Some(out)
 }
 
+/// Each authored view's name and body, from `views/*.sql` on disk.
+pub(crate) fn nest_view_bodies(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut bodies = std::collections::BTreeMap::new();
+    for f in nest_view_files(dir) {
+        for stmt in split_sql_statements(&f.sql) {
+            if let (Some(name), Some(body)) = (view_name(&stmt), view_body(&stmt)) {
+                bodies.insert(name, body.to_string());
+            }
+        }
+    }
+    bodies
+}
+
 /// The base tables a statement reads, lowercased. The security walk collects the same set for the
 /// caller's own query; this is for SQL we hand ourselves, like a view's stored definition.
-fn base_tables_in(conn: &Connection, sql: &str) -> Option<std::collections::BTreeSet<String>> {
+pub(crate) fn base_tables_in(
+    conn: &Connection,
+    sql: &str,
+) -> Option<std::collections::BTreeSet<String>> {
     table_refs_in(conn, sql, "BASE_TABLE")
 }
 
@@ -2392,7 +2401,7 @@ fn walk_table_refs(v: &Value, f: &mut impl FnMut(&str, &str)) {
 /// name is matched only when it's a real call: a word boundary before it and (after optional
 /// whitespace) a `(` after it - so a table or column merely *named* like one (e.g. `pool__glob`) is
 /// fine, while `read_text/**/('…')` and `READ_TEXT (…)` are both caught. (SEC-2, primary control.)
-fn reject_file_access(sql: &str) -> Result<()> {
+pub(crate) fn reject_file_access(sql: &str) -> Result<()> {
     // **Double quotes are removed before scanning.** DuckDB accepts a quoted function name and calls
     // it exactly as the bare form, so `"read_csv"('/etc/passwd')` executed while sailing past a check
     // that looked for `(` after optional *whitespace* - a quote is not whitespace. Verified against a
@@ -2434,7 +2443,7 @@ fn reject_file_access(sql: &str) -> Result<()> {
 /// a single-quoted string (a double-quoted identifier is fine and untouched) - so rejecting a
 /// single-quote as the first non-space token after a word-bounded FROM/JOIN closes the bypass without
 /// affecting real queries. Comments are stripped first, mirroring the denylist scan.
-fn reject_replacement_scan(sql: &str) -> Result<()> {
+pub(crate) fn reject_replacement_scan(sql: &str) -> Result<()> {
     let cleaned = strip_all_sql_comments(sql).to_ascii_lowercase();
     let b = cleaned.as_bytes();
     let is_ident = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
@@ -2719,7 +2728,7 @@ pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> 
 /// view, or a view that could not be defined at all. Every reduction below is already logged, but a
 /// log is not reachable by the caller who is about to sum the reduced column, so the same decision is
 /// handed back as data and rides out on [`QueryOutput::degraded_tables`] (#435).
-fn define_views(
+pub(crate) fn define_views(
     conn: &Connection,
     dir: &Path,
     hot: &HotRows,
@@ -3156,7 +3165,7 @@ fn json_to_duck(v: Option<&Value>, col: &str) -> DuckValue {
 /// `reachable_tables` already carries the intermediate view names in its closure, so a view a
 /// statement reaches through another view is still defined, in file order, before the one that
 /// reads it.
-fn define_nest_views(
+pub(crate) fn define_nest_views(
     conn: &Connection,
     dir: &Path,
     wanted: Option<&std::collections::BTreeSet<String>>,

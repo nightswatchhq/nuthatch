@@ -2771,6 +2771,9 @@ async fn build_nest(
             None => tracing::warn!("view {} failed to load: {}", issue.file, issue.error),
         }
     }
+    // Unlike a view, a bad fold refuses the nest: its checkpoints would be state nobody can reproduce.
+    #[cfg(feature = "folds")]
+    crate::folds::FoldSet::load(&dir, &served)?;
     // #663: a declared event that has never fired on this chain is an ordinary state, not a fault -
     // but it used to be an invisible one, order-dependent and explained nowhere. Say it once, loudly,
     // at the moment an operator is most likely to be reading the log: the day it stops being true,
