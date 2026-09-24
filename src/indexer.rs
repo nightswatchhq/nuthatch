@@ -7851,18 +7851,26 @@ fn reorg_check_due(freshness: crate::freshness::Freshness, next: u64, ceiling: u
 /// Skips the reorg check on an idle poll that sees the tip and cursor of the last check (#1493).
 ///
 /// The check guards the next commit, and a poll with a window to commit always pays it. An idle one
-/// commits and seals nothing, so a same-height reorg waits for the first poll that finds a new block.
+/// commits and seals nothing, so a same-height reorg can wait for the next new block, or for
+/// [`REORG_RECHECK`] on a chain whose tip has stalled, so orphaned rows are not served indefinitely.
 /// A committed window counts as a check at its tip: its checkpoint header was just read there.
 #[derive(Default)]
-struct ReorgGate(Option<(u64, u64)>);
+struct ReorgGate(Option<(u64, u64, tokio::time::Instant)>);
+
+/// Longest an idle cursor goes without a reorg check. A 12 s L1 has usually found its next block by
+/// then, and an e2e reorg test waits 20 s for a stalled tip to reconverge.
+const REORG_RECHECK: std::time::Duration = std::time::Duration::from_secs(12);
 
 impl ReorgGate {
     fn due(&self, tip: u64, next: u64, idle: bool) -> bool {
-        !idle || self.0 != Some((tip, next))
+        match self.0 {
+            Some((t, n, at)) if idle && (t, n) == (tip, next) => at.elapsed() >= REORG_RECHECK,
+            _ => true,
+        }
     }
 
     fn checked(&mut self, tip: u64, next: u64) {
-        self.0 = Some((tip, next));
+        self.0 = Some((tip, next, tokio::time::Instant::now()));
     }
 }
 
@@ -18478,10 +18486,11 @@ rpc_urls = ["https://rpc.example"]
     async fn tip_bill_of_a_caught_up_nest_holding_rows() {
         for runtime in [false, true] {
             let (idle, advancing, m) = tip_bill(vec![(960, 0)], runtime).await;
-            assert!(idle.tip >= 8, "the idle phase must span polls: {idle:?}");
+            assert_eq!(idle.tip, 10, "the idle phase is ten polls: {idle:?}");
+            // Ten polls of a stalled tip span one `REORG_RECHECK`; before #1493 each paid a header.
             assert_eq!(
                 (idle.headers(), idle.logs, idle.finalized),
-                (0, 0, 0),
+                (1, 0, 0),
                 "runtime={runtime}: an idle poll's bill, {idle:?}"
             );
             assert_eq!(
@@ -18504,7 +18513,7 @@ rpc_urls = ["https://rpc.example"]
     async fn tip_bill_of_a_caught_up_nest_with_no_rows() {
         for runtime in [false, true] {
             let (idle, advancing, m) = tip_bill(Vec::new(), runtime).await;
-            assert_eq!(idle.headers(), 0, "runtime={runtime}: {idle:?}");
+            assert_eq!(idle.headers(), 1, "runtime={runtime}: {idle:?}");
             assert_eq!(
                 (
                     advancing.block_hash,
@@ -18513,6 +18522,29 @@ rpc_urls = ["https://rpc.example"]
                 ),
                 (2 * m, m, 0),
                 "runtime={runtime}: per committed window, {advancing:?}"
+            );
+        }
+    }
+
+    /// A same-height reorg on a chain whose tip then stalls is still rolled back, within one
+    /// `REORG_RECHECK` and a poll, through both loops. Without the bound it would be served until the
+    /// chain moved again.
+    #[tokio::test(start_paused = true)]
+    async fn a_reorg_at_a_stalled_tip_is_caught_within_the_recheck_bound() {
+        const T: u64 = TipCostSource::TIP;
+        for runtime in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = Arc::new(TipCostSource::new(vec![(960, 0), (T, 0)]));
+            let (task, store) = caught_up(tmp.path(), src.clone(), runtime).await;
+            src.fork(T);
+            tokio::time::sleep(REORG_RECHECK + std::time::Duration::from_secs(4)).await;
+            let rolled = store.get_block_hash(T).ok().flatten() == src.hash(T);
+            // Only the old chain had a row at T.
+            let row_gone = store.entities_in_range(T, T).unwrap().is_empty();
+            task.abort();
+            assert!(
+                rolled && row_gone,
+                "runtime={runtime}: the replaced tip block is still the old one (checkpoint {rolled}, row gone {row_gone})"
             );
         }
     }
