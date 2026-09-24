@@ -285,6 +285,15 @@ pub enum FoldCommand {
         #[arg(long)]
         at: u64,
     },
+    /// Measure head evaluation (RFC-0059 S1 gate): one warm process resumes the latest checkpoint
+    /// and evaluates every fold at each hot block in turn, discarding each result. Prints JSON.
+    Bench {
+        #[arg(long, default_value = ".")]
+        dir: String,
+        /// Evaluations timed after the first, which only warms the connection.
+        #[arg(long, default_value_t = 200)]
+        iters: usize,
+    },
 }
 
 #[derive(Args)]

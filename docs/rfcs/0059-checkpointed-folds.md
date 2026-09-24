@@ -394,9 +394,23 @@ Each slice's acceptance is written so it can fail.
   - a fold computing `count(*)` over a fact table returns the window's count, not history's;
   - a volatile fold is refused;
   - a schema mismatch is refused;
-  - head evaluation, measured **inside the running process**, meets S0's 500 ms and 256 MiB targets;
+  - head evaluation, measured **inside the running process**, is at most 500 ms p99 and 300 MiB peak
+    (256 MiB until 2026-09-24; see the report below);
   - the recursive delegation ledger passes the S0 differential and post-cut invariance, on nuthatch's
     own connection with its real scalars.
+
+  **Head evaluation reported 2026-09-24** (#1479, `docs/bench/fold-head-thinkpad.json`). The nine S0
+  carries were ported to folds and were exact against every S0 reference. One warm process, 200
+  evaluations across 88 hot heads:
+
+  | | p99 | Peak RSS |
+  |---|---|---|
+  | First run | 115 ms | 592.8 MiB: resuming a checkpoint materialised its 591k rows as JSON |
+  | Digest streamed | **115.6 ms** | **280.0 MiB**: evaluation adds 9 MiB, the rest is baseline and resident carries |
+
+  Chief raised the memory target to 300 MiB on that measurement. Narrowing large set carries (§5,
+  retention) is how it comes down. Porting also showed that the fold runtime's DuckDB connections had
+  no resource limits; they now share `/sql`'s.
 - **S2 - checkpoints from the seal loop.** Identity chain, atomic write, retention, restart and
   `check --folds`. *Accept when:*
   - a mid-write kill recovers;

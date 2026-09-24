@@ -1,0 +1,83 @@
+{
+  "gate": {
+    "p99_ms": 500,
+    "peak_rss_mib": 300,
+    "set_by": "Chief 2026-09-24 (#1479), raised from 256 MiB after run 2",
+    "verdict": "pass: 115.6 ms p99, 280.0 MiB peak"
+  },
+  "what": "RFC-0059 S1 gate: head evaluation of the nine S0 network carries, ported to folds, in one warm process on the ThinkPad",
+  "date": "2026-09-24",
+  "corpus": "nest-parity-20260920 (10,286 segments through 507,179,123), checkpoint 507,179,123, 88 hot heads to 507,197,663",
+  "port": "exact against S0: 26/26 blocks on all ten values, 117/117 carries at 13 blocks, dig-a.txt reproduced",
+  "box": "ThinkPad, 32 cores, 62 GB, moderately loaded (load average 4.6 to 7.8)",
+  "ruling": "Chief 2026-09-24: memory target raised from 256 to 300 MiB absolute after run 2 (see #1479)",
+  "run_1": {
+    "p99_ms": 115,
+    "peak_rss_mib": 592.8,
+    "peak_increase_mib": 3.2,
+    "cause": "resume materialised every checkpoint row as JSON to verify its digest"
+  },
+  "run_2": {
+    "checkpoint": 507179123,
+    "evaluations": 200,
+    "folds": [
+      "legacy_allocs",
+      "indexers",
+      "schedule",
+      "clock",
+      "epochs",
+      "latest_obs",
+      "persisted",
+      "pause",
+      "last_run"
+    ],
+    "heads": {
+      "count": 88,
+      "first": 507179786,
+      "last": 507197663
+    },
+    "peak_increase_mib": 9.0078125,
+    "peak_rss_mib": 279.984375,
+    "phases": [
+      {
+        "at": "start",
+        "peak_mib": 16.625,
+        "rss_mib": 16.625
+      },
+      {
+        "at": "store opened",
+        "peak_mib": 18.7734375,
+        "rss_mib": 18.7734375
+      },
+      {
+        "at": "folds loaded",
+        "peak_mib": 577.03125,
+        "rss_mib": 96.02734375
+      },
+      {
+        "at": "hot rows read",
+        "peak_mib": 577.03125,
+        "rss_mib": 96.171875
+      },
+      {
+        "at": "checkpoint resumed",
+        "peak_mib": 577.03125,
+        "rss_mib": 163.328125
+      },
+      {
+        "at": "warmed up",
+        "peak_mib": 577.03125,
+        "rss_mib": 200.73828125
+      }
+    ],
+    "wall_ms": {
+      "max": 134.26334400000002,
+      "p50": 98.70635399999999,
+      "p99": 115.558526
+    },
+    "targets_at_run_time": {
+      "p99_ms": 500,
+      "peak_rss_mib": 256
+    }
+  }
+}
