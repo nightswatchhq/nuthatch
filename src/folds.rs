@@ -142,9 +142,24 @@ impl FoldSet {
             }
         }
 
-        let binder = analytics::FoldBinder::new(dir, schema)?;
-        let surface = binder.relations()?;
+        let binder = analytics::FoldBinder::open(dir)?;
+        let surface = analytics::nest_relation_names(dir, schema)?;
         let view_bodies = analytics::nest_view_bodies(dir);
+        // Bind only what the folds read. What a fold reaches is known from its parse alone; a fold
+        // whose reach cannot be worked out is refused by `load_one` below.
+        let mut wanted = BTreeSet::new();
+        for file in &files {
+            let sql = std::fs::read_to_string(root.join(file))?;
+            let Some(refs) = binder.base_tables(&sql) else {
+                continue;
+            };
+            let direct: BTreeSet<String> = refs
+                .into_iter()
+                .filter(|t| !by_name.contains_key(t.strip_suffix("__carry").unwrap_or(t)))
+                .collect();
+            wanted.extend(binder.reachable(dir, &direct).unwrap_or_default());
+        }
+        binder.bind(dir, schema, &wanted)?;
 
         let mut set = FoldSet::default();
         for file in &files {
