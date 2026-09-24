@@ -1725,13 +1725,15 @@ pub async fn dev(
         std::collections::HashMap::new();
     let mut endpoint_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut chain_freshness: std::collections::HashMap<String, crate::freshness::Freshness> =
+        std::collections::HashMap::new();
     let mut runtime_total_mb = RUNTIME_BASE_RSS_MB;
     // The live health surface (RFC-0026 §5): the cursors write quarantine state here, the API reads it
     // per request. Replaces the roster snapshot that was built once at startup and could not express
     // "partly working".
     let health = Arc::new(crate::health::RuntimeHealth::new());
 
-    for group in groups {
+    for mut group in groups {
         let rpc_urls = rpc::select_rpcs(&rpc_override, group.endpoint.rpc_urls.clone());
         if rpc_urls.is_empty() {
             bail!(
@@ -1811,6 +1813,11 @@ pub async fn dev(
                     meta.name, group.endpoint.chain
                 )
             })?;
+        let dial = freshness.for_chain(&group.endpoint.chain, &rpc).await;
+        for (_, _, config) in &mut group.nests {
+            config.freshness = dial;
+        }
+        chain_freshness.insert(group.endpoint.chain.clone(), dial);
         let source: Arc<dyn Source> = Arc::new(rpc);
         // Retained so a mount can build a nest against the same source its co-tenants use - a nest
         // mounted at runtime must be indistinguishable from one mounted at boot.
@@ -1933,6 +1940,7 @@ pub async fn dev(
             admin_token: admin_token.clone(),
             max_rss_mb: max_rss,
             freshness,
+            chain_freshness,
         },
     }));
 
@@ -2285,6 +2293,8 @@ pub struct MountContext {
     /// The runtime's freshness dial (RFC-0040), stamped onto a hot-mounted nest's config so it runs
     /// at the cadence its co-tenants do.
     pub freshness: crate::freshness::Freshness,
+    /// Chain -> the dial its cursor runs at, once `freshness` has been settled on its block time.
+    pub chain_freshness: std::collections::HashMap<String, crate::freshness::Freshness>,
 }
 
 /// Why a mount was refused (RFC-0027 §3). Typed so the control surface can map each to its status
@@ -2424,11 +2434,13 @@ impl RuntimeHandles {
             None => {
                 let mut config = Config::load(&dir)
                     .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
-                stamp_operator_settings(
-                    &mut config,
-                    self.mount_ctx.freshness,
-                    self.mount_ctx.ipfs_window_deadline,
-                );
+                let dial = self
+                    .mount_ctx
+                    .chain_freshness
+                    .get(&config.nest.chain)
+                    .copied()
+                    .unwrap_or(self.mount_ctx.freshness);
+                stamp_operator_settings(&mut config, dial, self.mount_ctx.ipfs_window_deadline);
                 let chain = config.nest.chain.clone();
 
                 let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
@@ -2952,6 +2964,7 @@ mod tests {
         let freshness = crate::freshness::Freshness {
             poll_interval: minute,
             finality_only: true,
+            poll_interval_explicit: true,
         };
         stamp_operator_settings(&mut config, freshness, std::time::Duration::ZERO);
         assert_eq!(config.ipfs_window_deadline, std::time::Duration::ZERO);

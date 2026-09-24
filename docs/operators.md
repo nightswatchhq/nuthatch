@@ -493,8 +493,11 @@ nuthatch dev --dir . --poll-interval 5m
 nuthatch dev --dir . --poll-interval 5m --finality-only
 ```
 
-- **`--poll-interval <DURATION>`** (`2s` default; `5m`, `1h`, or bare seconds) is how long a caught-up
-  cursor waits before asking for the tip again. Every poll costs a tip call and, when a window commits,
+- **`--poll-interval <DURATION>`** (`5m`, `1h`, or bare seconds) is how long a caught-up cursor waits
+  before asking for the tip again. Unset, it is the chain's block time in whole seconds, never under
+  `2s`: 12 s on mainnet, 5 s on Gnosis, 2 s on the L2s and faster chains. A chain outside the registry
+  has its block time measured once at startup, over the last hundred blocks. Polling faster than blocks
+  arrive finds nothing new and is still billed. Every poll costs a tip call and, when a window commits,
   a reorg check, a checkpoint and a `finalized` probe, whether or not a block carried an event. At five
   minutes the allocations nest above drops from ~9,900 CU a minute to the order of **100** - a few
   dollars a month - and holds exactly the same rows. Match it to your consumers: a dashboard on a
@@ -505,9 +508,10 @@ nuthatch dev --dir . --poll-interval 5m --finality-only
   fifteen to twenty minutes behind the tip; that lag is the price, and it is deliberate.
 
 **Nothing about this is silent.** `/ready` carries a `freshness` object - `{"mode": "tip" | "finality",
-"poll_interval_secs": N}` - and `lag_blocks` is then the distance you chose. Its stall thresholds scale
-with the interval (at least three intervals), so a quiet five-minute cursor is not reported as a dead
-one, and a dead pool is still reported inside a quarter of an hour.
+"poll_interval_secs": N, "poll_interval_source": "block_time" | "flag"}` - and `lag_blocks` is then
+the distance you chose. Its stall thresholds scale with the interval (at least three intervals), so a quiet
+five-minute cursor is not reported as a dead one, and a dead pool is still reported inside a
+quarter of an hour.
 
 **What does not change.** The rows, the decode, the sealing, and a segment's content address, which is
 a function of its block range and rows alone. A slower cursor returns the same data later; it never

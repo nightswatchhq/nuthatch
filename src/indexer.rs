@@ -65,6 +65,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a
     // wrong-network endpoint in the pool corrupts silently, because failover hides it.
     rpc.verify_chain_ids(config.nest.chain_id).await?;
+    config.freshness = config.freshness.for_chain(&config.nest.chain, &rpc).await;
     let source: Arc<dyn Source> = Arc::new(rpc);
     let concurrency = backfill_concurrency_for(
         endpoint_count,
@@ -103,10 +104,8 @@ fn apply_dev_args(config: &mut Config, args: &DevArgs) {
     config.state_rpc_urls = args.state_rpc.clone();
     config.ipfs_gateways = args.ipfs.clone();
     // The freshness dial (RFC-0040): an operator's cadence is not the nest's identity.
-    config.freshness = crate::freshness::Freshness {
-        poll_interval: args.poll_interval,
-        finality_only: args.finality_only,
-    };
+    config.freshness =
+        crate::freshness::Freshness::from_flags(args.poll_interval, args.finality_only);
     config.ipfs_window_deadline = args.ipfs_window_deadline;
 }
 
@@ -7827,6 +7826,8 @@ fn cursor_freshness<'a>(
             Some(acc) => crate::freshness::Freshness {
                 poll_interval: acc.poll_interval.min(n.freshness.poll_interval),
                 finality_only: acc.finality_only && n.freshness.finality_only,
+                poll_interval_explicit: acc.poll_interval_explicit
+                    || n.freshness.poll_interval_explicit,
             },
         });
     }
@@ -17331,6 +17332,7 @@ template="pool"
             crate::freshness::Freshness {
                 poll_interval: std::time::Duration::from_secs(300),
                 finality_only: false,
+                poll_interval_explicit: true,
             },
         )
         .await;
@@ -17489,6 +17491,7 @@ template="pool"
             crate::freshness::Freshness {
                 poll_interval: std::time::Duration::from_secs(300),
                 finality_only: false,
+                poll_interval_explicit: true,
             },
         )
         .await;
