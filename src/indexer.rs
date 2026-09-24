@@ -7182,6 +7182,26 @@ fn hold_for_documents(
     Ok(Some(finalized_through))
 }
 
+/// `block:hash` of the checkpoint `maybe_seal` last pinned while holding rows (#1495).
+const SEAL_PIN_KEY: &str = "seal_pin";
+
+/// Whether that pin still anchors the reorg walk: at or above the watermark (`from - 1`), at or
+/// below `ceiling`, and still the checkpoint the store holds at its block.
+fn held_pin_covers(store: &dyn crate::store::HotStore, from: u64, ceiling: u64) -> Result<bool> {
+    let Some(pin) = store.get_meta(SEAL_PIN_KEY)? else {
+        return Ok(false);
+    };
+    let Some((block, hash)) = pin
+        .split_once(':')
+        .and_then(|(b, h)| Some((b.parse::<u64>().ok()?, h)))
+    else {
+        return Ok(false);
+    };
+    Ok(block + 1 >= from
+        && block <= ceiling
+        && store.get_block_hash(block)?.as_deref() == Some(hash))
+}
+
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
 /// chosen from the data. Rows short of the threshold stay in the hot store until the next call.
 ///
@@ -7282,8 +7302,14 @@ async fn maybe_seal(
                 // sealed_through to an older sparse checkpoint and tripped the finality
                 // guard on a block the reorg never touched. The empty-range arm already
                 // pins; this one must too (#1067).
-                if let Ok(Some(hash)) = source.block_hash(ceiling).await {
-                    store.set_block_hash(ceiling, &hash)?;
+                //
+                // One pin serves until the watermark moves (#1495). The walk needs a final
+                // checkpoint at or above the watermark, not a new one per window.
+                if !held_pin_covers(store, from, ceiling)? {
+                    if let Ok(Some(hash)) = source.block_hash(ceiling).await {
+                        store.set_block_hash(ceiling, &hash)?;
+                        store.set_meta(SEAL_PIN_KEY, &format!("{ceiling}:{hash}"))?;
+                    }
                 }
                 tracing::debug!(
                     rows = scan.rows,
@@ -8597,6 +8623,104 @@ mod tests {
             Some(pinned.as_str()),
             "a held finalized range must still pin a checkpoint at the ceiling, or a later \
              reorg walks past it to an older sparse checkpoint (#461 / #1067)"
+        );
+    }
+
+    /// Hashes that change at and above `fork_from`, counting every ask.
+    struct PinSource {
+        fork_from: std::sync::atomic::AtomicU64,
+        asks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PinSource {
+        fn hash(&self, n: u64) -> String {
+            let chain = u64::from(n >= self.fork_from.load(std::sync::atomic::Ordering::SeqCst));
+            format!("0x{n:060x}{chain:04x}")
+        }
+        fn asks(&self) -> usize {
+            self.asks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for PinSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(0)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.hash(n)))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(vec![])
+        }
+    }
+
+    /// #1495. A held range pins its ceiling once and reuses the pin while the watermark stands, and
+    /// the reused pin still anchors the reorg walk at or above the watermark (#461). The watermark
+    /// here has no checkpoint of its own, as after a pin that failed, so the held pin is the only
+    /// anchor the walk can find.
+    #[tokio::test]
+    async fn a_held_range_pins_once_and_the_pin_still_anchors_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let src = PinSource {
+            fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+            asks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let metrics = crate::metrics::NestMetrics::default();
+        let entities: Vec<(String, String)> = (51..=150)
+            .map(|i| (Store::entity_key(i, 0), entity_json(i, 0)))
+            .collect();
+        store
+            .commit_window(&entities, Some((150, src.hash(150).as_str())), 150)
+            .unwrap();
+        store.set_meta(SEALED_THROUGH_KEY, "50").unwrap();
+        let seal =
+            |ceiling: u64| maybe_seal(tmp.path(), &store, &src, ceiling, None, &metrics, SPAN_REAL);
+
+        seal(100).await.unwrap();
+        assert_eq!(src.asks(), 1, "the first held window pins its ceiling");
+        for ceiling in [110, 120, 130] {
+            seal(ceiling).await.unwrap();
+        }
+        assert_eq!(src.asks(), 1, "later held windows reuse the pin at 100");
+        assert_eq!(
+            store.get_meta(SEALED_THROUGH_KEY).unwrap().as_deref(),
+            Some("50")
+        );
+
+        // Tip windows checkpoint above finality; a reorg forking above the ceiling replaces them all.
+        for b in [135, 145] {
+            store.set_block_hash(b, &src.hash(b)).unwrap();
+        }
+        src.fork_from
+            .store(132, std::sync::atomic::Ordering::SeqCst);
+        let ancestor = detect_reorg(&src, &store, 150).await.unwrap();
+        assert_eq!(
+            ancestor,
+            Some(100),
+            "the walk must land on the reused pin, at or above the watermark 50"
+        );
+
+        // A pin whose checkpoint no longer matches, or that the watermark has passed, is re-taken.
+        src.fork_from
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        let before = src.asks();
+        store.set_block_hash(100, "0xdead").unwrap();
+        seal(130).await.unwrap();
+        assert_eq!(src.asks() - before, 1, "an overwritten pin is pinned again");
+        store.set_meta(SEALED_THROUGH_KEY, "131").unwrap();
+        seal(140).await.unwrap();
+        assert_eq!(
+            src.asks() - before,
+            2,
+            "a pin below the watermark is pinned again"
         );
     }
 
@@ -18368,7 +18492,7 @@ rpc_urls = ["https://rpc.example"]
                     advancing.finalized,
                     advancing.logs
                 ),
-                (2 * m, m, 0, m, m),
+                (m, m, 0, m, m),
                 "runtime={runtime}: per committed window, {advancing:?}"
             );
         }
