@@ -676,6 +676,8 @@ impl FoldSet {
 /// is the only writer of checkpoints.
 pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
     use crate::cli::FoldCommand;
+    let mut phases = Phases::default();
+    phases.mark("start");
     let dir = match &cmd {
         FoldCommand::Build { dir, .. }
         | FoldCommand::Read { dir, .. }
@@ -684,8 +686,10 @@ pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
     let dir = dir.as_path();
     let store = crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE))
         .context("opening the nest's store (is `dev` running on it?)")?;
+    phases.mark("store opened");
     let sealed_through = store.sealed_through();
     let set = FoldSet::load(dir, &[])?;
+    phases.mark("folds loaded");
     if set.folds.is_empty() {
         bail!("{} has no folds/", dir.display());
     }
@@ -712,7 +716,11 @@ pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
         }
         FoldCommand::Bench { iters, .. } => {
             let hot = store.hot_rows_by_table()?;
-            println!("{}", bench(dir, &set, &hot, sealed_through, iters)?);
+            phases.mark("hot rows read");
+            println!(
+                "{}",
+                bench(dir, &set, &hot, sealed_through, iters, &mut phases)?
+            );
         }
     }
     Ok(())
@@ -734,6 +742,22 @@ fn memory_kib() -> Option<(u64, u64)> {
     Some((field("VmHWM:")?, field("VmRSS:")?))
 }
 
+/// Resident and peak memory at named points, so a fixed cost can be told apart from evaluation.
+#[derive(Default)]
+struct Phases(Vec<serde_json::Value>);
+
+impl Phases {
+    fn mark(&mut self, at: &str) {
+        if let Some((hwm, rss)) = memory_kib() {
+            self.0.push(serde_json::json!({
+                "at": at,
+                "rss_mib": rss as f64 / 1024.0,
+                "peak_mib": hwm as f64 / 1024.0,
+            }));
+        }
+    }
+}
+
 fn reset_peak() {
     let _ = std::fs::write("/proc/self/clear_refs", "5");
 }
@@ -746,6 +770,7 @@ fn bench(
     hot: &analytics::HotRows,
     sealed_through: u64,
     iters: usize,
+    phases: &mut Phases,
 ) -> Result<serde_json::Value> {
     if iters == 0 {
         bail!("--iters must be at least 1");
@@ -767,6 +792,7 @@ fn bench(
     }
     let mut s = set.stepper(dir, &[])?;
     s.resume(from)?;
+    phases.mark("checkpoint resumed");
     let counts = |s: &Stepper| -> Result<u64> {
         set.folds
             .iter()
@@ -775,6 +801,7 @@ fn bench(
     };
     // Warm-up: the first evaluation pays for loading extensions and binding views, once per process.
     s.probe(hot, sealed_through, heads[0], counts)?;
+    phases.mark("warmed up");
 
     let mut wall = Vec::with_capacity(iters);
     let (mut peak_kib, mut delta_kib) = (0u64, 0u64);
@@ -801,6 +828,7 @@ fn bench(
         "peak_rss_mib": (peak_kib > 0).then(|| peak_kib as f64 / 1024.0),
         "peak_increase_mib": (peak_kib > 0).then(|| delta_kib as f64 / 1024.0),
         "targets": { "p99_ms": 500, "peak_rss_mib": 256 },
+        "phases": phases.0,
     }))
 }
 
@@ -1740,7 +1768,7 @@ mod bench_and_probe {
     fn the_bench_times_every_hot_head_from_the_checkpoint() {
         let (dir, hot, set) = nest();
         set.build(dir.path(), &[], 30, 10).unwrap();
-        let report = bench(dir.path(), &set, &hot, 30, 12).unwrap();
+        let report = bench(dir.path(), &set, &hot, 30, 12, &mut Phases::default()).unwrap();
         assert_eq!(report["checkpoint"], 30);
         assert_eq!(report["heads"]["count"], 5);
         assert_eq!(report["evaluations"], 12);
@@ -1748,7 +1776,7 @@ mod bench_and_probe {
             report["wall_ms"]["p99"].as_f64().unwrap()
                 >= report["wall_ms"]["p50"].as_f64().unwrap()
         );
-        assert!(bench(dir.path(), &set, &hot, 30, 0).is_err());
+        assert!(bench(dir.path(), &set, &hot, 30, 0, &mut Phases::default()).is_err());
     }
 }
 
