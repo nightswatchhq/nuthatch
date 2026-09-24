@@ -407,6 +407,9 @@ jobs:
       # cache the test step then reuses.
       - name: clippy (graph)
         run: cargo clippy --features graph --all-targets -- -D warnings
+      # `folds` without `graph` is a build of its own (RFC-0059 packaging); nothing else compiles it.
+      - name: clippy (folds alone)
+        run: cargo clippy --features folds --all-targets -- -D warnings
       # The whole suite, not only the facade's own: the feature changes what the Graph surface
       # serves, so every test that reaches it has to hold in this build too.
       - name: test (graph)

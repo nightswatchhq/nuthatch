@@ -51,6 +51,9 @@ pub mod entity_view;
 pub mod exposure;
 pub mod factory;
 pub mod flags;
+/// RFC-0059 checkpointed folds, behind the off-by-default `folds` feature.
+#[cfg(feature = "folds")]
+pub mod folds;
 pub mod freshness;
 pub mod graft;
 /// RFC-0053 S2: compile an accepted Graph query dialect to SQL over a nest (#1266).
