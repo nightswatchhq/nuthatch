@@ -176,6 +176,110 @@ impl FoldSet {
     }
 }
 
+/// Walks a fold set forward one window at a time: facts in `(lo, hi]`, each fold's output at `lo` as
+/// its carry. The first step starts from genesis with empty carries.
+pub struct Stepper<'a> {
+    set: &'a FoldSet,
+    eval: analytics::FoldEvaluator,
+    wanted: BTreeSet<String>,
+    at: Option<u64>,
+}
+
+impl FoldSet {
+    pub fn stepper<'a>(&'a self, dir: &Path, schema: &[TableSchema]) -> Result<Stepper<'a>> {
+        Ok(Stepper {
+            set: self,
+            eval: analytics::FoldEvaluator::new(dir, schema)?,
+            wanted: self.folds.iter().flat_map(|f| f.reaches.clone()).collect(),
+            at: None,
+        })
+    }
+}
+
+impl Stepper<'_> {
+    /// The block the folds were last evaluated at, or `None` before the first step.
+    pub fn at(&self) -> Option<u64> {
+        self.at
+    }
+
+    /// Evaluate every fold at `hi` from its state at the previous step.
+    pub fn step_to(
+        &mut self,
+        hot: &analytics::HotRows,
+        sealed_through: u64,
+        hi: u64,
+    ) -> Result<()> {
+        if let Some(lo) = self.at {
+            if hi <= lo {
+                bail!("a fold steps forward: {hi} is not after {lo}");
+            }
+        }
+        for f in &self.set.folds {
+            let carry = match self.at {
+                Some(_) => format!("SELECT * FROM \"{}\"", f.name),
+                None => empty_relation(&f.carry),
+            };
+            self.eval.execute(&format!(
+                "CREATE OR REPLACE TABLE \"{}__carry\" AS {carry}",
+                f.name
+            ))?;
+        }
+        self.eval
+            .bind_window(hot, sealed_through, self.at, hi, &self.wanted)?;
+        for f in &self.set.folds {
+            let step = format!("__step_{}", f.name);
+            self.eval
+                .execute(&format!("CREATE OR REPLACE TABLE \"{step}\" AS {}", f.sql))
+                .with_context(|| format!("evaluating fold `{}` at {hi}", f.name))?;
+            // A keyed fold emits the keys its window touched; every other key passes through as it was.
+            let output = match &f.key {
+                FoldKey::Columns(cols) => {
+                    let same: Vec<String> = cols
+                        .iter()
+                        .map(|c| format!("s.\"{c}\" IS NOT DISTINCT FROM c.\"{c}\""))
+                        .collect();
+                    format!(
+                        "SELECT * FROM \"{step}\" UNION ALL SELECT * FROM \"{0}__carry\" c \
+                         WHERE NOT EXISTS (SELECT 1 FROM \"{step}\" s WHERE {1})",
+                        f.name,
+                        same.join(" AND ")
+                    )
+                }
+                FoldKey::Singleton | FoldKey::Unkeyed => format!("SELECT * FROM \"{step}\""),
+            };
+            self.eval.execute(&format!(
+                "CREATE OR REPLACE TABLE \"{}\" AS {output}",
+                f.name
+            ))?;
+            let rows = self.eval.count(&f.name)?;
+            if rows > f.max_rows {
+                bail!(
+                    "fold `{}` holds {rows} rows at {hi}, over its declared max_rows {}",
+                    f.name,
+                    f.max_rows
+                );
+            }
+        }
+        self.at = Some(hi);
+        Ok(())
+    }
+
+    /// A fold's state at the last step, ordered by every column so it compares deterministically.
+    pub fn rows(&self, fold: &str) -> Result<Vec<serde_json::Value>> {
+        let f = self
+            .set
+            .folds
+            .iter()
+            .find(|f| f.name == fold)
+            .with_context(|| format!("no fold `{fold}`"))?;
+        let order: Vec<String> = (1..=f.carry.len()).map(|i| i.to_string()).collect();
+        self.eval.rows(&format!(
+            "SELECT * FROM \"{fold}\" ORDER BY {}",
+            order.join(", ")
+        ))
+    }
+}
+
 fn empty_relation(cols: &[(String, String)]) -> String {
     let select: Vec<String> = cols
         .iter()
@@ -381,7 +485,7 @@ fn schema_mismatch(carry: &[(String, String)], output: &[(String, String)]) -> S
 mod tests {
     use super::*;
 
-    const SCHEMA: &str = r#"{"tables":[{"table":"t","columns":[{"name":"block_number","storage":"u64"},{"name":"k","storage":"varchar"},{"name":"v","storage":"varchar"}]}]}"#;
+    pub(super) const SCHEMA: &str = r#"{"tables":[{"table":"t","columns":[{"name":"block_number","storage":"u64"},{"name":"k","storage":"varchar"},{"name":"v","storage":"varchar"}]}]}"#;
 
     fn nest(folds: &[(&str, &str)], decls: &str, views: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -540,6 +644,159 @@ mod tests {
         assert!(
             msg.contains("exactly one SELECT") || msg.contains("parse"),
             "{msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stepping_support {
+    use super::*;
+    use serde_json::json;
+
+    /// Blocks 1..=30 sealed as three segments, 31..=35 hot. Key `k` cycles a, b, c; `v` is the block.
+    pub(super) fn corpus() -> (tempfile::TempDir, analytics::HotRows) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), super::tests::SCHEMA).unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        let row = |b: u64| {
+            let k = ["a", "b", "c"][(b % 3) as usize];
+            json!({"table": "t", "block_number": b, "k": k, "v": b.to_string()})
+        };
+        for (from, to) in [(1, 10), (11, 20), (21, 30)] {
+            let rows: Vec<String> = (from..=to).map(|b| row(b).to_string()).collect();
+            crate::seal::seal_range(dir.path(), &rows, from, to).unwrap();
+        }
+        let mut hot = analytics::HotRows::new();
+        hot.insert("t".into(), (31..=35).map(row).collect());
+        (dir, hot)
+    }
+
+    pub(super) fn fold_files(dir: &Path, folds: &[(&str, &str)], decls: &str) {
+        std::fs::create_dir_all(dir.join("folds")).unwrap();
+        for (file, sql) in folds {
+            std::fs::write(dir.join("folds").join(file), sql).unwrap();
+        }
+        std::fs::write(dir.join("folds/folds.toml"), decls).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stepping {
+    use super::stepping_support::*;
+    use super::*;
+
+    fn n(rows: &[serde_json::Value]) -> u64 {
+        rows[0]["n"].as_u64().unwrap()
+    }
+
+    /// RFC-0059 S1's first criterion: `count(*)` over a fact table inside a fold counts the window,
+    /// not history, while a fold that adds its carry reaches the history total.
+    #[test]
+    fn a_fold_sees_its_window_and_its_carry_holds_the_rest() {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[
+                ("10-window.sql", "SELECT CAST(count(*) AS UBIGINT) AS n FROM t"),
+                (
+                    "20-running.sql",
+                    "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+                ),
+            ],
+            "[[fold]]\nname = \"window\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n\
+             [[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        // Cuts inside a segment (15, 25) and across the sealed/hot boundary (33).
+        for (hi, window, running) in [(15, 15, 15), (25, 10, 25), (33, 8, 33), (35, 2, 35)] {
+            s.step_to(&hot, 30, hi).unwrap();
+            assert_eq!(n(&s.rows("window").unwrap()), window, "window at {hi}");
+            assert_eq!(n(&s.rows("running").unwrap()), running, "running at {hi}");
+        }
+        assert!(
+            s.step_to(&hot, 30, 35).is_err(),
+            "a fold never steps backwards or in place"
+        );
+    }
+
+    /// A keyed fold emits only the keys its window touched; untouched keys keep their carried rows.
+    #[test]
+    fn a_keyed_fold_passes_untouched_keys_through() {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[(
+                "latest.sql",
+                "SELECT k, v FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY block_number DESC) = 1",
+            )],
+            "[[fold]]\nname = \"latest\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\", \"v VARCHAR\"]\nmax_rows = 3\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        s.step_to(&hot, 30, 30).unwrap();
+        // (30, 31] touches only block 31, key b.
+        s.step_to(&hot, 30, 31).unwrap();
+        let got: Vec<(String, String)> = s
+            .rows("latest")
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["k"].as_str().unwrap().into(),
+                    r["v"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        let want =
+            [("a", "30"), ("b", "31"), ("c", "29")].map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_fold_over_its_max_rows_is_refused() {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[("keys.sql", "SELECT DISTINCT k FROM t")],
+            "[[fold]]\nname = \"keys\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\"]\nmax_rows = 2\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        let err = s.step_to(&hot, 30, 30).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("over its declared max_rows 2"),
+            "{err:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod short_windows {
+    use super::stepping_support::*;
+    use super::*;
+
+    /// `/sql` answers short and flags it; a fold step would checkpoint the short answer as the truth.
+    #[test]
+    fn a_window_missing_sealed_data_is_refused() {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[("c.sql", "SELECT CAST(count(*) AS UBIGINT) AS n FROM t")],
+            "[[fold]]\nname = \"c\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let manifest = crate::seal::load_manifest_with_hash(dir.path()).unwrap().0;
+        let seg = manifest.tables["t"]
+            .iter()
+            .find(|s| s.from_block == 11)
+            .unwrap();
+        std::fs::remove_file(crate::seal::segment_path(dir.path(), &seg.file, &seg.hash)).unwrap();
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        let err = s.step_to(&hot, 30, 25).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing sealed data for t"),
+            "{err:#}"
         );
     }
 }
