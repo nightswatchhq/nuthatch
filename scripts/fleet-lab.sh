@@ -511,20 +511,22 @@ cmd_pull() {
   local cp_priv; cp_priv=$(private_ip control)
   { [ -z "$w" ] || [ -z "$cp" ] || [ -z "$cp_priv" ]; } && { echo "needs the 'multi' shape"; exit 1; }
 
-  # MinIO rather than a real S3: the registry has to be reachable from another machine (a local
+  # A local S3 server (versitygw; MinIO was withdrawn upstream, #1492) rather than a real S3: the
+  # registry has to be reachable from another machine (a local
   # directory would make this a single-box test and prove nothing), and a self-contained one keeps
   # long-lived cloud credentials out of a lab that gets destroyed and rebuilt.
   local key=labuser sec=labpassword123
   local s3env="AWS_ACCESS_KEY_ID=$key AWS_SECRET_ACCESS_KEY=$sec AWS_ENDPOINT=http://$cp_priv:9000 AWS_REGION=us-east-1 AWS_ALLOW_HTTP=true"
-  echo "== registry pull: publishing to MinIO on $cp_priv:9000, writer $w starts with no nest =="
+  echo "== registry pull: publishing to versitygw on $cp_priv:9000, writer $w starts with no nest =="
 
   lab_ssh "root@$cp" "set -eu
-    docker rm -f minio >/dev/null 2>&1 || true
-    docker run -d --name minio -p $cp_priv:9000:9000 \
-      -e MINIO_ROOT_USER=$key -e MINIO_ROOT_PASSWORD=$sec quay.io/minio/minio server /data >/dev/null
-    for i in \$(seq 1 30); do curl -fsS -m2 http://$cp_priv:9000/minio/health/live >/dev/null 2>&1 && break; sleep 2; done
-    docker run --rm --network host quay.io/minio/mc alias set lab http://$cp_priv:9000 $key $sec >/dev/null
-    docker run --rm --network host quay.io/minio/mc mb -p lab/nests >/dev/null"
+    docker rm -f s3 >/dev/null 2>&1 || true
+    docker run -d --name s3 -p $cp_priv:9000:9000 -v /data \
+      -e ROOT_ACCESS_KEY=$key -e ROOT_SECRET_KEY=$sec \
+      versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
+      --port :9000 --health /health posix /data >/dev/null
+    for i in \$(seq 1 30); do curl -fsS -m2 http://$cp_priv:9000/health >/dev/null 2>&1 && break; sleep 2; done
+    curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 --user $key:$sec -X PUT http://$cp_priv:9000/nests >/dev/null"
 
   # Publish from the control box, which is the only machine that has the nest.
   local hash

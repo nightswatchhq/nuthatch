@@ -5,6 +5,9 @@ with `scripts/publish-throughput-gate.sh`. RFC-0052 §7 fails S2 if RFC-0004's b
 measures ingestion throughput outside noise while publishing to a MinIO throttled to 1 MB/s. It does
 not.
 
+These figures were taken against MinIO. Open-source MinIO has since been withdrawn upstream (#1492),
+and the script now runs versitygw; a rerun measures against that.
+
 ## The scenario
 
 `nuthatch bench backfill --seal-direct --concurrency 4` over blocks 1 to 20,000 of the chain

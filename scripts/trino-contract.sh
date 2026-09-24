@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # RFC-0052 S3 (#1261): the Trino half of the contract test. `tests/e2e_trino_contract.rs` publishes
-# a nest with a drifted table to MinIO and writes what DuckDB reads over the local segments; this
+# a nest with a drifted table to an S3 server (versitygw in CI, #1492) and writes what DuckDB reads over the local segments; this
 # script points a running Trino (container `trino`, Hive catalog `hive`) at the published prefix and
 # fails on any difference.
 #
