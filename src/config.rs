@@ -29,11 +29,23 @@ pub const READABLE_SCHEMA_VERSION: u32 = if cfg!(feature = "graph") {
 
 /// RFC-0060: the Graph history read policy needs a `graph` build. A default build would otherwise
 /// serve latest-only answers without the freshness limit the policy promises.
-fn refuse_graph_only_files(dir: &Path) -> Result<()> {
+///
+/// RFC-0059: `folds/` is refused rather than skipped, because a view reading a fold would otherwise be
+/// served as if the fold had no state.
+fn refuse_feature_only_files(dir: &Path) -> Result<()> {
     if !cfg!(feature = "graph") && dir.join("graph/history.toml").exists() {
         bail!(
             "this nest declares graph/history.toml, the Graph history read policy, which only a \
              nuthatch built with `--features graph` honours"
+        );
+    }
+    if dir.join("folds").exists() {
+        if cfg!(feature = "folds") {
+            bail!("this nest ships folds/, and this build does not load folds yet (RFC-0059 S1)");
+        }
+        bail!(
+            "this nest ships folds/ (checkpointed folds, RFC-0059), which only a nuthatch built \
+             with `--features folds` or `--features graph` loads"
         );
     }
     Ok(())
@@ -571,7 +583,7 @@ impl Config {
             }
         }
         cfg.refuse_tip_finality_webhooks()?;
-        refuse_graph_only_files(dir)?;
+        refuse_feature_only_files(dir)?;
         Ok(cfg)
     }
 

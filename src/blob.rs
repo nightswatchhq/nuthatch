@@ -24,7 +24,12 @@ pub const BLOB_FORMAT_VERSION: u32 = 1;
 /// Files/dirs never included in a blob: the hot store and sealed data are *derived*, not authored, and
 /// including them would make the hash depend on runtime state instead of inputs. Matched by exact name
 /// at any depth.
+#[cfg(not(feature = "folds"))]
 const EXCLUDE: &[&str] = &[DB_FILE, "segments", ".git", ".DS_Store"];
+/// RFC-0059: fold checkpoints are derived state. Excluded only where folds exist, because a name
+/// matched at any depth would otherwise move the NID of a default-build nest that owns such a directory.
+#[cfg(feature = "folds")]
+const EXCLUDE: &[&str] = &[DB_FILE, "segments", "checkpoints", ".git", ".DS_Store"];
 
 /// The **derived state** a dataset accumulates by indexing: the hot store and the sealed segments.
 ///
@@ -223,6 +228,8 @@ const NON_DATA_INPUTS: &[&str] = &[
     // RFC-0060: the Graph history read policy, read by serving alone. Excluded in every build so the
     // data identity never depends on compile features; a default build refuses the nest anyway.
     "graph/history.toml",
+    // RFC-0059: folds are read at query time over stored facts and never change a stored byte.
+    "folds/",
     "entities.toml",
     "semantic.toml",
     "llms.txt",

@@ -166,7 +166,9 @@ postgres-store = ["dep:postgres"]
 counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
 # RFC-0060 §5.6: the Graph network facade. Off by default: a default build never shows it and
 # refuses a nest that needs it.
-graph = ["duckdb/vscalar", "duckdb/vscalar-arrow"]
+graph = ["duckdb/vscalar", "duckdb/vscalar-arrow", "folds"]
+# RFC-0059: checkpointed folds. Off by default, and a default build refuses a nest that ships `folds/`.
+folds = []
 
 [dev-dependencies]
 proptest = "1"
