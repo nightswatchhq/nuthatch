@@ -1371,3 +1371,73 @@ mod checkpoints {
         assert_ne!(other.1, base.1);
     }
 }
+
+#[cfg(test)]
+mod checkpoints_are_used {
+    use super::stepping_support::*;
+    use super::*;
+
+    fn nest() -> (tempfile::TempDir, analytics::HotRows, FoldSet) {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[(
+                "running.sql",
+                "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+            )],
+            "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        (dir, hot, set)
+    }
+
+    /// The point of a checkpoint: a read past it never touches the history before it. With the
+    /// first segment gone, only a read that really starts from the checkpoint at 20 can answer.
+    #[test]
+    fn a_read_past_a_checkpoint_does_not_need_the_history_before_it() {
+        let (dir, hot, set) = nest();
+        set.build(dir.path(), &[], 30, 10).unwrap();
+        let manifest = crate::seal::load_manifest_with_hash(dir.path()).unwrap().0;
+        let first = manifest.tables["t"]
+            .iter()
+            .find(|s| s.from_block == 1)
+            .unwrap();
+        std::fs::remove_file(crate::seal::segment_path(
+            dir.path(),
+            &first.file,
+            &first.hash,
+        ))
+        .unwrap();
+        let s = set.read_at(dir.path(), &[], &hot, 30, 25).unwrap();
+        assert_eq!(s.rows("running").unwrap()[0]["n"], 25);
+    }
+
+    /// An id addresses every sealed fact up to its block, not only its last window: two histories
+    /// whose last windows read the same segment still get different ids.
+    #[test]
+    fn a_checkpoint_id_covers_the_whole_history_not_the_last_window() {
+        let mut last = Vec::new();
+        for cuts in [&[10, 20, 30][..], &[20, 30][..]] {
+            let (dir, hot, set) = nest();
+            let mut s = set.stepper(dir.path(), &[]).unwrap();
+            for &c in cuts {
+                s.step_to(&hot, 30, c).unwrap();
+                s.checkpoint().unwrap();
+            }
+            let log = load_log(dir.path(), &set.folds[0]).unwrap();
+            let end = log.checkpoints.last().unwrap().clone();
+            assert_eq!(
+                end.inputs.len(),
+                1,
+                "both last windows read only the third segment"
+            );
+            last.push(end);
+        }
+        assert_eq!(last[0].row_digest, last[1].row_digest, "same state");
+        assert_eq!(last[0].inputs, last[1].inputs, "same last window");
+        assert_ne!(
+            last[0].id, last[1].id,
+            "different histories, so different ids"
+        );
+    }
+}
