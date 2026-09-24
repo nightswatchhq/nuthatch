@@ -6519,18 +6519,13 @@ impl NestIngest {
         }
         // Fetch the window boundary's canonical hash for future reorg detection, then commit the whole
         // window - rows + annotations + the checkpoint + the `last_block` watermark - in one atomic txn.
-        let checkpoint = match source.block_hash(to).await {
-            Ok(Some(hash)) => {
-                let ts = match timestamps.get(&to).copied() {
-                    Some(t) => Some(t),
-                    None => source
-                        .block_timestamps(&[to])
-                        .await
-                        .ok()
-                        .and_then(|m| m.get(&to).copied()),
-                };
-                Some((to, crate::store::encode_block_record(&hash, ts)))
-            }
+        // When no kept row stamped `to`, its hash and timestamp come from one header (#1494).
+        let record = match timestamps.get(&to).copied() {
+            Some(t) => source.block_hash(to).await.map(|h| h.map(|h| (h, Some(t)))),
+            None => source.block_record(to).await,
+        };
+        let checkpoint = match record {
+            Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(&hash, ts))),
             _ => None,
         };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
@@ -18195,6 +18190,10 @@ rpc_urls = ["https://rpc.example"]
             self.count(|c| c.block_hash += 1);
             Ok(self.hash(n))
         }
+        async fn block_record(&self, n: u64) -> Result<Option<(String, Option<u64>)>> {
+            self.count(|c| c.block_record += 1);
+            Ok(self.hash(n).map(|h| (h, Some(1_700_000_000 + n))))
+        }
         async fn block_timestamps(
             &self,
             blocks: &[u64],
@@ -18338,7 +18337,7 @@ rpc_urls = ["https://rpc.example"]
                     advancing.finalized,
                     advancing.logs
                 ),
-                (3 * m, 0, m, m, m),
+                (2 * m, m, 0, m, m),
                 "runtime={runtime}: per committed window, {advancing:?}"
             );
         }
@@ -18357,7 +18356,7 @@ rpc_urls = ["https://rpc.example"]
                     advancing.block_record,
                     advancing.block_timestamps
                 ),
-                (3 * m, 0, m),
+                (2 * m, m, 0),
                 "runtime={runtime}: per committed window, {advancing:?}"
             );
         }
