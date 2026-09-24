@@ -427,6 +427,15 @@ fn window_inputs(
     through: u64,
 ) -> Result<Vec<(String, String)>> {
     let manifest = crate::seal::load_manifest_with_hash(dir)?.0;
+    Ok(inputs_in(&manifest, tables, after, through))
+}
+
+fn inputs_in(
+    manifest: &crate::seal::Manifest,
+    tables: &BTreeSet<String>,
+    after: Option<u64>,
+    through: u64,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = manifest
         .tables
         .iter()
@@ -439,7 +448,34 @@ fn window_inputs(
         })
         .collect();
     out.sort();
-    Ok(out)
+    out
+}
+
+/// Walk a fold's log from genesis to `block`: every link must name its predecessor, recompute to its
+/// id, and have read exactly the sealed segments the catalogue now holds for its window. A checkpoint
+/// whose history cannot be shown is not resumed from, however well its rows match their digest.
+fn verify_chain(dir: &Path, fold: &Fold, log: &CheckpointLog, block: u64) -> Result<()> {
+    let manifest = crate::seal::load_manifest_with_hash(dir)?.0;
+    let mut prev: Option<&Checkpoint> = None;
+    for c in log.checkpoints.iter().take_while(|c| c.block <= block) {
+        let why = if c.prev != prev.map(|p| p.block) {
+            Some("does not follow the checkpoint before it")
+        } else if c.inputs != inputs_in(&manifest, &fold.reaches, c.prev, c.block) {
+            Some("read segments the catalogue no longer holds for its window")
+        } else if c.id != checkpoint_id(fold, prev, &c.inputs) {
+            Some("does not recompute to its recorded id")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            bail!("fold `{}`: the checkpoint at {} {why}", fold.name, c.block);
+        }
+        prev = Some(c);
+    }
+    if prev.map(|p| p.block) != Some(block) {
+        bail!("fold `{}` has no checkpoint at {block}", fold.name);
+    }
+    Ok(())
 }
 
 impl Stepper<'_> {
@@ -506,6 +542,7 @@ impl Stepper<'_> {
                 .iter()
                 .find(|c| c.block == block)
                 .with_context(|| format!("fold `{}` has no checkpoint at {block}", f.name))?;
+            verify_chain(&self.dir, f, &log, block)?;
             let path = checkpoint_dir(&self.dir, f).join(format!("{block}.parquet"));
             let cols: Vec<String> = f
                 .carry
@@ -1697,5 +1734,79 @@ mod bench_and_probe {
                 >= report["wall_ms"]["p50"].as_f64().unwrap()
         );
         assert!(bench(dir.path(), &set, &hot, 30, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod provenance {
+    use super::stepping_support::*;
+    use super::*;
+
+    fn built() -> (tempfile::TempDir, analytics::HotRows, FoldSet) {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[(
+                "running.sql",
+                "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+            )],
+            "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        set.build(dir.path(), &[], 30, 10).unwrap();
+        (dir, hot, set)
+    }
+
+    fn edit_log(dir: &Path, set: &FoldSet, f: impl FnOnce(&mut CheckpointLog)) {
+        let mut log = load_log(dir, &set.folds[0]).unwrap();
+        f(&mut log);
+        let path = checkpoint_dir(dir, &set.folds[0]).join(CHECKPOINT_LOG);
+        std::fs::write(path, serde_json::to_vec(&log).unwrap()).unwrap();
+    }
+
+    fn refusal(dir: &Path, set: &FoldSet, hot: &analytics::HotRows) -> String {
+        format!(
+            "{:#}",
+            set.read_at(dir, &[], hot, 30, 25).err().expect("refused")
+        )
+    }
+
+    #[test]
+    fn a_checkpoint_that_claims_another_predecessor_is_refused() {
+        let (dir, hot, set) = built();
+        edit_log(dir.path(), &set, |log| log.checkpoints[1].prev = None);
+        assert!(
+            refusal(dir.path(), &set, &hot).contains("does not follow"),
+            "predecessor"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_whose_id_does_not_recompute_is_refused() {
+        let (dir, hot, set) = built();
+        edit_log(dir.path(), &set, |log| {
+            log.checkpoints[0].id = "0".repeat(64)
+        });
+        assert!(refusal(dir.path(), &set, &hot).contains("recorded id"));
+    }
+
+    /// Rows and digest can be perfect and the history still wrong: a segment in its window has since
+    /// been replaced, so the checkpoint no longer describes these facts.
+    #[test]
+    fn a_checkpoint_over_segments_the_catalogue_no_longer_holds_is_refused() {
+        let (dir, hot, set) = built();
+        let path = dir
+            .path()
+            .join(crate::seal::SEGMENTS_DIR)
+            .join(crate::seal::MANIFEST_FILE);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let manifest = crate::seal::load_manifest_with_hash(dir.path()).unwrap().0;
+        let old = &manifest.tables["t"]
+            .iter()
+            .find(|s| s.from_block == 11)
+            .unwrap()
+            .hash;
+        std::fs::write(&path, raw.replace(old.as_str(), &"f".repeat(64))).unwrap();
+        assert!(refusal(dir.path(), &set, &hot).contains("no longer holds"));
     }
 }
