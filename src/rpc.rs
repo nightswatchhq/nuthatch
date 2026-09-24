@@ -1749,7 +1749,30 @@ impl RpcClient {
         let arr = result
             .as_array()
             .ok_or_else(|| anyhow!("eth_getLogs did not return an array"))?;
+        self.remember_log_timestamps(arr);
         arr.iter().map(parse_log).collect()
+    }
+
+    /// Nodes that carry `blockTimestamp` on each log (execution-apis, 2025) answer the header
+    /// `block_timestamps` would otherwise buy per block: on a backfill, most of the RPC bill.
+    fn remember_log_timestamps(&self, logs: &[Value]) {
+        let found: HashMap<u64, u64> = logs
+            .iter()
+            .filter(|l| l.get("removed").and_then(Value::as_bool) != Some(true))
+            .filter_map(|l| {
+                let block = parse_hex_u64(l.get("blockNumber")?.as_str()?).ok()?;
+                let ts = parse_hex_u64(l.get("blockTimestamp")?.as_str()?).ok()?;
+                Some((block, ts))
+            })
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        let mut cache = self.timestamps.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() + found.len() > TIMESTAMP_CACHE_MAX {
+            cache.clear();
+        }
+        cache.extend(found);
     }
 }
 
@@ -2247,6 +2270,67 @@ mod tests {
             cache.len() <= super::TIMESTAMP_CACHE_MAX,
             "the cache must never exceed its ceiling"
         );
+    }
+
+    #[tokio::test]
+    async fn timestamps_carried_on_logs_cost_no_header_calls() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static HEADERS: AtomicUsize = AtomicUsize::new(0);
+        HEADERS.store(0, Ordering::SeqCst);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let log = |block: u64, ts: Option<u64>, removed: bool| {
+            let mut v = json!({"address":"0xaa","topics":["0x01"],"data":"0x",
+                "blockNumber":format!("0x{block:x}"),"blockHash":"0xbh","transactionHash":"0xtx",
+                "logIndex":"0x0","removed":removed});
+            if let Some(ts) = ts {
+                v["blockTimestamp"] = json!(format!("0x{ts:x}"));
+            }
+            v
+        };
+        let logs = json!([
+            log(10, Some(1_000), false),
+            log(11, Some(1_012), false),
+            log(12, None, false),
+            log(13, Some(9_999), true),
+        ]);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let logs = logs.clone();
+                async move {
+                    let one = |item: &Value| {
+                        if item["method"] == "eth_getLogs" {
+                            json!({"jsonrpc":"2.0","id":item["id"],"result":logs})
+                        } else {
+                            HEADERS.fetch_add(1, Ordering::SeqCst);
+                            json!({"jsonrpc":"2.0","id":item["id"],"result":{"timestamp":"0x7"}})
+                        }
+                    };
+                    match req {
+                        Value::Array(items) => Json(Value::Array(items.iter().map(one).collect())),
+                        item => Json(one(&item)),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
+        c.get_logs(&[], &["0x01".into()], 10, 13).await.unwrap();
+        let got = c.block_timestamps(&[10, 11]).await.unwrap();
+        assert_eq!(got, HashMap::from([(10, 1_000), (11, 1_012)]));
+        assert_eq!(HEADERS.load(Ordering::SeqCst), 0, "the logs already said when");
+
+        // A log without the field, and a removed one, still go to the header.
+        let got = c.block_timestamps(&[12, 13]).await.unwrap();
+        server.abort();
+        assert_eq!(got, HashMap::from([(12, 7), (13, 7)]));
+        assert_eq!(HEADERS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
