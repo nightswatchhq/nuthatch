@@ -239,6 +239,28 @@ impl Stepper<'_> {
         }
     }
 
+    /// Evaluate every fold at `hi`, run `read` over the result, then discard it: the stepper stays
+    /// where it was. This is a head read (RFC-0059 §4), one window from the last step every time.
+    pub fn probe<R>(
+        &mut self,
+        hot: &analytics::HotRows,
+        sealed_through: u64,
+        hi: u64,
+        read: impl FnOnce(&Self) -> Result<R>,
+    ) -> Result<R> {
+        if let Some(lo) = self.at {
+            if hi <= lo {
+                bail!("a probe reads ahead: {hi} is not after {lo}");
+            }
+        }
+        self.eval.begin()?;
+        let out = self
+            .advance(hot, sealed_through, hi)
+            .and_then(|()| read(self));
+        self.eval.rollback()?;
+        out
+    }
+
     fn advance(&mut self, hot: &analytics::HotRows, sealed_through: u64, hi: u64) -> Result<()> {
         for f in &self.set.folds {
             let carry = match self.at {
@@ -603,9 +625,9 @@ impl FoldSet {
 pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
     use crate::cli::FoldCommand;
     let dir = match &cmd {
-        FoldCommand::Build { dir, .. } | FoldCommand::Read { dir, .. } => {
-            std::path::PathBuf::from(dir)
-        }
+        FoldCommand::Build { dir, .. }
+        | FoldCommand::Read { dir, .. }
+        | FoldCommand::Bench { dir, .. } => std::path::PathBuf::from(dir),
     };
     let dir = dir.as_path();
     let store = crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE))
@@ -636,8 +658,98 @@ pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
                 println!("{row}");
             }
         }
+        FoldCommand::Bench { iters, .. } => {
+            let hot = store.hot_rows_by_table()?;
+            println!("{}", bench(dir, &set, &hot, sealed_through, iters)?);
+        }
     }
     Ok(())
+}
+
+/// Peak resident memory since the last reset, and current resident memory, in KiB. Linux only: the
+/// S1 gate is measured on the ThinkPad, and a 120 ms RSS poll can miss a 150 ms peak.
+fn memory_kib() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(name))?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()
+    };
+    Some((field("VmHWM:")?, field("VmRSS:")?))
+}
+
+fn reset_peak() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+}
+
+/// RFC-0059 S1's gate: head evaluation in one warm process, measured per the 2026-09-24 ruling. The
+/// latest checkpoint is resumed once; each hot block is then evaluated from it and discarded.
+fn bench(
+    dir: &Path,
+    set: &FoldSet,
+    hot: &analytics::HotRows,
+    sealed_through: u64,
+    iters: usize,
+) -> Result<serde_json::Value> {
+    if iters == 0 {
+        bail!("--iters must be at least 1");
+    }
+    let from = set
+        .latest_checkpoint(dir, sealed_through)?
+        .context("no checkpoint to resume; run `nuthatch fold build` first")?;
+    let reached: BTreeSet<String> = set.folds.iter().flat_map(|f| f.reaches.clone()).collect();
+    let mut heads: Vec<u64> = hot
+        .iter()
+        .filter(|(t, _)| reached.contains(&t.to_ascii_lowercase()))
+        .flat_map(|(_, rows)| rows.iter().filter_map(|r| r.get("block_number")?.as_u64()))
+        .filter(|b| *b > from)
+        .collect::<BTreeSet<u64>>()
+        .into_iter()
+        .collect();
+    if heads.is_empty() {
+        heads.push(sealed_through.max(from + 1));
+    }
+    let mut s = set.stepper(dir, &[])?;
+    s.resume(from)?;
+    let counts = |s: &Stepper| -> Result<u64> {
+        set.folds
+            .iter()
+            .map(|f| s.eval.count(&f.name))
+            .sum::<Result<u64>>()
+    };
+    // Warm-up: the first evaluation pays for loading extensions and binding views, once per process.
+    s.probe(hot, sealed_through, heads[0], counts)?;
+
+    let mut wall = Vec::with_capacity(iters);
+    let (mut peak_kib, mut delta_kib) = (0u64, 0u64);
+    for i in 0..iters {
+        let head = heads[i % heads.len()];
+        reset_peak();
+        let base = memory_kib().map(|(_, rss)| rss);
+        let started = std::time::Instant::now();
+        s.probe(hot, sealed_through, head, counts)?;
+        wall.push(started.elapsed().as_secs_f64() * 1000.0);
+        if let (Some((hwm, _)), Some(base)) = (memory_kib(), base) {
+            peak_kib = peak_kib.max(hwm);
+            delta_kib = delta_kib.max(hwm.saturating_sub(base));
+        }
+    }
+    wall.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| wall[((wall.len() as f64 * p).ceil() as usize).clamp(1, wall.len()) - 1];
+    Ok(serde_json::json!({
+        "folds": set.folds.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+        "checkpoint": from,
+        "heads": { "count": heads.len(), "first": heads.first(), "last": heads.last() },
+        "evaluations": wall.len(),
+        "wall_ms": { "p50": pct(0.50), "p99": pct(0.99), "max": wall.last() },
+        "peak_rss_mib": (peak_kib > 0).then(|| peak_kib as f64 / 1024.0),
+        "peak_increase_mib": (peak_kib > 0).then(|| delta_kib as f64 / 1024.0),
+        "targets": { "p99_ms": 500, "peak_rss_mib": 256 },
+    }))
 }
 
 fn empty_relation(cols: &[(String, String)]) -> String {
@@ -1530,5 +1642,60 @@ mod cli {
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains("is `dev` running"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod bench_and_probe {
+    use super::stepping_support::*;
+    use super::*;
+
+    fn nest() -> (tempfile::TempDir, analytics::HotRows, FoldSet) {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[(
+                "running.sql",
+                "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+            )],
+            "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        (dir, hot, set)
+    }
+
+    /// A head read answers at the head and leaves the stepper where it was, so the next head is again
+    /// one window from the checkpoint rather than an accumulating walk.
+    #[test]
+    fn a_probe_answers_at_the_head_and_changes_nothing() {
+        let (dir, hot, set) = nest();
+        set.build(dir.path(), &[], 30, 10).unwrap();
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        s.resume(30).unwrap();
+        for head in [33, 35, 31] {
+            let n = s
+                .probe(&hot, 30, head, |s| {
+                    Ok(s.rows("running")?[0]["n"].as_u64().unwrap())
+                })
+                .unwrap();
+            assert_eq!(n, head, "at {head}");
+            assert_eq!(s.at(), Some(30));
+            assert_eq!(s.rows("running").unwrap()[0]["n"], 30);
+        }
+    }
+
+    #[test]
+    fn the_bench_times_every_hot_head_from_the_checkpoint() {
+        let (dir, hot, set) = nest();
+        set.build(dir.path(), &[], 30, 10).unwrap();
+        let report = bench(dir.path(), &set, &hot, 30, 12).unwrap();
+        assert_eq!(report["checkpoint"], 30);
+        assert_eq!(report["heads"]["count"], 5);
+        assert_eq!(report["evaluations"], 12);
+        assert!(
+            report["wall_ms"]["p99"].as_f64().unwrap()
+                >= report["wall_ms"]["p50"].as_f64().unwrap()
+        );
+        assert!(bench(dir.path(), &set, &hot, 30, 0).is_err());
     }
 }
