@@ -18092,6 +18092,356 @@ rpc_urls = ["https://rpc.example"]
     }
 
     // ---------------------------------------------------------------------------------------------
+    // What a caught-up nest pays per poll (#1493, #1494, #1495).
+    // ---------------------------------------------------------------------------------------------
+
+    /// Calls a caught-up nest makes, by method. `block_hash` and `block_record` are each one
+    /// `eth_getBlockByNumber` on an RPC source.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct TipCalls {
+        tip: usize,
+        block_hash: usize,
+        block_record: usize,
+        block_timestamps: usize,
+        finalized: usize,
+        logs: usize,
+    }
+
+    impl TipCalls {
+        fn since(self, earlier: TipCalls) -> TipCalls {
+            TipCalls {
+                tip: self.tip - earlier.tip,
+                block_hash: self.block_hash - earlier.block_hash,
+                block_record: self.block_record - earlier.block_record,
+                block_timestamps: self.block_timestamps - earlier.block_timestamps,
+                finalized: self.finalized - earlier.finalized,
+                logs: self.logs - earlier.logs,
+            }
+        }
+        fn headers(self) -> usize {
+            self.block_hash + self.block_record + self.block_timestamps
+        }
+    }
+
+    /// A chain whose tip the test moves by hand, counting every call. `fork(from)` replaces every
+    /// block at or above `from`: new hashes, and the rows of the chain it replaced are gone.
+    struct TipCostSource {
+        tip: std::sync::atomic::AtomicU64,
+        fork_from: std::sync::atomic::AtomicU64,
+        /// `(block, chain)`: a Transfer at `block` on the old chain (0) or the replacement (1).
+        rows: Vec<(u64, u64)>,
+        calls: std::sync::Mutex<TipCalls>,
+    }
+
+    impl TipCostSource {
+        const TIP: u64 = 1_000;
+        /// The `finalized` tag trails the tip by this much.
+        const FINALITY: u64 = 5;
+        const ADDR: &'static str = "0x1111111111111111111111111111111111111111";
+
+        fn new(rows: Vec<(u64, u64)>) -> Self {
+            TipCostSource {
+                tip: std::sync::atomic::AtomicU64::new(Self::TIP),
+                fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+                rows,
+                calls: std::sync::Mutex::new(TipCalls::default()),
+            }
+        }
+        fn calls(&self) -> TipCalls {
+            *self.calls.lock().unwrap()
+        }
+        fn count(&self, f: impl FnOnce(&mut TipCalls)) {
+            f(&mut self.calls.lock().unwrap())
+        }
+        fn set_tip(&self, t: u64) {
+            self.tip.store(t, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn fork(&self, from: u64) {
+            self.fork_from
+                .store(from, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn chain_of(&self, n: u64) -> u64 {
+            u64::from(n >= self.fork_from.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn hash(&self, n: u64) -> Option<String> {
+            (n <= self.tip.load(std::sync::atomic::Ordering::SeqCst))
+                .then(|| format!("0x{n:060x}{:04x}", self.chain_of(n)))
+        }
+        /// Blocks in `[from, to]` holding a Transfer on the chain as it stands now.
+        fn canonical_rows(&self, from: u64, to: u64) -> Vec<u64> {
+            self.rows
+                .iter()
+                .filter(|&&(b, c)| b >= from && b <= to && self.chain_of(b) == c)
+                .map(|&(b, _)| b)
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for TipCostSource {
+        async fn tip(&self) -> Result<u64> {
+            self.count(|c| c.tip += 1);
+            Ok(self.tip.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            self.count(|c| c.finalized += 1);
+            Ok(Some(
+                self.tip
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .saturating_sub(Self::FINALITY),
+            ))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.count(|c| c.block_hash += 1);
+            Ok(self.hash(n))
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            // An empty ask sends nothing on an RPC source.
+            if !blocks.is_empty() {
+                self.count(|c| c.block_timestamps += 1);
+            }
+            Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.count(|c| c.logs += 1);
+            Ok(self
+                .canonical_rows(from, to)
+                .into_iter()
+                .map(|b| {
+                    let mut log = transfer_log(b, 0);
+                    log.address = Self::ADDR.into();
+                    log.block_hash = self.hash(b).unwrap_or_default();
+                    log.data = format!("0x{:064x}", 1_000 + self.chain_of(b));
+                    log
+                })
+                .collect())
+        }
+    }
+
+    fn last_block_of(store: &dyn crate::store::HotStore) -> Option<u64> {
+        store
+            .get_meta(LAST_BLOCK_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+    }
+
+    fn sealed_through_of(store: &dyn crate::store::HotStore) -> u64 {
+        store
+            .get_meta(SEALED_THROUGH_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A nest caught up at `TipCostSource::TIP` on a two-second poll, driven by the solo loop or by a
+    /// one-nest runtime cursor.
+    async fn caught_up(
+        dir: &std::path::Path,
+        src: Arc<TipCostSource>,
+        runtime: bool,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<dyn crate::store::HotStore>,
+    ) {
+        let nest = build_dialled_nest(
+            dir,
+            crate::freshness::Freshness {
+                poll_interval: std::time::Duration::from_secs(2),
+                finality_only: false,
+            },
+        )
+        .await;
+        let store = nest.store.clone();
+        let source = src.clone() as Arc<dyn Source>;
+        let task = if runtime {
+            tokio::spawn(runtime_index_loop(
+                source,
+                vec![nest],
+                Some(50),
+                false,
+                1,
+                50,
+                Arc::new(crate::health::RuntimeHealth::new()),
+                false,
+                None,
+            ))
+        } else {
+            tokio::spawn(index_loop(source, nest, Some(50), false, 1, 50))
+        };
+        assert!(
+            within_deadline(|| last_block_of(store.as_ref()) == Some(TipCostSource::TIP)).await,
+            "the nest never caught up: last block {:?}",
+            last_block_of(store.as_ref())
+        );
+        // Past the poll that follows the catch-up commit, so the idle phase starts idle.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        (task, store)
+    }
+
+    /// Calls over `idle` idle polls and then `advancing` polls that each find one new block.
+    async fn tip_bill(rows: Vec<(u64, u64)>, runtime: bool) -> (TipCalls, TipCalls, usize) {
+        const ADVANCING: u64 = 6;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = Arc::new(TipCostSource::new(rows));
+        let (task, store) = caught_up(tmp.path(), src.clone(), runtime).await;
+
+        let before = src.calls();
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let idle = src.calls().since(before);
+
+        let before = src.calls();
+        for step in 1..=ADVANCING {
+            let t = TipCostSource::TIP + step;
+            src.set_tip(t);
+            assert!(
+                within_deadline(|| last_block_of(store.as_ref()) == Some(t)).await,
+                "block {t} was never committed"
+            );
+        }
+        let advancing = src.calls().since(before);
+        task.abort();
+        assert_eq!(
+            advancing.tip, ADVANCING as usize,
+            "each new block must be found by exactly one poll, or the per-poll figures below are \
+             not per poll: {advancing:?}"
+        );
+        (idle, advancing, ADVANCING as usize)
+    }
+
+    /// The bill of a caught-up nest holding finalized rows short of a seal, per idle poll and per
+    /// committed one-block window, through both loops. The rows put `maybe_seal` in its held arm.
+    #[tokio::test(start_paused = true)]
+    async fn tip_bill_of_a_caught_up_nest_holding_rows() {
+        for runtime in [false, true] {
+            let (idle, advancing, m) = tip_bill(vec![(960, 0)], runtime).await;
+            assert!(idle.tip >= 8, "the idle phase must span polls: {idle:?}");
+            assert_eq!(
+                (idle.headers(), idle.logs, idle.finalized),
+                (idle.tip, 0, 0),
+                "runtime={runtime}: an idle poll's bill, {idle:?}"
+            );
+            assert_eq!(
+                (
+                    advancing.block_hash,
+                    advancing.block_record,
+                    advancing.block_timestamps,
+                    advancing.finalized,
+                    advancing.logs
+                ),
+                (3 * m, 0, m, m, m),
+                "runtime={runtime}: per committed window, {advancing:?}"
+            );
+        }
+    }
+
+    /// The same bill for a nest that has never matched a row, where `maybe_seal` takes its empty arm
+    /// and advances the watermark on every window.
+    #[tokio::test(start_paused = true)]
+    async fn tip_bill_of_a_caught_up_nest_with_no_rows() {
+        for runtime in [false, true] {
+            let (idle, advancing, m) = tip_bill(Vec::new(), runtime).await;
+            assert_eq!(idle.headers(), idle.tip, "runtime={runtime}: {idle:?}");
+            assert_eq!(
+                (
+                    advancing.block_hash,
+                    advancing.block_record,
+                    advancing.block_timestamps
+                ),
+                (3 * m, 0, m),
+                "runtime={runtime}: per committed window, {advancing:?}"
+            );
+        }
+    }
+
+    /// A reorg that lands while the nest sits idle at the tip, at any depth above finality: one that
+    /// replaces the tip block at the same height, and one that leaves the replacement a block
+    /// shorter. The first poll that finds a new block must roll it back before committing, every
+    /// stored row and checkpoint must then match the replacement chain, and nothing above finality
+    /// may be sealed in the meantime.
+    #[tokio::test(start_paused = true)]
+    async fn a_reorg_during_idle_polls_converges_on_the_next_advancing_poll() {
+        const T: u64 = TipCostSource::TIP;
+        for runtime in [false, true] {
+            for depth in [0u64, 1, 2, 4] {
+                for idle_polls in [1u64, 3] {
+                    for shorter in [false, true] {
+                        if shorter && depth == 0 {
+                            continue;
+                        }
+                        let case = format!(
+                            "runtime={runtime} depth={depth} idle={idle_polls} shorter={shorter}"
+                        );
+                        let tmp = tempfile::tempdir().unwrap();
+                        // 960 is finalized and held; T-2 exists only on the old chain and T-1 only on
+                        // the replacement, so the rows show which chain the store ended up on.
+                        let src =
+                            Arc::new(TipCostSource::new(vec![(960, 0), (T - 2, 0), (T - 1, 1)]));
+                        let (task, store) = caught_up(tmp.path(), src.clone(), runtime).await;
+
+                        src.fork(T - depth);
+                        if shorter {
+                            src.set_tip(T - 1);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2 * idle_polls)).await;
+                        assert!(
+                            sealed_through_of(store.as_ref()) <= T - TipCostSource::FINALITY,
+                            "{case}: sealed past finality while idle"
+                        );
+
+                        let head = T + 2;
+                        src.set_tip(head);
+                        assert!(
+                            within_deadline(|| {
+                                last_block_of(store.as_ref()) == Some(head)
+                                    && store.get_block_hash(head).ok().flatten() == src.hash(head)
+                            })
+                            .await,
+                            "{case}: never reached {head} on the replacement chain: last block {:?}",
+                            last_block_of(store.as_ref())
+                        );
+                        task.abort();
+
+                        let sealed = sealed_through_of(store.as_ref());
+                        assert!(
+                            sealed < T - depth,
+                            "{case}: sealed {sealed} reaches the fork"
+                        );
+                        let stored: std::collections::BTreeSet<u64> = store
+                            .entities_in_range(sealed + 1, head)
+                            .unwrap()
+                            .iter()
+                            .filter_map(|j| block_number_of(j))
+                            .collect();
+                        let want: std::collections::BTreeSet<u64> =
+                            src.canonical_rows(sealed + 1, head).into_iter().collect();
+                        assert_eq!(
+                            stored, want,
+                            "{case}: hot rows are not the replacement chain's"
+                        );
+                        for (b, h) in store.checkpoints_desc().unwrap() {
+                            assert_eq!(
+                                Some(h),
+                                src.hash(b),
+                                "{case}: checkpoint {b} is not canonical"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // RFC-0029 slice 5: adaptive windows on the pipelined path.
     // ---------------------------------------------------------------------------------------------
 
