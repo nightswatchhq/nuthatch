@@ -5,9 +5,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use clap::CommandFactory;
 use common::tape::*;
-use nuthatch::cli::Cli;
 use nuthatch::config::Config;
 
 fn root() -> PathBuf {
@@ -45,6 +43,9 @@ fn a_nest_shipping_folds_is_refused_not_served_without_them() {
 #[cfg(not(feature = "folds"))]
 #[test]
 fn a_default_build_has_no_fold_command() {
+    use clap::CommandFactory;
+    use nuthatch::cli::Cli;
+
     fn walk(cmd: &clap::Command, path: &str) {
         for sub in cmd.get_subcommands() {
             let p = format!("{path} {}", sub.get_name());
