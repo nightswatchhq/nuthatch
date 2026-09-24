@@ -425,6 +425,14 @@ surface](#configuration-surface): a timestamp lives in the block header, not in 
 distinct block (RFC-0029 §4). That cost does not end when backfill does - a nest at tip pays it again
 on every new block, indefinitely.
 
+**Since 3.11, only on a node that does not say.** Current execution clients put `blockTimestamp` on
+every log (execution-apis, 2025), and nuthatch now takes the timestamp from there and fetches a header
+only for a block whose logs lack it. Checked 2026-09-24 on Alchemy's Ethereum, Sepolia, Base, Arbitrum
+and Arc endpoints and on the public Sepolia, Base and Arc ones: all carry it, and it matches the
+header. The same 20,000-block Sepolia backfill paid **4,444** `eth_getBlockByNumber` on 3.9.0 and
+**34** after, about 89,600 CU against 1,300, and sealed byte-identical segments. The headers left are
+the poll loop's own, described below.
+
 Arbitrum produces about 345,600 blocks a day. `graph-staking-nest` averaged **~549,000 requests a
 day** over the audit window - the right order of magnitude for a header fetch per block plus its log
 polling on top.
@@ -536,6 +544,7 @@ SQL surfaces). Full key reference:
 |---|---|
 | `--listen` | bind address. Defaults to `127.0.0.1:8288` |
 | `--rpc` | override configured endpoints without editing config. Repeatable. Single-chain runtimes only (ambiguous once a runtime spans chains) |
+| `--rpc-fallback` | endpoint(s) asked only while every other endpoint is failing. Repeatable. Put a paid key here behind free endpoints and it bills only for what they could not answer. Otherwise endpoints share the load round-robin, so a paid key in `--rpc` takes its share of every call. Single-chain runtimes only |
 | `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Prerequisite for `--concurrency`; the storage path alone is not a speedup. Current figures: [benchmarks.md](benchmarks.md) |
 | `--concurrency` | concurrent window fetches during seal-direct backfill. 8-16 against your own node; low on rate-limited public RPC |
 | `--window` | override the `eth_getLogs` block window. A *sparse* contract wants a large window (50k) to turn thousands of near-empty requests into a few. Keep under your provider's range cap |
@@ -549,7 +558,9 @@ Every table carries an implicit `block_timestamp`, and fetching it is the single
 a backfill does: timestamps live in the block header, which `eth_getLogs` does not return, so they
 cost a separate `eth_getBlockByNumber` per distinct block. On the workloads we measured that is
 roughly **85% of backfill wall clock** (RFC-0029 §4). `nuthatch init --no-timestamps` drops the column
-and stops paying for it.
+and stops paying for it. Since 3.11 that cost is gone on any node that returns `blockTimestamp` on
+its logs, which every endpoint we checked does (see *What a nest costs at tip*), so check yours before
+giving up the column.
 
 Read the next paragraph before you reach for it.
 
