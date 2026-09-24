@@ -202,7 +202,8 @@ impl Stepper<'_> {
         self.at
     }
 
-    /// Evaluate every fold at `hi` from its state at the previous step.
+    /// Evaluate every fold at `hi` from its state at the previous step. All or nothing: a refused
+    /// step leaves every fold as it was at the previous step, so a retry cannot fold a window twice.
     pub fn step_to(
         &mut self,
         hot: &analytics::HotRows,
@@ -214,6 +215,21 @@ impl Stepper<'_> {
                 bail!("a fold steps forward: {hi} is not after {lo}");
             }
         }
+        self.eval.execute("BEGIN TRANSACTION")?;
+        match self.advance(hot, sealed_through, hi) {
+            Ok(()) => {
+                self.eval.execute("COMMIT")?;
+                self.at = Some(hi);
+                Ok(())
+            }
+            Err(e) => {
+                self.eval.execute("ROLLBACK")?;
+                Err(e)
+            }
+        }
+    }
+
+    fn advance(&mut self, hot: &analytics::HotRows, sealed_through: u64, hi: u64) -> Result<()> {
         for f in &self.set.folds {
             let carry = match self.at {
                 Some(_) => format!("SELECT * FROM \"{}\"", f.name),
@@ -260,7 +276,6 @@ impl Stepper<'_> {
                 );
             }
         }
-        self.at = Some(hi);
         Ok(())
     }
 
@@ -751,6 +766,39 @@ mod stepping {
         let want =
             [("a", "30"), ("b", "31"), ("c", "29")].map(|(k, v)| (k.to_string(), v.to_string()));
         assert_eq!(got, want);
+    }
+
+    /// A step refused part-way leaves every fold at the previous step. Otherwise an earlier fold has
+    /// already advanced, and a retry folds the same window into it twice.
+    #[test]
+    fn a_refused_step_changes_nothing_and_a_retry_does_not_double_count() {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[
+                (
+                    "10-running.sql",
+                    "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+                ),
+                // Blocks 1, 2, 3 bring keys b, c, a: the third step breaks max_rows.
+                ("20-keys.sql", "SELECT DISTINCT k FROM t"),
+            ],
+            "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n\
+             [[fold]]\nname = \"keys\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\"]\nmax_rows = 2\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        s.step_to(&hot, 30, 1).unwrap();
+        s.step_to(&hot, 30, 2).unwrap();
+        for _ in 0..2 {
+            assert!(s.step_to(&hot, 30, 3).is_err());
+            assert_eq!(s.at(), Some(2));
+            assert_eq!(
+                n(&s.rows("running").unwrap()),
+                2,
+                "running advanced on a refused step"
+            );
+        }
     }
 
     #[test]
