@@ -3814,6 +3814,111 @@ impl FoldBinder {
     }
 }
 
+/// RFC-0059: evaluates folds one window at a time on a connection of its own. Inside it a fact name
+/// means the current window, never history, so it can never share `/sql`'s pooled catalogue.
+#[cfg(feature = "folds")]
+pub(crate) struct FoldEvaluator {
+    conn: Connection,
+    dir: PathBuf,
+    schema: Vec<crate::registry::TableSchema>,
+    views_defined: bool,
+    /// Views defined inside the open transaction: a rollback removes them, so the flag goes too.
+    views_pending: bool,
+}
+
+#[cfg(feature = "folds")]
+impl FoldEvaluator {
+    pub(crate) fn new(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        register_extensions(&conn)?;
+        Ok(Self {
+            conn,
+            dir: dir.to_path_buf(),
+            schema: schema.to_vec(),
+            views_defined: false,
+            views_pending: false,
+        })
+    }
+
+    /// Bind every fact table in `wanted` to `(after, through]`, over sealed segments and hot rows.
+    pub(crate) fn bind_window(
+        &mut self,
+        hot: &HotRows,
+        sealed_through: u64,
+        after: Option<u64>,
+        through: u64,
+        wanted: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let defined = define_views_bound(
+            &self.conn,
+            &self.dir,
+            hot,
+            sealed_through,
+            &Default::default(),
+            &self.schema,
+            Some(wanted),
+            FactWindow {
+                after,
+                through: Some(through),
+            },
+        )?;
+        // `/sql` may answer short and say so; a checkpoint built from a short window is simply wrong.
+        if !defined.degraded.is_empty() {
+            bail!(
+                "fold window ({}, {through}] is missing sealed data for {}; refusing to evaluate it",
+                after.map_or("genesis".to_string(), |a| a.to_string()),
+                defined.degraded.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        // Views resolve fact names when queried, so defining them once serves every later window.
+        if !self.views_defined {
+            define_nest_views(&self.conn, &self.dir, Some(wanted));
+            self.views_defined = true;
+            self.views_pending = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin(&mut self) -> Result<()> {
+        Ok(self.conn.execute_batch("BEGIN TRANSACTION")?)
+    }
+
+    pub(crate) fn commit(&mut self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        self.views_pending = false;
+        Ok(())
+    }
+
+    pub(crate) fn rollback(&mut self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        if self.views_pending {
+            self.views_defined = false;
+            self.views_pending = false;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute(&self, sql: &str) -> Result<()> {
+        Ok(self.conn.execute_batch(sql)?)
+    }
+
+    pub(crate) fn count(&self, relation: &str) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT count(*) FROM \"{relation}\""), [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    pub(crate) fn rows(&self, sql: &str) -> Result<Vec<Value>> {
+        collect(&self.conn, sql, None)
+            .map(|(rows, _)| rows)
+            .map_err(|died| match died {
+                Died::Binding(e) | Died::Executing(e) => e,
+            })
+    }
+}
+
 /// The table name out of a DuckDB catalog error, if that is what this is.
 ///
 /// Format-dependent by necessity - DuckDB gives no structured error code for it - so it fails soft:
