@@ -3966,6 +3966,33 @@ impl FoldEvaluator {
             })?)
     }
 
+    /// Row count and order-independent digest of a result: the sum, mod 2^256, of the sha256 of each
+    /// row's cells as a JSON array. Streamed, so a 591k-row carry is never held as JSON (RFC-0059 S1
+    /// gate: materialising it cost 474 MiB of resident memory).
+    pub(crate) fn digest(&self, sql: &str) -> Result<(u64, String)> {
+        use sha2::{Digest, Sha256};
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let width = rows.as_ref().map_or(0, |s| s.column_count());
+        let (mut count, mut sum) = (0u64, [0u8; 32]);
+        let mut cells = Vec::with_capacity(width);
+        while let Some(row) = rows.next()? {
+            cells.clear();
+            for i in 0..width {
+                cells.push(value_to_json(row.get_ref(i)?));
+            }
+            let h: [u8; 32] = Sha256::digest(serde_json::to_vec(&cells)?).into();
+            let mut carry = 0u16;
+            for i in (0..32).rev() {
+                let s = sum[i] as u16 + h[i] as u16 + carry;
+                sum[i] = s as u8;
+                carry = s >> 8;
+            }
+            count += 1;
+        }
+        Ok((count, hex::encode(sum)))
+    }
+
     pub(crate) fn rows(&self, sql: &str) -> Result<Vec<Value>> {
         collect(&self.conn, sql, None)
             .map(|(rows, _)| rows)

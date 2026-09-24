@@ -402,6 +402,8 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The digest by materialising every row: the reference the streamed one must match exactly.
+#[cfg(test)]
 fn row_digest(fold: &Fold, rows: &[serde_json::Value]) -> String {
     let mut sum = [0u8; 32];
     for row in rows {
@@ -514,13 +516,13 @@ impl Stepper<'_> {
                 );
             }
             let inputs = window_inputs(&self.dir, &f.reaches, self.from, at)?;
-            let rows = self.rows(&f.name)?;
+            let (rows, row_digest) = self.eval.digest(&format!("SELECT * FROM \"{}\"", f.name))?;
             let entry = Checkpoint {
                 block: at,
                 id: checkpoint_id(f, prev, &inputs),
                 prev: self.from,
-                rows: rows.len() as u64,
-                row_digest: row_digest(f, &rows),
+                rows,
+                row_digest,
                 inputs,
             };
             let cdir = checkpoint_dir(&self.dir, f);
@@ -570,8 +572,8 @@ impl Stepper<'_> {
                 cols.join(", "),
                 path.display().to_string().replace('\'', "''")
             ))?;
-            let rows = self.rows(&f.name)?;
-            if rows.len() as u64 != entry.rows || row_digest(f, &rows) != entry.row_digest {
+            let (rows, digest) = self.eval.digest(&format!("SELECT * FROM \"{}\"", f.name))?;
+            if rows != entry.rows || digest != entry.row_digest {
                 bail!(
                     "fold `{}`: the checkpoint at {block} does not match its recorded digest",
                     f.name
@@ -1851,5 +1853,33 @@ mod provenance {
             .hash;
         std::fs::write(&path, raw.replace(old.as_str(), &"f".repeat(64))).unwrap();
         assert!(refusal(dir.path(), &set, &hot).contains("no longer holds"));
+    }
+}
+
+#[cfg(test)]
+mod streamed_digest {
+    use super::stepping_support::*;
+    use super::*;
+
+    /// Checkpoints already on disk carry the materialised digest; the streamed one must equal it.
+    #[test]
+    fn the_streamed_digest_equals_the_materialised_one() {
+        let (dir, hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[(
+                "latest.sql",
+                "SELECT k, v FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY block_number DESC) = 1",
+            )],
+            "[[fold]]\nname = \"latest\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\", \"v VARCHAR\"]\nmax_rows = 3\n",
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        s.step_to(&hot, 30, 33).unwrap();
+        let rows = s.rows("latest").unwrap();
+        assert_eq!(rows.len(), 3);
+        let (n, streamed) = s.eval.digest("SELECT * FROM \"latest\"").unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(streamed, row_digest(&set.folds[0], &rows));
     }
 }
