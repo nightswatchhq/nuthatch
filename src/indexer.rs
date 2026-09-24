@@ -18422,6 +18422,7 @@ rpc_urls = ["https://rpc.example"]
             dir,
             crate::freshness::Freshness {
                 poll_interval: std::time::Duration::from_secs(2),
+                poll_interval_explicit: true,
                 finality_only: false,
             },
         )
