@@ -150,6 +150,9 @@ mod rfc_index_status;
 mod scheduled_workflow_failure_is_reported;
 #[path = "seal_batching_asymmetry.rs"]
 mod seal_batching_asymmetry;
+#[cfg(feature = "folds")]
+#[path = "seal_latency_with_folds.rs"]
+mod seal_latency_with_folds;
 #[path = "secret_isolation.rs"]
 mod secret_isolation;
 #[path = "seed_scale.rs"]
