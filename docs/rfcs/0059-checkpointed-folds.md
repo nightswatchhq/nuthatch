@@ -244,11 +244,14 @@ To read at `n`, take `C` = the latest retained checkpoint with block ≤ `n`, an
   `block N predates retained history for fold F (oldest checkpoint: M)`. graph-node's pruned
   deployments refuse in the same way.
 
-**Once per head.** At each head advance, the runtime evaluates the declared folds once into an
-in-memory snapshot keyed by block hash, and every request at that head reads it. Advances are
-coalesced: at most one evaluation is in flight, and the next one starts at whatever the head is when
-the previous one finishes. The snapshot's block is what `_meta` reports, so `_meta` never claims a
-block the state does not reflect. The request count does not multiply the compute.
+**Once per head, on demand.** The first read at a new head evaluates the declared folds once into an
+in-memory snapshot keyed by block hash, and every other read at that head waits for it and shares it.
+At most one evaluation is in flight. Nothing is evaluated while nobody reads: an idle nest pays
+nothing, and the first read after a head advance pays one evaluation. *(Amended 2026-09-26, Chief,
+#1513. This section first said the runtime evaluates at every head advance, which on a chain with a
+block every poll keeps a core busy for a nest nobody queries.)* The snapshot's block is what `_meta`
+reports, so `_meta` never claims a block the state does not reflect. The request count does not
+multiply the compute.
 
 The last `R` snapshots are **retained for `T` seconds**. A client that pins its later pages to the
 hash returned by its first page (indexer-rs does exactly this, RFC-0060 §2) reads the snapshot it
@@ -440,6 +443,21 @@ Each slice's acceptance is written so it can fail.
   - a pinned read to a retained hash is identical to the head response at that hash;
   - an orphaned hash is refused;
   - the memory of `R` snapshots stays within the declared bound.
+
+  **Reported 2026-09-26** (#1513, `docs/bench/fold-snapshots-thinkpad.json`). Evaluation is lazy (§4,
+  amended). `R`, `T` and the bound are `[snapshots]` in `folds.toml`: `recent = 16`, `seconds = 120`,
+  `max_bytes = 64 MiB` by default. Snapshots are Arrow, so the bound is counted exactly, and it is
+  enforced on every insert by evicting the oldest. The first three criteria are unit tests, each
+  mutation-checked. On the ThinkPad corpus, one warm `graph` build, every one of 88 hot heads read once:
+
+  | | Evaluations | p99 | Retained at most | Peak RSS |
+  |---|---|---|---|---|
+  | Snapshots | 88, one per head | 112.7 ms | 16 snapshots, 52.3 MB | 262.5 MiB |
+  | S1's bench, same binary | 200 | 104.9 ms | - | 170.3 MiB |
+
+  Almost all of a snapshot is `legacy_allocs`: 70,762 ids, about 3.3 MB, held in full per snapshot
+  because #1503 made it unkeyed. The keyed folds hold only touched keys over one shared checkpoint.
+  A pinned read past `T` is refused in S3; the on-demand fallback above arrives with S4's serving.
 - **S4 - serving.** `/sql` and the RFC-0053 GraphQL surface read fold projections, and refusals are
   named. *Accept when* snapshot responses equal on-demand evaluation at the same block.
 
