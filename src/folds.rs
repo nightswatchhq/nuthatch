@@ -478,16 +478,23 @@ fn verified_prefix(fold: &Fold, log: &CheckpointLog) -> usize {
     log.checkpoints.len()
 }
 
-fn verify_chain(fold: &Fold, log: &CheckpointLog, block: u64) -> Result<()> {
+/// The first checkpoint in a log that does not chain, and why.
+fn chain_break(fold: &Fold, log: &CheckpointLog) -> Option<(u64, &'static str)> {
     let ok = verified_prefix(fold, log);
-    if let Some(c) = log.checkpoints.get(ok).filter(|c| c.block <= block) {
-        let why = if c.prev != log.checkpoints[..ok].last().map(|p| p.block) {
-            "does not follow the checkpoint before it"
-        } else {
-            "does not recompute to its recorded id"
-        };
-        bail!("fold `{}`: the checkpoint at {} {why}", fold.name, c.block);
+    let c = log.checkpoints.get(ok)?;
+    let why = if c.prev != log.checkpoints[..ok].last().map(|p| p.block) {
+        "the checkpoint does not follow the one before it"
+    } else {
+        "the checkpoint does not recompute to its recorded id"
+    };
+    Some((c.block, why))
+}
+
+fn verify_chain(fold: &Fold, log: &CheckpointLog, block: u64) -> Result<()> {
+    if let Some((b, why)) = chain_break(fold, log).filter(|(b, _)| *b <= block) {
+        bail!("fold `{}` at {b}: {why}", fold.name);
     }
+    let ok = verified_prefix(fold, log);
     if !log.checkpoints[..ok].iter().any(|c| c.block == block) {
         bail!("fold `{}` has no checkpoint at {block}", fold.name);
     }
@@ -769,6 +776,19 @@ impl FoldSet {
         let blocks: Vec<u64> = common.unwrap_or_default().into_iter().collect();
         if blocks.is_empty() {
             bail!("no checkpoint every fold shares; nothing to verify");
+        }
+        // Rows that recompute say nothing about the links between checkpoints, and a broken link is
+        // named here rather than tripped over by the resume below.
+        let broken: Vec<String> = self
+            .folds
+            .iter()
+            .zip(&logs)
+            .filter_map(|(f, log)| {
+                chain_break(f, log).map(|(b, why)| format!("fold `{}` at {b}: {why}", f.name))
+            })
+            .collect();
+        if !broken.is_empty() {
+            return Ok(broken);
         }
         // Every checkpointed block is sealed, so the sealed ceiling the walk needs is the catalogue's.
         let manifest = crate::seal::load_manifest_with_hash(dir)?.0;
@@ -2324,8 +2344,13 @@ mod verification {
         edit_log(dir.path(), &set.folds[1], |log| {
             log.checkpoints[2].row_digest = "0".repeat(64)
         });
-        edit_log(dir.path(), &set.folds[0], |log| {
-            log.checkpoints[2].inputs[0].rows += 1
+        // Inputs feed the id, so a forger who changes them re-signs the link; only recomputing the
+        // window can then tell.
+        let fold = set.folds[0].clone();
+        edit_log(dir.path(), &fold, |log| {
+            log.checkpoints[2].inputs[0].rows += 1;
+            let id = checkpoint_id(&fold, Some(&log.checkpoints[1]), &log.checkpoints[2].inputs);
+            log.checkpoints[2].id = id;
         });
         let out = set.verify(dir.path(), &[], false).unwrap();
         assert_eq!(out.len(), 2, "{out:?}");
@@ -2358,6 +2383,28 @@ mod verification {
             out[0].starts_with("fold `running` at 20: recomputed to 1 row(s)"),
             "{out:?}"
         );
+    }
+
+    /// Every row recomputes and the chain is still forged: both modes name the link.
+    #[test]
+    fn check_folds_names_a_link_that_does_not_chain() {
+        for from_genesis in [false, true] {
+            let (dir, set) = built();
+            edit_log(dir.path(), &set.folds[0], |log| {
+                log.checkpoints[1].id = "0".repeat(64)
+            });
+            edit_log(dir.path(), &set.folds[1], |log| {
+                log.checkpoints[2].prev = None
+            });
+            assert_eq!(
+                set.verify(dir.path(), &[], from_genesis).unwrap(),
+                [
+                    "fold `running` at 20: the checkpoint does not recompute to its recorded id",
+                    "fold `latest` at 30: the checkpoint does not follow the one before it",
+                ],
+                "from_genesis = {from_genesis}"
+            );
+        }
     }
 }
 
