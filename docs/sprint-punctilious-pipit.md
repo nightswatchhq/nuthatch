@@ -17,7 +17,8 @@ label, not this document, is the record of scope.
    touched-key deltas. This completes RFC-0060 S2. Head evaluation already sits at 280.0 MiB against a
    300 MiB ceiling, so the snapshot bound is measured, not assumed.
 3. **#1514, RFC-0060 S3 step 1: allocations, the saved clock and epochs.** They decide eligibility and
-   . **#1516, RFC-0060 S3 step 2: escrow accounts, signers and escrow transactions.** What decides whether
+   the agent's lifecycle, so they are first in the payment-risk order. Each lands with its differential.
+4. **#1516, RFC-0060 S3 step 2: escrow accounts, signers and escrow transactions.** What decides whether
    a TAP receipt is backed and a RAV worth redeeming. Step 1 and step 2 together must still hold the
    head gate.
 
