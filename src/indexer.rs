@@ -2911,6 +2911,8 @@ async fn build_nest(
         exposure: exposure.clone(),
         velocity: velocity.clone(),
         entities: entities.clone(),
+        #[cfg(feature = "folds")]
+        folds: None,
         labels: labels.clone(),
         screener: screener.clone(),
         threshold,
@@ -2971,6 +2973,19 @@ async fn build_nest(
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
     // here, not permanent - see `serve::poll_stalled`.
     nest.metrics.mark_started();
+    // Started here rather than in the tip loop so a restart catches up before the first poll, and
+    // beside the seal rather than inside it (RFC-0059 §5).
+    #[cfg(feature = "folds")]
+    let nest = NestIngest {
+        folds: crate::folds::Writer::start(
+            dir.clone(),
+            served.clone(),
+            shared_store.sealed_through(),
+            nest.metrics.clone(),
+        )?
+        .map(Arc::new),
+        ..nest
+    };
 
     // No command printed a single nest's NID (#1420). Computed from the inputs as they are now; `None`
     // only for a directory `blob` cannot read.
@@ -3010,6 +3025,8 @@ async fn build_nest(
         balances,
         exposure,
         velocity,
+        #[cfg(feature = "folds")]
+        folds: nest.folds.clone(),
         entities,
         threshold,
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
@@ -5733,6 +5750,9 @@ pub struct NestIngest {
     /// Per-nest metrics handle (SEC-9): nest-scoped updates go here, which also feed the process-global
     /// aggregates. In a runtime each nest gets its own, keyed by name.
     metrics: Arc<crate::metrics::NestMetrics>,
+    /// RFC-0059 §5: the seal loop's checkpoint writer, when the nest ships `folds/`.
+    #[cfg(feature = "folds")]
+    folds: Option<Arc<crate::folds::Writer>>,
     addresses: Vec<String>,
     topic0s: Vec<String>,
     /// The nest's earliest vendored deployment block (the min of the contracts' `start_block`s), or
@@ -6689,6 +6709,12 @@ impl NestIngest {
             ) {
                 tracing::warn!("webhook delivery failed: {e:#}");
             }
+        }
+        // Whatever advanced the watermark, the fold writer hears of it here; an unchanged one costs an
+        // atomic compare.
+        #[cfg(feature = "folds")]
+        if let Some(w) = &self.folds {
+            w.sealed_through_advanced(self.store.sealed_through());
         }
         Ok(Some(stored))
     }

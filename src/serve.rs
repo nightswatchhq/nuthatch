@@ -226,6 +226,9 @@ pub struct AppState {
     /// during backfill, and answering for the nest's head while holding this one's rows is exactly
     /// how a partial relation gets stamped current (§5.1, #866).
     pub entities: Arc<Vec<crate::entity_view::EntityView>>,
+    /// RFC-0059 §5: the seal loop's checkpoint writer, when the nest ships `folds/`.
+    #[cfg(feature = "folds")]
+    pub folds: Option<Arc<crate::folds::Writer>>,
     /// Single-transfer threshold in base units, if configured (RFC-0008 C3) - for `/`'s flag summary.
     pub threshold: Option<i128>,
     /// Velocity flag threshold in base units, if configured - the cutoff `/flags?kind=velocity` uses.
@@ -1391,6 +1394,34 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
     (Value::Array(entities), stalled)
 }
 
+/// How the fold checkpoint writer is doing (RFC-0059 §5), and whether it makes this nest unready.
+///
+/// Being behind is not unready: a fresh nest, or one whose folds were edited, walks its whole sealed
+/// history one window at a time, and that lag is the ordinary state for as long as it takes. What
+/// is unready is a writer that has stopped on an error, because from then on every read pays a
+/// window that only grows. A duration threshold on progress would call a large first window a
+/// fault; the entity rule (`entity_wedged`) tolerates that because an entity's batches are small.
+#[cfg(feature = "folds")]
+fn fold_readiness(s: &AppState, now: u64) -> (Value, bool) {
+    let Some(w) = &s.folds else {
+        return (Value::Null, false);
+    };
+    let st = w.status();
+    let faulted = st.fault.is_some();
+    (
+        json!({
+            "checkpointed_through": st.checkpointed_through,
+            "target": st.target,
+            "lag_blocks": st.lag_blocks,
+            "catching_up": st.lag_blocks > 0 && !faulted,
+            "faulted": faulted,
+            "fault": st.fault,
+            "seconds_since_progress": (st.last_progress != 0).then(|| now.saturating_sub(st.last_progress)),
+        }),
+        faulted,
+    )
+}
+
 /// RFC-0045 §6's second guarantee: rows that can be re-checked given the snapshots, but not
 /// re-derived from chain.
 const SNAPSHOT_REPRODUCIBLE: &str = "snapshot";
@@ -1468,6 +1499,10 @@ pub(crate) struct NestReadiness {
     pub ipfs_window_deadline: Option<u64>,
     pub fetch_window: u64,
     pub entities: Value,
+    #[cfg(feature = "folds")]
+    pub folds: Value,
+    #[cfg(feature = "folds")]
+    pub folds_stalled: bool,
 }
 
 impl NestReadiness {
@@ -1493,6 +1528,10 @@ impl NestReadiness {
         }
         if self.entities_stalled {
             out.push("entities_stalled");
+        }
+        #[cfg(feature = "folds")]
+        if self.folds_stalled {
+            out.push("fold_writer_faulted");
         }
         out
     }
@@ -1587,6 +1626,8 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     // serving frozen derived state as healthy "a lie with a pleasant HTTP status", and a cursor
     // polling happily while an entity is dead is exactly that lie.
     let (entities, entities_stalled) = entity_readiness(s, last, now);
+    #[cfg(feature = "folds")]
+    let (folds, folds_stalled) = fold_readiness(s, now);
     // #1199: the tip path's own seal clock. `seal_stalled` above judges only a bulk backfill, so a
     // nest whose *ordinary* sealing had stopped answered `ready: true` indefinitely - measured at
     // 739,192 blocks behind on a cursor that was sitting at tip.
@@ -1635,6 +1676,8 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
                 || wedged)
     };
     let stalled = seal_stalled || tip_seal_stalled || entities_stalled || cursor_stalled;
+    #[cfg(feature = "folds")]
+    let stalled = stalled || folds_stalled;
     NestReadiness {
         stalled,
         wedged,
@@ -1660,6 +1703,10 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
         ipfs_window_deadline,
         fetch_window,
         entities,
+        #[cfg(feature = "folds")]
+        folds,
+        #[cfg(feature = "folds")]
+        folds_stalled,
     }
 }
 
@@ -1717,6 +1764,10 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         ipfs_window_deadline,
         fetch_window,
         entities,
+        #[cfg(feature = "folds")]
+        folds,
+        #[cfg(feature = "folds")]
+            folds_stalled: _,
     } = nest_readiness(&s);
     let body = json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -1807,6 +1858,14 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "entities": entities,
         "entities_stalled": entities_stalled,
     });
+    #[cfg(feature = "folds")]
+    let body = {
+        let mut body = body;
+        if !folds.is_null() {
+            body["folds"] = folds;
+        }
+        body
+    };
     let code = if stalled {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -4450,6 +4509,8 @@ mod tests {
         entity.flush();
         let state = AppState {
             entities: Arc::new(vec![entity]),
+            #[cfg(feature = "folds")]
+            folds: None,
             ..test_state(dir.path(), 1)
         };
 
@@ -4531,6 +4592,8 @@ mod tests {
             exposure: ExposureView::start(true).unwrap(),
             velocity: VelocityView::start(true).unwrap(),
             entities: Arc::new(Vec::new()),
+            #[cfg(feature = "folds")]
+            folds: None,
             threshold: None,
             velocity_threshold: None,
             tables: Arc::new(vec![]),

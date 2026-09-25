@@ -101,6 +101,12 @@ pub struct NestMetrics {
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
+    /// RFC-0059 §5: sealed blocks whose rows the folds are not yet checkpointed through, and whether
+    /// the writer has stopped. Only a folds build has a writer, so only it has the series.
+    #[cfg(feature = "folds")]
+    fold_checkpoint_lag_blocks: AtomicU64,
+    #[cfg(feature = "folds")]
+    fold_writer_faulted: AtomicBool,
     /// RFC-0037: rows an `[[ipfs]]` declaration reads that named no CID it could use.
     ipfs_unreadable: AtomicU64,
     /// RFC-0037 §3: documents named and neither stored nor given up on, at the resolver's last pass.
@@ -226,6 +232,22 @@ impl NestMetrics {
     }
     pub fn sealed_through(&self) -> u64 {
         self.sealed_through.load(Relaxed)
+    }
+    #[cfg(feature = "folds")]
+    pub fn set_fold_checkpoint_lag_blocks(&self, v: u64) {
+        self.fold_checkpoint_lag_blocks.store(v, Relaxed);
+    }
+    #[cfg(feature = "folds")]
+    pub fn fold_checkpoint_lag_blocks(&self) -> u64 {
+        self.fold_checkpoint_lag_blocks.load(Relaxed)
+    }
+    #[cfg(feature = "folds")]
+    pub fn set_fold_writer_faulted(&self, v: bool) {
+        self.fold_writer_faulted.store(v, Relaxed);
+    }
+    #[cfg(feature = "folds")]
+    pub fn fold_writer_faulted(&self) -> bool {
+        self.fold_writer_faulted.load(Relaxed)
     }
     /// Stamps `last_seal_progress` when the watermark actually advances (#1199).
     ///
@@ -930,6 +952,19 @@ impl Metrics {
                 "Highest block sealed to the immutable cold layer (solo runtime only).",
                 sealed_through,
             ));
+            #[cfg(feature = "folds")]
+            if let Some(m) = solo.as_ref() {
+                s.push_str(&gauge(
+                    "nuthatch_fold_checkpoint_lag_blocks",
+                    "Sealed blocks the folds are not yet checkpointed through (solo runtime only).",
+                    m.fold_checkpoint_lag_blocks(),
+                ));
+                s.push_str(&gauge(
+                    "nuthatch_fold_writer_faulted",
+                    "1 when the fold checkpoint writer has stopped on an error (solo runtime only).",
+                    u64::from(m.fold_writer_faulted()),
+                ));
+            }
         }
         s.push_str(&gauge(
             "nuthatch_rss_bytes",
@@ -1216,6 +1251,20 @@ impl Metrics {
                 "Highest block sealed to the cold layer, per nest.",
                 "gauge",
                 &|m| m.sealed_through.load(Relaxed),
+            );
+            #[cfg(feature = "folds")]
+            labelled(
+                "nuthatch_nest_fold_checkpoint_lag_blocks",
+                "Sealed blocks the folds are not yet checkpointed through, per nest.",
+                "gauge",
+                &|m| m.fold_checkpoint_lag_blocks(),
+            );
+            #[cfg(feature = "folds")]
+            labelled(
+                "nuthatch_nest_fold_writer_faulted",
+                "1 when the nest's fold checkpoint writer has stopped on an error.",
+                "gauge",
+                &|m| u64::from(m.fold_writer_faulted()),
             );
             labelled(
                 "nuthatch_nest_rows_decoded_total",

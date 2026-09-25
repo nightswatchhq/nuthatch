@@ -188,9 +188,9 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "docs/rfcs/0059-checkpointed-folds.md",
         "--folds",
-        1,
-        "RFC-0059 §5 proposes the not-yet-shipped `nuthatch check --folds`; delete this entry in the \
-         PR that ships it",
+        if cfg!(feature = "folds") { 0 } else { 1 },
+        "RFC-0059 S2 ships `nuthatch check --folds` in a `folds` build only; a default build has no \
+         such flag, so there the mention is expected",
     ),
 ];
 

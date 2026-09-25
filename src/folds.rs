@@ -841,8 +841,164 @@ impl FoldSet {
     }
 }
 
-/// `nuthatch fold ...`. Opens the store itself, so it refuses while `dev` holds the nest: in S1 this
-/// is the only writer of checkpoints.
+/// Sealed rows a walk reads before it checkpoints, when nothing narrower is asked for.
+pub const DEFAULT_WINDOW_ROWS: u64 = 2_000_000;
+
+/// What the seal loop's writer is doing (RFC-0059 §5), for `/ready` and `/metrics`.
+#[derive(Debug, Default)]
+pub struct WriterStatus {
+    /// Latest block every fold is checkpointed at; 0 before the first.
+    checkpointed_through: std::sync::atomic::AtomicU64,
+    /// The last sealed block the folds have rows through: what the writer is working towards.
+    target: std::sync::atomic::AtomicU64,
+    /// Unix seconds a checkpoint was last written; 0 until one has been.
+    last_progress: std::sync::atomic::AtomicU64,
+    fault: std::sync::Mutex<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterSnapshot {
+    pub checkpointed_through: u64,
+    pub target: u64,
+    /// Sealed blocks whose rows no fold is checkpointed through yet.
+    pub lag_blocks: u64,
+    pub last_progress: u64,
+    pub fault: Option<String>,
+}
+
+impl WriterStatus {
+    pub fn snapshot(&self) -> WriterSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        let checkpointed_through = self.checkpointed_through.load(Relaxed);
+        let target = self.target.load(Relaxed);
+        WriterSnapshot {
+            checkpointed_through,
+            target,
+            lag_blocks: target.saturating_sub(checkpointed_through),
+            last_progress: self.last_progress.load(Relaxed),
+            fault: self.fault.lock().unwrap().clone(),
+        }
+    }
+}
+
+/// The seal loop's checkpoint writer: one thread per nest, told each time `sealed_through` advances,
+/// stepping every fold from its last checkpoint to the new watermark and writing the result. It
+/// runs beside the seal, never inside it: a slow or failed checkpoint delays no seal, and a read
+/// meanwhile is exact over a longer window. A writer that fails stays failed, visibly, until the
+/// nest restarts; the next start reconciles the logs and continues.
+pub struct Writer {
+    tx: Option<std::sync::mpsc::Sender<u64>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    status: std::sync::Arc<WriterStatus>,
+    /// The highest watermark handed to the thread, so an unchanged one costs nothing per poll.
+    told: std::sync::atomic::AtomicU64,
+}
+
+impl Writer {
+    /// Start the writer for `dir`, catching up to `sealed_through` first. `None` when the nest has no
+    /// `folds/`. `metrics` mirrors the lag for Prometheus.
+    pub fn start(
+        dir: std::path::PathBuf,
+        schema: Vec<TableSchema>,
+        sealed_through: u64,
+        metrics: std::sync::Arc<crate::metrics::NestMetrics>,
+    ) -> Result<Option<Writer>> {
+        if !dir.join(FOLDS_DIR).exists() {
+            return Ok(None);
+        }
+        let status = std::sync::Arc::new(WriterStatus::default());
+        let (tx, rx) = std::sync::mpsc::channel::<u64>();
+        let worker = status.clone();
+        let thread = std::thread::Builder::new()
+            .name("fold-writer".into())
+            .spawn(move || {
+                if let Err(e) = write_loop(&dir, &schema, rx, &worker, &metrics) {
+                    tracing::error!("fold writer stopped: {e:#}");
+                    *worker.fault.lock().unwrap() = Some(format!("{e:#}"));
+                    metrics.set_fold_writer_faulted(true);
+                }
+            })?;
+        let w = Writer {
+            tx: Some(tx),
+            thread: Some(thread),
+            status,
+            told: std::sync::atomic::AtomicU64::new(0),
+        };
+        w.sealed_through_advanced(sealed_through);
+        Ok(Some(w))
+    }
+
+    /// The tip loop calls this after every seal pass with the current watermark. Only a higher
+    /// value than last time reaches the thread.
+    pub fn sealed_through_advanced(&self, sealed_through: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if sealed_through == 0 || self.told.fetch_max(sealed_through, Relaxed) >= sealed_through {
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            // A closed channel is a writer that has already failed and said so.
+            let _ = tx.send(sealed_through);
+        }
+    }
+
+    pub fn status(&self) -> WriterSnapshot {
+        self.status.snapshot()
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn write_loop(
+    dir: &Path,
+    schema: &[TableSchema],
+    rx: std::sync::mpsc::Receiver<u64>,
+    status: &WriterStatus,
+    metrics: &crate::metrics::NestMetrics,
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let set = FoldSet::load(dir, schema)?;
+    let start = set.reconcile(dir)?;
+    let mut s = set.stepper(dir, schema)?;
+    if let Some(b) = start {
+        s.resume(b)?;
+        status.checkpointed_through.store(b, Relaxed);
+    }
+    let empty = analytics::HotRows::new();
+    while let Ok(mut sealed_through) = rx.recv() {
+        // Several advances while a window was being folded collapse into the latest.
+        while let Ok(later) = rx.try_recv() {
+            sealed_through = sealed_through.max(later);
+        }
+        let cuts = set.cuts(dir, s.at(), sealed_through, DEFAULT_WINDOW_ROWS)?;
+        if let Some(&target) = cuts.last() {
+            status.target.store(target, Relaxed);
+            metrics.set_fold_checkpoint_lag_blocks(
+                target.saturating_sub(status.checkpointed_through.load(Relaxed)),
+            );
+        }
+        for cut in cuts {
+            s.step_to(&empty, sealed_through, cut)?;
+            s.checkpoint()?;
+            status.checkpointed_through.store(cut, Relaxed);
+            status
+                .last_progress
+                .store(crate::metrics::now_unix(), Relaxed);
+            metrics.set_fold_checkpoint_lag_blocks(status.target.load(Relaxed).saturating_sub(cut));
+            tracing::debug!("folds checkpointed at {cut}");
+        }
+    }
+    Ok(())
+}
+
+/// `nuthatch fold ...`. Opens the store itself, so it refuses while `dev` holds the nest, whose own
+/// writer (S2) would otherwise be a second one.
 pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
     use crate::cli::FoldCommand;
     let mut phases = Phases::default();
@@ -1128,6 +1284,16 @@ fn load_one(
 
     // Identity: the plan, the declaration, every view and fact schema it reads, the folds it reads,
     // the engine, and the scalar set a graph build registers. `max_rows` changes no output.
+    // A fact table counts by its declared columns, never by what the binder sees: a table bound
+    // before its first seal describes differently from one bound over Parquet, and a fold's identity
+    // must not depend on whether anything had sealed when the process started.
+    let declared: BTreeMap<String, Vec<(String, String)>> = analytics::declared_columns(dir)
+        .into_iter()
+        .map(|(t, mut cols)| {
+            cols.sort();
+            (t.to_ascii_lowercase(), cols)
+        })
+        .collect();
     let mut h = Sha256::new();
     let mut part = |label: &str, text: &str| {
         h.update(label.as_bytes());
@@ -1141,10 +1307,15 @@ fn load_one(
     for t in &reaches {
         match view_bodies.get(t) {
             Some(body) => part(&format!("view:{t}"), &binder.plan_text(body)),
-            None => part(
-                &format!("table:{t}"),
-                &format!("{:?}", binder.describe(&format!("SELECT * FROM \"{t}\""))?),
-            ),
+            None => {
+                let cols = declared.get(t).with_context(|| {
+                    format!(
+                        "{at}: reads `{t}`, which schema.json does not declare, so its checkpoints \
+                         could not name the schema they were built from; run `nuthatch schema`"
+                    )
+                })?;
+                part(&format!("table:{t}"), &format!("{cols:?}"))
+            }
         }
     }
     for d in &deps {
@@ -2247,5 +2418,183 @@ mod name_case {
         std::fs::write(dir.path().join("folds/folds.toml"), decl("users")).unwrap();
         let err = format!("{:#}", FoldSet::load(dir.path(), &[]).unwrap_err());
         assert!(err.contains("already a table or view"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod writer {
+    use super::stepping_support::*;
+    use super::*;
+
+    const FOLDS: &[(&str, &str)] = &[
+        (
+            "10-running.sql",
+            "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+        ),
+        (
+            "20-latest.sql",
+            "SELECT k, v FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY block_number DESC) = 1",
+        ),
+    ];
+    const DECLS: &str = "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n\
+                         [[fold]]\nname = \"latest\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\", \"v VARCHAR\"]\nmax_rows = 3\n";
+
+    fn metrics() -> std::sync::Arc<crate::metrics::NestMetrics> {
+        std::sync::Arc::new(crate::metrics::NestMetrics::default())
+    }
+
+    fn settle(w: &Writer, what: impl Fn(&WriterSnapshot) -> bool) -> WriterSnapshot {
+        let start = std::time::Instant::now();
+        loop {
+            let s = w.status();
+            if what(&s) || start.elapsed() > std::time::Duration::from_secs(30) {
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn logs(dir: &Path, set: &FoldSet) -> Vec<Vec<Checkpoint>> {
+        set.folds
+            .iter()
+            .map(|f| load_log(dir, f).unwrap().checkpoints)
+            .collect()
+    }
+
+    #[test]
+    fn a_nest_without_folds_has_no_writer() {
+        let (dir, _hot) = corpus();
+        assert!(Writer::start(dir.path().into(), vec![], 30, metrics())
+            .unwrap()
+            .is_none());
+    }
+
+    /// The writer's checkpoints are the ones `fold build` writes over the same history, and each
+    /// later watermark continues the chain rather than starting another.
+    #[test]
+    fn the_writer_checkpoints_each_advance_and_matches_a_build() {
+        let (dir, _hot) = corpus();
+        fold_files(dir.path(), FOLDS, DECLS);
+        let m = metrics();
+        let w = Writer::start(dir.path().into(), vec![], 20, m.clone())
+            .unwrap()
+            .expect("a writer");
+        let s = settle(&w, |s| s.checkpointed_through == 20);
+        assert_eq!(
+            (s.checkpointed_through, s.lag_blocks, s.fault),
+            (20, 0, None)
+        );
+        w.sealed_through_advanced(30);
+        let s = settle(&w, |s| s.checkpointed_through == 30);
+        assert_eq!(s.checkpointed_through, 30);
+        assert_eq!(m.fold_checkpoint_lag_blocks(), 0);
+        drop(w);
+
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let written = logs(dir.path(), &set);
+        assert_eq!(
+            written[0]
+                .iter()
+                .map(|c| (c.prev, c.block))
+                .collect::<Vec<_>>(),
+            [(None, 20), (Some(20), 30)]
+        );
+        let (other, _) = corpus();
+        fold_files(other.path(), FOLDS, DECLS);
+        set.build(other.path(), &[], 20, DEFAULT_WINDOW_ROWS)
+            .unwrap();
+        set.build(other.path(), &[], 30, DEFAULT_WINDOW_ROWS)
+            .unwrap();
+        assert_eq!(logs(other.path(), &set), written);
+        assert!(set.verify(dir.path(), &[], true).unwrap().is_empty());
+    }
+
+    /// A restarted writer resumes from the logs and continues; one killed between two folds' logs
+    /// finishes the checkpoint it was writing.
+    #[test]
+    fn a_restarted_writer_continues_from_its_checkpoints() {
+        let (dir, _hot) = corpus();
+        fold_files(dir.path(), FOLDS, DECLS);
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        set.build(dir.path(), &[], 30, 10).unwrap();
+        let intact = logs(dir.path(), &set);
+        let cdir = checkpoint_dir(dir.path(), &set.folds[1]);
+        let mut log = load_log(dir.path(), &set.folds[1]).unwrap();
+        log.checkpoints.pop();
+        std::fs::write(cdir.join(CHECKPOINT_LOG), serde_json::to_vec(&log).unwrap()).unwrap();
+
+        let w = Writer::start(dir.path().into(), vec![], 30, metrics())
+            .unwrap()
+            .unwrap();
+        let s = settle(&w, |s| s.checkpointed_through == 30);
+        assert_eq!((s.checkpointed_through, s.fault), (30, None));
+        drop(w);
+        assert_eq!(logs(dir.path(), &set), intact);
+    }
+
+    /// A fold that fails leaves the writer failed and saying so, and the seal side is untouched:
+    /// telling a failed writer about a new watermark neither blocks nor panics.
+    #[test]
+    fn a_writer_that_fails_says_so_and_stops() {
+        let (dir, _hot) = corpus();
+        fold_files(
+            dir.path(),
+            &[("latest.sql", FOLDS[1].1)],
+            "[[fold]]\nname = \"latest\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\", \"v VARCHAR\"]\nmax_rows = 2\n",
+        );
+        let m = metrics();
+        let w = Writer::start(dir.path().into(), vec![], 30, m.clone())
+            .unwrap()
+            .unwrap();
+        let s = settle(&w, |s| s.fault.is_some());
+        assert!(
+            s.fault
+                .as_deref()
+                .unwrap_or("")
+                .contains("over its declared max_rows 2"),
+            "{s:?}"
+        );
+        assert!(m.fold_writer_faulted());
+        assert_eq!(s.checkpointed_through, 0);
+        w.sealed_through_advanced(40);
+        drop(w);
+    }
+}
+
+#[cfg(test)]
+mod identity {
+    use super::stepping_support::*;
+    use super::*;
+    use serde_json::json;
+
+    /// A fold loaded before a nest's first seal and one loaded after it are the same fold. The
+    /// binder describes a table differently once Parquet backs it, so a hash taken from the binder
+    /// sent a restarted writer to a second checkpoint directory.
+    #[test]
+    fn a_fold_hash_does_not_depend_on_whether_anything_has_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), super::tests::SCHEMA).unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        fold_files(
+            dir.path(),
+            &[(
+                "running.sql",
+                "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+            )],
+            "[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let before = FoldSet::load(dir.path(), &[]).unwrap().folds[0]
+            .hash
+            .clone();
+        let rows: Vec<String> = (1..=10u64)
+            .map(|b| {
+                json!({"table": "t", "block_number": b, "k": "a", "v": b.to_string()}).to_string()
+            })
+            .collect();
+        crate::seal::seal_range(dir.path(), &rows, 1, 10).unwrap();
+        let after = FoldSet::load(dir.path(), &[]).unwrap().folds[0]
+            .hash
+            .clone();
+        assert_eq!(before, after);
     }
 }
