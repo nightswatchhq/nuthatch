@@ -58,9 +58,22 @@ async fn main() -> Result<()> {
     // the one blemish on the part of the product a stranger sees first (#695). Same filter, same
     // messages, different presentation: see `help::PrettyLine`.
     let pretty = matches!(cli.command, cli::Command::Init(_) | cli::Command::Add(_));
+    // `fold read` and `fold bench` print data on stdout, so their log lines go to stderr.
+    #[cfg(feature = "folds")]
+    let data_on_stdout = matches!(cli.command, cli::Command::Fold(_));
+    #[cfg(not(feature = "folds"))]
+    let data_on_stdout = false;
+    let writer = || {
+        if data_on_stdout {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+        } else {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+        }
+    };
     match cli.log_format {
         cli::LogFormat::Text if pretty => tracing_subscriber::fmt()
             .with_env_filter(filter())
+            .with_writer(writer())
             .with_target(false)
             .with_ansi(false)
             .event_format(help::PrettyLine)
@@ -69,6 +82,7 @@ async fn main() -> Result<()> {
         // default `nuthatch=info`.
         cli::LogFormat::Text => tracing_subscriber::fmt()
             .with_env_filter(filter())
+            .with_writer(writer())
             .with_target(false)
             .init(),
         // One JSON object per line for a log aggregator. Every `tracing::info!(block = .., tip = ..,
@@ -77,6 +91,7 @@ async fn main() -> Result<()> {
         cli::LogFormat::Json => tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter())
+            .with_writer(writer())
             .init(),
     }
 

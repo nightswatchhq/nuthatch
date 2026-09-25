@@ -104,6 +104,9 @@ mod entity_provenance_is_atomic;
 mod eval_harness;
 #[path = "eval_runner_self_test.rs"]
 mod eval_runner_self_test;
+#[cfg(feature = "folds")]
+#[path = "fold_cli_stdout.rs"]
+mod fold_cli_stdout;
 #[path = "folds_absent.rs"]
 mod folds_absent;
 #[path = "gate_audit_cases.rs"]
