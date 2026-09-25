@@ -1399,7 +1399,9 @@ fn evaluate_head<'a>(
         for f in &set.folds {
             bases.push(match (&f.key, from) {
                 (FoldKey::Columns(_), Some(_)) => Some(Arc::new(
-                    stepper.eval.arrow(&format!("SELECT * FROM \"{}\"", f.name))?,
+                    stepper
+                        .eval
+                        .arrow(&format!("SELECT * FROM \"{}\"", f.name))?,
                 )),
                 (FoldKey::Columns(_), None) => Some(Arc::new(Vec::new())),
                 _ => None,
@@ -1656,13 +1658,17 @@ pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
                 println!("{row}");
             }
         }
-        FoldCommand::Bench { iters, .. } => {
+        FoldCommand::Bench {
+            iters, snapshots, ..
+        } => {
             let hot = store.hot_rows_by_table()?;
             phases.mark("hot rows read");
-            println!(
-                "{}",
+            let out = if snapshots {
+                bench_snapshots(dir, &set, hot, sealed_through, &mut phases)?
+            } else {
                 bench(dir, &set, &hot, sealed_through, iters, &mut phases)?
-            );
+            };
+            println!("{out}");
         }
     }
     Ok(())
@@ -1706,17 +1712,13 @@ fn reset_peak() {
 
 /// RFC-0059 S1's gate: head evaluation in one warm process, measured per the 2026-09-24 ruling. The
 /// latest checkpoint is resumed once; each hot block is then evaluated from it and discarded.
-fn bench(
+/// The latest checkpoint, and every hot block past it that a fold reaches.
+fn bench_heads(
     dir: &Path,
     set: &FoldSet,
     hot: &analytics::HotRows,
     sealed_through: u64,
-    iters: usize,
-    phases: &mut Phases,
-) -> Result<serde_json::Value> {
-    if iters == 0 {
-        bail!("--iters must be at least 1");
-    }
+) -> Result<(u64, Vec<u64>)> {
     let from = set
         .latest_checkpoint(dir, sealed_through)?
         .context("no checkpoint to resume; run `nuthatch fold build` first")?;
@@ -1732,6 +1734,94 @@ fn bench(
     if heads.is_empty() {
         heads.push(sealed_through.max(from + 1));
     }
+    Ok((from, heads))
+}
+
+/// RFC-0059 S3's memory criterion: every hot head read once through the head snapshots, with the
+/// retained set's Arrow bytes and the process's peak measured after each.
+fn bench_snapshots(
+    dir: &Path,
+    set: &FoldSet,
+    hot: analytics::HotRows,
+    sealed_through: u64,
+    phases: &mut Phases,
+) -> Result<serde_json::Value> {
+    struct Walk {
+        head: Mutex<u64>,
+        hot: analytics::HotRows,
+        sealed_through: u64,
+    }
+    impl HeadSource for Walk {
+        fn head(&self) -> Result<Head> {
+            let n = *self.head.lock().unwrap();
+            Ok(Head {
+                number: n,
+                hash: n.to_string(),
+            })
+        }
+        fn canonical_hash(&self, number: u64) -> Result<Option<String>> {
+            Ok((number <= *self.head.lock().unwrap()).then(|| number.to_string()))
+        }
+        fn inputs(&self) -> Result<(analytics::HotRows, u64)> {
+            Ok((self.hot.clone(), self.sealed_through))
+        }
+    }
+    let (from, heads) = bench_heads(dir, set, &hot, sealed_through)?;
+    let walk = Arc::new(Walk {
+        head: Mutex::new(heads[0]),
+        hot,
+        sealed_through,
+    });
+    let snaps = HeadSnapshots::start(dir.to_path_buf(), vec![], set.clone(), walk.clone())?
+        .context("no folds")?;
+    // The first read pays for resuming the checkpoint and binding views, once per process.
+    snaps.at_head()?;
+    phases.mark("warmed up");
+    let (mut wall, mut max_retained, mut peak_kib) = (Vec::new(), (0usize, 0u64), 0u64);
+    for &n in &heads[1..] {
+        *walk.head.lock().unwrap() = n;
+        let started = std::time::Instant::now();
+        snaps.at_head()?;
+        wall.push(started.elapsed().as_secs_f64() * 1000.0);
+        let r = snaps.retained();
+        if r.1 > max_retained.1 {
+            max_retained = r;
+        }
+        if let Some((hwm, _)) = memory_kib() {
+            peak_kib = peak_kib.max(hwm);
+        }
+    }
+    wall.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| {
+        (!wall.is_empty())
+            .then(|| wall[((wall.len() as f64 * p).ceil() as usize).clamp(1, wall.len()) - 1])
+    };
+    Ok(serde_json::json!({
+        "folds": set.folds.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+        "checkpoint": from,
+        "heads": heads.len(),
+        "evaluations": snaps.evaluations(),
+        "wall_ms": { "p50": pct(0.50), "p99": pct(0.99), "max": wall.last() },
+        "retained_max": { "snapshots": max_retained.0, "bytes": max_retained.1 },
+        "declared": { "recent": set.snapshots.recent, "seconds": set.snapshots.seconds, "max_bytes": set.snapshots.max_bytes },
+        "peak_rss_mib": (peak_kib > 0).then(|| peak_kib as f64 / 1024.0),
+        "targets": { "p99_ms": 500, "peak_rss_mib": 300 },
+        "phases": phases.0,
+    }))
+}
+
+fn bench(
+    dir: &Path,
+    set: &FoldSet,
+    hot: &analytics::HotRows,
+    sealed_through: u64,
+    iters: usize,
+    phases: &mut Phases,
+) -> Result<serde_json::Value> {
+    if iters == 0 {
+        bail!("--iters must be at least 1");
+    }
+    let (from, heads) = bench_heads(dir, set, hot, sealed_through)?;
     let mut s = set.stepper(dir, &[])?;
     s.resume(from)?;
     phases.mark("checkpoint resumed");
@@ -3587,10 +3677,18 @@ mod head_snapshots {
         let opts = FormatOptions::default();
         let mut out = Vec::new();
         for b in batches {
-            let mut names: Vec<&str> = b.schema_ref().fields().iter().map(|f| f.name().as_str()).collect();
+            let mut names: Vec<&str> = b
+                .schema_ref()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
             names.sort();
             let cols: Vec<_> = names.iter().map(|n| b.column_by_name(n).unwrap()).collect();
-            let fmts: Vec<_> = cols.iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &opts).unwrap()).collect();
+            let fmts: Vec<_> = cols
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts).unwrap())
+                .collect();
             for i in 0..b.num_rows() {
                 out.push(
                     names
@@ -3624,7 +3722,10 @@ mod head_snapshots {
             .collect();
         let got: Vec<Arc<Snapshot>> = readers.into_iter().map(|r| r.join().unwrap()).collect();
         assert_eq!(heads.evaluations(), 1);
-        assert!(got.iter().all(|s| Arc::ptr_eq(s, &got[0])), "one shared snapshot");
+        assert!(
+            got.iter().all(|s| Arc::ptr_eq(s, &got[0])),
+            "one shared snapshot"
+        );
         assert_eq!(got[0].head.number, 35);
     }
 
@@ -3657,7 +3758,9 @@ mod head_snapshots {
         chain.advance(32);
         let b = heads.at_head().unwrap();
         let touched = |s: &Snapshot| match &s.folds[0].1 {
-            SnapshotRows::Delta { touched, .. } => touched.iter().map(|b| b.num_rows()).sum::<usize>(),
+            SnapshotRows::Delta { touched, .. } => {
+                touched.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
             SnapshotRows::Full(_) => panic!("latest is keyed"),
         };
         assert_eq!((touched(&a), touched(&b)), (1, 2));
@@ -3742,9 +3845,22 @@ mod head_snapshots {
     }
 
     #[test]
+    fn the_snapshot_bench_reads_every_hot_head_once() {
+        let (dir, hot, set) = built("");
+        let out = bench_snapshots(dir.path(), &set, hot, 30, &mut Phases::default()).unwrap();
+        assert_eq!(out["heads"], 5);
+        assert_eq!(out["evaluations"], 5);
+        assert!(out["retained_max"]["bytes"].as_u64().unwrap() <= set.snapshots.max_bytes);
+    }
+
+    #[test]
     fn an_empty_snapshot_bound_is_refused_at_load() {
         let (dir, _hot) = corpus();
-        fold_files(dir.path(), FOLDS, &format!("{DECLS}[snapshots]\nrecent = 0\n"));
+        fold_files(
+            dir.path(),
+            FOLDS,
+            &format!("{DECLS}[snapshots]\nrecent = 0\n"),
+        );
         let err = FoldSet::load(dir.path(), &[]).unwrap_err();
         assert!(format!("{err:#}").contains("[snapshots]"), "{err:#}");
     }

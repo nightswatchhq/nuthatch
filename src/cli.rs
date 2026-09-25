@@ -293,6 +293,10 @@ pub enum FoldCommand {
         /// Evaluations timed after the first, which only warms the connection.
         #[arg(long, default_value_t = 200)]
         iters: usize,
+        /// Walk the hot heads through the head snapshots instead (RFC-0059 S3), reporting what the
+        /// retained set holds against its declared bound.
+        #[arg(long)]
+        snapshots: bool,
     },
 }
 
