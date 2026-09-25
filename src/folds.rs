@@ -46,6 +46,9 @@ pub struct Fold {
     /// RFC-0059 §5 `fold_hash`: the content address of everything that decides this fold's output
     /// for a given set of facts. Its checkpoints live under `checkpoints/<hash>/`.
     pub hash: String,
+    /// #1504: each view this fold reaches that looks back into history, and how. Inside a fold such a
+    /// view answers over the window alone, with nothing else to say so.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -186,6 +189,9 @@ impl FoldSet {
                 fold.name,
                 empty_relation(&fold.carry)
             ))?;
+            for w in &fold.warnings {
+                tracing::warn!("{w}");
+            }
             set.folds.push(Fold {
                 file: file.clone(),
                 ..fold
@@ -930,6 +936,21 @@ fn load_one(
         }
     }
 
+    // A reached view that ranks, recurses or looks up earlier rows was written over the whole
+    // history and gives a window-only answer inside a fold, with nothing else to say so (#1504). The
+    // fold's own body is exempt: `QUALIFY row_number() OVER` over carry ∪ window is the idiom.
+    let mut warnings = Vec::new();
+    for t in &reaches {
+        if let Some(body) = view_bodies.get(t) {
+            for how in binder.lookbacks(body, &reaches) {
+                warnings.push(format!(
+                    "{at}: view `{t}` uses {how}, which inside a fold sees only the window \
+                     (RFC-0059 §3: history is not in scope inside a fold)"
+                ));
+            }
+        }
+    }
+
     let carry = declared_carry(binder, at, &decl)?;
     let key = match decl.key {
         KeyDecl::Word(w) if w == "singleton" => FoldKey::Singleton,
@@ -1016,6 +1037,7 @@ fn load_one(
         reaches,
         deps,
         hash,
+        warnings,
     })
 }
 
@@ -1176,6 +1198,75 @@ mod tests {
         assert!(
             msg.contains("view `noisy`") && msg.contains("random"),
             "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_view_that_looks_back_into_history_is_warned_by_name_and_construct() {
+        const FOLD: &str = "SELECT CAST(count(*) AS UBIGINT) AS n FROM h";
+        for (view, construct) in [
+            (
+                "CREATE VIEW h AS SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY block_number) AS rn FROM t;",
+                "a window function (`row_number() OVER`)",
+            ),
+            (
+                "CREATE VIEW h AS WITH RECURSIVE chain AS (SELECT k, v, block_number FROM t UNION ALL SELECT k, v, block_number + 1 FROM chain WHERE block_number < 0) SELECT k, v FROM chain;",
+                "a recursive CTE (`chain`)",
+            ),
+            (
+                "CREATE VIEW h AS SELECT a.k, a.v FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.k = a.k AND b.block_number < a.block_number);",
+                "an EXISTS subquery over `t`",
+            ),
+            (
+                "CREATE VIEW h AS SELECT a.k, (SELECT min(b.block_number) FROM t b WHERE b.k = a.k) AS first_seen FROM t a;",
+                "a scalar subquery over `t`",
+            ),
+        ] {
+            let dir = nest(&[("c.sql", FOLD)], COUNT_DECL, &[("10-h.sql", view)]);
+            let set = FoldSet::load(dir.path(), &[]).unwrap();
+            let w = set.folds[0].warnings.join("\n");
+            assert!(
+                w.contains("folds/c.sql: view `h` uses ")
+                    && w.contains(construct)
+                    && w.contains("RFC-0059 §3"),
+                "{view}\n{w}"
+            );
+            assert_eq!(set.folds[0].warnings.len(), 1, "{w}");
+        }
+
+        // Reached through another view, the warning still names the view that looks back.
+        let dir = nest(
+            &[("c.sql", "SELECT CAST(count(*) AS UBIGINT) AS n FROM o")],
+            COUNT_DECL,
+            &[
+                (
+                    "10-h.sql",
+                    "CREATE VIEW h AS SELECT k, row_number() OVER (ORDER BY block_number) AS rn FROM t;",
+                ),
+                ("20-o.sql", "CREATE VIEW o AS SELECT k FROM h;"),
+            ],
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        let w = set.folds[0].warnings.join("\n");
+        assert!(w.contains("view `h` uses a window function"), "{w}");
+        assert!(!w.contains("view `o`"), "{w}");
+
+        // A view that only projects each event is silent, and so is the fold's own ranking over
+        // carry ∪ window, which is the idiom rather than a lookback.
+        let dir = nest(
+            &[(
+                "c.sql",
+                "SELECT k, v FROM (SELECT k, v FROM p UNION ALL SELECT k, v FROM c__carry) \
+                 QUALIFY row_number() OVER (PARTITION BY k ORDER BY v DESC) = 1",
+            )],
+            "[[fold]]\nname = \"c\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\", \"v VARCHAR\"]\nmax_rows = 10\n",
+            &[("10-p.sql", "CREATE VIEW p AS SELECT k, upper(v) AS v FROM t;")],
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        assert!(
+            set.folds[0].warnings.is_empty(),
+            "{:?}",
+            set.folds[0].warnings
         );
     }
 
