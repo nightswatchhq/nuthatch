@@ -17,7 +17,9 @@ label, not this document, is the record of scope.
    touched-key deltas. This completes RFC-0060 S2. Head evaluation already sits at 280.0 MiB against a
    300 MiB ceiling, so the snapshot bound is measured, not assumed.
 3. **#1514, RFC-0060 S3 step 1: allocations, the saved clock and epochs.** They decide eligibility and
-   the agent's lifecycle, so they are first in the payment-risk order. Each lands with its differential.
+   . **#1516, RFC-0060 S3 step 2: escrow accounts, signers and escrow transactions.** What decides whether
+   a TAP receipt is backed and a RAV worth redeeming. Step 1 and step 2 together must still hold the
+   head gate.
 
 ## Rules
 
@@ -28,7 +30,7 @@ label, not this document, is the record of scope.
 
 ## Not in this sprint
 
-- RFC-0059 S4 (serving) and RFC-0060 S4 onwards. S3's differentials evaluate folds directly and do not
+- RFC-0059 S4 (serving), the rest of RFC-0060 S3 (deployments onward) and RFC-0060 S4 onwards. S3's differentials evaluate folds directly and do not
   need serving.
 - The parked items: #1446, #1324, #1313, #1288, #1280, #1263.
 - `docs/frozen-for-2027.md` and its reopening rule.
