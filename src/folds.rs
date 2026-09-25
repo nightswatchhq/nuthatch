@@ -1047,10 +1047,11 @@ impl Writer {
     pub fn start(
         dir: std::path::PathBuf,
         schema: Vec<TableSchema>,
+        set: FoldSet,
         sealed_through: u64,
         metrics: std::sync::Arc<crate::metrics::NestMetrics>,
     ) -> Result<Option<Writer>> {
-        if !dir.join(FOLDS_DIR).exists() {
+        if set.folds.is_empty() {
             return Ok(None);
         }
         let status = std::sync::Arc::new(WriterStatus::default());
@@ -1059,7 +1060,7 @@ impl Writer {
         let thread = std::thread::Builder::new()
             .name("fold-writer".into())
             .spawn(move || {
-                if let Err(e) = write_loop(&dir, &schema, rx, &worker, &metrics) {
+                if let Err(e) = write_loop(&dir, &schema, &set, rx, &worker, &metrics) {
                     tracing::error!("fold writer stopped: {e:#}");
                     *worker.fault.lock().unwrap() = Some(format!("{e:#}"));
                     metrics.set_fold_writer_faulted(true);
@@ -1105,12 +1106,12 @@ impl Drop for Writer {
 fn write_loop(
     dir: &Path,
     schema: &[TableSchema],
+    set: &FoldSet,
     rx: std::sync::mpsc::Receiver<u64>,
     status: &WriterStatus,
     metrics: &crate::metrics::NestMetrics,
 ) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
-    let set = FoldSet::load(dir, schema)?;
     let start = set.reconcile(dir)?;
     let mut s = set.stepper(dir, schema)?;
     if let Some(b) = start {
@@ -2724,9 +2725,15 @@ mod writer {
     #[test]
     fn a_nest_without_folds_has_no_writer() {
         let (dir, _hot) = corpus();
-        assert!(Writer::start(dir.path().into(), vec![], 30, metrics())
-            .unwrap()
-            .is_none());
+        assert!(Writer::start(
+            dir.path().into(),
+            vec![],
+            FoldSet::load(dir.path(), &[]).unwrap(),
+            30,
+            metrics()
+        )
+        .unwrap()
+        .is_none());
     }
 
     /// The writer's checkpoints are the ones `fold build` writes over the same history, and each
@@ -2736,9 +2743,15 @@ mod writer {
         let (dir, _hot) = corpus();
         fold_files(dir.path(), FOLDS, DECLS);
         let m = metrics();
-        let w = Writer::start(dir.path().into(), vec![], 20, m.clone())
-            .unwrap()
-            .expect("a writer");
+        let w = Writer::start(
+            dir.path().into(),
+            vec![],
+            FoldSet::load(dir.path(), &[]).unwrap(),
+            20,
+            m.clone(),
+        )
+        .unwrap()
+        .expect("a writer");
         let s = settle(&w, |s| s.checkpointed_through == 20);
         assert_eq!(
             (s.checkpointed_through, s.lag_blocks, s.fault),
@@ -2783,9 +2796,15 @@ mod writer {
         log.checkpoints.pop();
         std::fs::write(cdir.join(CHECKPOINT_LOG), serde_json::to_vec(&log).unwrap()).unwrap();
 
-        let w = Writer::start(dir.path().into(), vec![], 30, metrics())
-            .unwrap()
-            .unwrap();
+        let w = Writer::start(
+            dir.path().into(),
+            vec![],
+            FoldSet::load(dir.path(), &[]).unwrap(),
+            30,
+            metrics(),
+        )
+        .unwrap()
+        .unwrap();
         let s = settle(&w, |s| s.checkpointed_through == 30);
         assert_eq!((s.checkpointed_through, s.fault), (30, None));
         drop(w);
@@ -2803,9 +2822,15 @@ mod writer {
             "[[fold]]\nname = \"latest\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\", \"v VARCHAR\"]\nmax_rows = 2\n",
         );
         let m = metrics();
-        let w = Writer::start(dir.path().into(), vec![], 30, m.clone())
-            .unwrap()
-            .unwrap();
+        let w = Writer::start(
+            dir.path().into(),
+            vec![],
+            FoldSet::load(dir.path(), &[]).unwrap(),
+            30,
+            m.clone(),
+        )
+        .unwrap()
+        .unwrap();
         let s = settle(&w, |s| s.fault.is_some());
         assert!(
             s.fault
