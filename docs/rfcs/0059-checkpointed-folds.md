@@ -301,6 +301,21 @@ Kept at every seal, that one set alone would be hundreds of GB. So a large set c
 to the members that can still matter (here, the legacy allocations that can still receive rewards) or
 stored as deltas against the previous checkpoint.
 
+**As built (#1503, 2026-09-25).** Narrowing was enough; deltas were not needed. A legacy allocation
+takes rewards once, when it closes, so its id is dropped at its `RewardsAssigned` or
+`HorizonRewardsAssigned`. On the whole network history no legacy id is rewarded twice (the 6,415 ids
+rewarded more than once are all Horizon allocations), and the carry at head falls from 591,071 rows to
+70,762. A fold that drops keys must be `unkeyed`, since a keyed fold passes untouched keys through.
+Every S0 projection and the other eight carries still match; the head gate went from 280.0 to 186.8 MiB
+peak at 105.6 ms p99 (`docs/bench/fold-head-thinkpad-narrowed.json`). One checkpoint set at head is 2.8 MB.
+
+Retention is declared in `folds/folds.toml` as `[retention]`: `recent` (default 8, at least 2, so
+`check --folds` can resume from the checkpoint before the latest), `every_blocks` (default 10,000,000:
+the earliest checkpoint in each span is kept) and an optional `horizon_blocks`, past which nothing is
+kept and a read is refused by name. On the network nest the defaults hold at most about 43 sets, about
+120 MB. Retention removes only files: every log entry stays, because each checkpoint's id chains
+through its predecessor.
+
 **Verification.** `nuthatch check --folds` recomputes a checkpoint from its predecessor, which costs
 one window. `--from-genesis` walks the whole chain offline.
 
@@ -457,7 +472,7 @@ Each slice's acceptance is written so it can fail.
 
 ## Open questions
 
-1. Checkpoint spacing and retention defaults. S0 measures carry size for the network nest.
+1. ~~Checkpoint spacing and retention defaults.~~ Settled in §5 by #1503, from measured sizes.
 2. Are checkpoints part of the published directory (RFC-0047, RFC-0052)? The default is no: they are
    derivable, and the contract is the facts.
 3. Declaration: a `folds/` directory, as proposed, or `kind = "fold"` in `entities.toml`?
