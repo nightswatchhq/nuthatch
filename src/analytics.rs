@@ -1318,6 +1318,7 @@ fn attempt(
                 after: None,
                 through: as_of,
             },
+            false,
         )?;
         let degraded_tables = defined.degraded.clone();
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
@@ -2763,8 +2764,33 @@ fn define_views(
         declared,
         wanted,
         FactWindow::default(),
+        false,
     )?
     .degraded)
+}
+
+/// The first file of each distinct schema among `sealed`, in their order. `union_by_name` over these
+/// yields exactly what it yields over all of them, since a later file with an already-seen schema adds
+/// no column and no type; binding thousands of files by name held about 240 MiB (#1508). A file whose
+/// schema cannot be read is kept, so the unreadable-segment handling still sees it.
+fn one_per_file_schema(conn: &Connection, sealed: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    let mut seen = std::collections::BTreeSet::new();
+    sealed
+        .into_iter()
+        .filter(|(f, _)| {
+            let shape: Option<Vec<(String, String)>> = conn
+                .prepare(&format!("DESCRIBE SELECT * FROM read_parquet([{f}])"))
+                .and_then(|mut st| {
+                    st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                        .collect()
+                })
+                .ok();
+            match shape {
+                Some(shape) => seen.insert(shape),
+                None => true,
+            }
+        })
+        .collect()
 }
 
 /// The block range fact views expose: rows with `after < block_number <= through`. `/sql` bounds only
@@ -2817,6 +2843,9 @@ fn define_views_bound(
     declared: &[crate::registry::TableSchema],
     wanted: Option<&std::collections::BTreeSet<String>>,
     window: FactWindow,
+    // Bind each table over one sealed file per distinct file schema: the same columns, types and
+    // order as all of them (#1508), for a caller that describes queries and never reads a row.
+    schema_only: bool,
 ) -> Result<DefinedViews> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
@@ -2955,6 +2984,11 @@ fn define_views_bound(
                     .collect()
             })
             .unwrap_or_default();
+        let sealed = if schema_only {
+            one_per_file_schema(conn, sealed)
+        } else {
+            sealed
+        };
         let sealed_files: Vec<String> = sealed.iter().map(|(file, _)| file.clone()).collect();
         // Only tip rows strictly past the watermark (COR-1 disjointness; belt-and-braces with the
         // atomic seal→prune, which already keeps sealed rows out of hot).
@@ -3776,7 +3810,7 @@ impl FoldBinder {
         schema: &[crate::registry::TableSchema],
         wanted: &std::collections::BTreeSet<String>,
     ) -> Result<()> {
-        define_views(
+        define_views_bound(
             &self.conn,
             dir,
             &HotRows::new(),
@@ -3784,6 +3818,8 @@ impl FoldBinder {
             &Default::default(),
             schema,
             Some(wanted),
+            FactWindow::default(),
+            true,
         )?;
         define_nest_views(&self.conn, dir, Some(wanted));
         Ok(())
@@ -4004,6 +4040,7 @@ impl FoldEvaluator {
                 after,
                 through: Some(through),
             },
+            false,
         )?;
         // `/sql` may answer short and say so; a checkpoint built from a short window is simply wrong.
         if !defined.degraded.is_empty() {
@@ -4416,6 +4453,7 @@ mod tests {
                 &[],
                 None,
                 FactWindow { after, through },
+                false,
             )
             .unwrap();
             let n: u64 = conn
@@ -8824,5 +8862,86 @@ mod fold_connections {
             binder.relations().unwrap(),
             std::collections::BTreeSet::from(["t".to_string()])
         );
+    }
+}
+
+#[cfg(all(test, feature = "folds"))]
+mod schema_only_binding {
+    use super::*;
+    use serde_json::json;
+
+    /// Five segments in three shapes: `extra` appears from the third, and `v` is a number in the first
+    /// two and text after.
+    fn nest() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        let rows = |b: u64| -> Vec<String> {
+            let row = match b {
+                1 | 2 => json!({"table": "t", "block_number": b, "k": "a", "v": b}),
+                3 | 4 => {
+                    json!({"table": "t", "block_number": b, "k": "a", "v": b.to_string(), "extra": "x"})
+                }
+                _ => {
+                    json!({"table": "t", "block_number": b, "k": "a", "v": b.to_string(), "extra": "x", "more": true})
+                }
+            };
+            vec![row.to_string()]
+        };
+        for b in 1..=5 {
+            crate::seal::seal_range(dir.path(), &rows(b), b, b).unwrap();
+        }
+        dir
+    }
+
+    fn files(dir: &Path) -> Vec<(String, u64)> {
+        let manifest = crate::seal::load_manifest_with_hash(dir).unwrap().0;
+        manifest.tables["t"]
+            .iter()
+            .map(|s| {
+                let p = crate::seal::segment_path(dir, &s.file, &s.hash);
+                (format!("'{}'", p.display()), 0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_file_per_schema_is_kept_in_order() {
+        let dir = nest();
+        let conn = Connection::open_in_memory().unwrap();
+        let all = files(dir.path());
+        let kept = one_per_file_schema(&conn, all.clone());
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        let pos = |f: &(String, u64)| all.iter().position(|a| a == f).unwrap();
+        assert!(kept.windows(2).all(|w| pos(&w[0]) < pos(&w[1])));
+    }
+
+    /// The fold binder's schema-only views describe exactly as views over every file would.
+    #[test]
+    fn a_schema_only_binding_describes_like_the_whole_union() {
+        let dir = nest();
+        let wanted: std::collections::BTreeSet<String> = ["t".to_string()].into();
+        let describe = |schema_only: bool| {
+            let conn = Connection::open_in_memory().unwrap();
+            define_views_bound(
+                &conn,
+                dir.path(),
+                &HotRows::new(),
+                u64::MAX,
+                &Default::default(),
+                &[],
+                Some(&wanted),
+                FactWindow::default(),
+                schema_only,
+            )
+            .unwrap();
+            let mut st = conn.prepare("DESCRIBE SELECT * FROM t").unwrap();
+            st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let whole = describe(false);
+        assert!(whole.iter().any(|(c, _)| c == "more"), "{whole:?}");
+        assert_eq!(describe(true), whole);
     }
 }
