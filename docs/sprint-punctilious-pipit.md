@@ -31,7 +31,7 @@ label, not this document, is the record of scope.
 
 ## Not in this sprint
 
-- RFC-0059 S4 (serving), the rest of RFC-0060 S3 (deployments onward) and RFC-0060 S4 onwards. S3's differentials evaluate folds directly and do not
-  need serving.
+- RFC-0059 S4 (serving), the rest of RFC-0060 S3 (deployments onward) and RFC-0060 S4 onwards.
+  S3's differentials evaluate folds directly and do not need serving.
 - The parked items: #1446, #1324, #1313, #1288, #1280, #1263.
 - `docs/frozen-for-2027.md` and its reopening rule.
