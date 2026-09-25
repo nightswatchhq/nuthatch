@@ -82,15 +82,29 @@ fn seal_latency_with_the_fold_writer_busy() {
     )
     .unwrap()
     .expect("a writer");
-    // Let it get into its first window before timing anything.
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let before = w.status();
+    // Busy means walking toward the history's last block and not there yet, before the first timed
+    // seal and after the last. The walk's target is fixed now, so a later notification cannot pass
+    // for work still to do.
+    let start = std::time::Instant::now();
+    let before = loop {
+        let s = w.status();
+        if s.target > 0 || s.fault.is_some() || start.elapsed().as_secs() > 120 {
+            break s;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(
+        before.fault.is_none() && before.target >= sealed_through / 2,
+        "the writer never began walking history: {before:?}"
+    );
+    assert!(before.checkpointed_through < before.target, "{before:?}");
     let on = seals(&dir, &mut next, Some(&w));
     let after = w.status();
-    assert!(before.fault.is_none() && after.fault.is_none(), "{after:?}");
+    assert!(after.fault.is_none(), "{after:?}");
     assert!(
-        after.lag_blocks > 0,
-        "the writer finished during the timed seals, so part of them ran unloaded: {after:?}"
+        after.checkpointed_through < before.target,
+        "the writer reached the end of history during the timed seals, so part of them ran \
+         unloaded: {after:?}"
     );
 
     println!(
