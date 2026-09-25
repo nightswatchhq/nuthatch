@@ -1044,6 +1044,17 @@ pub struct CheckArgs {
     /// comparing - the authoring mode, run once against known-good sealed data.
     #[arg(long)]
     pub update: bool,
+
+    /// RFC-0059 S2: recompute every fold's latest checkpoint from the one before it and compare, in
+    /// place of the parity checks. Reads only, so it runs beside a `dev` holding the nest.
+    #[cfg(feature = "folds")]
+    #[arg(long, hide = true)]
+    pub folds: bool,
+
+    /// With --folds, walk every checkpoint from genesis instead of the last window only.
+    #[cfg(feature = "folds")]
+    #[arg(long, requires = "folds", hide = true)]
+    pub from_genesis: bool,
 }
 
 #[derive(Args)]

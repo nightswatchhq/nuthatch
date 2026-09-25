@@ -92,6 +92,10 @@ async fn a_checked_entity_file_starts_and_indexes() {
         name: None,
         dir: dir.path().to_str().unwrap().into(),
         update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
     })
     .expect("the authored file must pass check before startup");
     let manifest = std::fs::read(dir.path().join("entities.toml")).unwrap();

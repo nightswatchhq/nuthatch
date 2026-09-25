@@ -3965,8 +3965,13 @@ pub(crate) struct FoldEvaluator {
 #[cfg(feature = "folds")]
 impl FoldEvaluator {
     pub(crate) fn new(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<Self> {
-        // The lockdown admits only directories that exist when the connection opens.
+        // The lockdown admits only directories that exist when the connection opens, and the seal
+        // loop's writer opens this before a fresh nest has sealed anything.
         std::fs::create_dir_all(dir.join(crate::folds::CHECKPOINTS_DIR))?;
+        std::fs::create_dir_all(dir.join(crate::seal::SEGMENTS_DIR))?;
+        if let Some(shared) = crate::seal::shared_store(dir) {
+            std::fs::create_dir_all(shared)?;
+        }
         let (conn, spill) = open_locked_duckdb(dir)?;
         Ok(Self {
             conn,
@@ -4093,6 +4098,12 @@ fn missing_table_of(err: &str) -> Option<String> {
     let after = err.split("Table with name ").nth(1)?;
     let name = after.split_whitespace().next()?;
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The nest's declared tables and their `(column, storage)`, from `schema.json`.
+#[cfg(feature = "folds")]
+pub(crate) fn declared_columns(dir: &Path) -> Vec<(String, Vec<(String, String)>)> {
+    schema_columns(dir)
 }
 
 /// (table, [(column, storage)]) for every declared table, from the nest's `schema.json`. Empty if

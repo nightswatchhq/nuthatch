@@ -55,6 +55,9 @@ mod e2e_early_cutoff;
 mod e2e_entity_reorg;
 #[path = "e2e_fencing.rs"]
 mod e2e_fencing;
+#[cfg(feature = "folds")]
+#[path = "e2e_fold_writer.rs"]
+mod e2e_fold_writer;
 #[path = "e2e_migrate_parity.rs"]
 mod e2e_migrate_parity;
 #[path = "e2e_minio_publish.rs"]
