@@ -68,8 +68,9 @@ pub struct Retention {
     /// Before those, the earliest checkpoint in each span of this many blocks, so a historical read
     /// steps at most about two spans of facts.
     pub every_blocks: u64,
-    /// When set, nothing older than this many blocks behind the latest checkpoint is kept, and a read
-    /// into that dropped history is refused by name.
+    /// When set, the spaced history stops this many blocks behind the latest checkpoint, and a read
+    /// into what it dropped is refused by name. The latest `recent` are kept wherever they fall:
+    /// `check --folds` resumes from the one before the latest.
     pub horizon_blocks: Option<u64>,
 }
 
@@ -2931,6 +2932,11 @@ mod retention {
             [20, 29, 30]
         );
         assert!(r.keep(&[]).is_empty());
+        // Sparse history: the latest `recent` stay even below the horizon.
+        assert_eq!(
+            h.keep(&[5, 50, 60, 100]).into_iter().collect::<Vec<_>>(),
+            [60, 100]
+        );
     }
 
     /// Thirty checkpoints, five files: storage follows the settings, every read is still exact, and
@@ -2938,6 +2944,16 @@ mod retention {
     #[test]
     fn retention_bounds_the_files_and_every_read_stays_exact() {
         let (dir, set) = nest("[retention]\nrecent = 2\nevery_blocks = 10\n");
+        assert_eq!(files(dir.path(), &set), [1, 10, 20, 29, 30]);
+        // Reconciling a pruned log keeps every entry: the chain check reads the log, not the files.
+        assert_eq!(set.reconcile(dir.path()).unwrap(), Some(30));
+        assert_eq!(
+            load_log(dir.path(), &set.folds[0])
+                .unwrap()
+                .checkpoints
+                .len(),
+            30
+        );
         assert_eq!(files(dir.path(), &set), [1, 10, 20, 29, 30]);
         let log = load_log(dir.path(), &set.folds[0]).unwrap();
         assert_eq!(log.checkpoints.len(), 30, "every entry is kept");

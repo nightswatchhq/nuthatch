@@ -311,8 +311,9 @@ peak at 105.6 ms p99 (`docs/bench/fold-head-thinkpad-narrowed.json`). One checkp
 
 Retention is declared in `folds/folds.toml` as `[retention]`: `recent` (default 8, at least 2, so
 `check --folds` can resume from the checkpoint before the latest), `every_blocks` (default 10,000,000:
-the earliest checkpoint in each span is kept) and an optional `horizon_blocks`, past which nothing is
-kept and a read is refused by name. On the network nest the defaults hold at most about 43 sets, about
+the earliest checkpoint in each span is kept) and an optional `horizon_blocks`, past which the spaced
+history stops and a read into what it dropped is refused by name (the latest `recent` stay wherever
+they fall). On the network nest the defaults hold at most about 43 sets, about
 120 MB. Retention removes only files: every log entry stays, because each checkpoint's id chains
 through its predecessor.
 
