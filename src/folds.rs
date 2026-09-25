@@ -55,6 +55,55 @@ pub struct Fold {
 pub struct FoldSet {
     /// In load order, which is dependency order.
     pub folds: Vec<Fold>,
+    pub retention: Retention,
+}
+
+/// Which checkpoint files are kept (RFC-0059 §5). Every log entry is kept whatever happens to its
+/// file, because the identity chain needs each link; only the Parquet goes.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Retention {
+    /// Every checkpoint among the latest this many is kept.
+    pub recent: usize,
+    /// Before those, the earliest checkpoint in each span of this many blocks, so a historical read
+    /// steps at most about two spans of facts.
+    pub every_blocks: u64,
+    /// When set, the spaced history stops this many blocks behind the latest checkpoint, and a read
+    /// into what it dropped is refused by name. The latest `recent` are kept wherever they fall:
+    /// `check --folds` resumes from the one before the latest.
+    pub horizon_blocks: Option<u64>,
+}
+
+pub const DEFAULT_RETAIN_RECENT: usize = 8;
+pub const DEFAULT_RETAIN_EVERY_BLOCKS: u64 = 10_000_000;
+
+impl Default for Retention {
+    fn default() -> Self {
+        Retention {
+            recent: DEFAULT_RETAIN_RECENT,
+            every_blocks: DEFAULT_RETAIN_EVERY_BLOCKS,
+            horizon_blocks: None,
+        }
+    }
+}
+
+impl Retention {
+    /// Of these checkpoint blocks, ascending, the ones whose files are kept.
+    fn keep(&self, blocks: &[u64]) -> BTreeSet<u64> {
+        let Some(&latest) = blocks.last() else {
+            return BTreeSet::new();
+        };
+        let floor = self.horizon_blocks.map_or(0, |h| latest.saturating_sub(h));
+        let mut keep: BTreeSet<u64> = blocks.iter().rev().take(self.recent).copied().collect();
+        let mut bucket = None;
+        for &b in blocks.iter().filter(|b| **b >= floor) {
+            if bucket != Some(b / self.every_blocks) {
+                bucket = Some(b / self.every_blocks);
+                keep.insert(b);
+            }
+        }
+        keep
+    }
 }
 
 #[derive(Deserialize)]
@@ -62,6 +111,8 @@ pub struct FoldSet {
 struct FoldsToml {
     #[serde(default)]
     fold: Vec<FoldDecl>,
+    #[serde(default)]
+    retention: Retention,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +164,11 @@ impl FoldSet {
             .with_context(|| format!("{FOLDS_DIR}/ needs {FOLDS_DIR}/{FOLDS_TOML}"))?;
         let decls: FoldsToml =
             toml::from_str(&raw).with_context(|| format!("parsing {FOLDS_DIR}/{FOLDS_TOML}"))?;
+        let retention = decls.retention.clone();
+        // `check --folds` resumes from the checkpoint before the latest, so two must always be kept.
+        if retention.recent < 2 || retention.every_blocks == 0 {
+            bail!("{FOLDS_DIR}/{FOLDS_TOML}: [retention] needs recent >= 2 and every_blocks >= 1");
+        }
 
         let mut files: Vec<String> = std::fs::read_dir(&root)?
             .filter_map(|e| e.ok())
@@ -164,7 +220,10 @@ impl FoldSet {
         }
         binder.bind(dir, schema, &wanted)?;
 
-        let mut set = FoldSet::default();
+        let mut set = FoldSet {
+            retention,
+            ..FoldSet::default()
+        };
         for file in &files {
             let name = fold_name_of(file).unwrap_or_default().to_string();
             let at = format!("{FOLDS_DIR}/{file}");
@@ -376,6 +435,9 @@ pub struct Checkpoint {
     pub row_digest: String,
     /// Every fact table the fold reaches that had a row in `(prev, block]`, in name order.
     pub inputs: Vec<WindowInput>,
+    /// Retention removed this checkpoint's file. The entry stays: later ids chain through it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pruned: bool,
 }
 
 /// The rows one fact table contributed to a window, digested as a checkpoint's own rows are.
@@ -557,6 +619,7 @@ impl Stepper<'_> {
                 rows,
                 row_digest,
                 inputs,
+                pruned: false,
             };
             let cdir = checkpoint_dir(&self.dir, f);
             std::fs::create_dir_all(&cdir)?;
@@ -592,6 +655,12 @@ impl Stepper<'_> {
                 .iter()
                 .find(|c| c.block == block)
                 .with_context(|| format!("fold `{}` has no checkpoint at {block}", f.name))?;
+            if entry.pruned {
+                bail!(
+                    "fold `{}`: the checkpoint at {block} was removed by retention",
+                    f.name
+                );
+            }
             verify_chain(f, &log, block)?;
             let path = checkpoint_dir(&self.dir, f).join(format!("{block}.parquet"));
             let cols: Vec<String> = f
@@ -626,6 +695,7 @@ impl FoldSet {
             let blocks: BTreeSet<u64> = load_log(dir, f)?
                 .checkpoints
                 .iter()
+                .filter(|c| !c.pruned)
                 .map(|c| c.block)
                 .filter(|b| *b <= n)
                 .collect();
@@ -684,6 +754,7 @@ impl FoldSet {
             let named: BTreeSet<String> = log
                 .checkpoints
                 .iter()
+                .filter(|c| !c.pruned)
                 .map(|c| format!("{}.parquet", c.block))
                 .collect();
             for entry in std::fs::read_dir(&cdir)?.flatten() {
@@ -695,6 +766,40 @@ impl FoldSet {
             }
         }
         Ok(latest)
+    }
+
+    /// Remove the checkpoint files retention no longer keeps. The log is written first, so a crash
+    /// between the two leaves an unnamed file for `reconcile`, never a named one that is gone.
+    pub fn prune(&self, dir: &Path) -> Result<usize> {
+        let mut removed = 0;
+        for f in &self.folds {
+            let mut log = load_log(dir, f)?;
+            let blocks: Vec<u64> = log.checkpoints.iter().map(|c| c.block).collect();
+            let keep = self.retention.keep(&blocks);
+            let mut gone = Vec::new();
+            for c in log.checkpoints.iter_mut().filter(|c| !c.pruned) {
+                if !keep.contains(&c.block) {
+                    c.pruned = true;
+                    gone.push(c.block);
+                }
+            }
+            if gone.is_empty() {
+                continue;
+            }
+            let cdir = checkpoint_dir(dir, f);
+            write_atomically(
+                &cdir.join(CHECKPOINT_LOG),
+                &serde_json::to_vec_pretty(&log)?,
+            )?;
+            for b in gone {
+                match std::fs::remove_file(cdir.join(format!("{b}.parquet"))) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Where a walk from `start` to `sealed_through` checkpoints: at the end of about every
@@ -754,6 +859,7 @@ impl FoldSet {
         for &cut in &cuts {
             s.step_to(&empty, sealed_through, cut)?;
             s.checkpoint()?;
+            self.prune(dir)?;
         }
         Ok(cuts)
     }
@@ -855,8 +961,23 @@ impl FoldSet {
         sealed_through: u64,
         n: u64,
     ) -> Result<Stepper<'a>> {
-        let mut s = self.stepper(dir, schema)?;
         let c = self.latest_checkpoint(dir, n)?;
+        if c.is_none() {
+            // Stepping from genesis is exact, but past a removed checkpoint it is exactly the
+            // history the horizon was set to stop paying for.
+            for f in &self.folds {
+                let log = load_log(dir, f)?;
+                if log.checkpoints.iter().any(|c| c.pruned && c.block <= n) {
+                    let oldest = log.checkpoints.iter().find(|c| !c.pruned).map(|c| c.block);
+                    bail!(
+                        "block {n} predates retained history for fold `{}` (oldest checkpoint: {})",
+                        f.name,
+                        oldest.map_or("none".to_string(), |b| b.to_string())
+                    );
+                }
+            }
+        }
+        let mut s = self.stepper(dir, schema)?;
         if let Some(b) = c {
             s.resume(b)?;
         }
@@ -1012,6 +1133,7 @@ fn write_loop(
         for cut in cuts {
             s.step_to(&empty, sealed_through, cut)?;
             s.checkpoint()?;
+            set.prune(dir)?;
             status.checkpointed_through.store(cut, Relaxed);
             status
                 .last_progress
@@ -2734,5 +2856,150 @@ mod identity {
             .hash
             .clone();
         assert_eq!(before, after);
+    }
+}
+
+#[cfg(test)]
+mod retention {
+    use super::stepping_support::*;
+    use super::*;
+    use serde_json::json;
+
+    const RUNNING: &str =
+        "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t";
+
+    /// One sealed segment per block, 1..=30, so a walk checkpoints at every block.
+    fn nest(retention: &str) -> (tempfile::TempDir, FoldSet) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), super::tests::SCHEMA).unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        for b in 1..=30u64 {
+            let row = json!({"table": "t", "block_number": b, "k": "a", "v": b.to_string()});
+            crate::seal::seal_range(dir.path(), &[row.to_string()], b, b).unwrap();
+        }
+        fold_files(
+            dir.path(),
+            &[("running.sql", RUNNING)],
+            &format!(
+                "{retention}\n[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n"
+            ),
+        );
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        assert_eq!(set.build(dir.path(), &[], 30, 1).unwrap().len(), 30);
+        (dir, set)
+    }
+
+    fn files(dir: &Path, set: &FoldSet) -> Vec<u64> {
+        let mut out: Vec<u64> = std::fs::read_dir(checkpoint_dir(dir, &set.folds[0]))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .strip_suffix(".parquet")
+                    .and_then(|b| b.parse().ok())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn n_at(dir: &Path, set: &FoldSet, n: u64) -> u64 {
+        let s = set
+            .read_at(dir, &[], &analytics::HotRows::new(), 30, n)
+            .unwrap();
+        s.rows("running").unwrap()[0]["n"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn the_keep_rule_takes_the_recent_and_the_first_of_each_span() {
+        let r = Retention {
+            recent: 2,
+            every_blocks: 10,
+            horizon_blocks: None,
+        };
+        let blocks: Vec<u64> = (1..=30).collect();
+        assert_eq!(
+            r.keep(&blocks).into_iter().collect::<Vec<_>>(),
+            [1, 10, 20, 29, 30]
+        );
+        let h = Retention {
+            horizon_blocks: Some(10),
+            ..r
+        };
+        assert_eq!(
+            h.keep(&blocks).into_iter().collect::<Vec<_>>(),
+            [20, 29, 30]
+        );
+        assert!(r.keep(&[]).is_empty());
+        // Sparse history: the latest `recent` stay even below the horizon.
+        assert_eq!(
+            h.keep(&[5, 50, 60, 100]).into_iter().collect::<Vec<_>>(),
+            [60, 100]
+        );
+    }
+
+    /// Thirty checkpoints, five files: storage follows the settings, every read is still exact, and
+    /// the chain still verifies through the entries whose files are gone.
+    #[test]
+    fn retention_bounds_the_files_and_every_read_stays_exact() {
+        let (dir, set) = nest("[retention]\nrecent = 2\nevery_blocks = 10\n");
+        assert_eq!(files(dir.path(), &set), [1, 10, 20, 29, 30]);
+        // Reconciling a pruned log keeps every entry: the chain check reads the log, not the files.
+        assert_eq!(set.reconcile(dir.path()).unwrap(), Some(30));
+        assert_eq!(
+            load_log(dir.path(), &set.folds[0])
+                .unwrap()
+                .checkpoints
+                .len(),
+            30
+        );
+        assert_eq!(files(dir.path(), &set), [1, 10, 20, 29, 30]);
+        let log = load_log(dir.path(), &set.folds[0]).unwrap();
+        assert_eq!(log.checkpoints.len(), 30, "every entry is kept");
+        for n in 1..=30 {
+            assert_eq!(n_at(dir.path(), &set, n), n, "at {n}");
+        }
+        assert!(set.verify(dir.path(), &[], true).unwrap().is_empty());
+        assert!(set.verify(dir.path(), &[], false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_read_into_history_past_the_horizon_is_refused_by_name() {
+        let (dir, set) = nest("[retention]\nrecent = 2\nevery_blocks = 10\nhorizon_blocks = 10\n");
+        assert_eq!(files(dir.path(), &set), [20, 29, 30]);
+        assert_eq!(n_at(dir.path(), &set, 25), 25);
+        let err = set
+            .read_at(dir.path(), &[], &analytics::HotRows::new(), 30, 15)
+            .err()
+            .expect("refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "block 15 predates retained history for fold `running` (oldest checkpoint: 20)"
+        );
+    }
+
+    #[test]
+    fn resuming_at_a_removed_checkpoint_says_so() {
+        let (dir, set) = nest("[retention]\nrecent = 2\nevery_blocks = 10\n");
+        let mut s = set.stepper(dir.path(), &[]).unwrap();
+        let err = s.resume(15).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "fold `running`: the checkpoint at 15 was removed by retention"
+        );
+    }
+
+    #[test]
+    fn a_retention_that_would_break_check_folds_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), super::tests::SCHEMA).unwrap();
+        fold_files(
+            dir.path(),
+            &[("running.sql", RUNNING)],
+            "[retention]\nrecent = 1\n[[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n",
+        );
+        let err = FoldSet::load(dir.path(), &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("recent >= 2"), "{err:#}");
     }
 }
