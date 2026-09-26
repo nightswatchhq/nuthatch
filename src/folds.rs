@@ -1187,8 +1187,15 @@ struct HeadState {
     retained: VecDeque<Arc<Snapshot>>,
     in_flight: Option<(u64, Head)>,
     attempts: u64,
-    /// Recent outcomes by attempt, for the readers that waited on them.
-    outcomes: VecDeque<(u64, Head, Result<Arc<Snapshot>, String>)>,
+    /// Attempts some reader is still waiting on. The last reader to claim an outcome removes it, so
+    /// an evicted snapshot is owned by nothing here (Jules on #1517).
+    waiters: BTreeMap<u64, Waiters>,
+}
+
+struct Waiters {
+    head: Head,
+    readers: usize,
+    outcome: Option<Result<Arc<Snapshot>, String>>,
 }
 
 impl HeadState {
@@ -1299,14 +1306,22 @@ impl HeadSnapshots {
         loop {
             // An attempt for another head, once finished, leaves this reader to start its own.
             if let Some(a) = waiting.take() {
-                if let Some((_, h, out)) = st.outcomes.iter().find(|(n, ..)| *n == a) {
-                    if *h == head {
-                        return out.clone().map_err(|e| anyhow::anyhow!(e));
-                    }
-                } else if st.in_flight.as_ref().map(|(n, _)| *n) == Some(a) {
+                let w = st
+                    .waiters
+                    .get_mut(&a)
+                    .expect("a waited attempt stays until claimed");
+                let Some(out) = w.outcome.clone() else {
                     waiting = Some(a);
                     st = sh.finished.wait(st).unwrap();
                     continue;
+                };
+                let mine = w.head == head;
+                w.readers -= 1;
+                if w.readers == 0 {
+                    st.waiters.remove(&a);
+                }
+                if mine {
+                    return out.map_err(|e| anyhow::anyhow!(e));
                 }
             }
             st.expire(&sh.cfg);
@@ -1314,15 +1329,26 @@ impl HeadSnapshots {
                 return Ok(s.clone());
             }
             if let Some((a, _)) = &st.in_flight {
-                waiting = Some(*a);
+                let a = *a;
+                st.waiters.get_mut(&a).expect("in flight").readers += 1;
+                waiting = Some(a);
                 continue;
             }
             st.attempts += 1;
             let a = st.attempts;
             st.in_flight = Some((a, head.clone()));
+            st.waiters.insert(
+                a,
+                Waiters {
+                    head: head.clone(),
+                    readers: 1,
+                    outcome: None,
+                },
+            );
             let sent = self.tx.as_ref().map(|tx| tx.send((a, head.clone())));
             if !matches!(sent, Some(Ok(()))) {
                 st.in_flight = None;
+                st.waiters.remove(&a);
                 bail!("the fold head thread has stopped");
             }
             waiting = Some(a);
@@ -1370,9 +1396,8 @@ fn head_loop(
             .map(Arc::new)
             .and_then(|s| st.admit(&sh.cfg, s.clone()).map(|()| s))
             .map_err(|e| format!("{e:#}"));
-        st.outcomes.push_back((attempt, head, out));
-        if st.outcomes.len() > 8 {
-            st.outcomes.pop_front();
+        if let Some(w) = st.waiters.get_mut(&attempt) {
+            w.outcome = Some(out);
         }
         sh.finished.notify_all();
     }
@@ -3851,6 +3876,18 @@ mod head_snapshots {
         assert_eq!(out["heads"], 5);
         assert_eq!(out["evaluations"], 5);
         assert!(out["retained_max"]["bytes"].as_u64().unwrap() <= set.snapshots.max_bytes);
+    }
+
+    /// Jules on #1517: an evicted snapshot must be freed, not kept alive by the readers' bookkeeping.
+    #[test]
+    fn an_evicted_snapshot_is_freed() {
+        let (dir, hot, set) = built("[snapshots]\nrecent = 1\n");
+        let chain = Chain::new(hot, 31);
+        let heads = start(dir.path(), &set, &chain);
+        let first = Arc::downgrade(&heads.at_head().unwrap());
+        chain.advance(32);
+        heads.at_head().unwrap();
+        assert!(first.upgrade().is_none(), "evicted, yet still resident");
     }
 
     #[test]
