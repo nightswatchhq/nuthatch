@@ -23,15 +23,17 @@ pub enum SqlRejection {
     Invalid,
     Bounded,
     Admission,
+    Timeout,
 }
 
 impl SqlRejection {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Busy,
         Self::TooLarge,
         Self::Invalid,
         Self::Bounded,
         Self::Admission,
+        Self::Timeout,
     ];
 
     const fn index(self) -> usize {
@@ -41,6 +43,7 @@ impl SqlRejection {
             Self::Invalid => 2,
             Self::Bounded => 3,
             Self::Admission => 4,
+            Self::Timeout => 5,
         }
     }
 
@@ -51,6 +54,7 @@ impl SqlRejection {
             Self::Invalid => "invalid",
             Self::Bounded => "bounded",
             Self::Admission => "admission",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -535,7 +539,7 @@ pub struct Metrics {
     sql_queries: AtomicU64,
     /// Backward-compatible aggregate of every member of `sql_rejections_by_reason`.
     sql_rejections: AtomicU64,
-    sql_rejections_by_reason: [AtomicU64; 5],
+    sql_rejections_by_reason: [AtomicU64; 6],
     /// Cumulative per [`NAMED_SCAN_BOUNDS`] entry, then `+Inf`.
     named_scan_buckets: [AtomicU64; 7],
     named_scan_bytes_sum: AtomicU64,
@@ -610,7 +614,7 @@ impl Metrics {
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
             sql_rejections: AtomicU64::new(0),
-            sql_rejections_by_reason: [const { AtomicU64::new(0) }; 5],
+            sql_rejections_by_reason: [const { AtomicU64::new(0) }; 6],
             named_scan_buckets: [const { AtomicU64::new(0) }; 7],
             named_scan_bytes_sum: AtomicU64::new(0),
             named_scan_refusals: AtomicU64::new(0),

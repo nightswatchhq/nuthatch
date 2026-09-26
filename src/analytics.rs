@@ -364,6 +364,26 @@ fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
     Ok((conn, spill))
 }
 
+/// A query the guard cut off at its deadline. Its own type, so `/sql` can tell a caller the query was
+/// sound but too slow (a 504) rather than malformed (a 400): a gateway that sees the 400 has no way
+/// to know it should simply try again later, and an alert built on it names the wrong fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudgetExceeded {
+    pub secs: u64,
+}
+
+impl std::fmt::Display for QueryBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "query exceeded the {}s time budget on the read-only SQL surface",
+            self.secs
+        )
+    }
+}
+
+impl std::error::Error for QueryBudgetExceeded {}
+
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
 /// interrupting the running DuckDB query) and a cap on materialised rows. Trusted internal callers
 /// (`net_balances`, `get_row`) run *unguarded* - their SQL is registry-built, never user text, and
@@ -1466,14 +1486,14 @@ fn attempt(
         Err(Died::Binding(e)) => {
             if interrupted.load(Ordering::SeqCst) {
                 let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-                bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+                return Err(QueryBudgetExceeded { secs }.into());
             }
             return Err(e);
         }
         Err(Died::Executing(e)) => {
             if interrupted.load(Ordering::SeqCst) {
                 let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-                bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+                return Err(QueryBudgetExceeded { secs }.into());
             }
             // Handed back rather than returned: the caller decides whether a corrupt segment explains
             // it and is worth one reduced retry (#433). The tables ride along because they come from
