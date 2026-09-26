@@ -3,6 +3,9 @@
 **Finish the fold runtime with head snapshots, then port the first folds whose failure costs an indexer
 money.**
 
+**Stopped 2026-09-26.** #1512 and #1513 landed. Chief then parked RFC-0059 and RFC-0060. #1514 was scoped and
+its carry measured (861,541 allocations) but not built; #1516 was not started. See CLAUDE.md.
+
 ## Definition of done
 
 Every issue carrying the **`punctilious-pipit`** label is closed, and no open PR is for one of them. The

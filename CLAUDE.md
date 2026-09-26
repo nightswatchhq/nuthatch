@@ -222,6 +222,14 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > goes under version control first (done as `pete/network-facade-rescue`, 2026-09-21), then
 > RFC-0059's S0 spike, which can stop the programme, and only then the runtime.
 >
+> **Parked 2026-09-26 by Chief: RFC-0059 and RFC-0060, in full.** RFC-0059 S0 to S3 are built and
+> stay in the tree behind the off-by-default features (S3's head snapshots in #1517). Nothing further
+> is started: not S4 serving, not RFC-0060's fold ports. It stopped at #1514, where a keyed
+> `allocations` fold proved to carry all 861,541 allocations ever made, about 14,600 of them active,
+> against the 300 MiB head gate. Even finished, it would replace the gateway for indexer-agent,
+> indexer-service-rs and tap-agent only, and the "not a drop-in replacement" rule stands. Reopening
+> is Chief's call on whether that is worth the remaining sprints. The trackers are #1441 and #1442.
+>
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
 > the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred
