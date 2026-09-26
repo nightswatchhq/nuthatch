@@ -8951,3 +8951,103 @@ mod schema_only_binding {
         assert_eq!(describe(true), whole);
     }
 }
+
+/// RFC-0058 S0: the two facts §4 depends on, measured against the bundled DuckDB.
+#[cfg(test)]
+mod cross_nest_s0 {
+    use super::*;
+
+    fn conn() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE SCHEMA a; CREATE SCHEMA b;
+             CREATE TABLE main.t AS SELECT 'main' AS w;
+             CREATE TABLE a.t AS SELECT 'a' AS w;
+             CREATE TABLE b.t AS SELECT 'b' AS w;",
+        )
+        .unwrap();
+        c
+    }
+
+    fn one(c: &Connection, sql: &str) -> std::result::Result<String, String> {
+        c.query_row(sql, [], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())
+    }
+
+    /// §4 step 4 needs an unqualified name inside a member's view to resolve in that member's schema.
+    #[test]
+    fn an_unqualified_name_in_a_schema_view_binds_in_that_schema() {
+        let c = conn();
+        c.execute_batch("CREATE VIEW a.v AS SELECT w FROM t")
+            .unwrap();
+        let qualified = one(&c, "SELECT w FROM a.v");
+        c.execute_batch("SET schema = 'b'; CREATE VIEW v AS SELECT w FROM t; SET schema = 'main';")
+            .unwrap();
+        let set_schema = one(&c, "SELECT w FROM b.v");
+        c.execute_batch("CREATE VIEW a.v2 AS SELECT w FROM v")
+            .unwrap();
+        let view_on_view = one(&c, "SELECT w FROM a.v2");
+        eprintln!(
+            "S0 binding: CREATE VIEW a.v -> {qualified:?}; SET schema b -> {set_schema:?}; \
+             a.v2 over unqualified v -> {view_on_view:?}"
+        );
+        assert_eq!(qualified.as_deref(), Ok("a"), "CREATE VIEW a.v");
+        assert_eq!(
+            set_schema.as_deref(),
+            Ok("b"),
+            "SET schema then CREATE VIEW"
+        );
+        assert_eq!(
+            view_on_view.as_deref(),
+            Ok("a"),
+            "a view over a view in its schema"
+        );
+    }
+
+    /// §4 step 6 needs the walk to recover each base table's schema, not only its name.
+    #[test]
+    fn the_serialized_ast_carries_each_tables_schema() {
+        let c = conn();
+        let ast: String = c
+            .query_row(
+                "SELECT json_serialize_sql('SELECT * FROM a.t JOIN b.t USING (w) JOIN t USING (w)')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&ast).unwrap();
+        let mut pairs = Vec::new();
+        fn walk(v: &Value, out: &mut Vec<(String, String)>) {
+            match v {
+                Value::Object(m) => {
+                    if m.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
+                        out.push((
+                            m.get("schema_name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            m.get("table_name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        ));
+                    }
+                    m.values().for_each(|c| walk(c, out));
+                }
+                Value::Array(a) => a.iter().for_each(|c| walk(c, out)),
+                _ => {}
+            }
+        }
+        walk(&v, &mut pairs);
+        pairs.sort();
+        eprintln!("S0 walk: {pairs:?}");
+        assert_eq!(
+            pairs,
+            vec![
+                ("".into(), "t".into()),
+                ("a".into(), "t".into()),
+                ("b".into(), "t".into())
+            ]
+        );
+    }
+}
