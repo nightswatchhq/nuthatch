@@ -215,6 +215,9 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > surface in the default binary. It stores nothing, feeds no circuit and never merges two chains' block
 > streams, so the single-cursor law holds. Its capacity comes out of each member cursor's budget at
 > startup and is never borrowed at request time. S0 reported the same day: continue.
+> **Parked the same day, after S0**: its one motivating user, the Arcaidia builder, runs on the hosted
+> platform, which runs one container per nest, so a cross view could not reach him without a platform
+> change, and nobody else asked for it. S1 to S5 wait for a user who does.
 >
 > **RFC-0059 and RFC-0060 are accepted, and this line is the record RFC-0044 §8 asks for.** Chief
 > accepted [RFC-0059](docs/rfcs/0059-checkpointed-folds.md) (checkpointed folds) and

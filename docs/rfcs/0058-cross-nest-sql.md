@@ -1,7 +1,8 @@
 # RFC-0058: Cross-nest SQL - a declared, read-only query across mounted nests in one runtime
 
 **Status:** **Accepted 2026-09-26 (Chief)**, when he unparked #1324 and asked for it to be built. S0
-reported the same day (§9): continue. Tracking #1324.
+reported the same day (§9): continue. **Parked after S0, the same day**: no user needs it now (see CLAUDE.md).
+Tracking #1324.
 
 **Date:** 2026-09-15
 
