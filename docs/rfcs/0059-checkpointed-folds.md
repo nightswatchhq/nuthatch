@@ -452,8 +452,11 @@ Each slice's acceptance is written so it can fail.
 
   | | Evaluations | p99 | Retained at most | Peak RSS |
   |---|---|---|---|---|
-  | Snapshots | 88, one per head | 112.7 ms | 16 snapshots, 52.3 MB | 262.5 MiB |
+  | Snapshots | 88, one per head | 99 to 115 ms | 16 snapshots, 52.3 MB | 262 to 275 MiB |
   | S1's bench, same binary | 200 | 104.9 ms | - | 170.3 MiB |
+
+  Snapshot figures span four runs on a shared box, all after #1517's review found that finished outcomes kept
+  evicted snapshots alive; the retained-set bytes could not show that, and the fix has its own test.
 
   Almost all of a snapshot is `legacy_allocs`: 70,762 ids, about 3.3 MB, held in full per snapshot
   because #1503 made it unkeyed. The keyed folds hold only touched keys over one shared checkpoint.
