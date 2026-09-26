@@ -1518,15 +1518,37 @@ enum Died {
 /// materialises every row. Row materialisation is Rust-side and escapes DuckDB's own memory limit,
 /// so the cap is what actually bounds a `SELECT *` result buffer.
 fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
-    let sql = decimal_safe_sql(conn, sql)?;
     let mut stmt = conn
-        .prepare(&sql)
+        .prepare(sql)
         .context("failed to prepare query")
         .map_err(Died::Binding)?;
-    let mut rows = stmt
+    let rows = stmt
         .query([])
         .context("query failed")
         .map_err(Died::Executing)?;
+    // Column types are only known once the statement has executed, and a scaled decimal is the one
+    // result this cannot materialise (#1433). It is rare, so the answer is read off this run and
+    // only that case pays a second, wrapped one. Probing with a query of its own executed every
+    // statement twice, which cost the SQL surface 1.7x from 3.8.5 to 3.11.0.
+    match decimal_safe_projection(rows.as_ref(), sql) {
+        None => drain(rows, cap),
+        Some(wrapped) => {
+            drop(rows);
+            let mut stmt = conn
+                .prepare(&wrapped)
+                .context("failed to prepare query")
+                .map_err(Died::Binding)?;
+            let rows = stmt
+                .query([])
+                .context("query failed")
+                .map_err(Died::Executing)?;
+            drain(rows, cap)
+        }
+    }
+}
+
+/// Materialise an executed statement's rows as JSON, under the caps `collect` documents.
+fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
     // Column metadata is only materialised once the statement has executed - read it off the
     // executed result, not the prepared statement.
     let column_names: Vec<String> = rows
@@ -1570,40 +1592,28 @@ fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Valu
 
 /// `duckdb-rs` currently materialises a scaled `DECIMAL(38, s)` through
 /// `rust_decimal::Decimal`. That type only holds 96 bits, while DuckDB's decimal holds 128, and its
-/// `from_i128_with_scale` constructor panics before we can render the cell. Detect those result
-/// columns after execution, then run an outer projection which asks DuckDB to format them as text.
-/// This preserves the established JSON contract for exact wide numbers and, importantly, turns an
-/// ordinary SQL result into an ordinary SQL result rather than a request-thread panic (#1433).
-fn decimal_safe_sql(conn: &Connection, sql: &str) -> Result<String, Died> {
-    let mut stmt = conn
-        .prepare(sql)
-        .context("failed to prepare query")
-        .map_err(Died::Binding)?;
-    let rows = stmt
-        .query([])
-        .context("query failed")
-        .map_err(Died::Executing)?;
-    let columns: Vec<(String, bool)> = {
-        let Some(statement) = rows.as_ref() else {
-            return Ok(sql.to_owned());
-        };
-        statement
-            .column_names()
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let scaled_decimal = matches!(
-                    statement.column_type(i),
-                    DataType::Decimal128(_, scale) if scale != 0
-                );
-                (name.to_string(), scaled_decimal)
-            })
-            .collect()
-    };
-    drop(rows);
+/// `from_i128_with_scale` constructor panics before we can render the cell. Given an executed
+/// statement, name the outer projection that asks DuckDB to format those columns as text, or
+/// `None` when no column needs it. This preserves the established JSON contract for exact wide
+/// numbers and turns an ordinary SQL result into an ordinary SQL result rather than a request-thread
+/// panic (#1433).
+fn decimal_safe_projection(statement: Option<&duckdb::Statement<'_>>, sql: &str) -> Option<String> {
+    let statement = statement?;
+    let columns: Vec<(String, bool)> = statement
+        .column_names()
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let scaled_decimal = matches!(
+                statement.column_type(i),
+                DataType::Decimal128(_, scale) if scale != 0
+            );
+            (name.to_string(), scaled_decimal)
+        })
+        .collect();
 
     if !columns.iter().any(|(_, scaled_decimal)| *scaled_decimal) {
-        return Ok(sql.to_owned());
+        return None;
     }
 
     let projection = columns
@@ -1619,7 +1629,7 @@ fn decimal_safe_sql(conn: &Connection, sql: &str) -> Result<String, Died> {
         .collect::<Vec<_>>()
         .join(", ");
     let inner = without_trailing_statement_terminator(sql);
-    Ok(format!(
+    Some(format!(
         "SELECT {projection} FROM ({inner}) AS \"__nuthatch_decimal_source\""
     ))
 }
