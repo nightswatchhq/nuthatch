@@ -3081,10 +3081,10 @@ async fn named_scan(
         }
         let timeout = SQL_TIMEOUT.saturating_sub(started.elapsed());
         if timeout.is_zero() {
-            anyhow::bail!(
-                "query exceeded the {}s time budget on the read-only SQL surface",
-                SQL_TIMEOUT.as_secs()
-            );
+            return Err(crate::analytics::QueryBudgetExceeded {
+                secs: SQL_TIMEOUT.as_secs(),
+            }
+            .into());
         }
         let admission = NamedAdmission {
             cap,
@@ -3459,6 +3459,16 @@ async fn run_sql_query_at(
 
 fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::response::Response {
     use crate::metrics::METRICS;
+    // The guard's deadline, not a bad query. A 504 so a gateway retries or degrades instead of
+    // reporting a client error, and its own rejection reason so a slow nest is visible as one.
+    if let Some(cut) = e.downcast_ref::<crate::analytics::QueryBudgetExceeded>() {
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Timeout);
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "error": cut.to_string(), "timeout_secs": cut.secs })),
+        )
+            .into_response();
+    }
     let reason = if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
         || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
             .is_some()
