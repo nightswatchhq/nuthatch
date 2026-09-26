@@ -1,7 +1,8 @@
 # RFC-0058: Cross-nest SQL - a declared, read-only query across mounted nests in one runtime
 
-**Status:** **Draft** - awaiting Chief's decision. Design only; build slices are filed from §9 on
-acceptance. Tracking #1324.
+**Status:** **Accepted 2026-09-26 (Chief)**, when he unparked #1324 and asked for it to be built. S0
+reported the same day (§9): continue. **Parked after S0, the same day**: no user needs it now (see CLAUDE.md).
+Tracking #1324.
 
 **Date:** 2026-09-15
 
@@ -476,6 +477,17 @@ S0 runs first, and it can stop the rest.
 | S3 | Health, unmount, remount, `/ready` and `/schema` on the cross route. | Unmount a member: the cross route refuses and names it, and prune reclaims the dataset. Remount under a new NID: the provenance names it. | `nuthatch prune` keeps the dataset on the cross record's account; any request answers from the remaining member; the cross `/ready` answers `200` with a quarantined member. |
 | S4 | The budget, on the enforcing surface. | The dense multi-nest RSS gate gains a two-cursor runtime under concurrent member and cross load, with the cross connection's peak charged to every member cursor. | Any cursor's attributed RSS exceeds its 2 GiB budget; or, on any cursor, live query connections exceed its own permits plus the permits reserved on it. |
 | S5 | Documentation: `docs/operators.md`, the builder skill's `views.md`, `llms.txt`, and the MCP nest selector accepting a cross name. | The documentation drift gates pass, and a runnable example uses the Arcaidia pair. | `tests/doc_command_check.rs` or `tests/skill_refs.rs` fails; or the example's documented query does not run against the fixture runtime. |
+
+**S0 reported 2026-09-26: continue** (`analytics.rs`, `cross_nest_s0`).
+
+| Question | Answer |
+|---|---|
+| An unqualified `t` inside a view in schema `a`, with `main.t`, `a.t` and `b.t` all present | Binds `a.t`. Also true for a view created under `SET schema`, and for a view over a view in the same schema. |
+| What `json_serialize_sql` gives for `a.t` | Every `BASE_TABLE` node carries `schema_name` beside `table_name`: `a.t`, `b.t` and a bare `t` are three distinct pairs. The walk discards the pairing today, in `walk_table_refs`; it does not lose it. |
+| A timestamp for `indexed_head` after a tip commit | Present, on redb and Postgres, whether or not `block_timestamps` is set: the window boundary's record comes from one header, hash and timestamp together (#1494). Read from the code, not yet asserted by a test. |
+| After the seal-direct hand-off | Can be absent until the next tip commit, because the hand-off sets `last_block` without a header. §5 already answers `null` then. |
+
+Neither stop condition fired.
 
 ## §10 - Alternatives
 
