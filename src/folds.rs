@@ -4,10 +4,13 @@
 //! fold against the nest's surface without reading a row, and refuses anything a checkpoint could not
 //! carry exactly: a volatile call, an input it cannot enumerate, or an output that is not its carry.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{bail, Context, Result};
+use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -56,6 +59,27 @@ pub struct FoldSet {
     /// In load order, which is dependency order.
     pub folds: Vec<Fold>,
     pub retention: Retention,
+    pub snapshots: Snapshots,
+}
+
+/// Which head snapshots are kept for pinned reads (RFC-0059 §4): the latest `recent`, none older than
+/// `seconds`, and never more than `max_bytes` of Arrow between them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Snapshots {
+    pub recent: usize,
+    pub seconds: u64,
+    pub max_bytes: u64,
+}
+
+impl Default for Snapshots {
+    fn default() -> Self {
+        Snapshots {
+            recent: 16,
+            seconds: 120,
+            max_bytes: 64 << 20,
+        }
+    }
 }
 
 /// Which checkpoint files are kept (RFC-0059 §5). Every log entry is kept whatever happens to its
@@ -113,6 +137,8 @@ struct FoldsToml {
     fold: Vec<FoldDecl>,
     #[serde(default)]
     retention: Retention,
+    #[serde(default)]
+    snapshots: Snapshots,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +195,10 @@ impl FoldSet {
         if retention.recent < 2 || retention.every_blocks == 0 {
             bail!("{FOLDS_DIR}/{FOLDS_TOML}: [retention] needs recent >= 2 and every_blocks >= 1");
         }
+        let snapshots = decls.snapshots.clone();
+        if snapshots.recent == 0 || snapshots.max_bytes == 0 {
+            bail!("{FOLDS_DIR}/{FOLDS_TOML}: [snapshots] needs recent >= 1 and max_bytes >= 1");
+        }
 
         let mut files: Vec<String> = std::fs::read_dir(&root)?
             .filter_map(|e| e.ok())
@@ -222,6 +252,7 @@ impl FoldSet {
 
         let mut set = FoldSet {
             retention,
+            snapshots,
             ..FoldSet::default()
         };
         for file in &files {
@@ -963,19 +994,7 @@ impl FoldSet {
     ) -> Result<Stepper<'a>> {
         let c = self.latest_checkpoint(dir, n)?;
         if c.is_none() {
-            // Stepping from genesis is exact, but past a removed checkpoint it is exactly the
-            // history the horizon was set to stop paying for.
-            for f in &self.folds {
-                let log = load_log(dir, f)?;
-                if log.checkpoints.iter().any(|c| c.pruned && c.block <= n) {
-                    let oldest = log.checkpoints.iter().find(|c| !c.pruned).map(|c| c.block);
-                    bail!(
-                        "block {n} predates retained history for fold `{}` (oldest checkpoint: {})",
-                        f.name,
-                        oldest.map_or("none".to_string(), |b| b.to_string())
-                    );
-                }
-            }
+            self.refuse_pruned(dir, n)?;
         }
         let mut s = self.stepper(dir, schema)?;
         if let Some(b) = c {
@@ -986,6 +1005,482 @@ impl FoldSet {
         }
         Ok(s)
     }
+
+    /// Stepping from genesis is exact, but past a removed checkpoint it is exactly the history the
+    /// horizon was set to stop paying for.
+    fn refuse_pruned(&self, dir: &Path, n: u64) -> Result<()> {
+        for f in &self.folds {
+            let log = load_log(dir, f)?;
+            if log.checkpoints.iter().any(|c| c.pruned && c.block <= n) {
+                let oldest = log.checkpoints.iter().find(|c| !c.pruned).map(|c| c.block);
+                bail!(
+                    "block {n} predates retained history for fold `{}` (oldest checkpoint: {})",
+                    f.name,
+                    oldest.map_or("none".to_string(), |b| b.to_string())
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A block as head snapshots key it: the hash names the fork, the number orders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    pub number: u64,
+    pub hash: String,
+}
+
+/// Where head snapshots learn the canonical chain and read the hot tail.
+pub trait HeadSource: Send + Sync {
+    fn head(&self) -> Result<Head>;
+    /// `None` past the head.
+    fn canonical_hash(&self, number: u64) -> Result<Option<String>>;
+    /// The hot rows and the sealed watermark, as of now.
+    fn inputs(&self) -> Result<(analytics::HotRows, u64)>;
+}
+
+enum SnapshotRows {
+    Full(Vec<RecordBatch>),
+    /// A keyed fold: the rows its window touched, over the checkpoint's rows, which every snapshot
+    /// taken from that checkpoint shares.
+    Delta {
+        base: Arc<Vec<RecordBatch>>,
+        touched: Vec<RecordBatch>,
+        key: Vec<String>,
+    },
+}
+
+/// Every fold's state at one head (RFC-0059 §4).
+pub struct Snapshot {
+    pub head: Head,
+    /// The checkpoint the window was evaluated from; `None` from genesis.
+    pub checkpoint: Option<u64>,
+    folds: Vec<(String, SnapshotRows)>,
+    taken: std::time::Instant,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("head", &self.head)
+            .field("checkpoint", &self.checkpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Snapshot {
+    /// One fold's rows at this head, in no particular order.
+    pub fn rows(&self, fold: &str) -> Result<Vec<RecordBatch>> {
+        let (_, rows) = self
+            .folds
+            .iter()
+            .find(|(f, _)| f == fold)
+            .with_context(|| format!("no fold `{fold}`"))?;
+        match rows {
+            SnapshotRows::Full(b) => Ok(b.clone()),
+            SnapshotRows::Delta { base, touched, key } => {
+                let mut seen = std::collections::HashSet::new();
+                for b in touched {
+                    seen.extend(key_strings(b, key)?);
+                }
+                let mut out = touched.clone();
+                for b in base.iter() {
+                    let keep: arrow::array::BooleanArray = key_strings(b, key)?
+                        .iter()
+                        .map(|k| Some(!seen.contains(k)))
+                        .collect();
+                    out.push(arrow::compute::filter_record_batch(b, &keep)?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Arrow bytes this snapshot holds alone, leaving out the checkpoint rows it shares.
+    fn own_bytes(&self) -> usize {
+        let size = |b: &[RecordBatch]| b.iter().map(|b| b.get_array_memory_size()).sum::<usize>();
+        self.folds
+            .iter()
+            .map(|(_, r)| match r {
+                SnapshotRows::Full(b) => size(b),
+                SnapshotRows::Delta { touched, .. } => size(touched),
+            })
+            .sum()
+    }
+
+    fn bases(&self) -> impl Iterator<Item = &Arc<Vec<RecordBatch>>> {
+        self.folds.iter().filter_map(|(_, r)| match r {
+            SnapshotRows::Delta { base, .. } => Some(base),
+            SnapshotRows::Full(_) => None,
+        })
+    }
+}
+
+/// Each row's key as one string. A null and an empty value must not collide, so each cell is tagged.
+fn key_strings(b: &RecordBatch, key: &[String]) -> Result<Vec<String>> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+    use std::fmt::Write;
+    let opts = FormatOptions::default();
+    let cols = key
+        .iter()
+        .map(|k| {
+            b.column_by_name(k)
+                .with_context(|| format!("no key column `{k}`"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fmts = cols
+        .iter()
+        .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((0..b.num_rows())
+        .map(|i| {
+            let mut s = String::new();
+            for (c, f) in cols.iter().zip(&fmts) {
+                if c.is_null(i) {
+                    s.push('\0');
+                } else {
+                    let _ = write!(s, "\u{1}{}", f.value(i));
+                }
+                s.push('\u{1f}');
+            }
+            s
+        })
+        .collect())
+}
+
+/// Bytes the retained snapshots hold between them, each shared checkpoint counted once.
+fn retained_bytes(retained: &VecDeque<Arc<Snapshot>>) -> u64 {
+    let mut bases = BTreeSet::new();
+    let mut total = 0usize;
+    for s in retained {
+        total += s.own_bytes();
+        for b in s.bases() {
+            if bases.insert(Arc::as_ptr(b) as usize) {
+                total += b.iter().map(|b| b.get_array_memory_size()).sum::<usize>();
+            }
+        }
+    }
+    total as u64
+}
+
+/// RFC-0059 §4, evaluated lazily (Chief, 2026-09-26, #1513): the first reader at a new head starts
+/// the one evaluation, every other reader at that head waits for it, and nothing runs while nobody
+/// reads. One thread per nest evaluates; at most one evaluation is in flight.
+pub struct HeadSnapshots {
+    shared: Arc<HeadShared>,
+    tx: Option<std::sync::mpsc::Sender<(u64, Head)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct HeadShared {
+    state: Mutex<HeadState>,
+    finished: Condvar,
+    evaluations: AtomicU64,
+    source: Arc<dyn HeadSource>,
+    cfg: Snapshots,
+}
+
+#[derive(Default)]
+struct HeadState {
+    /// Oldest first.
+    retained: VecDeque<Arc<Snapshot>>,
+    in_flight: Option<(u64, Head)>,
+    attempts: u64,
+    /// Attempts some reader is still waiting on. The last reader to claim an outcome removes it, so
+    /// an evicted snapshot is owned by nothing here (Jules on #1517).
+    waiters: BTreeMap<u64, Waiters>,
+}
+
+struct Waiters {
+    head: Head,
+    readers: usize,
+    outcome: Option<Result<Arc<Snapshot>, String>>,
+}
+
+impl HeadState {
+    fn expire(&mut self, cfg: &Snapshots) {
+        let ttl = std::time::Duration::from_secs(cfg.seconds);
+        self.retained.retain(|s| s.taken.elapsed() <= ttl);
+    }
+
+    fn admit(&mut self, cfg: &Snapshots, snap: Arc<Snapshot>) -> Result<()> {
+        // Another hash at this height is a fork that lost; `pinned` checks everything else.
+        self.retained.retain(|s| s.head.number != snap.head.number);
+        self.retained.push_back(snap);
+        while self.retained.len() > cfg.recent {
+            self.retained.pop_front();
+        }
+        while retained_bytes(&self.retained) > cfg.max_bytes {
+            if self.retained.len() == 1 {
+                let s = self.retained.pop_front().expect("one");
+                bail!(
+                    "the fold snapshot at block {} holds {} bytes, over [snapshots] max_bytes {}",
+                    s.head.number,
+                    retained_bytes(&VecDeque::from([s.clone()])),
+                    cfg.max_bytes
+                );
+            }
+            self.retained.pop_front();
+        }
+        Ok(())
+    }
+}
+
+impl HeadSnapshots {
+    /// `None` when the nest has no `folds/`.
+    pub fn start(
+        dir: std::path::PathBuf,
+        schema: Vec<TableSchema>,
+        set: FoldSet,
+        source: Arc<dyn HeadSource>,
+    ) -> Result<Option<HeadSnapshots>> {
+        if set.folds.is_empty() {
+            return Ok(None);
+        }
+        let shared = Arc::new(HeadShared {
+            state: Mutex::new(HeadState::default()),
+            finished: Condvar::new(),
+            evaluations: AtomicU64::new(0),
+            source,
+            cfg: set.snapshots.clone(),
+        });
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, Head)>();
+        let worker = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("fold-head".into())
+            .spawn(move || head_loop(&dir, &schema, &set, rx, &worker))?;
+        Ok(Some(HeadSnapshots {
+            shared,
+            tx: Some(tx),
+            thread: Some(thread),
+        }))
+    }
+
+    /// The snapshot at the canonical head.
+    pub fn at_head(&self) -> Result<Arc<Snapshot>> {
+        let head = self.shared.source.head()?;
+        self.at(head)
+    }
+
+    /// A read pinned to a hash an earlier response named. Refused once it has expired, or when the
+    /// block it names has been reorged away.
+    pub fn pinned(&self, hash: &str) -> Result<Arc<Snapshot>> {
+        let snap = {
+            let mut st = self.shared.state.lock().unwrap();
+            st.expire(&self.shared.cfg);
+            st.retained.iter().find(|s| s.head.hash == hash).cloned()
+        };
+        let Some(snap) = snap else {
+            bail!(
+                "block hash {hash} names no retained fold snapshot: it expired, or was never read at \
+                 head"
+            );
+        };
+        let canonical = self.shared.source.canonical_hash(snap.head.number)?;
+        if canonical.as_deref() != Some(hash) {
+            let mut st = self.shared.state.lock().unwrap();
+            st.retained.retain(|s| s.head.hash != hash);
+            bail!(
+                "block hash {hash} is not canonical: block {} was reorged away",
+                snap.head.number
+            );
+        }
+        Ok(snap)
+    }
+
+    /// Evaluations run since start, whatever their outcome.
+    pub fn evaluations(&self) -> u64 {
+        self.shared.evaluations.load(Ordering::Relaxed)
+    }
+
+    pub fn retained(&self) -> (usize, u64) {
+        let st = self.shared.state.lock().unwrap();
+        (st.retained.len(), retained_bytes(&st.retained))
+    }
+
+    fn at(&self, head: Head) -> Result<Arc<Snapshot>> {
+        let sh = &self.shared;
+        let mut st = sh.state.lock().unwrap();
+        let mut waiting: Option<u64> = None;
+        loop {
+            // An attempt for another head, once finished, leaves this reader to start its own.
+            if let Some(a) = waiting.take() {
+                let w = st
+                    .waiters
+                    .get_mut(&a)
+                    .expect("a waited attempt stays until claimed");
+                let Some(out) = w.outcome.clone() else {
+                    waiting = Some(a);
+                    st = sh.finished.wait(st).unwrap();
+                    continue;
+                };
+                let mine = w.head == head;
+                w.readers -= 1;
+                if w.readers == 0 {
+                    st.waiters.remove(&a);
+                }
+                if mine {
+                    return out.map_err(|e| anyhow::anyhow!(e));
+                }
+            }
+            st.expire(&sh.cfg);
+            if let Some(s) = st.retained.iter().find(|s| s.head == head) {
+                return Ok(s.clone());
+            }
+            if let Some((a, _)) = &st.in_flight {
+                let a = *a;
+                st.waiters.get_mut(&a).expect("in flight").readers += 1;
+                waiting = Some(a);
+                continue;
+            }
+            st.attempts += 1;
+            let a = st.attempts;
+            st.in_flight = Some((a, head.clone()));
+            st.waiters.insert(
+                a,
+                Waiters {
+                    head: head.clone(),
+                    readers: 1,
+                    outcome: None,
+                },
+            );
+            let sent = self.tx.as_ref().map(|tx| tx.send((a, head.clone())));
+            if !matches!(sent, Some(Ok(()))) {
+                st.in_flight = None;
+                st.waiters.remove(&a);
+                bail!("the fold head thread has stopped");
+            }
+            waiting = Some(a);
+        }
+    }
+}
+
+impl Drop for HeadSnapshots {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// A stepper resumed at one checkpoint, and the rows of each keyed fold there.
+struct Resumed<'a> {
+    from: Option<u64>,
+    stepper: Stepper<'a>,
+    bases: Vec<Option<Arc<Vec<RecordBatch>>>>,
+}
+
+fn head_loop(
+    dir: &Path,
+    schema: &[TableSchema],
+    set: &FoldSet,
+    rx: std::sync::mpsc::Receiver<(u64, Head)>,
+    sh: &HeadShared,
+) {
+    let mut resumed: Option<Resumed> = None;
+    while let Ok((attempt, head)) = rx.recv() {
+        sh.evaluations.fetch_add(1, Ordering::Relaxed);
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            evaluate_head(dir, schema, set, &mut resumed, sh.source.as_ref(), &head)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("fold evaluation panicked")));
+        if out.is_err() {
+            // The stepper may be mid-transaction; the next reader starts from a fresh one.
+            resumed = None;
+        }
+        let mut st = sh.state.lock().unwrap();
+        st.in_flight = None;
+        let out = out
+            .map(Arc::new)
+            .and_then(|s| st.admit(&sh.cfg, s.clone()).map(|()| s))
+            .map_err(|e| format!("{e:#}"));
+        if let Some(w) = st.waiters.get_mut(&attempt) {
+            w.outcome = Some(out);
+        }
+        sh.finished.notify_all();
+    }
+}
+
+fn evaluate_head<'a>(
+    dir: &Path,
+    schema: &[TableSchema],
+    set: &'a FoldSet,
+    resumed: &mut Option<Resumed<'a>>,
+    source: &dyn HeadSource,
+    head: &Head,
+) -> Result<Snapshot> {
+    let from = set.latest_checkpoint(dir, head.number)?;
+    if from.is_none() {
+        set.refuse_pruned(dir, head.number)?;
+    }
+    if resumed.as_ref().map(|r| r.from) != Some(from) {
+        let mut stepper = set.stepper(dir, schema)?;
+        if let Some(b) = from {
+            stepper.resume(b)?;
+        }
+        let mut bases = Vec::with_capacity(set.folds.len());
+        for f in &set.folds {
+            bases.push(match (&f.key, from) {
+                (FoldKey::Columns(_), Some(_)) => Some(Arc::new(
+                    stepper
+                        .eval
+                        .arrow(&format!("SELECT * FROM \"{}\"", f.name))?,
+                )),
+                (FoldKey::Columns(_), None) => Some(Arc::new(Vec::new())),
+                _ => None,
+            });
+        }
+        *resumed = Some(Resumed {
+            from,
+            stepper,
+            bases,
+        });
+    }
+    let Resumed { stepper, bases, .. } = resumed.as_mut().expect("resumed above");
+    let collect = |s: &Stepper, stepped: bool| -> Result<Vec<(String, SnapshotRows)>> {
+        let mut out = Vec::with_capacity(set.folds.len());
+        for (f, base) in set.folds.iter().zip(bases.iter()) {
+            let rows = match (&f.key, base) {
+                (FoldKey::Columns(key), Some(base)) => SnapshotRows::Delta {
+                    base: base.clone(),
+                    touched: if stepped {
+                        s.eval
+                            .arrow(&format!("SELECT * FROM \"__step_{}\"", f.name))?
+                    } else {
+                        Vec::new()
+                    },
+                    key: key.clone(),
+                },
+                _ if stepped || from.is_some() => {
+                    SnapshotRows::Full(s.eval.arrow(&format!("SELECT * FROM \"{}\"", f.name))?)
+                }
+                _ => SnapshotRows::Full(Vec::new()),
+            };
+            out.push((f.name.clone(), rows));
+        }
+        Ok(out)
+    };
+    let folds = if from == Some(head.number) {
+        collect(stepper, false)?
+    } else {
+        let (hot, sealed_through) = source.inputs()?;
+        stepper.probe(&hot, sealed_through, head.number, |s| collect(s, true))?
+    };
+    // The hot rows were read after the head was named, so a reorg in between shows here.
+    if source.canonical_hash(head.number)?.as_deref() != Some(head.hash.as_str()) {
+        bail!(
+            "block {} was reorged while its folds were evaluated; read again",
+            head.number
+        );
+    }
+    Ok(Snapshot {
+        head: head.clone(),
+        checkpoint: from,
+        folds,
+        taken: std::time::Instant::now(),
+    })
 }
 
 /// Sealed rows a walk reads before it checkpoints, when nothing narrower is asked for.
@@ -1188,13 +1683,17 @@ pub fn run(cmd: crate::cli::FoldCommand) -> Result<()> {
                 println!("{row}");
             }
         }
-        FoldCommand::Bench { iters, .. } => {
+        FoldCommand::Bench {
+            iters, snapshots, ..
+        } => {
             let hot = store.hot_rows_by_table()?;
             phases.mark("hot rows read");
-            println!(
-                "{}",
+            let out = if snapshots {
+                bench_snapshots(dir, &set, hot, sealed_through, &mut phases)?
+            } else {
                 bench(dir, &set, &hot, sealed_through, iters, &mut phases)?
-            );
+            };
+            println!("{out}");
         }
     }
     Ok(())
@@ -1238,17 +1737,13 @@ fn reset_peak() {
 
 /// RFC-0059 S1's gate: head evaluation in one warm process, measured per the 2026-09-24 ruling. The
 /// latest checkpoint is resumed once; each hot block is then evaluated from it and discarded.
-fn bench(
+/// The latest checkpoint, and every hot block past it that a fold reaches.
+fn bench_heads(
     dir: &Path,
     set: &FoldSet,
     hot: &analytics::HotRows,
     sealed_through: u64,
-    iters: usize,
-    phases: &mut Phases,
-) -> Result<serde_json::Value> {
-    if iters == 0 {
-        bail!("--iters must be at least 1");
-    }
+) -> Result<(u64, Vec<u64>)> {
     let from = set
         .latest_checkpoint(dir, sealed_through)?
         .context("no checkpoint to resume; run `nuthatch fold build` first")?;
@@ -1264,6 +1759,94 @@ fn bench(
     if heads.is_empty() {
         heads.push(sealed_through.max(from + 1));
     }
+    Ok((from, heads))
+}
+
+/// RFC-0059 S3's memory criterion: every hot head read once through the head snapshots, with the
+/// retained set's Arrow bytes and the process's peak measured after each.
+fn bench_snapshots(
+    dir: &Path,
+    set: &FoldSet,
+    hot: analytics::HotRows,
+    sealed_through: u64,
+    phases: &mut Phases,
+) -> Result<serde_json::Value> {
+    struct Walk {
+        head: Mutex<u64>,
+        hot: analytics::HotRows,
+        sealed_through: u64,
+    }
+    impl HeadSource for Walk {
+        fn head(&self) -> Result<Head> {
+            let n = *self.head.lock().unwrap();
+            Ok(Head {
+                number: n,
+                hash: n.to_string(),
+            })
+        }
+        fn canonical_hash(&self, number: u64) -> Result<Option<String>> {
+            Ok((number <= *self.head.lock().unwrap()).then(|| number.to_string()))
+        }
+        fn inputs(&self) -> Result<(analytics::HotRows, u64)> {
+            Ok((self.hot.clone(), self.sealed_through))
+        }
+    }
+    let (from, heads) = bench_heads(dir, set, &hot, sealed_through)?;
+    let walk = Arc::new(Walk {
+        head: Mutex::new(heads[0]),
+        hot,
+        sealed_through,
+    });
+    let snaps = HeadSnapshots::start(dir.to_path_buf(), vec![], set.clone(), walk.clone())?
+        .context("no folds")?;
+    // The first read pays for resuming the checkpoint and binding views, once per process.
+    snaps.at_head()?;
+    phases.mark("warmed up");
+    let (mut wall, mut max_retained, mut peak_kib) = (Vec::new(), (0usize, 0u64), 0u64);
+    for &n in &heads[1..] {
+        *walk.head.lock().unwrap() = n;
+        let started = std::time::Instant::now();
+        snaps.at_head()?;
+        wall.push(started.elapsed().as_secs_f64() * 1000.0);
+        let r = snaps.retained();
+        if r.1 > max_retained.1 {
+            max_retained = r;
+        }
+        if let Some((hwm, _)) = memory_kib() {
+            peak_kib = peak_kib.max(hwm);
+        }
+    }
+    wall.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| {
+        (!wall.is_empty())
+            .then(|| wall[((wall.len() as f64 * p).ceil() as usize).clamp(1, wall.len()) - 1])
+    };
+    Ok(serde_json::json!({
+        "folds": set.folds.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+        "checkpoint": from,
+        "heads": heads.len(),
+        "evaluations": snaps.evaluations(),
+        "wall_ms": { "p50": pct(0.50), "p99": pct(0.99), "max": wall.last() },
+        "retained_max": { "snapshots": max_retained.0, "bytes": max_retained.1 },
+        "declared": { "recent": set.snapshots.recent, "seconds": set.snapshots.seconds, "max_bytes": set.snapshots.max_bytes },
+        "peak_rss_mib": (peak_kib > 0).then(|| peak_kib as f64 / 1024.0),
+        "targets": { "p99_ms": 500, "peak_rss_mib": 300 },
+        "phases": phases.0,
+    }))
+}
+
+fn bench(
+    dir: &Path,
+    set: &FoldSet,
+    hot: &analytics::HotRows,
+    sealed_through: u64,
+    iters: usize,
+    phases: &mut Phases,
+) -> Result<serde_json::Value> {
+    if iters == 0 {
+        bail!("--iters must be at least 1");
+    }
+    let (from, heads) = bench_heads(dir, set, hot, sealed_through)?;
     let mut s = set.stepper(dir, &[])?;
     s.resume(from)?;
     phases.mark("checkpoint resumed");
@@ -3026,5 +3609,296 @@ mod retention {
         );
         let err = FoldSet::load(dir.path(), &[]).unwrap_err();
         assert!(format!("{err:#}").contains("recent >= 2"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod head_snapshots {
+    use super::stepping_support::*;
+    use super::*;
+
+    struct Chain {
+        hashes: Mutex<BTreeMap<u64, String>>,
+        head: Mutex<u64>,
+        hot: analytics::HotRows,
+        delay: std::time::Duration,
+    }
+
+    impl Chain {
+        fn new(hot: analytics::HotRows, head: u64) -> Arc<Chain> {
+            Arc::new(Chain {
+                hashes: Mutex::new((1..=head).map(|n| (n, format!("h{n}"))).collect()),
+                head: Mutex::new(head),
+                hot,
+                delay: std::time::Duration::from_millis(200),
+            })
+        }
+
+        fn advance(&self, to: u64) {
+            *self.head.lock().unwrap() = to;
+            let mut h = self.hashes.lock().unwrap();
+            for n in 1..=to {
+                h.entry(n).or_insert_with(|| format!("h{n}"));
+            }
+        }
+
+        fn reorg(&self, at: u64) {
+            self.hashes.lock().unwrap().insert(at, format!("h{at}b"));
+        }
+    }
+
+    impl HeadSource for Chain {
+        fn head(&self) -> Result<Head> {
+            let n = *self.head.lock().unwrap();
+            Ok(Head {
+                number: n,
+                hash: self.hashes.lock().unwrap()[&n].clone(),
+            })
+        }
+        fn canonical_hash(&self, number: u64) -> Result<Option<String>> {
+            Ok(self.hashes.lock().unwrap().get(&number).cloned())
+        }
+        fn inputs(&self) -> Result<(analytics::HotRows, u64)> {
+            std::thread::sleep(self.delay);
+            Ok((self.hot.clone(), 30))
+        }
+    }
+
+    const FOLDS: &[(&str, &str)] = &[
+        (
+            "10-latest.sql",
+            "SELECT k, v FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY block_number DESC) = 1",
+        ),
+        (
+            "20-running.sql",
+            "SELECT CAST(coalesce((SELECT max(n) FROM running__carry), 0) + count(*) AS UBIGINT) AS n FROM t",
+        ),
+        (
+            "30-seen.sql",
+            "SELECT DISTINCT k FROM (SELECT k FROM seen__carry UNION ALL SELECT k FROM t)",
+        ),
+    ];
+    const DECLS: &str = "[[fold]]\nname = \"latest\"\nkey = [\"k\"]\ncarry = [\"k VARCHAR\", \"v VARCHAR\"]\nmax_rows = 3\n\
+         [[fold]]\nname = \"running\"\nkey = \"singleton\"\ncarry = [\"n UBIGINT\"]\nmax_rows = 1\n\
+         [[fold]]\nname = \"seen\"\nkey = \"unkeyed\"\ncarry = [\"k VARCHAR\"]\nmax_rows = 3\n";
+
+    /// Checkpoints at 10, 20 and 30; blocks 31 to 35 hot.
+    fn built(snapshots: &str) -> (tempfile::TempDir, analytics::HotRows, FoldSet) {
+        let (dir, hot) = corpus();
+        fold_files(dir.path(), FOLDS, &format!("{DECLS}{snapshots}"));
+        let set = FoldSet::load(dir.path(), &[]).unwrap();
+        set.build(dir.path(), &[], 30, 10).unwrap();
+        (dir, hot, set)
+    }
+
+    fn start(dir: &Path, set: &FoldSet, chain: &Arc<Chain>) -> HeadSnapshots {
+        HeadSnapshots::start(dir.to_path_buf(), vec![], set.clone(), chain.clone())
+            .unwrap()
+            .expect("folds")
+    }
+
+    fn sorted(batches: &[RecordBatch]) -> Vec<String> {
+        use arrow::util::display::{ArrayFormatter, FormatOptions};
+        let opts = FormatOptions::default();
+        let mut out = Vec::new();
+        for b in batches {
+            let mut names: Vec<&str> = b
+                .schema_ref()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            names.sort();
+            let cols: Vec<_> = names.iter().map(|n| b.column_by_name(n).unwrap()).collect();
+            let fmts: Vec<_> = cols
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts).unwrap())
+                .collect();
+            for i in 0..b.num_rows() {
+                out.push(
+                    names
+                        .iter()
+                        .zip(&fmts)
+                        .map(|(n, f)| format!("{n}={}", f.value(i)))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// RFC-0059 S3: N concurrent requests at one head cause exactly one evaluation.
+    #[test]
+    fn concurrent_readers_at_one_head_cause_one_evaluation() {
+        let (dir, hot, set) = built("");
+        let chain = Chain::new(hot, 35);
+        let heads = Arc::new(start(dir.path(), &set, &chain));
+        let gate = Arc::new(std::sync::Barrier::new(16));
+        let readers: Vec<_> = (0..16)
+            .map(|_| {
+                let (heads, gate) = (heads.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    heads.at_head().unwrap()
+                })
+            })
+            .collect();
+        let got: Vec<Arc<Snapshot>> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+        assert_eq!(heads.evaluations(), 1);
+        assert!(
+            got.iter().all(|s| Arc::ptr_eq(s, &got[0])),
+            "one shared snapshot"
+        );
+        assert_eq!(got[0].head.number, 35);
+    }
+
+    /// What S4 will serve must be what the on-demand path computes: the keyed delta merged over its
+    /// checkpoint, a singleton and an unkeyed fold, from a stepped head and from a checkpoint itself.
+    #[test]
+    fn a_snapshot_equals_the_on_demand_read_at_its_block() {
+        let (dir, hot, set) = built("");
+        let chain = Chain::new(hot.clone(), 30);
+        let heads = start(dir.path(), &set, &chain);
+        for n in [30, 31, 33, 35] {
+            chain.advance(n);
+            let snap = heads.at_head().unwrap();
+            let s = set.read_at(dir.path(), &[], &hot, 30, n).unwrap();
+            for f in ["latest", "running", "seen"] {
+                let want = s.eval.arrow(&format!("SELECT * FROM \"{f}\"")).unwrap();
+                assert_eq!(sorted(&snap.rows(f).unwrap()), sorted(&want), "{f} at {n}");
+            }
+        }
+        assert_eq!(heads.evaluations(), 4);
+    }
+
+    /// The keyed fold keeps only what its window touched; the checkpoint's rows are shared.
+    #[test]
+    fn a_keyed_snapshot_holds_its_touched_keys_over_a_shared_checkpoint() {
+        let (dir, hot, set) = built("");
+        let chain = Chain::new(hot, 31);
+        let heads = start(dir.path(), &set, &chain);
+        let a = heads.at_head().unwrap();
+        chain.advance(32);
+        let b = heads.at_head().unwrap();
+        let touched = |s: &Snapshot| match &s.folds[0].1 {
+            SnapshotRows::Delta { touched, .. } => {
+                touched.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
+            SnapshotRows::Full(_) => panic!("latest is keyed"),
+        };
+        assert_eq!((touched(&a), touched(&b)), (1, 2));
+        let base = |s: &Snapshot| Arc::as_ptr(s.bases().next().unwrap());
+        assert_eq!(base(&a), base(&b), "one copy of the checkpoint");
+    }
+
+    /// RFC-0059 S3: a pinned read to a retained hash is identical to the head response at that hash.
+    #[test]
+    fn a_pinned_read_to_a_retained_hash_is_the_head_response() {
+        let (dir, hot, set) = built("");
+        let chain = Chain::new(hot, 33);
+        let heads = start(dir.path(), &set, &chain);
+        let first = heads.at_head().unwrap();
+        chain.advance(35);
+        let later = heads.at_head().unwrap();
+        assert_eq!(later.head.number, 35);
+        let pinned = heads.pinned("h33").unwrap();
+        assert!(Arc::ptr_eq(&pinned, &first));
+        assert_eq!(heads.evaluations(), 2, "a pinned read evaluates nothing");
+    }
+
+    /// RFC-0059 S3: an orphaned hash is refused, and its snapshot is dropped.
+    #[test]
+    fn an_orphaned_hash_is_refused() {
+        let (dir, hot, set) = built("");
+        let chain = Chain::new(hot, 34);
+        let heads = start(dir.path(), &set, &chain);
+        heads.at_head().unwrap();
+        chain.reorg(34);
+        chain.advance(35);
+        let err = format!("{:#}", heads.pinned("h34").unwrap_err());
+        assert!(err.contains("not canonical"), "{err}");
+        assert_eq!(heads.retained().0, 0);
+    }
+
+    /// RFC-0059 S3: the retained set stays within `recent` and `max_bytes`.
+    #[test]
+    fn retained_snapshots_stay_within_the_declared_bound() {
+        let (dir, hot, set) = built("[snapshots]\nrecent = 2\n");
+        let chain = Chain::new(hot.clone(), 31);
+        let heads = start(dir.path(), &set, &chain);
+        for n in 31..=34 {
+            chain.advance(n);
+            heads.at_head().unwrap();
+        }
+        assert_eq!(heads.retained().0, 2);
+        assert!(heads.pinned("h32").is_err(), "evicted past recent");
+        assert!(heads.pinned("h33").is_ok());
+
+        let one = heads.retained().1 / 2;
+        let tight = |max: u64| {
+            let (dir, hot, set) = built(&format!("[snapshots]\nmax_bytes = {max}\n"));
+            let chain = Chain::new(hot, 34);
+            let heads = start(dir.path(), &set, &chain);
+            (dir, heads, chain)
+        };
+        let (_d, heads, chain) = tight(one + one / 2);
+        heads.at_head().unwrap();
+        chain.advance(35);
+        heads.at_head().unwrap();
+        let (count, bytes) = heads.retained();
+        assert!(bytes <= one + one / 2, "{bytes} over the bound");
+        assert_eq!(count, 1);
+
+        let (_d, heads, _chain) = tight(1);
+        let err = format!("{:#}", heads.at_head().unwrap_err());
+        assert!(err.contains("max_bytes"), "{err}");
+        assert_eq!(heads.retained(), (0, 0));
+    }
+
+    /// With `seconds = 0` nothing is retained, yet the readers of an evaluation still get its result.
+    #[test]
+    fn an_expired_snapshot_still_answers_the_readers_that_waited_for_it() {
+        let (dir, hot, set) = built("[snapshots]\nseconds = 0\n");
+        let chain = Chain::new(hot, 35);
+        let heads = start(dir.path(), &set, &chain);
+        assert_eq!(heads.at_head().unwrap().head.number, 35);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let err = format!("{:#}", heads.pinned("h35").unwrap_err());
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn the_snapshot_bench_reads_every_hot_head_once() {
+        let (dir, hot, set) = built("");
+        let out = bench_snapshots(dir.path(), &set, hot, 30, &mut Phases::default()).unwrap();
+        assert_eq!(out["heads"], 5);
+        assert_eq!(out["evaluations"], 5);
+        assert!(out["retained_max"]["bytes"].as_u64().unwrap() <= set.snapshots.max_bytes);
+    }
+
+    /// Jules on #1517: an evicted snapshot must be freed, not kept alive by the readers' bookkeeping.
+    #[test]
+    fn an_evicted_snapshot_is_freed() {
+        let (dir, hot, set) = built("[snapshots]\nrecent = 1\n");
+        let chain = Chain::new(hot, 31);
+        let heads = start(dir.path(), &set, &chain);
+        let first = Arc::downgrade(&heads.at_head().unwrap());
+        chain.advance(32);
+        heads.at_head().unwrap();
+        assert!(first.upgrade().is_none(), "evicted, yet still resident");
+    }
+
+    #[test]
+    fn an_empty_snapshot_bound_is_refused_at_load() {
+        let (dir, _hot) = corpus();
+        fold_files(
+            dir.path(),
+            FOLDS,
+            &format!("{DECLS}[snapshots]\nrecent = 0\n"),
+        );
+        let err = FoldSet::load(dir.path(), &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("[snapshots]"), "{err:#}");
     }
 }

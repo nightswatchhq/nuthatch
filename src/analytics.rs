@@ -4117,6 +4117,12 @@ impl FoldEvaluator {
         Ok((count, hex::encode(sum)))
     }
 
+    /// A result as Arrow, for head snapshots (RFC-0059 §4), whose size must be counted exactly.
+    pub(crate) fn arrow(&self, sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        Ok(stmt.query_arrow([])?.collect())
+    }
+
     pub(crate) fn rows(&self, sql: &str) -> Result<Vec<Value>> {
         collect(&self.conn, sql, None)
             .map(|(rows, _)| rows)
