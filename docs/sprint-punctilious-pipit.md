@@ -3,8 +3,8 @@
 **Finish the fold runtime with head snapshots, then port the first folds whose failure costs an indexer
 money.**
 
-**Stopped 2026-09-26.** #1512 and #1513 landed. Chief then parked RFC-0059 and RFC-0060, so #1514 and
-#1516 were parked unstarted; see CLAUDE.md.
+**Stopped 2026-09-26.** #1512 and #1513 landed. Chief then parked RFC-0059 and RFC-0060. #1514 was scoped and
+its carry measured (861,541 allocations) but not built; #1516 was not started. See CLAUDE.md.
 
 ## Definition of done
 
