@@ -41,6 +41,9 @@ pub(crate) enum Kind {
     Refusal,
     /// A catalogue call the secondary would not take; `sql` names the call.
     Catalogue,
+    /// Both answered and the rows differ, but the statement takes a `LIMIT` with no `ORDER BY`,
+    /// so which rows it gets is the engine's choice and not a wrong answer. Recorded, not counted.
+    Unordered,
     /// The secondary was not run: the primary had used the budget.
     Skipped,
 }
@@ -176,6 +179,14 @@ fn outcome(r: &Result<(Vec<Value>, bool), Died>) -> String {
     }
 }
 
+/// A `LIMIT` with no `ORDER BY` anywhere: the rows kept are whichever the engine met first. A
+/// textual test, so a subquery's `ORDER BY` counts for the whole statement; that errs towards
+/// calling a difference real, which is the direction to err in.
+fn limits_without_order(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.contains("LIMIT") && !upper.contains("ORDER BY")
+}
+
 /// Rows compared as a multiset: an engine may return them in any order unless the statement orders
 /// them, and a difference in order alone is not a difference in answer.
 fn same_rows(a: &[Value], b: &[Value]) -> Option<String> {
@@ -237,7 +248,13 @@ impl Session for ShadowSession {
             (Ok((_, true)), Ok(_)) | (Ok(_), Ok((_, true))) => {
                 Some((Kind::Rows, "truncation differs".to_string()))
             }
-            (Ok((a, _)), Ok((b, _))) => same_rows(a, b).map(|why| (Kind::Rows, why)),
+            (Ok((a, _)), Ok((b, _))) => same_rows(a, b).map(|why| {
+                if limits_without_order(sql) {
+                    (Kind::Unordered, why)
+                } else {
+                    (Kind::Rows, why)
+                }
+            }),
             (Ok(_), Err(_)) | (Err(_), Ok(_)) => Some((Kind::Refusal, String::new())),
             (Err(_), Err(_)) => None,
         };
