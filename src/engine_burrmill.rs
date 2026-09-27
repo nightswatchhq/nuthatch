@@ -425,16 +425,25 @@ mod tests {
         let dir = Path::new(&nest);
         let seen = Arc::new(Mutex::new(Vec::<Difference>::new()));
         let s = seen.clone();
+        let recording: crate::engine_shadow::Sink = Arc::new(move |d: &Difference| {
+            eprintln!(
+                "DIFF\t{:?}\tprimary={}\tsecondary={}\tprimary_ms={}\tsecondary_ms={}\n\t{}",
+                d.kind, d.primary, d.secondary, d.primary_ms, d.secondary_ms, d.sql
+            );
+            s.lock().unwrap().push(d.clone());
+        });
+        // The same file `enable_shadow` would write, so the replay exercises the operator's sink.
+        let sink = match std::env::var_os("NUTHATCH_SHADOW_LOG") {
+            Some(path) => crate::engine_shadow::both_sinks(
+                recording,
+                crate::engine_shadow::file_sink(Path::new(&path)).unwrap(),
+            ),
+            None => recording,
+        };
         crate::engine_shadow::install(ShadowEngine::new(
             Box::new(crate::engine_duck::DuckEngine),
             Box::new(BurrmillEngine),
-            Arc::new(move |d: &Difference| {
-                eprintln!(
-                    "DIFF\t{:?}\tprimary={}\tsecondary={}\tprimary_ms={}\tsecondary_ms={}\n\t{}",
-                    d.kind, d.primary, d.secondary, d.primary_ms, d.secondary_ms, d.sql
-                );
-                s.lock().unwrap().push(d.clone());
-            }),
+            sink,
         ))
         .unwrap();
         let mut views: Vec<String> = crate::analytics::nest_view_files(dir)
