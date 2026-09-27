@@ -1581,7 +1581,7 @@ fn reject_statement_stacking(sql: &str) -> Result<()> {
 /// no table function at all to do its job - these exist because ordinary analytical SQL uses them for
 /// generating rows, not for reaching data. Adding to this list means asserting a function cannot read a
 /// file, open a socket, or leak the environment.
-const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
+pub(crate) const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
 
 /// Ask DuckDB's parser what the statement references, and refuse anything unrecognised.
 ///
@@ -1608,54 +1608,12 @@ fn reject_unknown_table_refs(
     session: &dyn Session,
     sql: &str,
 ) -> Result<Option<(std::collections::BTreeSet<String>, bool)>> {
-    let Ok(v) = session.serialize_sql(sql) else {
-        return Ok(None);
-    };
-    if v.get("error").and_then(Value::as_bool) == Some(true) {
-        // DuckDB could not parse it. Let it say so itself, with its own error message.
-        return Ok(None);
-    }
-    let mut referenced = std::collections::BTreeSet::new();
-    // Whether this statement reaches outside the nest's own tables - a catalogue schema, or a
-    // catalogue-listing table function. Such a statement needs **every** view defined, because what
-    // it is asking for is the list of them (#896).
-    let mut surveys = false;
-    let mut bad: Option<String> = None;
-    walk_table_refs(&v, &mut |kind, name| {
-        if bad.is_some() {
-            return;
-        }
-        match kind {
-            "TABLE_FUNCTION" => {
-                let f = name.to_ascii_lowercase();
-                if !ALLOWED_TABLE_FNS.contains(&f.as_str()) {
-                    bad = Some(format!("table function `{name}` is not permitted here"));
-                }
-                // `duckdb_views()`, `duckdb_tables()` and friends enumerate the catalogue.
-                if f.starts_with("duckdb_") {
-                    surveys = true;
-                }
-            }
-            "QUALIFIED_SCHEMA" => surveys = true,
-            // A DuckDB *replacement scan* (`FROM '/x.parquet'`) parses as a BASE_TABLE whose name is
-            // the path, so the AST alone cannot tell it from a real table - the name has to be checked.
-            "BASE_TABLE"
-                if name.is_empty()
-                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
-            {
-                bad = Some(format!(
-                    "`{name}` is not a table name - a quoted path in table position reads a file"
-                ));
-            }
-            "BASE_TABLE" => {
-                referenced.insert(name.to_ascii_lowercase());
-            }
-            _ => {}
-        }
-    });
-    match bad {
-        Some(why) => bail!("{why} - the SQL surface serves this nest's tables and views only"),
-        None => Ok(Some((referenced, surveys))),
+    // The walk itself is the engine's (`engine_duck::reach`, over DuckDB's AST); a shadow engine
+    // answers it beside DuckDB and the two are compared there.
+    match session.reach(sql) {
+        None => Ok(None),
+        Some(Err(why)) => Err(why),
+        Some(Ok(found)) => Ok(Some(found)),
     }
 }
 
@@ -1929,7 +1887,7 @@ fn walk_base_table_refs(
 }
 
 /// Walk the serialized AST, calling `f(kind, name)` for every table reference found.
-fn walk_table_refs(v: &Value, f: &mut impl FnMut(&str, &str)) {
+pub(crate) fn walk_table_refs(v: &Value, f: &mut impl FnMut(&str, &str)) {
     match v {
         Value::Object(map) => {
             if let Some(Value::String(t)) = map.get("type") {

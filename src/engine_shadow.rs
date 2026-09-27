@@ -58,12 +58,20 @@ pub(crate) enum Kind {
     FloatOrder,
     /// The secondary was not run: the primary had used the budget.
     Skipped,
+    /// The secondary's security walk reached more, or refused what the primary allowed: safe.
+    ParserStricter,
+    /// The secondary's security walk reached less, or allowed what the primary refused: the one
+    /// direction Gate 2's parser leg forbids.
+    ParserLooser,
 }
 
 impl Kind {
     /// Whether Gate 2 counts it: a difference nothing here explains.
     pub(crate) fn unexplained(self) -> bool {
-        matches!(self, Kind::Rows | Kind::Refusal | Kind::Catalogue)
+        matches!(
+            self,
+            Kind::Rows | Kind::Refusal | Kind::Catalogue | Kind::ParserLooser
+        )
     }
 }
 
@@ -422,6 +430,55 @@ impl Session for ShadowSession {
 
     fn serialize_sql(&self, sql: &str) -> Result<Value> {
         self.primary.serialize_sql(sql)
+    }
+
+    /// The parser role in shadow: both walks run, the primary's decides. Gate 2 asks the secondary
+    /// to be at least as strict, so it reaching fewer tables or admitting what the primary refused
+    /// is `ParserLooser` and counted; more tables or a refusal the primary did not make is
+    /// `ParserStricter` and explained.
+    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
+        let primary = self.primary.reach(sql);
+        let Some(secondary) = &self.secondary else {
+            return primary;
+        };
+        let shadow = secondary.reach(sql);
+        let show = |r: &Option<Result<(BTreeSet<String>, bool)>>| match r {
+            None => "no parse".to_string(),
+            Some(Err(e)) => format!("refused: {e:#}"),
+            Some(Ok((t, s))) => format!(
+                "{}{}",
+                t.iter().cloned().collect::<Vec<_>>().join(","),
+                if *s { " (surveys)" } else { "" }
+            ),
+        };
+        let kind = match (&primary, &shadow) {
+            (None, _) | (_, None) => None,
+            (Some(Ok((a, sa))), Some(Ok((b, sb)))) => {
+                if a == b && sa == sb {
+                    None
+                } else if b.is_superset(a) && (*sb || !*sa) {
+                    Some(Kind::ParserStricter)
+                } else {
+                    Some(Kind::ParserLooser)
+                }
+            }
+            (Some(Ok(_)), Some(Err(_))) => Some(Kind::ParserStricter),
+            (Some(Err(_)), Some(Ok(_))) => Some(Kind::ParserLooser),
+            (Some(Err(_)), Some(Err(_))) => None,
+        };
+        if let Some(kind) = kind {
+            (self.sink)(&Difference {
+                sql: sql.to_string(),
+                kind,
+                primary: show(&primary),
+                secondary: show(&shadow),
+                primary_ms: 0,
+                secondary_ms: 0,
+                primary_rss_mb: 0,
+                secondary_rss_mb: 0,
+            });
+        }
+        primary
     }
 
     fn set_deadline(&self, deadline: Option<Instant>) {

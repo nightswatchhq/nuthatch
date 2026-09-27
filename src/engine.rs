@@ -122,6 +122,14 @@ pub(crate) trait Session: Send {
     /// serialisation itself failing.
     fn serialize_sql(&self, sql: &str) -> Result<Value>;
 
+    /// The security walk: what the statement reaches, from the engine's own parse. `None` when the
+    /// parser could not say (it fails open; the denylist is still in front), `Some(Err)` when the
+    /// statement is refused with the reason, `Some(Ok((tables, surveys)))` with the base tables and
+    /// CTE names lowercased and whether it asks about the catalogue.
+    fn reach(&self, _sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
+        None
+    }
+
     /// A handle another thread can use to cancel whatever this session is running.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
 

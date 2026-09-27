@@ -83,6 +83,9 @@ impl Session for DuckSession {
     fn serialize_sql(&self, sql: &str) -> Result<Value> {
         self.conn.serialize_sql(sql)
     }
+    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
+        self.conn.reach(sql)
+    }
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
         Session::interrupt_handle(&self.conn)
     }
@@ -193,6 +196,62 @@ impl Session for Connection {
             })
             .ok()?;
         Some(defs)
+    }
+
+    /// The allowlist walk over DuckDB's `json_serialize_sql` AST: what `reject_unknown_table_refs`
+    /// did in `analytics.rs` before phase 2a, unchanged.
+    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
+        use crate::analytics::{walk_table_refs, ALLOWED_TABLE_FNS};
+        let v = Session::serialize_sql(self, sql).ok()?;
+        if v.get("error").and_then(Value::as_bool) == Some(true) {
+            // DuckDB could not parse it. Let it say so itself, with its own error message.
+            return None;
+        }
+        let mut referenced = BTreeSet::new();
+        // Whether this statement reaches outside the nest's own tables - a catalogue schema, or a
+        // catalogue-listing table function. Such a statement needs **every** view defined, because
+        // what it is asking for is the list of them (#896).
+        let mut surveys = false;
+        let mut bad: Option<String> = None;
+        walk_table_refs(&v, &mut |kind, name| {
+            if bad.is_some() {
+                return;
+            }
+            match kind {
+                "TABLE_FUNCTION" => {
+                    let f = name.to_ascii_lowercase();
+                    if !ALLOWED_TABLE_FNS.contains(&f.as_str()) {
+                        bad = Some(format!("table function `{name}` is not permitted here"));
+                    }
+                    // `duckdb_views()`, `duckdb_tables()` and friends enumerate the catalogue.
+                    if f.starts_with("duckdb_") {
+                        surveys = true;
+                    }
+                }
+                "QUALIFIED_SCHEMA" => surveys = true,
+                // A DuckDB *replacement scan* (`FROM '/x.parquet'`) parses as a BASE_TABLE whose
+                // name is the path, so the AST alone cannot tell it from a real table - the name has
+                // to be checked.
+                "BASE_TABLE"
+                    if name.is_empty()
+                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                {
+                    bad = Some(format!(
+                        "`{name}` is not a table name - a quoted path in table position reads a file"
+                    ));
+                }
+                "BASE_TABLE" => {
+                    referenced.insert(name.to_ascii_lowercase());
+                }
+                _ => {}
+            }
+        });
+        Some(match bad {
+            Some(why) => Err(anyhow::anyhow!(
+                "{why} - the SQL surface serves this nest's tables and views only"
+            )),
+            None => Ok((referenced, surveys)),
+        })
     }
 
     fn serialize_sql(&self, sql: &str) -> Result<Value> {

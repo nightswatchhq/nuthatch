@@ -249,6 +249,16 @@ impl Session for BurrmillSession {
         Err(anyhow!("the parser role is DuckDB's until phase 2 proper"))
     }
 
+    /// Burrmill's own walk, `inspect::reach`: sqlparser's AST under nuthatch's allowlist and
+    /// reachability rules, failing closed. A parse it cannot make is `None`, as DuckDB's is.
+    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
+        match burrmill::inspect::reach(sql) {
+            Ok(r) => Some(Ok((r.tables, r.surveys))),
+            Err(burrmill::BurrmillError::Parse(_)) => None,
+            Err(e) => Some(Err(engine_err(e))),
+        }
+    }
+
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
         Arc::new(Cancel(self.engine().cancel_token()))
     }
