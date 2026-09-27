@@ -39,6 +39,8 @@ pub mod doctor;
 pub mod dune_emit;
 pub mod dune_views;
 pub mod effectful;
+pub(crate) mod engine;
+pub(crate) mod engine_duck;
 pub mod entities;
 pub mod entity_bind;
 pub mod entity_circuit;
