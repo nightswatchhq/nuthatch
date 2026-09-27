@@ -44,6 +44,8 @@ pub(crate) enum Kind {
     /// Both answered and the rows differ, but the statement takes a `LIMIT` with no `ORDER BY`,
     /// so which rows it gets is the engine's choice and not a wrong answer. Recorded, not counted.
     Unordered,
+    /// The same rows to twelve significant digits: doubles summed in a different order.
+    FloatOrder,
     /// The secondary was not run: the primary had used the budget.
     Skipped,
 }
@@ -187,21 +189,57 @@ fn limits_without_order(sql: &str) -> bool {
     upper.contains("LIMIT") && !upper.contains("ORDER BY")
 }
 
+/// How two answers differ, if they do.
+enum Differ {
+    /// Different rows.
+    Rows(String),
+    /// The same rows once every float is read to twelve significant digits: the engines summed
+    /// the same doubles in a different order, which is not a wrong answer either side.
+    FloatOrder(String),
+}
+
 /// Rows compared as a multiset: an engine may return them in any order unless the statement orders
 /// them, and a difference in order alone is not a difference in answer.
-fn same_rows(a: &[Value], b: &[Value]) -> Option<String> {
+fn same_rows(a: &[Value], b: &[Value]) -> Option<Differ> {
     if a.len() != b.len() {
-        return Some(format!("{} rows against {}", a.len(), b.len()));
+        return Some(Differ::Rows(format!(
+            "{} rows against {}",
+            a.len(),
+            b.len()
+        )));
     }
     let key = |v: &Value| serde_json::to_string(v).unwrap_or_default();
-    let mut xa: Vec<String> = a.iter().map(key).collect();
-    let mut xb: Vec<String> = b.iter().map(key).collect();
+    let exact = first_difference(a, b, key);
+    let exact = exact?;
+    match first_difference(a, b, |v| key(&rounded(v))) {
+        Some(why) => Some(Differ::Rows(why)),
+        None => Some(Differ::FloatOrder(exact)),
+    }
+}
+
+fn first_difference(a: &[Value], b: &[Value], key: impl Fn(&Value) -> String) -> Option<String> {
+    let mut xa: Vec<String> = a.iter().map(&key).collect();
+    let mut xb: Vec<String> = b.iter().map(&key).collect();
     xa.sort();
     xb.sort();
     xa.iter()
         .zip(&xb)
         .find(|(x, y)| x != y)
         .map(|(x, y)| format!("first differing row: {x} against {y}"))
+}
+
+/// Every float in `v` as text to twelve significant digits; everything else as it was.
+fn rounded(v: &Value) -> Value {
+    match v {
+        Value::Number(n) if n.is_f64() => {
+            Value::String(format!("{:.11e}", n.as_f64().unwrap_or_default()))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(rounded).collect()),
+        Value::Object(map) => {
+            Value::Object(map.iter().map(|(k, x)| (k.clone(), rounded(x))).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 impl Session for ShadowSession {
@@ -248,12 +286,10 @@ impl Session for ShadowSession {
             (Ok((_, true)), Ok(_)) | (Ok(_), Ok((_, true))) => {
                 Some((Kind::Rows, "truncation differs".to_string()))
             }
-            (Ok((a, _)), Ok((b, _))) => same_rows(a, b).map(|why| {
-                if limits_without_order(sql) {
-                    (Kind::Unordered, why)
-                } else {
-                    (Kind::Rows, why)
-                }
+            (Ok((a, _)), Ok((b, _))) => same_rows(a, b).map(|d| match d {
+                Differ::Rows(why) if limits_without_order(sql) => (Kind::Unordered, why),
+                Differ::Rows(why) => (Kind::Rows, why),
+                Differ::FloatOrder(why) => (Kind::FloatOrder, why),
             }),
             (Ok(_), Err(_)) | (Err(_), Ok(_)) => Some((Kind::Refusal, String::new())),
             (Err(_), Err(_)) => None,
@@ -559,11 +595,22 @@ mod tests {
             &[serde_json::json!({"n": 2}), serde_json::json!({"n": 1})]
         )
         .is_none());
-        assert!(same_rows(
-            &[serde_json::json!({"n": 1})],
-            &[serde_json::json!({"n": 3})]
-        )
-        .is_some());
+        assert!(matches!(
+            same_rows(
+                &[serde_json::json!({"n": 1})],
+                &[serde_json::json!({"n": 3})]
+            ),
+            Some(Differ::Rows(_))
+        ));
+    }
+
+    #[test]
+    fn a_double_summed_in_another_order_is_float_order_not_rows() {
+        let a = [serde_json::json!({"d": "2024-08-30", "out": 3428611.8956044842f64})];
+        let b = [serde_json::json!({"d": "2024-08-30", "out": 3428611.8956044847f64})];
+        assert!(matches!(same_rows(&a, &b), Some(Differ::FloatOrder(_))));
+        let c = [serde_json::json!({"d": "2024-08-30", "out": 3428612.0f64})];
+        assert!(matches!(same_rows(&a, &c), Some(Differ::Rows(_))));
     }
 
     #[test]
