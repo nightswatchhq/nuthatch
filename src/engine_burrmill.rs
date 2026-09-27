@@ -52,7 +52,12 @@ pub(crate) struct BurrmillSession {
 impl BurrmillSession {
     fn new() -> Result<Self> {
         Ok(Self {
-            engine: Mutex::new(burrmill::Engine::open_empty().map_err(engine_err)?),
+            engine: Mutex::new(
+                burrmill::Engine::open_empty_within(
+                    (crate::analytics_budget::from_env().memory_limit_mb as usize) << 20,
+                )
+                .map_err(engine_err)?,
+            ),
             hot: Mutex::new(HashMap::new()),
         })
     }
