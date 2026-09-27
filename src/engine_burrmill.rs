@@ -87,10 +87,14 @@ fn sized(files: &[PathBuf]) -> Result<Vec<(PathBuf, u64)>> {
         .collect()
 }
 
-struct Noop;
+/// Burrmill's token: the statement stops at its next scan batch, since a DataFusion join yields
+/// nothing above the scan until it is done.
+struct Cancel(burrmill::CancelToken);
 
-impl Interrupt for Noop {
-    fn interrupt(&self) {}
+impl Interrupt for Cancel {
+    fn interrupt(&self) {
+        self.0.cancel();
+    }
 }
 
 impl Session for BurrmillSession {
@@ -246,9 +250,7 @@ impl Session for BurrmillSession {
     }
 
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
-        // Burrmill's engine has no cancellation handle yet; the shadow's budget rule and the
-        // primary's watchdog bound the request instead.
-        Arc::new(Noop)
+        Arc::new(Cancel(self.engine().cancel_token()))
     }
 
     fn cold_scan_operators(&self, _sql: &str) -> Result<u64> {
