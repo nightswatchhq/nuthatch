@@ -28,11 +28,18 @@ impl Engine for BurrmillEngine {
 }
 
 /// Put Burrmill beside DuckDB on every nest this process serves. Once per process.
+/// Records go to the log, and also as JSON lines to the file `NUTHATCH_SHADOW_LOG` names, when it
+/// names one.
 pub fn enable_shadow() -> Result<()> {
+    use crate::engine_shadow::{both_sinks, file_sink, log_sink};
+    let sink = match std::env::var_os("NUTHATCH_SHADOW_LOG") {
+        Some(path) => both_sinks(log_sink(), file_sink(Path::new(&path))?),
+        None => log_sink(),
+    };
     crate::engine_shadow::install(crate::engine_shadow::ShadowEngine::new(
         Box::new(crate::engine_duck::DuckEngine),
         Box::new(BurrmillEngine),
-        crate::engine_shadow::log_sink(),
+        sink,
     ))
 }
 
@@ -522,6 +529,11 @@ mod tests {
             }
         }
         let seen = seen.lock().unwrap();
-        eprintln!("SHADOW\tviews={}\tdifferences={}", views.len(), seen.len());
+        let unexplained = seen.iter().filter(|d| d.kind.unexplained()).count();
+        eprintln!(
+            "SHADOW\tviews={}\trecords={}\tunexplained={unexplained}",
+            views.len(),
+            seen.len()
+        );
     }
 }

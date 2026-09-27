@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// One disagreement between the engines, or a shadow that could not run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Difference {
     pub(crate) sql: String,
     pub(crate) kind: Kind,
@@ -31,14 +31,24 @@ pub(crate) struct Difference {
     pub(crate) secondary: String,
     pub(crate) primary_ms: u128,
     pub(crate) secondary_ms: u128,
+    /// The process's resident set after each engine answered, in MiB; 0 where it cannot be read.
+    /// A process-wide figure, so it is the pair's difference that says what the shadow cost.
+    pub(crate) primary_rss_mb: u64,
+    pub(crate) secondary_rss_mb: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Kind {
     /// Both answered, and the row multisets differ.
     Rows,
-    /// One answered and the other refused, or both refused differently.
+    /// The secondary refused what the primary answered.
     Refusal,
+    /// The secondary refused what the primary answered, by the checked rule's design: a sum over a
+    /// `TRY_CAST` value would drop the rows that did not fit. Explained, and the statement's author
+    /// should hear of it before cutover.
+    Designed,
+    /// The primary refused what the secondary answered: the no-ICU class, mostly.
+    Looser,
     /// A catalogue call the secondary would not take; `sql` names the call.
     Catalogue,
     /// Both answered and the rows differ, but the statement takes a `LIMIT` with no `ORDER BY`,
@@ -50,6 +60,13 @@ pub(crate) enum Kind {
     Skipped,
 }
 
+impl Kind {
+    /// Whether Gate 2 counts it: a difference nothing here explains.
+    pub(crate) fn unexplained(self) -> bool {
+        matches!(self, Kind::Rows | Kind::Refusal | Kind::Catalogue)
+    }
+}
+
 pub(crate) type Sink = Arc<dyn Fn(&Difference) + Send + Sync>;
 
 /// Records to the log under the `shadow` target. The operator pulls it with the rest of the log.
@@ -58,14 +75,59 @@ pub(crate) fn log_sink() -> Sink {
         tracing::warn!(
             target: "shadow",
             kind = ?d.kind,
+            unexplained = d.kind.unexplained(),
             primary_ms = d.primary_ms,
             secondary_ms = d.secondary_ms,
+            primary_rss_mb = d.primary_rss_mb,
+            secondary_rss_mb = d.secondary_rss_mb,
             primary = %d.primary,
             secondary = %d.secondary,
             sql = %d.sql,
             "shadow engine differs"
         );
     })
+}
+
+/// Appends one JSON object per record to `path`, for an operator to pull and a classifier to read
+/// back. Opened once; a write that fails is logged and dropped rather than failing the request.
+pub(crate) fn file_sink(path: &Path) -> Result<Sink> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let file = std::sync::Mutex::new(file);
+    let shown = path.display().to_string();
+    Ok(Arc::new(move |d: &Difference| {
+        use std::io::Write;
+        let line = match serde_json::to_string(d) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(target: "shadow", "record not serialised: {e}");
+                return;
+            }
+        };
+        let mut f = file.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = writeln!(f, "{line}") {
+            tracing::warn!(target: "shadow", "record not written to {shown}: {e}");
+        }
+    }))
+}
+
+/// Both sinks, in order.
+pub(crate) fn both_sinks(a: Sink, b: Sink) -> Sink {
+    Arc::new(move |d: &Difference| {
+        a(d);
+        b(d);
+    })
+}
+
+fn rss_mb() -> u64 {
+    crate::metrics::rss_bytes() / (1024 * 1024)
+}
+
+/// The checked rule's own refusal, as opposed to a plan that would not build for another reason.
+fn designed_refusal(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("refusing plan")
 }
 
 /// Opens a primary and a secondary session for every nest and pairs them.
@@ -101,6 +163,8 @@ impl Engine for ShadowEngine {
                     secondary: format!("{e:#}"),
                     primary_ms: 0,
                     secondary_ms: 0,
+                    primary_rss_mb: 0,
+                    secondary_rss_mb: 0,
                 });
                 None
             }
@@ -162,6 +226,8 @@ impl ShadowSession {
                     secondary: describe(&shadow),
                     primary_ms: 0,
                     secondary_ms: 0,
+                    primary_rss_mb: 0,
+                    secondary_rss_mb: 0,
                 });
             }
         }
@@ -258,6 +324,7 @@ impl Session for ShadowSession {
         let started = Instant::now();
         let primary = self.primary.collect(sql, cap);
         let primary_ms = started.elapsed();
+        let primary_rss_mb = rss_mb();
         let Some(secondary) = &self.secondary else {
             return primary;
         };
@@ -272,6 +339,8 @@ impl Session for ShadowSession {
                     secondary: "not run: the primary used the budget".into(),
                     primary_ms: primary_ms.as_millis(),
                     secondary_ms: 0,
+                    primary_rss_mb,
+                    secondary_rss_mb: 0,
                 });
                 return primary;
             }
@@ -279,6 +348,7 @@ impl Session for ShadowSession {
         let shadow_started = Instant::now();
         let shadow = secondary.collect(sql, cap);
         let secondary_ms = shadow_started.elapsed();
+        let secondary_rss_mb = rss_mb();
         let kind = match (&primary, &shadow) {
             // A truncated answer is a prefix in the engine's own row order, and the two orders
             // need not agree; once both have truncated there is nothing sound left to compare.
@@ -291,7 +361,11 @@ impl Session for ShadowSession {
                 Differ::Rows(why) => (Kind::Rows, why),
                 Differ::FloatOrder(why) => (Kind::FloatOrder, why),
             }),
-            (Ok(_), Err(_)) | (Err(_), Ok(_)) => Some((Kind::Refusal, String::new())),
+            (Ok(_), Err(Died::Binding(e) | Died::Executing(e))) if designed_refusal(e) => {
+                Some((Kind::Designed, String::new()))
+            }
+            (Ok(_), Err(_)) => Some((Kind::Refusal, String::new())),
+            (Err(_), Ok(_)) => Some((Kind::Looser, String::new())),
             (Err(_), Err(_)) => None,
         };
         if let Some((kind, why)) = kind {
@@ -307,6 +381,8 @@ impl Session for ShadowSession {
                 },
                 primary_ms: primary_ms.as_millis(),
                 secondary_ms: secondary_ms.as_millis(),
+                primary_rss_mb,
+                secondary_rss_mb,
             });
         }
         primary
