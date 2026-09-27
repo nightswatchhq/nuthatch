@@ -454,6 +454,73 @@ mod tests {
                 Err(e) => eprintln!("VIEW\t{view}\tERROR\tms={ms}\t{e:#}"),
             }
         }
+        // The dashboard's own statements, from kittiwake's `dump_nest_sql` example, `;;` between
+        // them, with the marker ids it prints replaced by ids this nest actually has.
+        if let Ok(file) = std::env::var("NUTHATCH_SHADOW_SQL") {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let first_cell = |sql: &str| -> Option<String> {
+                crate::analytics::query_guarded(dir, sql, guard)
+                    .ok()?
+                    .rows
+                    .into_iter()
+                    .next()?
+                    .as_object()?
+                    .values()
+                    .next()?
+                    .as_str()
+                    .map(str::to_string)
+            };
+            let markers = [
+                (
+                    "0x00000000000000000000000000000000000000a1",
+                    "SELECT id FROM lodestar_indexers ORDER BY staked_tokens DESC LIMIT 1",
+                ),
+                (
+                    "0x00000000000000000000000000000000000000a2",
+                    "SELECT id FROM lodestar_delegators LIMIT 1",
+                ),
+                (
+                    "0x00000000000000000000000000000000000000a3",
+                    "SELECT id FROM lodestar_curators LIMIT 1",
+                ),
+                (
+                    "0x00000000000000000000000000000000000000a4",
+                    "SELECT id FROM lodestar_indexers ORDER BY staked_tokens DESC LIMIT 1",
+                ),
+                (
+                    "0x00000000000000000000000000000000000000000000000000000000000000d1",
+                    "SELECT id FROM lodestar_deployments LIMIT 1",
+                ),
+            ];
+            let subs: Vec<(&str, String)> = markers
+                .iter()
+                .filter_map(|(m, sql)| first_cell(sql).map(|v| (*m, v)))
+                .collect();
+            eprintln!("MARKERS\tresolved={}/{}", subs.len(), markers.len());
+            for stmt in text.split("\n;;\n") {
+                let mut sql = stmt.trim().to_string();
+                if sql.is_empty() {
+                    continue;
+                }
+                for (m, v) in &subs {
+                    sql = sql.replace(m, v);
+                }
+                let before = seen.lock().unwrap().len();
+                let started = std::time::Instant::now();
+                let out = crate::analytics::query_guarded(dir, &sql, guard);
+                let ms = started.elapsed().as_millis();
+                let after = seen.lock().unwrap().len();
+                let head: String = sql.chars().take(90).collect();
+                match out {
+                    Ok(o) => eprintln!(
+                        "STMT\trows={}\tms={ms}\tdifferences={}\t{head}",
+                        o.rows.len(),
+                        after - before
+                    ),
+                    Err(e) => eprintln!("STMT\tERROR\tms={ms}\t{head}\t{e:#}"),
+                }
+            }
+        }
         let seen = seen.lock().unwrap();
         eprintln!("SHADOW\tviews={}\tdifferences={}", views.len(), seen.len());
     }
