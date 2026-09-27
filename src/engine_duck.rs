@@ -5,7 +5,9 @@
 //! here from `analytics.rs` unchanged in what it does; `analytics.rs` keeps the policy and no longer
 //! names the engine.
 
-use crate::engine::{Died, Engine, FactWindow, Interrupt, Session};
+use crate::engine::{
+    value_bytes, Died, Engine, FactWindow, Interrupt, Session, SQL_MAX_RESULT_BYTES,
+};
 use anyhow::{bail, Context, Result};
 use duckdb::arrow::datatypes::DataType;
 use duckdb::types::{Value as DuckValue, ValueRef};
@@ -730,27 +732,6 @@ fn decimal_safe_projection(statement: Option<&duckdb::Statement<'_>>, sql: &str)
 
 fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// The per-result Rust-side byte ceiling for the guarded `/sql` surface (64 MiB). Comfortably above any
-/// legitimate 50k-row result, far below the per-cursor RAM budget - the backstop against a wide-cell
-/// `SELECT` inflating the materialised buffer past the budget (see `collect`).
-const SQL_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
-
-/// A cheap lower-bound byte estimate of a materialised cell - dominated by string payloads, which is
-/// exactly the wide-cell attack vector. Numbers/bools/null count a small fixed cost.
-fn value_bytes(v: &Value) -> usize {
-    match v {
-        Value::String(s) => s.len(),
-        Value::Array(a) => 8 + a.iter().map(value_bytes).sum::<usize>(),
-        Value::Object(o) => {
-            8 + o
-                .iter()
-                .map(|(k, x)| k.len() + value_bytes(x))
-                .sum::<usize>()
-        }
-        _ => 8,
-    }
 }
 
 /// Create a temp table for one logical table's hot rows and append them, typed to match the sealed

@@ -231,11 +231,13 @@ impl Session for ShadowSession {
         let shadow = secondary.collect(sql, cap);
         let secondary_ms = shadow_started.elapsed();
         let kind = match (&primary, &shadow) {
-            (Ok((a, ta)), Ok((b, tb))) => match same_rows(a, b) {
-                None if ta == tb => None,
-                None => Some((Kind::Rows, "truncation differs".to_string())),
-                Some(why) => Some((Kind::Rows, why)),
-            },
+            // A truncated answer is a prefix in the engine's own row order, and the two orders
+            // need not agree; once both have truncated there is nothing sound left to compare.
+            (Ok((_, true)), Ok((_, true))) => None,
+            (Ok((_, true)), Ok(_)) | (Ok(_), Ok((_, true))) => {
+                Some((Kind::Rows, "truncation differs".to_string()))
+            }
+            (Ok((a, _)), Ok((b, _))) => same_rows(a, b).map(|why| (Kind::Rows, why)),
             (Ok(_), Err(_)) | (Err(_), Ok(_)) => Some((Kind::Refusal, String::new())),
             (Err(_), Err(_)) => None,
         };

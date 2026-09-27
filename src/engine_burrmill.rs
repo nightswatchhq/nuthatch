@@ -102,14 +102,28 @@ impl Session for BurrmillSession {
     }
 
     fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+        // The same two caps `engine_duck` applies, so the shadow truncates where the primary does.
         let hard = cap.map(|c| c + 1);
+        let byte_cap = cap.map(|_| crate::engine::SQL_MAX_RESULT_BYTES);
+        let mut bytes = 0usize;
         let mut out = Vec::new();
         let mut over = false;
         let engine = self.engine();
         let r = engine.sql_for_each(sql, |batch| {
             for row in burrmill::df::encode::rows(&batch)? {
+                if byte_cap.is_some() {
+                    bytes += row
+                        .as_object()
+                        .map(|o| {
+                            o.iter()
+                                .map(|(k, v)| k.len() + crate::engine::value_bytes(v))
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(0);
+                }
                 out.push(row);
-                if hard.is_some_and(|h| out.len() >= h) {
+                if hard.is_some_and(|h| out.len() >= h) || byte_cap.is_some_and(|max| bytes >= max)
+                {
                     over = true;
                     return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
                 }
