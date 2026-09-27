@@ -10,11 +10,9 @@
 //! The binary stays single-file: DuckDB is statically bundled. Memory is capped so an analytical
 //! query can't blow the embedded-mode RAM budget.
 
+use crate::engine::{Died, Engine, Interrupt, Session};
 use anyhow::{bail, Context, Result};
-use duckdb::arrow::datatypes::DataType;
-use duckdb::types::{Value as DuckValue, ValueRef};
-use duckdb::{Config, Connection};
-use serde_json::{Map, Value};
+use serde_json::Value;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,27 +20,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Open an in-memory DuckDB whose file access is pinned to the nest's data dirs (#289).
-///
-/// DuckDB's `allowed_directories` is an *addition* to the allow-list while `enable_external_access`
-/// is on, and a restriction only when it is off. The flag is startup-only, so it has to go on the
-/// `Config`, not in a later `SET`. `lock_configuration` then freezes both so a query cannot widen
-/// them. Measured against `libduckdb-sys` 1.10504.0, the bundled build.
-fn allowed_read_dirs(dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![
-        dir.join(crate::seal::SEGMENTS_DIR),
-        dir.join("labels"),
-        dir.join(crate::offchain::DIR).join("segments"),
-    ];
-    #[cfg(feature = "folds")]
-    dirs.push(dir.join(crate::folds::CHECKPOINTS_DIR));
-    // Runtime layout (RFC-0033): Parquet lives at `<root>/segments/{hash}.parquet`, not under
-    // `data/<nid>/segments`. Locking only the per-dataset dir made `/sql` succeed with zero rows
-    // on every mounted nest (#289 follow-up, `e2e_early_cutoff`).
-    if let Some(shared) = crate::seal::shared_store(dir) {
-        dirs.push(shared);
-    }
-    dirs
+/// The engine every query runs on. One implementation until phase 2b puts a shadow beside it.
+fn engine() -> &'static dyn Engine {
+    static ENGINE: crate::engine_duck::DuckEngine = crate::engine_duck::DuckEngine;
+    &ENGINE
+}
+
+/// A session bounded and locked to `dir`, counted so a test can see the cache reuse one.
+fn open_session(dir: &Path) -> Result<Box<dyn Session>> {
+    note_duck_open(dir);
+    engine().open(dir)
 }
 
 /// One cached read-only DuckDB (#295). A fresh in-memory instance per query was the rebuild the
@@ -70,10 +57,7 @@ struct DuckCache {
     excluded: std::collections::BTreeSet<String>,
     inputs: std::collections::BTreeMap<PathBuf, DuckInputStamp>,
     last_used: u64,
-    conn: Connection,
-    /// This instance's private spill directory, removed when the cached connection is dropped or
-    /// evicted (#1165). Held here so its lifetime is exactly the connection's.
-    _spill: SpillDir,
+    session: Box<dyn Session>,
 }
 
 /// A content hash of one cache input, hex sha256 (#840).
@@ -176,192 +160,6 @@ fn duck_opens_for(dir: &Path) -> u64 {
         .get()
         .and_then(|m| m.lock().ok().map(|g| g.get(dir).copied().unwrap_or(0)))
         .unwrap_or(0)
-}
-
-/// A DuckDB instance's private spill directory, removed when the instance is dropped (#1165).
-///
-/// DuckDB spills buffers past `max_memory` into `temp_directory`, whose files are named by *index*
-/// within that directory - `duckdb_temp_storage_DEFAULT-0.tmp`, `..._S128K-0.tmp`, and so on. The
-/// name says nothing about which instance wrote it, because DuckDB assumes one instance owns the
-/// directory. This process runs several: the connection cache hands its connection to a query for
-/// the query's whole duration, so a second concurrent query finds the cache empty and opens an
-/// instance of its own. With the default `temp_directory` - `.tmp` under the working directory,
-/// which for a nest service is the nest's own data directory - those instances write the same file
-/// names in one place and overwrite each other's spilled blocks.
-///
-/// Reading such a block back fails DuckDB's own check, `decompressed_size == buffer->AllocSize()` in
-/// `temporary_file_manager.cpp`, and the process dies. Reproduced 2026-09-06 against a copy of the
-/// production corpus: four threads replaying 51 captured statements, a segmentation fault inside
-/// fifteen seconds, every time. On the box it was 25 SEGVs in a minute at four permits and none at
-/// one, which is the same fault seen from the outside - one permit never has a second instance.
-struct SpillDir(PathBuf);
-
-impl Drop for SpillDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Remove spill directories left by processes that are no longer running.
-///
-/// The cache lives in a `static`, and Rust does not drop statics at exit, so a cached connection's
-/// [`SpillDir`] guard never runs on the way out and its directory outlives the process. One empty
-/// directory per instance is not much, but a nest restarting every fifteen seconds under a fault -
-/// which is exactly what #1165 looked like - would leave one behind each time, with whatever it had
-/// spilled inside. Ownership is by pid: a directory whose pid still has a `/proc` entry belongs to a
-/// live process and is left alone. Where `/proc` is not there to ask (macOS, dev machines), nothing
-/// is swept, because guessing by age could delete a running instance's spill under it.
-fn sweep_dead_spill_dirs(parent: &Path) {
-    if !Path::new("/proc").is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(rest) = name
-            .to_string_lossy()
-            .strip_prefix("nuthatch-duckdb-")
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
-            continue;
-        };
-        if !Path::new(&format!("/proc/{pid}")).exists() {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
-}
-
-/// The in-process half of a spill directory's name; the other half is the PID.
-static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn spill_parent() -> PathBuf {
-    crate::analytics_budget::from_env()
-        .temp_directory
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-/// A directory no other DuckDB instance in this process (or any other) will write to.
-///
-/// Created **exclusively**: `create_dir`, not `create_dir_all`, and a name that already exists is
-/// skipped for the next sequence number. The name alone is not enough. A process that dies without
-/// dropping its static cache leaves its directories behind, the sweep keeps any whose PID is live,
-/// and a later process handed that same PID by the kernel would otherwise start its sequence at zero
-/// and write into the dead process's `-0` - the collision this whole change exists to remove, back
-/// through PID reuse. Refusing an existing path makes the directory this instance's by construction,
-/// whatever is left on disk. The parent is `analytics.temp_directory` when set, else the process
-/// temp dir; the instance name is unchanged (#1165).
-fn new_spill_dir() -> Result<SpillDir> {
-    static SWEPT: std::sync::Once = std::sync::Once::new();
-    SWEPT.call_once(|| {
-        sweep_dead_spill_dirs(&std::env::temp_dir());
-        if let Some(ref p) = crate::analytics_budget::from_env().temp_directory {
-            if *p != std::env::temp_dir() {
-                sweep_dead_spill_dirs(p);
-            }
-        }
-    });
-    let parent = spill_parent();
-    if !parent.exists() {
-        std::fs::create_dir_all(&parent)
-            .with_context(|| format!("creating the DuckDB spill parent {}", parent.display()))?;
-    }
-    loop {
-        let path = parent.join(format!(
-            "nuthatch-duckdb-{}-{}",
-            std::process::id(),
-            SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        match std::fs::create_dir(&path) {
-            Ok(()) => return Ok(SpillDir(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("creating the DuckDB spill directory {}", path.display())
-                })
-            }
-        }
-    }
-}
-
-/// RFC-0060 §5.6: what a `graph` build adds to every connection. A default build adds nothing, so its
-/// connections behave exactly as they did before the feature existed.
-fn register_extensions(conn: &Connection) -> Result<()> {
-    #[cfg(feature = "graph")]
-    {
-        crate::analytics_scalars::register(conn)?;
-        // GraphQL and the SQL surface define observable order explicitly, so retaining insertion
-        // order buys no contract and can hold a whole extra ordering buffer for a large historical
-        // aggregation.
-        conn.execute_batch("SET preserve_insertion_order=false;")
-            .context("failed to disable DuckDB insertion-order preservation")?;
-    }
-    #[cfg(not(feature = "graph"))]
-    let _ = conn;
-    Ok(())
-}
-
-fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
-    note_duck_open(dir);
-    let spill = new_spill_dir()?;
-    let allowed: Vec<String> = allowed_read_dirs(dir)
-        .into_iter()
-        .chain(std::iter::once(spill.0.clone()))
-        .filter(|p| p.exists())
-        .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
-        .collect();
-    // DuckDB's docs set the allow-list first, then turn external access off. Doing it the other
-    // way round is refused: "Cannot change allowed_directories when enable_external_access is
-    // disabled". The flag is *not* startup-only on 1.10504.0; a `SET` after open works, which is
-    // why this was inert until now - we set the list and never flipped the flag.
-    let resources = crate::analytics_budget::from_env();
-    let mem_limit = format!("{}MB", resources.memory_limit_mb);
-    let mut config = Config::default()
-        .max_memory(&mem_limit)
-        .context("duckdb max_memory")?
-        .threads(resources.threads)
-        .context("duckdb threads")?
-        // Set on the config rather than by a later `SET`, so no query can ever run against the
-        // shared default - and before `lock_configuration`, which freezes it (#1165).
-        .with("temp_directory", spill.0.display().to_string())
-        .context("duckdb temp_directory")?;
-    if let Some(ref size) = resources.max_temp_size {
-        config = config
-            .with("max_temp_directory_size", size)
-            .context("duckdb max_temp_directory_size")?;
-    }
-    let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
-    register_extensions(&conn)?;
-    // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
-    // materialisation fires on an ordinary shape: a filtered `ORDER BY` whose scan reads one Parquet
-    // file holding rows on both sides of the filter. The optimiser compresses the sort key against
-    // the minimum the filter promised, and a row the filter has not yet removed reaches it. #1152
-    // switched the optimiser off in debug builds, where the assertion aborts the process, and left
-    // the release library alone because six measured shapes still answered correctly there.
-    //
-    // #1165 is why it is off everywhere now. A 3.4.0 nest serving Lodestar's curator lists - every
-    // one a filtered `ORDER BY` over a view whose scan reads one segment spanning the filter - died
-    // twice at the same instruction, a `free` on the HTTP response path: the signature of a native
-    // library corrupting the heap, found where the neighbouring chunk is released. An assertion
-    // violated in a release build is code carrying on with a value its author ruled out, and this
-    // is the one such assertion known to trip on nuthatch's own shapes. Not proven to be the cause
-    // (the fresh-process reproduction did not fault in an hour of the same queries); removed
-    // because it is the cheapest suspect to remove and #1152 already measured that the answers do
-    // not change without it. Every sealed segment of more than one block has this shape once a
-    // cursor sits inside it.
-    conn.execute_batch("SET disabled_optimizers='compressed_materialization';")
-        .context("failed to disable compressed materialisation")?;
-    let lockdown = format!(
-        "SET allowed_directories=[{}]; SET enable_external_access=false; SET lock_configuration=true;",
-        allowed.join(", ")
-    );
-    conn.execute_batch(&lockdown)
-        .context("failed to lock down DuckDB filesystem access")?;
-    Ok((conn, spill))
 }
 
 /// A query the guard cut off at its deadline. Its own type, so `/sql` can tell a caller the query was
@@ -532,7 +330,7 @@ impl std::fmt::Display for AdmissionRefusal {
 
 impl std::error::Error for AdmissionRefusal {}
 
-fn unboundable(why: impl Into<String>) -> anyhow::Error {
+pub(crate) fn unboundable(why: impl Into<String>) -> anyhow::Error {
     AdmissionRefusal::Unboundable(why.into()).into()
 }
 
@@ -571,7 +369,7 @@ fn remember_scan_bound(dir: &Path, sql: &str, bound: &ScanBound) {
 /// Bound a declared statement on the connection whose views it will run against (RFC-0048 §3).
 #[allow(clippy::too_many_arguments)]
 fn named_scan_bound(
-    conn: &Connection,
+    session: &dyn Session,
     dir: &Path,
     sql: &str,
     admission: &NamedAdmission,
@@ -612,7 +410,7 @@ fn named_scan_bound(
         }
         if let Some(body) = authored.get(name) {
             // A view that reads files itself is a Parquet scan no catalogue table accounts for.
-            let functions = table_refs_in(conn, body, "TABLE_FUNCTION")
+            let functions = table_refs_in(session, body, "TABLE_FUNCTION")
                 .ok_or_else(|| unboundable(format!("view {name} will not parse")))?;
             if let Some(f) = functions
                 .iter()
@@ -624,23 +422,13 @@ fn named_scan_bound(
         }
         // Neither a table nor an authored view: a CTE, unless the connection holds a relation by
         // that name (labels, offchain snapshots, factory children), which has no catalogue bound.
-        if connection_has_relation(conn, name) {
+        if session.has_relation(name) {
             return Err(unboundable(format!(
                 "it reads {name}, which the catalogue does not account for"
             )));
         }
     }
-    let plan: String = conn
-        .query_row(&format!("EXPLAIN (FORMAT JSON) {sql}"), [], |row| {
-            row.get(1)
-        })
-        .context("failed to plan query")?;
-    let plan: Value = serde_json::from_str(&plan).map_err(|e| {
-        unboundable(format!(
-            "DuckDB returned a physical plan that is not JSON: {e}"
-        ))
-    })?;
-    let scans = physical_parquet_scans(&plan)?;
+    let scans = session.cold_scan_operators(sql)?;
     let tables: std::collections::BTreeMap<String, TableScan> = defined
         .tables
         .iter()
@@ -666,77 +454,6 @@ fn named_scan_bound(
     })
 }
 
-fn connection_has_relation(conn: &Connection, name: &str) -> bool {
-    conn.query_row(
-        "SELECT count(*) FROM (SELECT view_name AS n FROM duckdb_views() WHERE NOT internal \
-         UNION ALL SELECT table_name FROM duckdb_tables()) WHERE lower(n) = ?",
-        [name],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|n| n > 0)
-    .unwrap_or(true)
-}
-
-/// Parquet scans in a physical plan. An operator not listed refuses, and so does every operator
-/// that can run its input more than once: a nested-loop or delim join rescans per outer row, and a
-/// recursive CTE has no static scan count at all (RFC-0048 §3 rules 3b to 5).
-fn physical_parquet_scans(plan: &Value) -> Result<u64> {
-    let nodes = plan
-        .as_array()
-        .ok_or_else(|| unboundable("the physical plan is not an operator list"))?;
-    let mut scans = 0_u64;
-    for node in nodes {
-        let name = node
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| unboundable("a physical plan operator has no name"))?;
-        match name.trim() {
-            "READ_PARQUET"
-            | "SEQ_SCAN"
-            | "COLUMN_DATA_SCAN"
-            | "DUMMY_SCAN"
-            | "EMPTY_RESULT"
-            | "RANGE"
-            | "GENERATE_SERIES"
-            | "UNNEST"
-            | "PROJECTION"
-            | "FILTER"
-            | "HASH_JOIN"
-            | "CROSS_PRODUCT"
-            | "PIECEWISE_MERGE_JOIN"
-            | "HASH_GROUP_BY"
-            | "PERFECT_HASH_GROUP_BY"
-            | "UNGROUPED_AGGREGATE"
-            | "SIMPLE_AGGREGATE"
-            | "ORDER_BY"
-            | "TOP_N"
-            | "LIMIT"
-            | "STREAMING_LIMIT"
-            | "LIMIT_PERCENT"
-            | "UNION"
-            | "WINDOW"
-            | "STREAMING_WINDOW"
-            | "CTE"
-            | "CTE_SCAN"
-            | "RESERVOIR_SAMPLE"
-            | "STREAMING_SAMPLE" => {}
-            other => {
-                return Err(unboundable(format!(
-                    "cannot bound physical plan operator {other:?}"
-                )))
-            }
-        }
-        let children = node
-            .get("children")
-            .ok_or_else(|| unboundable("a physical plan operator has no children"))?;
-        scans = scans
-            .checked_add(physical_parquet_scans(children)?)
-            .and_then(|n| n.checked_add(u64::from(name.trim() == "READ_PARQUET")))
-            .ok_or_else(|| unboundable("the physical scan count overflows"))?;
-    }
-    Ok(scans)
-}
-
 /// **The nest-wide corruption sweep.** Which of this nest's tables have sealed segments that will
 /// not bind, whether or not anybody has asked about them.
 ///
@@ -756,10 +473,9 @@ pub fn degraded_tables(
     dir: &Path,
     declared: &[crate::registry::TableSchema],
 ) -> Result<std::collections::BTreeSet<String>> {
-    let (conn, _spill) =
-        open_locked_duckdb(dir).context("failed to open DuckDB for the segment sweep")?;
+    let session = open_session(dir).context("failed to open DuckDB for the segment sweep")?;
     define_views(
-        &conn,
+        &*session,
         dir,
         &HotRows::new(),
         u64::MAX,
@@ -974,7 +690,7 @@ pub(crate) fn test_set_remove_after_define(dir: &Path, file: Option<PathBuf>) {
 /// path in it.
 /// Interrupt handles of the DuckDB statements running now, so a shutdown can stop them rather than
 /// drain behind them.
-type LiveHandles = Mutex<Vec<(u64, PathBuf, Arc<duckdb::InterruptHandle>)>>;
+type LiveHandles = Mutex<Vec<(u64, PathBuf, Arc<dyn Interrupt>)>>;
 
 fn live_queries() -> &'static LiveHandles {
     static LIVE: OnceLock<LiveHandles> = OnceLock::new();
@@ -987,7 +703,7 @@ static LIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 struct LiveQuery(u64);
 
 impl LiveQuery {
-    fn register(dir: &Path, handle: Arc<duckdb::InterruptHandle>) -> LiveQuery {
+    fn register(dir: &Path, handle: Arc<dyn Interrupt>) -> LiveQuery {
         let id = LIVE_SEQ.fetch_add(1, Ordering::SeqCst);
         live_queries()
             .lock()
@@ -1293,7 +1009,7 @@ fn attempt(
             && c.inputs == inputs
     });
     if !reusable {
-        let (conn, spill) = open_locked_duckdb(dir).context("failed to open DuckDB")?;
+        let session = open_session(dir).context("failed to open DuckDB")?;
         slot = Some(DuckCache {
             dir: dir.to_path_buf(),
             sealed_through,
@@ -1301,15 +1017,14 @@ fn attempt(
             excluded: excluded.clone(),
             inputs,
             last_used: DUCK_USE.fetch_add(1, Ordering::Relaxed),
-            conn,
-            _spill: spill,
+            session,
         });
     }
     let mut slot = slot.expect("just inserted");
     slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
     let (referenced, offchain, degraded_tables, interrupted, outcome, cap, scan) = {
-        let conn = &slot.conn;
-        let walked = reject_unknown_table_refs(conn, sql)?;
+        let session: &dyn Session = slot.session.as_ref();
+        let walked = reject_unknown_table_refs(session, sql)?;
         // No parse means no idea what the statement reaches, and the safe answer to that is "all of
         // it" on both counts.
         let surveys = walked.as_ref().map(|(_, sv)| *sv).unwrap_or(true);
@@ -1324,10 +1039,10 @@ fn attempt(
         } else {
             referenced
                 .as_ref()
-                .and_then(|r| reachable_tables(conn, dir, r))
+                .and_then(|r| reachable_tables(session, dir, r))
         };
         let defined = define_views_bound(
-            conn,
+            session,
             dir,
             hot,
             sealed_through,
@@ -1344,25 +1059,25 @@ fn attempt(
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
-        define_nest_views(conn, dir, wanted.as_ref());
+        define_nest_views(session, dir, wanted.as_ref());
         let offchain = if as_of.is_none() {
-            define_offchain_views(conn, dir, wanted.as_ref())
+            define_offchain_views(session, dir, wanted.as_ref())
         } else {
             Default::default()
         };
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
         // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
         if as_of.is_none() {
-            define_labels_view(conn, dir);
+            define_labels_view(session, dir);
         }
         // Factory nests (RFC-0009): a `{template}__children` view over the sealed factory events, so
         // "which pools, discovered when, by which parent" is one query. Best-effort - no factories, no-op.
-        define_children_views(conn, dir);
+        define_children_views(session, dir);
 
         // Every view this query could be reading now exists, so the names it used can be widened to the
         // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
         // happen here rather than beside the security walk: at that point the catalogue was empty.
-        let referenced = referenced.map(|names| expand_through_views(conn, &names));
+        let referenced = referenced.map(|names| expand_through_views(session, &names));
         // What the answer read from offchain snapshots (#1437). Unparsed, every defined view counts:
         // an over-reported snapshot label claims less than the answer has, never more.
         let offchain = Some(match &referenced {
@@ -1385,7 +1100,7 @@ fn attempt(
         // the past (the sweep between attempts ran long) makes `recv_timeout` fire immediately.
         let interrupted = Arc::new(AtomicBool::new(false));
         let watchdog = guard.zip(deadline).map(|(_, d)| {
-            let handle = conn.interrupt_handle();
+            let handle = session.interrupt_handle();
             let flag = interrupted.clone();
             let (tx, rx) = mpsc::channel::<()>();
             let join = std::thread::spawn(move || {
@@ -1405,7 +1120,7 @@ fn attempt(
         // is not free.
         let scan = named.map(|admission| {
             let bound = named_scan_bound(
-                conn,
+                session,
                 dir,
                 sql,
                 admission,
@@ -1430,8 +1145,8 @@ fn attempt(
             std::fs::remove_file(&f).expect("test hook: remove the planned segment");
         }
         let cap = guard.map(|g| g.max_rows);
-        let _live = LiveQuery::register(dir, conn.interrupt_handle());
-        let outcome = evaluate.then(|| collect(conn, sql, cap));
+        let _live = LiveQuery::register(dir, session.interrupt_handle());
+        let outcome = evaluate.then(|| session.collect(sql, cap));
 
         // Stop the watchdog before interpreting the result: a value arriving before the deadline makes
         // `recv_timeout` return `Ok`, so it won't interrupt; then join so it can't fire late.
@@ -1524,145 +1239,11 @@ fn attempt(
     }))
 }
 
-/// Which phase of [`collect`] a failure came from. See [`Attempt`] for why the split is load-bearing.
-enum Died {
-    /// `conn.prepare` refused it: a name the catalogue does not have, a type that does not check.
-    Binding(anyhow::Error),
-    /// It bound, then died running or materialising rows - the only shape a corrupt page produces.
-    Executing(anyhow::Error),
-}
-
-/// Prepare, execute and materialise the result. With `cap = Some(n)` it stops after `n + 1` rows so
-/// the caller can report truncation precisely (the returned bool is true when that extra row existed,
-/// i.e. more than `n` rows were available); the caller then truncates back to `n`. `cap = None`
-/// materialises every row. Row materialisation is Rust-side and escapes DuckDB's own memory limit,
-/// so the cap is what actually bounds a `SELECT *` result buffer.
-fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
-    let mut stmt = conn
-        .prepare(sql)
-        .context("failed to prepare query")
-        .map_err(Died::Binding)?;
-    let rows = stmt
-        .query([])
-        .context("query failed")
-        .map_err(Died::Executing)?;
-    // Column types are only known once the statement has executed, and a scaled decimal is the one
-    // result this cannot materialise (#1433). It is rare, so the answer is read off this run and
-    // only that case pays a second, wrapped one. Probing with a query of its own executed every
-    // statement twice, which cost the SQL surface 1.7x from 3.8.5 to 3.11.0.
-    match decimal_safe_projection(rows.as_ref(), sql) {
-        None => drain(rows, cap),
-        Some(wrapped) => {
-            drop(rows);
-            let mut stmt = conn
-                .prepare(&wrapped)
-                .context("failed to prepare query")
-                .map_err(Died::Binding)?;
-            let rows = stmt
-                .query([])
-                .context("query failed")
-                .map_err(Died::Executing)?;
-            drain(rows, cap)
-        }
-    }
-}
-
-/// Materialise an executed statement's rows as JSON, under the caps `collect` documents.
-fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
-    // Column metadata is only materialised once the statement has executed - read it off the
-    // executed result, not the prepared statement.
-    let column_names: Vec<String> = rows
-        .as_ref()
-        .map(|s| s.column_names().iter().map(|c| c.to_string()).collect())
-        .unwrap_or_default();
-
-    let hard = cap.map(|c| c + 1);
-    // A row cap alone bounds row *count*, not row *width*: the materialised `Vec<Value>` lives Rust-side,
-    // outside DuckDB's `memory_limit`, so `SELECT repeat('A', 20000000) FROM range(50000)` would accrue
-    // ~1 TB before the wall-clock guard fires - breaching the <=2 GB per-cursor budget and, in a runtime,
-    // OOM-killing co-tenants. The guarded (untrusted `/sql`) path therefore also caps cumulative result
-    // bytes. Trusted unguarded queries (`cap = None`: registry-built folds, cold seeds) are never
-    // byte-capped, so a large token's balance rebuild is never silently truncated.
-    let byte_cap = cap.map(|_| SQL_MAX_RESULT_BYTES);
-    let mut out = Vec::new();
-    let mut bytes = 0usize;
-    while let Some(row) = rows
-        .next()
-        .context("row read failed")
-        .map_err(Died::Executing)?
-    {
-        let mut obj = Map::new();
-        for (i, name) in column_names.iter().enumerate() {
-            let v = value_to_json(row.get_ref(i).map_err(|e| Died::Executing(e.into()))?);
-            if byte_cap.is_some() {
-                bytes += name.len() + value_bytes(&v);
-            }
-            obj.insert(name.clone(), v);
-        }
-        out.push(Value::Object(obj));
-        if hard.is_some_and(|h| out.len() >= h) {
-            return Ok((out, true));
-        }
-        if byte_cap.is_some_and(|max| bytes >= max) {
-            return Ok((out, true));
-        }
-    }
-    Ok((out, false))
-}
-
-/// `duckdb-rs` currently materialises a scaled `DECIMAL(38, s)` through
-/// `rust_decimal::Decimal`. That type only holds 96 bits, while DuckDB's decimal holds 128, and its
-/// `from_i128_with_scale` constructor panics before we can render the cell. Given an executed
-/// statement, name the outer projection that asks DuckDB to format those columns as text, or
-/// `None` when no column needs it. This preserves the established JSON contract for exact wide
-/// numbers and turns an ordinary SQL result into an ordinary SQL result rather than a request-thread
-/// panic (#1433).
-fn decimal_safe_projection(statement: Option<&duckdb::Statement<'_>>, sql: &str) -> Option<String> {
-    let statement = statement?;
-    let columns: Vec<(String, bool)> = statement
-        .column_names()
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let scaled_decimal = matches!(
-                statement.column_type(i),
-                DataType::Decimal128(_, scale) if scale != 0
-            );
-            (name.to_string(), scaled_decimal)
-        })
-        .collect();
-
-    if !columns.iter().any(|(_, scaled_decimal)| *scaled_decimal) {
-        return None;
-    }
-
-    let projection = columns
-        .iter()
-        .map(|(name, scaled_decimal)| {
-            let ident = quote_identifier(name);
-            if *scaled_decimal {
-                format!("CAST({ident} AS VARCHAR) AS {ident}")
-            } else {
-                ident
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let inner = without_trailing_statement_terminator(sql);
-    Some(format!(
-        "SELECT {projection} FROM ({inner}) AS \"__nuthatch_decimal_source\""
-    ))
-}
-
-fn quote_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
 /// A public query may end with a statement terminator, but an inner derived-table query may not.
 /// `collect` is reached only after [`reject_statement_stacking`] has proved any top-level semicolon
 /// is terminal, so removing it and its trailing comment is safe. Semicolons in strings, quoted
 /// identifiers, or comments are not terminators and remain part of the query.
-fn without_trailing_statement_terminator(sql: &str) -> &str {
+pub(crate) fn without_trailing_statement_terminator(sql: &str) -> &str {
     let bytes = sql.as_bytes();
     let mut i = 0;
     let mut terminator = None;
@@ -1698,27 +1279,6 @@ fn without_trailing_statement_terminator(sql: &str) -> &str {
         i += 1;
     }
     terminator.map_or(sql, |i| &sql[..i])
-}
-
-/// The per-result Rust-side byte ceiling for the guarded `/sql` surface (64 MiB). Comfortably above any
-/// legitimate 50k-row result, far below the per-cursor RAM budget - the backstop against a wide-cell
-/// `SELECT` inflating the materialised buffer past the budget (see `collect`).
-const SQL_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
-
-/// A cheap lower-bound byte estimate of a materialised cell - dominated by string payloads, which is
-/// exactly the wide-cell attack vector. Numbers/bools/null count a small fixed cost.
-fn value_bytes(v: &Value) -> usize {
-    match v {
-        Value::String(s) => s.len(),
-        Value::Array(a) => 8 + a.iter().map(value_bytes).sum::<usize>(),
-        Value::Object(o) => {
-            8 + o
-                .iter()
-                .map(|(k, x)| k.len() + value_bytes(x))
-                .sum::<usize>()
-        }
-        _ => 8,
-    }
 }
 
 /// Skip leading whitespace and SQL comments (`-- line` and `/* block */`) so the read-only guard
@@ -2044,16 +1604,10 @@ const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
 /// names parse as `BASE_TABLE` too and are included; a CTE named after a real table can only widen
 /// the set to a table that exists, which is the safe direction.
 fn reject_unknown_table_refs(
-    conn: &Connection,
+    session: &dyn Session,
     sql: &str,
 ) -> Result<Option<(std::collections::BTreeSet<String>, bool)>> {
-    let literal = format!("'{}'", sql.replace('\'', "''"));
-    let Ok(ast) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-        r.get::<_, String>(0)
-    }) else {
-        return Ok(None);
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&ast) else {
+    let Ok(v) = session.serialize_sql(sql) else {
         return Ok(None);
     };
     if v.get("error").and_then(Value::as_bool) == Some(true) {
@@ -2122,22 +1676,16 @@ fn reject_unknown_table_refs(
 /// fails with DuckDB's own error), and the cost of the other choice is the unbounded sweep coming
 /// back in through a fallback, which is the defect this whole change exists to remove.
 fn expand_through_views(
-    conn: &Connection,
+    session: &dyn Session,
     named: &std::collections::BTreeSet<String>,
 ) -> std::collections::BTreeSet<String> {
-    let mut defs: std::collections::BTreeMap<String, String> = Default::default();
-    let listed = conn
-        .prepare("SELECT view_name, sql FROM duckdb_views()")
-        .and_then(|mut s| {
-            let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            for (name, sql) in rows.flatten() {
-                defs.insert(name.to_ascii_lowercase(), sql);
-            }
-            Ok(())
-        });
-    if listed.is_err() {
+    let Some(listed) = session.view_definitions() else {
         return named.clone();
-    }
+    };
+    let defs: std::collections::BTreeMap<String, String> = listed
+        .into_iter()
+        .map(|(name, sql)| (name.to_ascii_lowercase(), sql))
+        .collect();
 
     let mut out = named.clone();
     let mut frontier: Vec<String> = named.iter().cloned().collect();
@@ -2148,7 +1696,7 @@ fn expand_through_views(
         for name in frontier.drain(..) {
             let Some(sql) = defs.get(&name) else { continue };
             let Some(body) = view_body(sql) else { continue };
-            let Some(inner) = base_tables_in(conn, body) else {
+            let Some(inner) = base_tables_in(session, body) else {
                 continue;
             };
             for t in inner {
@@ -2239,7 +1787,7 @@ pub(crate) fn view_name(create_view_sql: &str) -> Option<String> {
 /// `define_children_views` after this point, out of factory tables enumerated from the config, and
 /// working out which ones here would be a second copy of that logic to keep in step.
 fn reachable_tables(
-    conn: &Connection,
+    session: &dyn Session,
     dir: &Path,
     referenced: &std::collections::BTreeSet<String>,
 ) -> Option<std::collections::BTreeSet<String>> {
@@ -2258,7 +1806,7 @@ fn reachable_tables(
             let Some(body) = bodies.get(&name) else {
                 continue;
             };
-            for t in base_tables_in(conn, body)? {
+            for t in base_tables_in(session, body)? {
                 if out.insert(t.clone()) {
                     next.push(t);
                 }
@@ -2287,23 +1835,17 @@ pub(crate) fn nest_view_bodies(dir: &Path) -> std::collections::BTreeMap<String,
 
 /// The base tables a statement reads, lowercased. The security walk collects the same set for the
 /// caller's own query; this is for SQL we hand ourselves, like a view's stored definition.
-fn base_tables_in(conn: &Connection, sql: &str) -> Option<std::collections::BTreeSet<String>> {
-    table_refs_in(conn, sql, "BASE_TABLE")
+fn base_tables_in(session: &dyn Session, sql: &str) -> Option<std::collections::BTreeSet<String>> {
+    table_refs_in(session, sql, "BASE_TABLE")
 }
 
 /// The references of one `kind` (`BASE_TABLE`, `TABLE_FUNCTION`) a statement makes, lowercased.
 fn table_refs_in(
-    conn: &Connection,
+    session: &dyn Session,
     sql: &str,
     wanted_kind: &str,
 ) -> Option<std::collections::BTreeSet<String>> {
-    let literal = format!("'{}'", sql.replace('\'', "''"));
-    let ast = conn
-        .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()?;
-    let v = serde_json::from_str::<Value>(&ast).ok()?;
+    let v = session.serialize_sql(sql).ok()?;
     if v.get("error").and_then(Value::as_bool) == Some(true) {
         return None;
     }
@@ -2647,7 +2189,7 @@ pub fn cold_velocity(
 /// Define a read-only `labels` view over the content-addressed snapshots in `dir/labels/*.json`
 /// (each a flat JSON array of `{address, label}`). No snapshots → no view, so joins against it are
 /// only attempted when labels exist. Addresses are lower-cased for a clean join with decoded hex.
-fn define_labels_view(conn: &Connection, dir: &Path) {
+fn define_labels_view(session: &dyn Session, dir: &Path) {
     let labels_dir = dir.join(crate::labels::LABELS_DIR);
     let has_snapshot = std::fs::read_dir(&labels_dir)
         .map(|rd| {
@@ -2658,13 +2200,7 @@ fn define_labels_view(conn: &Connection, dir: &Path) {
     if !has_snapshot {
         return;
     }
-    let glob = labels_dir.join("*.json");
-    let ddl = format!(
-        "CREATE OR REPLACE VIEW labels AS SELECT lower(address) AS address, label \
-         FROM read_json('{}', format='array', columns={{address: 'VARCHAR', label: 'VARCHAR'}})",
-        glob.display()
-    );
-    if let Err(e) = conn.execute_batch(&ddl) {
+    if let Err(e) = session.bind_labels(&labels_dir) {
         tracing::debug!("labels view skipped: {e}");
     }
 }
@@ -2675,7 +2211,7 @@ fn define_labels_view(conn: &Connection, dir: &Path) {
 /// discovery per address. Reads the nest's factory config from `nuthatch.toml`; best-effort, so a
 /// factory table with no sealed events yet (only an empty typed view) just yields an empty children
 /// view. Non-factory nests are a no-op.
-fn define_children_views(conn: &Connection, dir: &Path) {
+fn define_children_views(session: &dyn Session, dir: &Path) {
     let Ok(config) = crate::config::Config::load(dir) else {
         return;
     };
@@ -2728,7 +2264,7 @@ fn define_children_views(conn: &Connection, dir: &Path) {
              FROM ({union}) \
              QUALIFY row_number() OVER (PARTITION BY address ORDER BY discovered_block, discovered_log_index) = 1"
         );
-        if let Err(e) = conn.execute_batch(&ddl) {
+        if let Err(e) = session.execute(&ddl) {
             tracing::debug!("children view {template}__children skipped: {e}");
         }
     }
@@ -2762,7 +2298,7 @@ pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> 
 /// log is not reachable by the caller who is about to sum the reduced column, so the same decision is
 /// handed back as data and rides out on [`QueryOutput::degraded_tables`] (#435).
 fn define_views(
-    conn: &Connection,
+    session: &dyn Session,
     dir: &Path,
     hot: &HotRows,
     sealed_through: u64,
@@ -2786,7 +2322,7 @@ fn define_views(
     wanted: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<std::collections::BTreeSet<String>> {
     Ok(define_views_bound(
-        conn,
+        session,
         dir,
         hot,
         sealed_through,
@@ -2803,22 +2339,13 @@ fn define_views(
 /// yields exactly what it yields over all of them, since a later file with an already-seen schema adds
 /// no column and no type; binding thousands of files by name held about 240 MiB (#1508). A file whose
 /// schema cannot be read is kept, so the unreadable-segment handling still sees it.
-fn one_per_file_schema(conn: &Connection, sealed: Vec<(String, u64)>) -> Vec<(String, u64)> {
+fn one_per_file_schema(session: &dyn Session, sealed: Vec<(PathBuf, u64)>) -> Vec<(PathBuf, u64)> {
     let mut seen = std::collections::BTreeSet::new();
     sealed
         .into_iter()
-        .filter(|(f, _)| {
-            let shape: Option<Vec<(String, String)>> = conn
-                .prepare(&format!("DESCRIBE SELECT * FROM read_parquet([{f}])"))
-                .and_then(|mut st| {
-                    st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                        .collect()
-                })
-                .ok();
-            match shape {
-                Some(shape) => seen.insert(shape),
-                None => true,
-            }
+        .filter(|(f, _)| match session.file_schema(f) {
+            Some(shape) => seen.insert(shape),
+            None => true,
         })
         .collect()
 }
@@ -2833,7 +2360,7 @@ pub(crate) struct FactWindow {
 }
 
 impl FactWindow {
-    fn is_bounded(&self) -> bool {
+    pub(crate) fn is_bounded(&self) -> bool {
         self.after.is_some() || self.through.is_some()
     }
 
@@ -2845,7 +2372,7 @@ impl FactWindow {
         self.after.is_none_or(|lo| to > lo) && self.through.is_none_or(|hi| from <= hi)
     }
 
-    fn predicate(&self) -> String {
+    pub(crate) fn predicate(&self) -> String {
         match (self.after, self.through) {
             (Some(lo), Some(hi)) => format!("block_number > {lo} AND block_number <= {hi}"),
             (Some(lo), None) => format!("block_number > {lo}"),
@@ -2865,7 +2392,7 @@ struct DefinedViews {
 
 #[allow(clippy::too_many_arguments)]
 fn define_views_bound(
-    conn: &Connection,
+    session: &dyn Session,
     dir: &Path,
     hot: &HotRows,
     sealed_through: u64,
@@ -2962,7 +2489,7 @@ fn define_views_bound(
             }
         }
         // Only segments finalized at or below the served watermark (COR-1 disjointness).
-        let sealed: Vec<(String, u64)> = manifest
+        let sealed: Vec<(PathBuf, u64)> = manifest
             .tables
             .get(table)
             .map(|segs| {
@@ -2993,7 +2520,7 @@ fn define_views_bound(
                         // missing file makes `read_parquet` throw and the whole query fail; instead the
                         // table's cold data is reduced, loudly, and queries keep working.
                         if let Ok(meta) = std::fs::metadata(&p) {
-                            Some((format!("'{}'", p.display()), meta.len()))
+                            Some((p, meta.len()))
                         } else if crate::seal::catalogue_hash(dir).ok().flatten() != catalogue_hash {
                             // Gone because the catalogue moved under this plan, not because it was
                             // quarantined: reducing would answer short, so the plan is redone.
@@ -3015,11 +2542,11 @@ fn define_views_bound(
             })
             .unwrap_or_default();
         let sealed = if schema_only {
-            one_per_file_schema(conn, sealed)
+            one_per_file_schema(session, sealed)
         } else {
             sealed
         };
-        let sealed_files: Vec<String> = sealed.iter().map(|(file, _)| file.clone()).collect();
+        let sealed_files: Vec<PathBuf> = sealed.iter().map(|(file, _)| file.clone()).collect();
         // Only tip rows strictly past the watermark (COR-1 disjointness; belt-and-braces with the
         // atomic seal→prune, which already keeps sealed rows out of hot).
         //
@@ -3055,75 +2582,25 @@ fn define_views_bound(
         // The hot tip: load this table's unsealed rows into a temp table, then union it in. Columns are
         // derived from the rows themselves (like the sealed Parquet, `seal::rows_to_batch`), so this
         // works with or without a `schema.json`. The `*_dec` derived columns still come from the schema.
-        let hot_part: Option<String> = if hot_rows.is_empty() {
-            None
-        } else {
-            let hot_tbl = format!("__hot_{table}");
-            match load_hot_temp(conn, &hot_tbl, &hot_rows) {
-                Ok(()) => Some(format!(
-                    "SELECT *{} FROM {}",
-                    derived_bigint_cols(cols),
-                    with_declared_base_cols(&format!("\"{hot_tbl}\""), cols)
-                )),
+        let hot_loaded = !hot_rows.is_empty()
+            && match session.load_hot(table, &hot_rows) {
+                Ok(()) => true,
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
                     degraded.insert(table.clone());
-                    None
+                    false
                 }
-            }
-        };
+            };
 
-        // The view over a given set of sealed files plus whatever hot rows loaded. Built as a closure
-        // because a segment that will not bind is dropped and the view rebuilt from what remains, below.
-        let view_ddl = |files: &[String]| -> Option<String> {
-            let mut parts: Vec<String> = Vec::new();
-            if !files.is_empty() {
-                // COR-2: `union_by_name=true` NULL-fills columns that differ across segments - segment
-                // schemas legitimately drift over a nest's life as ABIs are versioned (CLAUDE.md), and
-                // without this a single drifted column makes `read_parquet` throw and the whole table's
-                // view silently vanish.
-                parts.push(format!(
-                    "SELECT *{} FROM {}",
-                    derived_bigint_cols(cols),
-                    with_declared_base_cols(
-                        &format!("read_parquet([{}], union_by_name=true)", files.join(", ")),
-                        cols
-                    )
-                ));
+        // The view over the sealed files plus whatever hot rows loaded. A segment that will not bind
+        // is dropped and the view rebuilt from what remains, below.
+        let e = match session.bind_facts(table, cols, &sealed_files, hot_loaded, window) {
+            Ok(true) => {
+                bound.insert(table.clone(), table_scan(&sealed));
+                continue;
             }
-            parts.extend(hot_part.clone());
-            if parts.is_empty() {
-                // Nothing sealed and nothing hot: an empty typed view so nest views resolve to zero rows
-                // instead of cascade-failing (skip a table with no declared columns).
-                if cols.is_empty() {
-                    return None;
-                }
-                Some(empty_view_ddl(table, cols))
-            } else {
-                // `UNION ALL BY NAME` aligns columns by name and NULL-fills any a side lacks (a column
-                // all-null over the sealed range is dropped from its Parquet schema; hot may still
-                // carry it).
-                let union = parts.join(" UNION ALL BY NAME ");
-                let select = if window.is_bounded() {
-                    format!(
-                        "SELECT * FROM ({union}) historical_facts WHERE CASE \
-                         WHEN block_number IS NULL THEN error('historical query requires block-stamped facts: unstamped archived row') \
-                         ELSE {} END",
-                        window.predicate()
-                    )
-                } else {
-                    union
-                };
-                Some(format!("CREATE OR REPLACE VIEW \"{table}\" AS {select}"))
-            }
-        };
-
-        let Some(ddl) = view_ddl(&sealed_files) else {
-            continue;
-        };
-        let Err(e) = conn.execute_batch(&ddl) else {
-            bound.insert(table.clone(), table_scan(&sealed));
-            continue;
+            Ok(false) => continue,
+            Err(e) => e,
         };
         // A sealed segment that is present but *unreadable* throws while `read_parquet` binds its
         // footer, which happens at DDL time. Swallowing that used to delete the table from the SQL
@@ -3132,21 +2609,19 @@ fn define_views_bound(
         // segments that will not bind and rebuild the view from what remains, so one bad file *reduces*
         // the table rather than deleting it. The probe is free on the healthy path - it only runs once
         // the whole-view DDL has already failed.
-        let readable: Vec<(String, u64)> = sealed
+        let readable: Vec<(PathBuf, u64)> = sealed
             .iter()
-            .filter(|(f, _)| {
-                let probe = format!("SELECT 1 FROM read_parquet([{f}], union_by_name=true) LIMIT 0");
-                match conn.prepare(&probe) {
-                    Ok(_) => true,
-                    Err(err) => {
-                        // Present and unreadable, same class as the excluded case above: `error!`,
-                        // and recorded so the caller learns the table came back short (#435).
-                        tracing::error!(
-                            "segment {f} for {table} will not bind - skipping (cold data reduced): {err}"
-                        );
-                        degraded.insert(table.clone());
-                        false
-                    }
+            .filter(|(f, _)| match session.segment_binds(f) {
+                Ok(()) => true,
+                Err(err) => {
+                    // Present and unreadable, same class as the excluded case above: `error!`,
+                    // and recorded so the caller learns the table came back short (#435).
+                    tracing::error!(
+                        "segment '{}' for {table} will not bind - skipping (cold data reduced): {err}",
+                        f.display()
+                    );
+                    degraded.insert(table.clone());
+                    false
                 }
             })
             .cloned()
@@ -3159,16 +2634,16 @@ fn define_views_bound(
             degraded.insert(table.clone());
             continue;
         }
-        let readable_files: Vec<String> = readable.iter().map(|(file, _)| file.clone()).collect();
-        match view_ddl(&readable_files).map(|retry| conn.execute_batch(&retry)) {
-            Some(Err(e)) => {
+        let readable_files: Vec<PathBuf> = readable.iter().map(|(file, _)| file.clone()).collect();
+        match session.bind_facts(table, cols, &readable_files, hot_loaded, window) {
+            Err(e) => {
                 tracing::warn!("view {table} skipped after dropping bad segments: {e}");
                 degraded.insert(table.clone());
             }
-            Some(Ok(())) => {
+            Ok(true) => {
                 bound.insert(table.clone(), table_scan(&readable));
             }
-            None => {}
+            Ok(false) => {}
         }
     }
     if overtaken {
@@ -3181,7 +2656,7 @@ fn define_views_bound(
     })
 }
 
-fn table_scan(files: &[(String, u64)]) -> TableScan {
+fn table_scan(files: &[(PathBuf, u64)]) -> TableScan {
     TableScan {
         segments: files.len() as u64,
         bytes: files
@@ -3192,7 +2667,7 @@ fn table_scan(files: &[(String, u64)]) -> TableScan {
 
 /// The DuckDB column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
 /// columns are `UBIGINT`, everything else is stored as canonical text (`VARCHAR`).
-fn hot_col_type(name: &str) -> &'static str {
+pub(crate) fn hot_col_type(name: &str) -> &'static str {
     if matches!(
         name,
         "block_number" | "log_index" | "_seq" | "block_timestamp"
@@ -3200,56 +2675,6 @@ fn hot_col_type(name: &str) -> &'static str {
         "UBIGINT"
     } else {
         "VARCHAR"
-    }
-}
-
-/// Create a temp table for one logical table's hot rows and append them, typed to match the sealed
-/// Parquet (so `UNION ALL BY NAME` lines up). Columns are the sorted union of the rows' JSON keys -
-/// exactly how `seal::rows_to_batch` derives the Parquet schema - so no `schema.json` is required.
-/// Value marshalling mirrors seal exactly: counter columns are `u64` (0 if absent), every other column
-/// is the JSON string as-is, or the JSON value stringified, or NULL when absent/null.
-fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value]) -> Result<()> {
-    let mut columns: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for r in rows {
-        if let Some(obj) = r.as_object() {
-            columns.extend(obj.keys().cloned());
-        }
-    }
-    let columns: Vec<String> = columns.into_iter().collect();
-    if columns.is_empty() {
-        bail!("hot rows have no columns");
-    }
-    let coldefs: Vec<String> = columns
-        .iter()
-        .map(|c| format!("\"{c}\" {}", hot_col_type(c)))
-        .collect();
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS \"{name}\"; CREATE TEMP TABLE \"{name}\" ({})",
-        coldefs.join(", ")
-    ))?;
-    let mut app = conn.appender(name)?;
-    for row in rows {
-        let vals: Vec<DuckValue> = columns
-            .iter()
-            .map(|c| json_to_duck(row.get(c), c))
-            .collect();
-        let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
-        app.append_row(refs.as_slice())?;
-    }
-    app.flush()?;
-    Ok(())
-}
-
-/// One JSON cell → a DuckDB value, mirroring `seal::rows_to_batch`'s marshalling for a matching schema.
-fn json_to_duck(v: Option<&Value>, col: &str) -> DuckValue {
-    if hot_col_type(col) == "UBIGINT" {
-        DuckValue::UBigInt(v.and_then(Value::as_u64).unwrap_or(0))
-    } else {
-        match v {
-            Some(Value::String(s)) => DuckValue::Text(s.clone()),
-            None | Some(Value::Null) => DuckValue::Null,
-            Some(other) => DuckValue::Text(other.to_string()),
-        }
     }
 }
 
@@ -3274,7 +2699,7 @@ fn json_to_duck(v: Option<&Value>, col: &str) -> DuckValue {
 /// statement reaches through another view is still defined, in file order, before the one that
 /// reads it.
 fn define_nest_views(
-    conn: &Connection,
+    session: &dyn Session,
     dir: &Path,
     wanted: Option<&std::collections::BTreeSet<String>>,
 ) {
@@ -3293,7 +2718,7 @@ fn define_nest_views(
                     continue;
                 }
             }
-            if let Err(e) = conn.execute_batch(&with_or_replace_view(&stmt)) {
+            if let Err(e) = session.execute(&with_or_replace_view(&stmt)) {
                 tracing::debug!("nest view {} statement skipped: {e}", v.file);
             }
         }
@@ -3305,7 +2730,7 @@ fn define_nest_views(
 /// Returns each view it defined and the content hashes of the snapshots behind it, in append order,
 /// so an answer can name what it read (#1437).
 fn define_offchain_views(
-    conn: &Connection,
+    session: &dyn Session,
     dir: &Path,
     wanted: Option<&std::collections::BTreeSet<String>>,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
@@ -3329,15 +2754,8 @@ fn define_offchain_views(
         if present.is_empty() {
             continue;
         }
-        let files: Vec<String> = present
-            .iter()
-            .map(|(_, p)| format!("'{}'", p.display().to_string().replace('\'', "''")))
-            .collect();
-        let ddl = format!(
-            "CREATE OR REPLACE VIEW \"{view}\" AS SELECT * FROM read_parquet([{}], union_by_name=true)",
-            files.join(", ")
-        );
-        match conn.execute_batch(&ddl) {
+        let files: Vec<PathBuf> = present.iter().map(|(_, p)| p.clone()).collect();
+        match session.bind_snapshots(&view, &files) {
             Ok(()) => {
                 defined.insert(view, present.iter().map(|(s, _)| s.hash.clone()).collect());
             }
@@ -3352,7 +2770,7 @@ fn define_offchain_views(
             continue;
         }
         let ddl = offchain_status_ddl(&view, table, refresh);
-        if let Err(e) = conn.execute_batch(&ddl) {
+        if let Err(e) = session.execute(&ddl) {
             tracing::warn!("offchain status view {view} skipped: {e}");
         }
     }
@@ -3563,11 +2981,10 @@ fn view_build_failure_at(
     if files.is_empty() {
         return None;
     }
-    let conn = Connection::open_in_memory().ok()?;
-    register_extensions(&conn).ok()?;
+    let session = engine().open_bare().ok()?;
     let empty_hot = HotRows::new();
     let _ = define_views(
-        &conn,
+        &*session,
         dir,
         &empty_hot,
         u64::MAX,
@@ -3575,13 +2992,13 @@ fn view_build_failure_at(
         schema,
         None,
     );
-    define_labels_view(&conn, dir);
-    define_children_views(&conn, dir);
+    define_labels_view(&*session, dir);
+    define_children_views(&*session, dir);
 
     let target = missing.trim_matches('"').to_ascii_lowercase();
     for v in &files {
         for stmt in split_sql_statements(&v.sql) {
-            let result = conn.execute_batch(&stmt);
+            let result = session.execute(&stmt);
             let Some(name) = view_target_name(&stmt) else {
                 continue;
             };
@@ -3690,21 +3107,21 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     if files.is_empty() {
         return Vec::new();
     }
-    let Ok(conn) = Connection::open_in_memory() else {
-        return Vec::new();
+    let session = match engine().open_bare() {
+        Ok(session) => session,
+        Err(error) => {
+            return vec![ViewIssue {
+                file: "<scalar functions>".into(),
+                error: format!("open the query engine: {error:#}"),
+                hint: None,
+            }]
+        }
     };
-    if let Err(error) = register_extensions(&conn) {
-        return vec![ViewIssue {
-            file: "<scalar functions>".into(),
-            error: format!("register query scalar functions: {error:#}"),
-            hint: None,
-        }];
-    }
     // Base surface the views bind against. `u64::MAX` includes every sealed segment (or, on a fresh
     // nest, yields the empty typed views) so a view referencing `usdc__transfer` resolves.
     let empty_hot = HotRows::new();
     let _ = define_views(
-        &conn,
+        &*session,
         dir,
         &empty_hot,
         u64::MAX,
@@ -3712,8 +3129,8 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
         schema,
         None,
     );
-    define_labels_view(&conn, dir);
-    define_children_views(&conn, dir);
+    define_labels_view(&*session, dir);
+    define_children_views(&*session, dir);
 
     let mut issues = Vec::new();
     for v in &files {
@@ -3724,7 +3141,7 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
         // one pass; withholding it is a choice, and a bad one.
         let mut errors: Vec<String> = Vec::new();
         for stmt in split_sql_statements(&v.sql) {
-            if let Err(e) = conn.execute_batch(&stmt) {
+            if let Err(e) = session.execute(&stmt) {
                 errors.push(format!("{e}"));
             }
         }
@@ -3768,11 +3185,10 @@ pub fn entity_output_columns(
     schema: &[crate::registry::TableSchema],
     sql: &str,
 ) -> Result<Vec<String>> {
-    let conn = Connection::open_in_memory()?;
-    register_extensions(&conn)?;
+    let session = engine().open_bare()?;
     let empty_hot = HotRows::new();
     let _ = define_views(
-        &conn,
+        &*session,
         dir,
         &empty_hot,
         u64::MAX,
@@ -3780,13 +3196,10 @@ pub fn entity_output_columns(
         schema,
         None,
     );
-    let _ = define_offchain_views(&conn, dir, None);
-    define_labels_view(&conn, dir);
-    define_children_views(&conn, dir);
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query([])?;
-    drop(rows);
-    Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
+    let _ = define_offchain_views(&*session, dir, None);
+    define_labels_view(&*session, dir);
+    define_children_views(&*session, dir);
+    session.column_names(sql)
 }
 
 /// Every table and authored view name a nest has, lowercased, read from its files without binding
@@ -3817,18 +3230,18 @@ pub(crate) fn nest_relation_names(
 /// engine stays inside this module (RFC-0042 §6): every method takes and returns plain data.
 #[cfg(feature = "folds")]
 pub(crate) struct FoldBinder {
-    conn: Connection,
-    _spill: SpillDir,
+    session: Box<dyn Session>,
+    /// The parser role stays DuckDB's for now (RFC-0044 Amendment 2, phase 2); it needs no catalogue.
+    parser: crate::graft::Parser,
 }
 
 #[cfg(feature = "folds")]
 impl FoldBinder {
     /// Bounded and locked down like `/sql`'s connection: the same memory, thread and spill limits.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
-        let (conn, spill) = open_locked_duckdb(dir)?;
         Ok(Self {
-            conn,
-            _spill: spill,
+            session: open_session(dir)?,
+            parser: crate::graft::Parser::new()?,
         })
     }
 
@@ -3841,7 +3254,7 @@ impl FoldBinder {
         wanted: &std::collections::BTreeSet<String>,
     ) -> Result<()> {
         define_views_bound(
-            &self.conn,
+            &*self.session,
             dir,
             &HotRows::new(),
             u64::MAX,
@@ -3851,29 +3264,19 @@ impl FoldBinder {
             FactWindow::default(),
             true,
         )?;
-        define_nest_views(&self.conn, dir, Some(wanted));
+        define_nest_views(&*self.session, dir, Some(wanted));
         Ok(())
     }
 
     /// Every table and view currently defined, lowercased.
     #[cfg(test)]
     pub(crate) fn relations(&self) -> Result<std::collections::BTreeSet<String>> {
-        Ok(self
-            .conn
-            .prepare("SELECT lower(view_name) FROM duckdb_views() WHERE NOT internal")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<_, _>>()?)
+        self.session.relations()
     }
 
     /// The statement's top-level node type, or the parser's error.
     pub(crate) fn statement_kinds(&self, sql: &str) -> Result<Vec<String>> {
-        let literal = format!("'{}'", sql.replace('\'', "''"));
-        let ast: String =
-            self.conn
-                .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-                    r.get(0)
-                })?;
-        let ast: Value = serde_json::from_str(&ast)?;
+        let ast = self.session.serialize_sql(sql)?;
         if ast.get("error").and_then(Value::as_bool) == Some(true) {
             bail!(
                 "does not parse: {}",
@@ -3895,7 +3298,7 @@ impl FoldBinder {
     }
 
     pub(crate) fn base_tables(&self, sql: &str) -> Option<std::collections::BTreeSet<String>> {
-        base_tables_in(&self.conn, sql)
+        base_tables_in(&*self.session, sql)
     }
 
     pub(crate) fn reachable(
@@ -3903,33 +3306,31 @@ impl FoldBinder {
         dir: &Path,
         referenced: &std::collections::BTreeSet<String>,
     ) -> Option<std::collections::BTreeSet<String>> {
-        reachable_tables(&self.conn, dir, referenced)
+        reachable_tables(&*self.session, dir, referenced)
     }
 
     pub(crate) fn refusals(&self, sql: &str) -> Vec<crate::graft::Refusal> {
-        crate::graft::static_refusals(&crate::graft::canonical_plan(&self.conn, sql))
+        crate::graft::static_refusals(&self.parser.canonical_plan(sql))
     }
 
     /// The canonical plan, so formatting alone never changes a fold's identity.
     pub(crate) fn plan_text(&self, sql: &str) -> String {
-        match crate::graft::canonical_plan(&self.conn, sql) {
+        match self.parser.canonical_plan(sql) {
             crate::graft::CanonicalPlan::Ast(s) | crate::graft::CanonicalPlan::RawText(s) => s,
         }
     }
 
     pub(crate) fn engine_version(&self) -> String {
-        crate::graft::engine_version(&self.conn)
+        self.parser.engine_version()
     }
 
     /// `(column, type)` of a query's output, as DuckDB spells the type.
     pub(crate) fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(&format!("DESCRIBE {sql}"))?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        self.session.describe(sql)
     }
 
     pub(crate) fn execute(&self, sql: &str) -> Result<()> {
-        Ok(self.conn.execute_batch(sql)?)
+        self.session.execute(sql)
     }
 
     /// The constructs in a statement that read across rows or reach back for earlier ones: a window
@@ -3942,16 +3343,7 @@ impl FoldBinder {
         sql: &str,
         facts: &std::collections::BTreeSet<String>,
     ) -> Vec<String> {
-        let literal = format!("'{}'", sql.replace('\'', "''"));
-        let Ok(ast) =
-            self.conn
-                .query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-                    r.get::<_, String>(0)
-                })
-        else {
-            return Vec::new();
-        };
-        let Ok(ast) = serde_json::from_str::<Value>(&ast) else {
+        let Ok(ast) = self.session.serialize_sql(sql) else {
             return Vec::new();
         };
         let mut out: Vec<String> = Vec::new();
@@ -4019,13 +3411,12 @@ fn walk_ast(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
 /// means the current window, never history, so it can never share `/sql`'s pooled catalogue.
 #[cfg(feature = "folds")]
 pub(crate) struct FoldEvaluator {
-    conn: Connection,
+    session: Box<dyn Session>,
     dir: PathBuf,
     schema: Vec<crate::registry::TableSchema>,
     views_defined: bool,
     /// Views defined inside the open transaction: a rollback removes them, so the flag goes too.
     views_pending: bool,
-    _spill: SpillDir,
 }
 
 #[cfg(feature = "folds")]
@@ -4038,10 +3429,8 @@ impl FoldEvaluator {
         if let Some(shared) = crate::seal::shared_store(dir) {
             std::fs::create_dir_all(shared)?;
         }
-        let (conn, spill) = open_locked_duckdb(dir)?;
         Ok(Self {
-            conn,
-            _spill: spill,
+            session: open_session(dir)?,
             dir: dir.to_path_buf(),
             schema: schema.to_vec(),
             views_defined: false,
@@ -4059,7 +3448,7 @@ impl FoldEvaluator {
         wanted: &std::collections::BTreeSet<String>,
     ) -> Result<()> {
         let defined = define_views_bound(
-            &self.conn,
+            &*self.session,
             &self.dir,
             hot,
             sealed_through,
@@ -4082,7 +3471,7 @@ impl FoldEvaluator {
         }
         // Views resolve fact names when queried, so defining them once serves every later window.
         if !self.views_defined {
-            define_nest_views(&self.conn, &self.dir, Some(wanted));
+            define_nest_views(&*self.session, &self.dir, Some(wanted));
             self.views_defined = true;
             self.views_pending = true;
         }
@@ -4090,17 +3479,17 @@ impl FoldEvaluator {
     }
 
     pub(crate) fn begin(&mut self) -> Result<()> {
-        Ok(self.conn.execute_batch("BEGIN TRANSACTION")?)
+        self.session.execute("BEGIN TRANSACTION")
     }
 
     pub(crate) fn commit(&mut self) -> Result<()> {
-        self.conn.execute_batch("COMMIT")?;
+        self.session.execute("COMMIT")?;
         self.views_pending = false;
         Ok(())
     }
 
     pub(crate) fn rollback(&mut self) -> Result<()> {
-        self.conn.execute_batch("ROLLBACK")?;
+        self.session.execute("ROLLBACK")?;
         if self.views_pending {
             self.views_defined = false;
             self.views_pending = false;
@@ -4109,15 +3498,14 @@ impl FoldEvaluator {
     }
 
     pub(crate) fn execute(&self, sql: &str) -> Result<()> {
-        Ok(self.conn.execute_batch(sql)?)
+        self.session.execute(sql)
     }
 
     pub(crate) fn count(&self, relation: &str) -> Result<u64> {
-        Ok(self
-            .conn
-            .query_row(&format!("SELECT count(*) FROM \"{relation}\""), [], |r| {
-                r.get(0)
-            })?)
+        self.session
+            .one_value(&format!("SELECT count(*) FROM \"{relation}\""))?
+            .as_u64()
+            .context("count(*) is not an integer")
     }
 
     /// Row count and order-independent digest of a result: the sum, mod 2^256, of the sha256 of each
@@ -4125,17 +3513,9 @@ impl FoldEvaluator {
     /// gate: materialising it cost 474 MiB of resident memory).
     pub(crate) fn digest(&self, sql: &str) -> Result<(u64, String)> {
         use sha2::{Digest, Sha256};
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
-        let width = rows.as_ref().map_or(0, |s| s.column_count());
         let (mut count, mut sum) = (0u64, [0u8; 32]);
-        let mut cells = Vec::with_capacity(width);
-        while let Some(row) = rows.next()? {
-            cells.clear();
-            for i in 0..width {
-                cells.push(value_to_json(row.get_ref(i)?));
-            }
-            let h: [u8; 32] = Sha256::digest(serde_json::to_vec(&cells)?).into();
+        self.session.for_each_row(sql, &mut |cells| {
+            let h: [u8; 32] = Sha256::digest(serde_json::to_vec(cells)?).into();
             let mut carry = 0u16;
             for i in (0..32).rev() {
                 let s = sum[i] as u16 + h[i] as u16 + carry;
@@ -4143,22 +3523,18 @@ impl FoldEvaluator {
                 carry = s >> 8;
             }
             count += 1;
-        }
+            Ok(())
+        })?;
         Ok((count, hex::encode(sum)))
     }
 
     /// A result as Arrow, for head snapshots (RFC-0059 §4), whose size must be counted exactly.
     pub(crate) fn arrow(&self, sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
-        let mut stmt = self.conn.prepare(sql)?;
-        Ok(stmt.query_arrow([])?.collect())
+        self.session.query_arrow(sql)
     }
 
     pub(crate) fn rows(&self, sql: &str) -> Result<Vec<Value>> {
-        collect(&self.conn, sql, None)
-            .map(|(rows, _)| rows)
-            .map_err(|died| match died {
-                Died::Binding(e) | Died::Executing(e) => e,
-            })
+        Ok(self.session.collect(sql, None)?.0)
     }
 }
 
@@ -4216,7 +3592,7 @@ fn schema_columns(dir: &Path) -> Vec<(String, Vec<(String, String)>)> {
 }
 
 /// True for a big-integer (uint/int > 64-bit) storage kind - the columns that get `*_dec`/`*_overflow`.
-fn is_bigint(storage: &str) -> bool {
+pub(crate) fn is_bigint(storage: &str) -> bool {
     storage == "word16" || storage == "word32"
 }
 
@@ -4233,95 +3609,13 @@ pub(crate) fn derived_bigint_cols(cols: &[(String, String)]) -> String {
     s
 }
 
-/// Wrap a row source so every declared column is present in its schema, NULL-filled where no input
-/// carries it.
-///
-/// COR-2's `union_by_name=true` only unions the schemas of the *listed inputs*, and `derived_bigint_cols`
-/// projects its casts one level above them - so a `word16`/`word32` column that **no** input carries is
-/// referenced by a cast and bound by nothing, the whole-view DDL fails on `Referenced column not found`,
-/// and the table disappears from `/sql` entirely (#434). That is not an exotic state: it is every nest
-/// between `schema.json` gaining a big-int column and the first segment carrying it sealing. One input
-/// out of N carrying the column already worked, which is what made this easy to believe was covered.
-///
-/// #729 broadens this from big-integer columns to every declared column, for the same reason with a
-/// quieter failure mode: a plain column no listed input carries doesn't fail the DDL (nothing above it
-/// casts it) - `SELECT *` simply omits it, so the view builds "successfully" and is silently missing the
-/// column, exactly the state #729 reported for a `schema.json` reconciled with a re-fetched ABI whose
-/// new field predates every currently-sealed segment. Confirmed against DuckDB directly (not assumed):
-/// `read_parquet([...], union_by_name=true)` NULL-fills a column across the *listed* files that carry it
-/// unevenly, but a column *no listed file* carries is absent from the result schema outright, and an
-/// explicit `SELECT that_col` against it is a binder error, not a NULL row - so the fix is this same
-/// stub, one level up, for every declared column rather than only the bigint-derived ones.
-///
-/// A zero-row typed branch fixes it where the drift belongs - inside the union, so the column is
-/// NULL-filled exactly as a partially-present one is, rather than by weakening the cast. `WHERE false`
-/// contributes schema and no rows, and it costs no extra scan or bind of the segments themselves.
-/// Types come from `hot_col_type` (COR-4: by column *name*), matching `empty_view_ddl` and the hot temp
-/// table, so a column does not change type the instant its first segment seals. Stubbing a column the
-/// input already carries is harmless - `UNION ALL BY NAME` merges same-named columns from both sides
-/// rather than duplicating them - so this does not need to special-case which columns are actually
-/// missing from `from_item`.
-fn with_declared_base_cols(from_item: &str, cols: &[(String, String)]) -> String {
-    let stubs: Vec<String> = cols
-        .iter()
-        .map(|(c, _)| format!("CAST(NULL AS {}) AS \"{c}\"", hot_col_type(c)))
-        .collect();
-    if stubs.is_empty() {
-        return from_item.to_string();
-    }
-    format!(
-        "(SELECT * FROM {from_item} UNION ALL BY NAME SELECT {} WHERE false)",
-        stubs.join(", ")
-    )
-}
-
-/// An empty but correctly-typed view for a declared table that has no sealed segment yet, so a nest
-/// view that references it (or UNIONs it with a table that *does* have data) resolves instead of
-/// silently vanishing. Columns and their `*_dec`/`*_overflow` siblings match the sealed view's shape;
-/// `WHERE false` yields zero rows.
-fn empty_view_ddl(table: &str, cols: &[(String, String)]) -> String {
-    let mut sel: Vec<String> = Vec::new();
-    for (name, storage) in cols {
-        // COR-4: type by column NAME (`hot_col_type`), exactly as `seal::rows_to_batch` and the hot temp
-        // table do - only the four counter columns are UBIGINT, everything else (incl. a `u64`-storage
-        // event field like a `uint24`) is VARCHAR. Typing by *storage* here made a column flip type the
-        // instant the first row sealed (`AVG(fee)` valid empty, erroring once populated).
-        let ty = hot_col_type(name);
-        sel.push(format!("CAST(NULL AS {ty}) AS \"{name}\""));
-        if is_bigint(storage) {
-            sel.push(format!("CAST(NULL AS DECIMAL(38,0)) AS \"{name}_dec\""));
-            sel.push(format!("CAST(NULL AS BOOLEAN) AS \"{name}_overflow\""));
-        }
-    }
-    format!(
-        "CREATE OR REPLACE VIEW \"{table}\" AS SELECT {} WHERE false",
-        sel.join(", ")
-    )
-}
-
-fn value_to_json(v: ValueRef<'_>) -> Value {
-    match v {
-        ValueRef::Null => Value::Null,
-        ValueRef::Boolean(b) => Value::Bool(b),
-        ValueRef::TinyInt(i) => Value::from(i),
-        ValueRef::SmallInt(i) => Value::from(i),
-        ValueRef::Int(i) => Value::from(i),
-        ValueRef::BigInt(i) => Value::from(i),
-        ValueRef::UTinyInt(i) => Value::from(i),
-        ValueRef::USmallInt(i) => Value::from(i),
-        ValueRef::UInt(i) => Value::from(i),
-        ValueRef::UBigInt(i) => Value::from(i),
-        ValueRef::Float(f) => Value::from(f),
-        ValueRef::Double(f) => Value::from(f),
-        ValueRef::HugeInt(i) => Value::String(i.to_string()),
-        ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
-        // Timestamps, decimals, nested types etc. - stringify for the skeleton surface.
-        other => Value::String(format!("{other:?}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::engine_duck::{
+        empty_view_ddl, new_spill_dir, physical_parquet_scans, with_declared_base_cols, SPILL_SEQ,
+    };
+    use duckdb::Connection;
+
     #[test]
     fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -5312,53 +4606,6 @@ template="pool"
             "retired files must be deleted once their readers are done"
         );
         assert_eq!(count(dir.path()).rows[0]["n"], Value::from(FOLDS + 1));
-    }
-
-    /// An unconfigured process still opens DuckDB at today's 512 MB / 2 threads. Raising the permit
-    /// count no longer silently shrinks the per-connection ceiling: that product is the startup
-    /// validator's job (RFC-0047 C4).
-    #[test]
-    fn unconfigured_duckdb_still_opens_at_todays_walls() {
-        let resources = crate::analytics_budget::from_env();
-        assert_eq!(resources.memory_limit_mb, 512);
-        assert_eq!(resources.threads, 2);
-        assert!(resources.temp_directory.is_none());
-        assert!(resources.max_temp_size.is_none());
-        let dir = tempfile::tempdir().unwrap();
-        let (conn, spill) = open_locked_duckdb(dir.path()).unwrap();
-        let mem: String = conn
-            .query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0))
-            .unwrap();
-        let threads: i64 = conn
-            .query_row("SELECT current_setting('threads')", [], |r| r.get(0))
-            .unwrap();
-        let temp: String = conn
-            .query_row("SELECT current_setting('temp_directory')", [], |r| r.get(0))
-            .unwrap();
-        // DuckDB prints `512MB` as `488.2 MiB` (SI mega, not mebi). Either spelling is the wall.
-        assert!(
-            mem.to_ascii_uppercase().contains("512") || mem.contains("488"),
-            "unconfigured max_memory must still be 512MB, got {mem}"
-        );
-        assert_eq!(
-            threads, 2,
-            "unconfigured threads must still be 2, got {threads}"
-        );
-        assert_eq!(
-            PathBuf::from(&temp),
-            spill.0,
-            "spill must stay a private per-instance directory (#1165), got {temp}"
-        );
-        assert!(
-            spill
-                .0
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(&format!("nuthatch-duckdb-{}-", std::process::id())),
-            "spill name must stay nuthatch-duckdb-{{pid}}-{{seq}}: {}",
-            spill.0.display()
-        );
     }
 
     #[test]
@@ -6664,73 +5911,6 @@ template="pool"
         assert!(!exfil.exists(), "a WITH-prefixed COPY wrote a file");
     }
 
-    /// #289: the directory lockdown, configured the way `run` configures it, must refuse an
-    /// out-of-allowlist read *on its own*. The denylist is still the primary control; this is the
-    /// second layer. Deleting `enable_external_access(false)` from `open_locked_duckdb` fails this.
-    #[test]
-    fn the_directory_lockdown_blocks_an_out_of_allowlist_file_read() {
-        let nest = tempfile::tempdir().unwrap();
-        let segments = nest.path().join(crate::seal::SEGMENTS_DIR);
-        std::fs::create_dir_all(&segments).unwrap();
-        let secret = tempfile::tempdir().unwrap();
-        let secret_file = secret.path().join("nuthatch.toml");
-        std::fs::write(&secret_file, "[nest]\napi_key = \"hunter2\"\n").unwrap();
-        let sql = format!("SELECT * FROM read_text('{}')", secret_file.display());
-
-        assert!(
-            reject_file_access(&sql).is_err(),
-            "the denylist must still refuse read_text - it is the control in front"
-        );
-
-        let (conn, _spill) = open_locked_duckdb(nest.path()).unwrap();
-        let read_succeeded = match conn.prepare(&sql) {
-            Ok(mut stmt) => stmt.query_row([], |r| r.get::<_, String>(0)).is_ok(),
-            Err(_) => false,
-        };
-        assert!(
-            !read_succeeded,
-            "allowed_directories + enable_external_access=false must refuse an out-of-allowlist read"
-        );
-
-        assert!(
-            conn.execute_batch("SET allowed_directories=['/'];")
-                .is_err(),
-            "lock_configuration must prevent widening file access"
-        );
-
-        // A file inside the allow-list still reads: the lockdown is a restriction, not a total ban.
-        let allowed_file = segments.join("ok.txt");
-        std::fs::write(&allowed_file, "ok\n").unwrap();
-        let ok_sql = format!("SELECT * FROM read_text('{}')", allowed_file.display());
-        let mut stmt = conn
-            .prepare(&ok_sql)
-            .expect("in-allowlist read_text prepares");
-        let got: String = stmt
-            .query_row([], |r| r.get(0))
-            .expect("in-allowlist read_text runs");
-        assert!(got.contains("ok"), "got {got:?}");
-    }
-
-    /// Runtime layout: Parquet is at `<root>/segments/`, the nest dir is `<root>/data/<nid>/`.
-    /// Locking only the nest dir made every mounted `/sql` return empty (#289, e2e_early_cutoff).
-    #[test]
-    fn the_lockdown_allows_the_shared_segment_store() {
-        let root = tempfile::tempdir().unwrap();
-        let nid_dir = root.path().join("data").join("nid");
-        std::fs::create_dir_all(&nid_dir).unwrap();
-        let shared = root.path().join(crate::seal::SEGMENTS_DIR);
-        std::fs::create_dir_all(&shared).unwrap();
-        let file = shared.join("ok.txt");
-        std::fs::write(&file, "shared\n").unwrap();
-        let (conn, _spill) = open_locked_duckdb(&nid_dir).unwrap();
-        let sql = format!("SELECT content FROM read_text('{}')", file.display());
-        let mut stmt = conn.prepare(&sql).expect("shared-store read_text prepares");
-        let got: String = stmt
-            .query_row([], |r| r.get(0))
-            .expect("shared-store read_text runs");
-        assert_eq!(got.trim(), "shared");
-    }
-
     /// Issue #150: a value larger than `i128` must be dropped **identically** by the cold fold and the
     /// hot replay, or a warm restart would silently change balances.
     ///
@@ -7461,7 +6641,7 @@ template="pool"
         // A name the catalogue does not have: refused by the binder, before a page is touched.
         assert!(
             matches!(
-                collect(&conn, r#"SELECT no_such_column FROM "t__transfer""#, None),
+                conn.collect(r#"SELECT no_such_column FROM "t__transfer""#, None),
                 Err(Died::Binding(_))
             ),
             "a missing column is a bind failure - it cannot have been caused by a corrupt page"
@@ -7470,7 +6650,7 @@ template="pool"
         // The same connection, a query that binds and then reads the corrupt pages.
         assert!(
             matches!(
-                collect(&conn, r#"SELECT * FROM "t__transfer""#, None),
+                conn.collect(r#"SELECT * FROM "t__transfer""#, None),
                 Err(Died::Executing(_))
             ),
             "reading a page-corrupt segment is an execution failure - the only shape worth sweeping for"
@@ -8849,13 +8029,13 @@ events = ["Transfer"]
 mod fold_connections {
     use super::*;
 
-    fn setting(conn: &Connection, name: &str) -> String {
-        conn.query_row(
-            &format!("SELECT current_setting('{name}')::VARCHAR"),
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
+    fn setting(session: &dyn Session, name: &str) -> String {
+        session
+            .one_value(&format!("SELECT current_setting('{name}')::VARCHAR"))
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// Both fold connections carry `/sql`'s budget and lockdown. A bare in-memory DuckDB takes 80%
@@ -8863,19 +8043,20 @@ mod fold_connections {
     #[test]
     fn fold_connections_are_bounded_and_locked_down_like_sql() {
         let dir = tempfile::tempdir().unwrap();
-        let (reference, _spill) = open_locked_duckdb(dir.path()).unwrap();
+        let reference = engine().open(dir.path()).unwrap();
         let binder = FoldBinder::open(dir.path()).unwrap();
         let eval = FoldEvaluator::new(dir.path(), &[]).unwrap();
-        for (what, conn) in [("binder", &binder.conn), ("evaluator", &eval.conn)] {
+        for (what, session) in [("binder", &*binder.session), ("evaluator", &*eval.session)] {
             for name in ["memory_limit", "threads", "enable_external_access"] {
                 assert_eq!(
-                    setting(conn, name),
-                    setting(&reference, name),
+                    setting(session, name),
+                    setting(&*reference, name),
                     "{what} {name}"
                 );
             }
             assert!(
-                conn.execute_batch("SELECT * FROM read_text('/etc/hosts')")
+                session
+                    .execute("SELECT * FROM read_text('/etc/hosts')")
                     .is_err(),
                 "{what} reads outside the nest"
             );
@@ -8929,25 +8110,22 @@ mod schema_only_binding {
         dir
     }
 
-    fn files(dir: &Path) -> Vec<(String, u64)> {
+    fn files(dir: &Path) -> Vec<(PathBuf, u64)> {
         let manifest = crate::seal::load_manifest_with_hash(dir).unwrap().0;
         manifest.tables["t"]
             .iter()
-            .map(|s| {
-                let p = crate::seal::segment_path(dir, &s.file, &s.hash);
-                (format!("'{}'", p.display()), 0)
-            })
+            .map(|s| (crate::seal::segment_path(dir, &s.file, &s.hash), 0))
             .collect()
     }
 
     #[test]
     fn one_file_per_schema_is_kept_in_order() {
         let dir = nest();
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
         let all = files(dir.path());
         let kept = one_per_file_schema(&conn, all.clone());
         assert_eq!(kept.len(), 3, "{kept:?}");
-        let pos = |f: &(String, u64)| all.iter().position(|a| a == f).unwrap();
+        let pos = |f: &(PathBuf, u64)| all.iter().position(|a| a == f).unwrap();
         assert!(kept.windows(2).all(|w| pos(&w[0]) < pos(&w[1])));
     }
 
@@ -8957,7 +8135,7 @@ mod schema_only_binding {
         let dir = nest();
         let wanted: std::collections::BTreeSet<String> = ["t".to_string()].into();
         let describe = |schema_only: bool| {
-            let conn = Connection::open_in_memory().unwrap();
+            let conn = duckdb::Connection::open_in_memory().unwrap();
             define_views_bound(
                 &conn,
                 dir.path(),
@@ -8986,6 +8164,7 @@ mod schema_only_binding {
 #[cfg(test)]
 mod cross_nest_s0 {
     use super::*;
+    use duckdb::Connection;
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();

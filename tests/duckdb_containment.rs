@@ -59,15 +59,16 @@ use std::path::PathBuf;
 /// The sites slice 0 inventoried, with their roles, plus what has been added since. See
 /// `docs/rfcs/0042-slice0-bom.md`.
 const KNOWN: &[&str] = &[
-    "analytics.rs",             // general SQL, views, hot+cold federation
-    "analytics_scalars.rs",     // bounded pure Arrow scalar conversions, registered by analytics
-    "entities.rs",              // the admissible function vocabulary, from duckdb_functions()
-    "entity_lower.rs",          // AST for lowering authored SQL to a circuit
-    "graft.rs",                 // canonical plan, engine version, determinism gate
-    "seal.rs",                  // segment-binding oracle (test-only)
-    "port_emit.rs",             // emitted-check oracle (test-only)
+    "analytics.rs", // tests only, as oracles; the policy code went engine-neutral in phase 2a
+    "engine_duck.rs", // the `engine::Session` implementation: what analytics.rs used to hold
+    "analytics_scalars.rs", // bounded pure Arrow scalar conversions, registered by analytics
+    "entities.rs",  // the admissible function vocabulary, from duckdb_functions()
+    "entity_lower.rs", // AST for lowering authored SQL to a circuit
+    "graft.rs",     // canonical plan, engine version, determinism gate
+    "seal.rs",      // segment-binding oracle (test-only)
+    "port_emit.rs", // emitted-check oracle (test-only)
     "authored_entity_spike.rs", // RFC-0041 spike, reachable via `nuthatch bench`
-    "dune_views.rs",            // AST of authored views, for RFC-0055 S3's translation
+    "dune_views.rs", // AST of authored views, for RFC-0055 S3's translation
 ];
 
 /// Internal (`pub(crate)`) signatures that currently carry a DuckDB type, pinned with their count.
