@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 /// The engine every query runs on. One implementation until phase 2b puts a shadow beside it.
 fn engine() -> &'static dyn Engine {
     static ENGINE: crate::engine_duck::DuckEngine = crate::engine_duck::DuckEngine;
-    &ENGINE
+    crate::engine_shadow::installed().unwrap_or(&ENGINE)
 }
 
 /// A session bounded and locked to `dir`, counted so a test can see the cache reuse one.
@@ -1024,6 +1024,7 @@ fn attempt(
     slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
     let (referenced, offchain, degraded_tables, interrupted, outcome, cap, scan) = {
         let session: &dyn Session = slot.session.as_ref();
+        session.set_deadline(deadline);
         let walked = reject_unknown_table_refs(session, sql)?;
         // No parse means no idea what the statement reaches, and the safe answer to that is "all of
         // it" on both counts.

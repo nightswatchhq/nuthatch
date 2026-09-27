@@ -36,6 +36,7 @@ pub(crate) trait Interrupt: Send + Sync {
 /// question about names - a typo, a missing column, an unknown table - and no corrupt page can
 /// cause one, so it must never trigger the integrity sweep. Only a statement that bound and then
 /// died while reading rows is worth paying for.
+#[derive(Debug)]
 pub(crate) enum Died {
     /// The engine refused it before running: a name the catalogue does not have, a type that does
     /// not check.
@@ -100,6 +101,11 @@ pub(crate) trait Session: Send {
 
     /// A handle another thread can use to cancel whatever this session is running.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
+
+    /// The guard's deadline for the statement about to run, so an engine that does extra work
+    /// beside the answer (a shadow) can decline it when the budget is nearly spent. Advisory; the
+    /// watchdog still enforces the deadline.
+    fn set_deadline(&self, _deadline: Option<std::time::Instant>) {}
 
     /// How many cold Parquet scans the statement's physical plan performs (RFC-0048 §3). Refuses,
     /// as `AdmissionRefusal::Unboundable`, any plan it cannot count.

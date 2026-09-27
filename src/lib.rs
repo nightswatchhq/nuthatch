@@ -41,6 +41,9 @@ pub mod dune_views;
 pub mod effectful;
 pub(crate) mod engine;
 pub(crate) mod engine_duck;
+// Nothing installs a shadow until the second engine lands (RFC-0044 Amendment 2, phase 2b).
+#[allow(dead_code)]
+pub(crate) mod engine_shadow;
 pub mod entities;
 pub mod entity_bind;
 pub mod entity_circuit;
