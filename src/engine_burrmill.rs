@@ -386,4 +386,61 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert!(seen.is_empty(), "{seen:#?}");
     }
+
+    /// Shadow mode over a real nest, through the production path: the shadow is installed, every
+    /// authored view is read whole with `query_guarded`, and each difference is printed and
+    /// counted. Ignored unless `NUTHATCH_SHADOW_NEST` names the nest directory.
+    ///
+    ///     NUTHATCH_SHADOW_NEST=/path/to/nest cargo test --release --features shadow-burrmill \
+    ///         --lib shadow_replay -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn shadow_replay_over_a_nest() {
+        let Ok(nest) = std::env::var("NUTHATCH_SHADOW_NEST") else {
+            return;
+        };
+        let dir = Path::new(&nest);
+        let seen = Arc::new(Mutex::new(Vec::<Difference>::new()));
+        let s = seen.clone();
+        crate::engine_shadow::install(ShadowEngine::new(
+            Box::new(crate::engine_duck::DuckEngine),
+            Box::new(BurrmillEngine),
+            Arc::new(move |d: &Difference| {
+                eprintln!(
+                    "DIFF\t{:?}\tprimary={}\tsecondary={}\tprimary_ms={}\tsecondary_ms={}\n\t{}",
+                    d.kind, d.primary, d.secondary, d.primary_ms, d.secondary_ms, d.sql
+                );
+                s.lock().unwrap().push(d.clone());
+            }),
+        ))
+        .unwrap();
+        let mut views: Vec<String> = crate::analytics::nest_view_files(dir)
+            .iter()
+            .flat_map(|f| crate::analytics::split_sql_statements(&f.sql))
+            .filter_map(|stmt| crate::analytics::view_name(&stmt))
+            .collect();
+        views.sort();
+        let guard = crate::analytics::QueryGuard {
+            timeout: std::time::Duration::from_secs(600),
+            max_rows: 10_000_000,
+        };
+        for view in &views {
+            let before = seen.lock().unwrap().len();
+            let started = std::time::Instant::now();
+            let out =
+                crate::analytics::query_guarded(dir, &format!("SELECT * FROM \"{view}\""), guard);
+            let ms = started.elapsed().as_millis();
+            let after = seen.lock().unwrap().len();
+            match out {
+                Ok(o) => eprintln!(
+                    "VIEW\t{view}\trows={}\tms={ms}\tdifferences={}",
+                    o.rows.len(),
+                    after - before
+                ),
+                Err(e) => eprintln!("VIEW\t{view}\tERROR\tms={ms}\t{e:#}"),
+            }
+        }
+        let seen = seen.lock().unwrap();
+        eprintln!("SHADOW\tviews={}\tdifferences={}", views.len(), seen.len());
+    }
 }
