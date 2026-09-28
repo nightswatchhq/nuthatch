@@ -1,20 +1,19 @@
 # Governance & scope
 
-nuthatch is a free, `MIT OR Apache-2.0` public good with a single maintainer and no direct monetization. This
-document states how it is sustained, what stays out of scope regardless of who's paying, and the
+nuthatch is a free, `MIT OR Apache-2.0` public good with a single maintainer. This
+document states how it can be sustained, what stays out of scope regardless of who's paying, and the
 neutrality guarantees that make it safe to depend on. See [RFC-0006](docs/rfcs/0006-grant-funding.md)
 for the full reasoning.
 
-## Sustainability - two independent legs
+## Sustainability
 
-1. **Grants** (NLnet/NGI, EF ESP) fund the commons-facing roadmap - semantic layer, IVM
-   generalization, GraphQL compatibility, security audit, docs. Public-benefit, milestone-based.
-2. **Operator revenue-share** funds maintainer availability and operator-adjacent work (release
-   engineering, guards, fleet ergonomics), proportional to hosted-service revenue.
+No grant has been awarded. Grants remain a possible source of funding for open-source work, but no
+roadmap item depends on one. Nightswatch also operates a [hosted nest service](https://platform.nuthatch-indexer.com)
+using the published binary. Its plans and billing are separate from this repository.
 
-The legs are deliberately independent: either alone sustains part-time development; nothing in the
-grant plan depends on operator revenue, and vice versa. No milestone is funded by both (RFC-0006
-Rule 1).
+The boundary in [RFC-0006](docs/rfcs/0006-grant-funding.md) still applies: the same milestone must
+not be funded twice, and a funding arrangement must not give an operator control of the open-source
+core.
 
 ## Neutrality (the guarantee you can depend on)
 
@@ -33,12 +32,9 @@ is that every derivative does.
 
 ### Operator-partnership disclosure
 
-> An independent infrastructure operator (GraphOps) is preparing a hosted offering of nuthatch and
-> shares revenue with the maintainer to fund core development. The relationship is
-> partnership, not ownership: no exclusivity, no relicensing, no private features, no roadmap veto.
-
-_(Terms are summarised here as existence + shape once agreed; amounts stay private - RFC-0006
-Acceptance.)_
+> Nightswatch operates [platform.nuthatch-indexer.com](https://platform.nuthatch-indexer.com)
+> with the published nuthatch binary. The platform's accounts, plans, billing and customer isolation
+> live outside this repository. Hosting confers no exclusivity, private core features or roadmap veto.
 
 ## The dividing line: core vs operator layer
 

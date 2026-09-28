@@ -60,6 +60,24 @@ More on both at [nuthatch-indexer.com/stories](https://www.nuthatch-indexer.com/
 
 ---
 
+## Hosted nests
+
+If you want the SQL endpoint without running the indexer, [Nightswatch hosts nests](https://platform.nuthatch-indexer.com)
+using the published nuthatch image. Sign in with GitHub or a wallet, deploy from a public nuthatch
+repository or supply contracts and ABIs, and query the resulting endpoint. Arcaidia's Sepolia and Arc
+Testnet nests are a [working example](https://nuthatch-indexer.com/blog/hosted-nests-are-open),
+including a query you can run yourself.
+
+Free accounts can run up to three nests with a five-million-block backfill limit; the introductory
+Paid plan is $20 per month in USDC for up to ten nests and a 50-million-block limit. Paid adds hosted
+RPC access for Ethereum, Base and Arbitrum One. New nests wait for manual approval before indexing.
+The service runs on one machine, has no SLA, accepts public repositories only, and serves SQL rather
+than the partial GraphQL compatibility layer. The [hosted launch post](https://nuthatch-indexer.com/blog/hosted-nests-are-open)
+has the current limits and an example endpoint. You can run the same published binary yourself;
+sign-in and billing belong to the separate hosting service.
+
+---
+
 ## Install
 
 ```sh
@@ -568,8 +586,9 @@ A major version is a promise about **stability**, not a claim of completeness.
   is built and verified across real machines, but younger** - and until 0.9.3 its writer pool did not
   index at all. If one process per box is enough, that is still the shape to reach for.
 
-**What is deliberately not here:** a hosted service, a token, telemetry, non-EVM chains, or any
-deployment story beyond binary + compose. Those are not backlog items; they are out of scope.
+**What is deliberately not in this binary:** hosted-service accounts and billing, a token,
+telemetry, or non-EVM chains. Nightswatch's hosted service runs the published binary and keeps its
+account, billing and isolation layer outside this repository.
 
 ## Security
 
@@ -592,10 +611,11 @@ the findings we closed as *not ours to fix* and why, is in
 - **Design** lives in [RFCs](docs/rfcs/) (0001-0036); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
-- **Governance:** a grant-funded public good (NLnet / EF-ESP). No hosted service, no token, no
-  phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing design brief [`CLAUDE.md`](CLAUDE.md).
-- **Out of scope:** a hosted/metered service, non-EVM chains before EVM is airtight, or any deployment
-  story beyond binary + compose.
+- **Governance:** an open-source project with an optional hosted service operated by Nightswatch.
+  No grant has been awarded. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing design brief
+  [`CLAUDE.md`](CLAUDE.md).
+- **Out of scope for the binary:** hosted accounts and billing, non-EVM chains before EVM is airtight,
+  and a mandatory hosted dependency.
 
 ## License
 
