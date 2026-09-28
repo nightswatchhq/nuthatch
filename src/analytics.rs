@@ -3247,25 +3247,7 @@ impl FoldBinder {
 
     /// The statement's top-level node type, or the parser's error.
     pub(crate) fn statement_kinds(&self, sql: &str) -> Result<Vec<String>> {
-        let ast = self.session.serialize_sql(sql)?;
-        if ast.get("error").and_then(Value::as_bool) == Some(true) {
-            bail!(
-                "does not parse: {}",
-                ast.get("error_message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-            );
-        }
-        Ok(ast
-            .pointer("/statements")
-            .and_then(Value::as_array)
-            .map(|s| {
-                s.iter()
-                    .filter_map(|st| st.pointer("/node/type").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default())
+        fold_statement_kinds(sql)
     }
 
     pub(crate) fn base_tables(&self, sql: &str) -> Option<std::collections::BTreeSet<String>> {
@@ -3314,68 +3296,132 @@ impl FoldBinder {
         sql: &str,
         facts: &std::collections::BTreeSet<String>,
     ) -> Vec<String> {
-        let Ok(ast) = self.session.serialize_sql(sql) else {
-            return Vec::new();
-        };
-        let mut out: Vec<String> = Vec::new();
-        let mut note = |s: String| {
-            if !out.contains(&s) {
-                out.push(s);
-            }
-        };
-        walk_ast(&ast, &mut |map| {
-            let class = map.get("class").and_then(Value::as_str);
-            let kind = map.get("type").and_then(Value::as_str);
-            if class == Some("WINDOW") {
-                let f = map
-                    .get("function_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
-                note(format!("a window function (`{f}() OVER`)"));
-            }
-            if kind == Some("RECURSIVE_CTE_NODE") {
-                let name = map.get("cte_name").and_then(Value::as_str).unwrap_or("?");
-                note(format!("a recursive CTE (`{name}`)"));
-            }
-            if class == Some("SUBQUERY") {
-                let how = match map.get("subquery_type").and_then(Value::as_str) {
-                    Some("EXISTS") => "an EXISTS subquery",
-                    Some("NOT_EXISTS") => "a NOT EXISTS subquery",
-                    Some("SCALAR") => "a scalar subquery",
-                    _ => "a subquery",
-                };
-                let mut over = std::collections::BTreeSet::new();
-                if let Some(inner) = map.get("subquery") {
-                    walk_ast(inner, &mut |m| {
-                        if m.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
-                            if let Some(t) = m.get("table_name").and_then(Value::as_str) {
-                                let t = t.to_ascii_lowercase();
-                                if facts.contains(&t) {
-                                    over.insert(t);
-                                }
-                            }
-                        }
-                    });
-                }
-                for t in over {
-                    note(format!("{how} over `{t}`"));
-                }
-            }
-        });
-        out
+        fold_lookbacks(sql, facts)
     }
 }
 
 #[cfg(feature = "folds")]
-fn walk_ast(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
-    match v {
-        Value::Object(map) => {
-            f(map);
-            map.values().for_each(|c| walk_ast(c, f));
+fn parse_duck(sql: &str) -> Result<Vec<sqlparser::ast::Statement>> {
+    sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, sql)
+        .map_err(|e| anyhow::anyhow!("does not parse: {e}"))
+}
+
+#[cfg(feature = "folds")]
+fn fold_statement_kinds(sql: &str) -> Result<Vec<String>> {
+    use sqlparser::ast::{SetExpr, Statement};
+    fn kind(body: &SetExpr) -> &'static str {
+        match body {
+            SetExpr::Select(_) | SetExpr::Values(_) => "SELECT_NODE",
+            SetExpr::SetOperation { .. } => "SET_OPERATION_NODE",
+            SetExpr::Query(q) => kind(&q.body),
+            _ => "OTHER",
         }
-        Value::Array(items) => items.iter().for_each(|c| walk_ast(c, f)),
-        _ => {}
     }
+    parse_duck(sql)?
+        .iter()
+        .map(|st| match st {
+            Statement::Query(q) => Ok(kind(&q.body).to_string()),
+            _ => bail!("does not parse: only SELECT statements can be folds"),
+        })
+        .collect()
+}
+
+#[cfg(feature = "folds")]
+fn fold_lookbacks(sql: &str, facts: &std::collections::BTreeSet<String>) -> Vec<String> {
+    use sqlparser::ast::{Expr, Query, SetExpr, TableFactor, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    fn tables_over(q: &Query, facts: &std::collections::BTreeSet<String>) -> Vec<String> {
+        struct Tables<'a>(
+            &'a std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+        );
+        impl Visitor for Tables<'_> {
+            type Break = ();
+            fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+                if let TableFactor::Table {
+                    name, args: None, ..
+                } = t
+                {
+                    let n = name
+                        .0
+                        .last()
+                        .map(|p| p.to_string().trim_matches('"').to_ascii_lowercase());
+                    if let Some(n) = n.filter(|n| self.0.contains(n)) {
+                        self.1.insert(n);
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        let mut t = Tables(facts, Default::default());
+        let _ = q.visit(&mut t);
+        t.1.into_iter().collect()
+    }
+
+    struct Look<'a> {
+        facts: &'a std::collections::BTreeSet<String>,
+        out: Vec<String>,
+    }
+    impl Look<'_> {
+        fn note(&mut self, s: String) {
+            if !self.out.contains(&s) {
+                self.out.push(s);
+            }
+        }
+    }
+    impl Visitor for Look<'_> {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if let Some(with) = q.with.as_ref().filter(|w| w.recursive) {
+                for c in &with.cte_tables {
+                    if matches!(*c.query.body, SetExpr::SetOperation { .. }) {
+                        self.note(format!("a recursive CTE (`{}`)", c.alias.name.value));
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            let (how, q) = match e {
+                Expr::Function(f) if f.over.is_some() => {
+                    let name = f.name.0.last().map(|p| p.to_string()).unwrap_or_default();
+                    self.note(format!(
+                        "a window function (`{}() OVER`)",
+                        name.to_ascii_lowercase()
+                    ));
+                    return ControlFlow::Continue(());
+                }
+                Expr::Exists {
+                    subquery,
+                    negated: false,
+                } => ("an EXISTS subquery", subquery),
+                Expr::Exists {
+                    subquery,
+                    negated: true,
+                } => ("a NOT EXISTS subquery", subquery),
+                Expr::Subquery(q) => ("a scalar subquery", q),
+                Expr::InSubquery { subquery, .. } => ("a subquery", subquery),
+                _ => return ControlFlow::Continue(()),
+            };
+            for t in tables_over(q, self.facts) {
+                self.note(format!("{how} over `{t}`"));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let Ok(stmts) = parse_duck(sql) else {
+        return Vec::new();
+    };
+    let mut look = Look {
+        facts,
+        out: Vec::new(),
+    };
+    for st in &stmts {
+        let _ = st.visit(&mut look);
+    }
+    look.out
 }
 
 /// RFC-0059: evaluates folds one window at a time on a connection of its own. Inside it a fact name
@@ -8229,5 +8275,154 @@ mod cross_nest_s0 {
                 ("b".into(), "t".into())
             ]
         );
+    }
+}
+
+/// The fold binder's parser role as it was on DuckDB's `json_serialize_sql`, kept to test the port.
+#[cfg(all(test, feature = "folds"))]
+mod fold_parser_oracle {
+    use super::*;
+
+    /// The statement's top-level node type, or the parser's error.
+    pub(super) fn statement_kinds(session: &dyn Session, sql: &str) -> Result<Vec<String>> {
+        let ast = session.serialize_sql(sql)?;
+        if ast.get("error").and_then(Value::as_bool) == Some(true) {
+            bail!(
+                "does not parse: {}",
+                ast.get("error_message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+        Ok(ast
+            .pointer("/statements")
+            .and_then(Value::as_array)
+            .map(|s| {
+                s.iter()
+                    .filter_map(|st| st.pointer("/node/type").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The constructs in a statement that read across rows or reach back for earlier ones: a window
+    /// function, a recursive CTE, or a subquery over one of `facts`. Inside a fold each of them
+    /// answers over the window alone (RFC-0059 §3), which is what #1504 asks to warn about. Each is
+    /// described once. Empty when the statement does not parse: the fold loader has refused that
+    /// already.
+    pub(super) fn lookbacks(
+        session: &dyn Session,
+        sql: &str,
+        facts: &std::collections::BTreeSet<String>,
+    ) -> Vec<String> {
+        let Ok(ast) = session.serialize_sql(sql) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut note = |s: String| {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        };
+        walk_ast(&ast, &mut |map| {
+            let class = map.get("class").and_then(Value::as_str);
+            let kind = map.get("type").and_then(Value::as_str);
+            if class == Some("WINDOW") {
+                let f = map
+                    .get("function_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                note(format!("a window function (`{f}() OVER`)"));
+            }
+            if kind == Some("RECURSIVE_CTE_NODE") {
+                let name = map.get("cte_name").and_then(Value::as_str).unwrap_or("?");
+                note(format!("a recursive CTE (`{name}`)"));
+            }
+            if class == Some("SUBQUERY") {
+                let how = match map.get("subquery_type").and_then(Value::as_str) {
+                    Some("EXISTS") => "an EXISTS subquery",
+                    Some("NOT_EXISTS") => "a NOT EXISTS subquery",
+                    Some("SCALAR") => "a scalar subquery",
+                    _ => "a subquery",
+                };
+                let mut over = std::collections::BTreeSet::new();
+                if let Some(inner) = map.get("subquery") {
+                    walk_ast(inner, &mut |m| {
+                        if m.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
+                            if let Some(t) = m.get("table_name").and_then(Value::as_str) {
+                                let t = t.to_ascii_lowercase();
+                                if facts.contains(&t) {
+                                    over.insert(t);
+                                }
+                            }
+                        }
+                    });
+                }
+                for t in over {
+                    note(format!("{how} over `{t}`"));
+                }
+            }
+        });
+        out
+    }
+
+    fn walk_ast(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
+        match v {
+            Value::Object(map) => {
+                f(map);
+                map.values().for_each(|c| walk_ast(c, f));
+            }
+            Value::Array(items) => items.iter().for_each(|c| walk_ast(c, f)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_sqlparser_port_finds_what_duckdb_found() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let facts: std::collections::BTreeSet<String> = ["t", "h", "transfer"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cases = [
+            "SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY block_number) AS rn FROM t",
+            "WITH RECURSIVE chain AS (SELECT k, v, block_number FROM t UNION ALL SELECT k, v, block_number + 1 FROM chain WHERE block_number < 0) SELECT k, v FROM chain",
+            "WITH RECURSIVE c AS (SELECT 1 AS n) SELECT * FROM c",
+            "WITH c AS (SELECT k FROM t UNION ALL SELECT k FROM h) SELECT * FROM c",
+            "SELECT a.k, a.v FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.k = a.k AND b.block_number < a.block_number)",
+            "SELECT a.k FROM t a WHERE NOT EXISTS (SELECT 1 FROM h b WHERE b.k = a.k)",
+            "SELECT a.k, (SELECT min(b.block_number) FROM t b WHERE b.k = a.k) AS first_seen FROM t a",
+            "SELECT k FROM t WHERE k IN (SELECT k FROM transfer)",
+            "SELECT k FROM t WHERE k IN (SELECT k FROM other)",
+            "SELECT sum(v) OVER (ORDER BY block_number), lag(v) OVER w FROM t WINDOW w AS (ORDER BY k)",
+            "SELECT * FROM (SELECT k FROM t) s",
+            "SELECT CAST(count(*) AS UBIGINT) AS n FROM t",
+            "SELECT 1 AS n UNION ALL SELECT 2",
+            "(SELECT 1 AS n)",
+            "VALUES (1), (2)",
+            "SELECT 1 AS n; SELECT 2 AS n",
+            "INSERT INTO t VALUES (1)",
+            "SELEC 1",
+        ];
+        for sql in cases {
+            let old_k = statement_kinds(&conn, sql).map_err(|_| ());
+            let new_k = super::fold_statement_kinds(sql).map_err(|_| ());
+            let accepted = |k: &std::result::Result<Vec<String>, ()>| matches!(k, Ok(v) if matches!(v.as_slice(), [x] if x == "SELECT_NODE" || x == "SET_OPERATION_NODE"));
+            assert_eq!(
+                accepted(&old_k),
+                accepted(&new_k),
+                "kinds, {sql}: {old_k:?} / {new_k:?}"
+            );
+            let mut old_l = lookbacks(&conn, sql, &facts);
+            // DuckDB serialises `NOT EXISTS` as `NOT (EXISTS …)`, so the old walk named it an EXISTS.
+            let mut new_l: Vec<String> = super::fold_lookbacks(sql, &facts)
+                .into_iter()
+                .map(|w| w.replace("a NOT EXISTS subquery", "an EXISTS subquery"))
+                .collect();
+            old_l.sort();
+            new_l.sort();
+            assert_eq!(old_l, new_l, "lookbacks, {sql}");
+        }
     }
 }
