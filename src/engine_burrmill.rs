@@ -308,10 +308,10 @@ impl Session for BurrmillSession {
         Arc::new(Cancel(self.engine().cancel_token()))
     }
 
-    fn cold_scan_operators(&self, _sql: &str) -> Result<u64> {
-        Err(crate::analytics::unboundable(
-            "the admission bound is planned on DuckDB",
-        ))
+    fn cold_scan_operators(&self, sql: &str) -> Result<u64> {
+        self.engine()
+            .parquet_scans(sql)
+            .map_err(|e| crate::analytics::unboundable(e.to_string()))
     }
 
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
