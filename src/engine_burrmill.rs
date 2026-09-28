@@ -49,6 +49,8 @@ pub(crate) struct BurrmillSession {
     hot: Mutex<HashMap<String, Vec<Value>>>,
     /// Held for the session's life, as DuckDB's is; removed on drop and swept by pid after a crash.
     _spill: crate::engine_duck::SpillDir,
+    /// Each view's `CREATE VIEW` text as defined, for the integrity sweep's walk through views.
+    views: Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 impl BurrmillSession {
@@ -65,10 +67,15 @@ impl BurrmillSession {
             threads: cfg.threads.max(1) as usize,
             spill: Some((spill.0.clone(), cap)),
         };
+        #[allow(unused_mut)]
+        let mut engine = burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?;
+        #[cfg(feature = "graph")]
+        crate::analytics_scalars::register_burrmill(&mut engine);
         Ok(Self {
-            engine: Mutex::new(burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?),
+            engine: Mutex::new(engine),
             hot: Mutex::new(HashMap::new()),
             _spill: spill,
+            views: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -124,7 +131,14 @@ impl Session for BurrmillSession {
                 "not a view definition, and Burrmill runs nothing else for effect"
             ));
         };
-        self.engine().register_view(&name, body).map_err(engine_err)
+        self.engine()
+            .register_view(&name, body)
+            .map_err(engine_err)?;
+        self.views
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name, sql.to_string());
+        Ok(())
     }
 
     fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
@@ -257,7 +271,15 @@ impl Session for BurrmillSession {
     }
 
     fn view_definitions(&self) -> Option<Vec<(String, String)>> {
-        None
+        let views = self.views.lock().unwrap_or_else(|p| p.into_inner());
+        Some(views.iter().map(|(n, s)| (n.clone(), s.clone())).collect())
+    }
+
+    fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+        Some((
+            burrmill::inspect::base_tables(sql)?,
+            burrmill::inspect::refs(sql)?.functions,
+        ))
     }
 
     fn serialize_sql(&self, _sql: &str) -> Result<Value> {

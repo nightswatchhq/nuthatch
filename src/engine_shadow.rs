@@ -481,6 +481,38 @@ impl Session for ShadowSession {
         primary
     }
 
+    /// The primary's refs decide; the secondary not parsing is stricter (admission refuses, the
+    /// sweep widens less), and different sets are a catalogue difference.
+    fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+        let primary = self.primary.table_refs(sql);
+        let Some(secondary) = &self.secondary else {
+            return primary;
+        };
+        let shadow = secondary.table_refs(sql);
+        let kind = match (&primary, &shadow) {
+            (Some(_), None) => Some(Kind::ParserStricter),
+            (a, b) if a == b => None,
+            _ => Some(Kind::Catalogue),
+        };
+        if let Some(kind) = kind {
+            let show = |r: &Option<(BTreeSet<String>, BTreeSet<String>)>| match r {
+                None => "no parse".to_string(),
+                Some((t, f)) => format!("tables {t:?} functions {f:?}"),
+            };
+            (self.sink)(&Difference {
+                sql: sql.to_string(),
+                kind,
+                primary: show(&primary),
+                secondary: show(&shadow),
+                primary_ms: 0,
+                secondary_ms: 0,
+                primary_rss_mb: 0,
+                secondary_rss_mb: 0,
+            });
+        }
+        primary
+    }
+
     fn set_deadline(&self, deadline: Option<Instant>) {
         *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) = deadline;
         self.primary.set_deadline(deadline);

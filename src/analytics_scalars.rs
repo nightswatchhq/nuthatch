@@ -23,6 +23,30 @@ pub(crate) fn register(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Name, `evaluate` kind and arity of each function `register` defines.
+#[cfg(feature = "shadow-burrmill")]
+const FUNCTIONS: [(&str, u8, usize); 7] = [
+    ("nuthatch_uint256", 1, 1),
+    ("nuthatch_mul_div", 2, 3),
+    ("nuthatch_cid_v0", 3, 1),
+    ("nuthatch_base58_uint256", 4, 1),
+    ("nuthatch_uint256_word", 5, 1),
+    ("nuthatch_keccak256", 6, 1),
+    ("nuthatch_abi_tuple", 7, 2),
+];
+
+/// The same functions on Burrmill, over the same `evaluate`.
+#[cfg(feature = "shadow-burrmill")]
+pub(crate) fn register_burrmill(engine: &mut burrmill::Engine) {
+    for (name, kind, arity) in FUNCTIONS {
+        engine.register_text_function(
+            name,
+            arity,
+            Arc::new(move |v: &[&str]| evaluate(kind, v).map_err(|e| format!("{e:#}"))),
+        );
+    }
+}
+
 fn decimal(value: &str) -> Result<BigUint> {
     // 512-bit intermediates, with a little room for event-ledger sums, without admitting
     // arbitrarily large user strings into the bigint allocator.
@@ -182,6 +206,44 @@ impl<const KIND: u8> VArrowScalar for Scalar<KIND> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "shadow-burrmill")]
+    #[test]
+    fn burrmill_answers_every_function_as_duckdb_does() {
+        let conn = Connection::open_in_memory().unwrap();
+        register(&conn).unwrap();
+        let mut engine = burrmill::Engine::open_empty().unwrap();
+        register_burrmill(&mut engine);
+        let word = format!("0x{:064x}", 16_083_151u64);
+        let tuple = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        let cases = [
+            format!("nuthatch_uint256('{word}')"),
+            "nuthatch_uint256('0x')".to_string(),
+            "nuthatch_mul_div('10', '3', '4')".to_string(),
+            "nuthatch_mul_div('10', '3', '0')".to_string(),
+            format!("nuthatch_cid_v0('{word}')"),
+            "nuthatch_base58_uint256('16083151')".to_string(),
+            "nuthatch_uint256_word('16083151')".to_string(),
+            "nuthatch_keccak256('0x')".to_string(),
+            format!("nuthatch_abi_tuple('bool', '{tuple}')"),
+            "nuthatch_abi_tuple('int8', '0x')".to_string(),
+            "nuthatch_uint256(NULL)".to_string(),
+        ];
+        for call in cases {
+            let sql = format!("SELECT {call} AS v");
+            let duck: std::result::Result<Option<String>, _> =
+                conn.query_row(&sql, [], |r| r.get(0));
+            let burr = engine.sql(&sql).map(|b| {
+                let rows = burrmill::df::encode::rows(&b[0]).unwrap();
+                rows[0]["v"].as_str().map(str::to_string)
+            });
+            match (duck, burr) {
+                (Ok(d), Ok(b)) => assert_eq!(d, b, "{call}"),
+                (Err(_), Err(_)) => {}
+                (d, b) => panic!("{call}: duckdb {d:?}, burrmill {b:?}"),
+            }
+        }
+    }
 
     #[test]
     fn a_case_guard_does_not_decode_an_empty_predeployment_word() {

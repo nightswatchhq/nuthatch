@@ -130,6 +130,12 @@ pub(crate) trait Session: Send {
         None
     }
 
+    /// The physical tables a statement reads (names a `WITH` binds in scope excluded) and the table
+    /// functions it calls, lowercased; `None` when the statement will not parse.
+    fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+        crate::analytics::table_refs_from_ast(&self.serialize_sql(sql).ok()?)
+    }
+
     /// A handle another thread can use to cancel whatever this session is running.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
 

@@ -1804,21 +1804,33 @@ fn table_refs_in(
     sql: &str,
     wanted_kind: &str,
 ) -> Option<std::collections::BTreeSet<String>> {
-    let v = session.serialize_sql(sql).ok()?;
+    let (tables, functions) = session.table_refs(sql)?;
+    Some(if wanted_kind == "BASE_TABLE" {
+        tables
+    } else {
+        functions
+    })
+}
+
+/// `Session::table_refs` over DuckDB's `json_serialize_sql` AST.
+pub(crate) fn table_refs_from_ast(
+    v: &Value,
+) -> Option<(
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+)> {
     if v.get("error").and_then(Value::as_bool) == Some(true) {
         return None;
     }
-    let mut out = std::collections::BTreeSet::new();
-    if wanted_kind == "BASE_TABLE" {
-        walk_base_table_refs(&v, &Default::default(), &mut out);
-        return Some(out);
-    }
-    walk_table_refs(&v, &mut |kind, name| {
-        if kind == wanted_kind {
-            out.insert(name.to_ascii_lowercase());
+    let mut tables = std::collections::BTreeSet::new();
+    walk_base_table_refs(v, &Default::default(), &mut tables);
+    let mut functions = std::collections::BTreeSet::new();
+    walk_table_refs(v, &mut |kind, name| {
+        if kind == "TABLE_FUNCTION" {
+            functions.insert(name.to_ascii_lowercase());
         }
     });
-    Some(out)
+    Some((tables, functions))
 }
 
 /// Dependency discovery respects lexical CTE scope. The security walk below deliberately remains
