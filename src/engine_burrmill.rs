@@ -121,23 +121,69 @@ impl Interrupt for Cancel {
 
 impl Session for BurrmillSession {
     fn execute(&self, sql: &str) -> Result<()> {
-        // The statements the policy code runs for effect are all view definitions; anything else
-        // (a transaction boundary on the folds path) has no Burrmill meaning and says so.
-        let (Some(name), Some(body)) = (
+        use sqlparser::ast::{ObjectType, Statement};
+        if let (Some(name), Some(body)) = (
             crate::analytics::view_name(sql),
             crate::analytics::view_body(sql),
-        ) else {
-            return Err(anyhow!(
-                "not a view definition, and Burrmill runs nothing else for effect"
-            ));
-        };
+        ) {
+            self.engine()
+                .register_view(&name, body)
+                .map_err(engine_err)?;
+            self.views
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(name, sql.to_string());
+            return Ok(());
+        }
+        // The folds path's statements for effect, and nothing else: a statement is still read-only.
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, sql)?;
+        // In order, as DuckDB runs a batch: each takes effect before the next, none is atomic.
+        let mut engine = self.engine();
+        for stmt in &stmts {
+            match stmt {
+                Statement::CreateTable(ct) if ct.query.is_some() => {
+                    let name = ct.name.to_string().trim_matches('"').to_string();
+                    let query = ct.query.as_ref().expect("checked").to_string();
+                    engine.create_table_as(&name, &query).map_err(engine_err)?;
+                }
+                Statement::Drop {
+                    object_type: ObjectType::View | ObjectType::Table,
+                    names,
+                    ..
+                } => {
+                    for n in names {
+                        let n = n.to_string().trim_matches('"').to_string();
+                        engine.drop_relation(&n);
+                        self.views
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&n);
+                    }
+                }
+                Statement::StartTransaction { .. } => engine.begin().map_err(engine_err)?,
+                Statement::Commit { .. } => engine.commit().map_err(engine_err)?,
+                Statement::Rollback { .. } => engine.rollback().map_err(engine_err)?,
+                _ => return Err(anyhow!("Burrmill runs no `{stmt}` for effect")),
+            }
+        }
+        Ok(())
+    }
+
+    fn write_parquet(&self, table: &str, path: &Path) -> Result<()> {
         self.engine()
-            .register_view(&name, body)
+            .write_parquet(&format!("SELECT * FROM \"{table}\" ORDER BY ALL"), path)
             .map_err(engine_err)?;
-        self.views
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(name, sql.to_string());
+        Ok(())
+    }
+
+    fn load_parquet(&self, table: &str, select: &str, path: &Path) -> Result<()> {
+        const LOADING: &str = "__checkpoint_load";
+        let mut engine = self.engine();
+        engine.load_parquet(LOADING, path).map_err(engine_err)?;
+        let made = engine.create_table_as(table, &format!("SELECT {select} FROM \"{LOADING}\""));
+        engine.drop_relation(LOADING);
+        made.map_err(engine_err)?;
         Ok(())
     }
 
@@ -214,9 +260,11 @@ impl Session for BurrmillSession {
             .ok_or_else(|| anyhow!("no rows"))
     }
 
-    fn query_arrow(&self, _sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
-        // Burrmill's arrow is not nuthatch's arrow; the fold snapshot path stays on the primary.
-        Err(anyhow!("query_arrow is not available on the shadow engine"))
+    /// Through Arrow IPC, because Burrmill's arrow is not nuthatch's.
+    fn query_arrow(&self, sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+        let ipc = self.engine().sql_ipc(sql).map_err(engine_err)?;
+        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)?;
+        Ok(reader.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     fn column_names(&self, sql: &str) -> Result<Vec<String>> {
@@ -239,22 +287,7 @@ impl Session for BurrmillSession {
     }
 
     fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
-        let engine = self.engine();
-        let mut out = Vec::new();
-        engine
-            .sql_for_each(sql, |batch| {
-                if out.is_empty() {
-                    out = batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| (f.name().clone(), f.data_type().to_string()))
-                        .collect();
-                }
-                Ok(())
-            })
-            .map_err(engine_err)?;
-        Ok(out)
+        self.engine().describe(sql).map_err(engine_err)
     }
 
     fn has_relation(&self, name: &str) -> bool {

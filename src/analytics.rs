@@ -23,7 +23,18 @@ use std::time::{Duration, Instant};
 /// The engine every query runs on. One implementation until phase 2b puts a shadow beside it.
 pub(crate) fn engine() -> &'static dyn Engine {
     static ENGINE: crate::engine_duck::DuckEngine = crate::engine_duck::DuckEngine;
+    #[cfg(all(test, feature = "shadow-burrmill"))]
+    if let Some(e) = TEST_ENGINE.with(std::cell::Cell::get) {
+        return e;
+    }
     crate::engine_shadow::installed().unwrap_or(&ENGINE)
+}
+
+// A test running this thread's work on another engine, so one body checks both.
+#[cfg(all(test, feature = "shadow-burrmill"))]
+thread_local! {
+    pub(crate) static TEST_ENGINE: std::cell::Cell<Option<&'static dyn Engine>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// A session bounded and locked to `dir`, counted so a test can see the cache reuse one.
@@ -3263,7 +3274,7 @@ impl FoldBinder {
     }
 
     pub(crate) fn refusals(&self, sql: &str) -> Vec<crate::graft::Refusal> {
-        crate::graft::static_refusals(&self.parser.canonical_plan(sql))
+        crate::graft::refusals_in_sql(sql)
     }
 
     /// The canonical plan, so formatting alone never changes a fold's identity.
@@ -3516,6 +3527,14 @@ impl FoldEvaluator {
 
     pub(crate) fn execute(&self, sql: &str) -> Result<()> {
         self.session.execute(sql)
+    }
+
+    pub(crate) fn write_parquet(&self, table: &str, path: &Path) -> Result<()> {
+        self.session.write_parquet(table, path)
+    }
+
+    pub(crate) fn load_parquet(&self, table: &str, select: &str, path: &Path) -> Result<()> {
+        self.session.load_parquet(table, select, path)
     }
 
     pub(crate) fn count(&self, relation: &str) -> Result<u64> {

@@ -130,6 +130,22 @@ pub(crate) trait Session: Send {
         None
     }
 
+    /// `SELECT * FROM table ORDER BY ALL` written to `path` as one Parquet file (a fold checkpoint).
+    fn write_parquet(&self, table: &str, path: &Path) -> Result<()> {
+        self.execute(&format!(
+            "COPY (SELECT * FROM \"{table}\" ORDER BY ALL) TO '{}' (FORMAT parquet)",
+            path.display().to_string().replace('\'', "''")
+        ))
+    }
+
+    /// `table` replaced by the Parquet file at `path`, read through `select` (its columns cast).
+    fn load_parquet(&self, table: &str, select: &str, path: &Path) -> Result<()> {
+        self.execute(&format!(
+            "CREATE OR REPLACE TABLE \"{table}\" AS SELECT {select} FROM read_parquet('{}')",
+            path.display().to_string().replace('\'', "''")
+        ))
+    }
+
     /// The statement as this engine keys it for reuse (RFC-0033 §3); `None` keys it by its raw text.
     fn canonical_plan(&self, sql: &str) -> Option<String> {
         crate::graft::canonical_from_ast(self.serialize_sql(sql).ok()?)
