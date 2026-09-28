@@ -132,7 +132,7 @@ kept because that is the number the rest of this document reasons about.
 | `analytics.rs` | general SQL, views, hot+cold federation | production | 53 connection ops, the obvious one |
 | `analytics_scalars.rs` | pure bounded scalar conversions and exact arithmetic | production | registers on the existing analytical connection; one crate-internal `&Connection` signature, no additional connection or I/O |
 | `entities.rs` | aggregate **classification** from `duckdb_functions()` | **production, public contract** | its own comment: "the same catalogue the binder uses". Narrower than first written - see correction |
-| `entity_lower.rs` | AST for lowering authored SQL to a DBSP circuit | production | RFC-0041 parser role |
+| `entity_lower.rs` | AST for lowering authored SQL to a DBSP circuit | production | RFC-0041 parser role. **Gone 2026-09-28:** sqlparser, differential-tested against the old lowering |
 | `graft.rs` | engine string in the derivation reuse key (`engine: "duckdb-v1.4.0"`) | **latent** - see correction below | **not** production: nothing calls it and nothing is written to disk |
 | `seal.rs` | segment-binding oracle | test-only | one in-memory connection in a fixture |
 | `port_emit.rs` | emitted-check oracle | test-only | added 2026-09-08 (#1211). Two in-memory connections in `#[cfg(test)]`, proving the generated `checks/port_views.sql` binds and answers the same on an empty and a populated nest. Nothing in the authoring path reaches the engine |

@@ -554,6 +554,14 @@ fn validate_sql(sql: &str) -> Result<()> {
     Ok(())
 }
 
+/// `USING SAMPLE`, which sqlparser does not parse: recognised here so its refusal still says what it
+/// is rather than that the statement does not parse.
+pub(crate) fn uses_sample(sql: &str) -> bool {
+    sql_tokens(sql)
+        .windows(2)
+        .any(|pair| pair[0] == "USING" && pair[1] == "SAMPLE")
+}
+
 /// SQL tokens relevant to the refusal list. DuckDB owns parsing and the statement-shape gate above;
 /// this only recognises constructs whose AST forms are deliberately not yet lowered. Quoted text and
 /// comments are discarded first, so an entity may quite safely produce the string `"ORDER BY"`.
