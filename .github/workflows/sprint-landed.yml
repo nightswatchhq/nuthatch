@@ -51,6 +51,13 @@
 #     PR merged into a `pete/*` branch which was later squashed would look stranded - did not
 #     materialise once in 200.
 #
+# That measurement stopped holding on 2026-09-27. #1351 merged into `pete/1260-continuous-publish`
+# on 2026-09-13, and #1349 squash-merged the branch to `main` the same afternoon. The merge commit
+# is not an ancestor of `main`. The work is on `main`: #1349's commit list still carries `b08ace6`.
+# Rule B now accepts that shape. Ancestry stays the first test. The squash lookup runs only after
+# ancestry says no, and a lookup that fails leaves the PR stranded. A query that did not run must
+# not clear a finding.
+#
 # That matters more than it sounds. This repository has shipped five checks that were green with
 # the mechanism removed, so a gate whose only evidence is that it passes on a healthy tree is worth
 # nothing here. This one was built while a real fault was live and was confirmed to red on that
@@ -151,13 +158,21 @@ jobs:
             [ "$1" -gt 0 ] && [ "$2" -eq 0 ]
           }
 
+          # A squash onto main records the side-branch SHAs on the landing PR and does not make
+          # them ancestors. Match the whole line: a prefix of a SHA is not that SHA, and an empty
+          # list (the lookup failed, or no squash PR exists) is not a match.
+          carried() {  # carried <sha> <shas> -> 0 if <sha> is one whole line of <shas>
+            [ -n "$1" ] && printf '%s\n' "$2" | grep -qx -- "$1"
+          }
+
           # ---------------------------------------------------------------------------------
           # Self-test, both directions, against a synthetic repository.
           #
           # The live fault this job was written against (#684) will be gone the moment the branch
           # lands, and after that a broken `landed()` looks exactly like a healthy firm. These are
           # the cases that die under mutation: invert the `--is-ancestor` sense and the first two
-          # swap; drop the `total > 0` arm from `complete()` and 'label with no issues' goes green.
+          # swap; drop the `total > 0` arm from `complete()` and 'label with no issues' goes green;
+          # invert `carried()` and a recorded squash stays red, or a missing one goes green.
           # ---------------------------------------------------------------------------------
           selftest=0
           fixture="$(mktemp -d)"
@@ -196,6 +211,18 @@ jobs:
           complete_is 1 'four issues, four open'   4 4
           complete_is 1 'six issues, one open'     6 1
           complete_is 1 'label with no issues'     0 0
+
+          carried_is() {  # carried_is <want-exit> <label> <sha> <shas>
+            if carried "$3" "$4"; then got=0; else got=1; fi
+            if [ "$got" != "$1" ]; then
+              echo "::error::carried() self-test failed: '$2' returned $got, wanted $1"
+              selftest=1
+            fi
+          }
+          carried_is 0 'sha recorded on the squash'  b08ace6 $'5d1ce0d\nb08ace6\n'
+          carried_is 1 'sha not on the squash'       b08ace6 $'5d1ce0d\ned7a463\n'
+          carried_is 1 'prefix is not the commit'    b08ace6 $'b08ace6fc5053cc368664888bf3e8ad1a0b9a855\n'
+          carried_is 1 'empty lookup is not carried' b08ace6 ''
 
           rm -rf "$fixture"
           if [ "$selftest" != 0 ]; then
@@ -295,6 +322,7 @@ jobs:
 
           cutoff="$(date -u -d "-${STRAND_GRACE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)"
           stranded=0
+          carried_off_main=0
 
           # Capture the query before reading it, and check it did something (#699). Reading straight
           # from a process substitution is what made this rule fail *open*: `gh` exits non-zero and
@@ -338,6 +366,40 @@ jobs:
             # returns non-zero as a complete command, and the job dies on the first stranded PR it
             # finds - which is to say, on exactly the input this rule exists to report.
             if landed "$sha" "$MAIN"; then continue; fi
+            # Ancestry missed it. A squash records the side-branch SHA on the landing PR, and
+            # only counts once that PR's own merge commit is on main. A failed or empty lookup
+            # falls through, so the PR stays stranded (#699).
+            carrying=""
+            # Do not put a numerical ceiling on this lookup. A branch may have been merged to
+            # main more than once, and an older squash can be the one that carried this PR.
+            # `--paginate` follows every REST Link page; a failure falls through as stranded.
+            owner="${REPO%%/*}"
+            if pairs="$(gh api --paginate -X GET "repos/$REPO/pulls" \
+                          -f state=closed -f base=main -f "head=$owner:$base" -f per_page=100 \
+                          --jq '.[] | select(.merged_at != null and .merge_commit_sha != null) | [.number, .merge_commit_sha] | @tsv')"; then
+              while IFS=$'\t' read -r squash_num squash_sha; do
+                [ -n "${squash_num:-}" ] || continue
+                if ! landed "$squash_sha" "$MAIN"; then
+                  continue
+                fi
+                if ! shas="$(gh api --paginate -X GET "repos/$REPO/pulls/$squash_num/commits" \
+                              --jq '.[].sha' 2>/dev/null)"; then
+                  echo "::warning::could not list commits on possible squash PR #$squash_num - leaving #$num stranded"
+                  continue
+                fi
+                if carried "$sha" "$shas"; then
+                  carrying="$squash_num"
+                  break
+                fi
+              done <<< "$pairs"
+            else
+              echo "::warning::could not list possible squash PRs for '$base' - leaving #$num stranded"
+            fi
+            if [ -n "$carrying" ]; then
+              carried_off_main=1
+              echo "- #$num merged into \`$base\` on ${merged%T*}; merge commit \`${sha:0:8}\` is not an ancestor of \`main\`, and #$carrying squashed that branch onto \`main\` carrying it" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             stranded=1
             failed=1
             echo "- **#$num** merged into \`$base\` on ${merged%T*}, merge commit \`${sha:0:8}\`, not reachable from \`main\`" >> "$GITHUB_STEP_SUMMARY"
@@ -346,8 +408,10 @@ jobs:
 
           if [ "$rule_b_judged" = 0 ]; then
             : # already reported above; do not claim anything was checked
-          elif [ "$stranded" = 0 ]; then
+          elif [ "$stranded" = 0 ] && [ "$carried_off_main" -eq 0 ]; then
             echo "Nothing. Every PR merged before $cutoff is reachable from \`main\`." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$stranded" = 0 ]; then
+            echo "Nothing stranded. Where a merge commit is not an ancestor, the line above names the squash that carried it onto \`main\`." >> "$GITHUB_STEP_SUMMARY"
           else
             {
               echo
