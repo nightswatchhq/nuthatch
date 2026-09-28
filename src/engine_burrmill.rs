@@ -47,18 +47,28 @@ pub(crate) struct BurrmillSession {
     engine: Mutex<burrmill::Engine>,
     /// Hot rows staged by `load_hot`, bound by the next `bind_facts` for that table.
     hot: Mutex<HashMap<String, Vec<Value>>>,
+    /// Held for the session's life, as DuckDB's is; removed on drop and swept by pid after a crash.
+    _spill: crate::engine_duck::SpillDir,
 }
 
 impl BurrmillSession {
     fn new() -> Result<Self> {
+        let cfg = crate::analytics_budget::from_env();
+        let spill = crate::engine_duck::new_spill_dir()?;
+        let cap = cfg
+            .max_temp_size
+            .as_deref()
+            .and_then(crate::analytics_budget::parse_memory_mb)
+            .map_or(100 << 30, |mb| mb << 20);
+        let budget = burrmill::Budget {
+            memory_bytes: (cfg.memory_limit_mb as usize) << 20,
+            threads: cfg.threads.max(1) as usize,
+            spill: Some((spill.0.clone(), cap)),
+        };
         Ok(Self {
-            engine: Mutex::new(
-                burrmill::Engine::open_empty_within(
-                    (crate::analytics_budget::from_env().memory_limit_mb as usize) << 20,
-                )
-                .map_err(engine_err)?,
-            ),
+            engine: Mutex::new(burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?),
             hot: Mutex::new(HashMap::new()),
+            _spill: spill,
         })
     }
 
