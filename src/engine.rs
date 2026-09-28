@@ -130,6 +130,19 @@ pub(crate) trait Session: Send {
         None
     }
 
+    /// The statement as this engine keys it for reuse (RFC-0033 §3); `None` keys it by its raw text.
+    fn canonical_plan(&self, sql: &str) -> Option<String> {
+        crate::graft::canonical_from_ast(self.serialize_sql(sql).ok()?)
+    }
+
+    /// This engine and its version, written into reuse keys (RFC-0033 §2.2).
+    fn engine_version(&self) -> String {
+        self.one_value("SELECT version()")
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "duckdb-unknown".to_string())
+    }
+
     /// The physical tables a statement reads (names a `WITH` binds in scope excluded) and the table
     /// functions it calls, lowercased; `None` when the statement will not parse.
     fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {

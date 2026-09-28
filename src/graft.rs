@@ -135,21 +135,27 @@ pub(crate) fn canonical_plan(conn: &Connection, sql: &str) -> CanonicalPlan {
     }) else {
         return CanonicalPlan::RawText(sql.trim().to_string());
     };
-    let Ok(mut ast) = serde_json::from_str::<Value>(&raw) else {
-        return CanonicalPlan::RawText(sql.trim().to_string());
-    };
+    match serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(canonical_from_ast)
+    {
+        Some(ast) => CanonicalPlan::Ast(ast),
+        None => CanonicalPlan::RawText(sql.trim().to_string()),
+    }
+}
+
+/// [`canonical_plan`]'s normalisation over an AST already serialised by DuckDB.
+pub(crate) fn canonical_from_ast(mut ast: Value) -> Option<String> {
     // DuckDB reports a parse failure in-band rather than as an error.
     if ast.get("error").and_then(Value::as_bool) != Some(false) {
-        return CanonicalPlan::RawText(sql.trim().to_string());
+        return None;
     }
-
     strip_positional(&mut ast);
     let aliases = collect_aliases(&ast);
     rename_aliases(&mut ast, &aliases);
-
     // `serde_json` preserves object key order as parsed, and DuckDB emits it deterministically for a
     // given version - which is the version already in the key.
-    CanonicalPlan::Ast(ast.to_string())
+    Some(ast.to_string())
 }
 
 /// Remove source-position fields everywhere in the tree.
@@ -251,18 +257,6 @@ fn walk_mut(v: &mut Value, f: &mut impl FnMut(&mut serde_json::Map<String, Value
         Value::Array(items) => items.iter_mut().for_each(|c| walk_mut(c, f)),
         _ => {}
     }
-}
-
-/// The engine that will evaluate a derivation, and its version (RFC-0033 §2.2).
-///
-/// Not bookkeeping - a correctness requirement. **DuckDB changed CTE semantics at 1.4**, making them
-/// materialized by default where they had been inlined; PostgreSQL flipped the same switch the other
-/// way at 12. Same SQL, different version, different evaluation and potentially different results. A
-/// key without this is unsound across our *own* upgrades, which is the worst place to be unsound
-/// because it is discovered in production rather than in CI.
-pub(crate) fn engine_version(conn: &Connection) -> String {
-    conn.query_row("SELECT version()", [], |r| r.get::<_, String>(0))
-        .unwrap_or_else(|_| "duckdb-unknown".to_string())
 }
 
 /// Everything a derivation's identity depends on. Assembled explicitly so a reader can see the whole
@@ -402,24 +396,34 @@ pub(crate) fn parser_connection() -> Result<Connection> {
 /// own merits - a public function returning a third-party connection type is wrong whether or not the
 /// third party ever changes.
 pub struct Parser {
-    conn: Connection,
+    session: Box<dyn crate::engine::Session>,
 }
 
 impl Parser {
+    /// Keys as the engine that evaluates derivations keys them, so a change of engine changes every key.
     pub fn new() -> Result<Self> {
         Ok(Self {
-            conn: parser_connection()?,
+            session: crate::analytics::engine().open_bare()?,
         })
     }
 
     /// See [`canonical_plan`].
     pub fn canonical_plan(&self, sql: &str) -> CanonicalPlan {
-        canonical_plan(&self.conn, sql)
+        match self.session.canonical_plan(sql) {
+            Some(ast) => CanonicalPlan::Ast(ast),
+            None => CanonicalPlan::RawText(sql.trim().to_string()),
+        }
     }
 
-    /// See [`engine_version`]. This is the value written into grafting identity.
+    /// The engine that will evaluate a derivation, and its version (RFC-0033 §2.2).
+    ///
+    /// Not bookkeeping - a correctness requirement. **DuckDB changed CTE semantics at 1.4**, making them
+    /// materialized by default where they had been inlined; PostgreSQL flipped the same switch the other
+    /// way at 12. Same SQL, different version, different evaluation and potentially different results. A
+    /// key without this is unsound across our *own* upgrades, which is the worst place to be unsound
+    /// because it is discovered in production rather than in CI.
     pub fn engine_version(&self) -> String {
-        engine_version(&self.conn)
+        self.session.engine_version()
     }
 }
 

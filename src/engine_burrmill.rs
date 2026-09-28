@@ -275,6 +275,14 @@ impl Session for BurrmillSession {
         Some(views.iter().map(|(n, s)| (n.clone(), s.clone())).collect())
     }
 
+    fn canonical_plan(&self, sql: &str) -> Option<String> {
+        burrmill::inspect::canonical(sql)
+    }
+
+    fn engine_version(&self) -> String {
+        burrmill::ENGINE.to_string()
+    }
+
     fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
         Some((
             burrmill::inspect::base_tables(sql)?,
@@ -402,6 +410,17 @@ impl Session for BurrmillSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn burrmill_keys_derivations_by_its_own_parse_and_build() {
+        use crate::engine::Session;
+        let s = super::BurrmillSession::new().unwrap();
+        let a = s.canonical_plan("SELECT a.x FROM t a -- c\nWHERE a.y > 1");
+        assert!(a.is_some());
+        assert_eq!(a, s.canonical_plan("select b.x from t b where b.y > 1"));
+        assert_ne!(a, s.canonical_plan("SELECT a.x FROM u a WHERE a.y > 1"));
+        assert!(s.engine_version().starts_with("burrmill "));
+    }
+
     use super::*;
     use crate::engine_shadow::{Difference, ShadowEngine};
     use serde_json::json;

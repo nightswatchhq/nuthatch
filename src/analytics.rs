@@ -21,7 +21,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The engine every query runs on. One implementation until phase 2b puts a shadow beside it.
-fn engine() -> &'static dyn Engine {
+pub(crate) fn engine() -> &'static dyn Engine {
     static ENGINE: crate::engine_duck::DuckEngine = crate::engine_duck::DuckEngine;
     crate::engine_shadow::installed().unwrap_or(&ENGINE)
 }

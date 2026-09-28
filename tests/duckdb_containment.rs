@@ -82,7 +82,6 @@ const KNOWN: &[&str] = &[
 const INTERNAL_EXPOSURE: &[(&str, &str)] = &[
     ("analytics_scalars.rs", "register"),
     ("graft.rs", "canonical_plan"),
-    ("graft.rs", "engine_version"),
     ("graft.rs", "parser_connection"),
     ("graft.rs", "build"),
     ("graft.rs", "determinism_gate"),
@@ -499,8 +498,8 @@ fn internal_duckdb_exposure_is_pinned_and_may_only_shrink() {
     );
     assert_eq!(
         found.len(),
-        6,
-        "the internal-exposure count changed: five graft parser/canonicalisation sites and one \
+        5,
+        "the internal-exposure count changed: four graft parser/canonicalisation sites and one \
          pure analytical-scalar registration site. Found: {found:#?}"
     );
 }

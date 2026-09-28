@@ -432,6 +432,15 @@ impl Session for ShadowSession {
         self.primary.serialize_sql(sql)
     }
 
+    /// Reuse keys are the serving engine's.
+    fn canonical_plan(&self, sql: &str) -> Option<String> {
+        self.primary.canonical_plan(sql)
+    }
+
+    fn engine_version(&self) -> String {
+        self.primary.engine_version()
+    }
+
     /// The parser role in shadow: both walks run, the primary's decides. Gate 2 asks the secondary
     /// to be at least as strict, so it reaching fewer tables or admitting what the primary refused
     /// is `ParserLooser` and counted; more tables or a refusal the primary did not make is
