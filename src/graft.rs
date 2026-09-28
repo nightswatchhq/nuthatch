@@ -1456,7 +1456,7 @@ impl std::fmt::Display for Refusal {
 /// with the determinism gate (§10) as the empirical backstop. An allowlist over DuckDB's several
 /// hundred scalar functions would be wrong on day one and wrong differently after every upgrade;
 /// this list plus a gate that actually runs the query twice is the honest combination.
-const VOLATILE_FUNCTIONS: &[&str] = &[
+pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "now",
     "current_timestamp",
     "get_current_timestamp",

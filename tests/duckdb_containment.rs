@@ -62,8 +62,6 @@ const KNOWN: &[&str] = &[
     "analytics.rs", // tests only, as oracles; the policy code went engine-neutral in phase 2a
     "engine_duck.rs", // the `engine::Session` implementation: what analytics.rs used to hold
     "analytics_scalars.rs", // bounded pure Arrow scalar conversions, registered by analytics
-    "entities.rs",  // the admissible function vocabulary, from duckdb_functions()
-    "entity_lower.rs", // AST for lowering authored SQL to a circuit
     "graft.rs",     // canonical plan, engine version, determinism gate
     "seal.rs",      // segment-binding oracle (test-only)
     "port_emit.rs", // emitted-check oracle (test-only)

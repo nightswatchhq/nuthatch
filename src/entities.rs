@@ -1,11 +1,15 @@
 //! RFC-0041 slice one: explicit authored incremental-entity declarations and conservative refusal.
 
-use anyhow::{bail, Context, Result};
-use duckdb::Connection;
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use sqlparser::ast::{
+    self as ast, DuplicateTreatment, FunctionArguments, GroupByExpr, Statement, TableFactor, Visit,
+    Visitor,
+};
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::Duration;
 
@@ -347,17 +351,6 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
     issues
 }
 
-/// The serialized AST for `sql`, parsed. Shared by the shape gate and the allowlist so both judge
-/// exactly the same parse.
-fn plan_ast(conn: &Connection, sql: &str) -> Result<Value> {
-    let literal = format!("'{}'", sql.replace('\'', "''"));
-    let raw: String =
-        conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-            r.get(0)
-        })?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
 /// Aggregates whose maintenance under insert **and retraction** the v1 lowerer can express.
 ///
 /// Short by design and an **allowlist**, which is the whole point (#836). The refusal list used to
@@ -372,121 +365,239 @@ fn plan_ast(conn: &Connection, sql: &str) -> Result<Value> {
 /// `count_star` is DuckDB's internal name for `count(*)`.
 const INCREMENTAL_AGGREGATES: &[&str] = &["sum", "min", "max", "avg", "count", "count_star"];
 
-/// Every `function_name` the parsed statement mentions, at any depth.
-fn function_names(ast: &Value, out: &mut BTreeSet<String>) {
-    match ast {
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("FUNCTION") {
-                if let Some(name) = map.get("function_name").and_then(Value::as_str) {
-                    out.insert(name.to_ascii_lowercase());
-                }
-            }
-            for child in map.values() {
-                function_names(child, out);
-            }
-        }
-        Value::Array(values) => values.iter().for_each(|v| function_names(v, out)),
-        _ => {}
-    }
-}
-
-/// Whether any node of `kind` appears, and whether any aggregate carries `DISTINCT`.
-/// An **expression** subquery: a scalar `(SELECT …)`, `IN (SELECT …)`, or `EXISTS (…)`.
+/// Every name DuckDB 1.5's catalogue classifies as an aggregate: what the gate treats as one.
 ///
-/// Deliberately not "any node of type SUBQUERY". DuckDB gives a derived table in `FROM` the same
-/// node type, and a derived table is an ordinary relation the lowerer has no trouble with - refusing
-/// those would reject `FROM (VALUES …) t(k)` and most real authored SQL with it. The two are told
-/// apart by `class`: an expression subquery carries `class: "SUBQUERY"` and a `subquery_type`
-/// (`SCALAR`/`ANY`/`EXISTS`), a derived table carries neither.
-fn has_expression_subquery(ast: &Value) -> bool {
-    match ast {
-        Value::Object(map) => {
-            (map.get("class").and_then(Value::as_str) == Some("SUBQUERY")
-                && map.get("subquery_type").is_some())
-                || map.values().any(has_expression_subquery)
-        }
-        Value::Array(values) => values.iter().any(has_expression_subquery),
-        _ => false,
-    }
-}
+/// Frozen from `duckdb_functions()` when the gate stopped asking DuckDB;
+/// `the_aggregate_list_is_duckdbs_catalogue` fails while DuckDB is linked if the two drift. A name
+/// here and not in [`INCREMENTAL_AGGREGATES`] is refused; an aggregate some later engine adds is not
+/// here, and is refused at lowering instead, which admits only the six.
+const AGGREGATES: &[&str] = &[
+    "any_value",
+    "approx_count_distinct",
+    "approx_quantile",
+    "approx_top_k",
+    "arbitrary",
+    "arg_max",
+    "arg_max_null",
+    "arg_max_nulls_last",
+    "arg_min",
+    "arg_min_null",
+    "arg_min_nulls_last",
+    "argmax",
+    "argmin",
+    "array_agg",
+    "avg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bitstring_agg",
+    "bool_and",
+    "bool_or",
+    "corr",
+    "count",
+    "count_if",
+    "count_star",
+    "countif",
+    "covar_pop",
+    "covar_samp",
+    "cume_dist",
+    "dense_rank",
+    "entropy",
+    "favg",
+    "fill",
+    "first",
+    "first_value",
+    "fsum",
+    "group_concat",
+    "histogram",
+    "histogram_exact",
+    "kahan_sum",
+    "kurtosis",
+    "kurtosis_pop",
+    "lag",
+    "last",
+    "last_value",
+    "lead",
+    "list",
+    "listagg",
+    "mad",
+    "max",
+    "max_by",
+    "mean",
+    "median",
+    "min",
+    "min_by",
+    "mode",
+    "nth_value",
+    "ntile",
+    "percent_rank",
+    "product",
+    "quantile",
+    "quantile_cont",
+    "quantile_disc",
+    "rank",
+    "rank_dense",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    "reservoir_quantile",
+    "row_number",
+    "sem",
+    "skewness",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "sum",
+    "sum_no_overflow",
+    "sumkahan",
+    "var_pop",
+    "var_samp",
+    "variance",
+];
 
-fn has_distinct_aggregate(ast: &Value) -> bool {
-    match ast {
-        Value::Object(map) => {
-            (map.get("type").and_then(Value::as_str) == Some("FUNCTION")
-                && map.get("distinct").and_then(Value::as_bool) == Some(true))
-                || map.values().any(has_distinct_aggregate)
-        }
-        Value::Array(values) => values.iter().any(has_distinct_aggregate),
-        _ => false,
-    }
-}
-
-/// Which of `names` DuckDB itself classifies as aggregates.
-///
-/// Asked of the engine rather than kept in a table here, so the set is whatever this build actually
-/// supports and cannot drift from it. `duckdb_functions()` is the same catalogue the binder uses.
-fn aggregates_among(conn: &Connection, names: &BTreeSet<String>) -> Result<BTreeSet<String>> {
-    if names.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let list = names
+/// Which of `names` are aggregates.
+fn aggregates_among(names: &BTreeSet<String>) -> BTreeSet<String> {
+    names
         .iter()
-        .map(|n| format!("'{}'", n.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT DISTINCT lower(function_name) FROM duckdb_functions() \
-         WHERE function_type = 'aggregate' AND lower(function_name) IN ({list})"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    let mut out = BTreeSet::new();
-    for r in rows {
-        out.insert(r?);
-    }
-    Ok(out)
+        .filter(|n| AGGREGATES.contains(&n.as_str()))
+        .cloned()
+        .collect()
 }
+
+/// What the gate reads off a parsed statement, in one walk of all of it: subqueries, CTE bodies and
+/// table function arguments included.
+#[derive(Default)]
+struct Facts {
+    volatile: bool,
+    /// Every call, by the name DuckDB's parser gave it. A window call is not one.
+    functions: BTreeSet<String>,
+    /// A scalar `(SELECT ...)`, `IN (SELECT ...)`, `EXISTS`, or a quantified comparison. A derived
+    /// table in `FROM` is not one: it is an ordinary relation.
+    expression_subquery: bool,
+    distinct_aggregate: bool,
+    tables: BTreeSet<String>,
+}
+
+impl Facts {
+    fn of(statements: &[Statement]) -> Self {
+        let mut facts = Facts::default();
+        for statement in statements {
+            let _ = statement.visit(&mut facts);
+        }
+        facts
+    }
+
+    fn call(&mut self, name: String) {
+        self.volatile |= crate::graft::VOLATILE_FUNCTIONS.contains(&name.as_str());
+        self.functions.insert(name);
+    }
+}
+
+impl Visitor for Facts {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &ast::Expr) -> ControlFlow<()> {
+        use ast::Expr as E;
+        match e {
+            // DuckDB's parser read a bare `current_date` as a column, and the volatile list names
+            // it; `t.current_date` is an ordinary column.
+            E::Identifier(i) => {
+                self.volatile |= crate::graft::VOLATILE_FUNCTIONS
+                    .contains(&i.value.to_ascii_lowercase().as_str());
+            }
+            E::Function(f) if f.over.is_none() => match &f.args {
+                FunctionArguments::None => {
+                    if let [name] = crate::entity_lower::object_name_parts(&f.name).as_slice() {
+                        self.volatile |= crate::graft::VOLATILE_FUNCTIONS
+                            .contains(&name.to_ascii_lowercase().as_str());
+                    }
+                }
+                FunctionArguments::List(list) => {
+                    self.distinct_aggregate |=
+                        matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct));
+                    self.call(crate::entity_lower::canonical_function_name(f));
+                }
+                FunctionArguments::Subquery(_) => {
+                    self.expression_subquery = true;
+                    self.call(crate::entity_lower::canonical_function_name(f));
+                }
+            },
+            E::Subquery(_) | E::Exists { .. } | E::InSubquery { .. } => {
+                self.expression_subquery = true
+            }
+            E::AnyOp { right, .. } | E::AllOp { right, .. }
+                if matches!(right.as_ref(), E::Subquery(_)) =>
+            {
+                self.expression_subquery = true
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Table { name, args, .. } = t {
+            let mut parts = crate::entity_lower::object_name_parts(name);
+            match args {
+                None => self.tables.extend(parts.pop()),
+                Some(_) => self.call(parts.pop().unwrap_or_default().to_ascii_lowercase()),
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// How many grouping sets a `GROUP BY` makes: a plain list is one, however long.
+fn grouping_sets(group_by: &GroupByExpr) -> usize {
+    let GroupByExpr::Expressions(exprs, _) = group_by else {
+        return 0;
+    };
+    exprs
+        .iter()
+        .map(|e| match e {
+            ast::Expr::Rollup(sets) => sets.len() + 1,
+            ast::Expr::Cube(sets) => 1 << sets.len().min(usize::BITS as usize - 1),
+            ast::Expr::GroupingSets(sets) => sets.len(),
+            _ => 1,
+        })
+        .fold(if exprs.is_empty() { 0 } else { 1 }, usize::saturating_mul)
+}
+
+const ONE_SELECT: &str = "entity must contain exactly one SELECT; keep other SQL as views/*.sql";
 
 fn validate_sql(sql: &str) -> Result<()> {
-    let conn = Connection::open_in_memory()?;
-    let literal = format!("'{}'", sql.replace('\'', "''"));
-    let ast: String =
-        conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-            r.get(0)
-        })?;
-    let ast: Value = serde_json::from_str(&ast)?;
-    if ast
-        .pointer("/statements")
-        .and_then(Value::as_array)
-        .is_none_or(|s| s.len() != 1)
-        || ast
-            .pointer("/statements/0/node/type")
-            .and_then(Value::as_str)
-            != Some("SELECT_NODE")
-    {
-        bail!("entity must contain exactly one SELECT; keep other SQL as views/*.sql")
-    }
-    // Reuse the AST-level volatile detector rather than trying to maintain a second string list.
-    // DuckDB represents `CURRENT_DATE` as an unqualified column reference, not a function call. A
-    // text matcher that gets this wrong turns time into silently frozen state.
-    let plan = crate::graft::canonical_plan(&conn, sql);
-    if crate::graft::static_refusals(&plan)
-        .iter()
-        .any(|refusal| matches!(refusal, crate::graft::Refusal::Volatile { .. }))
-    {
+    let statements = match crate::entity_lower::parse(sql) {
+        Ok(statements) => statements,
+        Err(_) if uses_sample(sql) => {
+            bail!("USING SAMPLE is not incremental v1 SQL; keep this as views/*.sql")
+        }
+        Err(e) => bail!("{ONE_SELECT} ({e})"),
+    };
+    let Some((select, _)) = (match statements.as_slice() {
+        [Statement::Query(query)] => crate::entity_lower::select_of(query),
+        _ => None,
+    }) else {
+        bail!("{ONE_SELECT}")
+    };
+    let facts = Facts::of(&statements);
+    // DuckDB's parser represents `CURRENT_DATE` as an unqualified column reference, not a function
+    // call, and so does this walk. A text matcher that gets this wrong turns time into silently
+    // frozen state.
+    if facts.volatile {
         bail!("volatile functions are not incremental v1 SQL; keep this as views/*.sql")
     }
     // **The allowlist, and the control meant to outlive the token pass below** (#836).
     //
-    // Asks DuckDB which of the functions this statement names are aggregates, then admits only the
-    // ones the v1 lowerer can maintain. A function the engine gains tomorrow is refused by default,
-    // which is the property the token list could never have - and the name comes from the parsed
+    // Admits only the aggregates the v1 lowerer can maintain, and the name comes from the parsed
     // AST, so `"median"(x)` cannot spell its way past it either.
-    let ast = plan_ast(&conn, sql)?;
-    let mut named = BTreeSet::new();
-    function_names(&ast, &mut named);
-    for aggregate in aggregates_among(&conn, &named)? {
+    for aggregate in aggregates_among(&facts.functions) {
         if !INCREMENTAL_AGGREGATES.contains(&aggregate.as_str()) {
             bail!(
                 "`{aggregate}` is not an aggregate incremental v1 can maintain (only {}); \
@@ -495,25 +606,15 @@ fn validate_sql(sql: &str) -> Result<()> {
             )
         }
     }
-    if has_expression_subquery(&ast) {
+    if facts.expression_subquery {
         bail!(
             "correlated and scalar subqueries are not incremental v1 SQL; keep this as views/*.sql"
         )
     }
-    if has_distinct_aggregate(&ast) {
+    if facts.distinct_aggregate {
         bail!("DISTINCT aggregates are not incremental v1 SQL; keep this as views/*.sql")
     }
-    if ast
-        .pointer("/statements/0/node/sample")
-        .is_some_and(|v| !v.is_null())
-    {
-        bail!("USING SAMPLE is not incremental v1 SQL; keep this as views/*.sql")
-    }
-    if ast
-        .pointer("/statements/0/node/group_sets")
-        .and_then(Value::as_array)
-        .is_some_and(|sets| sets.len() > 1)
-    {
+    if select.is_some_and(|s| grouping_sets(&s.group_by) > 1) {
         bail!("GROUPING SETS/ROLLUP/CUBE are not incremental v1 SQL; keep this as views/*.sql")
     }
 
@@ -552,6 +653,14 @@ fn validate_sql(sql: &str) -> Result<()> {
         bail!("holistic aggregates are not incremental v1 SQL; keep this as views/*.sql")
     }
     Ok(())
+}
+
+/// `USING SAMPLE`, which sqlparser does not parse: recognised here so its refusal still says what it
+/// is rather than that the statement does not parse.
+pub(crate) fn uses_sample(sql: &str) -> bool {
+    sql_tokens(sql)
+        .windows(2)
+        .any(|pair| pair[0] == "USING" && pair[1] == "SAMPLE")
 }
 
 /// SQL tokens relevant to the refusal list. DuckDB owns parsing and the statement-shape gate above;
@@ -635,11 +744,11 @@ fn sql_tokens(sql: &str) -> Vec<String> {
     tokens
 }
 
-/// Referenced relations from the same DuckDB AST used for the statement-shape gate. The caller
-/// resolves these names against fact tables and earlier entities to form the entity DAG.
+/// Referenced relations from the same parse the statement-shape gate reads. The caller resolves
+/// these names against fact tables and earlier entities to form the entity DAG.
 pub fn dependencies(sql: &str) -> Result<Vec<String>> {
-    let conn = Connection::open_in_memory()?;
-    Ok(crate::graft::table_refs(&plan_ast(&conn, sql)?))
+    let statements = crate::entity_lower::parse(sql).map_err(|e| anyhow!("{e}"))?;
+    Ok(Facts::of(&statements).tables.into_iter().collect())
 }
 
 /// Return one named cycle among entity-to-entity dependencies. Fact tables are absent from `nodes`
@@ -703,6 +812,325 @@ fn issue(name: &str, error: impl Into<String>) -> EntityIssue {
     EntityIssue {
         name: name.into(),
         error: error.into(),
+    }
+}
+
+/// The DuckDB-JSON gate this module replaced, moved here verbatim as the differential oracle.
+#[cfg(test)]
+pub(crate) mod duck_oracle {
+    use super::sql_tokens;
+    use anyhow::{bail, Result};
+    use duckdb::Connection;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    /// The serialized AST for `sql`, parsed. Shared by the shape gate and the allowlist so both judge
+    /// exactly the same parse.
+    fn plan_ast(conn: &Connection, sql: &str) -> Result<Value> {
+        let literal = format!("'{}'", sql.replace('\'', "''"));
+        let raw: String =
+            conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+                r.get(0)
+            })?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
+    /// Aggregates whose maintenance under insert **and retraction** the v1 lowerer can express.
+    ///
+    /// Short by design and an **allowlist**, which is the whole point (#836). The refusal list used to
+    /// enumerate what was forbidden - `MEDIAN`, `MODE`, `PERCENTILE_*` - over a vocabulary DuckDB owns
+    /// and grows, and it was wrong in both the ways `analytics.rs` predicts a denylist is wrong. About
+    /// **coverage**: this build knows 88 distinct aggregate names, of which the list named three, so
+    /// `quantile_cont`, `arg_max`, `string_agg`, `list`, `first`, `histogram` and the rest were admitted
+    /// as incrementally maintainable. And about **spelling**: `PERCENTILE_CONT` is the SQL-standard alias
+    /// while `quantile_cont` is the name DuckDB actually uses, so the list blocked the alias and admitted
+    /// the real thing.
+    ///
+    /// `count_star` is DuckDB's internal name for `count(*)`.
+    const INCREMENTAL_AGGREGATES: &[&str] = &["sum", "min", "max", "avg", "count", "count_star"];
+
+    /// Every `function_name` the parsed statement mentions, at any depth.
+    fn function_names(ast: &Value, out: &mut BTreeSet<String>) {
+        match ast {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("FUNCTION") {
+                    if let Some(name) = map.get("function_name").and_then(Value::as_str) {
+                        out.insert(name.to_ascii_lowercase());
+                    }
+                }
+                for child in map.values() {
+                    function_names(child, out);
+                }
+            }
+            Value::Array(values) => values.iter().for_each(|v| function_names(v, out)),
+            _ => {}
+        }
+    }
+
+    /// Whether any node of `kind` appears, and whether any aggregate carries `DISTINCT`.
+    /// An **expression** subquery: a scalar `(SELECT …)`, `IN (SELECT …)`, or `EXISTS (…)`.
+    ///
+    /// Deliberately not "any node of type SUBQUERY". DuckDB gives a derived table in `FROM` the same
+    /// node type, and a derived table is an ordinary relation the lowerer has no trouble with - refusing
+    /// those would reject `FROM (VALUES …) t(k)` and most real authored SQL with it. The two are told
+    /// apart by `class`: an expression subquery carries `class: "SUBQUERY"` and a `subquery_type`
+    /// (`SCALAR`/`ANY`/`EXISTS`), a derived table carries neither.
+    fn has_expression_subquery(ast: &Value) -> bool {
+        match ast {
+            Value::Object(map) => {
+                (map.get("class").and_then(Value::as_str) == Some("SUBQUERY")
+                    && map.get("subquery_type").is_some())
+                    || map.values().any(has_expression_subquery)
+            }
+            Value::Array(values) => values.iter().any(has_expression_subquery),
+            _ => false,
+        }
+    }
+
+    fn has_distinct_aggregate(ast: &Value) -> bool {
+        match ast {
+            Value::Object(map) => {
+                (map.get("type").and_then(Value::as_str) == Some("FUNCTION")
+                    && map.get("distinct").and_then(Value::as_bool) == Some(true))
+                    || map.values().any(has_distinct_aggregate)
+            }
+            Value::Array(values) => values.iter().any(has_distinct_aggregate),
+            _ => false,
+        }
+    }
+
+    /// Which of `names` DuckDB itself classifies as aggregates.
+    ///
+    /// Asked of the engine rather than kept in a table here, so the set is whatever this build actually
+    /// supports and cannot drift from it. `duckdb_functions()` is the same catalogue the binder uses.
+    fn aggregates_among(conn: &Connection, names: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+        if names.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let list = names
+            .iter()
+            .map(|n| format!("'{}'", n.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT lower(function_name) FROM duckdb_functions() \
+             WHERE function_type = 'aggregate' AND lower(function_name) IN ({list})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = BTreeSet::new();
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
+    }
+
+    fn validate_sql(sql: &str) -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let literal = format!("'{}'", sql.replace('\'', "''"));
+        let ast: String =
+            conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
+                r.get(0)
+            })?;
+        let ast: Value = serde_json::from_str(&ast)?;
+        if ast
+            .pointer("/statements")
+            .and_then(Value::as_array)
+            .is_none_or(|s| s.len() != 1)
+            || ast
+                .pointer("/statements/0/node/type")
+                .and_then(Value::as_str)
+                != Some("SELECT_NODE")
+        {
+            bail!("entity must contain exactly one SELECT; keep other SQL as views/*.sql")
+        }
+        // Reuse the AST-level volatile detector rather than trying to maintain a second string list.
+        // DuckDB represents `CURRENT_DATE` as an unqualified column reference, not a function call. A
+        // text matcher that gets this wrong turns time into silently frozen state.
+        let plan = crate::graft::canonical_plan(&conn, sql);
+        if crate::graft::static_refusals(&plan)
+            .iter()
+            .any(|refusal| matches!(refusal, crate::graft::Refusal::Volatile { .. }))
+        {
+            bail!("volatile functions are not incremental v1 SQL; keep this as views/*.sql")
+        }
+        // **The allowlist, and the control meant to outlive the token pass below** (#836).
+        //
+        // Asks DuckDB which of the functions this statement names are aggregates, then admits only the
+        // ones the v1 lowerer can maintain. A function the engine gains tomorrow is refused by default,
+        // which is the property the token list could never have - and the name comes from the parsed
+        // AST, so `"median"(x)` cannot spell its way past it either.
+        let ast = plan_ast(&conn, sql)?;
+        let mut named = BTreeSet::new();
+        function_names(&ast, &mut named);
+        for aggregate in aggregates_among(&conn, &named)? {
+            if !INCREMENTAL_AGGREGATES.contains(&aggregate.as_str()) {
+                bail!(
+                    "`{aggregate}` is not an aggregate incremental v1 can maintain (only {}); \
+                     keep this as views/*.sql",
+                    INCREMENTAL_AGGREGATES.join(", ")
+                )
+            }
+        }
+        if has_expression_subquery(&ast) {
+            bail!(
+                "correlated and scalar subqueries are not incremental v1 SQL; keep this as views/*.sql"
+            )
+        }
+        if has_distinct_aggregate(&ast) {
+            bail!("DISTINCT aggregates are not incremental v1 SQL; keep this as views/*.sql")
+        }
+        if ast
+            .pointer("/statements/0/node/sample")
+            .is_some_and(|v| !v.is_null())
+        {
+            bail!("USING SAMPLE is not incremental v1 SQL; keep this as views/*.sql")
+        }
+        if ast
+            .pointer("/statements/0/node/group_sets")
+            .and_then(Value::as_array)
+            .is_some_and(|sets| sets.len() > 1)
+        {
+            bail!("GROUPING SETS/ROLLUP/CUBE are not incremental v1 SQL; keep this as views/*.sql")
+        }
+
+        // Kept *beside* the allowlist rather than replaced by it: two independent controls that must both
+        // pass, so a gap in either is covered. These are syntax forms, not function names, so the
+        // catalogue above cannot see them.
+        let tokens = sql_tokens(sql);
+        for (needle, why) in [
+            ("DISTINCT", "DISTINCT"),
+            ("LIMIT", "LIMIT"),
+            ("OVER", "window functions"),
+            ("RECURSIVE", "recursive CTEs"),
+            ("OUTER", "outer joins"),
+            ("EXISTS", "correlated subqueries"),
+        ] {
+            if tokens.iter().any(|token| token == needle) {
+                bail!("{why} is not incremental v1 SQL; keep this as views/*.sql")
+            }
+        }
+        if tokens
+            .windows(2)
+            .any(|pair| pair[0] == "ORDER" && pair[1] == "BY")
+        {
+            bail!("ORDER BY is not incremental v1 SQL; keep this as views/*.sql")
+        }
+        if tokens
+            .windows(2)
+            .any(|pair| matches!(pair[0].as_str(), "LEFT" | "RIGHT" | "FULL") && pair[1] == "JOIN")
+        {
+            bail!("outer joins are not incremental v1 SQL; keep this as views/*.sql")
+        }
+        if tokens.windows(2).any(|pair| {
+            (matches!(pair[0].as_str(), "MEDIAN" | "MODE") || pair[0].starts_with("PERCENTILE_"))
+                && pair[1] == "("
+        }) {
+            bail!("holistic aggregates are not incremental v1 SQL; keep this as views/*.sql")
+        }
+        Ok(())
+    }
+
+    /// Referenced relations from the same DuckDB AST used for the statement-shape gate. The caller
+    /// resolves these names against fact tables and earlier entities to form the entity DAG.
+    pub fn dependencies(sql: &str) -> Result<Vec<String>> {
+        let conn = Connection::open_in_memory()?;
+        Ok(crate::graft::table_refs(&plan_ast(&conn, sql)?))
+    }
+
+    #[test]
+    fn the_duckdb_gate_depended_on_its_parser_renaming_aliases() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        let catalogued: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_functions() WHERE lower(function_name) = 'percentile_cont'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            catalogued, 0,
+            "the premise of this test is that the catalogue does NOT know the alias; if DuckDB has \
+             started listing `percentile_cont`, the gate no longer depends on canonicalisation and \
+             this test should be re-read rather than adjusted"
+        );
+
+        let ast = plan_ast(
+            &conn,
+            "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m \
+             FROM (VALUES (1,2)) t(k,v) GROUP BY k",
+        )
+        .unwrap();
+        let mut named = BTreeSet::new();
+        function_names(&ast, &mut named);
+        assert!(
+            named.contains("quantile_cont"),
+            "the parser must canonicalise the alias into catalogue vocabulary, got {named:?}"
+        );
+        assert!(
+            !named.contains("percentile_cont"),
+            "the source spelling must not survive into the AST, or the catalogue cannot classify it"
+        );
+    }
+
+    /// The frozen list is the catalogue the gate used to ask, in the DuckDB this build links.
+    #[test]
+    fn the_aggregate_list_is_duckdbs_catalogue() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT lower(function_name) FROM duckdb_functions() \
+                 WHERE function_type = 'aggregate' ORDER BY 1",
+            )
+            .unwrap();
+        let catalogue: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(catalogue, super::AGGREGATES);
+    }
+
+    /// The port's gate against the DuckDB-JSON gate it replaced, on every entity SQL string the tree
+    /// uses and on the seam probes, and the dependencies of every statement both admit. A parse
+    /// failure may add why after the old message; the pinned parser gaps are refusals now.
+    #[test]
+    fn the_port_gates_every_statement_exactly_as_duckdbs_parse_did() {
+        use crate::entity_lower::corpus;
+        let mut diffs = Vec::new();
+        for sql in corpus::USED.iter().chain(corpus::PROBES) {
+            let old = validate_sql(sql).map_err(|e| format!("{e:#}"));
+            let new = super::validate_sql(sql).map_err(|e| format!("{e:#}"));
+            let agree = old == new
+                || matches!((&old, &new), (Err(o), Err(n))
+                    if o == super::ONE_SELECT && n.starts_with(&format!("{o} (")));
+            if corpus::PARSER_GAPS.contains(sql) {
+                assert!(
+                    new.is_err() && !agree,
+                    "listed as a parser gap but the port agrees or admits it: {sql:?}\n  duckdb: {old:?}\n  port:   {new:?}"
+                );
+                continue;
+            }
+            if !agree {
+                diffs.push(format!("{sql:?}\n  duckdb: {old:?}\n  port:   {new:?}"));
+            }
+            if let (Ok(()), Ok(())) = (&old, &new) {
+                let old = dependencies(sql).map_err(|e| format!("{e:#}"));
+                let new = super::dependencies(sql).map_err(|e| format!("{e:#}"));
+                if old != new {
+                    diffs.push(format!(
+                        "dependencies of {sql:?}\n  duckdb: {old:?}\n  port:   {new:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} differ:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     }
 }
 
@@ -882,52 +1310,14 @@ mod tests {
     /// **The allowlist's closure rests on the parser, not on the catalogue** - pinned here because
     /// nothing else states it and a replacement engine must reproduce it (RFC-0042 slice 3, #966).
     ///
-    /// `percentile_cont` has **zero rows** in `duckdb_functions()`. The catalogue cannot classify it
-    /// as an aggregate, so `aggregates_among` would return an empty set and the refusal loop would
-    /// never fire. It is refused only because DuckDB's parser rewrites the alias to `quantile_cont`
-    /// before `json_serialize_sql` runs, and *that* name is in the catalogue.
-    ///
-    /// So the gate needs two properties from its engine, and only one of them is written down: a
-    /// queryable aggregate classification, **and** an AST rendered in the same vocabulary that
-    /// classification uses. An engine whose parser preserved the source spelling - a purely syntactic
-    /// parser, which is the common design - would admit a quantile into a DBSP circuit that cannot
-    /// maintain it, with every existing test still green.
+    /// `percentile_cont` has **zero rows** in DuckDB's `duckdb_functions()`, so a gate classifying
+    /// names by the catalogue refuses it only because DuckDB's parser rewrote the alias to
+    /// `quantile_cont` first (`duck_oracle::the_duckdb_gate_depended_on_its_parser_renaming_aliases`).
+    /// sqlparser preserves the source spelling, which is the common design, so the port reproduces
+    /// the rewrite itself; without it a quantile would reach a DBSP circuit that cannot maintain it,
+    /// with every other test here still green.
     #[test]
     fn the_allowlist_depends_on_the_parser_canonicalising_aliases() {
-        let conn = Connection::open_in_memory().unwrap();
-
-        let catalogued: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM duckdb_functions() WHERE lower(function_name) = 'percentile_cont'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            catalogued, 0,
-            "the premise of this test is that the catalogue does NOT know the alias; if DuckDB has \
-             started listing `percentile_cont`, the gate no longer depends on canonicalisation and \
-             this test should be re-read rather than adjusted"
-        );
-
-        let ast = plan_ast(
-            &conn,
-            "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m \
-             FROM (VALUES (1,2)) t(k,v) GROUP BY k",
-        )
-        .unwrap();
-        let mut named = BTreeSet::new();
-        function_names(&ast, &mut named);
-        assert!(
-            named.contains("quantile_cont"),
-            "the parser must canonicalise the alias into catalogue vocabulary, got {named:?}"
-        );
-        assert!(
-            !named.contains("percentile_cont"),
-            "the source spelling must not survive into the AST, or the catalogue cannot classify it"
-        );
-
-        // And the consequence the two properties buy together.
         let err = validate_sql(
             "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m \
              FROM (VALUES (1,2)) t(k,v) GROUP BY k",
@@ -1055,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn dependencies_come_from_duckdbs_ast() {
+    fn dependencies_come_from_the_parsed_ast() {
         assert_eq!(
             dependencies("SELECT a.x FROM facts a JOIN earlier e ON a.x = e.x").unwrap(),
             vec!["earlier", "facts"]
