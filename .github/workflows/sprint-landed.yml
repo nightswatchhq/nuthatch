@@ -370,21 +370,30 @@ jobs:
             # only counts once that PR's own merge commit is on main. A failed or empty lookup
             # falls through, so the PR stays stranded (#699).
             carrying=""
-            if pairs="$(gh pr list --repo "$REPO" --state merged --base main --head "$base" \
-                          --limit 20 --json number,mergeCommit \
-                          --jq '.[] | select(.mergeCommit.oid != null) | [.number, .mergeCommit.oid] | @tsv')"; then
+            # Do not put a numerical ceiling on this lookup. A branch may have been merged to
+            # main more than once, and an older squash can be the one that carried this PR.
+            # `--paginate` follows every REST Link page; a failure falls through as stranded.
+            owner="${REPO%%/*}"
+            if pairs="$(gh api --paginate -X GET "repos/$REPO/pulls" \
+                          -f state=closed -f base=main -f "head=$owner:$base" -f per_page=100 \
+                          --jq '.[] | select(.merged_at != null and .merge_commit_sha != null) | [.number, .merge_commit_sha] | @tsv')"; then
               while IFS=$'\t' read -r squash_num squash_sha; do
                 [ -n "${squash_num:-}" ] || continue
                 if ! landed "$squash_sha" "$MAIN"; then
                   continue
                 fi
-                shas="$(gh api --paginate -X GET "repos/$REPO/pulls/$squash_num/commits" \
-                          --jq '.[].sha' 2>/dev/null || true)"
+                if ! shas="$(gh api --paginate -X GET "repos/$REPO/pulls/$squash_num/commits" \
+                              --jq '.[].sha' 2>/dev/null)"; then
+                  echo "::warning::could not list commits on possible squash PR #$squash_num - leaving #$num stranded"
+                  continue
+                fi
                 if carried "$sha" "$shas"; then
                   carrying="$squash_num"
                   break
                 fi
               done <<< "$pairs"
+            else
+              echo "::warning::could not list possible squash PRs for '$base' - leaving #$num stranded"
             fi
             if [ -n "$carrying" ]; then
               carried_off_main=1
