@@ -5,7 +5,9 @@
 //! here from `analytics.rs` unchanged in what it does; `analytics.rs` keeps the policy and no longer
 //! names the engine.
 
-use crate::engine::{Died, Engine, FactWindow, Interrupt, Session};
+use crate::engine::{
+    value_bytes, Died, Engine, FactWindow, Interrupt, Session, SQL_MAX_RESULT_BYTES,
+};
 use anyhow::{bail, Context, Result};
 use duckdb::arrow::datatypes::DataType;
 use duckdb::types::{Value as DuckValue, ValueRef};
@@ -80,6 +82,9 @@ impl Session for DuckSession {
     }
     fn serialize_sql(&self, sql: &str) -> Result<Value> {
         self.conn.serialize_sql(sql)
+    }
+    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
+        self.conn.reach(sql)
     }
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
         Session::interrupt_handle(&self.conn)
@@ -191,6 +196,62 @@ impl Session for Connection {
             })
             .ok()?;
         Some(defs)
+    }
+
+    /// The allowlist walk over DuckDB's `json_serialize_sql` AST: what `reject_unknown_table_refs`
+    /// did in `analytics.rs` before phase 2a, unchanged.
+    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
+        use crate::analytics::{walk_table_refs, ALLOWED_TABLE_FNS};
+        let v = Session::serialize_sql(self, sql).ok()?;
+        if v.get("error").and_then(Value::as_bool) == Some(true) {
+            // DuckDB could not parse it. Let it say so itself, with its own error message.
+            return None;
+        }
+        let mut referenced = BTreeSet::new();
+        // Whether this statement reaches outside the nest's own tables - a catalogue schema, or a
+        // catalogue-listing table function. Such a statement needs **every** view defined, because
+        // what it is asking for is the list of them (#896).
+        let mut surveys = false;
+        let mut bad: Option<String> = None;
+        walk_table_refs(&v, &mut |kind, name| {
+            if bad.is_some() {
+                return;
+            }
+            match kind {
+                "TABLE_FUNCTION" => {
+                    let f = name.to_ascii_lowercase();
+                    if !ALLOWED_TABLE_FNS.contains(&f.as_str()) {
+                        bad = Some(format!("table function `{name}` is not permitted here"));
+                    }
+                    // `duckdb_views()`, `duckdb_tables()` and friends enumerate the catalogue.
+                    if f.starts_with("duckdb_") {
+                        surveys = true;
+                    }
+                }
+                "QUALIFIED_SCHEMA" => surveys = true,
+                // A DuckDB *replacement scan* (`FROM '/x.parquet'`) parses as a BASE_TABLE whose
+                // name is the path, so the AST alone cannot tell it from a real table - the name has
+                // to be checked.
+                "BASE_TABLE"
+                    if name.is_empty()
+                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                {
+                    bad = Some(format!(
+                        "`{name}` is not a table name - a quoted path in table position reads a file"
+                    ));
+                }
+                "BASE_TABLE" => {
+                    referenced.insert(name.to_ascii_lowercase());
+                }
+                _ => {}
+            }
+        });
+        Some(match bad {
+            Some(why) => Err(anyhow::anyhow!(
+                "{why} - the SQL surface serves this nest's tables and views only"
+            )),
+            None => Ok((referenced, surveys)),
+        })
     }
 
     fn serialize_sql(&self, sql: &str) -> Result<Value> {
@@ -730,27 +791,6 @@ fn decimal_safe_projection(statement: Option<&duckdb::Statement<'_>>, sql: &str)
 
 fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// The per-result Rust-side byte ceiling for the guarded `/sql` surface (64 MiB). Comfortably above any
-/// legitimate 50k-row result, far below the per-cursor RAM budget - the backstop against a wide-cell
-/// `SELECT` inflating the materialised buffer past the budget (see `collect`).
-const SQL_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
-
-/// A cheap lower-bound byte estimate of a materialised cell - dominated by string payloads, which is
-/// exactly the wide-cell attack vector. Numbers/bools/null count a small fixed cost.
-fn value_bytes(v: &Value) -> usize {
-    match v {
-        Value::String(s) => s.len(),
-        Value::Array(a) => 8 + a.iter().map(value_bytes).sum::<usize>(),
-        Value::Object(o) => {
-            8 + o
-                .iter()
-                .map(|(k, x)| k.len() + value_bytes(x))
-                .sum::<usize>()
-        }
-        _ => 8,
-    }
 }
 
 /// Create a temp table for one logical table's hot rows and append them, typed to match the sealed

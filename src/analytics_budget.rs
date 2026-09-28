@@ -100,12 +100,19 @@ pub fn from_env() -> AnalyticsConfig {
 /// exactly why the reservation may only be raised. 2 GiB is the footprint CI job / process RSS
 /// wall; this is the arithmetic that keeps a config from being allowed to breach it quietly.
 pub fn validate_cursor_budget() -> Result<()> {
-    validate_against(&from_env(), crate::serve::sql_max_concurrency())
+    let engines = 1 + crate::engine_shadow::installed().is_some() as u64;
+    validate_engines(&from_env(), crate::serve::sql_max_concurrency(), engines)
 }
 
 /// Same check against an explicit config, so a test can drive the inequality without the process
 /// environment. `permits` is clamped to the gate's ceiling, the same bound the live gate uses.
 pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
+    validate_engines(cfg, permits, 1)
+}
+
+/// With the shadow installed a permit holds two sessions, each bounded by `analytics.memory_limit`,
+/// so the split counts both.
+pub fn validate_engines(cfg: &AnalyticsConfig, permits: usize, engines: u64) -> Result<()> {
     let permits = permits.clamp(1, crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
     if cfg.memory_limit_mb == 0 {
         bail!(
@@ -125,7 +132,9 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
             cfg.threads
         );
     }
-    let duck = permits.saturating_mul(cfg.memory_limit_mb);
+    let duck = permits
+        .saturating_mul(engines)
+        .saturating_mul(cfg.memory_limit_mb);
     let reservation = cfg.reservation_mb();
     let floor = derived_ingestion_reservation_mb();
     if reservation < floor {
@@ -144,9 +153,11 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
     let ceiling = crate::runtime::DEFAULT_MAX_RSS_MB;
     if total > ceiling {
         bail!(
-            "DuckDB split does not leave the named ingest floor: (sql_permits × \
+            "DuckDB split does not leave the named ingest floor: (sql_permits × engines × \
              analytics.memory_limit) + ingestion_reservation + runtime_headroom = ({permits} × \
-             {} MB) + {reservation} MB + {headroom} MB = {total} MB, which is above {ceiling} MB. \
+             {engines} × {} MB) + {reservation} MB + {headroom} MB = {total} MB, which is above \
+             {ceiling} MB. Two engines means shadow-burrmill, which runs Burrmill beside DuckDB \
+             under the same permit. \
              This gate refuses that split; it does not cap ingest, DBSP, redb, or result \
              materialisation. The 2 GiB cursor budget is the footprint CI job / process RSS wall, \
              not this arithmetic. Lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
@@ -323,6 +334,15 @@ mod tests {
     fn unconfigured_config_validates_at_the_shipped_permits() {
         validate_against(&AnalyticsConfig::default(), SQL_MAX_CONCURRENCY)
             .expect("today's walls must still start");
+    }
+
+    #[test]
+    fn the_shadow_counts_its_second_engine() {
+        let err = validate_engines(&AnalyticsConfig::default(), SQL_MAX_CONCURRENCY, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shadow-burrmill"), "{err}");
+        validate_engines(&AnalyticsConfig::default(), 1, 2).expect("1 × 2 × 512 + 1024 = 2048");
     }
 
     #[test]

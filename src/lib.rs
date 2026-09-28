@@ -41,6 +41,12 @@ pub mod dune_views;
 pub mod effectful;
 pub(crate) mod engine;
 pub(crate) mod engine_duck;
+// The second engine (RFC-0044 Amendment 2, phase 2b): compiled and installed only with the
+// `shadow-burrmill` feature, which a release build does not carry.
+#[cfg(feature = "shadow-burrmill")]
+pub mod engine_burrmill;
+#[cfg_attr(not(feature = "shadow-burrmill"), allow(dead_code))]
+pub(crate) mod engine_shadow;
 pub mod entities;
 pub mod entity_bind;
 pub mod entity_circuit;

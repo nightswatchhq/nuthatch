@@ -15,6 +15,29 @@ use std::sync::Arc;
 
 pub(crate) use crate::analytics::FactWindow;
 
+/// The per-result Rust-side byte ceiling for the guarded `/sql` surface (64 MiB). Comfortably above
+/// any legitimate 50k-row result, far below the per-cursor RAM budget - the backstop against a
+/// wide-cell `SELECT` inflating the materialised buffer past the budget. Part of `collect`'s
+/// contract: every engine applies it whenever a row cap is given, so a shadow truncates where the
+/// primary does.
+pub(crate) const SQL_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
+/// A cheap lower-bound byte estimate of a materialised cell - dominated by string payloads, which is
+/// exactly the wide-cell attack vector. Numbers/bools/null count a small fixed cost.
+pub(crate) fn value_bytes(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.len(),
+        Value::Array(a) => 8 + a.iter().map(value_bytes).sum::<usize>(),
+        Value::Object(o) => {
+            8 + o
+                .iter()
+                .map(|(k, x)| k.len() + value_bytes(x))
+                .sum::<usize>()
+        }
+        _ => 8,
+    }
+}
+
 /// Opens sessions. One implementation today; a shadow engine is phase 2b.
 pub(crate) trait Engine: Send + Sync {
     /// A session bounded and locked to `dir`: the nest's memory, thread and spill limits, file
@@ -36,6 +59,7 @@ pub(crate) trait Interrupt: Send + Sync {
 /// question about names - a typo, a missing column, an unknown table - and no corrupt page can
 /// cause one, so it must never trigger the integrity sweep. Only a statement that bound and then
 /// died while reading rows is worth paying for.
+#[derive(Debug)]
 pub(crate) enum Died {
     /// The engine refused it before running: a name the catalogue does not have, a type that does
     /// not check.
@@ -98,8 +122,21 @@ pub(crate) trait Session: Send {
     /// serialisation itself failing.
     fn serialize_sql(&self, sql: &str) -> Result<Value>;
 
+    /// The security walk: what the statement reaches, from the engine's own parse. `None` when the
+    /// parser could not say (it fails open; the denylist is still in front), `Some(Err)` when the
+    /// statement is refused with the reason, `Some(Ok((tables, surveys)))` with the base tables and
+    /// CTE names lowercased and whether it asks about the catalogue.
+    fn reach(&self, _sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
+        None
+    }
+
     /// A handle another thread can use to cancel whatever this session is running.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
+
+    /// The guard's deadline for the statement about to run, so an engine that does extra work
+    /// beside the answer (a shadow) can decline it when the budget is nearly spent. Advisory; the
+    /// watchdog still enforces the deadline.
+    fn set_deadline(&self, _deadline: Option<std::time::Instant>) {}
 
     /// How many cold Parquet scans the statement's physical plan performs (RFC-0048 §3). Refuses,
     /// as `AdmissionRefusal::Unboundable`, any plan it cannot count.
