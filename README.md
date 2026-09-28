@@ -68,13 +68,12 @@ repository or supply contracts and ABIs, and query the resulting endpoint. Arcai
 Testnet nests are a [working example](https://nuthatch-indexer.com/blog/hosted-nests-are-open),
 including a query you can run yourself.
 
-Free accounts can run up to three nests with a five-million-block backfill limit; the introductory
-Paid plan is $20 per month in USDC for up to ten nests and a 50-million-block limit. Paid adds hosted
-RPC access for Ethereum, Base and Arbitrum One. New nests wait for manual approval before indexing.
-The service runs on one machine, has no SLA, accepts public repositories only, and serves SQL rather
-than the partial GraphQL compatibility layer. The [hosted launch post](https://nuthatch-indexer.com/blog/hosted-nests-are-open)
-has the current limits and an example endpoint. You can run the same published binary yourself;
-sign-in and billing belong to the separate hosting service.
+The service offers Free, Builder and Pro plans. The [hosted guide](https://platform.nuthatch-indexer.com/guide)
+states the current prices, limits and supported chains from the configuration that enforces them. New
+nests wait for manual approval before indexing. The service runs on one machine, has no SLA, accepts
+public repositories only, and serves SQL rather than the partial GraphQL compatibility layer. The
+[hosted launch post](https://nuthatch-indexer.com/blog/hosted-nests-are-open) has an example endpoint.
+You can run the same published binary yourself; sign-in and billing belong to the separate hosting service.
 
 ---
 

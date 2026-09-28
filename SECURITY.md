@@ -35,7 +35,7 @@ anonymous.
 
 ## Supported versions
 
-Pre-1.0, only the latest release (currently the `0.1.x` line) receives security fixes. Releases
-are cut from tagged commits on `main`, published to GitHub Releases with per-artifact SHA-256
-and to crates.io, and reproducible from the pinned toolchain (see
+Only the latest released nuthatch version receives security fixes. Releases are cut from tagged
+commits on `main`, published to GitHub Releases with per-artifact SHA-256 and to crates.io, and
+reproducible from the pinned toolchain (see
 [GOVERNANCE.md § Release integrity](GOVERNANCE.md#release-integrity--key-custody)).
