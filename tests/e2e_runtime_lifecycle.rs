@@ -236,6 +236,55 @@ async fn unmounting_an_absent_nest_is_a_no_op() {
     assert_eq!(handles.states.len(), 1);
 }
 
+/// #1536, #1538: a live mount that opens its own store takes the recorded SQL surface and the
+/// cursor's existing gate. Boot does both. This path used to serve `sql = "deny"` as open, on a
+/// private semaphore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_mount_applies_the_recorded_surface_and_shares_the_sql_gate() {
+    use nuthatch::allowlist::SqlAccess;
+
+    let roost = tempfile::tempdir().unwrap();
+    let usdc_dir = tempfile::tempdir().unwrap();
+    let arb_dir = tempfile::tempdir().unwrap();
+    let (mut handles, _tape) = two_nest_roost(roost.path(), usdc_dir.path(), arb_dir.path()).await;
+
+    let nid = "ee55".repeat(16);
+    let gamma = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::create_dir_all(&gamma).unwrap();
+    scaffold_nest(&gamma, "gamma", USDC);
+    handles.mount_ctx.mounts.push(runtime::Mount {
+        tenant: "default".to_string(),
+        alias: "gamma".to_string(),
+        nid: nid.clone(),
+        sql: SqlAccess::Deny,
+        queries: Vec::new(),
+        publish: None,
+        #[cfg(feature = "counter")]
+        counter: None,
+    });
+
+    handles
+        .mount("gamma", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+
+    let gamma_state = handles
+        .states
+        .iter()
+        .find(|(n, _)| n == "gamma")
+        .expect("gamma mounted");
+    assert_eq!(gamma_state.1.surface.access, SqlAccess::Deny);
+    let usdc = handles
+        .states
+        .iter()
+        .find(|(n, _)| n == "usdc")
+        .expect("usdc still mounted");
+    assert!(
+        Arc::ptr_eq(&gamma_state.1.sql_gate, &usdc.1.sql_gate),
+        "a live mount must take the cursor's /sql gate"
+    );
+}
+
 /// RFC-0027 §3: the three admission refusals, each decided **before** any work is done - no store
 /// opened, no block fetched, nothing left behind by a rejected mount.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1055,6 +1104,14 @@ async fn the_lifecycle_routes_demand_the_admin_token_before_they_act() {
         status,
         axum::http::StatusCode::UNAUTHORIZED,
         "an unauthenticated DELETE /_admin/nests/{{name}} must be refused"
+    );
+    // #1533: a multi-tenant route key has a slash. `{name}` was one segment, so this 404'd and the
+    // nest could not be named. 401 means the route matched and the guard ran.
+    let (status, _) = call(&routes, "DELETE", "/_admin/nests/acme/usdc", None, None).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNAUTHORIZED,
+        "DELETE /_admin/nests/acme/usdc must reach the handler, not 404"
     );
     let (status, _) = call(&live_service, "GET", "/arb/health", None, None).await;
     assert_eq!(

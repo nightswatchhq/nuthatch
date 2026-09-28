@@ -1850,6 +1850,12 @@ fn drain_lifecycle(
     while let Ok(cmd) = rx.try_recv() {
         match cmd {
             CursorCommand::Unmount { name, ack } => {
+                // The driver drops the receiver when its wait times out, and it leaves the routes
+                // up. Retiring after that stops a nest that is still being served (#1535).
+                if ack.as_ref().is_some_and(|a| a.is_closed()) {
+                    tracing::warn!("unmount of '{name}' was abandoned; leaving it on the cursor");
+                    continue;
+                }
                 match sup.index_of(&name) {
                     // Retire *and release*: dropping the `NestIngest` drops this cursor's `Store`
                     // clone, its view handles and its screener. redb only lets go of the file when
@@ -1871,7 +1877,15 @@ fn drain_lifecycle(
             }
             CursorCommand::Mount { nest, next, ack } => {
                 let name = nest.name.clone();
-                if sup.index_of(&name).is_some() {
+                // Same abandonment as unmount: the driver timed out and did not publish routes.
+                // Admitting holds the store, and the retry cannot open it (#1535).
+                let abandoned = ack.as_ref().is_some_and(|a| a.is_closed());
+                let mut admitted = false;
+                if abandoned {
+                    tracing::warn!(
+                        "mount of '{name}' was abandoned before the cursor reached it; not admitting"
+                    );
+                } else if sup.index_of(&name).is_some() {
                     // Mounting over a live name is an upgrade, and that is RFC-0020's job. Refusing
                     // here keeps the two from silently overlapping.
                     tracing::warn!("nest '{name}' is already on this cursor; ignoring the mount");
@@ -1881,10 +1895,16 @@ fn drain_lifecycle(
                     nests.push(Some(*nest));
                     nexts.push(next);
                     sup.admit(&name);
+                    admitted = true;
                     tracing::info!("nest '{name}' mounted onto this cursor at block {next}");
                 }
                 if let Some(ack) = ack {
-                    let _ = ack.send(());
+                    if ack.send(()).is_err() && admitted {
+                        // The receiver went away between the check and the admit.
+                        let i = sup.index_of(&name).expect("just admitted");
+                        sup.retire(i);
+                        nests[i] = None;
+                    }
                 }
             }
         }
@@ -1910,8 +1930,8 @@ pub enum CursorCommand {
     /// which matters because redb only releases the file once every clone drops - the cursor's, the
     /// serving state's, and the alert worker's.
     ///
-    /// A dropped `ack` sender is not an error: the driver may have stopped caring, and the cursor's
-    /// job is done either way.
+    /// A closed receiver means the driver gave up waiting and left the routes in place, so the
+    /// nest stays (#1535). `None` is the fire-and-forget path, and that one does retire.
     Unmount {
         name: String,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
@@ -2424,13 +2444,14 @@ pub async fn build_and_prepare_nest(
     // is handed the shared store the writer is filling; `None` keeps the embedded behaviour, which is
     // every existing caller.
     store_override: Option<Arc<dyn crate::store::HotStore>>,
+    sql_gate: Arc<tokio::sync::Semaphore>,
 ) -> Result<(
     NestIngest,
     serve::AppState,
     Option<tokio::task::JoinHandle<()>>,
     u64,
 )> {
-    let (mut nest, state, worker, window) = build_nest(
+    let (mut nest, state, mut worker, window) = build_nest(
         source,
         dataset.into_dir(),
         config,
@@ -2438,10 +2459,19 @@ pub async fn build_and_prepare_nest(
         admin_enabled,
         admin_token,
         store_override,
-        // One nest built on its own is one cursor (#1024).
-        serve::new_sql_gate(),
+        // The caller passes the cursor's gate. A fresh one here gave a live-mounted nest its own
+        // budget on top of the nests already on that cursor (#1538).
+        sql_gate,
     )
     .await?;
+    // The same refusal as `spawn_nest`. Inside `prepare` it would arrive after seal-direct had
+    // already written history the entity never sees (#1537).
+    if let Err(e) = refuse_seal_direct_with_entities(seal_direct, &nest) {
+        if let Some(w) = worker.take() {
+            w.abort();
+        }
+        return Err(e);
+    }
     let next = nest
         .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
         .await?;
@@ -10737,6 +10767,94 @@ template = "pool"
              treat its `next` as unknown, i.e. genesis, and drag every co-tenant back with it"
         );
         assert_eq!(sup.index_of("late-arrival"), Some(1));
+    }
+
+    /// #1535: the driver drops the receiver when its wait times out and leaves the routes up.
+    /// Applying the unmount after that retires a nest that is still being served.
+    #[test]
+    fn an_abandoned_unmount_leaves_the_nest_on_the_cursor() {
+        let mut sup = test_supervisor(1);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+        let mut nests: Vec<Option<NestIngest>> = vec![None];
+        let mut nexts = vec![10u64];
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        drop(ack_rx);
+        tx.send(CursorCommand::Unmount {
+            name: "nest0".into(),
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
+
+        assert_eq!(sup.live(), vec![0], "the nest is still indexing");
+        assert!(nests[0].is_none(), "the slot was empty and stays empty");
+    }
+
+    /// #1535: a mount whose caller has gone is not admitted, and the store it was holding can be
+    /// opened again. Admitting it would leave the file locked with no routes.
+    #[tokio::test]
+    async fn an_abandoned_mount_is_not_admitted_and_releases_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(dir.path(), "0x00000000000000000000000000000000000000aa").await;
+        let name = nest.name.clone();
+
+        let mut sup = test_supervisor(1);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+        let mut nests: Vec<Option<NestIngest>> = vec![None];
+        let mut nexts = vec![10u64];
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        drop(ack_rx);
+        tx.send(CursorCommand::Mount {
+            nest: Box::new(nest),
+            next: 12,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
+
+        assert_eq!(sup.live(), vec![0]);
+        assert_eq!(sup.index_of(&name), None);
+        assert_eq!(nests.len(), 1);
+        assert_eq!(nexts.len(), 1);
+        Store::open(&dir.path().join(crate::config::DB_FILE))
+            .expect("the abandoned mount must have dropped its store");
+    }
+
+    /// The receiver is still there, so the mount joins the working set and the arrays stay aligned.
+    #[tokio::test]
+    async fn an_acknowledged_mount_joins_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(dir.path(), "0x00000000000000000000000000000000000000ab").await;
+        let name = nest.name.clone();
+
+        let mut sup = test_supervisor(1);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+        let mut nests: Vec<Option<NestIngest>> = vec![None];
+        let mut nexts = vec![10u64];
+
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(CursorCommand::Mount {
+            nest: Box::new(nest),
+            next: 12,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
+
+        assert!(ack_rx.try_recv().is_ok(), "the mount was acknowledged");
+        assert_eq!(sup.index_of(&name), Some(1));
+        assert_eq!(sup.live(), vec![0, 1]);
+        assert_eq!(nests.len(), 2);
+        assert_eq!(nexts, vec![10, 12]);
+        assert!(
+            Store::open(&dir.path().join(crate::config::DB_FILE)).is_err(),
+            "the cursor is holding the store"
+        );
     }
 
     /// A mount is applied at a window boundary like any other command, keeps the arrays in step, and
