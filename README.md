@@ -68,12 +68,12 @@ repository or supply contracts and ABIs, and query the resulting endpoint. Arcai
 Testnet nests are a [working example](https://nuthatch-indexer.com/blog/hosted-nests-are-open),
 including a query you can run yourself.
 
-The service offers Free, Builder and Pro plans. The [hosted guide](https://platform.nuthatch-indexer.com/guide)
-states the current prices, limits and supported chains from the configuration that enforces them. New
-nests wait for manual approval before indexing. The service runs on one machine, has no SLA, accepts
-public repositories only, and serves SQL rather than the partial GraphQL compatibility layer. The
-[hosted launch post](https://nuthatch-indexer.com/blog/hosted-nests-are-open) has an example endpoint.
-You can run the same published binary yourself; sign-in and billing belong to the separate hosting service.
+The [hosted guide](https://platform.nuthatch-indexer.com/guide) states the current plans, prices,
+limits and supported chains from the configuration that enforces them. New nests wait for manual
+approval before indexing. The service runs on one machine, has no SLA, accepts public repositories
+only, and serves SQL rather than the partial GraphQL compatibility layer. The [hosted launch
+post](https://nuthatch-indexer.com/blog/hosted-nests-are-open) has an example endpoint. You can run
+the same published binary yourself; sign-in and billing belong to the separate hosting service.
 
 ---
 
