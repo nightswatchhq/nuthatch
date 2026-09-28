@@ -126,12 +126,14 @@ Three sites have been added since: `port_emit.rs` (test-only, 2026-09-08), `dune
 (production, 2026-09-15), and `analytics_scalars.rs` (production, 2026-09-17).
 The table now lists nine; the six in the heading is what slice 0 found,
 kept because that is the number the rest of this document reasons about.
+Two have since left: `entities.rs` and `entity_lower.rs` parse with sqlparser's DuckDB dialect
+(2026-09-28), keeping the DuckDB-JSON versions only as `#[cfg(test)]` differential oracles.
 
 | site | role | classification | notes |
 | --- | --- | --- | --- |
 | `analytics.rs` | general SQL, views, hot+cold federation | production | 53 connection ops, the obvious one |
 | `analytics_scalars.rs` | pure bounded scalar conversions and exact arithmetic | production | registers on the existing analytical connection; one crate-internal `&Connection` signature, no additional connection or I/O |
-| `entities.rs` | aggregate **classification** from `duckdb_functions()` | **production, public contract** | its own comment: "the same catalogue the binder uses". Narrower than first written - see correction |
+| `entities.rs` | aggregate **classification** from `duckdb_functions()` | **production, public contract** | its own comment: "the same catalogue the binder uses". Narrower than first written - see correction. **Gone 2026-09-28:** the catalogue is a frozen list, checked against `duckdb_functions()` in tests |
 | `entity_lower.rs` | AST for lowering authored SQL to a DBSP circuit | production | RFC-0041 parser role. **Gone 2026-09-28:** sqlparser, differential-tested against the old lowering |
 | `graft.rs` | engine string in the derivation reuse key (`engine: "duckdb-v1.4.0"`) | **latent** - see correction below | **not** production: nothing calls it and nothing is written to disk |
 | `seal.rs` | segment-binding oracle | test-only | one in-memory connection in a fixture |
