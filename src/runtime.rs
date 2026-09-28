@@ -2153,7 +2153,7 @@ pub fn lifecycle_routes(
 
     axum::Router::new()
         .route("/_admin/nests", post(mount_nest))
-        .route("/_admin/nests/{name}", delete(unmount_nest))
+        .route("/_admin/nests/{*name}", delete(unmount_nest))
         .with_state((handles, admin_token))
 }
 
@@ -2204,7 +2204,12 @@ fn persist_mounted_nests(dir: &Path, nests: &[String], known: &[Mount]) -> Resul
             if mounts.mounts.iter().any(|m| &key_of(m) == key) {
                 continue;
             }
-            if let Some(m) = known.iter().find(|m| &key_of(m) == key) {
+            // A live mount that introduces a second tenant is stored under `tenant/alias`, while
+            // this file is still single-tenant and `key_of` returns the alias alone (#1534).
+            if let Some(m) = known
+                .iter()
+                .find(|m| &key_of(m) == key || format!("{}/{}", m.tenant, m.alias) == *key)
+            {
                 mounts.mounts.push(m.clone());
             }
         }
@@ -2351,6 +2356,14 @@ impl std::error::Error for MountRefusal {}
 /// unmount so much as a refusal to guess: we would rather report that the cursor has not let go than
 /// tear the routes down while it is still writing.
 const UNMOUNT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The alert delivery task holds a `Store` clone. Dropping its `JoinHandle` detaches it, so a
+/// mount that never publishes routes has to abort the task or redb keeps the file (#1535).
+fn abort_alert_worker(worker: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(w) = worker.take() {
+        w.abort();
+    }
+}
 
 impl RuntimeHandles {
     /// Mount a nest into the running mounts (RFC-0027 §3-§4).
@@ -2506,7 +2519,13 @@ impl RuntimeHandles {
                 config.route = Some(name.to_string());
 
                 // Phase 1: build and catch up, off to one side of the cursor.
-                let (nest, mut state, worker, next) = indexer::build_and_prepare_nest(
+                let sql_gate = self
+                    .states
+                    .iter()
+                    .find(|(_, s)| s.chain == chain)
+                    .map(|(_, s)| Arc::clone(&s.sql_gate))
+                    .unwrap_or_else(crate::serve::new_sql_gate);
+                let (nest, mut state, mut worker, next) = indexer::build_and_prepare_nest(
                     &source,
                     prepared,
                     &config,
@@ -2517,6 +2536,7 @@ impl RuntimeHandles {
                     self.mount_ctx.admin_enabled,
                     self.mount_ctx.admin_token.clone(),
                     None,
+                    sql_gate,
                 )
                 .await
                 .with_context(|| format!("preparing nest '{name}' for mount"))?;
@@ -2528,29 +2548,54 @@ impl RuntimeHandles {
                 // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
                 // it here or serve `nid: null` until the next restart (#557).
                 state.nid = nid.as_deref().map(Arc::from);
+                // Boot overlays the mount record after `build_nest`. This path opens a store, so it
+                // has to do the same or a recorded `sql = "deny"` serves open until restart (#1536).
+                if let Some(record) = self
+                    .mount_ctx
+                    .mounts
+                    .iter()
+                    .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+                {
+                    state.surface = Arc::new(record.surface());
+                    #[cfg(feature = "counter")]
+                    {
+                        state.counter = record.counter.clone().map(Arc::new);
+                    }
+                }
 
                 // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
+                // The delivery task holds its own store clone. Dropping the `JoinHandle` does not
+                // stop it, so a rejected mount has to abort the task or the file stays locked (#1535).
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                lifecycle
+                if lifecycle
                     .send(indexer::CursorCommand::Mount {
                         nest: Box::new(nest),
                         next,
                         ack: Some(ack_tx),
                     })
-                    .map_err(|_| {
-                        anyhow::anyhow!("cursor on {chain} is gone; cannot mount '{name}'")
-                    })?;
-                tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx)
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
+                    .is_err()
+                {
+                    abort_alert_worker(&mut worker);
+                    return Err(anyhow::anyhow!(
+                        "cursor on {chain} is gone; cannot mount '{name}'"
+                    ));
+                }
+                match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        abort_alert_worker(&mut worker);
+                        return Err(anyhow::anyhow!(
+                            "cursor on {chain} stopped while mounting '{name}'"
+                        ));
+                    }
+                    Err(_) => {
+                        abort_alert_worker(&mut worker);
+                        return Err(anyhow::anyhow!(
                             "cursor on {chain} did not acknowledge mounting '{name}' within {}s",
                             UNMOUNT_ACK_TIMEOUT.as_secs()
-                        )
-                    })?
-                    .map_err(|_| {
-                        anyhow::anyhow!("cursor on {chain} stopped while mounting '{name}'")
-                    })?;
+                        ));
+                    }
+                }
                 tracing::info!("nest '{name}' mounted onto the {chain} cursor at block {next}");
                 (state, worker, incoming, name.to_string())
             }
@@ -2664,10 +2709,9 @@ impl RuntimeHandles {
             return Ok(());
         };
         let chain = self.states[idx].1.chain.clone();
-        let dataset_dir = match self.mount_ctx.mounts.iter().find(|m| m.alias == name) {
-            Some(m) => MountTable::data_dir(&self.mount_ctx.dir, &m.nid),
-            None => MountTable::nest_dir(&self.mount_ctx.dir, name),
-        };
+        // The route key is `tenant/alias` once more than one tenant is mounted, and the record's
+        // `alias` is only the second segment. The serving state already knows its dataset (#1531).
+        let dataset_dir = self.states[idx].1.dir.clone();
         // The cursor and alert worker know a shared dataset by the mount that first indexed it, which
         // may be this one or another. While any other mount still holds the store, both stay running
         // (RFC-0032 §5): only this mount's routes go.
@@ -3705,6 +3749,54 @@ mod tests {
             after.mounts[0].nid, nid,
             "the surviving mount must still point at the same dataset"
         );
+    }
+
+    /// #1534: the file still has one tenant, so route keys are aliases, but the live name of the
+    /// new mount is `tenant/alias`. That record has to be written or the mount vanishes on restart.
+    #[test]
+    fn a_second_tenant_mounted_live_is_written_while_the_file_is_still_single_tenant() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let acme = "aa11".repeat(16);
+        let globex = "bb22".repeat(16);
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+                 rpc_urls = []\n\n\
+                 [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"{acme}\"\n"
+            ),
+        )
+        .unwrap();
+        let known: MountTable = toml::from_str(&format!(
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n\n\
+             [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"{acme}\"\n\n\
+             [[mounts]]\ntenant = \"globex\"\nalias = \"usdc\"\nnid = \"{globex}\"\n"
+        ))
+        .unwrap();
+
+        persist_mounted_nests(
+            root,
+            &["usdc".to_string(), "globex/usdc".to_string()],
+            &known.mounts,
+        )
+        .unwrap();
+
+        let after = MountTable::load(root).expect("the rewritten file must still load");
+        assert_eq!(
+            after.mounts.len(),
+            2,
+            "the new tenant was dropped: {after:?}"
+        );
+        assert!(after
+            .mounts
+            .iter()
+            .any(|m| m.tenant == "acme" && m.nid == acme));
+        assert!(after
+            .mounts
+            .iter()
+            .any(|m| m.tenant == "globex" && m.alias == "usdc" && m.nid == globex));
     }
 
     /// RFC-0032 slice 5: the runtime is retired, so a directory still holding the pre-2.0 file is a

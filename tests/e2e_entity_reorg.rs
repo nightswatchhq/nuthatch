@@ -371,6 +371,46 @@ async fn seal_direct_refuses_a_nest_that_declares_an_entity() {
     );
 }
 
+/// #1537: a live mount builds through `build_and_prepare_nest`, which used to skip the refusal
+/// `spawn_nest` makes and then serve the entity empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_mount_refuses_seal_direct_with_an_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    declare_entity(dir.path());
+    let source: Arc<dyn nuthatch::source::Source> = tape;
+
+    let err = indexer::build_and_prepare_nest(
+        &source,
+        nuthatch::runtime::PreparedDataset::without_nid(dir.path().to_path_buf()),
+        &cfg,
+        None,
+        true,
+        1,
+        Some(2),
+        false,
+        None,
+        None,
+        nuthatch::serve::new_sql_gate(),
+    )
+    .await
+    .err()
+    .expect("a live mount must refuse seal-direct plus an entity");
+
+    let err = format!("{err:#}");
+    assert!(err.contains("--seal-direct cannot be combined"), "{err}");
+    assert!(
+        err.contains("`received`"),
+        "the refusal must name the entity: {err}"
+    );
+}
+
 /// The same nest without `--seal-direct` starts and folds - so the refusal above is about the
 /// combination and not about entities being unable to start at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

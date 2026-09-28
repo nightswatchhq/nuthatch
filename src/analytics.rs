@@ -831,7 +831,7 @@ fn run(
     };
     if vanished {
         if let Some(secs) = timed_out(guard, deadline) {
-            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+            return Err(QueryBudgetExceeded { secs }.into());
         }
         tracing::info!(
             "a segment the plan named was gone by execution - a seal replaced it under the query \
@@ -899,12 +899,12 @@ fn run(
     // skipping the sweep and returning `e`, which (for a guard-bound caller) could otherwise read as
     // an ordinary query error rather than the timeout it actually is.
     if let Some(secs) = timed_out(guard, deadline) {
-        bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+        return Err(QueryBudgetExceeded { secs }.into());
     }
     let corrupt = crate::seal::segments_failing_verification(dir, &tables, deadline);
     if corrupt.is_empty() {
         if let Some(secs) = timed_out(guard, deadline) {
-            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+            return Err(QueryBudgetExceeded { secs }.into());
         }
         return Err(e);
     }
@@ -1174,7 +1174,7 @@ fn attempt(
     let scan = match scan {
         Some(Err(_)) if interrupted.load(Ordering::SeqCst) => {
             let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+            return Err(QueryBudgetExceeded { secs }.into());
         }
         Some(Err(e)) => return Err(e),
         Some(Ok(bound)) => Some(bound),
