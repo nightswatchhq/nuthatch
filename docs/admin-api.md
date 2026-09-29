@@ -59,7 +59,8 @@ A mount can take minutes when it fetches, so it answers `202` at once with a job
 ```
 
 `phase` moves through `accepted`, `fetching` (only when the registry is needed), `joining` (catching up
-beside the cursor before it joins), and ends at `live` or `failed`, with a `reason` on a failure. Poll
+beside the cursor before it joins), and ends at `live` or `failed`, with a `reason` on a failure. A
+suspended mount reads `suspended`. Poll
 `GET /_admin/mounts/<name>`; reading it never waits on a mount in progress. Unfinished jobs survive a
 restart and resume; failed ones stay readable until the name is mounted again or unmounted.
 
