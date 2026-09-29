@@ -439,6 +439,9 @@ async fn bring_up_live(
             max_rss_mb: 2048,
             freshness: Default::default(),
             chain_freshness: Default::default(),
+            dormant: Default::default(),
+            fail_fast: false,
+            cursors: None,
         },
     };
     // The cursor has to keep running for the mount handshake to be answered at a window boundary.

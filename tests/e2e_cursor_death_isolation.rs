@@ -219,8 +219,11 @@ async fn a_dead_cursor_leaves_its_sibling_indexing_and_the_runtime_up() {
     ];
     // Boxed rather than `tokio::pin!`ed so the borrow of `ingests` can be released before the set is
     // inspected below.
+    // Closed: no mount can add a cursor here, which is the pre-#1545 contract this test pins.
+    let (_, mut intake) = tokio::sync::mpsc::unbounded_channel();
     let mut supervisor = Box::pin(nuthatch::runtime::supervise_cursors(
         &mut ingests,
+        &mut intake,
         &health,
         false,
     ));

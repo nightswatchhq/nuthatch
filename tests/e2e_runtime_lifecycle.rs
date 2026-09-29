@@ -108,6 +108,9 @@ async fn two_nest_roost(
             max_rss_mb: 2048,
             freshness: Default::default(),
             chain_freshness: Default::default(),
+            dormant: Default::default(),
+            fail_fast: false,
+            cursors: None,
         },
     };
     // The ingest task is deliberately leaked into the handles' lifetime here: the cursor must stay
@@ -499,6 +502,9 @@ async fn route_named_runtime(
             max_rss_mb: 2048,
             freshness: Default::default(),
             chain_freshness: Default::default(),
+            dormant: Default::default(),
+            fail_fast: false,
+            cursors: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -714,6 +720,9 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
             max_rss_mb: 2048,
             freshness: Default::default(),
             chain_freshness: Default::default(),
+            dormant: Default::default(),
+            fail_fast: false,
+            cursors: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -885,6 +894,9 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
             max_rss_mb: 2048,
             freshness: Default::default(),
             chain_freshness: Default::default(),
+            dormant: Default::default(),
+            fail_fast: false,
+            cursors: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1252,6 +1264,9 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
             max_rss_mb: 2048,
             freshness: Default::default(),
             chain_freshness: Default::default(),
+            dormant: Default::default(),
+            fail_fast: false,
+            cursors: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1316,4 +1331,233 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
     handles.unmount("v2").await.expect("unmount v2");
     Store::open(&data_dir.join("nuthatch.redb"))
         .expect("after the last mount goes, the shared store must be reopenable");
+}
+
+type CursorIntake = tokio::sync::mpsc::UnboundedReceiver<(
+    String,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)>;
+
+/// A runtime that started with nothing mounted (#1545): `arbitrum-one` has a source and no cursor,
+/// and the nest at `data/<nid>/` is recorded but not running.
+async fn empty_runtime(
+    roost_dir: &std::path::Path,
+    nid: &str,
+) -> (runtime::RuntimeHandles, Arc<TapeSource>, CursorIntake) {
+    let tape = Arc::new(TapeSource::new());
+    let (a1, a2) = (account(1), account(2));
+    for b in 1..=3u64 {
+        tape.insert_block(
+            b,
+            transfers_block(
+                b,
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
+            ),
+        );
+    }
+    tape.advance_tip_to(3);
+    let data_dir = runtime::MountTable::data_dir(roost_dir, nid);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    scaffold_nest(&data_dir, "usdc", USDC);
+
+    let health = Arc::new(RuntimeHealth::new());
+    let roster = serde_json::json!({"runtime": "test", "nests": []});
+    let live = serve::LiveRuntime::new(serve::compose_runtime(
+        roster.clone(),
+        Vec::new(),
+        health.clone(),
+    ));
+    let (feed, intake) = tokio::sync::mpsc::unbounded_channel();
+    let handles = runtime::RuntimeHandles {
+        live,
+        states: Vec::new(),
+        alert_workers: Vec::new(),
+        publishers: Vec::new(),
+        lifecycle: Default::default(),
+        health,
+        roster,
+        estimates: Default::default(),
+        multi_tenant: false,
+        mount_ctx: runtime::MountContext {
+            dir: roost_dir.to_path_buf(),
+            mounts: vec![runtime::Mount {
+                tenant: "default".to_string(),
+                alias: "usdc".to_string(),
+                nid: nid.to_string(),
+                sql: Default::default(),
+                queries: Vec::new(),
+                publish: None,
+                #[cfg(feature = "counter")]
+                counter: None,
+            }],
+            sources: std::collections::HashMap::from([(
+                "arbitrum-one".to_string(),
+                tape.clone() as Arc<dyn nuthatch::source::Source>,
+            )]),
+            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
+            backfill: None,
+            seal_direct: false,
+            concurrency: 1,
+            ipfs_window_deadline: nuthatch::ipfs_resolve::WINDOW_DEADLINE,
+            window_override: Some(2),
+            admin_enabled: false,
+            admin_token: None,
+            max_rss_mb: 2048,
+            freshness: Default::default(),
+            chain_freshness: Default::default(),
+            dormant: Default::default(),
+            fail_fast: false,
+            cursors: Some(feed),
+        },
+    };
+    (handles, tape, intake)
+}
+
+/// #1545: the first mount onto a chain with no cursor starts one, which indexes, serves and is
+/// handed to the supervisor. Unmounting its only nest leaves that cursor idle rather than ended,
+/// and the next mount rejoins it instead of starting a second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_mount_starts_its_chains_cursor_and_the_cursor_outlives_an_empty_set() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "ab12".repeat(16);
+    let (mut handles, tape, mut intake) = empty_runtime(roost.path(), &nid).await;
+    assert_eq!(
+        status(&handles.live, "/usdc/health").await,
+        axum::http::StatusCode::NOT_FOUND,
+        "premise: nothing is mounted"
+    );
+    // As if this name had been unmounted from a cursor on another chain earlier.
+    handles.health.retire_nest("usdc");
+
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("the first mount onto a declared chain must start its cursor");
+    let (chain, ingest) = intake
+        .try_recv()
+        .expect("the new cursor must be handed to the supervisor");
+    assert_eq!(chain, "arbitrum-one");
+    assert_eq!(
+        status(&handles.live, "/usdc/health").await,
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(roster_names(&handles.live).await, vec!["usdc".to_string()]);
+    assert_eq!(handles.health.json_for("usdc").0, "indexing");
+    let last_block = |h: &runtime::RuntimeHandles| {
+        h.states
+            .iter()
+            .find(|(n, _)| n == "usdc")
+            .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
+    };
+    assert!(
+        wait_until(POLL_TIMEOUT, || last_block(&handles).as_deref() == Some("3")).await,
+        "the started cursor never indexed: last_block {:?}",
+        last_block(&handles)
+    );
+
+    handles.unmount("usdc").await.expect("unmount");
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(
+        !ingest.is_finished(),
+        "a cursor emptied by an unmount returned; the last one to do so ends the runtime"
+    );
+
+    let (a1, a2) = (account(1), account(2));
+    tape.insert_block(
+        4,
+        transfers_block(4, 0, 1_700_000_004, USDC, &[(a1.as_str(), a2.as_str(), 400)]),
+    );
+    tape.advance_tip_to(4);
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("a remount onto the idle cursor");
+    assert!(
+        intake.try_recv().is_err(),
+        "the remount started a second cursor on a chain that already had one"
+    );
+    assert!(
+        wait_until(POLL_TIMEOUT, || last_block(&handles).as_deref() == Some("4")).await,
+        "the remounted nest does not follow the tip: last_block {:?}",
+        last_block(&handles)
+    );
+    assert_eq!(
+        handles.health.json_for("usdc").0,
+        "indexing",
+        "the remount must not report the earlier unmount's retirement"
+    );
+    ingest.abort();
+}
+
+/// #1545: a chain whose cursor died stays quarantined until restart. A mount onto it is refused
+/// rather than starting a second cursor under the quarantine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_onto_a_chain_whose_cursor_died_is_refused() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "cd34".repeat(16);
+    let (mut handles, _tape, mut intake) = empty_runtime(roost.path(), &nid).await;
+    handles
+        .health
+        .quarantine_cursor("arbitrum-one", "finality violation".to_string());
+
+    let err = handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("restart"), "{err:#}");
+    assert!(handles.states.is_empty());
+    assert!(intake.try_recv().is_err(), "no cursor may start");
+}
+
+/// #1545: a declared chain with no cursor is dialled on its first mount, not at boot. A dormant
+/// chain with no endpoint is refused by name, and one with another chain id is not this chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dormant_chain_is_opened_by_its_first_mount() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "ef56".repeat(16);
+    let (mut handles, _tape, mut intake) = empty_runtime(roost.path(), &nid).await;
+    handles.mount_ctx.sources.clear();
+    handles.mount_ctx.dormant.insert(
+        "arbitrum-one".to_string(),
+        runtime::DormantChain {
+            endpoint: runtime::ChainEndpoint {
+                chain: "arbitrum-one".to_string(),
+                chain_id: 1,
+                rpc_urls: Vec::new(),
+            },
+            rpc_fallback: Vec::new(),
+        },
+    );
+    let err = handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<runtime::MountRefusal>(),
+            Some(runtime::MountRefusal::UndeclaredChain { .. })
+        ),
+        "a dormant chain with another chain id must not take the nest: {err:#}"
+    );
+
+    handles
+        .mount_ctx
+        .dormant
+        .get_mut("arbitrum-one")
+        .unwrap()
+        .endpoint
+        .chain_id = 42161;
+    let err = handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("has no rpc_urls"),
+        "the dormant chain must be opened, and its missing endpoint named: {err:#}"
+    );
+    assert!(handles.states.is_empty());
+    assert!(intake.try_recv().is_err());
 }

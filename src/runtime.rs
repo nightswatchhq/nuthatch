@@ -1548,8 +1548,8 @@ pub struct ChainGroup {
 }
 
 /// Group loaded nests by their declared chain, matching each to a runtime chain endpoint (RFC-0021).
-/// A nest whose chain the runtime doesn't declare is a hard error; declared-but-unused chains are dropped
-/// (a cursor with no nests is pointless). Deterministic order (endpoints as declared).
+/// A nest whose chain the runtime doesn't declare is a hard error; declared-but-unused chains are left
+/// out, and [`dev`] keeps them dormant until a mount needs one (#1545). Deterministic order (endpoints as declared).
 pub fn group_by_chain(
     endpoints: &[ChainEndpoint],
     mounted: Vec<(String, PathBuf, Config)>,
@@ -1576,9 +1576,6 @@ pub fn group_by_chain(
         }
     }
     groups.retain(|g| !g.nests.is_empty());
-    if groups.is_empty() {
-        bail!("mounts mounts nests but none matched a declared chain");
-    }
     Ok(groups)
 }
 
@@ -1610,9 +1607,13 @@ pub async fn dev(
     // fifteenth minute of a backfill.
     let cors = crate::serve::cors_layer(&cors)?;
     let mounts = MountTable::load(&dir)?;
-    if mounts.mount_refs().is_empty() {
+    let admin_enabled = indexer::admin_enabled(no_admin, &listen);
+    // Empty is a valid start (#1545): nests arrive over the admin API. Without that API nothing
+    // ever could.
+    if mounts.mount_refs().is_empty() && !admin_enabled {
         anyhow::bail!(
-            "runtime '{}' mounts nothing (no [[mounts]] records and an empty `nests` list)",
+            "runtime '{}' mounts nothing, and without the admin API nothing can be mounted later \
+             (add a [[mounts]] record, or drop --no-admin)",
             mounts.runtime.name
         );
     }
@@ -1706,7 +1707,6 @@ pub async fn dev(
         groups.len(),
     );
 
-    let admin_enabled = indexer::admin_enabled(no_admin, &listen);
     let admin_token = indexer::admin_required_token(admin_enabled, &listen);
     // The RSS budget is now **per active-chain cursor** (RFC-0021), not per whole runtime.
     let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
@@ -1802,24 +1802,16 @@ pub async fn dev(
         }
 
         // One source + one shared cursor per chain - per-nest tables stay byte-identical to solo `dev`.
-        // Verify the whole pool is on THIS chain first (issue #150). It matters more in a runtime than
-        // solo: with several chains in one runtime, pasting one chain's endpoint under another's
-        // `[[chains]]` entry is an easy slip, and failover would mask it indefinitely.
-        let rpc = RpcClient::with_fallbacks(rpc_urls, rpc_fallback.clone())?;
-        rpc.verify_chain_ids(group.endpoint.chain_id)
-            .await
-            .with_context(|| {
-                format!(
-                    "verifying rpc_urls for mounts '{}' cursor on {}",
-                    meta.name, group.endpoint.chain
-                )
-            })?;
-        let dial = freshness.for_chain(&group.endpoint.chain, &rpc).await;
+        let endpoint = ChainEndpoint {
+            rpc_urls,
+            ..group.endpoint.clone()
+        };
+        let (source, dial) =
+            open_chain(&endpoint, rpc_fallback.clone(), &meta.name, freshness).await?;
         for (_, _, config) in &mut group.nests {
             config.freshness = dial;
         }
         chain_freshness.insert(group.endpoint.chain.clone(), dial);
-        let source: Arc<dyn Source> = Arc::new(rpc);
         // Retained so a mount can build a nest against the same source its co-tenants use - a nest
         // mounted at runtime must be indistinguishable from one mounted at boot.
         sources.insert(group.endpoint.chain.clone(), source.clone());
@@ -1849,6 +1841,39 @@ pub async fn dev(
         ingests.push((group.endpoint.chain.clone(), cursor.ingest));
         alert_workers.extend(cursor.alert_workers);
     }
+
+    // `--rpc` and `--rpc-fallback` only ever mean something for a single-chain runtime.
+    let single_chain = endpoints.len() == 1;
+    let dormant: std::collections::HashMap<String, DormantChain> = endpoints
+        .iter()
+        .filter(|e| !lifecycle.contains_key(&e.chain))
+        .map(|e| {
+            let rpc_urls = if single_chain {
+                rpc::select_rpcs(&rpc_override, e.rpc_urls.clone())
+            } else {
+                e.rpc_urls.clone()
+            };
+            let chain = DormantChain {
+                endpoint: ChainEndpoint {
+                    rpc_urls,
+                    ..e.clone()
+                },
+                rpc_fallback: if single_chain {
+                    rpc_fallback.clone()
+                } else {
+                    Vec::new()
+                },
+            };
+            (e.chain.clone(), chain)
+        })
+        .collect();
+    if !dormant.is_empty() {
+        tracing::info!(
+            "chain(s) with nothing mounted yet: {} - a cursor starts on the first mount onto each",
+            dormant.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    let (cursor_feed, mut cursor_intake) = tokio::sync::mpsc::unbounded_channel();
 
     tracing::info!(
         "mounts footprint: ~{runtime_total_mb} MB projected across {} cursor(s)",
@@ -1942,6 +1967,9 @@ pub async fn dev(
             max_rss_mb: max_rss,
             freshness,
             chain_freshness,
+            dormant,
+            fail_fast,
+            cursors: admin_enabled.then_some(cursor_feed),
         },
     }));
 
@@ -1954,7 +1982,7 @@ pub async fn dev(
     ));
     let result = tokio::select! {
         r = crate::serve::bind_and_serve(&listen, service, cors) => r,
-        r = supervise_cursors(&mut ingests, &health, fail_fast) => r,
+        r = supervise_cursors(&mut ingests, &mut cursor_intake, &health, fail_fast) => r,
     };
     for (_, h) in &ingests {
         h.abort();
@@ -1984,19 +2012,50 @@ pub async fn dev(
 /// [`crate::indexer::ChainCursor::ingest`] handles of two live cursors instead (issue #387). Keeping it
 /// private would only have moved that test onto handles it fabricated itself, which is the coverage
 /// that already existed and the coverage the issue was filed about.
+///
+/// `intake` carries the cursors a mount spawns after boot (#1545). While it is open, an empty set is
+/// a runtime waiting for its first mount, not a finished one.
 pub async fn supervise_cursors(
     ingests: &mut Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
+    intake: &mut tokio::sync::mpsc::UnboundedReceiver<(
+        String,
+        tokio::task::JoinHandle<Result<()>>,
+    )>,
     health: &crate::health::RuntimeHealth,
     fail_fast: bool,
 ) -> Result<()> {
-    let total = ingests.len();
+    enum Next {
+        Spawned(Option<(String, tokio::task::JoinHandle<Result<()>>)>),
+        Ended(Result<Result<()>, tokio::task::JoinError>, usize),
+    }
+    let mut total = ingests.len();
     let mut failures: Vec<String> = Vec::new();
-    while !ingests.is_empty() {
-        // Scope the borrow so the finished handle can be removed from the set afterwards.
-        let (joined, idx) = {
-            let (joined, idx, _rest) =
-                futures::future::select_all(ingests.iter_mut().map(|(_, h)| h)).await;
-            (joined, idx)
+    let mut intake_open = true;
+    loop {
+        if ingests.is_empty() && (!failures.is_empty() || !intake_open) {
+            break;
+        }
+        let next = if ingests.is_empty() {
+            Next::Spawned(intake.recv().await)
+        } else {
+            tokio::select! {
+                c = intake.recv(), if intake_open => Next::Spawned(c),
+                (joined, idx, _) = futures::future::select_all(ingests.iter_mut().map(|(_, h)| h)) => {
+                    Next::Ended(joined, idx)
+                }
+            }
+        };
+        let (joined, idx) = match next {
+            Next::Spawned(Some(cursor)) => {
+                total += 1;
+                ingests.push(cursor);
+                continue;
+            }
+            Next::Spawned(None) => {
+                intake_open = false;
+                continue;
+            }
+            Next::Ended(joined, idx) => (joined, idx),
         };
         let (chain, _) = ingests.remove(idx);
         let outcome = match joined {
@@ -2301,6 +2360,53 @@ pub struct MountContext {
     pub freshness: crate::freshness::Freshness,
     /// Chain -> the dial its cursor runs at, once `freshness` has been settled on its block time.
     pub chain_freshness: std::collections::HashMap<String, crate::freshness::Freshness>,
+    /// Declared chains nothing mounted onto at boot (#1545). Their RPC is not dialled until the first
+    /// mount onto one, so an unused chain, or one whose endpoint is down, cannot stop the runtime.
+    pub dormant: std::collections::HashMap<String, DormantChain>,
+    pub fail_fast: bool,
+    /// Where a cursor that a mount spawns goes to be supervised. `None` without the admin surface,
+    /// which is the only thing that mounts.
+    pub cursors: Option<CursorFeed>,
+}
+
+/// A cursor's ingest task, handed to [`supervise_cursors`] after boot.
+pub type CursorFeed =
+    tokio::sync::mpsc::UnboundedSender<(String, tokio::task::JoinHandle<Result<()>>)>;
+
+/// A declared chain with no cursor yet: its endpoint, with `--rpc` already applied, and its fallbacks.
+#[derive(Clone, Debug)]
+pub struct DormantChain {
+    pub endpoint: ChainEndpoint,
+    pub rpc_fallback: Vec<String>,
+}
+
+/// Dial a chain's RPC pool, check it is the chain declared, and settle the freshness dial on it.
+async fn open_chain(
+    endpoint: &ChainEndpoint,
+    rpc_fallback: Vec<String>,
+    runtime: &str,
+    freshness: crate::freshness::Freshness,
+) -> Result<(Arc<dyn Source>, crate::freshness::Freshness)> {
+    if endpoint.rpc_urls.is_empty() {
+        bail!(
+            "mounts '{runtime}' chain {} has no rpc_urls (set them under [[chains]], or pass --rpc for a \
+             single-chain runtime)",
+            endpoint.chain
+        );
+    }
+    // Verify the whole pool is on this chain (issue #150): pasting one chain's endpoint under
+    // another's `[[chains]]` entry is an easy slip, and failover would mask it indefinitely.
+    let rpc = RpcClient::with_fallbacks(endpoint.rpc_urls.clone(), rpc_fallback)?;
+    rpc.verify_chain_ids(endpoint.chain_id)
+        .await
+        .with_context(|| {
+            format!(
+                "verifying rpc_urls for mounts '{runtime}' cursor on {}",
+                endpoint.chain
+            )
+        })?;
+    let dial = freshness.for_chain(&endpoint.chain, &rpc).await;
+    Ok((Arc::new(rpc), dial))
 }
 
 /// Why a mount was refused (RFC-0027 §3). Typed so the control surface can map each to its status
@@ -2362,6 +2468,23 @@ const UNMOUNT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 fn abort_alert_worker(worker: &mut Option<tokio::task::JoinHandle<()>>) {
     if let Some(w) = worker.take() {
         w.abort();
+    }
+}
+
+/// Stamp a live-mounted nest's dataset identity and mount record onto its serving state. Boot does
+/// the same after `build_nest`; without it a recorded `sql = "deny"` serves open until restart (#1536).
+fn overlay_mount_record(
+    state: &mut crate::serve::AppState,
+    nid: Option<&str>,
+    record: Option<&Mount>,
+) {
+    state.nid = nid.map(Arc::from);
+    if let Some(record) = record {
+        state.surface = Arc::new(record.surface());
+        #[cfg(feature = "counter")]
+        {
+            state.counter = record.counter.clone().map(Arc::new);
+        }
     }
 }
 
@@ -2457,20 +2580,34 @@ impl RuntimeHandles {
                 stamp_operator_settings(&mut config, dial, self.mount_ctx.ipfs_window_deadline);
                 let chain = config.nest.chain.clone();
 
-                let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
+                let dormant = self
+                    .mount_ctx
+                    .dormant
+                    .get(&chain)
+                    .filter(|d| d.endpoint.chain_id == config.nest.chain_id)
+                    .cloned();
+                if !self.mount_ctx.sources.contains_key(&chain) && dormant.is_none() {
                     return Err(MountRefusal::UndeclaredChain {
                         nest: name.to_string(),
                         chain,
                     }
                     .into());
-                };
-                let Some(lifecycle) = self.lifecycle.get(&chain).cloned() else {
-                    return Err(MountRefusal::UndeclaredChain {
-                        nest: name.to_string(),
-                        chain,
-                    }
-                    .into());
-                };
+                }
+                // A chain with no running cursor gets one below (#1545), unless it had one that
+                // died: that quarantine holds until restart, and nests may still be serving from it.
+                let lifecycle = self
+                    .lifecycle
+                    .get(&chain)
+                    .filter(|tx| !tx.is_closed())
+                    .cloned();
+                if lifecycle.is_none()
+                    && (self.health.cursor_quarantined(&chain)
+                        || self.states.iter().any(|(_, s)| s.chain == chain))
+                {
+                    bail!(
+                        "the cursor on {chain} has stopped; restart the runtime to mount '{name}' onto it"
+                    );
+                }
 
                 // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
                 // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
@@ -2495,6 +2632,32 @@ impl RuntimeHandles {
                     .into());
                 }
 
+                // After the budget, so a refused mount never dials anything.
+                if let Some(d) = dormant {
+                    let runtime = self.roster["runtime"].as_str().unwrap_or("runtime").to_string();
+                    let (source, dial) = open_chain(
+                        &d.endpoint,
+                        d.rpc_fallback,
+                        &runtime,
+                        self.mount_ctx.freshness,
+                    )
+                    .await?;
+                    self.mount_ctx.sources.insert(chain.clone(), source);
+                    self.mount_ctx
+                        .endpoint_counts
+                        .insert(chain.clone(), d.endpoint.rpc_urls.len());
+                    self.mount_ctx.chain_freshness.insert(chain.clone(), dial);
+                    self.mount_ctx.dormant.remove(&chain);
+                    stamp_operator_settings(&mut config, dial, self.mount_ctx.ipfs_window_deadline);
+                }
+                let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
+                    return Err(MountRefusal::UndeclaredChain {
+                        nest: name.to_string(),
+                        chain,
+                    }
+                    .into());
+                };
+
                 // The early cutoff (RFC-0033 §5), which this path did not apply until #414: an operator who
                 // edits a nest cosmetically and mounts it into a running runtime re-indexed from the start
                 // block, where a restart would have adopted the predecessor's dataset and re-indexed
@@ -2517,7 +2680,50 @@ impl RuntimeHandles {
                     &[name],
                 );
                 config.route = Some(name.to_string());
+                let record = self
+                    .mount_ctx
+                    .mounts
+                    .iter()
+                    .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+                    .cloned();
 
+                let (state, worker) = match lifecycle {
+                None => {
+                // The first nest on this chain (#1545). It starts the chain's cursor exactly as boot
+                // would, so it backfills inside that cursor and serves while it does, as at boot.
+                self.health.register(name, &chain);
+                // An earlier unmount of this name left it recorded as retired.
+                self.health.mark_indexing(name);
+                let mut cursor = indexer::spawn_runtime(
+                    source,
+                    vec![(name.to_string(), prepared.into_dir(), config)],
+                    self.mount_ctx.backfill,
+                    self.mount_ctx.seal_direct,
+                    concurrency,
+                    self.mount_ctx.window_override,
+                    self.mount_ctx.admin_enabled,
+                    self.mount_ctx.admin_token.clone(),
+                    self.health.clone(),
+                    self.mount_ctx.fail_fast,
+                )
+                .await
+                .with_context(|| format!("starting the {chain} cursor for '{name}'"))?;
+                let (_, mut state) = cursor.states.pop().expect("one nest in, one state out");
+                let worker = cursor.alert_workers.pop().map(|(_, w)| w);
+                overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
+                self.lifecycle.insert(chain.clone(), cursor.lifecycle);
+                match &self.mount_ctx.cursors {
+                    Some(feed) => {
+                        if feed.send((chain.clone(), cursor.ingest)).is_err() {
+                            tracing::warn!("the {chain} cursor started while the runtime was stopping");
+                        }
+                    }
+                    None => drop(cursor.ingest),
+                }
+                tracing::info!("nest '{name}' started the {chain} cursor");
+                (state, worker)
+                }
+                Some(lifecycle) => {
                 // Phase 1: build and catch up, off to one side of the cursor.
                 let sql_gate = self
                     .states
@@ -2547,21 +2753,7 @@ impl RuntimeHandles {
                 // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
                 // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
                 // it here or serve `nid: null` until the next restart (#557).
-                state.nid = nid.as_deref().map(Arc::from);
-                // Boot overlays the mount record after `build_nest`. This path opens a store, so it
-                // has to do the same or a recorded `sql = "deny"` serves open until restart (#1536).
-                if let Some(record) = self
-                    .mount_ctx
-                    .mounts
-                    .iter()
-                    .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
-                {
-                    state.surface = Arc::new(record.surface());
-                    #[cfg(feature = "counter")]
-                    {
-                        state.counter = record.counter.clone().map(Arc::new);
-                    }
-                }
+                overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
 
                 // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
                 // The delivery task holds its own store clone. Dropping the `JoinHandle` does not
@@ -2597,6 +2789,9 @@ impl RuntimeHandles {
                     }
                 }
                 tracing::info!("nest '{name}' mounted onto the {chain} cursor at block {next}");
+                (state, worker)
+                }
+                };
                 (state, worker, incoming, name.to_string())
             }
         };
@@ -4314,9 +4509,10 @@ mod tests {
         let health = crate::health::RuntimeHealth::new();
         health.register("nest-a", "base");
         health.register("nest-b", "arbitrum-one");
+        let (_feed, mut intake) = tokio::sync::mpsc::unbounded_channel();
         let returned = tokio::time::timeout(
             Duration::from_millis(250),
-            supervise_cursors(&mut ingests, &health, false),
+            supervise_cursors(&mut ingests, &mut intake, &health, false),
         )
         .await;
         assert!(
@@ -4359,7 +4555,9 @@ mod tests {
         let mut ingests = vec![("base".to_string(), a), ("arbitrum-one".to_string(), b)];
 
         let health = crate::health::RuntimeHealth::new();
-        let err = supervise_cursors(&mut ingests, &health, false)
+        // Open, so a mount could still add a cursor: all-dead ends the runtime regardless.
+        let (_feed, mut intake) = tokio::sync::mpsc::unbounded_channel();
+        let err = supervise_cursors(&mut ingests, &mut intake, &health, false)
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -4372,5 +4570,52 @@ mod tests {
             "should name the second dead chain: {msg}"
         );
         assert!(ingests.is_empty(), "every cursor should have been retired");
+    }
+
+    /// #1545: a runtime with nothing mounted is waiting for its first mount, not finished. It stays
+    /// up, and a cursor a mount spawns later is supervised like one started at boot.
+    #[tokio::test]
+    async fn an_empty_runtime_waits_and_supervises_a_cursor_spawned_later() {
+        let health = crate::health::RuntimeHealth::new();
+        let (feed, mut intake) = tokio::sync::mpsc::unbounded_channel();
+        let mut ingests = Vec::new();
+        let mut supervisor = Box::pin(supervise_cursors(&mut ingests, &mut intake, &health, false));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut supervisor)
+                .await
+                .is_err(),
+            "an empty runtime ended before anything could be mounted"
+        );
+
+        let dies =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("finality violation")) });
+        feed.send(("base".to_string(), dies)).unwrap();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("the spawned cursor was never supervised")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("base"), "{err:#}");
+        assert!(health.cursor_quarantined("base"));
+    }
+
+    /// A cursor that finishes cleanly leaves the runtime up while a mount can still add one, and
+    /// ends it once nothing can.
+    #[tokio::test]
+    async fn a_clean_finish_ends_the_runtime_only_once_the_intake_closes() {
+        let health = crate::health::RuntimeHealth::new();
+        let (feed, mut intake) = tokio::sync::mpsc::unbounded_channel();
+        let mut ingests = vec![("base".to_string(), tokio::spawn(async { Ok(()) }))];
+        let mut supervisor = Box::pin(supervise_cursors(&mut ingests, &mut intake, &health, false));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut supervisor)
+                .await
+                .is_err(),
+            "a clean finish ended the runtime while the admin API could still mount"
+        );
+        drop(feed);
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("a closed intake with nothing left must end the runtime")
+            .expect("a clean finish is not an error");
     }
 }
