@@ -31,6 +31,8 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 - **Off localhost the API needs `NUTHATCH_ADMIN_TOKEN`**, presented as `Authorization: Bearer <token>`
   or `?token=<token>`. Without the variable an off-localhost runtime serves no admin routes at all.
   `--no-admin` removes them everywhere.
+- **Request bodies are JSON** and need `Content-Type: application/json`; without it a `POST` is
+  answered `415`.
 
 ## The lifecycle
 
