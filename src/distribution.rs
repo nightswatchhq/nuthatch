@@ -99,6 +99,10 @@ pub trait BundleStore: Send + Sync {
     async fn set_ref(&self, name: &str, version: &str, hash: &str) -> Result<()>;
     /// Resolve `name@version` to a hash. Errors *loudly* when the name/version is unknown.
     async fn get_ref(&self, name: &str, version: &str) -> Result<String>;
+    /// Point a nest identity (NID, RFC-0032 §3) at the hash of a bundle computed to it (#1551).
+    async fn set_nid_ref(&self, nid: &str, hash: &str) -> Result<()>;
+    /// Resolve a NID to a bundle hash. Errors *loudly* when no bundle was published under it.
+    async fn get_nid_ref(&self, nid: &str) -> Result<String>;
 }
 
 /// A filesystem-backed [`BundleStore`] - "a directory is a registry." The zero-dependency,
@@ -107,6 +111,7 @@ pub trait BundleStore: Send + Sync {
 /// <root>/blobs/<hash>.bundle       immutable, content-addressed
 /// <root>/index/<name>/<version>    a file whose contents are the hash
 /// <root>/index/<name>/latest       the movable pointer
+/// <root>/nids/<nid>                 the hash of a bundle whose manifest computes to that NID
 /// ```
 pub struct FsStore {
     root: PathBuf,
@@ -123,6 +128,10 @@ impl FsStore {
 
     fn ref_path(&self, name: &str, version: &str) -> PathBuf {
         self.root.join("index").join(name).join(version)
+    }
+
+    fn nid_path(&self, nid: &str) -> PathBuf {
+        self.root.join("nids").join(nid)
     }
 }
 
@@ -160,6 +169,23 @@ impl BundleStore for FsStore {
         let path = self.ref_path(name, version);
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| map_io_err(e, &format!("nest '{name}@{version}'"), &path))?;
+        Ok(raw.trim().to_string())
+    }
+
+    async fn set_nid_ref(&self, nid: &str, hash: &str) -> Result<()> {
+        let path = self.nid_path(nid);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&path, hash).with_context(|| format!("writing ref {}", path.display()))?;
+        Ok(())
+    }
+
+    async fn get_nid_ref(&self, nid: &str) -> Result<String> {
+        let path = self.nid_path(nid);
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| map_io_err(e, &format!("nid {nid}"), &path))?;
         Ok(raw.trim().to_string())
     }
 }
@@ -214,6 +240,7 @@ pub struct PublishOutcome {
     pub name: String,
     pub version: String,
     pub hash: String,
+    pub nid: String,
 }
 
 /// Publish a `.bundle` file to a store under `name@version`, advancing `latest`. Returns the blob's
@@ -230,8 +257,12 @@ pub async fn publish(
     let manifest = crate::blob::bundle_manifest(bundle_file)
         .with_context(|| format!("reading manifest of {}", bundle_file.display()))?;
     let hash = manifest.blob_hash();
+    let nid = manifest.nid();
 
     let name = name.map(str::to_string).unwrap_or(manifest.nest_name);
+    if is_nid_shaped(&name) {
+        bail!("nest name {name:?} is shaped like a NID, so `nest load` would read it as one - choose another name");
+    }
     let version = version
         .map(str::to_string)
         .unwrap_or_else(|| format!("h{}", &hash[..12]));
@@ -241,10 +272,12 @@ pub async fn publish(
     store.put_blob(&hash, &bytes).await?;
     store.set_ref(&name, &version, &hash).await?;
     store.set_ref(&name, LATEST, &hash).await?;
+    store.set_nid_ref(&nid, &hash).await?;
     Ok(PublishOutcome {
         name,
         version,
         hash,
+        nid,
     })
 }
 
@@ -252,6 +285,29 @@ pub async fn publish(
 pub async fn pull(store: &dyn BundleStore, r: &NestRef) -> Result<(String, Vec<u8>)> {
     let hash = store.get_ref(&r.name, r.version_key()).await?;
     let bytes = store.get_blob(&hash).await?;
+    Ok((hash, bytes))
+}
+
+/// 64 hex characters: what `nuthatch nest nid` prints, and what `nest load` resolves by NID.
+pub fn is_nid_shaped(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Fetch the bundle published under a NID (#1551). The NID index is mutable like any ref, so the
+/// bundle's own manifest must compute to the NID asked for, or it is refused.
+pub async fn pull_by_nid(store: &dyn BundleStore, nid: &str) -> Result<(String, Vec<u8>)> {
+    let nid = nid.to_ascii_lowercase();
+    let hash = store.get_nid_ref(&nid).await?;
+    let bytes = store.get_blob(&hash).await?;
+    let tmp = tempfile::tempdir().context("temp dir for pulled bundle")?;
+    let bundle_file = tmp.path().join("pulled.bundle");
+    std::fs::write(&bundle_file, &bytes).context("writing pulled bundle")?;
+    let actual = crate::blob::bundle_manifest(&bundle_file)
+        .with_context(|| format!("reading the manifest of bundle {hash}"))?
+        .nid();
+    if actual != nid {
+        bail!("the registry maps nid {nid} to bundle {hash}, whose nid is {actual} - refusing it");
+    }
     Ok((hash, bytes))
 }
 
@@ -275,6 +331,7 @@ pub async fn publish_cli(registry: &str, bundle_file: &Path, as_ref: Option<&str
     .await?;
     println!("✓ published {}@{}", out.name, out.version);
     println!("  hash:  {}", out.hash);
+    println!("  nid:   {}", out.nid);
     println!(
         "  load:  nuthatch nest load {}@{} --registry {registry}",
         out.name, out.version
@@ -320,6 +377,7 @@ pub async fn load_pinned_from_registry(
             })?;
             (h.to_string(), bytes)
         }
+        None if is_nid_shaped(reference) => pull_by_nid(store.as_ref(), reference).await?,
         None => {
             let r = NestRef::parse(reference)?;
             pull(store.as_ref(), &r).await?
@@ -392,6 +450,10 @@ mod object_store_impl {
         fn ref_key(&self, name: &str, version: &str) -> ObjPath {
             self.prefix.child("index").child(name).child(version)
         }
+
+        fn nid_key(&self, nid: &str) -> ObjPath {
+            self.prefix.child("nids").child(nid)
+        }
     }
 
     /// Map an object-store error into a legible registry error: `NotFound` → "not found",
@@ -461,6 +523,30 @@ mod object_store_impl {
                 .trim()
                 .to_string())
         }
+
+        async fn set_nid_ref(&self, nid: &str, hash: &str) -> Result<()> {
+            self.inner
+                .put(
+                    &self.nid_key(nid),
+                    object_store::PutPayload::from(hash.as_bytes().to_vec()),
+                )
+                .await
+                .map_err(|e| map_obj_err(e, &format!("nid {nid}")))?;
+            Ok(())
+        }
+
+        async fn get_nid_ref(&self, nid: &str) -> Result<String> {
+            let got = self
+                .inner
+                .get(&self.nid_key(nid))
+                .await
+                .map_err(|e| map_obj_err(e, &format!("nid {nid}")))?;
+            let raw = got.bytes().await.context("reading ref")?;
+            Ok(String::from_utf8(raw.to_vec())
+                .context("ref is not valid utf-8")?
+                .trim()
+                .to_string())
+        }
     }
 }
 
@@ -475,6 +561,11 @@ mod tests {
     /// `.bundle` at `out`. Mirrors blob.rs's fixture so publish exercises a real, verifiable bundle;
     /// `marker` varies an authored input so two fixtures get distinct content addresses.
     fn write_bundle_fixture(out: &Path, marker: &str) -> String {
+        write_bundle_fixture_with_nid(out, marker).0
+    }
+
+    /// [`write_bundle_fixture`], plus the NID `nuthatch nest nid` prints for the source directory.
+    fn write_bundle_fixture_with_nid(out: &Path, marker: &str) -> (String, String) {
         let nest = tempfile::tempdir().unwrap();
         std::fs::write(
             nest.path().join(crate::config::CONFIG_FILE),
@@ -500,7 +591,82 @@ abi = "abis/c.json"
         .unwrap();
         std::fs::write(nest.path().join("llms.txt"), marker).unwrap();
         crate::blob::bundle(nest.path(), Some(out), false).unwrap();
-        crate::blob::bundle_manifest(out).unwrap().blob_hash()
+        (
+            crate::blob::bundle_manifest(out).unwrap().blob_hash(),
+            crate::blob::nest_nid(nest.path()).unwrap(),
+        )
+    }
+
+    /// #1551: the NID `nest nid` prints for a directory pulls, from a registry, the bundle made
+    /// from that directory.
+    #[tokio::test]
+    async fn a_nid_pulls_the_bundle_it_was_computed_from() {
+        let reg = tempfile::tempdir().unwrap();
+        let registry = reg.path().to_str().unwrap();
+        let store = open(registry).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t.bundle");
+        let (hash, nid) = write_bundle_fixture_with_nid(&f, "by-nid");
+        let out = publish(store.as_ref(), &f, Some("horizon"), Some("1.0.0"))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.nid, nid,
+            "publish recorded another nid than `nest nid` prints"
+        );
+        assert_eq!(pull_by_nid(store.as_ref(), &nid).await.unwrap().0, hash);
+
+        let target = tempfile::tempdir().unwrap();
+        let installed = target.path().join("nest");
+        load_from_registry(registry, &nid, Some(&installed))
+            .await
+            .unwrap();
+        assert_eq!(marker_of(&installed), "by-nid");
+    }
+
+    /// #1551: the NID index is a mutable ref. One pointed at a bundle that computes to another NID
+    /// is refused, naming both, and nothing is installed.
+    #[tokio::test]
+    async fn a_nid_ref_pointing_at_another_nest_is_refused() {
+        let reg = tempfile::tempdir().unwrap();
+        let registry = reg.path().to_str().unwrap();
+        let store = open(registry).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.bundle"), dir.path().join("b.bundle"));
+        let (_, nid_a) = write_bundle_fixture_with_nid(&a, "asked-for");
+        let (hash_b, nid_b) = write_bundle_fixture_with_nid(&b, "substituted");
+        publish(store.as_ref(), &a, Some("a"), None).await.unwrap();
+        publish(store.as_ref(), &b, Some("b"), None).await.unwrap();
+        store.set_nid_ref(&nid_a, &hash_b).await.unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let installed = target.path().join("nest");
+        let err = load_from_registry(registry, &nid_a, Some(&installed))
+            .await
+            .expect_err("a substituted bundle must be refused");
+        let err = format!("{err:#}");
+        assert!(err.contains(&nid_a) && err.contains(&nid_b), "{err}");
+        assert!(!installed.join(crate::config::CONFIG_FILE).exists());
+    }
+
+    /// #1551: a NID nothing was published under fails loudly, and a nest name shaped like a NID is
+    /// refused at publish, since `nest load` would read it as a NID.
+    #[tokio::test]
+    async fn an_unknown_nid_fails_and_a_nid_shaped_name_cannot_be_published() {
+        let reg = tempfile::tempdir().unwrap();
+        let store = open(reg.path().to_str().unwrap()).unwrap();
+        let err = pull_by_nid(store.as_ref(), &"b".repeat(64))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t.bundle");
+        write_bundle_fixture(&f, "x");
+        let err = publish(store.as_ref(), &f, Some(&"c".repeat(64)), None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("shaped like a NID"), "{err:#}");
     }
 
     #[test]
@@ -799,6 +965,10 @@ abi = "abis/c.json"
         assert_eq!(store.get_ref("horizon", "latest").await.unwrap(), hash);
         // Unknown ref fails loudly.
         assert!(store.get_ref("horizon", "9.9.9").await.is_err());
+        // #1551: the NID index lives in this store too.
+        let (h, _) = pull_by_nid(store.as_ref(), &out.nid).await.unwrap();
+        assert_eq!(h, hash);
+        assert!(store.get_nid_ref(&"d".repeat(64)).await.is_err());
     }
 
     /// The AWS convention is **upper case** (`AWS_ACCESS_KEY_ID`), but `object_store::parse_url_opts`
