@@ -1977,8 +1977,10 @@ pub async fn dev(
 
     // The server and the cursor supervisor race; whichever ends first decides the exit (RFC-0026 §6).
     // A *single* cursor's death no longer ends anything - that is the supervisor's job to absorb.
+    let jobs = start_mount_jobs(&dir, &handles, admin_enabled).await;
     let service = handles.lock().await.live.service().merge(lifecycle_routes(
         handles.clone(),
+        jobs.clone(),
         admin_enabled,
         admin_token.clone(),
     ));
@@ -2107,17 +2109,26 @@ pub async fn supervise_cursors(
 /// control plane and want the runtime to have no lifecycle surface at all.
 pub fn lifecycle_routes(
     handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: Arc<crate::mount_jobs::MountJobs>,
     admin_enabled: bool,
     admin_token: Option<String>,
 ) -> axum::Router {
+    use crate::mount_jobs::{MountJob, MountPhase};
     use axum::extract::{Path as AxPath, Query, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::{delete, post};
+    use axum::routing::{delete, get, post};
     use axum::Json;
 
     #[derive(serde::Deserialize)]
     struct TokenQuery {
         token: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MountQuery {
+        token: Option<String>,
+        /// Answer once the mount has finished, as every mount did before #1544.
+        #[serde(default)]
+        wait: bool,
     }
     #[derive(serde::Deserialize)]
     struct MountBody {
@@ -2135,7 +2146,18 @@ pub fn lifecycle_routes(
         nid: Option<String>,
     }
 
-    type Shared = (Arc<tokio::sync::Mutex<RuntimeHandles>>, Option<String>);
+    type Shared = (
+        Arc<tokio::sync::Mutex<RuntimeHandles>>,
+        Arc<crate::mount_jobs::MountJobs>,
+        Option<String>,
+    );
+
+    fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "admin token required"})),
+        )
+    }
 
     if !admin_enabled {
         return axum::Router::new();
@@ -2155,16 +2177,13 @@ pub fn lifecycle_routes(
     }
 
     async fn mount_nest(
-        State((handles, required)): State<Shared>,
-        Query(q): Query<TokenQuery>,
+        State((handles, jobs, required)): State<Shared>,
+        Query(q): Query<MountQuery>,
         headers: HeaderMap,
         Json(body): Json<MountBody>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "admin token required"})),
-            );
+            return unauthorized();
         }
         // Validate before the caller's `nid` touches anything, not after: RuntimeHandles::mount
         // requires an `Nid` and cannot be called without one, but a bad value should read as a
@@ -2178,34 +2197,72 @@ pub fn lifecycle_routes(
                 )
             }
         };
-        let mut h = handles.lock().await;
-        match h.mount(&body.name, nid).await {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(serde_json::json!({"mounted": body.name})),
-            ),
-            Err(e) => (
-                status_for(&e),
-                Json(serde_json::json!({"error": format!("{e:#}")})),
-            ),
+        let nid_str = nid.as_ref().map(|n| n.as_str().to_string());
+
+        if q.wait {
+            let mut h = handles.lock().await;
+            return match h.mount(&body.name, nid).await {
+                Ok(()) => {
+                    jobs.put(MountJob::new(
+                        &body.name,
+                        nid_str.as_deref(),
+                        MountPhase::Live,
+                    ));
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"mounted": body.name})),
+                    )
+                }
+                Err(e) => (
+                    status_for(&e),
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                ),
+            };
         }
+
+        // Decided from the jobs alone, never the runtime's lock, which a mount in progress holds.
+        if let Some(job) = jobs.get(&body.name) {
+            let same = job.nid == nid_str || nid_str.is_none();
+            match (job.phase, same) {
+                (MountPhase::Live, true) => return (StatusCode::OK, Json(serde_json::json!(job))),
+                (MountPhase::Failed, _) => {}
+                (_, true) => return (StatusCode::ACCEPTED, Json(serde_json::json!(job))),
+                (_, false) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "'{}' is already {} as nid {}; changing a mount's nest is `nest upgrade`",
+                                body.name,
+                                if job.phase == MountPhase::Live { "mounted" } else { "being mounted" },
+                                job.nid.as_deref().unwrap_or("(unrecorded)")
+                            )
+                        })),
+                    )
+                }
+            }
+        }
+        let job = MountJob::new(&body.name, nid_str.as_deref(), MountPhase::Accepted);
+        jobs.put(job.clone());
+        spawn_mount_job(handles, jobs, body.name, nid);
+        (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
 
     async fn unmount_nest(
-        State((handles, required)): State<Shared>,
+        State((handles, jobs, required)): State<Shared>,
         AxPath(name): AxPath<String>,
         Query(q): Query<TokenQuery>,
         headers: HeaderMap,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "admin token required"})),
-            );
+            return unauthorized();
         }
         let mut h = handles.lock().await;
         match h.unmount(&name).await {
-            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"unmounted": name}))),
+            Ok(()) => {
+                jobs.forget(&name);
+                (StatusCode::OK, Json(serde_json::json!({"unmounted": name})))
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("{e:#}")})),
@@ -2213,10 +2270,44 @@ pub fn lifecycle_routes(
         }
     }
 
+    async fn list_mounts(
+        State((_, jobs, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"mounts": jobs.list()})),
+        )
+    }
+
+    async fn get_mount(
+        State((_, jobs, required)): State<Shared>,
+        AxPath(name): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        match jobs.get(&name) {
+            Some(job) => (StatusCode::OK, Json(serde_json::json!(job))),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("no mount named '{name}'")})),
+            ),
+        }
+    }
+
     axum::Router::new()
         .route("/_admin/nests", post(mount_nest))
         .route("/_admin/nests/{*name}", delete(unmount_nest))
-        .with_state((handles, admin_token))
+        .route("/_admin/mounts", get(list_mounts))
+        .route("/_admin/mounts/{*name}", get(get_mount))
+        .with_state((handles, jobs, admin_token))
 }
 
 /// Persist the mounted-nest list to `mounts.toml` (RFC-0027 §5).
@@ -2486,6 +2577,96 @@ fn abort_alert_worker(worker: &mut Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+/// `name` is a route key: `<alias>` single-tenant, `<tenant>/<alias>` multi-tenant. Split so a record
+/// lookup works either way, rather than missing every multi-tenant mount and falling through to the
+/// pre-2.0 directory - which would come up empty and re-backfill.
+fn split_route_key(name: &str) -> (Option<&str>, &str) {
+    match name.split_once('/') {
+        Some((t, a)) => (Some(t), a),
+        None => (None, name),
+    }
+}
+
+/// Where a mount's dataset lives, and the registry to fetch it from when it is not there yet.
+#[derive(Debug)]
+pub struct MountPlan {
+    pub nid: Option<String>,
+    pub dir: PathBuf,
+    pub fetch_from: Option<String>,
+}
+
+async fn fetch_nid(registry: &str, nid: &str, dir: &Path, name: &str) -> Result<()> {
+    crate::distribution::install_by_nid(registry, nid, dir)
+        .await
+        .with_context(|| format!("fetching nid {nid} from the registry"))?;
+    tracing::info!("fetched nid {nid} from the registry for '{name}'");
+    Ok(())
+}
+
+/// The mount jobs a runtime starts with (#1544): every mounted nest as live, and every job a restart
+/// interrupted running again. Nothing resumes without the admin API, which is what mounts.
+pub async fn start_mount_jobs(
+    dir: &Path,
+    handles: &Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    admin_enabled: bool,
+) -> Arc<crate::mount_jobs::MountJobs> {
+    use crate::mount_jobs::{MountJob, MountJobs, MountPhase};
+    // Before any job runs, so a fetch a killed process left staged cannot be mistaken for one running.
+    crate::mount_jobs::clear_stale_fetches(dir);
+    let jobs = Arc::new(MountJobs::load(dir));
+    for (name, state) in &handles.lock().await.states {
+        jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live));
+    }
+    if admin_enabled {
+        for job in jobs.unfinished() {
+            tracing::info!("resuming the mount of '{}' a restart interrupted", job.name);
+            let nid = job.nid.as_deref().and_then(|n| Nid::parse(n).ok());
+            spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid);
+        }
+    }
+    jobs
+}
+
+/// Run a mount as a job (#1544). The fetch happens with no lock held, so a slow registry holds up no
+/// other admin call; only the join takes the runtime's lock.
+pub fn spawn_mount_job(
+    handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: Arc<crate::mount_jobs::MountJobs>,
+    name: String,
+    nid: Option<Nid>,
+) -> tokio::task::JoinHandle<()> {
+    use crate::mount_jobs::MountPhase;
+    tokio::spawn(async move {
+        let outcome = async {
+            let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
+            let fetched = match (&plan.fetch_from, &plan.nid) {
+                (Some(registry), Some(n)) => {
+                    jobs.advance(&name, MountPhase::Fetching, None);
+                    fetch_nid(registry, n, &plan.dir, &name).await?;
+                    true
+                }
+                _ => false,
+            };
+            jobs.advance(&name, MountPhase::Joining, None);
+            let mut h = handles.lock().await;
+            let mounted = h.mount(&name, nid).await;
+            // Only a fetch no live mount has since taken up is ours to remove.
+            if mounted.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                let _ = std::fs::remove_dir_all(&plan.dir);
+            }
+            mounted
+        }
+        .await;
+        match outcome {
+            Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Err(e) => {
+                tracing::warn!("mounting '{name}' failed: {e:#}");
+                jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));
+            }
+        }
+    })
+}
+
 /// Stamp a live-mounted nest's dataset identity and mount record onto its serving state. Boot does
 /// the same after `build_nest`; without it a recorded `sql = "deny"` serves open until restart (#1536).
 fn overlay_mount_record(
@@ -2529,20 +2710,37 @@ impl RuntimeHandles {
     /// given an absolute string. [`Nid::parse`] is the only way to produce one, so nothing can call
     /// this function with a raw string.
     pub async fn mount(&mut self, name: &str, nid: Option<Nid>) -> Result<()> {
+        let plan = self.plan_mount(name, nid.as_ref())?;
+        // A NID this runtime does not hold is fetched first (#1543). Whatever refuses the mount after
+        // that removes the fetch again, so a refusal still leaves nothing behind.
+        let fetched = match (&plan.fetch_from, &plan.nid) {
+            (Some(registry), Some(nid)) => {
+                fetch_nid(registry, nid, &plan.dir, name).await?;
+                true
+            }
+            _ => false,
+        };
+        let (tenant, alias) = split_route_key(name);
+        let mounted = self
+            .mount_dataset(name, tenant, alias, plan.nid, plan.dir.clone())
+            .await;
+        if mounted.is_err() && fetched {
+            let _ = std::fs::remove_dir_all(&plan.dir);
+        }
+        mounted
+    }
+
+    /// Resolve a mount's dataset and whether it must be fetched first, refusing what can be refused
+    /// without doing any work.
+    pub fn plan_mount(&self, name: &str, nid: Option<&Nid>) -> Result<MountPlan> {
         if self.states.iter().any(|(n, _)| n == name) {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
-        // `name` is a route key: `<alias>` single-tenant, `<tenant>/<alias>` multi-tenant. Split it
-        // so a record lookup works either way, rather than silently missing every multi-tenant mount
-        // and falling through to the pre-2.0 directory - which would come up empty and re-backfill.
-        let (tenant, alias) = match name.split_once('/') {
-            Some((t, a)) => (Some(t), a),
-            None => (None, name),
-        };
+        let (tenant, alias) = split_route_key(name);
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the
         // caller does not know it, e.g. remounting a nest this runtime has already seen.
-        let nid = nid.map(Nid::into_string).or_else(|| {
+        let nid = nid.map(|n| n.as_str().to_string()).or_else(|| {
             self.mount_ctx
                 .mounts
                 .iter()
@@ -2553,28 +2751,18 @@ impl RuntimeHandles {
             Some(nid) => MountTable::data_dir(&self.mount_ctx.dir, nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
         };
-        // A NID this runtime does not hold is fetched first (#1543). Whatever refuses the mount after
-        // that removes the fetch again, so a refusal still leaves nothing behind.
-        let fetched = match &nid {
-            Some(nid) if !dir.exists() => {
-                let Some(registry) = self.mount_ctx.registry.clone() else {
-                    return Err(MountRefusal::NotHeld { nid: nid.clone() }.into());
-                };
-                crate::distribution::install_by_nid(&registry, nid, &dir)
-                    .await
-                    .with_context(|| format!("fetching nid {nid} from the registry"))?;
-                tracing::info!("fetched nid {nid} from the registry for '{name}'");
-                true
-            }
-            _ => false,
+        let fetch_from = match &nid {
+            Some(nid) if !dir.exists() => match &self.mount_ctx.registry {
+                Some(registry) => Some(registry.clone()),
+                None => return Err(MountRefusal::NotHeld { nid: nid.clone() }.into()),
+            },
+            _ => None,
         };
-        let mounted = self
-            .mount_dataset(name, tenant, alias, nid, dir.clone())
-            .await;
-        if mounted.is_err() && fetched {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-        mounted
+        Ok(MountPlan {
+            nid,
+            dir,
+            fetch_from,
+        })
     }
 
     /// [`Self::mount`] once the dataset directory is resolved and on disk.

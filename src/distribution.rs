@@ -422,8 +422,13 @@ pub async fn install_by_nid(registry: &str, nid: &str, target: &Path) -> Result<
         Some(&hash),
     )
     .await?;
-    std::fs::rename(&installed, target)
-        .with_context(|| format!("moving the fetched nest to {}", target.display()))?;
+    if let Err(e) = std::fs::rename(&installed, target) {
+        // Another mount of the same NID installed it first; a NID names one content, so theirs is ours.
+        if !target.join(crate::config::CONFIG_FILE).exists() {
+            return Err(e)
+                .with_context(|| format!("moving the fetched nest to {}", target.display()));
+        }
+    }
     Ok(())
 }
 
