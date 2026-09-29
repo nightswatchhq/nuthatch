@@ -2276,7 +2276,8 @@ pub fn lifecycle_routes(
             let same = job.nid == nid_str || nid_str.is_none();
             match (job.phase, same) {
                 (MountPhase::Live, true) => return (StatusCode::OK, Json(serde_json::json!(job))),
-                (MountPhase::Failed, _) => {}
+                // A suspended name mounts again as its resume.
+                (MountPhase::Failed | MountPhase::Suspended, _) => {}
                 (_, true) => return (StatusCode::ACCEPTED, Json(serde_json::json!(job))),
                 (_, false) => {
                     return (
@@ -2440,7 +2441,8 @@ pub fn lifecycle_routes(
         }
         match h.suspend(&name).await {
             Ok(()) => {
-                jobs.forget(&name);
+                let nid = h.suspended.get(&name).map(String::as_str);
+                jobs.put(MountJob::new(&name, nid, MountPhase::Suspended));
                 (StatusCode::OK, Json(serde_json::json!({"suspended": name})))
             }
             Err(e) => (
@@ -2923,8 +2925,14 @@ pub async fn start_mount_jobs(
     // Before any job runs, so a fetch a killed process left staged cannot be mistaken for one running.
     crate::mount_jobs::clear_stale_fetches(dir);
     let jobs = Arc::new(MountJobs::load(dir));
-    for (name, state) in &handles.lock().await.states {
-        jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live));
+    {
+        let h = handles.lock().await;
+        for (name, state) in &h.states {
+            jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live));
+        }
+        for (name, nid) in &h.suspended {
+            jobs.put(MountJob::new(name, Some(nid), MountPhase::Suspended));
+        }
     }
     if admin_enabled {
         for job in jobs.unfinished() {
