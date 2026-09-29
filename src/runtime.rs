@@ -3032,12 +3032,22 @@ pub fn spawn_move_job(
         let outcome = async {
             let staging = RuntimeHandles::staging_name(&name);
             let plan = handles.lock().await.plan_mount(&staging, Some(&nid))?;
-            if let (Some(registry), Some(n)) = (&plan.fetch_from, &plan.nid) {
-                jobs.advance(&name, MountPhase::Fetching, None);
-                fetch_nid(registry, n, &plan.dir, &name).await?;
-            }
+            let fetched = match (&plan.fetch_from, &plan.nid) {
+                (Some(registry), Some(n)) => {
+                    jobs.advance(&name, MountPhase::Fetching, None);
+                    fetch_nid(registry, n, &plan.dir, &name).await?;
+                    true
+                }
+                _ => false,
+            };
             jobs.advance(&name, MountPhase::Joining, None);
-            handles.lock().await.move_name(&name, nid).await
+            let mut h = handles.lock().await;
+            let moved = h.move_name(&name, nid).await;
+            // As for a mount: a refused move removes only a fetch no live mount has since taken up.
+            if moved.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                let _ = std::fs::remove_dir_all(&plan.dir);
+            }
+            moved
         }
         .await;
         match outcome {

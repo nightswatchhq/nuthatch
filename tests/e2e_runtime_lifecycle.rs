@@ -2425,3 +2425,32 @@ async fn a_move_over_the_admin_api_is_a_job() {
         "{job}"
     );
 }
+
+/// #1549, from review: a move that fetched its NID and was then refused removes the fetch, and the
+/// name keeps serving the nest it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_move_leaves_no_fetched_dataset_behind() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let new_nid = registry_with_one_nest(registry.path()).await;
+    let old_nid = "af".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    handles.mount_ctx.max_rss_mb = 100;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    assert!(!new_dir.exists(), "premise: the new nid is not held");
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let body = format!(r#"{{"nid":"{new_nid}"}}"#);
+    let (status, _) = call(&routes, "POST", "/_admin/move/usdc", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job = wait_for_phase(&routes, "usdc", "failed").await;
+    assert_eq!(job["phase"], "failed", "{job}");
+    assert!(
+        !new_dir.exists(),
+        "a refused move left the dataset it fetched"
+    );
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
+}
