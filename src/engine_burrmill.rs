@@ -267,23 +267,15 @@ impl Session for BurrmillSession {
         Ok(reader.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// From the plan, as DuckDB's prepare gives them: a result with no rows has no batch to read.
     fn column_names(&self, sql: &str) -> Result<Vec<String>> {
-        let engine = self.engine();
-        let mut names = Vec::new();
-        engine
-            .sql_for_each(sql, |batch| {
-                if names.is_empty() {
-                    names = batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().clone())
-                        .collect();
-                }
-                Ok(())
-            })
-            .map_err(engine_err)?;
-        Ok(names)
+        Ok(self
+            .engine()
+            .describe(sql)
+            .map_err(engine_err)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
 
     fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
