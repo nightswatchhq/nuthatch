@@ -2282,3 +2282,146 @@ async fn a_dry_run_fetches_what_it_needs_and_mounts_nothing() {
     assert!(handles.lock().await.states.is_empty());
     assert!(intake.try_recv().is_err());
 }
+
+/// #1549: moving a name to another NID leaves no gap. A reader polling the name through the move
+/// sees only 200s, and only the old dataset, then only the new one. Afterwards the cursor knows the
+/// moved nest by the name, the staging name is gone, and the old store is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_name_moves_to_another_nid_without_a_gap() {
+    use tower::ServiceExt;
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("8d".repeat(32), "9e".repeat(32));
+    let (mut handles, tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+
+    let svc = handles.live.service();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (svc, stop) = (svc.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut seen: Vec<(u16, String)> = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let req = axum::http::Request::builder()
+                    .uri("/usdc/sql?q=SELECT%201")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = svc.clone().oneshot(req).await.unwrap();
+                let status = resp.status().as_u16();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let nid = body["provenance"]["nid"].as_str().unwrap_or("").to_string();
+                seen.push((status, nid));
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            seen
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    handles
+        .move_name("usdc", runtime::Nid::parse(&new_nid).unwrap())
+        .await
+        .expect("move");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let seen = reader.await.unwrap();
+
+    assert!(
+        seen.iter().all(|(s, _)| *s == 200),
+        "a reader saw an error during the move: {:?}",
+        seen.iter()
+            .filter(|(s, _)| *s != 200)
+            .take(3)
+            .collect::<Vec<_>>()
+    );
+    let first_new = seen
+        .iter()
+        .position(|(_, n)| *n == new_nid)
+        .expect("never saw the new nid");
+    assert!(first_new > 0, "never saw the old nid");
+    assert!(
+        seen[..first_new].iter().all(|(_, n)| *n == old_nid),
+        "before the switch a reader saw something other than the old nest"
+    );
+    assert!(
+        seen[first_new..].iter().all(|(_, n)| *n == new_nid),
+        "after the switch a reader saw the old nest again"
+    );
+
+    assert_eq!(
+        status(&handles.live, "/usdc.moving/health").await,
+        axum::http::StatusCode::NOT_FOUND,
+        "the staging name is still routed"
+    );
+    let old_db = runtime::MountTable::data_dir(roost.path(), &old_nid).join("nuthatch.redb");
+    drop(Store::open(&old_db).expect("the old nest's store was not released"));
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert_eq!(file.mounts.len(), 1, "{:?}", file.mounts);
+    assert_eq!(file.mounts[0].nid, new_nid);
+
+    let (a1, a2) = (account(1), account(2));
+    tape.insert_block(
+        4,
+        transfers_block(
+            4,
+            0,
+            1_700_000_004,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 400)],
+        ),
+    );
+    tape.advance_tip_to(4);
+    assert!(
+        wait_until(POLL_TIMEOUT, || usdc_last_block(&handles).as_deref()
+            == Some("4"))
+        .await,
+        "the moved nest stopped following the tip"
+    );
+    handles.unmount("usdc").await.expect("unmount");
+    drop(
+        Store::open(&new_dir.join("nuthatch.redb"))
+            .expect("the cursor did not know the moved nest by its name"),
+    );
+}
+
+/// #1549 over HTTP: a move is a job like a mount, ending live on the new NID; a malformed NID is a
+/// caller error and a move of a name that is not mounted fails with the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_over_the_admin_api_is_a_job() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("ad".repeat(32), "be".repeat(32));
+    let (handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let (status, _) = call(
+        &routes,
+        "POST",
+        "/_admin/move/usdc",
+        None,
+        Some(r#"{"nid":"nope"}"#),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    let body = format!(r#"{{"nid":"{new_nid}"}}"#);
+    let (status, job) = call(&routes, "POST", "/_admin/move/usdc", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{job}");
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    assert_eq!(job["nid"], new_nid.as_str(), "{job}");
+
+    let (status, _) = call(&routes, "POST", "/_admin/move/ghost", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job = wait_for_phase(&routes, "ghost", "failed").await;
+    assert!(
+        job["reason"].as_str().unwrap_or("").contains("not mounted"),
+        "{job}"
+    );
+}

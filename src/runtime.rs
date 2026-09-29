@@ -2450,6 +2450,55 @@ pub fn lifecycle_routes(
         }
     }
 
+    #[derive(serde::Deserialize)]
+    struct MoveBody {
+        nid: String,
+    }
+
+    async fn move_nest(
+        State((handles, jobs, required)): State<Shared>,
+        AxPath(name): AxPath<String>,
+        Query(q): Query<MountQuery>,
+        headers: HeaderMap,
+        Json(body): Json<MoveBody>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let nid = match Nid::parse(&body.nid) {
+            Ok(nid) => nid,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                )
+            }
+        };
+        if q.wait {
+            let mut h = handles.lock().await;
+            return match h.move_name(&name, nid.clone()).await {
+                Ok(()) => {
+                    jobs.put(MountJob::new(&name, Some(nid.as_str()), MountPhase::Live));
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"moved": name, "nid": nid.as_str()})),
+                    )
+                }
+                Err(e) => (
+                    status_for(&e),
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                ),
+            };
+        }
+        if let Some(job) = jobs.get(&name).filter(|j| !j.phase.finished()) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!(job)));
+        }
+        let job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
+        jobs.put(job.clone());
+        spawn_move_job(handles, jobs, name, nid);
+        (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
+    }
+
     async fn resume_nest(
         State((handles, jobs, required)): State<Shared>,
         AxPath(name): AxPath<String>,
@@ -2495,6 +2544,7 @@ pub fn lifecycle_routes(
         .route("/_admin/mounts/{*name}", get(get_mount))
         .route("/_admin/suspend/{*name}", post(suspend_nest))
         .route("/_admin/resume/{*name}", post(resume_nest))
+        .route("/_admin/move/{*name}", post(move_nest))
         .route("/_admin/datasets/{nid}", delete(reclaim_dataset))
         .with_state((handles, jobs, admin_token))
 }
@@ -2546,6 +2596,12 @@ fn persist_mounted_nests(
         // collection explicit, because re-backfilling is precisely the cost this design exists to
         // avoid and an accidental unmount must not trigger one.
         mounts.mounts.retain(|m| nests.contains(&key_of(m)));
+        // A move changes a live name's nid (#1549); the record on disk follows the one in memory.
+        for m in mounts.mounts.iter_mut() {
+            if let Some(k) = known.iter().find(|k| key_of(k) == key_of(m)) {
+                m.nid = k.nid.clone();
+            }
+        }
         // Add records for live mounts with no entry on disk yet - a nest mounted live via `POST
         // /_admin/nests` rather than declared at boot (#517). Without this the mount works until the
         // next restart, then silently vanishes: the exact "looks like it worked" failure this file
@@ -2960,6 +3016,36 @@ fn suspended_router(name: &str) -> axum::Router {
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(body),
             )
+        }
+    })
+}
+
+/// Run a move as a job (#1549): fetch the new NID with no lock held, then move under it.
+pub fn spawn_move_job(
+    handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: Arc<crate::mount_jobs::MountJobs>,
+    name: String,
+    nid: Nid,
+) -> tokio::task::JoinHandle<()> {
+    use crate::mount_jobs::MountPhase;
+    tokio::spawn(async move {
+        let outcome = async {
+            let staging = RuntimeHandles::staging_name(&name);
+            let plan = handles.lock().await.plan_mount(&staging, Some(&nid))?;
+            if let (Some(registry), Some(n)) = (&plan.fetch_from, &plan.nid) {
+                jobs.advance(&name, MountPhase::Fetching, None);
+                fetch_nid(registry, n, &plan.dir, &name).await?;
+            }
+            jobs.advance(&name, MountPhase::Joining, None);
+            handles.lock().await.move_name(&name, nid).await
+        }
+        .await;
+        match outcome {
+            Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Err(e) => {
+                tracing::warn!("moving '{name}' failed: {e:#}");
+                jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));
+            }
         }
     })
 }
@@ -3603,6 +3689,133 @@ impl RuntimeHandles {
             return Ok(());
         }
 
+        self.drain_cursor_nest(&chain, &cursor_key, name).await?;
+        self.publishers.retain(|(n, _)| n != name);
+
+        // 3. Drop the serving state - the third - and re-compose without it. Requests already in
+        //    flight finish against the old composition; new ones 404.
+        self.states.remove(idx);
+        crate::analytics::invalidate_duck_cache(&dataset_dir);
+        crate::metrics::METRICS.remove_nest(&cursor_key);
+        crate::metrics::METRICS.remove_nest(name);
+        self.recompose_after_unmount(name);
+        Ok(())
+    }
+
+    /// The name a move stages its incoming nest under while it catches up.
+    pub fn staging_name(name: &str) -> String {
+        format!("{name}.moving")
+    }
+
+    /// Move a live name to another NID without a gap (#1549).
+    ///
+    /// The new NID is mounted under [`Self::staging_name`], which catches it up before it joins its
+    /// cursor. The old nest is then drained off the cursor, the new one takes its name there, and the
+    /// name's routes switch in one swap: a reader sees the old nest until then, and the new after.
+    pub async fn move_name(&mut self, name: &str, nid: Nid) -> Result<()> {
+        let Some(old) = self.states.iter().find(|(n, _)| n == name).map(|(_, s)| s) else {
+            bail!("'{name}' is not mounted");
+        };
+        if old.nid.as_deref() == Some(nid.as_str()) {
+            return Ok(());
+        }
+        let chain = old.chain.clone();
+        let old_key = old
+            .runtime_health
+            .as_ref()
+            .map_or_else(|| name.to_string(), |(n, _)| n.clone());
+        let old_store = old.store.clone();
+        let staging = Self::staging_name(name);
+
+        self.mount(&staging, Some(nid.clone())).await?;
+        let new_idx = self
+            .states
+            .iter()
+            .position(|(n, _)| *n == staging)
+            .expect("just mounted");
+        if self.states[new_idx].1.chain != chain {
+            self.unmount(&staging).await?;
+            bail!("a move keeps its chain: '{name}' is on {chain}");
+        }
+        let new_key = self.states[new_idx]
+            .1
+            .runtime_health
+            .as_ref()
+            .map_or_else(|| staging.clone(), |(n, _)| n.clone());
+
+        // Readers keep the old nest's routes while it comes off the cursor.
+        let old_shared = self
+            .states
+            .iter()
+            .filter(|(_, s)| Arc::ptr_eq(&s.store, &old_store))
+            .count()
+            > 1;
+        if !old_shared {
+            self.drain_cursor_nest(&chain, &old_key, name).await?;
+            crate::metrics::METRICS.remove_nest(&old_key);
+        }
+        let (_, mut new_state) = self.states.remove(new_idx);
+        if new_key == staging {
+            let tx = self
+                .lifecycle
+                .get(&chain)
+                .cloned()
+                .context("the cursor the move joined is gone")?;
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(indexer::CursorCommand::Rename {
+                from: staging.clone(),
+                to: name.to_string(),
+                ack: Some(ack_tx),
+            });
+            let _ = tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await;
+            new_state.runtime_health = Some((name.to_string(), self.health.clone()));
+            self.health.register(name, &chain);
+            self.health.mark_indexing(name);
+            if let Some(w) = self.alert_workers.iter_mut().find(|(n, _)| *n == staging) {
+                w.0 = name.to_string();
+            }
+        } else {
+            self.health.register_alias(name, &new_key, &chain);
+        }
+        let old_idx = self
+            .states
+            .iter()
+            .position(|(n, _)| n == name)
+            .expect("still mounted");
+        let (_, old_state) =
+            std::mem::replace(&mut self.states[old_idx], (name.to_string(), new_state));
+        if let Some(mb) = self.estimates.remove(&staging) {
+            self.estimates.insert(name.to_string(), mb);
+        }
+        self.publishers.retain(|(n, _)| n != name);
+        for p in self.publishers.iter_mut().filter(|(n, _)| *n == staging) {
+            p.0 = name.to_string();
+        }
+        let (tenant, alias) = split_route_key(name);
+        let (_, staging_alias) = split_route_key(&staging);
+        self.mount_ctx
+            .mounts
+            .retain(|m| !(m.alias == staging_alias && tenant.is_none_or(|t| m.tenant == t)));
+        for m in self
+            .mount_ctx
+            .mounts
+            .iter_mut()
+            .filter(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+        {
+            m.nid = nid.as_str().to_string();
+        }
+        if !old_shared {
+            crate::analytics::invalidate_duck_cache(&old_state.dir);
+        }
+        drop(old_state);
+        self.recompose();
+        tracing::info!("'{name}' moved to nid {nid}");
+        Ok(())
+    }
+
+    /// Take a nest off its cursor and stop its alert worker, waiting for both to let go of its store
+    /// (RFC-0027 §6). `cursor_key` is the name the cursor knows it by; `name` is for the errors.
+    async fn drain_cursor_nest(&mut self, chain: &str, cursor_key: &str, name: &str) -> Result<()> {
         // 1. Drain the cursor and wait for it to let go.
         //
         // No channel for this nest's chain means we cannot ask the cursor to stop, and tearing the
@@ -3610,7 +3823,7 @@ impl RuntimeHandles {
         // §6 orders this sequence to prevent. So this is an error, not a skip. (An early draft skipped
         // silently; the acceptance test then failed on a *held* store, which is how the gap surfaced.)
         {
-            let tx = self.lifecycle.get(&chain).ok_or_else(|| {
+            let tx = self.lifecycle.get(chain).ok_or_else(|| {
                 anyhow::anyhow!(
                     "no cursor channel for chain '{chain}' hosting '{name}' - refusing to unmount \
                      without draining it first"
@@ -3619,7 +3832,7 @@ impl RuntimeHandles {
             let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             if tx
                 .send(indexer::CursorCommand::Unmount {
-                    name: cursor_key.clone(),
+                    name: cursor_key.to_string(),
                     ack: Some(ack_tx),
                 })
                 .is_ok()
@@ -3652,19 +3865,15 @@ impl RuntimeHandles {
             // with "Database already open" a few microseconds after the abort.
             let _ = worker.await;
         }
-        self.publishers.retain(|(n, _)| n != name);
-
-        // 3. Drop the serving state - the third - and re-compose without it. Requests already in
-        //    flight finish against the old composition; new ones 404.
-        self.states.remove(idx);
-        crate::analytics::invalidate_duck_cache(&dataset_dir);
-        crate::metrics::METRICS.remove_nest(&cursor_key);
-        crate::metrics::METRICS.remove_nest(name);
-        self.recompose_after_unmount(name);
         Ok(())
     }
 
     fn recompose_after_unmount(&mut self, name: &str) {
+        self.recompose();
+        tracing::info!("nest '{name}' unmounted from the runtime");
+    }
+
+    fn recompose(&mut self) {
         // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
         // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
         let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
@@ -3676,7 +3885,6 @@ impl RuntimeHandles {
         ));
         self.live.swap(self.compose());
         self.persist();
-        tracing::info!("nest '{name}' unmounted from the runtime");
     }
 }
 

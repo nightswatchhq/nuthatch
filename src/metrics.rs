@@ -655,6 +655,14 @@ impl Metrics {
         self.per_nest.lock().unwrap().remove(name);
     }
 
+    /// Carry a nest's series over to a new name (#1549), replacing any the new name had.
+    pub fn rename_nest(&self, from: &str, to: &str) {
+        let mut map = self.per_nest.lock().unwrap();
+        if let Some(h) = map.remove(from) {
+            map.insert(to.to_string(), h);
+        }
+    }
+
     pub fn set_tip(&self, v: u64) {
         self.tip_height.store(v, Relaxed);
     }
