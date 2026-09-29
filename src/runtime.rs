@@ -2441,14 +2441,12 @@ fn persist_mounted_nests(
         // wrote. **The dataset under `data/<nid>` is deliberately left on disk** - RFC-0032 §5 makes
         // collection explicit, because re-backfilling is precisely the cost this design exists to
         // avoid and an accidental unmount must not trigger one.
-        // A suspended mount keeps its record: it is only paused (#1548).
-        mounts
-            .mounts
-            .retain(|m| nests.contains(&key_of(m)) || suspended.contains(&key_of(m)));
+        mounts.mounts.retain(|m| nests.contains(&key_of(m)));
         // Add records for live mounts with no entry on disk yet - a nest mounted live via `POST
         // /_admin/nests` rather than declared at boot (#517). Without this the mount works until the
         // next restart, then silently vanishes: the exact "looks like it worked" failure this file
         // exists to prevent (see the doc comment above).
+        // A suspended mount keeps its record: it is only paused (#1548).
         for key in nests.iter().chain(suspended) {
             if mounts.mounts.iter().any(|m| &key_of(m) == key) {
                 continue;
