@@ -419,6 +419,7 @@ async fn bring_up_live(
         roster,
         estimates: std::collections::HashMap::new(),
         multi_tenant,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: root.to_path_buf(),
             // The whole table, including the record for the nest not yet mounted - which is exactly

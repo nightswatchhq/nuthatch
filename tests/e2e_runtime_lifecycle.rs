@@ -89,6 +89,7 @@ async fn two_nest_roost(
             ("arb".to_string(), 90),
         ]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             // Un-migrated: no mount records, so resolution stays on the pre-2.0 `nests/<name>` path.
@@ -485,6 +486,7 @@ async fn route_named_runtime(
         roster,
         estimates: std::collections::HashMap::from([(route.to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: nest_dir.to_path_buf(),
             mounts: Vec::new(),
@@ -693,6 +695,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         roster,
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             // Only `usdc` is on record - `gamma` below is exactly the "runtime has never seen this
@@ -870,6 +873,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
         roster,
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1244,6 +1248,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
         roster,
         estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1387,6 +1392,7 @@ async fn empty_runtime(
         roster,
         estimates: Default::default(),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1825,4 +1831,141 @@ async fn a_restart_resumes_an_interrupted_mount() {
         job["phase"], "live",
         "the interrupted mount was not resumed: {job}"
     );
+}
+
+/// `empty_runtime` with a `mounts.toml` declaring its chain, and `usdc` mounted and at the tip.
+async fn one_live_mount(
+    roost: &std::path::Path,
+    nid: &str,
+) -> (runtime::RuntimeHandles, Arc<TapeSource>) {
+    std::fs::write(
+        roost.join(runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
+    )
+    .unwrap();
+    let (mut handles, tape, _intake) = empty_runtime(roost, nid).await;
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(nid).unwrap()))
+        .await
+        .expect("mount");
+    assert!(
+        wait_until(POLL_TIMEOUT, || usdc_last_block(&handles).as_deref()
+            == Some("3"))
+        .await,
+        "premise: usdc indexes to the tip"
+    );
+    (handles, tape)
+}
+
+fn usdc_last_block(h: &runtime::RuntimeHandles) -> Option<String> {
+    h.states
+        .iter()
+        .find(|(n, _)| n == "usdc")
+        .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
+}
+
+/// #1548: a suspended mount answers a named 503, lets go of its store, keeps its data and record,
+/// stays suspended across a restart, and does not hold `/ready` down. Resuming catches it up from
+/// where it stopped, and releases a quarantine it was in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspended_mount_keeps_its_place_and_resumes_from_it() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "5a".repeat(32);
+    let (mut handles, tape) = one_live_mount(roost.path(), &nid).await;
+    handles
+        .health
+        .quarantine_nest("usdc", "a view failed".to_string(), 1, None);
+
+    handles.suspend("usdc").await.expect("suspend");
+    let body = body_json(&handles.live, "/usdc/health").await;
+    assert_eq!(body["suspended"], true, "{body}");
+    assert_eq!(
+        status(&handles.live, "/usdc/health").await,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let db = runtime::MountTable::data_dir(roost.path(), &nid).join("nuthatch.redb");
+    drop(Store::open(&db).expect("a suspended mount must let go of its store"));
+    assert_eq!(handles.health.json_for("usdc").0, "suspended");
+    assert!(
+        handles.health.all_indexing(),
+        "a pause must not fail /ready"
+    );
+
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert_eq!(file.runtime.suspended, vec!["usdc".to_string()]);
+    let (active, suspended) = runtime::split_suspended(&file);
+    assert!(
+        active.mounts.is_empty(),
+        "a restart would index the suspended mount"
+    );
+    assert_eq!(suspended.get("usdc"), Some(&nid));
+
+    let (a1, a2) = (account(1), account(2));
+    tape.insert_block(
+        4,
+        transfers_block(
+            4,
+            0,
+            1_700_000_004,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 400)],
+        ),
+    );
+    tape.advance_tip_to(4);
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("resume");
+    assert!(
+        wait_until(POLL_TIMEOUT, || usdc_last_block(&handles).as_deref()
+            == Some("4"))
+        .await,
+        "the resumed mount did not catch up: {:?}",
+        usdc_last_block(&handles)
+    );
+    assert_eq!(
+        status(&handles.live, "/usdc/health").await,
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(handles.health.json_for("usdc").0, "indexing");
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert!(file.runtime.suspended.is_empty());
+    assert_eq!(file.mounts.len(), 1);
+}
+
+/// #1548 over HTTP: suspend and resume by name, with the refusals a caller can hit, and an unmount
+/// of a suspended mount dropping its record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn suspend_and_resume_over_the_admin_api() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6b".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/nope", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    let (status, _) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "resuming a live mount"
+    );
+
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let (status, body) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
+
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let (status, _) = call(&routes, "DELETE", "/_admin/nests/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::NOT_FOUND);
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert!(file.runtime.suspended.is_empty() && file.mounts.is_empty());
 }
