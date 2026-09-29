@@ -2129,10 +2129,18 @@ pub fn lifecycle_routes(
         }
     }
 
+    #[derive(serde::Deserialize)]
+    struct UnmountQuery {
+        token: Option<String>,
+        /// Also remove the dataset once no mount references it (#1547).
+        #[serde(default)]
+        reclaim: bool,
+    }
+
     async fn unmount_nest(
         State((handles, required)): State<Shared>,
         AxPath(name): AxPath<String>,
-        Query(q): Query<TokenQuery>,
+        Query(q): Query<UnmountQuery>,
         headers: HeaderMap,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
@@ -2142,8 +2150,74 @@ pub fn lifecycle_routes(
             );
         }
         let mut h = handles.lock().await;
-        match h.unmount(&name).await {
-            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"unmounted": name}))),
+        let nid = h
+            .states
+            .iter()
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, s)| s.nid.as_deref().map(Nid::parse))
+            .transpose();
+        if let Err(e) = h.unmount(&name).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            );
+        }
+        if !q.reclaim {
+            return (StatusCode::OK, Json(serde_json::json!({"unmounted": name})));
+        }
+        let reclaim = match nid {
+            Ok(Some(nid)) => h.reclaim(&nid).map_err(|e| format!("{e:#}")),
+            Ok(None) => Err(
+                "no dataset identity to reclaim: the nest was not mounted, or is on \
+                             the pre-2.0 layout (`nuthatch migrate`)"
+                    .to_string(),
+            ),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        match reclaim {
+            Ok(r) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"unmounted": name, "reclaim": r})),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"unmounted": name, "error": e})),
+            ),
+        }
+    }
+
+    /// Reclaim a dataset unmounted earlier without `?reclaim=true` (#1547).
+    async fn reclaim_dataset(
+        State((handles, required)): State<Shared>,
+        AxPath(nid): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "admin token required"})),
+            );
+        }
+        let nid = match Nid::parse(&nid) {
+            Ok(nid) => nid,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                )
+            }
+        };
+        let h = handles.lock().await;
+        match h.reclaim(&nid) {
+            Ok(r) => {
+                let status = match r {
+                    crate::prune::Reclaim::Reclaimed { .. } => StatusCode::OK,
+                    crate::prune::Reclaim::Kept { .. } => StatusCode::CONFLICT,
+                    crate::prune::Reclaim::Absent { .. } => StatusCode::NOT_FOUND,
+                };
+                (status, Json(serde_json::json!(r)))
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("{e:#}")})),
@@ -2154,6 +2228,7 @@ pub fn lifecycle_routes(
     axum::Router::new()
         .route("/_admin/nests", post(mount_nest))
         .route("/_admin/nests/{*name}", delete(unmount_nest))
+        .route("/_admin/datasets/{nid}", delete(reclaim_dataset))
         .with_state((handles, admin_token))
 }
 
@@ -2688,6 +2763,12 @@ impl RuntimeHandles {
                  change is live now but will not survive a restart"
             );
         }
+    }
+
+    /// Reclaim an unmounted dataset's disk (#1547). A mount record naming it keeps it, and a store
+    /// this process still holds is refused.
+    pub fn reclaim(&self, nid: &Nid) -> Result<crate::prune::Reclaim> {
+        crate::prune::reclaim(&self.mount_ctx.dir, nid.as_str())
     }
 
     /// Unmount a nest: drain its cursor, release every handle to its store, then remove its routes.

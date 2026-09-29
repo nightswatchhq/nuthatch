@@ -1317,3 +1317,176 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
     Store::open(&data_dir.join("nuthatch.redb"))
         .expect("after the last mount goes, the shared store must be reopenable");
 }
+
+/// #1547: an API-only operator can free a dataset's disk. Unmounting one of two mounts of a NID with
+/// `?reclaim=true` keeps the dataset and names who holds it; unmounting the last one removes it.
+/// A dataset unmounted earlier is reclaimed by NID, and a malformed NID is a caller error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it() {
+    const TOKEN: &str = "reclaim-token";
+    let roost_dir = tempfile::tempdir().unwrap();
+    let nid = "fe99".repeat(16);
+    let data_dir = runtime::MountTable::data_dir(roost_dir.path(), &nid);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(
+        roost_dir.path().join(runtime::MOUNTS_FILE),
+        format!(
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+             [[mounts]]\nalias = \"v1\"\nnid = \"{nid}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let tape = Arc::new(TapeSource::new());
+    let (a1, a2) = (account(1), account(2));
+    for b in 1..=3u64 {
+        tape.insert_block(
+            b,
+            transfers_block(
+                b,
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), (100 * b) as u128)],
+            ),
+        );
+    }
+    tape.advance_tip_to(3);
+    let cfg = scaffold_nest(&data_dir, "usdc", USDC);
+    let health = Arc::new(RuntimeHealth::new());
+    health.register("v1", "arbitrum-one");
+    let cursor = indexer::spawn_runtime(
+        tape.clone(),
+        vec![("v1".to_string(), data_dir.clone(), cfg)],
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+    let roster = serde_json::json!({"runtime": "test", "nests": [{"name": "v1"}]});
+    let live = serve::LiveRuntime::new(serve::compose_runtime(
+        roster.clone(),
+        cursor.states.clone(),
+        health.clone(),
+    ));
+    let mut states = cursor.states;
+    for (_, s) in &mut states {
+        s.nid = Some(Arc::from(nid.as_str()));
+    }
+    let handles = runtime::RuntimeHandles {
+        live,
+        states,
+        alert_workers: cursor.alert_workers,
+        publishers: Vec::new(),
+        lifecycle: std::collections::HashMap::from([(
+            "arbitrum-one".to_string(),
+            cursor.lifecycle.clone(),
+        )]),
+        health,
+        roster,
+        estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
+        multi_tenant: false,
+        mount_ctx: runtime::MountContext {
+            dir: roost_dir.path().to_path_buf(),
+            mounts: vec![runtime::Mount {
+                tenant: "default".to_string(),
+                alias: "v1".to_string(),
+                nid: nid.clone(),
+                sql: Default::default(),
+                queries: Vec::new(),
+                publish: None,
+                #[cfg(feature = "counter")]
+                counter: None,
+            }],
+            sources: std::collections::HashMap::from([(
+                "arbitrum-one".to_string(),
+                tape.clone() as Arc<dyn nuthatch::source::Source>,
+            )]),
+            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
+            backfill: None,
+            seal_direct: false,
+            concurrency: 1,
+            ipfs_window_deadline: nuthatch::ipfs_resolve::WINDOW_DEADLINE,
+            window_override: Some(2),
+            admin_enabled: true,
+            admin_token: Some(TOKEN.to_string()),
+            max_rss_mb: 2048,
+            freshness: Default::default(),
+            chain_freshness: Default::default(),
+        },
+    };
+    std::mem::forget(cursor.ingest);
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+
+    handles
+        .lock()
+        .await
+        .mount("v2", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("a second mount of the same nid");
+
+    let (status, body) = call(
+        &routes,
+        "DELETE",
+        "/_admin/nests/v1?reclaim=true",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["reclaim"]["outcome"], "kept", "{body}");
+    assert_eq!(body["reclaim"]["mounted_by"][0], "default/v2", "{body}");
+    assert!(data_dir.is_dir(), "a dataset v2 still serves was removed");
+
+    let (status, body) = call(
+        &routes,
+        "DELETE",
+        "/_admin/nests/v2?reclaim=true",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["reclaim"]["outcome"], "reclaimed", "{body}");
+    assert!(
+        !data_dir.exists(),
+        "the last unmount with reclaim left the dataset"
+    );
+
+    let (status, _) = call(
+        &routes,
+        "DELETE",
+        &format!("/_admin/datasets/{nid}"),
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    let (status, _) = call(
+        &routes,
+        "DELETE",
+        "/_admin/datasets/not-a-nid",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &routes,
+        "DELETE",
+        &format!("/_admin/datasets/{nid}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+}
