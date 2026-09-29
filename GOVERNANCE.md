@@ -70,5 +70,5 @@ If a funder or partner requires any item on this list, we decline that term rath
 Releases are the supply chain an operator depends on. Signing/release-key custody, and a named
 successor/escrow arrangement for those keys, are tracked as an open governance item (RFC-0006 Q3) to
 be settled while the project is small. Until then: releases are cut from tagged commits on `main`,
-published to GitHub Releases (with per-artifact SHA-256) and crates.io, and reproducible from the
+published to GitHub Releases (with per-artifact SHA-256), and reproducible from the
 pinned toolchain.
