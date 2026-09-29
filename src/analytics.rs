@@ -4192,6 +4192,36 @@ template="pool"
         );
     }
 
+    /// The cutover build has no DuckDB in front: the same watchdog must stop Burrmill, both in a
+    /// recursion that emits no batch until it ends and in a join that reads no Parquet.
+    #[cfg(feature = "shadow-burrmill")]
+    #[test]
+    fn guarded_query_times_out_on_a_runaway_on_burrmill() {
+        static E: crate::engine_burrmill::BurrmillEngine = crate::engine_burrmill::BurrmillEngine;
+        TEST_ENGINE.with(|c| c.set(Some(&E)));
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_millis(250),
+            max_rows: 1000,
+        };
+        for runaway in [
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000000000) SELECT count(*) FROM t",
+            "SELECT count(*) FROM range(1000000) a, range(1000000) b WHERE a.range + b.range = -1",
+        ] {
+            let started = Instant::now();
+            let err = query_guarded(dir.path(), runaway, guard).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("time budget"),
+                "expected a timeout error, got: {err:#}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{runaway}: stopped after {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
     #[test]
     fn queries_a_sealed_per_table_segment() {
         let dir = tempfile::tempdir().unwrap();
