@@ -434,14 +434,16 @@ who need more - none of it in the way of the happy path:
   used to mean editing config and restarting, which stops every *co-tenant* nest too - so the blast
   radius of a config change was larger than that of a fault. Now `POST /_admin/nests` mounts one and
   `DELETE /_admin/nests/<name>` unmounts one, live. A mount is admitted only if it fits the cursor's RAM
-  budget (refused with `507`, never a warning - a budget that can be quietly exceeded is not a budget),
+  budget (refused, never warned - a budget that can be quietly exceeded is not a budget),
   catches up *before* it joins so it never drags co-tenants back through history, and only then gets
   routes. An unmount is a **drain**, not a route removal: the cursor finishes its window and releases
   the store before anything is torn down. The set is persisted to `mounts.toml`, so a restart converges
   on what you last asked for. A runtime may start with nothing mounted: declare its chains under
   `[[chains]]`, and the first mount onto a chain starts that chain's cursor, dialling its RPC only then.
   Started with `--registry`, a runtime fetches a mounted NID it does not hold, verifies it as `nest load`
-  does, and installs it at `data/<nid>/` first.
+  does, and installs it at `data/<nid>/` first. A mount answers `202` at once, and `GET
+  /_admin/mounts/<name>` reports it fetching, joining, live, or failed with the reason, across a
+  restart; `?wait=true` answers only when it is done, with `507` for a breached budget.
 - **Scaled mode - a fleet across machines** (RFC-0022). When one box can no longer hold your cursors,
   or when serving and ingestion want to scale independently, the *same crates* run as three roles:
   a **control plane** holding what should run, a **writer pool** (`nuthatch worker`) whose members take
