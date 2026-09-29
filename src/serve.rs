@@ -6728,7 +6728,8 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         let error = body["error"].as_str().unwrap();
         assert!(
-            error.contains("DELIM") && !error.contains("evaluated"),
+            (error.contains("DELIM") || error.contains("NestedLoopJoinExec"))
+                && !error.contains("evaluated"),
             "{body}"
         );
     }

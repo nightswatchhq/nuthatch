@@ -4407,7 +4407,11 @@ template="pool"
         let correlated = r#"SELECT * FROM "t__transfer" a WHERE a.log_index =
             (SELECT max(b.log_index) FROM "t__big" b WHERE b.log_index < a.log_index)"#;
         match refusal(named(dir.path(), correlated, u64::MAX, 0, false, None)) {
-            AdmissionRefusal::Unboundable(why) => assert!(why.contains("DELIM"), "{why}"),
+            // Each engine names the operator that rescans: DuckDB's delim join, Burrmill's nested loop.
+            AdmissionRefusal::Unboundable(why) => assert!(
+                why.contains("DELIM") || why.contains("NestedLoopJoinExec"),
+                "{why}"
+            ),
             other => panic!("{other}"),
         }
     }
@@ -8017,24 +8021,39 @@ events = ["Transfer"]
     ///
     /// The cases below are deliberately ones the denylist does **not** list: if this test passes, the
     /// allowlist is carrying weight of its own rather than shadowing the older control.
+    /// The walks `/sql`'s allowlist runs on: DuckDB's, and Burrmill's where it is built in.
+    fn allowlist_sessions() -> Vec<Box<dyn Session>> {
+        #[allow(unused_mut)]
+        let mut sessions: Vec<Box<dyn Session>> =
+            vec![Box::new(Connection::open_in_memory().unwrap())];
+        #[cfg(feature = "shadow-burrmill")]
+        sessions.push(
+            crate::engine::Engine::open_bare(&crate::engine_burrmill::BurrmillEngine).unwrap(),
+        );
+        sessions
+    }
+
     #[test]
     fn the_allowlist_refuses_functions_the_denylist_never_heard_of() {
-        let conn = Connection::open_in_memory().unwrap();
-        for q in [
-            // Not in FORBIDDEN_FNS - inert today only because the extension is not bundled.
-            "SELECT * FROM read_xlsx('/etc/passwd')",
-            "SELECT * FROM st_read('/etc/passwd')",
-            "SELECT * FROM iceberg_scan('/tmp')",
-            "SELECT * FROM postgres_scan('host=x','public','t')",
-            // A plausible future name nobody has listed anywhere.
-            "SELECT * FROM read_totally_new_format('/etc/passwd')",
-            // And the ones it does list, by every spelling.
-            "SELECT * FROM read_csv('/etc/passwd')",
-            r#"SELECT * FROM "read_csv"('/etc/passwd')"#,
-        ] {
+        for (conn, q) in allowlist_sessions().iter().flat_map(|c| {
+            [
+                // Not in FORBIDDEN_FNS - inert today only because the extension is not bundled.
+                "SELECT * FROM read_xlsx('/etc/passwd')",
+                "SELECT * FROM st_read('/etc/passwd')",
+                "SELECT * FROM iceberg_scan('/tmp')",
+                "SELECT * FROM postgres_scan('host=x','public','t')",
+                // A plausible future name nobody has listed anywhere.
+                "SELECT * FROM read_totally_new_format('/etc/passwd')",
+                // And the ones it does list, by every spelling.
+                "SELECT * FROM read_csv('/etc/passwd')",
+                r#"SELECT * FROM "read_csv"('/etc/passwd')"#,
+            ]
+            .map(|q| (c, q))
+        }) {
             assert!(
-                reject_unknown_table_refs(&conn, q).is_err(),
-                "the allowlist must refuse: {q}"
+                reject_unknown_table_refs(conn.as_ref(), q).is_err(),
+                "the allowlist must refuse on {}: {q}",
+                conn.engine_version()
             );
         }
     }
@@ -8043,15 +8062,18 @@ events = ["Transfer"]
     /// distinguish it from a real table, so the name has to be checked.
     #[test]
     fn a_path_in_table_position_is_not_a_table_name() {
-        let conn = Connection::open_in_memory().unwrap();
-        for q in [
-            "SELECT * FROM '/etc/passwd'",
-            "SELECT * FROM '/x.parquet'",
-            "SELECT * FROM 'https://evil.example/x.parquet'",
-        ] {
+        for (conn, q) in allowlist_sessions().iter().flat_map(|c| {
+            [
+                "SELECT * FROM '/etc/passwd'",
+                "SELECT * FROM '/x.parquet'",
+                "SELECT * FROM 'https://evil.example/x.parquet'",
+            ]
+            .map(|q| (c, q))
+        }) {
             assert!(
-                reject_unknown_table_refs(&conn, q).is_err(),
-                "a path in table position must be refused: {q}"
+                reject_unknown_table_refs(conn.as_ref(), q).is_err(),
+                "a path in table position must be refused on {}: {q}",
+                conn.engine_version()
             );
         }
     }
@@ -8060,22 +8082,25 @@ events = ["Transfer"]
     /// which is a broken dashboard rather than a breach, but still a bug.
     #[test]
     fn ordinary_analytical_sql_still_passes_the_allowlist() {
-        let conn = Connection::open_in_memory().unwrap();
-        for q in [
-            "SELECT * FROM usdc__transfer",
-            r#"SELECT "from", "to", value_dec FROM usdc__transfer WHERE value_dec > 100"#,
-            "WITH t AS (SELECT * FROM usdc__transfer) SELECT count(*) FROM t",
-            "SELECT a.block_number FROM usdc__transfer a JOIN weth__transfer b USING (tx_hash)",
-            // Row-generating functions analytics legitimately uses.
-            "SELECT * FROM generate_series(1, 10)",
-            "SELECT * FROM range(10)",
-            // Inline VALUES references no table at all.
-            "SELECT * FROM (VALUES (1),(2)) t(x)",
-            "SELECT count(*) FROM usdc__transfer GROUP BY \"from\" ORDER BY 1 DESC LIMIT 5",
-        ] {
+        for (conn, q) in allowlist_sessions().iter().flat_map(|c| {
+            [
+                "SELECT * FROM usdc__transfer",
+                r#"SELECT "from", "to", value_dec FROM usdc__transfer WHERE value_dec > 100"#,
+                "WITH t AS (SELECT * FROM usdc__transfer) SELECT count(*) FROM t",
+                "SELECT a.block_number FROM usdc__transfer a JOIN weth__transfer b USING (tx_hash)",
+                // Row-generating functions analytics legitimately uses.
+                "SELECT * FROM generate_series(1, 10)",
+                "SELECT * FROM range(10)",
+                // Inline VALUES references no table at all.
+                "SELECT * FROM (VALUES (1),(2)) t(x)",
+                "SELECT count(*) FROM usdc__transfer GROUP BY \"from\" ORDER BY 1 DESC LIMIT 5",
+            ]
+            .map(|q| (c, q))
+        }) {
             assert!(
-                reject_unknown_table_refs(&conn, q).is_ok(),
-                "legitimate query must be allowed: {q}"
+                reject_unknown_table_refs(conn.as_ref(), q).is_ok(),
+                "legitimate query must be allowed on {}: {q}",
+                conn.engine_version()
             );
         }
     }
