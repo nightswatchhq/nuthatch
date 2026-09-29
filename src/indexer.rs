@@ -1513,9 +1513,13 @@ impl Supervisor {
         self.names.len() - 1
     }
 
-    /// The index of a nest by name, for a lifecycle command naming one.
+    /// The index of a nest by name, for a lifecycle command naming one. A retired slot is not on the
+    /// cursor: matching it acknowledged a remount of that name and never admitted it.
     fn index_of(&self, name: &str) -> Option<usize> {
-        self.names.iter().position(|n| n == name)
+        self.names
+            .iter()
+            .zip(&self.states)
+            .position(|(n, s)| n == name && !matches!(s, NestState::Retired))
     }
 
     /// Every quarantine reason, for the cursor's own death notice.
@@ -2042,10 +2046,10 @@ async fn runtime_index_loop(
         // windows" holds (RFC-0027 §2).
         drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
         if sup.all_retired() {
-            // Every nest was unmounted by the operator. Nothing left to advance, and nothing wrong -
-            // so this returns cleanly rather than bailing, and the runtime stays up (RFC-0027 §6).
-            tracing::info!("every nest on this cursor has been unmounted; retiring the cursor");
-            return Ok(());
+            // Every nest was unmounted. The cursor idles rather than returning: a return raced the
+            // next mount onto this chain, and the last cursor to return ended the runtime (#1545).
+            sleep_secs(1).await;
+            continue;
         }
         // Re-admit anything whose backoff elapsed, then take the live set for this iteration. Every
         // min/max/union below is derived from it - never from all nests (RFC-0026 §3.1).
@@ -2341,7 +2345,13 @@ pub async fn spawn_runtime(
     // declaring an entity is enough to make `--seal-direct` wrong for the whole cursor, which is the
     // only granularity the flag has.
     for nest in &ingests {
-        refuse_seal_direct_with_entities(seal_direct, nest)?;
+        // A live mount reaches this too (#1545), so the refusal must not leave a store locked (#1535).
+        if let Err(e) = refuse_seal_direct_with_entities(seal_direct, nest) {
+            for (_, w) in &alert_workers {
+                w.abort();
+            }
+            return Err(e);
+        }
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let ingest = tokio::spawn(runtime_index_loop(
