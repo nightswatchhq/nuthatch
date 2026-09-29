@@ -449,7 +449,9 @@ who need more - none of it in the way of the happy path:
   /_admin/suspend/<name>` takes a mount off its cursor and answers `503` in its place, keeping its data
   and record across a restart; `POST /_admin/resume/<name>` catches it up from where it stopped.
   `?dry_run=true` on a mount reports its chain, backfill, per-block RPC work and projected footprint,
-  and the refusal a real mount would give, mounting nothing.
+  and the refusal a real mount would give, mounting nothing. `POST /_admin/move/<name>` with a new
+  `nid` catches the new nest up beside the old one, then switches the name in one step: a reader sees
+  the old nest, then the new, and never an error between.
 - **Scaled mode - a fleet across machines** (RFC-0022). When one box can no longer hold your cursors,
   or when serving and ingestion want to scale independently, the *same crates* run as three roles:
   a **control plane** holding what should run, a **writer pool** (`nuthatch worker`) whose members take
