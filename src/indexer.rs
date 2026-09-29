@@ -2971,6 +2971,7 @@ async fn build_nest(
                 crate::seal::shared_store(&dir)
                     .unwrap_or_else(|| dir.join(crate::seal::SEGMENTS_DIR)),
             );
+            m.set_dataset_dir(dir.to_path_buf());
             // **#918: seed the sealed watermark from the store, not from the next seal.**
             //
             // The watermark is durable - `SEALED_THROUGH_KEY` in the store's meta - and the query path
