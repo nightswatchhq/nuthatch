@@ -443,7 +443,9 @@ who need more - none of it in the way of the happy path:
   Started with `--registry`, a runtime fetches a mounted NID it does not hold, verifies it as `nest load`
   does, and installs it at `data/<nid>/` first. A mount answers `202` at once, and `GET
   /_admin/mounts/<name>` reports it fetching, joining, live, or failed with the reason, across a
-  restart; `?wait=true` answers only when it is done, with `507` for a breached budget.
+  restart; `?wait=true` answers only when it is done, with `507` for a breached budget. `POST
+  /_admin/suspend/<name>` takes a mount off its cursor and answers `503` in its place, keeping its data
+  and record across a restart; `POST /_admin/resume/<name>` catches it up from where it stopped.
 - **Scaled mode - a fleet across machines** (RFC-0022). When one box can no longer hold your cursors,
   or when serving and ingestion want to scale independently, the *same crates* run as three roles:
   a **control plane** holding what should run, a **writer pool** (`nuthatch worker`) whose members take
