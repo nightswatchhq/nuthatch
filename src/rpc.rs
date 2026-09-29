@@ -79,10 +79,16 @@ fn decode_call_batch(response: &Value, expected: usize) -> Result<Vec<Option<Str
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let code = error.get("code").and_then(Value::as_i64);
-            let explicit_revert = matches!(code, Some(3 | -32000 | -32015))
-                && (message == "execution reverted"
-                    || message.starts_with("execution reverted:")
-                    || message.starts_with("vm execution error: revert"));
+            // GraphOps wraps the upstream's revert as `-32603 "gave up retrying on upstream-level
+            // after 1.9s: 3: execution reverted"`; the embedded `3:` keeps it as explicit as a bare one.
+            let wrapped_revert = code == Some(-32603)
+                && (message.ends_with(": 3: execution reverted")
+                    || message.contains(": 3: execution reverted:"));
+            let explicit_revert = wrapped_revert
+                || matches!(code, Some(3 | -32000 | -32015))
+                    && (message == "execution reverted"
+                        || message.starts_with("execution reverted:")
+                        || message.starts_with("vm execution error: revert"));
             if !explicit_revert {
                 return Err(ClassifiedError {
                     class: classify_rpc_error(error),
@@ -397,6 +403,8 @@ pub(crate) fn looks_like_cap(body: &str) -> bool {
         // Monad public endpoints, 2026-09-03 (RFC-0051): Ankr and QuickNode respectively.
         "exceeds size limit",
         "is limited to a",
+        // GraphOps, 2026-09-29.
+        "exceeded max allowed range",
     ];
     CAP.iter().any(|m| s.contains(m))
 }
@@ -466,6 +474,8 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         // fallback's cap list and not here, so the JSON-RPC classifier called it `Transient` and
         // the same width went round again - found by the test that pins it, before a backfill did.
         "logs matched by query",
+        // GraphOps, 2026-09-29: `-32012 "getLogs request exceeded max allowed range"` over 25,000.
+        "exceeded max allowed range",
     ];
     const TERMINAL: &[&str] = &[
         "must be authenticated",
@@ -2073,6 +2083,18 @@ mod tests {
             .unwrap(),
             vec![Some("0x0012".into()), None]
         );
+        // GraphOps, measured 2026-09-29: the upstream's code-3 revert, wrapped by its proxy.
+        assert_eq!(
+            super::decode_call_batch(
+                &json!([
+                    {"id":0,"error":{"code":-32603,"message":"gave up retrying on upstream-level after 1.89064678s: 3: execution reverted"}},
+                    {"id":1,"error":{"code":-32603,"message":"gave up retrying on upstream-level after 2s: 3: execution reverted: missing getter"}}
+                ]),
+                2
+            )
+            .unwrap(),
+            vec![None, None]
+        );
         for response in [
             json!([]),
             json!({"result":"0x"}),
@@ -2083,6 +2105,8 @@ mod tests {
             json!([{"id":0,"result":"0x1"}]),
             json!([{"id":0,"error":{"code":-32000,"message":"missing trie node"}}]),
             json!([{"id":0,"error":{"code":-32602,"message":"invalid block selector"}}]),
+            json!([{"id":0,"error":{"code":-32603,"message":"gave up retrying on upstream-level after 2s: -32000: header not found"}}]),
+            json!([{"id":0,"error":{"code":-32603,"message":"execution reverted"}}]),
             json!([{"id":0,"error":{"code":429,"message":"rate limit exceeded"}}]),
             json!([{"id":0,"result":"0x","error":{"code":3,"message":"execution reverted"}}]),
         ] {
@@ -2327,6 +2351,22 @@ mod tests {
                 "the text fallback must agree with the JSON-RPC classifier: {body}"
             );
         }
+    }
+
+    /// GraphOps' Arbitrum endpoint caps `eth_getLogs` at 25,000 blocks, measured 2026-09-29 with a
+    /// 100,000-block ask. The cap itself is only in `data.details`, so the chunker has to halve to it.
+    #[test]
+    fn graphops_endpoint_cap_shape_is_narrowable() {
+        let body = r#"{"code":-32012,"message":"getLogs request exceeded max allowed range","data":{"code":"ErrGetLogsExceededMaxAllowedRange","details":{"maxAllowedRange":25000,"requestRange":100001}}}"#;
+        let err: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            matches!(
+                super::classify_rpc_error(&err),
+                super::FailureClass::Narrowable { .. }
+            ),
+            "{body} must be narrowable, not transient"
+        );
+        assert!(super::looks_like_cap(body));
     }
 
     /// **The guard that makes the timestamp cache sound at all** (RFC-0029 §6d).
