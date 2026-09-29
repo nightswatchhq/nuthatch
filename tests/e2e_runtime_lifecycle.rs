@@ -2454,3 +2454,38 @@ async fn a_refused_move_leaves_no_fetched_dataset_behind() {
     );
     assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
 }
+
+/// #1557: a mounted nest's sealed figure is the segments its own manifest names, not the runtime's
+/// whole shared store, which here holds another dataset's 777 bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mounted_nests_storage_is_its_own_not_the_shared_stores() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c4".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let store = roost.path().join(nuthatch::seal::SEGMENTS_DIR);
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join(format!("{}.parquet", "ee".repeat(32))),
+        vec![0u8; 777],
+    )
+    .unwrap();
+
+    handles
+        .mount("storagewire", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    let text = nuthatch::metrics::METRICS.render();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("nuthatch_nest_sealed_segments_bytes{nest=\"storagewire\"}"))
+        .unwrap_or_else(|| panic!("no per-nest sealed series:\n{text}"));
+    assert!(
+        line.ends_with(" 0"),
+        "the nest reported the shared store rather than its own segments: {line}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("nuthatch_nest_hot_store_bytes{nest=\"storagewire\"}")),
+        "no per-nest hot series"
+    );
+}

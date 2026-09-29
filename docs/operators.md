@@ -951,6 +951,9 @@ per-nest series below.
 
 Per-nest series, labelled `{nest="…"}` with the nest's route in a runtime (its alias, or `tenant/alias`)
 and its name in a single-nest `dev` (#1415) - the ones that make co-tenancy operable:
+`nuthatch_nest_hot_store_bytes` and `nuthatch_nest_sealed_segments_bytes` (the segments this nest's
+manifest names; a segment two datasets share is counted under both, so for disk used read the
+unlabelled `nuthatch_sealed_segments_bytes`, which counts each store once),
 `nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
 `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`,

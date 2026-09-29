@@ -155,6 +155,10 @@ pub struct NestMetrics {
     hot_bytes: AtomicU64,
     sealed_bytes: AtomicU64,
     storage_scanned_at: AtomicU64,
+    /// The dataset directory, whose manifest names this nest's own segments (#1557). `None` for a
+    /// fixture; the store's whole size then stands in.
+    dataset: Mutex<Option<PathBuf>>,
+    dataset_sealed_bytes: AtomicU64,
 }
 
 impl NestMetrics {
@@ -482,6 +486,30 @@ impl NestMetrics {
         *self.storage.lock().unwrap() = Some((hot, sealed));
         self.storage_scanned_at.store(0, Relaxed);
     }
+
+    pub fn set_dataset_dir(&self, dir: PathBuf) {
+        *self.dataset.lock().unwrap() = Some(dir);
+        self.storage_scanned_at.store(0, Relaxed);
+    }
+
+    /// The segment store this nest seals into, which a runtime's nests share.
+    fn sealed_store(&self) -> Option<PathBuf> {
+        self.storage
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, s)| s.clone())
+    }
+
+    /// Hot-store bytes and the bytes of the segments this nest's manifest names. A segment another
+    /// dataset also names is counted under both, so a sum over nests is not disk used.
+    pub fn dataset_storage_bytes(&self) -> (u64, u64) {
+        let (hot, store) = self.storage_bytes();
+        if self.dataset.lock().unwrap().is_none() {
+            return (hot, store);
+        }
+        (hot, self.dataset_sealed_bytes.load(Relaxed))
+    }
     pub fn storage_bytes(&self) -> (u64, u64) {
         const STORAGE_REFRESH_SECS: u64 = 60;
         let now = now_unix();
@@ -495,6 +523,10 @@ impl NestMetrics {
             if let Some((hot, sealed)) = self.storage.lock().unwrap().as_ref() {
                 self.hot_bytes.store(path_bytes(hot), Relaxed);
                 self.sealed_bytes.store(path_bytes(sealed), Relaxed);
+            }
+            if let Some(dir) = self.dataset.lock().unwrap().as_ref() {
+                self.dataset_sealed_bytes
+                    .store(manifest_segment_bytes(dir), Relaxed);
             }
         }
         (
@@ -1134,13 +1166,14 @@ impl Metrics {
         let (hot_bytes, sealed_bytes) = {
             let per = self.per_nest.lock().unwrap();
             let mut hot = 0u64;
-            let mut sealed = 0u64;
+            // A runtime's nests share one segment store; counting it once per nest multiplied it.
+            let mut stores = std::collections::BTreeMap::new();
             for m in per.values() {
                 let (h, s) = m.storage_bytes();
                 hot += h;
-                sealed += s;
+                stores.insert(m.sealed_store(), s);
             }
-            (hot, sealed)
+            (hot, stores.values().sum::<u64>())
         };
         s.push_str(&gauge(
             "nuthatch_hot_store_bytes",
@@ -1149,7 +1182,7 @@ impl Metrics {
         ));
         s.push_str(&gauge(
             "nuthatch_sealed_segments_bytes",
-            "Bytes of sealed Parquet segments on disk, summed across nests.",
+            "Bytes of sealed Parquet segments on disk, each segment store counted once.",
             sealed_bytes,
         ));
 
@@ -1236,6 +1269,18 @@ impl Metrics {
                         s.push_str(&format!("{name}{{nest=\"{nest}\"}} {}\n", get(m)));
                     }
                 };
+            labelled(
+                "nuthatch_nest_hot_store_bytes",
+                "Bytes of this nest's hot store (redb) on disk.",
+                "gauge",
+                &|m| m.dataset_storage_bytes().0,
+            );
+            labelled(
+                "nuthatch_nest_sealed_segments_bytes",
+                "Bytes of the sealed segments this nest's manifest names. Segments datasets share are counted under each, so the sum over nests is not disk used; nuthatch_sealed_segments_bytes is.",
+                "gauge",
+                &|m| m.dataset_storage_bytes().1,
+            );
             labelled(
                 "nuthatch_nest_tip_height",
                 "Latest source block height, per nest and therefore per chain.",
@@ -1469,6 +1514,24 @@ pub fn endpoint_label(url: &str) -> String {
     hostport.trim().to_string()
 }
 
+/// Bytes of the segment files a dataset's manifest names, each file counted once.
+fn manifest_segment_bytes(dir: &Path) -> u64 {
+    let Ok(manifest) = crate::seal::load_manifest(dir) else {
+        return 0;
+    };
+    let files: std::collections::BTreeSet<PathBuf> = manifest
+        .tables
+        .values()
+        .flatten()
+        .map(|s| crate::seal::segment_path(dir, &s.file, &s.hash))
+        .collect();
+    files
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
 fn path_bytes(path: &Path) -> u64 {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -1676,6 +1739,63 @@ mod tests {
             (11, 13),
             "a second scrape uses the bounded-refresh value rather than walking the tree again"
         );
+    }
+
+    /// #1557: each nest reports its own redb and the segments its manifest names, and the global
+    /// sealed total counts a runtime's shared segment store once, not once per nest.
+    #[test]
+    fn storage_is_reported_per_nest_and_the_shared_store_once() {
+        use crate::seal::{Manifest, Segment, SEGMENTS_DIR};
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        let (own_a, shared, own_b) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        for (h, len) in [(&own_a, 100usize), (&shared, 1000), (&own_b, 10_000)] {
+            std::fs::write(store.join(format!("{h}.parquet")), vec![0u8; len]).unwrap();
+        }
+        let seg = |h: &str| Segment {
+            hash: h.to_string(),
+            from_block: 1,
+            to_block: 2,
+            rows: 1,
+            file: format!("t-{h}.parquet"),
+            registry_snapshot: None,
+            provisional: false,
+            writer_profile: crate::seal::ORIGINAL_WRITER_PROFILE.to_string(),
+        };
+        let m = Metrics::new();
+        for (name, nid, hashes, redb) in [
+            ("a", "01".repeat(32), [&own_a, &shared], 3usize),
+            ("b", "02".repeat(32), [&shared, &own_b], 5),
+        ] {
+            let dir = root.path().join(crate::runtime::DATA_DIR).join(&nid);
+            std::fs::create_dir_all(dir.join(SEGMENTS_DIR)).unwrap();
+            let mut manifest = Manifest::default();
+            manifest
+                .tables
+                .insert("t".into(), hashes.iter().map(|h| seg(h)).collect());
+            std::fs::write(
+                dir.join(SEGMENTS_DIR).join(crate::seal::MANIFEST_FILE),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(dir.join("nuthatch.redb"), vec![0u8; redb]).unwrap();
+            let nest = m.nest(name);
+            nest.set_storage_paths(dir.join("nuthatch.redb"), store.clone());
+            nest.set_dataset_dir(dir);
+        }
+
+        let out = m.render();
+        for line in [
+            "nuthatch_sealed_segments_bytes 11100\n",
+            "nuthatch_hot_store_bytes 8\n",
+            "nuthatch_nest_sealed_segments_bytes{nest=\"a\"} 1100\n",
+            "nuthatch_nest_sealed_segments_bytes{nest=\"b\"} 11000\n",
+            "nuthatch_nest_hot_store_bytes{nest=\"a\"} 3\n",
+            "nuthatch_nest_hot_store_bytes{nest=\"b\"} 5\n",
+        ] {
+            assert!(out.contains(line), "missing {line:?} in:\n{out}");
+        }
     }
 
     #[test]
