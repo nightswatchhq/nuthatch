@@ -419,6 +419,7 @@ async fn bring_up_live(
         roster,
         estimates: std::collections::HashMap::new(),
         multi_tenant,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: root.to_path_buf(),
             // The whole table, including the record for the nest not yet mounted - which is exactly
@@ -442,6 +443,7 @@ async fn bring_up_live(
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     // The cursor has to keep running for the mount handshake to be answered at a window boundary.

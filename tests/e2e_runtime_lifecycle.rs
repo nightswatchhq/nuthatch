@@ -89,6 +89,7 @@ async fn two_nest_roost(
             ("arb".to_string(), 90),
         ]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             // Un-migrated: no mount records, so resolution stays on the pre-2.0 `nests/<name>` path.
@@ -111,6 +112,7 @@ async fn two_nest_roost(
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     // The ingest task is deliberately leaked into the handles' lifetime here: the cursor must stay
@@ -484,6 +486,7 @@ async fn route_named_runtime(
         roster,
         estimates: std::collections::HashMap::from([(route.to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: nest_dir.to_path_buf(),
             mounts: Vec::new(),
@@ -505,6 +508,7 @@ async fn route_named_runtime(
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -691,6 +695,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         roster,
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             // Only `usdc` is on record - `gamma` below is exactly the "runtime has never seen this
@@ -723,6 +728,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -867,6 +873,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
         roster,
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -897,12 +904,14 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
 
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+    let routes =
+        runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(TOKEN.to_string()));
 
     let (status, body) = call(
         &routes,
@@ -962,7 +971,8 @@ async fn a_disabled_admin_surface_exposes_no_lifecycle_routes() {
 
     // Premise: with admin_enabled: true the routes exist - an unauthenticated call gets 401, not
     // 404. This rules out a `lifecycle_routes` that always returns Router::new().
-    let enabled_routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+    let enabled_routes =
+        runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(TOKEN.to_string()));
     let (premise_status, _) = call(
         &enabled_routes,
         "POST",
@@ -981,7 +991,7 @@ async fn a_disabled_admin_surface_exposes_no_lifecycle_routes() {
 
     // admin_enabled: false - this is the posture for any localhost bind without an explicit token
     // or any remote bind that omits --admin-token.
-    let routes = runtime::lifecycle_routes(handles.clone(), false, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), false, None);
 
     let (mount_status, _) = call(
         &routes,
@@ -1081,7 +1091,8 @@ async fn the_lifecycle_routes_demand_the_admin_token_before_they_act() {
     let live_service = handles.live.service();
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
     // The posture an off-localhost bind derives: surface on, credential required.
-    let routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+    let routes =
+        runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(TOKEN.to_string()));
 
     // 1. An unauthenticated mount is refused, and mounts nothing.
     let (status, _) = call(
@@ -1138,7 +1149,7 @@ async fn the_lifecycle_routes_demand_the_admin_token_before_they_act() {
     let (status, body) = call(
         &routes,
         "POST",
-        &format!("/_admin/nests?token={TOKEN}"),
+        &format!("/_admin/nests?token={TOKEN}&wait=true"),
         None,
         Some(r#"{"name":"usdc"}"#),
     )
@@ -1237,6 +1248,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
         roster,
         estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1267,6 +1279,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1379,6 +1392,7 @@ async fn empty_runtime(
         roster,
         estimates: Default::default(),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1409,6 +1423,7 @@ async fn empty_runtime(
             dormant: Default::default(),
             fail_fast: false,
             cursors: Some(feed),
+            registry: None,
         },
     };
     (handles, tape, intake)
@@ -1570,6 +1585,391 @@ async fn a_dormant_chain_is_opened_by_its_first_mount() {
     assert!(intake.try_recv().is_err());
 }
 
+/// A registry holding one published nest, and that nest's NID as `nuthatch nest nid` prints it.
+async fn registry_with_one_nest(registry: &std::path::Path) -> String {
+    let src = tempfile::tempdir().unwrap();
+    scaffold_nest(src.path(), "usdc", USDC);
+    let nid = nuthatch::blob::nest_nid(src.path()).unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    let file = bundle.path().join("usdc.bundle");
+    nuthatch::blob::bundle(src.path(), Some(&file), false).unwrap();
+    let store = nuthatch::distribution::open(registry.to_str().unwrap()).unwrap();
+    nuthatch::distribution::publish(store.as_ref(), &file, Some("usdc"), None)
+        .await
+        .unwrap();
+    nid
+}
+
+/// Nothing but datasets under `data/`: no fetch was left staged.
+fn no_fetch_left_behind(roost: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(roost.join("data")) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        assert!(!n.starts_with(".fetch-"), "a staged fetch was left: {n}");
+    }
+}
+
+/// #1543: a mount naming a NID the runtime does not hold fetches it from the registry, verifies it,
+/// installs it at `data/<nid>/` and indexes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_fetches_a_nid_the_runtime_does_not_hold() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::remove_dir_all(&data_dir).unwrap();
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("a mount by nid must fetch what the runtime does not hold");
+    assert!(data_dir.join(nuthatch::config::CONFIG_FILE).exists());
+    no_fetch_left_behind(roost.path());
+    let last_block = |h: &runtime::RuntimeHandles| {
+        h.states
+            .iter()
+            .find(|(n, _)| n == "usdc")
+            .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
+    };
+    assert!(
+        wait_until(POLL_TIMEOUT, || last_block(&handles).as_deref()
+            == Some("3"))
+        .await,
+        "the fetched nest never indexed: last_block {:?}",
+        last_block(&handles)
+    );
+}
+
+/// #1543: without `--registry` the refusal names the flag; a NID the registry lacks is refused before
+/// anything is written; and a fetched nest the runtime then refuses is removed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_that_cannot_or_may_not_fetch_leaves_nothing_behind() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::remove_dir_all(&data_dir).unwrap();
+    let parse = || Some(runtime::Nid::parse(&nid).unwrap());
+
+    let err = handles.mount("usdc", parse()).await.unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<runtime::MountRefusal>(),
+            Some(runtime::MountRefusal::NotHeld { .. })
+        ),
+        "{err:#}"
+    );
+    assert!(format!("{err:#}").contains("--registry"), "{err:#}");
+    assert!(!data_dir.exists());
+
+    let empty = tempfile::tempdir().unwrap();
+    handles.mount_ctx.registry = Some(empty.path().to_str().unwrap().to_string());
+    let err = handles.mount("usdc", parse()).await.unwrap_err();
+    assert!(format!("{err:#}").contains("not found"), "{err:#}");
+    assert!(
+        !data_dir.exists(),
+        "a nid the registry lacks wrote a dataset"
+    );
+    no_fetch_left_behind(roost.path());
+
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    handles.mount_ctx.max_rss_mb = 100;
+    let err = handles.mount("usdc", parse()).await.unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<runtime::MountRefusal>(),
+            Some(runtime::MountRefusal::OverBudget { .. })
+        ),
+        "{err:#}"
+    );
+    assert!(
+        !data_dir.exists(),
+        "a refused mount kept the dataset it fetched"
+    );
+    assert!(handles.states.is_empty());
+}
+
+/// A mount-jobs index in a directory of its own, kept for the life of the test process.
+fn test_jobs() -> Arc<nuthatch::mount_jobs::MountJobs> {
+    let dir = tempfile::tempdir().unwrap().keep();
+    Arc::new(nuthatch::mount_jobs::MountJobs::load(&dir))
+}
+
+/// Poll `GET /_admin/mounts/<name>` until the job reaches `phase`, returning its last body.
+async fn wait_for_phase(routes: &axum::Router, name: &str, phase: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + POLL_TIMEOUT;
+    loop {
+        let (_, body) = call(routes, "GET", &format!("/_admin/mounts/{name}"), None, None).await;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if body["phase"] == phase || std::time::Instant::now() > deadline {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// #1544: a mount answers 202 at once, and its progress is readable, even while the runtime's lock
+/// is held, until it goes live. A second POST of the same name and NID is idempotent; another NID
+/// under that name is a conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_is_accepted_at_once_and_read_until_it_is_live() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::remove_dir_all(runtime::MountTable::data_dir(roost.path(), &nid)).unwrap();
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+
+    // Hold the lock the mount needs: acceptance and status must not wait on it.
+    let held = handles.lock().await;
+    let (status, accepted) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        call(&routes, "POST", "/_admin/nests", None, Some(&body)),
+    )
+    .await
+    .expect("a POST waited on the runtime's lock");
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{accepted}");
+    let (status, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        call(&routes, "GET", "/_admin/mounts", None, None),
+    )
+    .await
+    .expect("a status read waited on the runtime's lock");
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let (status, again) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "an in-flight re-POST: {again}"
+    );
+    drop(held);
+
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    assert_eq!(
+        status_of(&handles).await,
+        axum::http::StatusCode::OK,
+        "the mount went live without its routes"
+    );
+    let (status, _) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "a re-POST of a live mount"
+    );
+    let other = format!(r#"{{"name":"usdc","nid":"{}"}}"#, "0a".repeat(32));
+    let (status, _) = call(&routes, "POST", "/_admin/nests", None, Some(&other)).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+}
+
+async fn status_of(
+    handles: &Arc<tokio::sync::Mutex<runtime::RuntimeHandles>>,
+) -> axum::http::StatusCode {
+    let h = handles.lock().await;
+    status(&h.live, "/usdc/health").await
+}
+
+/// #1544: a mount that fails says why, and leaves nothing on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_mount_is_reported_with_its_reason() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::remove_dir_all(&data_dir).unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    handles.mount_ctx.registry = Some(empty.path().to_str().unwrap().to_string());
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+    let (status, _) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job = wait_for_phase(&routes, "usdc", "failed").await;
+    assert_eq!(job["phase"], "failed", "{job}");
+    assert!(
+        job["reason"].as_str().unwrap_or("").contains("not found"),
+        "{job}"
+    );
+    assert!(!data_dir.exists());
+}
+
+/// #1544: a restart mid-mount resumes the job, after clearing the fetch the killed process left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_resumes_an_interrupted_mount() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::remove_dir_all(runtime::MountTable::data_dir(roost.path(), &nid)).unwrap();
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    let stale = roost.path().join("data/.fetch-killed");
+    std::fs::create_dir_all(stale.join("nest")).unwrap();
+    std::fs::write(
+        roost.path().join(nuthatch::mount_jobs::JOBS_FILE),
+        format!(r#"[{{"name":"usdc","nid":"{nid}","phase":"fetching","since_unixtime":1}}]"#),
+    )
+    .unwrap();
+
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    assert!(!stale.exists(), "the killed fetch was left staged");
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(
+        job["phase"], "live",
+        "the interrupted mount was not resumed: {job}"
+    );
+}
+
+/// `empty_runtime` with a `mounts.toml` declaring its chain, and `usdc` mounted and at the tip.
+async fn one_live_mount(
+    roost: &std::path::Path,
+    nid: &str,
+) -> (runtime::RuntimeHandles, Arc<TapeSource>) {
+    std::fs::write(
+        roost.join(runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
+    )
+    .unwrap();
+    let (mut handles, tape, _intake) = empty_runtime(roost, nid).await;
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(nid).unwrap()))
+        .await
+        .expect("mount");
+    assert!(
+        wait_until(POLL_TIMEOUT, || usdc_last_block(&handles).as_deref()
+            == Some("3"))
+        .await,
+        "premise: usdc indexes to the tip"
+    );
+    (handles, tape)
+}
+
+fn usdc_last_block(h: &runtime::RuntimeHandles) -> Option<String> {
+    h.states
+        .iter()
+        .find(|(n, _)| n == "usdc")
+        .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
+}
+
+/// #1548: a suspended mount answers a named 503, lets go of its store, keeps its data and record,
+/// stays suspended across a restart, and does not hold `/ready` down. Resuming catches it up from
+/// where it stopped, and releases a quarantine it was in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspended_mount_keeps_its_place_and_resumes_from_it() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "5a".repeat(32);
+    let (mut handles, tape) = one_live_mount(roost.path(), &nid).await;
+    handles
+        .health
+        .quarantine_nest("usdc", "a view failed".to_string(), 1, None);
+
+    handles.suspend("usdc").await.expect("suspend");
+    let body = body_json(&handles.live, "/usdc/health").await;
+    assert_eq!(body["suspended"], true, "{body}");
+    assert_eq!(
+        status(&handles.live, "/usdc/health").await,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let db = runtime::MountTable::data_dir(roost.path(), &nid).join("nuthatch.redb");
+    drop(Store::open(&db).expect("a suspended mount must let go of its store"));
+    assert_eq!(handles.health.json_for("usdc").0, "suspended");
+    assert!(
+        handles.health.all_indexing(),
+        "a pause must not fail /ready"
+    );
+
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert_eq!(file.runtime.suspended, vec!["usdc".to_string()]);
+    let (active, suspended) = runtime::split_suspended(&file);
+    assert!(
+        active.mounts.is_empty(),
+        "a restart would index the suspended mount"
+    );
+    assert_eq!(suspended.get("usdc"), Some(&nid));
+
+    let (a1, a2) = (account(1), account(2));
+    tape.insert_block(
+        4,
+        transfers_block(
+            4,
+            0,
+            1_700_000_004,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 400)],
+        ),
+    );
+    tape.advance_tip_to(4);
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("resume");
+    assert!(
+        wait_until(POLL_TIMEOUT, || usdc_last_block(&handles).as_deref()
+            == Some("4"))
+        .await,
+        "the resumed mount did not catch up: {:?}",
+        usdc_last_block(&handles)
+    );
+    assert_eq!(
+        status(&handles.live, "/usdc/health").await,
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(handles.health.json_for("usdc").0, "indexing");
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert!(file.runtime.suspended.is_empty());
+    assert_eq!(file.mounts.len(), 1);
+}
+
+/// #1548 over HTTP: suspend and resume by name, with the refusals a caller can hit, and an unmount
+/// of a suspended mount dropping its record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn suspend_and_resume_over_the_admin_api() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6b".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/nope", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    let (status, _) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "resuming a live mount"
+    );
+
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let (status, body) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
+
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let (status, _) = call(&routes, "DELETE", "/_admin/nests/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::NOT_FOUND);
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert!(file.runtime.suspended.is_empty() && file.mounts.is_empty());
+}
+
 /// #1547: an API-only operator can free a dataset's disk. Unmounting one of two mounts of a NID with
 /// `?reclaim=true` keeps the dataset and names who holds it; unmounting the last one removes it.
 /// A dataset unmounted earlier is reclaimed by NID, and a malformed NID is a caller error.
@@ -1644,6 +2044,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
         roster,
         estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
         multi_tenant: false,
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1674,11 +2075,13 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let routes = runtime::lifecycle_routes(handles.clone(), true, Some(TOKEN.to_string()));
+    let routes =
+        runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(TOKEN.to_string()));
 
     handles
         .lock()
@@ -1744,6 +2147,312 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// #1550: for every admission check, a dry run reports the refusal a real mount then gives, with the
+/// same status, and mounts nothing. An admitted dry run reports its cost and the backfill ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
+    enum Case {
+        Admitted,
+        AlreadyMounted,
+        NotHeld,
+        UndeclaredChain,
+        CursorStopped,
+        OverBudget,
+    }
+    for (label, case) in [
+        ("admitted", Case::Admitted),
+        ("already mounted", Case::AlreadyMounted),
+        ("not held", Case::NotHeld),
+        ("undeclared chain", Case::UndeclaredChain),
+        ("cursor stopped", Case::CursorStopped),
+        ("over budget", Case::OverBudget),
+    ] {
+        let roost = tempfile::tempdir().unwrap();
+        let nid = "7c".repeat(32);
+        let (mut handles, _tape, mut intake) = empty_runtime(roost.path(), &nid).await;
+        let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+        match case {
+            Case::Admitted => {}
+            Case::AlreadyMounted => handles
+                .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+                .await
+                .unwrap(),
+            Case::NotHeld => std::fs::remove_dir_all(&data_dir).unwrap(),
+            Case::UndeclaredChain => {
+                let mut cfg = nuthatch::config::Config::load(&data_dir).unwrap();
+                cfg.nest.chain = "base".to_string();
+                cfg.nest.chain_id = 8453;
+                cfg.save(&data_dir).unwrap();
+            }
+            Case::CursorStopped => handles
+                .health
+                .quarantine_cursor("arbitrum-one", "finality violation".to_string()),
+            Case::OverBudget => handles.mount_ctx.max_rss_mb = 100,
+        }
+        let mounted_before = handles.states.len();
+        let _ = intake.try_recv();
+        let handles = Arc::new(tokio::sync::Mutex::new(handles));
+        let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+        let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+
+        let (status, dry) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?dry_run=true",
+            None,
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{label}: {dry}");
+        let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+        assert_eq!(
+            handles.lock().await.states.len(),
+            mounted_before,
+            "{label}: the dry run mounted something"
+        );
+        assert!(
+            intake.try_recv().is_err(),
+            "{label}: the dry run started a cursor"
+        );
+
+        let (real, answer) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?wait=true",
+            None,
+            Some(&body),
+        )
+        .await;
+        match dry["refusal_status"].as_u64() {
+            Some(code) => assert_eq!(
+                u64::from(real.as_u16()),
+                code,
+                "{label}: the dry run said {dry}, the mount answered {answer}"
+            ),
+            None => {
+                assert_eq!(
+                    real,
+                    axum::http::StatusCode::OK,
+                    "{label}: {dry} / {answer}"
+                );
+                assert!(dry["incoming_mb"].as_u64().is_some(), "{label}: {dry}");
+                assert_eq!(dry["tip"], 3, "{label}: {dry}");
+                assert_eq!(dry["chain"], "arbitrum-one", "{label}: {dry}");
+            }
+        }
+        if matches!(case, Case::Admitted) {
+            assert!(
+                dry["refusal"].is_null(),
+                "an admissible mount was refused: {dry}"
+            );
+        }
+    }
+}
+
+/// #1550: a dry run fetches and verifies a NID the runtime does not hold, keeps the verified nest,
+/// and mounts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_fetches_what_it_needs_and_mounts_nothing() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, mut intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::remove_dir_all(&data_dir).unwrap();
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+
+    let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+    let (status, dry) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?dry_run=true",
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{dry}");
+    let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+    assert_eq!(dry["fetched"], true, "{dry}");
+    assert!(dry["refusal"].is_null(), "{dry}");
+    assert!(data_dir.join(nuthatch::config::CONFIG_FILE).exists());
+    assert!(handles.lock().await.states.is_empty());
+    assert!(intake.try_recv().is_err());
+}
+
+/// #1549: moving a name to another NID leaves no gap. A reader polling the name through the move
+/// sees only 200s, and only the old dataset, then only the new one. Afterwards the cursor knows the
+/// moved nest by the name, the staging name is gone, and the old store is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_name_moves_to_another_nid_without_a_gap() {
+    use tower::ServiceExt;
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("8d".repeat(32), "9e".repeat(32));
+    let (mut handles, tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+
+    let svc = handles.live.service();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (svc, stop) = (svc.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut seen: Vec<(u16, String)> = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let req = axum::http::Request::builder()
+                    .uri("/usdc/sql?q=SELECT%201")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = svc.clone().oneshot(req).await.unwrap();
+                let status = resp.status().as_u16();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let nid = body["provenance"]["nid"].as_str().unwrap_or("").to_string();
+                seen.push((status, nid));
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            seen
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    handles
+        .move_name("usdc", runtime::Nid::parse(&new_nid).unwrap())
+        .await
+        .expect("move");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let seen = reader.await.unwrap();
+
+    assert!(
+        seen.iter().all(|(s, _)| *s == 200),
+        "a reader saw an error during the move: {:?}",
+        seen.iter()
+            .filter(|(s, _)| *s != 200)
+            .take(3)
+            .collect::<Vec<_>>()
+    );
+    let first_new = seen
+        .iter()
+        .position(|(_, n)| *n == new_nid)
+        .expect("never saw the new nid");
+    assert!(first_new > 0, "never saw the old nid");
+    assert!(
+        seen[..first_new].iter().all(|(_, n)| *n == old_nid),
+        "before the switch a reader saw something other than the old nest"
+    );
+    assert!(
+        seen[first_new..].iter().all(|(_, n)| *n == new_nid),
+        "after the switch a reader saw the old nest again"
+    );
+
+    assert_eq!(
+        status(&handles.live, "/usdc.moving/health").await,
+        axum::http::StatusCode::NOT_FOUND,
+        "the staging name is still routed"
+    );
+    let old_db = runtime::MountTable::data_dir(roost.path(), &old_nid).join("nuthatch.redb");
+    drop(Store::open(&old_db).expect("the old nest's store was not released"));
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert_eq!(file.mounts.len(), 1, "{:?}", file.mounts);
+    assert_eq!(file.mounts[0].nid, new_nid);
+
+    let (a1, a2) = (account(1), account(2));
+    tape.insert_block(
+        4,
+        transfers_block(
+            4,
+            0,
+            1_700_000_004,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 400)],
+        ),
+    );
+    tape.advance_tip_to(4);
+    assert!(
+        wait_until(POLL_TIMEOUT, || usdc_last_block(&handles).as_deref()
+            == Some("4"))
+        .await,
+        "the moved nest stopped following the tip"
+    );
+    handles.unmount("usdc").await.expect("unmount");
+    drop(
+        Store::open(&new_dir.join("nuthatch.redb"))
+            .expect("the cursor did not know the moved nest by its name"),
+    );
+}
+
+/// #1549 over HTTP: a move is a job like a mount, ending live on the new NID; a malformed NID is a
+/// caller error and a move of a name that is not mounted fails with the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_over_the_admin_api_is_a_job() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("ad".repeat(32), "be".repeat(32));
+    let (handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let (status, _) = call(
+        &routes,
+        "POST",
+        "/_admin/move/usdc",
+        None,
+        Some(r#"{"nid":"nope"}"#),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    let body = format!(r#"{{"nid":"{new_nid}"}}"#);
+    let (status, job) = call(&routes, "POST", "/_admin/move/usdc", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{job}");
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    assert_eq!(job["nid"], new_nid.as_str(), "{job}");
+
+    let (status, _) = call(&routes, "POST", "/_admin/move/ghost", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job = wait_for_phase(&routes, "ghost", "failed").await;
+    assert!(
+        job["reason"].as_str().unwrap_or("").contains("not mounted"),
+        "{job}"
+    );
+}
+
+/// #1549, from review: a move that fetched its NID and was then refused removes the fetch, and the
+/// name keeps serving the nest it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_move_leaves_no_fetched_dataset_behind() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let new_nid = registry_with_one_nest(registry.path()).await;
+    let old_nid = "af".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    handles.mount_ctx.max_rss_mb = 100;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    assert!(!new_dir.exists(), "premise: the new nid is not held");
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let body = format!(r#"{{"nid":"{new_nid}"}}"#);
+    let (status, _) = call(&routes, "POST", "/_admin/move/usdc", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job = wait_for_phase(&routes, "usdc", "failed").await;
+    assert_eq!(job["phase"], "failed", "{job}");
+    assert!(
+        !new_dir.exists(),
+        "a refused move left the dataset it fetched"
+    );
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
 }
 
 /// #1557: a mounted nest's sealed figure is the segments its own manifest names, not the runtime's

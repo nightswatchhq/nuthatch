@@ -296,6 +296,10 @@ pub struct RuntimeMeta {
     /// before it starts. Absent → the CLAUDE.md 2 GB budget ([`DEFAULT_MAX_RSS_MB`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rss_mb: Option<u64>,
+    /// Route keys of mounts suspended by the operator (#1548). Their records and data are kept; they
+    /// are not indexed or served until resumed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspended: Vec<String>,
 }
 
 /// SEC-10: anything that becomes a filesystem path segment *and* a route segment gets this charset.
@@ -1602,11 +1606,13 @@ pub async fn dev(
     fail_fast: bool,
     freshness: crate::freshness::Freshness,
     cors: Vec<String>,
+    registry: Option<String>,
 ) -> Result<()> {
     // Before the mount table is even read: a malformed origin should fail the command, not the
     // fifteenth minute of a backfill.
     let cors = crate::serve::cors_layer(&cors)?;
-    let mounts = MountTable::load(&dir)?;
+    let all_mounts = MountTable::load(&dir)?;
+    let (mounts, suspended) = split_suspended(&all_mounts);
     let admin_enabled = indexer::admin_enabled(no_admin, &listen);
     // Empty is a valid start (#1545): nests arrive over the admin API. Without that API nothing
     // ever could.
@@ -1639,7 +1645,9 @@ pub async fn dev(
         tracing::warn!("identity drift: {d}");
     }
 
-    let multi_tenant = mounts.is_multi_tenant();
+    // The whole table decides the tenancy shape, suspended records included, or a route key would
+    // change with a suspend.
+    let multi_tenant = all_mounts.is_multi_tenant();
     let mut mounted = load_mounted(&dir, &datasets, multi_tenant)?;
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
@@ -1952,9 +1960,10 @@ pub async fn dev(
         roster,
         estimates: estimates.clone(),
         multi_tenant,
+        suspended,
         mount_ctx: MountContext {
             dir: dir.clone(),
-            mounts: mounts.mounts.clone(),
+            mounts: all_mounts.mounts.clone(),
             sources,
             endpoint_counts,
             backfill,
@@ -1970,13 +1979,25 @@ pub async fn dev(
             dormant,
             fail_fast,
             cursors: admin_enabled.then_some(cursor_feed),
+            registry,
         },
     }));
 
     // The server and the cursor supervisor race; whichever ends first decides the exit (RFC-0026 §6).
     // A *single* cursor's death no longer ends anything - that is the supervisor's job to absorb.
+    {
+        let h = handles.lock().await;
+        for name in h.suspended.keys() {
+            h.health.suspend_nest(name);
+        }
+        if !h.suspended.is_empty() {
+            h.live.swap(h.compose());
+        }
+    }
+    let jobs = start_mount_jobs(&dir, &handles, admin_enabled).await;
     let service = handles.lock().await.live.service().merge(lifecycle_routes(
         handles.clone(),
+        jobs.clone(),
         admin_enabled,
         admin_token.clone(),
     ));
@@ -2105,17 +2126,29 @@ pub async fn supervise_cursors(
 /// control plane and want the runtime to have no lifecycle surface at all.
 pub fn lifecycle_routes(
     handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: Arc<crate::mount_jobs::MountJobs>,
     admin_enabled: bool,
     admin_token: Option<String>,
 ) -> axum::Router {
+    use crate::mount_jobs::{MountJob, MountPhase};
     use axum::extract::{Path as AxPath, Query, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::{delete, post};
+    use axum::routing::{delete, get, post};
     use axum::Json;
 
     #[derive(serde::Deserialize)]
     struct TokenQuery {
         token: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MountQuery {
+        token: Option<String>,
+        /// Answer once the mount has finished, as every mount did before #1544.
+        #[serde(default)]
+        wait: bool,
+        /// Report what the mount would cost and whether it would be refused, and mount nothing (#1550).
+        #[serde(default)]
+        dry_run: bool,
     }
     #[derive(serde::Deserialize)]
     struct MountBody {
@@ -2133,7 +2166,18 @@ pub fn lifecycle_routes(
         nid: Option<String>,
     }
 
-    type Shared = (Arc<tokio::sync::Mutex<RuntimeHandles>>, Option<String>);
+    type Shared = (
+        Arc<tokio::sync::Mutex<RuntimeHandles>>,
+        Arc<crate::mount_jobs::MountJobs>,
+        Option<String>,
+    );
+
+    fn unauthorized() -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "admin token required"})),
+        )
+    }
 
     if !admin_enabled {
         return axum::Router::new();
@@ -2142,26 +2186,19 @@ pub fn lifecycle_routes(
     /// Map a refusal to its status code (RFC-0027 §3). Typed rather than string-matched, so the
     /// mapping cannot drift from the reasons.
     fn status_for(err: &anyhow::Error) -> StatusCode {
-        match err.downcast_ref::<MountRefusal>() {
-            Some(MountRefusal::AlreadyMounted(_)) | Some(MountRefusal::UndeclaredChain { .. }) => {
-                StatusCode::CONFLICT
-            }
-            Some(MountRefusal::OverBudget { .. }) => StatusCode::INSUFFICIENT_STORAGE,
-            None => StatusCode::INTERNAL_SERVER_ERROR,
-        }
+        err.downcast_ref::<MountRefusal>()
+            .and_then(|r| StatusCode::from_u16(r.status()).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
     }
 
     async fn mount_nest(
-        State((handles, required)): State<Shared>,
-        Query(q): Query<TokenQuery>,
+        State((handles, jobs, required)): State<Shared>,
+        Query(q): Query<MountQuery>,
         headers: HeaderMap,
         Json(body): Json<MountBody>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "admin token required"})),
-            );
+            return unauthorized();
         }
         // Validate before the caller's `nid` touches anything, not after: RuntimeHandles::mount
         // requires an `Nid` and cannot be called without one, but a bad value should read as a
@@ -2175,17 +2212,91 @@ pub fn lifecycle_routes(
                 )
             }
         };
-        let mut h = handles.lock().await;
-        match h.mount(&body.name, nid).await {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(serde_json::json!({"mounted": body.name})),
-            ),
-            Err(e) => (
-                status_for(&e),
-                Json(serde_json::json!({"error": format!("{e:#}")})),
-            ),
+        let nid_str = nid.as_ref().map(|n| n.as_str().to_string());
+
+        if q.dry_run {
+            let plan = match handles.lock().await.plan_mount(&body.name, nid.as_ref()) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "name": body.name,
+                            "refusal": format!("{e:#}"),
+                            "refusal_status": e.downcast_ref::<MountRefusal>().map(MountRefusal::status),
+                        })),
+                    )
+                }
+            };
+            let fetched = match (&plan.fetch_from, &plan.nid) {
+                (Some(registry), Some(n)) => {
+                    if let Err(e) = fetch_nid(registry, n, &plan.dir, &body.name).await {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": format!("{e:#}")})),
+                        );
+                    }
+                    true
+                }
+                _ => false,
+            };
+            let h = handles.lock().await;
+            return match h.dry_run(&body.name, &plan, fetched).await {
+                Ok(report) => (StatusCode::OK, Json(serde_json::json!(report))),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                ),
+            };
         }
+
+        if q.wait {
+            let mut h = handles.lock().await;
+            return match h.mount(&body.name, nid).await {
+                Ok(()) => {
+                    jobs.put(MountJob::new(
+                        &body.name,
+                        nid_str.as_deref(),
+                        MountPhase::Live,
+                    ));
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"mounted": body.name})),
+                    )
+                }
+                Err(e) => (
+                    status_for(&e),
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                ),
+            };
+        }
+
+        // Decided from the jobs alone, never the runtime's lock, which a mount in progress holds.
+        if let Some(job) = jobs.get(&body.name) {
+            let same = job.nid == nid_str || nid_str.is_none();
+            match (job.phase, same) {
+                (MountPhase::Live, true) => return (StatusCode::OK, Json(serde_json::json!(job))),
+                (MountPhase::Failed, _) => {}
+                (_, true) => return (StatusCode::ACCEPTED, Json(serde_json::json!(job))),
+                (_, false) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "'{}' is already {} as nid {}; changing a mount's nest is `nest upgrade`",
+                                body.name,
+                                if job.phase == MountPhase::Live { "mounted" } else { "being mounted" },
+                                job.nid.as_deref().unwrap_or("(unrecorded)")
+                            )
+                        })),
+                    )
+                }
+            }
+        }
+        let job = MountJob::new(&body.name, nid_str.as_deref(), MountPhase::Accepted);
+        jobs.put(job.clone());
+        spawn_mount_job(handles, jobs, body.name, nid);
+        (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
 
     #[derive(serde::Deserialize)]
@@ -2197,16 +2308,13 @@ pub fn lifecycle_routes(
     }
 
     async fn unmount_nest(
-        State((handles, required)): State<Shared>,
+        State((handles, jobs, required)): State<Shared>,
         AxPath(name): AxPath<String>,
         Query(q): Query<UnmountQuery>,
         headers: HeaderMap,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "admin token required"})),
-            );
+            return unauthorized();
         }
         let mut h = handles.lock().await;
         let nid = h
@@ -2221,6 +2329,7 @@ pub fn lifecycle_routes(
                 Json(serde_json::json!({"error": format!("{e:#}")})),
             );
         }
+        jobs.forget(&name);
         if !q.reclaim {
             return (StatusCode::OK, Json(serde_json::json!({"unmounted": name})));
         }
@@ -2247,16 +2356,13 @@ pub fn lifecycle_routes(
 
     /// Reclaim a dataset unmounted earlier without `?reclaim=true` (#1547).
     async fn reclaim_dataset(
-        State((handles, required)): State<Shared>,
+        State((handles, _, required)): State<Shared>,
         AxPath(nid): AxPath<String>,
         Query(q): Query<TokenQuery>,
         headers: HeaderMap,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "admin token required"})),
-            );
+            return unauthorized();
         }
         let nid = match Nid::parse(&nid) {
             Ok(nid) => nid,
@@ -2284,11 +2390,163 @@ pub fn lifecycle_routes(
         }
     }
 
+    async fn list_mounts(
+        State((_, jobs, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"mounts": jobs.list()})),
+        )
+    }
+
+    async fn get_mount(
+        State((_, jobs, required)): State<Shared>,
+        AxPath(name): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        match jobs.get(&name) {
+            Some(job) => (StatusCode::OK, Json(serde_json::json!(job))),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("no mount named '{name}'")})),
+            ),
+        }
+    }
+
+    async fn suspend_nest(
+        State((handles, jobs, required)): State<Shared>,
+        AxPath(name): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let mut h = handles.lock().await;
+        if !h.states.iter().any(|(n, _)| *n == name) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("'{name}' is not mounted")})),
+            );
+        }
+        match h.suspend(&name).await {
+            Ok(()) => {
+                jobs.forget(&name);
+                (StatusCode::OK, Json(serde_json::json!({"suspended": name})))
+            }
+            Err(e) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            ),
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MoveBody {
+        nid: String,
+    }
+
+    async fn move_nest(
+        State((handles, jobs, required)): State<Shared>,
+        AxPath(name): AxPath<String>,
+        Query(q): Query<MountQuery>,
+        headers: HeaderMap,
+        Json(body): Json<MoveBody>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let nid = match Nid::parse(&body.nid) {
+            Ok(nid) => nid,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                )
+            }
+        };
+        if q.wait {
+            let mut h = handles.lock().await;
+            return match h.move_name(&name, nid.clone()).await {
+                Ok(()) => {
+                    jobs.put(MountJob::new(&name, Some(nid.as_str()), MountPhase::Live));
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"moved": name, "nid": nid.as_str()})),
+                    )
+                }
+                Err(e) => (
+                    status_for(&e),
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                ),
+            };
+        }
+        if let Some(job) = jobs.get(&name).filter(|j| !j.phase.finished()) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!(job)));
+        }
+        let job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
+        jobs.put(job.clone());
+        spawn_move_job(handles, jobs, name, nid);
+        (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
+    }
+
+    async fn resume_nest(
+        State((handles, jobs, required)): State<Shared>,
+        AxPath(name): AxPath<String>,
+        Query(q): Query<MountQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let mut h = handles.lock().await;
+        let Some(nid) = h.suspended.get(&name).and_then(|n| Nid::parse(n).ok()) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("'{name}' is not suspended")})),
+            );
+        };
+        if q.wait {
+            return match h.mount(&name, Some(nid.clone())).await {
+                Ok(()) => {
+                    jobs.put(MountJob::new(&name, Some(nid.as_str()), MountPhase::Live));
+                    (StatusCode::OK, Json(serde_json::json!({"resumed": name})))
+                }
+                Err(e) => (
+                    status_for(&e),
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                ),
+            };
+        }
+        drop(h);
+        if let Some(job) = jobs.get(&name).filter(|j| !j.phase.finished()) {
+            return (StatusCode::ACCEPTED, Json(serde_json::json!(job)));
+        }
+        let job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
+        jobs.put(job.clone());
+        spawn_mount_job(handles, jobs, name, Some(nid));
+        (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
+    }
+
     axum::Router::new()
         .route("/_admin/nests", post(mount_nest))
         .route("/_admin/nests/{*name}", delete(unmount_nest))
+        .route("/_admin/mounts", get(list_mounts))
+        .route("/_admin/mounts/{*name}", get(get_mount))
+        .route("/_admin/suspend/{*name}", post(suspend_nest))
+        .route("/_admin/resume/{*name}", post(resume_nest))
+        .route("/_admin/move/{*name}", post(move_nest))
         .route("/_admin/datasets/{nid}", delete(reclaim_dataset))
-        .with_state((handles, admin_token))
+        .with_state((handles, jobs, admin_token))
 }
 
 /// Persist the mounted-nest list to `mounts.toml` (RFC-0027 §5).
@@ -2305,7 +2563,12 @@ pub fn lifecycle_routes(
 /// this list.** An operator who manages `mounts.toml` with configuration management should run
 /// `--no-admin` and restart to change the set, because fighting a config-management tool over a file
 /// is a losing game.
-fn persist_mounted_nests(dir: &Path, nests: &[String], known: &[Mount]) -> Result<()> {
+fn persist_mounted_nests(
+    dir: &Path,
+    nests: &[String],
+    known: &[Mount],
+    suspended: &[String],
+) -> Result<()> {
     let path = dir.join(MOUNTS_FILE);
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {} to persist the nest list", path.display()))?;
@@ -2333,11 +2596,18 @@ fn persist_mounted_nests(dir: &Path, nests: &[String], known: &[Mount]) -> Resul
         // collection explicit, because re-backfilling is precisely the cost this design exists to
         // avoid and an accidental unmount must not trigger one.
         mounts.mounts.retain(|m| nests.contains(&key_of(m)));
+        // A move changes a live name's nid (#1549); the record on disk follows the one in memory.
+        for m in mounts.mounts.iter_mut() {
+            if let Some(k) = known.iter().find(|k| key_of(k) == key_of(m)) {
+                m.nid = k.nid.clone();
+            }
+        }
         // Add records for live mounts with no entry on disk yet - a nest mounted live via `POST
         // /_admin/nests` rather than declared at boot (#517). Without this the mount works until the
         // next restart, then silently vanishes: the exact "looks like it worked" failure this file
         // exists to prevent (see the doc comment above).
-        for key in nests {
+        // A suspended mount keeps its record: it is only paused (#1548).
+        for key in nests.iter().chain(suspended) {
             if mounts.mounts.iter().any(|m| &key_of(m) == key) {
                 continue;
             }
@@ -2352,6 +2622,7 @@ fn persist_mounted_nests(dir: &Path, nests: &[String], known: &[Mount]) -> Resul
         }
         mounts.runtime.nests.clear(); // `[[mounts]]` is authoritative; a stale list beside it lies
     }
+    mounts.runtime.suspended = suspended.to_vec();
     let out = toml::to_string_pretty(&mounts).context("serialising mounts.toml")?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
@@ -2389,6 +2660,8 @@ pub struct RuntimeHandles {
     /// Whether the runtime serves more than one tenant, for [`build_roster_entries`]'s route keys.
     /// Frozen at startup like `mount_ctx.mounts` - tenancy shape is not something a mount changes.
     pub multi_tenant: bool,
+    /// Suspended mounts (#1548), route key to NID: kept on disk and in `mounts.toml`, answering 503.
+    pub suspended: std::collections::BTreeMap<String, String>,
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
     /// settings a new nest must be built with so it behaves identically to one mounted at boot.
     pub mount_ctx: MountContext,
@@ -2445,6 +2718,8 @@ pub struct MountContext {
     /// Where a cursor that a mount spawns goes to be supervised. `None` without the admin surface,
     /// which is the only thing that mounts.
     pub cursors: Option<CursorFeed>,
+    /// `--registry`: where a mount fetches a NID this runtime does not hold (#1543).
+    pub registry: Option<String>,
 }
 
 /// A cursor's ingest task, handed to [`supervise_cursors`] after boot.
@@ -2503,6 +2778,10 @@ pub enum MountRefusal {
         projected_mb: u64,
         ceiling_mb: u64,
     },
+    /// The runtime does not hold this NID and has no registry to fetch it from (#1543).
+    NotHeld { nid: String },
+    /// The chain's cursor died; its quarantine holds until restart (#1545).
+    CursorStopped { nest: String, chain: String },
 }
 
 impl std::fmt::Display for MountRefusal {
@@ -2527,11 +2806,33 @@ impl std::fmt::Display for MountRefusal {
                 "mounting '{nest}' would put the {chain} cursor at ~{projected_mb} MB against a \
                  {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another mounts"
             ),
+            MountRefusal::CursorStopped { nest, chain } => write!(
+                f,
+                "the cursor on {chain} has stopped; restart the runtime to mount '{nest}' onto it"
+            ),
+            MountRefusal::NotHeld { nid } => write!(
+                f,
+                "this runtime does not hold nid {nid} and has no registry to fetch it from - start it \
+                 with --registry"
+            ),
         }
     }
 }
 
 impl std::error::Error for MountRefusal {}
+
+impl MountRefusal {
+    /// The HTTP status a refusal is answered with, typed so the mapping cannot drift from the reasons.
+    pub fn status(&self) -> u16 {
+        match self {
+            MountRefusal::AlreadyMounted(_)
+            | MountRefusal::UndeclaredChain { .. }
+            | MountRefusal::CursorStopped { .. } => 409,
+            MountRefusal::OverBudget { .. } => 507,
+            MountRefusal::NotHeld { .. } => 404,
+        }
+    }
+}
 
 /// How long to wait for a cursor to acknowledge that it has released a nest.
 ///
@@ -2547,6 +2848,216 @@ fn abort_alert_worker(worker: &mut Option<tokio::task::JoinHandle<()>>) {
     if let Some(w) = worker.take() {
         w.abort();
     }
+}
+
+/// `name` is a route key: `<alias>` single-tenant, `<tenant>/<alias>` multi-tenant. Split so a record
+/// lookup works either way, rather than missing every multi-tenant mount and falling through to the
+/// pre-2.0 directory - which would come up empty and re-backfill.
+fn split_route_key(name: &str) -> (Option<&str>, &str) {
+    match name.split_once('/') {
+        Some((t, a)) => (Some(t), a),
+        None => (None, name),
+    }
+}
+
+/// What a mount would cost this runtime, and whether it would be refused (#1550).
+#[derive(Debug, serde::Serialize)]
+pub struct DryRun {
+    pub name: String,
+    pub nid: Option<String>,
+    /// Fetched from the registry by this dry run. The verified nest stays installed; nothing else
+    /// is written.
+    pub fetched: bool,
+    /// The mount would serve a dataset this mount already indexes, at no further cost.
+    pub shares: Option<String>,
+    pub chain: Option<String>,
+    pub start_block: Option<u64>,
+    /// Known only for a chain whose cursor is running; a dry run dials nothing.
+    pub tip: Option<u64>,
+    pub blocks_to_backfill: Option<u64>,
+    /// A dataset is already on disk, so `blocks_to_backfill` is an upper bound.
+    pub has_data: bool,
+    /// Extraction that costs RPC calls per block, beyond the shared `getLogs`.
+    pub per_block_rpc: Vec<&'static str>,
+    pub incoming_mb: Option<u64>,
+    pub projected_mb: Option<u64>,
+    pub ceiling_mb: u64,
+    /// What a real mount would answer, if it would be refused.
+    pub refusal: Option<String>,
+    pub refusal_status: Option<u16>,
+}
+
+/// What [`RuntimeHandles::admit`] found: the chain, how to reach its cursor, and what it would cost.
+struct Admission {
+    chain: String,
+    dormant: Option<DormantChain>,
+    lifecycle: Option<tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>>,
+    incoming_mb: u64,
+    projected_mb: u64,
+}
+
+/// Where a mount's dataset lives, and the registry to fetch it from when it is not there yet.
+#[derive(Debug)]
+pub struct MountPlan {
+    pub nid: Option<String>,
+    pub dir: PathBuf,
+    pub fetch_from: Option<String>,
+}
+
+async fn fetch_nid(registry: &str, nid: &str, dir: &Path, name: &str) -> Result<()> {
+    crate::distribution::install_by_nid(registry, nid, dir)
+        .await
+        .with_context(|| format!("fetching nid {nid} from the registry"))?;
+    tracing::info!("fetched nid {nid} from the registry for '{name}'");
+    Ok(())
+}
+
+/// The mount jobs a runtime starts with (#1544): every mounted nest as live, and every job a restart
+/// interrupted running again. Nothing resumes without the admin API, which is what mounts.
+pub async fn start_mount_jobs(
+    dir: &Path,
+    handles: &Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    admin_enabled: bool,
+) -> Arc<crate::mount_jobs::MountJobs> {
+    use crate::mount_jobs::{MountJob, MountJobs, MountPhase};
+    // Before any job runs, so a fetch a killed process left staged cannot be mistaken for one running.
+    crate::mount_jobs::clear_stale_fetches(dir);
+    let jobs = Arc::new(MountJobs::load(dir));
+    for (name, state) in &handles.lock().await.states {
+        jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live));
+    }
+    if admin_enabled {
+        for job in jobs.unfinished() {
+            tracing::info!("resuming the mount of '{}' a restart interrupted", job.name);
+            let nid = job.nid.as_deref().and_then(|n| Nid::parse(n).ok());
+            spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid);
+        }
+    }
+    jobs
+}
+
+/// Run a mount as a job (#1544). The fetch happens with no lock held, so a slow registry holds up no
+/// other admin call; only the join takes the runtime's lock.
+pub fn spawn_mount_job(
+    handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: Arc<crate::mount_jobs::MountJobs>,
+    name: String,
+    nid: Option<Nid>,
+) -> tokio::task::JoinHandle<()> {
+    use crate::mount_jobs::MountPhase;
+    tokio::spawn(async move {
+        let outcome = async {
+            let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
+            let fetched = match (&plan.fetch_from, &plan.nid) {
+                (Some(registry), Some(n)) => {
+                    jobs.advance(&name, MountPhase::Fetching, None);
+                    fetch_nid(registry, n, &plan.dir, &name).await?;
+                    true
+                }
+                _ => false,
+            };
+            jobs.advance(&name, MountPhase::Joining, None);
+            let mut h = handles.lock().await;
+            let mounted = h.mount(&name, nid).await;
+            // Only a fetch no live mount has since taken up is ours to remove.
+            if mounted.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                let _ = std::fs::remove_dir_all(&plan.dir);
+            }
+            mounted
+        }
+        .await;
+        match outcome {
+            Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Err(e) => {
+                tracing::warn!("mounting '{name}' failed: {e:#}");
+                jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));
+            }
+        }
+    })
+}
+
+/// The mount table without its suspended records, and those records by route key to NID (#1548).
+/// A suspended mount is neither loaded nor indexed at boot, but its record and data stay.
+pub fn split_suspended(
+    table: &MountTable,
+) -> (MountTable, std::collections::BTreeMap<String, String>) {
+    let multi_tenant = table.is_multi_tenant();
+    let key_of = |m: &Mount| {
+        MountRef {
+            tenant: m.tenant.clone(),
+            alias: m.alias.clone(),
+        }
+        .route_key(multi_tenant)
+    };
+    let mut active = table.clone();
+    let mut suspended = std::collections::BTreeMap::new();
+    active.mounts.retain(|m| {
+        let key = key_of(m);
+        if table.runtime.suspended.contains(&key) {
+            suspended.insert(key, m.nid.clone());
+            false
+        } else {
+            true
+        }
+    });
+    (active, suspended)
+}
+
+/// What a suspended mount serves: a 503 that says so, rather than the 404 of a mount that is gone.
+fn suspended_router(name: &str) -> axum::Router {
+    let body = serde_json::json!({
+        "error": format!("'{name}' is suspended; POST /_admin/resume/{name} to resume it"),
+        "suspended": true,
+    });
+    axum::Router::new().fallback(move || {
+        let body = body.clone();
+        async move {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(body),
+            )
+        }
+    })
+}
+
+/// Run a move as a job (#1549): fetch the new NID with no lock held, then move under it.
+pub fn spawn_move_job(
+    handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: Arc<crate::mount_jobs::MountJobs>,
+    name: String,
+    nid: Nid,
+) -> tokio::task::JoinHandle<()> {
+    use crate::mount_jobs::MountPhase;
+    tokio::spawn(async move {
+        let outcome = async {
+            let staging = RuntimeHandles::staging_name(&name);
+            let plan = handles.lock().await.plan_mount(&staging, Some(&nid))?;
+            let fetched = match (&plan.fetch_from, &plan.nid) {
+                (Some(registry), Some(n)) => {
+                    jobs.advance(&name, MountPhase::Fetching, None);
+                    fetch_nid(registry, n, &plan.dir, &name).await?;
+                    true
+                }
+                _ => false,
+            };
+            jobs.advance(&name, MountPhase::Joining, None);
+            let mut h = handles.lock().await;
+            let moved = h.move_name(&name, nid).await;
+            // As for a mount: a refused move removes only a fetch no live mount has since taken up.
+            if moved.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                let _ = std::fs::remove_dir_all(&plan.dir);
+            }
+            moved
+        }
+        .await;
+        match outcome {
+            Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Err(e) => {
+                tracing::warn!("moving '{name}' failed: {e:#}");
+                jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));
+            }
+        }
+    })
 }
 
 /// Stamp a live-mounted nest's dataset identity and mount record onto its serving state. Boot does
@@ -2592,20 +3103,170 @@ impl RuntimeHandles {
     /// given an absolute string. [`Nid::parse`] is the only way to produce one, so nothing can call
     /// this function with a raw string.
     pub async fn mount(&mut self, name: &str, nid: Option<Nid>) -> Result<()> {
+        let plan = self.plan_mount(name, nid.as_ref())?;
+        // A NID this runtime does not hold is fetched first (#1543). Whatever refuses the mount after
+        // that removes the fetch again, so a refusal still leaves nothing behind.
+        let fetched = match (&plan.fetch_from, &plan.nid) {
+            (Some(registry), Some(nid)) => {
+                fetch_nid(registry, nid, &plan.dir, name).await?;
+                true
+            }
+            _ => false,
+        };
+        let (tenant, alias) = split_route_key(name);
+        let mounted = self
+            .mount_dataset(name, tenant, alias, plan.nid, plan.dir.clone())
+            .await;
+        if mounted.is_err() && fetched {
+            let _ = std::fs::remove_dir_all(&plan.dir);
+        }
+        // A mount of a suspended name is its resume; it stays suspended until the join has landed.
+        if mounted.is_ok() && self.suspended.remove(name).is_some() {
+            self.persist();
+            self.live.swap(self.compose());
+        }
+        mounted
+    }
+
+    /// Every check that decides whether a nest may join its chain's cursor (RFC-0027 §3). A mount and
+    /// its dry run both call this, so they cannot disagree about a refusal (#1550).
+    fn admit(&self, name: &str, config: &Config, dir: &Path) -> Result<Admission> {
+        let chain = config.nest.chain.clone();
+        let dormant = self
+            .mount_ctx
+            .dormant
+            .get(&chain)
+            .filter(|d| d.endpoint.chain_id == config.nest.chain_id)
+            .cloned();
+        if !self.mount_ctx.sources.contains_key(&chain) && dormant.is_none() {
+            return Err(MountRefusal::UndeclaredChain {
+                nest: name.to_string(),
+                chain,
+            }
+            .into());
+        }
+        // A chain with no running cursor gets one (#1545), unless it had one that died: that
+        // quarantine holds until restart, and nests may still be serving from it.
+        let lifecycle = self
+            .lifecycle
+            .get(&chain)
+            .filter(|tx| !tx.is_closed())
+            .cloned();
+        if lifecycle.is_none()
+            && (self.health.cursor_quarantined(&chain)
+                || self.states.iter().any(|(_, s)| s.chain == chain))
+        {
+            return Err(MountRefusal::CursorStopped {
+                nest: name.to_string(),
+                chain,
+            }
+            .into());
+        }
+        // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
+        // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
+        // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
+        let has_labels = !crate::labels::load(dir).is_empty();
+        let (entity_count, entity_rows) = declared_entities(dir);
+        let incoming_mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows);
+        let existing: u64 = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.chain == chain)
+            .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
+            .sum();
+        let projected_mb = RUNTIME_BASE_RSS_MB + existing + incoming_mb;
+        if projected_mb > self.mount_ctx.max_rss_mb {
+            return Err(MountRefusal::OverBudget {
+                nest: name.to_string(),
+                chain,
+                projected_mb,
+                ceiling_mb: self.mount_ctx.max_rss_mb,
+            }
+            .into());
+        }
+        Ok(Admission {
+            chain,
+            dormant,
+            lifecycle,
+            incoming_mb,
+            projected_mb,
+        })
+    }
+
+    /// A mount's dry run (#1550), once [`Self::plan_mount`] has placed its dataset on disk. Runs the
+    /// same admission a mount does and changes nothing.
+    pub async fn dry_run(&self, name: &str, plan: &MountPlan, fetched: bool) -> Result<DryRun> {
+        let mut report = DryRun {
+            name: name.to_string(),
+            nid: plan.nid.clone(),
+            fetched,
+            shares: None,
+            chain: None,
+            start_block: None,
+            tip: None,
+            blocks_to_backfill: None,
+            has_data: plan.dir.join(crate::config::DB_FILE).exists(),
+            per_block_rpc: Vec::new(),
+            incoming_mb: None,
+            projected_mb: None,
+            ceiling_mb: self.mount_ctx.max_rss_mb,
+            refusal: None,
+            refusal_status: None,
+        };
+        if let Some((holder, _)) = self.states.iter().find(|(_, s)| s.dir == plan.dir) {
+            report.shares = Some(holder.clone());
+            return Ok(report);
+        }
+        let config = Config::load(&plan.dir)
+            .with_context(|| format!("loading nest '{name}' from {}", plan.dir.display()))?;
+        report.chain = Some(config.nest.chain.clone());
+        report.start_block = self
+            .mount_ctx
+            .backfill
+            .or_else(|| config.contracts.iter().filter_map(|c| c.start_block).min());
+        let x = &config.extract;
+        for (on, what) in [
+            (x.blocks, "[extract] blocks"),
+            (x.traces, "[extract] traces"),
+            (x.top_level_calls, "[extract] top_level_calls"),
+            (x.state, "[extract] state"),
+            (!config.calls.is_empty(), "[[calls]]"),
+        ] {
+            if on {
+                report.per_block_rpc.push(what);
+            }
+        }
+        match self.admit(name, &config, &plan.dir) {
+            Ok(adm) => {
+                report.incoming_mb = Some(adm.incoming_mb);
+                report.projected_mb = Some(adm.projected_mb);
+            }
+            Err(e) => {
+                report.refusal_status = e.downcast_ref::<MountRefusal>().map(MountRefusal::status);
+                report.refusal = Some(format!("{e:#}"));
+            }
+        }
+        if let Some(source) = self.mount_ctx.sources.get(&config.nest.chain) {
+            report.tip = source.tip().await.ok();
+        }
+        report.blocks_to_backfill = report
+            .tip
+            .zip(report.start_block)
+            .map(|(tip, start)| tip.saturating_sub(start));
+        Ok(report)
+    }
+
+    /// Resolve a mount's dataset and whether it must be fetched first, refusing what can be refused
+    /// without doing any work.
+    pub fn plan_mount(&self, name: &str, nid: Option<&Nid>) -> Result<MountPlan> {
         if self.states.iter().any(|(n, _)| n == name) {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
-        // `name` is a route key: `<alias>` single-tenant, `<tenant>/<alias>` multi-tenant. Split it
-        // so a record lookup works either way, rather than silently missing every multi-tenant mount
-        // and falling through to the pre-2.0 directory - which would come up empty and re-backfill.
-        let (tenant, alias) = match name.split_once('/') {
-            Some((t, a)) => (Some(t), a),
-            None => (None, name),
-        };
+        let (tenant, alias) = split_route_key(name);
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the
         // caller does not know it, e.g. remounting a nest this runtime has already seen.
-        let nid = nid.map(Nid::into_string).or_else(|| {
+        let nid = nid.map(|n| n.as_str().to_string()).or_else(|| {
             self.mount_ctx
                 .mounts
                 .iter()
@@ -2616,6 +3277,29 @@ impl RuntimeHandles {
             Some(nid) => MountTable::data_dir(&self.mount_ctx.dir, nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
         };
+        let fetch_from = match &nid {
+            Some(nid) if !dir.exists() => match &self.mount_ctx.registry {
+                Some(registry) => Some(registry.clone()),
+                None => return Err(MountRefusal::NotHeld { nid: nid.clone() }.into()),
+            },
+            _ => None,
+        };
+        Ok(MountPlan {
+            nid,
+            dir,
+            fetch_from,
+        })
+    }
+
+    /// [`Self::mount`] once the dataset directory is resolved and on disk.
+    async fn mount_dataset(
+        &mut self,
+        name: &str,
+        tenant: Option<&str>,
+        alias: &str,
+        nid: Option<String>,
+        dir: PathBuf,
+    ) -> Result<()> {
         // A dataset another live mount already holds is served through a clone of that mount's state,
         // as `fan_out_aliases` does at boot. Opening its store again is refused by redb (#1475).
         let shared = self
@@ -2656,59 +3340,13 @@ impl RuntimeHandles {
                     .copied()
                     .unwrap_or(self.mount_ctx.freshness);
                 stamp_operator_settings(&mut config, dial, self.mount_ctx.ipfs_window_deadline);
-                let chain = config.nest.chain.clone();
-
-                let dormant = self
-                    .mount_ctx
-                    .dormant
-                    .get(&chain)
-                    .filter(|d| d.endpoint.chain_id == config.nest.chain_id)
-                    .cloned();
-                if !self.mount_ctx.sources.contains_key(&chain) && dormant.is_none() {
-                    return Err(MountRefusal::UndeclaredChain {
-                        nest: name.to_string(),
-                        chain,
-                    }
-                    .into());
-                }
-                // A chain with no running cursor gets one below (#1545), unless it had one that
-                // died: that quarantine holds until restart, and nests may still be serving from it.
-                let lifecycle = self
-                    .lifecycle
-                    .get(&chain)
-                    .filter(|tx| !tx.is_closed())
-                    .cloned();
-                if lifecycle.is_none()
-                    && (self.health.cursor_quarantined(&chain)
-                        || self.states.iter().any(|(_, s)| s.chain == chain))
-                {
-                    bail!(
-                        "the cursor on {chain} has stopped; restart the runtime to mount '{name}' onto it"
-                    );
-                }
-
-                // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
-                // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
-                // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
-                let has_labels = !crate::labels::load(&dir).is_empty();
-                let (entity_count, entity_rows) = declared_entities(&dir);
-                let incoming = estimate_nest_rss_mb(&config, has_labels, entity_count, entity_rows);
-                let existing: u64 = self
-                    .states
-                    .iter()
-                    .filter(|(_, s)| s.chain == chain)
-                    .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
-                    .sum();
-                let projected = RUNTIME_BASE_RSS_MB + existing + incoming;
-                if projected > self.mount_ctx.max_rss_mb {
-                    return Err(MountRefusal::OverBudget {
-                        nest: name.to_string(),
-                        chain,
-                        projected_mb: projected,
-                        ceiling_mb: self.mount_ctx.max_rss_mb,
-                    }
-                    .into());
-                }
+                let Admission {
+                    chain,
+                    dormant,
+                    lifecycle,
+                    incoming_mb: incoming,
+                    ..
+                } = self.admit(name, &config, &dir)?;
 
                 // After the budget, so a refused mount never dials anything.
                 if let Some(d) = dormant {
@@ -2946,12 +3584,41 @@ impl RuntimeHandles {
             self.multi_tenant,
             &self.estimates,
         ));
-        self.live.swap(crate::serve::compose_runtime(
+        self.live.swap(self.compose());
+        self.persist();
+        Ok(())
+    }
+
+    /// The routes to serve: every live mount, and a 503 for each suspended one not live again yet.
+    pub fn compose(&self) -> axum::Router {
+        let mut router = crate::serve::compose_runtime(
             self.roster.clone(),
             self.states.clone(),
             self.health.clone(),
-        ));
+        );
+        for name in self.suspended.keys() {
+            if !self.states.iter().any(|(n, _)| n == name) {
+                router = router.nest(&format!("/{name}"), suspended_router(name));
+            }
+        }
+        router
+    }
+
+    /// Suspend a mount (#1548): drain it off its cursor as an unmount does, but keep its record and
+    /// its data, answer 503 in its place, and keep it suspended across a restart.
+    pub async fn suspend(&mut self, name: &str) -> Result<()> {
+        let Some((_, state)) = self.states.iter().find(|(n, _)| n == name) else {
+            bail!("'{name}' is not mounted");
+        };
+        let Some(nid) = state.nid.as_deref().map(str::to_string) else {
+            bail!("'{name}' has no recorded nid to resume from; `nuthatch migrate` records one");
+        };
+        self.unmount(name).await?;
+        self.suspended.insert(name.to_string(), nid);
+        self.health.suspend_nest(name);
         self.persist();
+        self.live.swap(self.compose());
+        tracing::info!("nest '{name}' suspended");
         Ok(())
     }
 
@@ -2963,7 +3630,13 @@ impl RuntimeHandles {
     /// outcome, and the operator can fix the file.
     fn persist(&self) {
         let names: Vec<String> = self.states.iter().map(|(n, _)| n.clone()).collect();
-        if let Err(e) = persist_mounted_nests(&self.mount_ctx.dir, &names, &self.mount_ctx.mounts) {
+        let suspended: Vec<String> = self.suspended.keys().cloned().collect();
+        if let Err(e) = persist_mounted_nests(
+            &self.mount_ctx.dir,
+            &names,
+            &self.mount_ctx.mounts,
+            &suspended,
+        ) {
             tracing::warn!(
                 "the runtime's nest set changed but {MOUNTS_FILE} could not be updated ({e:#}) - the \
                  change is live now but will not survive a restart"
@@ -2992,6 +3665,13 @@ impl RuntimeHandles {
     /// Idempotent: unmounting a nest that is not mounted is a no-op, not an error.
     pub async fn unmount(&mut self, name: &str) -> Result<()> {
         let Some(idx) = self.states.iter().position(|(n, _)| n == name) else {
+            // A suspended mount is already off its cursor; unmounting it drops the record.
+            if self.suspended.remove(name).is_some() {
+                self.health.retire_nest(name);
+                self.persist();
+                self.live.swap(self.compose());
+                return Ok(());
+            }
             tracing::debug!("nest '{name}' is not mounted; nothing to unmount");
             return Ok(());
         };
@@ -3019,6 +3699,133 @@ impl RuntimeHandles {
             return Ok(());
         }
 
+        self.drain_cursor_nest(&chain, &cursor_key, name).await?;
+        self.publishers.retain(|(n, _)| n != name);
+
+        // 3. Drop the serving state - the third - and re-compose without it. Requests already in
+        //    flight finish against the old composition; new ones 404.
+        self.states.remove(idx);
+        crate::analytics::invalidate_duck_cache(&dataset_dir);
+        crate::metrics::METRICS.remove_nest(&cursor_key);
+        crate::metrics::METRICS.remove_nest(name);
+        self.recompose_after_unmount(name);
+        Ok(())
+    }
+
+    /// The name a move stages its incoming nest under while it catches up.
+    pub fn staging_name(name: &str) -> String {
+        format!("{name}.moving")
+    }
+
+    /// Move a live name to another NID without a gap (#1549).
+    ///
+    /// The new NID is mounted under [`Self::staging_name`], which catches it up before it joins its
+    /// cursor. The old nest is then drained off the cursor, the new one takes its name there, and the
+    /// name's routes switch in one swap: a reader sees the old nest until then, and the new after.
+    pub async fn move_name(&mut self, name: &str, nid: Nid) -> Result<()> {
+        let Some(old) = self.states.iter().find(|(n, _)| n == name).map(|(_, s)| s) else {
+            bail!("'{name}' is not mounted");
+        };
+        if old.nid.as_deref() == Some(nid.as_str()) {
+            return Ok(());
+        }
+        let chain = old.chain.clone();
+        let old_key = old
+            .runtime_health
+            .as_ref()
+            .map_or_else(|| name.to_string(), |(n, _)| n.clone());
+        let old_store = old.store.clone();
+        let staging = Self::staging_name(name);
+
+        self.mount(&staging, Some(nid.clone())).await?;
+        let new_idx = self
+            .states
+            .iter()
+            .position(|(n, _)| *n == staging)
+            .expect("just mounted");
+        if self.states[new_idx].1.chain != chain {
+            self.unmount(&staging).await?;
+            bail!("a move keeps its chain: '{name}' is on {chain}");
+        }
+        let new_key = self.states[new_idx]
+            .1
+            .runtime_health
+            .as_ref()
+            .map_or_else(|| staging.clone(), |(n, _)| n.clone());
+
+        // Readers keep the old nest's routes while it comes off the cursor.
+        let old_shared = self
+            .states
+            .iter()
+            .filter(|(_, s)| Arc::ptr_eq(&s.store, &old_store))
+            .count()
+            > 1;
+        if !old_shared {
+            self.drain_cursor_nest(&chain, &old_key, name).await?;
+            crate::metrics::METRICS.remove_nest(&old_key);
+        }
+        let (_, mut new_state) = self.states.remove(new_idx);
+        if new_key == staging {
+            let tx = self
+                .lifecycle
+                .get(&chain)
+                .cloned()
+                .context("the cursor the move joined is gone")?;
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(indexer::CursorCommand::Rename {
+                from: staging.clone(),
+                to: name.to_string(),
+                ack: Some(ack_tx),
+            });
+            let _ = tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await;
+            new_state.runtime_health = Some((name.to_string(), self.health.clone()));
+            self.health.register(name, &chain);
+            self.health.mark_indexing(name);
+            if let Some(w) = self.alert_workers.iter_mut().find(|(n, _)| *n == staging) {
+                w.0 = name.to_string();
+            }
+        } else {
+            self.health.register_alias(name, &new_key, &chain);
+        }
+        let old_idx = self
+            .states
+            .iter()
+            .position(|(n, _)| n == name)
+            .expect("still mounted");
+        let (_, old_state) =
+            std::mem::replace(&mut self.states[old_idx], (name.to_string(), new_state));
+        if let Some(mb) = self.estimates.remove(&staging) {
+            self.estimates.insert(name.to_string(), mb);
+        }
+        self.publishers.retain(|(n, _)| n != name);
+        for p in self.publishers.iter_mut().filter(|(n, _)| *n == staging) {
+            p.0 = name.to_string();
+        }
+        let (tenant, alias) = split_route_key(name);
+        let (_, staging_alias) = split_route_key(&staging);
+        self.mount_ctx
+            .mounts
+            .retain(|m| !(m.alias == staging_alias && tenant.is_none_or(|t| m.tenant == t)));
+        for m in self
+            .mount_ctx
+            .mounts
+            .iter_mut()
+            .filter(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+        {
+            m.nid = nid.as_str().to_string();
+        }
+        if !old_shared {
+            crate::analytics::invalidate_duck_cache(&old_state.dir);
+        }
+        drop(old_state);
+        self.recompose();
+        tracing::info!("'{name}' moved to nid {nid}");
+        Ok(())
+    }
+
+    /// Take a nest off its cursor and stop its alert worker, waiting for both to let go of its store
+    /// (RFC-0027 §6). `cursor_key` is the name the cursor knows it by; `name` is for the errors.
+    async fn drain_cursor_nest(&mut self, chain: &str, cursor_key: &str, name: &str) -> Result<()> {
         // 1. Drain the cursor and wait for it to let go.
         //
         // No channel for this nest's chain means we cannot ask the cursor to stop, and tearing the
@@ -3026,7 +3833,7 @@ impl RuntimeHandles {
         // §6 orders this sequence to prevent. So this is an error, not a skip. (An early draft skipped
         // silently; the acceptance test then failed on a *held* store, which is how the gap surfaced.)
         {
-            let tx = self.lifecycle.get(&chain).ok_or_else(|| {
+            let tx = self.lifecycle.get(chain).ok_or_else(|| {
                 anyhow::anyhow!(
                     "no cursor channel for chain '{chain}' hosting '{name}' - refusing to unmount \
                      without draining it first"
@@ -3035,7 +3842,7 @@ impl RuntimeHandles {
             let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             if tx
                 .send(indexer::CursorCommand::Unmount {
-                    name: cursor_key.clone(),
+                    name: cursor_key.to_string(),
                     ack: Some(ack_tx),
                 })
                 .is_ok()
@@ -3068,19 +3875,15 @@ impl RuntimeHandles {
             // with "Database already open" a few microseconds after the abort.
             let _ = worker.await;
         }
-        self.publishers.retain(|(n, _)| n != name);
-
-        // 3. Drop the serving state - the third - and re-compose without it. Requests already in
-        //    flight finish against the old composition; new ones 404.
-        self.states.remove(idx);
-        crate::analytics::invalidate_duck_cache(&dataset_dir);
-        crate::metrics::METRICS.remove_nest(&cursor_key);
-        crate::metrics::METRICS.remove_nest(name);
-        self.recompose_after_unmount(name);
         Ok(())
     }
 
     fn recompose_after_unmount(&mut self, name: &str) {
+        self.recompose();
+        tracing::info!("nest '{name}' unmounted from the runtime");
+    }
+
+    fn recompose(&mut self) {
         // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
         // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
         let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
@@ -3090,13 +3893,8 @@ impl RuntimeHandles {
             self.multi_tenant,
             &self.estimates,
         ));
-        self.live.swap(crate::serve::compose_runtime(
-            self.roster.clone(),
-            self.states.clone(),
-            self.health.clone(),
-        ));
+        self.live.swap(self.compose());
         self.persist();
-        tracing::info!("nest '{name}' unmounted from the runtime");
     }
 }
 
@@ -4026,7 +4824,7 @@ mod tests {
         .unwrap();
 
         // acme unmounts; the runtime persists what is left, by route key.
-        persist_mounted_nests(root, &["globex/usdc".to_string()], &[]).unwrap();
+        persist_mounted_nests(root, &["globex/usdc".to_string()], &[], &[]).unwrap();
 
         let after = MountTable::load(root).expect("the rewritten file must still load");
         assert_eq!(after.mounts.len(), 1, "the co-tenant's mount was dropped");
@@ -4060,7 +4858,7 @@ mod tests {
             "[runtime]\nname = \"r\"\n\n[[mounts]]\nalias = \"usdc\"\nnid = \"{nid}\"\n"
         ))
         .unwrap();
-        persist_mounted_nests(root, &["usdc".to_string()], &known.mounts).unwrap();
+        persist_mounted_nests(root, &["usdc".to_string()], &known.mounts, &[]).unwrap();
 
         let after = MountTable::load(root).expect("the rewritten file must still load");
         assert_eq!(after.mounts.len(), 1, "the mount was not recorded");
@@ -4102,6 +4900,7 @@ mod tests {
             root,
             &["usdc".to_string(), "globex/usdc".to_string()],
             &known.mounts,
+            &[],
         )
         .unwrap();
 

@@ -130,6 +130,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--publish-interval <PUBLISH_INTERVAL>` - How often the mirror reconciles when no seal has woken it
 - `--publish-parallelism <PUBLISH_PARALLELISM>` - Objects the mirror uploads at once
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN` to be set AND each request to present it as `?token=…` (or it self-disables with a log line)
+- `--registry <REGISTRY>` - A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`
 
 ## `nuthatch doctor`
 

@@ -128,6 +128,21 @@ impl RuntimeHealth {
     /// deliberately excluded from [`RuntimeHealth::unhealthy`] - readiness answers "is anything broken?",
     /// and an intended removal is not. Paging someone because an operator did what they meant to do is
     /// how alerting gets muted.
+    /// Record a nest as suspended by the operator (#1548): paused on purpose, so not unhealthy.
+    pub fn suspend_nest(&self, nest: &str) {
+        self.nests.write().unwrap().insert(
+            nest.to_string(),
+            QuarantineInfo {
+                kind: "nest",
+                class: "suspended",
+                reason: "suspended by the operator".to_string(),
+                since_unixtime: now_unix(),
+                attempts: 0,
+                next_retry_unixtime: None,
+            },
+        );
+    }
+
     pub fn retire_nest(&self, nest: &str) {
         self.nests.write().unwrap().insert(
             nest.to_string(),
@@ -186,6 +201,7 @@ impl RuntimeHealth {
     /// `(health, quarantine)` for one nest, ready to merge into a roster entry.
     pub fn json_for(&self, nest: &str) -> (&'static str, Option<serde_json::Value>) {
         match self.status(nest) {
+            Some(q) if q.class == "suspended" => ("suspended", Some(q.to_json())),
             Some(q) => ("quarantined", Some(q.to_json())),
             None => ("indexing", None),
         }
@@ -202,7 +218,7 @@ impl RuntimeHealth {
             // would hold `/ready` at 503 forever after an intended unmount.
             .filter_map(|n| {
                 self.status(n)
-                    .filter(|q| q.class != "retired")
+                    .filter(|q| q.class != "retired" && q.class != "suspended")
                     .map(|q| (n.clone(), q.reason))
             })
             .collect();
