@@ -293,14 +293,12 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
   has no concept of it. Per-tenant billing and authz stay out and are the gateway's job. The
   earlier wording drew the line at "cooperating tenants an operator picked - not paying strangers",
   which asked a question nobody could answer from the code.
-  **Amended 2026-09-23, overriding this bullet for one case: Chief decided that Nightswatch runs a
-  hosted nest service** (`app.nuthatch-indexer.com`, private repo `nightswatchhq/nuthatch-hosted`).
-  Building and operating that service is approved work. Our first real user, Arcaidia, asked for
-  it. We operate the stock binary like any other operator. Sign-in, plans, billing and per-tenant
-  authz all live in that repo, and **none of it enters this tree**. The test is RFC-0046 §1's:
-  delete the platform and a self-hoster loses nothing, and the binary's CLI, config, layout and
-  behaviour are what they would be had it never existed. A platform need that would require a
-  change here is a normal nuthatch feature on its own merits, or it is not built.
+  **Amended 2026-09-29: Nightswatch does not run a hosted nest service.** The 2026-09-23 override
+  that approved one is withdrawn, and the platform built under it (`nightswatchhq/nuthatch-hosted`)
+  is retired. Hosted nests will be offered by GraphOps on its own platform, running the stock
+  binary like any other operator, which is why the website's hosted page says "coming soon".
+  Nothing in this tree is built for it: a hosted need that would require a change here is a normal
+  nuthatch feature on its own merits, or it is not built.
 - Token, staking, decentralized network features (a possible future Graph Horizon data
   service is explicitly deferred).
 - Non-EVM chains before EVM is airtight.
