@@ -86,7 +86,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:3.12.2
+  ghcr.io/nightswatchhq/nuthatch:3.13.0
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -123,7 +123,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:3.12.2-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:3.13.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -750,6 +750,18 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
 `GET /health`.
 
+**Runtime admin routes** (3.13.0), token-gated off-localhost like the admin UI and removed by
+`--no-admin`. The full request and response shapes are in [admin-api.md](admin-api.md).
+
+| Route | Purpose |
+|---|---|
+| `POST /_admin/nests` | mount `{name, nid}` as a job (`202`); `?wait=true` answers when done, `?dry_run=true` prices it |
+| `GET /_admin/mounts`, `GET /_admin/mounts/{name}` | every mount job, or one: `accepted`, `fetching`, `joining`, `live`, `failed` |
+| `POST /_admin/suspend/{name}`, `POST /_admin/resume/{name}` | pause a mount behind a `503`, and catch it up again |
+| `POST /_admin/move/{name}` | move a name to another `nid` without a gap |
+| `DELETE /_admin/nests/{name}` | unmount; `?reclaim=true` also frees the dataset once nothing mounts it |
+| `DELETE /_admin/datasets/{nid}` | reclaim a dataset unmounted earlier |
+
 ---
 
 ### Control-plane endpoints (scaled mode only)
@@ -1224,6 +1236,8 @@ nuthatch nest bundle <dir>                        # produce a .bundle, prints it
 nuthatch nest publish <bundle> --registry <ref>   # publish as name@version, advance latest
 nuthatch nest load <ref> --registry <ref>         # pull and install, hash-verified
 nuthatch nest load <bundle|url|dir> --expect <h>  # or install directly, asserting the hash
+nuthatch nest nid --dir <dir>                     # the NID a runtime stores the nest under
+nuthatch nest load <nid> --registry <ref>         # pull by NID, refused unless the bundle computes to it
 ```
 
 The registry is **decoupled** from the binary: a filesystem path or S3-compatible object storage, with
@@ -1248,9 +1262,22 @@ nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking
   its successor; the new is served under `--new-endpoint` (default `/next`). Consumers migrate on
   their own clock.
 
-**Adding or removing a nest no longer requires a restart** (RFC-0027). Mount and unmount are live, so
-onboarding one tenant's nest no longer stops every co-tenant's. This used to be the largest operational
-gap for a team running nests on behalf of others.
+**Hosting nests on a runtime** (RFC-0027, 3.13.0). A runtime runs its own nests' lifecycle: a caller
+hands it a NID and it does the rest, with no restart and no co-tenant interrupted.
+
+- Declare the chains in `mounts.toml` and start with `--registry`. The runtime may start with nothing
+  mounted; the first mount onto a chain starts that chain's cursor.
+- `POST /_admin/nests {name, nid}` fetches a NID the runtime does not hold, verifies it, installs it
+  at `data/<nid>/` and indexes it, reporting progress as a job. A refused mount leaves nothing behind.
+- `?dry_run=true` first, to see the backfill, the per-block RPC work and the memory against the
+  cursor's ceiling, and whether it would be refused.
+- Suspend and resume a mount, move a name to a new NID without a gap, and unmount with
+  `?reclaim=true` to free the disk once nothing else mounts the dataset.
+- Meter per nest from `/metrics`: `nuthatch_nest_hot_store_bytes` and
+  `nuthatch_nest_sealed_segments_bytes`.
+
+Tenants are opaque labels the runtime refcounts; sign-in, plans, billing and per-tenant authorisation
+belong to the gateway in front of it. The walkthrough is [admin-api.md](admin-api.md).
 
 **Compliance operations** (RFC-0008), if you serve regulated customers:
 
