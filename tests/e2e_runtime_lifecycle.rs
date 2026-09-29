@@ -2506,7 +2506,8 @@ async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
     let job = wait_for_phase(&routes, "usdc", "suspended").await;
     assert_eq!(job["phase"], "suspended", "{job}");
 
-    // A restart re-reads the jobs and the suspended list.
+    // A restart with no jobs file, as after a hand edit: `mounts.toml` alone says it is suspended.
+    std::fs::remove_file(roost.path().join(nuthatch::mount_jobs::JOBS_FILE)).unwrap();
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
     let job = wait_for_phase(&routes, "usdc", "suspended").await;
