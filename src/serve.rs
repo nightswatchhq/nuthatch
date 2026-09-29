@@ -4592,6 +4592,167 @@ mod tests {
         assert!(chain.get("offchain").is_none(), "{chain}");
     }
 
+    /// The `/sql` concurrency sweep through the router, on one engine alone: the permits, the
+    /// 250 ms admission wait and the 503 past it, as production serves them. Every authored view is
+    /// read whole, each client starting at its own offset. Ignored unless `NUTHATCH_SWEEP_NEST`
+    /// names a nest; run it on a copy, since the store is opened inside it. With the memo on, a
+    /// repeated view never reaches the engine, so `NUTHATCH_SQL_MEMO_BYTES=0` measures the engine.
+    ///
+    ///     NUTHATCH_SWEEP_NEST=/copy/of/nest NUTHATCH_SWEEP_ENGINE=burrmill CLIENTS=1,8,32 \
+    ///         cargo test --release --features shadow-burrmill --lib sql_sweep -- --ignored --nocapture
+    #[cfg(feature = "shadow-burrmill")]
+    #[test]
+    #[ignore]
+    fn sql_sweep_over_a_nest() {
+        use std::sync::atomic::Ordering;
+        use tower::ServiceExt;
+        let Ok(nest) = std::env::var("NUTHATCH_SWEEP_NEST") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(nest);
+        let engine = std::env::var("NUTHATCH_SWEEP_ENGINE").unwrap_or_else(|_| "burrmill".into());
+        if engine == "burrmill" {
+            static BURRMILL: crate::engine_burrmill::BurrmillEngine =
+                crate::engine_burrmill::BurrmillEngine;
+            crate::analytics::TEST_PRIMARY.set(&BURRMILL).ok();
+        }
+        let secs: u64 = std::env::var("SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let counts: Vec<usize> = std::env::var("CLIENTS")
+            .unwrap_or_else(|_| "1,2,4,8,16,32".into())
+            .split(',')
+            .filter_map(|c| c.trim().parse().ok())
+            .collect();
+        let mut views: Vec<String> = crate::analytics::nest_view_files(&dir)
+            .iter()
+            .flat_map(|f| crate::analytics::split_sql_statements(&f.sql))
+            .filter_map(|stmt| crate::analytics::view_name(&stmt))
+            .collect();
+        views.sort();
+        let encode = |sql: &str| -> String {
+            sql.bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                        (b as char).to_string()
+                    }
+                    b => format!("%{b:02X}"),
+                })
+                .collect()
+        };
+        let uris: Arc<Vec<String>> = Arc::new(
+            views
+                .iter()
+                .map(|v| format!("/sql?q={}", encode(&format!("SELECT * FROM \"{v}\""))))
+                .collect(),
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The declared tables as production passes them, so a view over an event that never fired
+        // binds to an empty typed table (#663) rather than failing.
+        let mut state = test_state(&dir, SQL_MAX_CONCURRENCY);
+        let config = crate::config::Config::load(&dir).unwrap();
+        let registry = crate::registry::from_nest(&dir, &config).unwrap();
+        state.tables = Arc::new(crate::indexer::full_schema(&registry, &config));
+        let app = router(SharedNest::new(state));
+        println!(
+            "SWEEP\tengine={engine}\tviews={}\tpermits={SQL_MAX_CONCURRENCY}\tseconds={secs}",
+            views.len()
+        );
+        // One pass first, so no point pays the first open of the nest's session.
+        rt.block_on(async {
+            for u in uris.iter() {
+                let req = axum::http::Request::builder()
+                    .uri(u)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{u}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        });
+        let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        for &n in &counts {
+            let stop = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let sampler = {
+                let (peak, sampling) = (peak.clone(), sampling.clone());
+                std::thread::spawn(move || {
+                    while sampling.load(Ordering::Relaxed) {
+                        peak.fetch_max(crate::metrics::rss_bytes(), Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                })
+            };
+            let results: Vec<(Vec<u128>, u64, u64)> = rt.block_on(async {
+                let tasks: Vec<_> = (0..n)
+                    .map(|c| {
+                        let (app, uris) = (app.clone(), uris.clone());
+                        tokio::spawn(async move {
+                            let (mut ok, mut busy, mut other) = (Vec::new(), 0u64, 0u64);
+                            let mut i = c;
+                            while std::time::Instant::now() < stop {
+                                let req = axum::http::Request::builder()
+                                    .uri(&uris[i % uris.len()])
+                                    .body(axum::body::Body::empty())
+                                    .unwrap();
+                                i += 1;
+                                let t = std::time::Instant::now();
+                                let resp = app.clone().oneshot(req).await.unwrap();
+                                let status = resp.status();
+                                let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+                                match status {
+                                    StatusCode::OK => ok.push(t.elapsed().as_millis()),
+                                    StatusCode::SERVICE_UNAVAILABLE => busy += 1,
+                                    _ => other += 1,
+                                }
+                            }
+                            (ok, busy, other)
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::new();
+                for t in tasks {
+                    out.push(t.await.unwrap());
+                }
+                out
+            });
+            sampling.store(false, Ordering::Relaxed);
+            sampler.join().unwrap();
+            let mut all: Vec<u128> = results.iter().flat_map(|r| r.0.iter().copied()).collect();
+            all.sort_unstable();
+            let pct = |p: f64| {
+                all.get(((all.len() as f64 - 1.0) * p).round() as usize)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let busy: u64 = results.iter().map(|r| r.1).sum();
+            let other: u64 = results.iter().map(|r| r.2).sum();
+            let per: Vec<usize> = results.iter().map(|r| r.0.len()).collect();
+            println!(
+                "POINT\tclients={n}\tok_qps={:.1}\tp50_ms={}\tp99_ms={}\tmax_ms={}\tbusy_503={busy}\tother={other}\tok_per_client={}..{}\tpeak_rss_mb={}",
+                all.len() as f64 / secs as f64,
+                pct(0.50),
+                pct(0.99),
+                all.last().copied().unwrap_or(0),
+                per.iter().min().unwrap_or(&0),
+                per.iter().max().unwrap_or(&0),
+                peak.load(Ordering::Relaxed) / (1024 * 1024),
+            );
+        }
+    }
+
     fn test_state(dir: &std::path::Path, permits: usize) -> AppState {
         AppState {
             store: std::sync::Arc::new(Store::open(&dir.join("t.redb")).unwrap()),

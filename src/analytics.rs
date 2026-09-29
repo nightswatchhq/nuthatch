@@ -27,8 +27,16 @@ pub(crate) fn engine() -> &'static dyn Engine {
     if let Some(e) = TEST_ENGINE.with(std::cell::Cell::get) {
         return e;
     }
+    #[cfg(all(test, feature = "shadow-burrmill"))]
+    if let Some(e) = TEST_PRIMARY.get() {
+        return *e;
+    }
     crate::engine_shadow::installed().unwrap_or(&ENGINE)
 }
+
+// The whole process on another engine, for a test whose queries run on threads it does not own.
+#[cfg(all(test, feature = "shadow-burrmill"))]
+pub(crate) static TEST_PRIMARY: OnceLock<&'static dyn Engine> = OnceLock::new();
 
 // A test running this thread's work on another engine, so one body checks both.
 #[cfg(all(test, feature = "shadow-burrmill"))]
