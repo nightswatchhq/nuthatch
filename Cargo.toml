@@ -111,8 +111,8 @@ dbsp = "0.320"
 # dbsp itself - these pin the same versions as direct dependencies so the derives are reachable.
 size-of = { package = "feldera-size-of", version = "0.1.7" }
 rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }
-wasmtime = { version = "46", features = ["component-model"] }
-wasmtime-wasi = "46"
+wasmtime = { version = "48", features = ["component-model"] }
+wasmtime-wasi = "48"
 sha2 = "0.10"
 # RFC-0052 S4: an S3 ETag is an MD5, so a shallow `publish verify` can see replaced bytes. Already in
 # the tree via object_store at this version; MIT OR Apache-2.0.
