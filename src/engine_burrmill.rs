@@ -509,6 +509,149 @@ mod tests {
         assert!(seen.is_empty(), "{seen:#?}");
     }
 
+    /// The SQL nuthatch writes itself, rather than the SQL a user or an authored view writes: the
+    /// restart folds, the recipes, a webhook predicate and GraphQL's lowering, each on both engines.
+    #[test]
+    fn duckdb_and_burrmill_agree_on_the_sql_nuthatch_generates() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        let zero = crate::recipes::ZERO_ADDRESS;
+        let transfers = [
+            (zero, "0xaa", "1000"),
+            (zero, "0xbb", "250"),
+            ("0xaa", "0xbb", "400"),
+            ("0xbb", "0xcc", "650"),
+            ("0xcc", zero, "50"),
+            // Above i128: the folds drop it and `over_i128_transfers` counts it.
+            (
+                "0xaa",
+                "0xcc",
+                "1606938044258990275541962092341162602522202993782792835301376",
+            ),
+        ];
+        for (i, (from, to, value)) in transfers.iter().enumerate() {
+            let b = i as u64 + 1;
+            let rows = [
+                json!({"table": "tok__transfer", "block_number": b, "log_index": 0, "from": from, "to": to, "value": value}).to_string(),
+                json!({"table": "tok__sync", "block_number": b, "log_index": 1, "address": if b.is_multiple_of(2) { "0xp1" } else { "0xp2" }, "reserve0": (b * 10).to_string(), "reserve1": (b * 7).to_string()}).to_string(),
+            ];
+            crate::seal::seal_range(dir.path(), &rows, b, b).unwrap();
+        }
+        let labels = dir.path().join("labels");
+        std::fs::create_dir_all(&labels).unwrap();
+        std::fs::write(
+            labels.join("l.json"),
+            r#"[{"address":"0xBB","label":"exchange"},{"address":"0xcc","label":"mixer"}]"#,
+        )
+        .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<Difference>::new()));
+        let s = seen.clone();
+        let engine = ShadowEngine::new(
+            Box::new(crate::engine_duck::DuckEngine),
+            Box::new(BurrmillEngine),
+            Arc::new(move |d: &Difference| s.lock().unwrap().push(d.clone())),
+        );
+        let session = engine.open(dir.path()).unwrap();
+        let manifest = crate::seal::load_manifest_with_hash(dir.path()).unwrap().0;
+        let sealed = |t: &str| -> Vec<PathBuf> {
+            manifest.tables[t]
+                .iter()
+                .map(|s| crate::seal::segment_path(dir.path(), &s.file, &s.hash))
+                .collect()
+        };
+        let col = |n: &str, t: &str| (n.to_string(), t.to_string());
+        let transfer_cols = [
+            col("block_number", "u64"),
+            col("log_index", "u64"),
+            col("from", "address"),
+            col("to", "address"),
+            col("value", "word32"),
+        ];
+        let sync_cols = [
+            col("block_number", "u64"),
+            col("log_index", "u64"),
+            col("address", "address"),
+            col("reserve0", "word32"),
+            col("reserve1", "word32"),
+        ];
+        for (t, cols) in [("tok__transfer", &transfer_cols), ("tok__sync", &sync_cols)] {
+            assert!(session
+                .bind_facts(t, cols, &sealed(t), false, FactWindow::default())
+                .unwrap());
+        }
+        session.bind_labels(&labels).unwrap();
+
+        let graph = crate::graph_schema::parse(
+            r#"
+type Pool @entity { id: ID! liquidity: BigInt! token0: Token! swaps: [Swap!]! @derivedFrom(field: "pool") }
+type Token @entity { id: ID! symbol: String! }
+type Swap @entity { id: ID! pool: Pool! }
+"#,
+        )
+        .unwrap();
+        let view = crate::subgraph_import::to_alias;
+        for ddl in [
+            format!("CREATE VIEW \"{}\" AS SELECT * FROM (VALUES ('p1', '5', 't1'), ('p2', '170141183460469231731687303715884105728', 't2'), ('p3', '12', 't1')) v(id, liquidity, token0)", view("Pool")),
+            format!("CREATE VIEW \"{}\" AS SELECT * FROM (VALUES ('t1', 'AAA'), ('t2', 'BBB')) v(id, symbol)", view("Token")),
+            format!("CREATE VIEW \"{}\" AS SELECT * FROM (VALUES ('s1', 'p1'), ('s2', 'p1'), ('s3', 'p3')) v(id, pool)", view("Swap")),
+        ] {
+            session.execute(&ddl).unwrap();
+        }
+        let mut statements: Vec<String> = [
+            crate::recipes::total_supply_select("tok"),
+            crate::recipes::balances_select("tok"),
+            crate::recipes::holder_count_select("tok"),
+            crate::recipes::reserves_select("tok"),
+            "SELECT * FROM \"tok__transfer\" WHERE block_number > 0 AND block_number <= 6 \
+             AND (CAST(value AS HUGEINT) >= 100) ORDER BY block_number, log_index"
+                .to_string(),
+        ]
+        .into_iter()
+        .chain(crate::analytics::generated_fold_sql(
+            "tok__transfer",
+            "from",
+            "to",
+            "value",
+            3,
+        ))
+        .collect();
+        for q in [
+            "{ pools { id liquidity } }",
+            "{ pools(orderBy: liquidity, orderDirection: desc) { id } }",
+            "{ pools(where: { liquidity_gt: \"6\" }) { id } }",
+            "{ pools { id token0 { symbol } } }",
+            "{ pools { id swaps { id } } }",
+            "{ swaps { id pool { id liquidity } } }",
+        ] {
+            let root = crate::graph_query::parse(q).unwrap().remove(0);
+            statements.push(crate::graph_query::compile(&graph, &root).unwrap().sql);
+        }
+
+        for sql in &statements {
+            let before = seen.lock().unwrap().len();
+            let served = session.collect(sql, Some(1000));
+            let after = seen.lock().unwrap().len();
+            eprintln!(
+                "{}\t{}\t{}",
+                if after > before { "DIFF" } else { "same" },
+                match &served {
+                    Ok((rows, _)) => format!("{} rows", rows.len()),
+                    Err(e) => format!("primary refused: {e:?}"),
+                },
+                sql.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+        }
+        let seen = seen.lock().unwrap();
+        for d in seen.iter() {
+            eprintln!(
+                "{:?}\n  primary={}\n  secondary={}",
+                d.kind, d.primary, d.secondary
+            );
+        }
+        assert!(seen.is_empty(), "{} differences", seen.len());
+    }
+
     /// Shadow mode over a real nest, through the production path: the shadow is installed, every
     /// authored view is read whole with `query_guarded`, and each difference is printed and
     /// counted. Ignored unless `NUTHATCH_SHADOW_NEST` names the nest directory.

@@ -614,10 +614,14 @@ fn write_entities(
                     Some(a) => match &a.source {
                         AccumulationSource::Column(column) => {
                             let cast = format!("TRY_CAST(\"{column}\" AS DECIMAL(38,0))");
+                            let value = crate::analytics::cast_or_null(
+                                &format!("\"{column}\""),
+                                "DECIMAL(38,0)",
+                            );
                             let term = if a.negated {
-                                format!("-{cast}")
+                                format!("-{value}")
                             } else {
-                                cast.clone()
+                                value
                             };
                             cols.push(format!("    {term} AS \"{f}\""));
                             if needs_overflow.contains(f) {

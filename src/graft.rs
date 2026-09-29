@@ -28,6 +28,7 @@
 //! **A parse failure falls back to the raw text.** That can only cost a match, never invent one.
 
 use anyhow::{Context, Result};
+#[cfg(test)]
 use duckdb::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -128,6 +129,7 @@ impl CanonicalPlan {
 /// Everything else in §3's unsafe list stays significant, and needs no work to stay so: the AST is
 /// already type-aware (`5/2` carries `INTEGER` where `5/2.0` carries `DECIMAL`), already ordered, and
 /// already distinguishes `DISTINCT`.
+#[cfg(test)]
 pub(crate) fn canonical_plan(conn: &Connection, sql: &str) -> CanonicalPlan {
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let Ok(raw) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {

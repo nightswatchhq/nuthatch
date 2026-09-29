@@ -1200,7 +1200,7 @@ export function handlePoolCreated(event: PoolCreated): void {
     );
     // The column-sourced total beside it keeps both the cast and the flag.
     assert!(
-        sql.contains(r#"TRY_CAST("fee" AS DECIMAL(38,0)) AS "liquidity""#)
+        sql.contains(r#"CAST("fee" AS DECIMAL(38,0)) END AS "liquidity""#)
             && sql.contains(r#"sum("liquidity") AS "liquidity""#),
         "a column total is still cast then summed:\n{sql}"
     );

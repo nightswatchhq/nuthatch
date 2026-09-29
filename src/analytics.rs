@@ -2048,14 +2048,83 @@ pub fn over_i128_transfers(
     value_col: &str,
     sealed_through: u64,
 ) -> Result<u64> {
-    let sql = format!(
+    Ok(
+        query_cold(dir, &over_i128_sql(table, value_col), sealed_through)?
+            .first()
+            .and_then(|r| r["n"].as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+fn over_i128_sql(table: &str, value_col: &str) -> String {
+    format!(
         "SELECT COUNT(*)::VARCHAR AS n FROM \"{table}\"          WHERE \"{value_col}\" IS NOT NULL AND TRY_CAST(\"{value_col}\" AS HUGEINT) IS NULL"
-    );
-    Ok(query_cold(dir, &sql, sealed_through)?
-        .first()
-        .and_then(|r| r["n"].as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0))
+    )
+}
+
+/// `expr` as `ty`, or NULL when it does not fit: `TRY_CAST`'s answer, spelled so the drop is
+/// visible to an engine that refuses to sum a `TRY_CAST` (Burrmill's checked rule).
+pub(crate) fn cast_or_null(expr: &str, ty: &str) -> String {
+    format!("CASE WHEN TRY_CAST({expr} AS {ty}) IS NOT NULL THEN CAST({expr} AS {ty}) END")
+}
+
+fn net_balances_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
+    // `to` receives (+value), `from` sends (−value); TRY_CAST yields NULL (skipped) for the rare
+    // value that overflows i128, mirroring the caller's i128 parse-or-skip.
+    let d = cast_or_null(&format!("\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
+           SELECT \"{to_col}\" AS addr, {d} AS d FROM \"{table}\" \
+           UNION ALL \
+           SELECT \"{from_col}\" AS addr, -{d} AS d FROM \"{table}\"\
+         ) GROUP BY addr HAVING SUM(d) <> 0"
+    )
+}
+
+fn cold_exposure_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
+    // Outbound: the sender has exposure to the labels of a labeled recipient. Inbound: the recipient
+    // has exposure from the labels of a labeled sender. COUNT/SUM per (address, label, direction).
+    let d = cast_or_null(&format!("t.\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT addr, label, dir, SUM(d)::VARCHAR AS amount, COUNT(*) AS cnt FROM (\
+           SELECT lower(t.\"{from_col}\") AS addr, l.label AS label, 'out' AS dir, \
+                  {d} AS d \
+           FROM \"{table}\" t JOIN labels l ON lower(t.\"{to_col}\") = l.address \
+           UNION ALL \
+           SELECT lower(t.\"{to_col}\") AS addr, l.label, 'in', \
+                  {d} AS d \
+           FROM \"{table}\" t JOIN labels l ON lower(t.\"{from_col}\") = l.address\
+         ) GROUP BY addr, label, dir"
+    )
+}
+
+fn cold_velocity_sql(table: &str, from_col: &str, value_col: &str, window: u64) -> String {
+    let w = window.max(1);
+    // window_start = (block // W) * W; sum outbound volume + count per (sender, window).
+    let d = cast_or_null(&format!("\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
+                SUM({d})::VARCHAR AS vol, COUNT(*) AS cnt \
+         FROM \"{table}\" GROUP BY addr, ws"
+    )
+}
+
+/// The four restart folds' SQL over one transfer table, for testing them on another engine.
+#[cfg(all(test, feature = "shadow-burrmill"))]
+pub(crate) fn generated_fold_sql(
+    table: &str,
+    from_col: &str,
+    to_col: &str,
+    value_col: &str,
+    window: u64,
+) -> [String; 4] {
+    [
+        over_i128_sql(table, value_col),
+        net_balances_sql(table, from_col, to_col, value_col),
+        cold_exposure_sql(table, from_col, to_col, value_col),
+        cold_velocity_sql(table, from_col, value_col, window),
+    ]
 }
 
 pub fn net_balances(
@@ -2066,17 +2135,12 @@ pub fn net_balances(
     value_col: &str,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128)>> {
-    // `to` receives (+value), `from` sends (−value); TRY_CAST yields NULL (skipped) for the rare
-    // value that overflows i128, mirroring the caller's i128 parse-or-skip.
-    let sql = format!(
-        "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
-           SELECT \"{to_col}\" AS addr, TRY_CAST(\"{value_col}\" AS HUGEINT) AS d FROM \"{table}\" \
-           UNION ALL \
-           SELECT \"{from_col}\" AS addr, -TRY_CAST(\"{value_col}\" AS HUGEINT) AS d FROM \"{table}\"\
-         ) GROUP BY addr HAVING SUM(d) <> 0"
-    );
     let mut out = Vec::new();
-    for r in query_cold(dir, &sql, sealed_through)? {
+    for r in query_cold(
+        dir,
+        &net_balances_sql(table, from_col, to_col, value_col),
+        sealed_through,
+    )? {
         if let (Some(addr), Some(net)) = (r["addr"].as_str(), r["net"].as_str()) {
             if let Ok(n) = net.parse::<i128>() {
                 out.push((addr.to_string(), n));
@@ -2100,21 +2164,12 @@ pub fn cold_exposure(
     value_col: &str,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128, i128)>> {
-    // Outbound: the sender has exposure to the labels of a labeled recipient. Inbound: the recipient
-    // has exposure from the labels of a labeled sender. COUNT/SUM per (address, label, direction).
-    let sql = format!(
-        "SELECT addr, label, dir, SUM(d)::VARCHAR AS amount, COUNT(*) AS cnt FROM (\
-           SELECT lower(t.\"{from_col}\") AS addr, l.label AS label, 'out' AS dir, \
-                  TRY_CAST(t.\"{value_col}\" AS HUGEINT) AS d \
-           FROM \"{table}\" t JOIN labels l ON lower(t.\"{to_col}\") = l.address \
-           UNION ALL \
-           SELECT lower(t.\"{to_col}\") AS addr, l.label, 'in', \
-                  TRY_CAST(t.\"{value_col}\" AS HUGEINT) AS d \
-           FROM \"{table}\" t JOIN labels l ON lower(t.\"{from_col}\") = l.address\
-         ) GROUP BY addr, label, dir"
-    );
     let mut out = Vec::new();
-    for r in query_cold(dir, &sql, sealed_through)? {
+    for r in query_cold(
+        dir,
+        &cold_exposure_sql(table, from_col, to_col, value_col),
+        sealed_through,
+    )? {
         let (Some(addr), Some(label), Some(dir_s), Some(cnt)) = (
             r["addr"].as_str(),
             r["label"].as_str(),
@@ -2145,15 +2200,12 @@ pub fn cold_velocity(
     window: u64,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128, i128)>> {
-    let w = window.max(1);
-    // window_start = (block // W) * W; sum outbound volume + count per (sender, window).
-    let sql = format!(
-        "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
-                SUM(TRY_CAST(\"{value_col}\" AS HUGEINT))::VARCHAR AS vol, COUNT(*) AS cnt \
-         FROM \"{table}\" GROUP BY addr, ws"
-    );
     let mut out = Vec::new();
-    for r in query_cold(dir, &sql, sealed_through)? {
+    for r in query_cold(
+        dir,
+        &cold_velocity_sql(table, from_col, value_col, window),
+        sealed_through,
+    )? {
         let (Some(addr), Some(ws), Some(cnt)) =
             (r["addr"].as_str(), r["ws"].as_u64(), r["cnt"].as_i64())
         else {
