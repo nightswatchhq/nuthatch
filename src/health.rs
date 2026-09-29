@@ -157,6 +157,12 @@ impl RuntimeHealth {
         );
     }
 
+    /// Whether `chain`'s cursor has died. Its quarantine holds until restart, so a mount onto that
+    /// chain must not quietly start a second cursor under it.
+    pub fn cursor_quarantined(&self, chain: &str) -> bool {
+        self.cursors.read().unwrap().contains_key(chain)
+    }
+
     /// This nest's effective quarantine: its own if it has one, otherwise its cursor's. A nest that is
     /// itself fine but whose cursor died is still not indexing, and must not report that it is.
     pub fn status(&self, nest: &str) -> Option<QuarantineInfo> {
