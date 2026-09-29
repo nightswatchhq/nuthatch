@@ -12,6 +12,8 @@ not to infer work that remains.
   their head targets, and the nuthatch release hosted nests depends on.
 - [Frozen for 2027](frozen-for-2027.md) - capability work deliberately deferred during the 2026
   feature freeze. These issues are closed, with an explicit reopening rule.
+- [Parked issues closed, 2026-09-28](parked-closed.md) - the open `parked` queue, closed with the
+  decision kept. Reopening one is a new decision.
 - [RFC index](rfcs/README.md) - design and implementation status for each RFC.
 
 ## Porting a subgraph
