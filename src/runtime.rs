@@ -2247,7 +2247,10 @@ fn persist_mounted_nests(dir: &Path, nests: &[String], known: &[Mount]) -> Resul
         }
         .route_key(multi_tenant)
     };
-    if mounts.mounts.is_empty() {
+    // A runtime that started empty has neither list nor records, and its first mount must be
+    // recorded by nid rather than by name (#1545). Only a file already on the pre-2.0 list, or with no
+    // nid to record, stays on the list.
+    if mounts.mounts.is_empty() && (!mounts.runtime.nests.is_empty() || known.is_empty()) {
         mounts.runtime.nests = nests.to_vec();
     } else {
         // Drop the records for mounts that are gone, or the next `load` refuses the file it just
@@ -3951,6 +3954,41 @@ mod tests {
         assert_eq!(
             after.mounts[0].nid, nid,
             "the surviving mount must still point at the same dataset"
+        );
+    }
+
+    /// #1545: a runtime that started with nothing mounted has neither `[[mounts]]` nor a `nests`
+    /// list. Its file must load, and its first live mount must be written as a record by nid, or the
+    /// restart looks for `nests/<name>` and the mount is gone.
+    #[test]
+    fn an_empty_runtimes_first_mount_is_persisted_by_nid() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let nid = "cc33".repeat(16);
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\n\n\
+             [[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let empty = MountTable::load(root).expect("an empty runtime's file must load");
+        assert!(empty.mount_refs().is_empty());
+        assert_eq!(empty.chain_endpoints().unwrap().len(), 1);
+
+        let known: MountTable = toml::from_str(&format!(
+            "[runtime]\nname = \"r\"\n\n[[mounts]]\nalias = \"usdc\"\nnid = \"{nid}\"\n"
+        ))
+        .unwrap();
+        persist_mounted_nests(root, &["usdc".to_string()], &known.mounts).unwrap();
+
+        let after = MountTable::load(root).expect("the rewritten file must still load");
+        assert_eq!(after.mounts.len(), 1, "the mount was not recorded");
+        assert_eq!(after.mounts[0].alias, "usdc");
+        assert_eq!(after.mounts[0].nid, nid);
+        assert!(
+            after.runtime.nests.is_empty(),
+            "a 2.0 mount written to the pre-2.0 list: {:?}",
+            after.runtime.nests
         );
     }
 
