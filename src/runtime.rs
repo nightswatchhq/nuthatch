@@ -2634,7 +2634,10 @@ impl RuntimeHandles {
 
                 // After the budget, so a refused mount never dials anything.
                 if let Some(d) = dormant {
-                    let runtime = self.roster["runtime"].as_str().unwrap_or("runtime").to_string();
+                    let runtime = self.roster["runtime"]
+                        .as_str()
+                        .unwrap_or("runtime")
+                        .to_string();
                     let (source, dial) = open_chain(
                         &d.endpoint,
                         d.rpc_fallback,
@@ -2688,109 +2691,114 @@ impl RuntimeHandles {
                     .cloned();
 
                 let (state, worker) = match lifecycle {
-                None => {
-                // The first nest on this chain (#1545). It starts the chain's cursor exactly as boot
-                // would, so it backfills inside that cursor and serves while it does, as at boot.
-                self.health.register(name, &chain);
-                // An earlier unmount of this name left it recorded as retired.
-                self.health.mark_indexing(name);
-                let mut cursor = indexer::spawn_runtime(
-                    source,
-                    vec![(name.to_string(), prepared.into_dir(), config)],
-                    self.mount_ctx.backfill,
-                    self.mount_ctx.seal_direct,
-                    concurrency,
-                    self.mount_ctx.window_override,
-                    self.mount_ctx.admin_enabled,
-                    self.mount_ctx.admin_token.clone(),
-                    self.health.clone(),
-                    self.mount_ctx.fail_fast,
-                )
-                .await
-                .with_context(|| format!("starting the {chain} cursor for '{name}'"))?;
-                let (_, mut state) = cursor.states.pop().expect("one nest in, one state out");
-                let worker = cursor.alert_workers.pop().map(|(_, w)| w);
-                overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
-                self.lifecycle.insert(chain.clone(), cursor.lifecycle);
-                match &self.mount_ctx.cursors {
-                    Some(feed) => {
-                        if feed.send((chain.clone(), cursor.ingest)).is_err() {
-                            tracing::warn!("the {chain} cursor started while the runtime was stopping");
+                    None => {
+                        // The first nest on this chain (#1545). It starts the chain's cursor exactly as boot
+                        // would, so it backfills inside that cursor and serves while it does, as at boot.
+                        self.health.register(name, &chain);
+                        // An earlier unmount of this name left it recorded as retired.
+                        self.health.mark_indexing(name);
+                        let mut cursor = indexer::spawn_runtime(
+                            source,
+                            vec![(name.to_string(), prepared.into_dir(), config)],
+                            self.mount_ctx.backfill,
+                            self.mount_ctx.seal_direct,
+                            concurrency,
+                            self.mount_ctx.window_override,
+                            self.mount_ctx.admin_enabled,
+                            self.mount_ctx.admin_token.clone(),
+                            self.health.clone(),
+                            self.mount_ctx.fail_fast,
+                        )
+                        .await
+                        .with_context(|| format!("starting the {chain} cursor for '{name}'"))?;
+                        let (_, mut state) =
+                            cursor.states.pop().expect("one nest in, one state out");
+                        let worker = cursor.alert_workers.pop().map(|(_, w)| w);
+                        overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
+                        self.lifecycle.insert(chain.clone(), cursor.lifecycle);
+                        match &self.mount_ctx.cursors {
+                            Some(feed) => {
+                                if feed.send((chain.clone(), cursor.ingest)).is_err() {
+                                    tracing::warn!(
+                                        "the {chain} cursor started while the runtime was stopping"
+                                    );
+                                }
+                            }
+                            None => drop(cursor.ingest),
                         }
+                        tracing::info!("nest '{name}' started the {chain} cursor");
+                        (state, worker)
                     }
-                    None => drop(cursor.ingest),
-                }
-                tracing::info!("nest '{name}' started the {chain} cursor");
-                (state, worker)
-                }
-                Some(lifecycle) => {
-                // Phase 1: build and catch up, off to one side of the cursor.
-                let sql_gate = self
-                    .states
-                    .iter()
-                    .find(|(_, s)| s.chain == chain)
-                    .map(|(_, s)| Arc::clone(&s.sql_gate))
-                    .unwrap_or_else(crate::serve::new_sql_gate);
-                let (nest, mut state, mut worker, next) = indexer::build_and_prepare_nest(
-                    &source,
-                    prepared,
-                    &config,
-                    self.mount_ctx.backfill,
-                    self.mount_ctx.seal_direct,
-                    concurrency,
-                    self.mount_ctx.window_override,
-                    self.mount_ctx.admin_enabled,
-                    self.mount_ctx.admin_token.clone(),
-                    None,
-                    sql_gate,
-                )
-                .await
-                .with_context(|| format!("preparing nest '{name}' for mount"))?;
-                state.runtime_health = Some((name.to_string(), self.health.clone()));
-                // `/sql` provenance names the dataset that answered (RFC-0035 §3, src/serve.rs:1161-1172), and
-                // this is the only place that knows it at mount time: `nid` above is already the resolved
-                // identity (the caller's, or the record's for a remount), the same one `dir` was derived from
-                // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
-                // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
-                // it here or serve `nid: null` until the next restart (#557).
-                overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
+                    Some(lifecycle) => {
+                        // Phase 1: build and catch up, off to one side of the cursor.
+                        let sql_gate = self
+                            .states
+                            .iter()
+                            .find(|(_, s)| s.chain == chain)
+                            .map(|(_, s)| Arc::clone(&s.sql_gate))
+                            .unwrap_or_else(crate::serve::new_sql_gate);
+                        let (nest, mut state, mut worker, next) = indexer::build_and_prepare_nest(
+                            &source,
+                            prepared,
+                            &config,
+                            self.mount_ctx.backfill,
+                            self.mount_ctx.seal_direct,
+                            concurrency,
+                            self.mount_ctx.window_override,
+                            self.mount_ctx.admin_enabled,
+                            self.mount_ctx.admin_token.clone(),
+                            None,
+                            sql_gate,
+                        )
+                        .await
+                        .with_context(|| format!("preparing nest '{name}' for mount"))?;
+                        state.runtime_health = Some((name.to_string(), self.health.clone()));
+                        // `/sql` provenance names the dataset that answered (RFC-0035 §3, src/serve.rs:1161-1172), and
+                        // this is the only place that knows it at mount time: `nid` above is already the resolved
+                        // identity (the caller's, or the record's for a remount), the same one `dir` was derived from
+                        // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
+                        // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
+                        // it here or serve `nid: null` until the next restart (#557).
+                        overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
 
-                // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
-                // The delivery task holds its own store clone. Dropping the `JoinHandle` does not
-                // stop it, so a rejected mount has to abort the task or the file stays locked (#1535).
-                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                if lifecycle
-                    .send(indexer::CursorCommand::Mount {
-                        nest: Box::new(nest),
-                        next,
-                        ack: Some(ack_tx),
-                    })
-                    .is_err()
-                {
-                    abort_alert_worker(&mut worker);
-                    return Err(anyhow::anyhow!(
-                        "cursor on {chain} is gone; cannot mount '{name}'"
-                    ));
-                }
-                match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => {
-                        abort_alert_worker(&mut worker);
-                        return Err(anyhow::anyhow!(
-                            "cursor on {chain} stopped while mounting '{name}'"
-                        ));
-                    }
-                    Err(_) => {
-                        abort_alert_worker(&mut worker);
-                        return Err(anyhow::anyhow!(
+                        // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
+                        // The delivery task holds its own store clone. Dropping the `JoinHandle` does not
+                        // stop it, so a rejected mount has to abort the task or the file stays locked (#1535).
+                        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                        if lifecycle
+                            .send(indexer::CursorCommand::Mount {
+                                nest: Box::new(nest),
+                                next,
+                                ack: Some(ack_tx),
+                            })
+                            .is_err()
+                        {
+                            abort_alert_worker(&mut worker);
+                            return Err(anyhow::anyhow!(
+                                "cursor on {chain} is gone; cannot mount '{name}'"
+                            ));
+                        }
+                        match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                abort_alert_worker(&mut worker);
+                                return Err(anyhow::anyhow!(
+                                    "cursor on {chain} stopped while mounting '{name}'"
+                                ));
+                            }
+                            Err(_) => {
+                                abort_alert_worker(&mut worker);
+                                return Err(anyhow::anyhow!(
                             "cursor on {chain} did not acknowledge mounting '{name}' within {}s",
                             UNMOUNT_ACK_TIMEOUT.as_secs()
                         ));
+                            }
+                        }
+                        tracing::info!(
+                            "nest '{name}' mounted onto the {chain} cursor at block {next}"
+                        );
+                        (state, worker)
                     }
-                }
-                tracing::info!("nest '{name}' mounted onto the {chain} cursor at block {next}");
-                (state, worker)
-                }
                 };
                 (state, worker, incoming, name.to_string())
             }

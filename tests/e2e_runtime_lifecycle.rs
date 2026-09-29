@@ -1333,10 +1333,8 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
         .expect("after the last mount goes, the shared store must be reopenable");
 }
 
-type CursorIntake = tokio::sync::mpsc::UnboundedReceiver<(
-    String,
-    tokio::task::JoinHandle<anyhow::Result<()>>,
-)>;
+type CursorIntake =
+    tokio::sync::mpsc::UnboundedReceiver<(String, tokio::task::JoinHandle<anyhow::Result<()>>)>;
 
 /// A runtime that started with nothing mounted (#1545): `arbitrum-one` has a source and no cursor,
 /// and the nest at `data/<nid>/` is recorded but not running.
@@ -1453,7 +1451,9 @@ async fn a_first_mount_starts_its_chains_cursor_and_the_cursor_outlives_an_empty
             .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
     };
     assert!(
-        wait_until(POLL_TIMEOUT, || last_block(&handles).as_deref() == Some("3")).await,
+        wait_until(POLL_TIMEOUT, || last_block(&handles).as_deref()
+            == Some("3"))
+        .await,
         "the started cursor never indexed: last_block {:?}",
         last_block(&handles)
     );
@@ -1468,7 +1468,13 @@ async fn a_first_mount_starts_its_chains_cursor_and_the_cursor_outlives_an_empty
     let (a1, a2) = (account(1), account(2));
     tape.insert_block(
         4,
-        transfers_block(4, 0, 1_700_000_004, USDC, &[(a1.as_str(), a2.as_str(), 400)]),
+        transfers_block(
+            4,
+            0,
+            1_700_000_004,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 400)],
+        ),
     );
     tape.advance_tip_to(4);
     handles
@@ -1480,7 +1486,9 @@ async fn a_first_mount_starts_its_chains_cursor_and_the_cursor_outlives_an_empty
         "the remount started a second cursor on a chain that already had one"
     );
     assert!(
-        wait_until(POLL_TIMEOUT, || last_block(&handles).as_deref() == Some("4")).await,
+        wait_until(POLL_TIMEOUT, || last_block(&handles).as_deref()
+            == Some("4"))
+        .await,
         "the remounted nest does not follow the tip: last_block {:?}",
         last_block(&handles)
     );
