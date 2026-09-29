@@ -614,7 +614,7 @@ fn write_entities(
                     Some(a) => match &a.source {
                         AccumulationSource::Column(column) => {
                             let cast = format!("TRY_CAST(\"{column}\" AS DECIMAL(38,0))");
-                            let value = crate::analytics::cast_or_null(
+                            let value = crate::analytics::exact_or_null(
                                 &format!("\"{column}\""),
                                 "DECIMAL(38,0)",
                             );

@@ -2032,7 +2032,7 @@ pub(crate) fn reject_replacement_scan(sql: &str) -> Result<()> {
 /// whose net is exactly zero are omitted (matching the view's drop-at-zero behaviour). `table` and
 /// the column names come from the registry (`{alias}__transfer`; from/to/value column names vary by
 /// token - USDC from/to/value, WETH src/dst/wad), never user text, so there is no injection surface.
-/// Transfers in `table` whose value does not fit `i128`, and which [`net_balances`] therefore
+/// Transfers in `table` whose value has more than 38 digits, and which [`net_balances`] therefore
 /// dropped (COR-8, #814).
 ///
 /// A separate query rather than a column on the fold: the fold groups by address and sums, so a
@@ -2042,14 +2042,14 @@ pub(crate) fn reject_replacement_scan(sql: &str) -> Result<()> {
 /// `TRY_CAST` is the same expression the fold uses, deliberately: a second spelling of "does not fit"
 /// could disagree with the one doing the dropping, and then the count would describe a different set
 /// of rows than the ones actually missing.
-pub fn over_i128_transfers(
+pub fn oversized_transfers(
     dir: &Path,
     table: &str,
     value_col: &str,
     sealed_through: u64,
 ) -> Result<u64> {
     Ok(
-        query_cold(dir, &over_i128_sql(table, value_col), sealed_through)?
+        query_cold(dir, &oversized_sql(table, value_col), sealed_through)?
             .first()
             .and_then(|r| r["n"].as_str())
             .and_then(|s| s.parse().ok())
@@ -2057,22 +2057,23 @@ pub fn over_i128_transfers(
     )
 }
 
-fn over_i128_sql(table: &str, value_col: &str) -> String {
+fn oversized_sql(table: &str, value_col: &str) -> String {
     format!(
-        "SELECT COUNT(*)::VARCHAR AS n FROM \"{table}\"          WHERE \"{value_col}\" IS NOT NULL AND TRY_CAST(\"{value_col}\" AS HUGEINT) IS NULL"
+        "SELECT COUNT(*)::VARCHAR AS n FROM \"{table}\"          WHERE \"{value_col}\" IS NOT NULL AND TRY_CAST(\"{value_col}\" AS DECIMAL(38,0)) IS NULL"
     )
 }
 
-/// `expr` as `ty`, or NULL when it does not fit: `TRY_CAST`'s answer, spelled so the drop is
-/// visible to an engine that refuses to sum a `TRY_CAST` (Burrmill's checked rule).
-pub(crate) fn cast_or_null(expr: &str, ty: &str) -> String {
-    format!("CASE WHEN TRY_CAST({expr} AS {ty}) IS NOT NULL THEN CAST({expr} AS {ty}) END")
+/// `expr` as `ty` when it has at most 38 digits, else NULL: the nest's `DECIMAL(38,0)` line (COR-8),
+/// spelled so the drop is visible to an engine that refuses to sum a `TRY_CAST` (Burrmill's checked
+/// rule). [`crate::views::transfer_value`] draws the same line for the live views.
+pub(crate) fn exact_or_null(expr: &str, ty: &str) -> String {
+    format!("CASE WHEN TRY_CAST({expr} AS DECIMAL(38,0)) IS NOT NULL THEN CAST({expr} AS {ty}) END")
 }
 
 fn net_balances_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
-    // `to` receives (+value), `from` sends (−value); TRY_CAST yields NULL (skipped) for the rare
-    // value that overflows i128, mirroring the caller's i128 parse-or-skip.
-    let d = cast_or_null(&format!("\"{value_col}\""), "HUGEINT");
+    // `to` receives (+value), `from` sends (−value); a value past 38 digits is NULL (skipped),
+    // mirroring the live views' `transfer_value`.
+    let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
     format!(
         "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
            SELECT \"{to_col}\" AS addr, {d} AS d FROM \"{table}\" \
@@ -2085,7 +2086,7 @@ fn net_balances_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) 
 fn cold_exposure_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
     // Outbound: the sender has exposure to the labels of a labeled recipient. Inbound: the recipient
     // has exposure from the labels of a labeled sender. COUNT/SUM per (address, label, direction).
-    let d = cast_or_null(&format!("t.\"{value_col}\""), "HUGEINT");
+    let d = exact_or_null(&format!("t.\"{value_col}\""), "HUGEINT");
     format!(
         "SELECT addr, label, dir, SUM(d)::VARCHAR AS amount, COUNT(*) AS cnt FROM (\
            SELECT lower(t.\"{from_col}\") AS addr, l.label AS label, 'out' AS dir, \
@@ -2102,7 +2103,7 @@ fn cold_exposure_sql(table: &str, from_col: &str, to_col: &str, value_col: &str)
 fn cold_velocity_sql(table: &str, from_col: &str, value_col: &str, window: u64) -> String {
     let w = window.max(1);
     // window_start = (block // W) * W; sum outbound volume + count per (sender, window).
-    let d = cast_or_null(&format!("\"{value_col}\""), "HUGEINT");
+    let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
     format!(
         "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
                 SUM({d})::VARCHAR AS vol, COUNT(*) AS cnt \
@@ -2120,7 +2121,7 @@ pub(crate) fn generated_fold_sql(
     window: u64,
 ) -> [String; 4] {
     [
-        over_i128_sql(table, value_col),
+        oversized_sql(table, value_col),
         net_balances_sql(table, from_col, to_col, value_col),
         cold_exposure_sql(table, from_col, to_col, value_col),
         cold_velocity_sql(table, from_col, value_col, window),
@@ -5999,21 +6000,21 @@ template="pool"
         assert!(!exfil.exists(), "a WITH-prefixed COPY wrote a file");
     }
 
-    /// Issue #150: a value larger than `i128` must be dropped **identically** by the cold fold and the
-    /// hot replay, or a warm restart would silently change balances.
+    /// Issue #150: a value of more than 38 digits must be dropped **identically** by the cold fold and
+    /// the hot replay, or a warm restart would silently change balances.
     ///
-    /// The two paths reject it by different mechanisms - the cold fold via `TRY_CAST(… AS HUGEINT)`
-    /// yielding NULL, the hot replay via `str::parse::<i128>()` returning `Err` - so their agreement is
-    /// a coincidence of intent, not of code, and worth pinning. Both must drop the *whole transfer*:
+    /// The two paths reject it in two languages - the cold fold via `TRY_CAST(… AS DECIMAL(38,0))`
+    /// yielding NULL, the hot replay via `views::transfer_value` - so their agreement is worth
+    /// pinning. Both must drop the *whole transfer*:
     /// dropping only one leg would invent value out of nowhere, leaving the sender debited and the
     /// recipient uncredited (or worse).
     #[test]
-    fn an_over_i128_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay() {
-        // 2^127 - one past i128::MAX, the smallest value that must be refused.
-        const TOO_BIG: &str = "170141183460469231731687303715884105728";
+    fn an_oversized_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay() {
+        // 10^38, the smallest value that must be refused; it fits i128, the old line.
+        const TOO_BIG: &str = "100000000000000000000000000000000000000";
         assert!(
-            TOO_BIG.parse::<i128>().is_err(),
-            "fixture must overflow i128"
+            crate::views::transfer_value(TOO_BIG).is_none(),
+            "fixture must be refused by the hot replay"
         );
 
         let row = |from: &str, to: &str, value: &str, block: u64, li: u64| {
@@ -6055,7 +6056,7 @@ template="pool"
         assert_eq!(
             fold(mixed.path()),
             fold(reference.path()),
-            "the cold fold must drop an over-i128 transfer exactly as the hot replay's parse-or-skip does"
+            "the cold fold must drop an oversized transfer exactly as the hot replay does"
         );
 
         // Concretely: only the ordinary transfer survives, and both its legs are present.

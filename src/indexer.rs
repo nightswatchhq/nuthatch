@@ -6408,7 +6408,7 @@ impl NestIngest {
             let key = Store::entity_key(row.block_number, row.log_index);
             // Feed the IVM balance + exposure views for transfer rows (extracted before storing).
             if let Some((from, to_addr, value, _hex)) = row.erc20_transfer_fields() {
-                if let Some(v) = value.as_deref().and_then(|s| s.parse::<i128>().ok()) {
+                if let Some(v) = value.as_deref().and_then(crate::views::transfer_value) {
                     deltas.extend(views::transfer_deltas(&from, &to_addr, v, 1));
                     // Direct exposure to the labeled set (empty when neither side is labeled).
                     exp_deltas.extend(exposure::exposure_deltas(
@@ -6450,14 +6450,14 @@ impl NestIngest {
                         }
                     }
                 } else if value.is_some() {
-                    // COR-8 (#814): a live transfer whose value exceeds `i128`. Skipped here exactly
+                    // COR-8 (#814): a live transfer whose value exceeds 38 digits. Skipped here exactly
                     // as the cold fold skips it, so hot and sealed agree - but counted now, so the
                     // balance says it is incomplete instead of looking complete.
                     self.balances.note_over_i128(1);
                     tracing::warn!(
                         block = row.block_number,
                         log_index = row.log_index,
-                        "transfer value does not fit i128; excluded from balances (#814)"
+                        "transfer value has more than 38 digits; excluded from balances (#814)"
                     );
                 }
                 if self.screener.is_some() {
@@ -7399,7 +7399,7 @@ fn retraction_batch(entity_json: &[String]) -> views::WeightedBatch {
         let (Some(from), Some(to)) = (v["from"].as_str(), v["to"].as_str()) else {
             continue;
         };
-        if let Some(val) = v["value"].as_str().and_then(|s| s.parse::<i128>().ok()) {
+        if let Some(val) = v["value"].as_str().and_then(crate::views::transfer_value) {
             batch.extend(views::transfer_deltas(from, to, val, -1));
         }
     }
@@ -7443,7 +7443,7 @@ fn exposure_retraction_batch(
         if let (Some(from), Some(to), Some(val)) = (
             v[from_col].as_str(),
             v[to_col].as_str(),
-            v[val_col].as_str().and_then(|s| s.parse::<i128>().ok()),
+            v[val_col].as_str().and_then(crate::views::transfer_value),
         ) {
             batch.extend(exposure::exposure_deltas(from, to, val, -1, labels));
         }
@@ -7481,7 +7481,7 @@ fn velocity_retraction_batch(
         if let (Some(from), Some(block), Some(val)) = (
             v[from_col].as_str(),
             v["block_number"].as_u64(),
-            v[val_col].as_str().and_then(|s| s.parse::<i128>().ok()),
+            v[val_col].as_str().and_then(crate::views::transfer_value),
         ) {
             batch.extend(velocity::velocity_deltas(from, block, val, -1, window));
         }
@@ -7583,20 +7583,20 @@ fn rebuild_views(
             }
             Err(e) => tracing::debug!("no cold seed for {table}: {e:#}"),
         }
-        // COR-8 (#814): the fold silently drops a transfer whose value exceeds `i128`. The drop is
+        // COR-8 (#814): the fold silently drops a transfer whose value exceeds 38 digits. The drop is
         // correct - both legs go, or the balance would gain value from nowhere - but it used to be
         // invisible, so a balance missing a transfer was served exactly like a complete one.
-        match crate::analytics::over_i128_transfers(dir, table, val_col, sealed_through) {
+        match crate::analytics::oversized_transfers(dir, table, val_col, sealed_through) {
             Ok(0) => {}
             Ok(n) => {
                 tracing::warn!(
-                    "{n} transfer(s) in {table} have a value that does not fit i128 and are \
+                    "{n} transfer(s) in {table} have a value of more than 38 digits and are \
                      excluded from balances; /balances reports this as `dropped_over_i128` (#814)"
                 );
                 balances.note_over_i128(n);
             }
             // A table with no sealed segment has no view to count over; that is not a failure.
-            Err(e) => tracing::debug!("no over-i128 count for {table}: {e:#}"),
+            Err(e) => tracing::debug!("no oversized-transfer count for {table}: {e:#}"),
         }
         if want_exposure {
             match crate::analytics::cold_exposure(
@@ -7657,7 +7657,7 @@ fn rebuild_views(
             if let (Some(from), Some(to), Some(val)) = (
                 v[from_col].as_str(),
                 v[to_col].as_str(),
-                v[val_col].as_str().and_then(|s| s.parse::<i128>().ok()),
+                v[val_col].as_str().and_then(crate::views::transfer_value),
             ) {
                 balance_batch.extend(views::transfer_deltas(from, to, val, 1));
                 hot_balances += 1;
@@ -7675,7 +7675,7 @@ fn rebuild_views(
                 if let (Some(from), Some(block), Some(val)) = (
                     v[from_col].as_str(),
                     v["block_number"].as_u64(),
-                    v[val_col].as_str().and_then(|s| s.parse::<i128>().ok()),
+                    v[val_col].as_str().and_then(crate::views::transfer_value),
                 ) {
                     velocity_batch.extend(velocity::velocity_deltas(from, block, val, 1, window));
                     hot_velocity += 1;

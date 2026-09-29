@@ -3686,7 +3686,7 @@ async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> 
         .into_iter()
         .map(|(address, balance)| json!({ "address": address, "balance": balance.to_string() }))
         .collect();
-    // COR-8 (#814): a transfer whose value exceeds `i128` is dropped from these balances - both
+    // COR-8 (#814): a transfer whose value exceeds 38 digits is dropped from these balances - both
     // legs, deliberately, because dropping one would invent value. Saying so is the whole fix: the
     // numbers stay what they are, and a caller can tell an incomplete answer from a complete one.
     // Zero is the ordinary case and is reported rather than omitted, so its absence means an old

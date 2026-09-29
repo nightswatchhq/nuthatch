@@ -522,12 +522,14 @@ mod tests {
             ("0xaa", "0xbb", "400"),
             ("0xbb", "0xcc", "650"),
             ("0xcc", zero, "50"),
-            // Above i128: the folds drop it and `over_i128_transfers` counts it.
+            // Past 38 digits: the folds drop it and `oversized_transfers` counts it.
             (
                 "0xaa",
                 "0xcc",
                 "1606938044258990275541962092341162602522202993782792835301376",
             ),
+            // Fits i128 but not 38 digits, where Burrmill's HUGEINT ends: dropped by both.
+            ("0xbb", "0xaa", "150000000000000000000000000000000000000"),
         ];
         for (i, (from, to, value)) in transfers.iter().enumerate() {
             let b = i as u64 + 1;

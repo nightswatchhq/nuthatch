@@ -62,7 +62,7 @@ pub fn reserves_select(alias: &str) -> String {
 /// `holder_count`.
 fn net_balance_subquery(alias: &str) -> String {
     let t = format!("{alias}__transfer");
-    let d = crate::analytics::cast_or_null("\"value\"", "HUGEINT");
+    let d = crate::analytics::exact_or_null("\"value\"", "HUGEINT");
     format!(
         "SELECT addr, SUM(d) AS balance FROM (\
            SELECT lower(\"to\") AS addr, {d} AS d FROM \"{t}\" \
@@ -92,7 +92,7 @@ pub fn holder_count_select(alias: &str) -> String {
 /// Σ(value where `from` = 0x0) − Σ(value where `to` = 0x0). Exposed so it can be queried directly (and
 /// tested) as well as wrapped in a `CREATE VIEW`.
 pub fn total_supply_select(alias: &str) -> String {
-    let d = crate::analytics::cast_or_null("\"value\"", "HUGEINT");
+    let d = crate::analytics::exact_or_null("\"value\"", "HUGEINT");
     format!(
         "SELECT \
            COALESCE(SUM(CASE WHEN lower(\"from\") = '{ZERO_ADDRESS}' \
