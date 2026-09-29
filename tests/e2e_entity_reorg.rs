@@ -411,6 +411,43 @@ async fn a_live_mount_refuses_seal_direct_with_an_entity() {
     );
 }
 
+/// #1545: a first mount onto a chain starts its cursor through `spawn_runtime`, so that path must
+/// refuse seal-direct with an entity too, and let go of the store it opened to find out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_started_by_a_mount_refuses_seal_direct_with_an_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    declare_entity(dir.path());
+
+    let err = indexer::spawn_runtime(
+        tape,
+        vec![("usdc".to_string(), dir.path().to_path_buf(), cfg)],
+        None,
+        true,
+        1,
+        Some(2),
+        false,
+        None,
+        Arc::new(nuthatch::health::RuntimeHealth::new()),
+        false,
+    )
+    .await
+    .err()
+    .expect("a cursor started for a mount must refuse seal-direct plus an entity");
+    assert!(
+        format!("{err:#}").contains("--seal-direct cannot be combined"),
+        "{err:#}"
+    );
+    nuthatch::store::Store::open(&dir.path().join(nuthatch::config::DB_FILE))
+        .expect("the refused nest's store must be released");
+}
+
 /// The same nest without `--seal-direct` starts and folds - so the refusal above is about the
 /// combination and not about entities being unable to start at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
