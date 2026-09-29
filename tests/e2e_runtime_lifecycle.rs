@@ -2489,3 +2489,34 @@ async fn a_mounted_nests_storage_is_its_own_not_the_shared_stores() {
         "no per-nest hot series"
     );
 }
+
+/// #1548, from review: a suspended mount is visible in the jobs API, before and after a restart,
+/// and a mount request for its name resumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "d7".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let job = wait_for_phase(&routes, "usdc", "suspended").await;
+    assert_eq!(job["phase"], "suspended", "{job}");
+
+    // A restart with no jobs file, as after a hand edit: `mounts.toml` alone says it is suspended.
+    std::fs::remove_file(roost.path().join(nuthatch::mount_jobs::JOBS_FILE)).unwrap();
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let job = wait_for_phase(&routes, "usdc", "suspended").await;
+    assert_eq!(job["phase"], "suspended", "after a restart: {job}");
+
+    let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+    let (status, _) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
+}

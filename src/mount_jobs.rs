@@ -25,11 +25,16 @@ pub enum MountPhase {
     Joining,
     Live,
     Failed,
+    /// Suspended by the operator (#1548): off its cursor, answering 503, until resumed.
+    Suspended,
 }
 
 impl MountPhase {
     pub fn finished(self) -> bool {
-        matches!(self, MountPhase::Live | MountPhase::Failed)
+        matches!(
+            self,
+            MountPhase::Live | MountPhase::Failed | MountPhase::Suspended
+        )
     }
 }
 
