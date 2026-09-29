@@ -438,8 +438,10 @@ who need more - none of it in the way of the happy path:
   catches up *before* it joins so it never drags co-tenants back through history, and only then gets
   routes. An unmount is a **drain**, not a route removal: the cursor finishes its window and releases
   the store before anything is torn down. The set is persisted to `mounts.toml`, so a restart converges
-  on what you last asked for. A runtime may start with nothing mounted: declare its chains under
-  `[[chains]]`, and the first mount onto a chain starts that chain's cursor, dialling its RPC only then.
+  on what you last asked for. An unmount keeps the dataset, so a remount is free; `?reclaim=true` on the
+  `DELETE` removes it once no mount references it, and `DELETE /_admin/datasets/<nid>` reclaims one
+  unmounted earlier. A runtime may start with nothing mounted: declare its chains under `[[chains]]`,
+  and the first mount onto a chain starts that chain's cursor, dialling its RPC only then.
   Started with `--registry`, a runtime fetches a mounted NID it does not hold, verifies it as `nest load`
   does, and installs it at `data/<nid>/` first. A mount answers `202` at once, and `GET
   /_admin/mounts/<name>` reports it fetching, joining, live, or failed with the reason, across a

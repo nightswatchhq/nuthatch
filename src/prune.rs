@@ -252,6 +252,93 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// What reclaiming one dataset did (#1547).
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum Reclaim {
+    Reclaimed {
+        nid: String,
+        bytes: u64,
+    },
+    /// Another mount still names this dataset, so nothing was touched.
+    Kept {
+        nid: String,
+        mounted_by: Vec<String>,
+    },
+    /// No dataset by that identity is on disk.
+    Absent {
+        nid: String,
+    },
+}
+
+/// Reclaim one unmounted dataset while its runtime is running (#1547).
+///
+/// Narrower than [`run`], which refuses while any store is open: an orphan left by a live fold may
+/// be one a running query is about to read. The segments removed here are only those this dataset's
+/// own manifest names and no surviving manifest does, and nothing can be reading those once its
+/// mount is gone.
+pub fn reclaim(dir: &Path, nid: &str) -> Result<Reclaim> {
+    let mounts = MountTable::load(dir)
+        .with_context(|| format!("reading the mount table of {}", dir.display()))?;
+    let mounted_by: Vec<String> = mounts
+        .mounts
+        .iter()
+        .filter(|m| m.nid == nid)
+        .map(|m| format!("{}/{}", m.tenant, m.alias))
+        .collect();
+    if !mounted_by.is_empty() {
+        return Ok(Reclaim::Kept {
+            nid: nid.to_string(),
+            mounted_by,
+        });
+    }
+    let data = MountTable::data_dir(dir, nid);
+    if !data.is_dir() {
+        return Ok(Reclaim::Absent {
+            nid: nid.to_string(),
+        });
+    }
+    if store_is_held(&data) {
+        anyhow::bail!(
+            "data/{} is still open in this process; nothing was deleted",
+            &nid[..nid.len().min(12)]
+        );
+    }
+
+    let mut surviving: Vec<String> = mounts.mounts.iter().map(|m| m.nid.clone()).collect();
+    surviving.sort();
+    surviving.dedup();
+    let referenced = referenced_segments(dir, &surviving)?;
+    let own = crate::seal::load_manifest(&data)
+        .with_context(|| format!("reading the manifest of data/{}", &nid[..nid.len().min(12)]))?;
+    let segments = dir.join(crate::seal::SEGMENTS_DIR);
+    let exclusive: std::collections::BTreeMap<PathBuf, u64> = own
+        .tables
+        .values()
+        .flatten()
+        .filter(|s| !referenced.contains(&s.hash))
+        .map(|s| segments.join(format!("{}.parquet", s.hash)))
+        .filter_map(|p| {
+            let len = std::fs::metadata(&p).ok()?.len();
+            Some((p, len))
+        })
+        .collect();
+
+    // Manifest first, bytes second, as `run` does: an interrupted reclaim leaves unreferenced
+    // segments for `prune`, never a manifest naming segments that are gone.
+    let mut bytes = size_of(&data);
+    std::fs::remove_dir_all(&data).with_context(|| format!("removing {}", data.display()))?;
+    let _ = std::fs::remove_dir_all(crate::runtime::adopt_staging(&data));
+    for (path, len) in &exclusive {
+        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+        bytes += len;
+    }
+    Ok(Reclaim::Reclaimed {
+        nid: nid.to_string(),
+        bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +611,122 @@ mod tests {
             "the mounted dataset survives"
         );
         assert!(!MountTable::data_dir(root, &drop_).exists());
+    }
+
+    /// #1547: a running runtime reclaims one dataset. It takes the dataset and the segments only
+    /// that dataset names, keeps a segment a mounted dataset shares, and keeps an orphan nothing
+    /// names, since that may be one a live fold replaced and a running query is still reading.
+    #[test]
+    fn reclaim_takes_only_what_the_dataset_alone_references() {
+        use crate::seal::{Segment, SEGMENTS_DIR};
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let (keep, drop_) = (nid("aa"), nid("bb"));
+        let (shared, lonely, foreign) = ("11".repeat(32), "22".repeat(32), "33".repeat(32));
+        std::fs::create_dir_all(root.join(SEGMENTS_DIR)).unwrap();
+        for h in [&shared, &lonely, &foreign] {
+            std::fs::write(
+                root.join(SEGMENTS_DIR).join(format!("{h}.parquet")),
+                b"bytes",
+            )
+            .unwrap();
+        }
+        let seg = |h: &str| Segment {
+            hash: h.to_string(),
+            from_block: 1,
+            to_block: 2,
+            rows: 1,
+            file: format!("t-{h}.parquet"),
+            registry_snapshot: None,
+            provisional: false,
+            writer_profile: crate::seal::ORIGINAL_WRITER_PROFILE.to_string(),
+        };
+        for (nid_, hashes) in [
+            (&keep, vec![shared.clone()]),
+            (&drop_, vec![shared.clone(), lonely.clone(), lonely.clone()]),
+        ] {
+            let dir = MountTable::data_dir(root, nid_);
+            std::fs::create_dir_all(dir.join(SEGMENTS_DIR)).unwrap();
+            let mut m = crate::seal::Manifest::default();
+            m.tables
+                .insert("t".to_string(), hashes.iter().map(|h| seg(h)).collect());
+            std::fs::write(
+                dir.join(SEGMENTS_DIR).join("manifest.json"),
+                serde_json::to_string(&m).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+                 chain_id = 42161\nrpc_urls = []\n\n[[mounts]]\nalias = \"a\"\nnid = \"{keep}\"\n"
+            ),
+        )
+        .unwrap();
+
+        match reclaim(root, &drop_).unwrap() {
+            Reclaim::Reclaimed { nid, bytes } => {
+                assert_eq!(nid, drop_);
+                assert!(
+                    bytes >= 5,
+                    "the freed bytes include the lonely segment: {bytes}"
+                );
+            }
+            other => panic!("expected Reclaimed, got {other:?}"),
+        }
+        let at = |h: &str| root.join(SEGMENTS_DIR).join(format!("{h}.parquet"));
+        assert!(!MountTable::data_dir(root, &drop_).exists());
+        assert!(
+            !at(&lonely).exists(),
+            "the dataset's own segment stays behind"
+        );
+        assert!(
+            at(&shared).exists(),
+            "a segment the mounted dataset reads was deleted"
+        );
+        assert!(
+            at(&foreign).exists(),
+            "reclaim swept an orphan it cannot prove unread; that is `prune`'s job, offline"
+        );
+        assert!(MountTable::data_dir(root, &keep).is_dir());
+    }
+
+    /// #1547: an unrecorded dataset whose store this process still holds is refused, and nothing is
+    /// deleted. A failed persist after a live mount would leave exactly that.
+    #[test]
+    fn reclaim_refuses_a_dataset_whose_store_is_still_open() {
+        let d = tempfile::tempdir().unwrap();
+        let (_keep, drop_, _lonely) = shared_fixture(d.path(), "{\"tables\":{}}");
+        let db = MountTable::data_dir(d.path(), &drop_).join(crate::config::DB_FILE);
+        let _ = std::fs::remove_file(&db);
+        let held = crate::store::Store::open(&db).unwrap();
+
+        let err = reclaim(d.path(), &drop_).expect_err("a held store must refuse");
+        assert!(format!("{err:#}").contains("still open"), "{err:#}");
+        assert!(MountTable::data_dir(d.path(), &drop_).is_dir());
+        drop(held);
+    }
+
+    /// #1547: a dataset a mount record still names is kept and the answer says by whom; one that is
+    /// not on disk is reported absent.
+    #[test]
+    fn reclaim_keeps_a_named_dataset_and_reports_an_absent_one() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (nid("aa"), nid("bb"));
+        fixture(d.path(), &[&a], &[]);
+        assert_eq!(
+            reclaim(d.path(), &a).unwrap(),
+            Reclaim::Kept {
+                nid: a.clone(),
+                mounted_by: vec!["default/n0".to_string()],
+            }
+        );
+        assert!(MountTable::data_dir(d.path(), &a).is_dir());
+        assert_eq!(
+            reclaim(d.path(), &b).unwrap(),
+            Reclaim::Absent { nid: b.clone() }
+        );
     }
 
     /// A shared-store fixture: `keep` mounted with `keep_manifest` as its manifest text, `drop_`
