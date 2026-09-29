@@ -438,8 +438,10 @@ who need more - none of it in the way of the happy path:
   catches up *before* it joins so it never drags co-tenants back through history, and only then gets
   routes. An unmount is a **drain**, not a route removal: the cursor finishes its window and releases
   the store before anything is torn down. The set is persisted to `mounts.toml`, so a restart converges
-  on what you last asked for. A runtime may start with nothing mounted: declare its chains under
-  `[[chains]]`, and the first mount onto a chain starts that chain's cursor, dialling its RPC only then.
+  on what you last asked for. An unmount keeps the dataset, so a remount is free; `?reclaim=true` on the
+  `DELETE` removes it once no mount references it, and `DELETE /_admin/datasets/<nid>` reclaims one
+  unmounted earlier. A runtime may start with nothing mounted: declare its chains under `[[chains]]`,
+  and the first mount onto a chain starts that chain's cursor, dialling its RPC only then.
 - **Scaled mode - a fleet across machines** (RFC-0022). When one box can no longer hold your cursors,
   or when serving and ingestion want to scale independently, the *same crates* run as three roles:
   a **control plane** holding what should run, a **writer pool** (`nuthatch worker`) whose members take
