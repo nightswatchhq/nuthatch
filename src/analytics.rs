@@ -5198,10 +5198,11 @@ template="pool"
         assert_eq!(rows[1]["value_dec"], Value::Null);
         assert_eq!(rows[1]["value_overflow"], Value::from(true));
 
-        // And SUM(value_dec) works over the fitting rows without a manual cast.
+        // And summing the rows that fit says so: over every row, a value that did not fit refuses
+        // on Burrmill rather than being left out of the total (Chief, 2026-09-29).
         let s = query(
             dir.path(),
-            r#"SELECT SUM(value_dec)::VARCHAR AS s FROM "t__transfer""#,
+            r#"SELECT (SUM(value_dec) FILTER (WHERE NOT value_overflow))::VARCHAR AS s FROM "t__transfer""#,
         )
         .unwrap();
         assert_eq!(s[0]["s"], Value::from(fits));

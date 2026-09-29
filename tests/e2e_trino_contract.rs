@@ -47,8 +47,9 @@ SELECT count(*) AS transfers, CAST(sum(value_dec) AS VARCHAR) AS total,
 FROM usdc__transfer;
 
 CREATE VIEW wide_values AS
-SELECT value_overflow AS overflowed, count(*) AS n, sum(value_dec) AS total_dec,
-       count(value_dec) AS with_dec
+SELECT value_overflow AS overflowed, count(*) AS n,
+       sum(CASE WHEN NOT value_overflow THEN value_dec END) AS total_dec,
+       count(CASE WHEN NOT value_overflow THEN value_dec END) AS with_dec
 FROM usdc__wide
 GROUP BY value_overflow;
 
