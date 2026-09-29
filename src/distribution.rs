@@ -396,6 +396,37 @@ pub async fn load_pinned_from_registry(
     .await
 }
 
+/// Fetch the bundle published under `nid` and install it at `target`, verified as `nest load` does
+/// (#1543). Nothing is written beside `target` until the registry has served a bundle computing to
+/// `nid`, and an install that fails part-way leaves nothing behind.
+pub async fn install_by_nid(registry: &str, nid: &str, target: &Path) -> Result<()> {
+    let store = open(registry)?;
+    let (hash, bytes) = pull_by_nid(store.as_ref(), nid).await?;
+    let tmp = tempfile::tempdir().context("temp dir for pulled bundle")?;
+    let bundle_file = tmp.path().join("pulled.bundle");
+    std::fs::write(&bundle_file, &bytes).context("writing pulled bundle")?;
+    let parent = target
+        .parent()
+        .with_context(|| format!("{} has no parent", target.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    // Staged beside the target so the final step is a rename on one filesystem. `prune` never
+    // lists it, since the name is not a NID, and dropping the guard removes it.
+    let staging = tempfile::Builder::new()
+        .prefix(".fetch-")
+        .tempdir_in(parent)
+        .with_context(|| format!("staging a fetch in {}", parent.display()))?;
+    let installed = staging.path().join("nest");
+    crate::blob::load(
+        bundle_file.to_str().context("non-utf8 temp path")?,
+        Some(&installed),
+        Some(&hash),
+    )
+    .await?;
+    std::fs::rename(&installed, target)
+        .with_context(|| format!("moving the fetched nest to {}", target.display()))?;
+    Ok(())
+}
+
 /// The S3-compatible registry backend (RFC-0019 slice 2), behind the `object-store` feature so the
 /// default embedded binary never pulls the S3 dep tree. Same [`BundleStore`] contract as [`FsStore`];
 /// same key layout (`<prefix>/blobs/<hash>.bundle`, `<prefix>/index/<name>/<version>`).

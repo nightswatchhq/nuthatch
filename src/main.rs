@@ -138,6 +138,7 @@ async fn main() -> Result<()> {
                         args.finality_only,
                     ),
                     args.cors,
+                    args.registry,
                 )
                 .await
             } else {

@@ -1602,6 +1602,7 @@ pub async fn dev(
     fail_fast: bool,
     freshness: crate::freshness::Freshness,
     cors: Vec<String>,
+    registry: Option<String>,
 ) -> Result<()> {
     // Before the mount table is even read: a malformed origin should fail the command, not the
     // fifteenth minute of a backfill.
@@ -1970,6 +1971,7 @@ pub async fn dev(
             dormant,
             fail_fast,
             cursors: admin_enabled.then_some(cursor_feed),
+            registry,
         },
     }));
 
@@ -2147,6 +2149,7 @@ pub fn lifecycle_routes(
                 StatusCode::CONFLICT
             }
             Some(MountRefusal::OverBudget { .. }) => StatusCode::INSUFFICIENT_STORAGE,
+            Some(MountRefusal::NotHeld { .. }) => StatusCode::NOT_FOUND,
             None => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -2370,6 +2373,8 @@ pub struct MountContext {
     /// Where a cursor that a mount spawns goes to be supervised. `None` without the admin surface,
     /// which is the only thing that mounts.
     pub cursors: Option<CursorFeed>,
+    /// `--registry`: where a mount fetches a NID this runtime does not hold (#1543).
+    pub registry: Option<String>,
 }
 
 /// A cursor's ingest task, handed to [`supervise_cursors`] after boot.
@@ -2428,6 +2433,8 @@ pub enum MountRefusal {
         projected_mb: u64,
         ceiling_mb: u64,
     },
+    /// The runtime does not hold this NID and has no registry to fetch it from (#1543).
+    NotHeld { nid: String },
 }
 
 impl std::fmt::Display for MountRefusal {
@@ -2451,6 +2458,11 @@ impl std::fmt::Display for MountRefusal {
                 f,
                 "mounting '{nest}' would put the {chain} cursor at ~{projected_mb} MB against a \
                  {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another mounts"
+            ),
+            MountRefusal::NotHeld { nid } => write!(
+                f,
+                "this runtime does not hold nid {nid} and has no registry to fetch it from - start it \
+                 with --registry"
             ),
         }
     }
@@ -2541,6 +2553,39 @@ impl RuntimeHandles {
             Some(nid) => MountTable::data_dir(&self.mount_ctx.dir, nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
         };
+        // A NID this runtime does not hold is fetched first (#1543). Whatever refuses the mount after
+        // that removes the fetch again, so a refusal still leaves nothing behind.
+        let fetched = match &nid {
+            Some(nid) if !dir.exists() => {
+                let Some(registry) = self.mount_ctx.registry.clone() else {
+                    return Err(MountRefusal::NotHeld { nid: nid.clone() }.into());
+                };
+                crate::distribution::install_by_nid(&registry, nid, &dir)
+                    .await
+                    .with_context(|| format!("fetching nid {nid} from the registry"))?;
+                tracing::info!("fetched nid {nid} from the registry for '{name}'");
+                true
+            }
+            _ => false,
+        };
+        let mounted = self
+            .mount_dataset(name, tenant, alias, nid, dir.clone())
+            .await;
+        if mounted.is_err() && fetched {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        mounted
+    }
+
+    /// [`Self::mount`] once the dataset directory is resolved and on disk.
+    async fn mount_dataset(
+        &mut self,
+        name: &str,
+        tenant: Option<&str>,
+        alias: &str,
+        nid: Option<String>,
+        dir: PathBuf,
+    ) -> Result<()> {
         // A dataset another live mount already holds is served through a clone of that mount's state,
         // as `fan_out_aliases` does at boot. Opening its store again is refused by redb (#1475).
         let shared = self

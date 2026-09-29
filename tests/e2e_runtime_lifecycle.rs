@@ -111,6 +111,7 @@ async fn two_nest_roost(
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     // The ingest task is deliberately leaked into the handles' lifetime here: the cursor must stay
@@ -505,6 +506,7 @@ async fn route_named_runtime(
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -723,6 +725,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -897,6 +900,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1267,6 +1271,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
             dormant: Default::default(),
             fail_fast: false,
             cursors: None,
+            registry: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1409,6 +1414,7 @@ async fn empty_runtime(
             dormant: Default::default(),
             fail_fast: false,
             cursors: Some(feed),
+            registry: None,
         },
     };
     (handles, tape, intake)
@@ -1568,4 +1574,113 @@ async fn a_dormant_chain_is_opened_by_its_first_mount() {
     );
     assert!(handles.states.is_empty());
     assert!(intake.try_recv().is_err());
+}
+
+/// A registry holding one published nest, and that nest's NID as `nuthatch nest nid` prints it.
+async fn registry_with_one_nest(registry: &std::path::Path) -> String {
+    let src = tempfile::tempdir().unwrap();
+    scaffold_nest(src.path(), "usdc", USDC);
+    let nid = nuthatch::blob::nest_nid(src.path()).unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    let file = bundle.path().join("usdc.bundle");
+    nuthatch::blob::bundle(src.path(), Some(&file), false).unwrap();
+    let store = nuthatch::distribution::open(registry.to_str().unwrap()).unwrap();
+    nuthatch::distribution::publish(store.as_ref(), &file, Some("usdc"), None)
+        .await
+        .unwrap();
+    nid
+}
+
+/// Nothing but datasets under `data/`: no fetch was left staged.
+fn no_fetch_left_behind(roost: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(roost.join("data")) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        assert!(!n.starts_with(".fetch-"), "a staged fetch was left: {n}");
+    }
+}
+
+/// #1543: a mount naming a NID the runtime does not hold fetches it from the registry, verifies it,
+/// installs it at `data/<nid>/` and indexes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_fetches_a_nid_the_runtime_does_not_hold() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::remove_dir_all(&data_dir).unwrap();
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("a mount by nid must fetch what the runtime does not hold");
+    assert!(data_dir.join(nuthatch::config::CONFIG_FILE).exists());
+    no_fetch_left_behind(roost.path());
+    let last_block = |h: &runtime::RuntimeHandles| {
+        h.states
+            .iter()
+            .find(|(n, _)| n == "usdc")
+            .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
+    };
+    assert!(
+        wait_until(POLL_TIMEOUT, || last_block(&handles).as_deref()
+            == Some("3"))
+        .await,
+        "the fetched nest never indexed: last_block {:?}",
+        last_block(&handles)
+    );
+}
+
+/// #1543: without `--registry` the refusal names the flag; a NID the registry lacks is refused before
+/// anything is written; and a fetched nest the runtime then refuses is removed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_that_cannot_or_may_not_fetch_leaves_nothing_behind() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::remove_dir_all(&data_dir).unwrap();
+    let parse = || Some(runtime::Nid::parse(&nid).unwrap());
+
+    let err = handles.mount("usdc", parse()).await.unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<runtime::MountRefusal>(),
+            Some(runtime::MountRefusal::NotHeld { .. })
+        ),
+        "{err:#}"
+    );
+    assert!(format!("{err:#}").contains("--registry"), "{err:#}");
+    assert!(!data_dir.exists());
+
+    let empty = tempfile::tempdir().unwrap();
+    handles.mount_ctx.registry = Some(empty.path().to_str().unwrap().to_string());
+    let err = handles.mount("usdc", parse()).await.unwrap_err();
+    assert!(format!("{err:#}").contains("not found"), "{err:#}");
+    assert!(
+        !data_dir.exists(),
+        "a nid the registry lacks wrote a dataset"
+    );
+    no_fetch_left_behind(roost.path());
+
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    handles.mount_ctx.max_rss_mb = 100;
+    let err = handles.mount("usdc", parse()).await.unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<runtime::MountRefusal>(),
+            Some(runtime::MountRefusal::OverBudget { .. })
+        ),
+        "{err:#}"
+    );
+    assert!(
+        !data_dir.exists(),
+        "a refused mount kept the dataset it fetched"
+    );
+    assert!(handles.states.is_empty());
 }

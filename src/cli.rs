@@ -1519,6 +1519,11 @@ pub struct DevArgs {
     /// to be set AND each request to present it as `?token=…` (or it self-disables with a log line).
     #[arg(long)]
     pub no_admin: bool,
+
+    /// A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when
+    /// this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`.
+    #[arg(long)]
+    pub registry: Option<String>,
 }
 
 #[derive(Args)]
