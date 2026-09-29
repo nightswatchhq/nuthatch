@@ -2148,3 +2148,137 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
     .await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
 }
+
+/// #1550: for every admission check, a dry run reports the refusal a real mount then gives, with the
+/// same status, and mounts nothing. An admitted dry run reports its cost and the backfill ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
+    enum Case {
+        Admitted,
+        AlreadyMounted,
+        NotHeld,
+        UndeclaredChain,
+        CursorStopped,
+        OverBudget,
+    }
+    for (label, case) in [
+        ("admitted", Case::Admitted),
+        ("already mounted", Case::AlreadyMounted),
+        ("not held", Case::NotHeld),
+        ("undeclared chain", Case::UndeclaredChain),
+        ("cursor stopped", Case::CursorStopped),
+        ("over budget", Case::OverBudget),
+    ] {
+        let roost = tempfile::tempdir().unwrap();
+        let nid = "7c".repeat(32);
+        let (mut handles, _tape, mut intake) = empty_runtime(roost.path(), &nid).await;
+        let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+        match case {
+            Case::Admitted => {}
+            Case::AlreadyMounted => handles
+                .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+                .await
+                .unwrap(),
+            Case::NotHeld => std::fs::remove_dir_all(&data_dir).unwrap(),
+            Case::UndeclaredChain => {
+                let mut cfg = nuthatch::config::Config::load(&data_dir).unwrap();
+                cfg.nest.chain = "base".to_string();
+                cfg.nest.chain_id = 8453;
+                cfg.save(&data_dir).unwrap();
+            }
+            Case::CursorStopped => handles
+                .health
+                .quarantine_cursor("arbitrum-one", "finality violation".to_string()),
+            Case::OverBudget => handles.mount_ctx.max_rss_mb = 100,
+        }
+        let mounted_before = handles.states.len();
+        let _ = intake.try_recv();
+        let handles = Arc::new(tokio::sync::Mutex::new(handles));
+        let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+        let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+
+        let (status, dry) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?dry_run=true",
+            None,
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{label}: {dry}");
+        let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+        assert_eq!(
+            handles.lock().await.states.len(),
+            mounted_before,
+            "{label}: the dry run mounted something"
+        );
+        assert!(
+            intake.try_recv().is_err(),
+            "{label}: the dry run started a cursor"
+        );
+
+        let (real, answer) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?wait=true",
+            None,
+            Some(&body),
+        )
+        .await;
+        match dry["refusal_status"].as_u64() {
+            Some(code) => assert_eq!(
+                u64::from(real.as_u16()),
+                code,
+                "{label}: the dry run said {dry}, the mount answered {answer}"
+            ),
+            None => {
+                assert_eq!(
+                    real,
+                    axum::http::StatusCode::OK,
+                    "{label}: {dry} / {answer}"
+                );
+                assert!(dry["incoming_mb"].as_u64().is_some(), "{label}: {dry}");
+                assert_eq!(dry["tip"], 3, "{label}: {dry}");
+                assert_eq!(dry["chain"], "arbitrum-one", "{label}: {dry}");
+            }
+        }
+        if matches!(case, Case::Admitted) {
+            assert!(
+                dry["refusal"].is_null(),
+                "an admissible mount was refused: {dry}"
+            );
+        }
+    }
+}
+
+/// #1550: a dry run fetches and verifies a NID the runtime does not hold, keeps the verified nest,
+/// and mounts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_fetches_what_it_needs_and_mounts_nothing() {
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let (mut handles, _tape, mut intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::remove_dir_all(&data_dir).unwrap();
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+
+    let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+    let (status, dry) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?dry_run=true",
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{dry}");
+    let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+    assert_eq!(dry["fetched"], true, "{dry}");
+    assert!(dry["refusal"].is_null(), "{dry}");
+    assert!(data_dir.join(nuthatch::config::CONFIG_FILE).exists());
+    assert!(handles.lock().await.states.is_empty());
+    assert!(intake.try_recv().is_err());
+}

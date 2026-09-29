@@ -2146,6 +2146,9 @@ pub fn lifecycle_routes(
         /// Answer once the mount has finished, as every mount did before #1544.
         #[serde(default)]
         wait: bool,
+        /// Report what the mount would cost and whether it would be refused, and mount nothing (#1550).
+        #[serde(default)]
+        dry_run: bool,
     }
     #[derive(serde::Deserialize)]
     struct MountBody {
@@ -2183,14 +2186,9 @@ pub fn lifecycle_routes(
     /// Map a refusal to its status code (RFC-0027 §3). Typed rather than string-matched, so the
     /// mapping cannot drift from the reasons.
     fn status_for(err: &anyhow::Error) -> StatusCode {
-        match err.downcast_ref::<MountRefusal>() {
-            Some(MountRefusal::AlreadyMounted(_)) | Some(MountRefusal::UndeclaredChain { .. }) => {
-                StatusCode::CONFLICT
-            }
-            Some(MountRefusal::OverBudget { .. }) => StatusCode::INSUFFICIENT_STORAGE,
-            Some(MountRefusal::NotHeld { .. }) => StatusCode::NOT_FOUND,
-            None => StatusCode::INTERNAL_SERVER_ERROR,
-        }
+        err.downcast_ref::<MountRefusal>()
+            .and_then(|r| StatusCode::from_u16(r.status()).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
     }
 
     async fn mount_nest(
@@ -2215,6 +2213,42 @@ pub fn lifecycle_routes(
             }
         };
         let nid_str = nid.as_ref().map(|n| n.as_str().to_string());
+
+        if q.dry_run {
+            let plan = match handles.lock().await.plan_mount(&body.name, nid.as_ref()) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "name": body.name,
+                            "refusal": format!("{e:#}"),
+                            "refusal_status": e.downcast_ref::<MountRefusal>().map(MountRefusal::status),
+                        })),
+                    )
+                }
+            };
+            let fetched = match (&plan.fetch_from, &plan.nid) {
+                (Some(registry), Some(n)) => {
+                    if let Err(e) = fetch_nid(registry, n, &plan.dir, &body.name).await {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": format!("{e:#}")})),
+                        );
+                    }
+                    true
+                }
+                _ => false,
+            };
+            let h = handles.lock().await;
+            return match h.dry_run(&body.name, &plan, fetched).await {
+                Ok(report) => (StatusCode::OK, Json(serde_json::json!(report))),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                ),
+            };
+        }
 
         if q.wait {
             let mut h = handles.lock().await;
@@ -2690,6 +2724,8 @@ pub enum MountRefusal {
     },
     /// The runtime does not hold this NID and has no registry to fetch it from (#1543).
     NotHeld { nid: String },
+    /// The chain's cursor died; its quarantine holds until restart (#1545).
+    CursorStopped { nest: String, chain: String },
 }
 
 impl std::fmt::Display for MountRefusal {
@@ -2714,6 +2750,10 @@ impl std::fmt::Display for MountRefusal {
                 "mounting '{nest}' would put the {chain} cursor at ~{projected_mb} MB against a \
                  {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another mounts"
             ),
+            MountRefusal::CursorStopped { nest, chain } => write!(
+                f,
+                "the cursor on {chain} has stopped; restart the runtime to mount '{nest}' onto it"
+            ),
             MountRefusal::NotHeld { nid } => write!(
                 f,
                 "this runtime does not hold nid {nid} and has no registry to fetch it from - start it \
@@ -2724,6 +2764,19 @@ impl std::fmt::Display for MountRefusal {
 }
 
 impl std::error::Error for MountRefusal {}
+
+impl MountRefusal {
+    /// The HTTP status a refusal is answered with, typed so the mapping cannot drift from the reasons.
+    pub fn status(&self) -> u16 {
+        match self {
+            MountRefusal::AlreadyMounted(_)
+            | MountRefusal::UndeclaredChain { .. }
+            | MountRefusal::CursorStopped { .. } => 409,
+            MountRefusal::OverBudget { .. } => 507,
+            MountRefusal::NotHeld { .. } => 404,
+        }
+    }
+}
 
 /// How long to wait for a cursor to acknowledge that it has released a nest.
 ///
@@ -2749,6 +2802,42 @@ fn split_route_key(name: &str) -> (Option<&str>, &str) {
         Some((t, a)) => (Some(t), a),
         None => (None, name),
     }
+}
+
+/// What a mount would cost this runtime, and whether it would be refused (#1550).
+#[derive(Debug, serde::Serialize)]
+pub struct DryRun {
+    pub name: String,
+    pub nid: Option<String>,
+    /// Fetched from the registry by this dry run. The verified nest stays installed; nothing else
+    /// is written.
+    pub fetched: bool,
+    /// The mount would serve a dataset this mount already indexes, at no further cost.
+    pub shares: Option<String>,
+    pub chain: Option<String>,
+    pub start_block: Option<u64>,
+    /// Known only for a chain whose cursor is running; a dry run dials nothing.
+    pub tip: Option<u64>,
+    pub blocks_to_backfill: Option<u64>,
+    /// A dataset is already on disk, so `blocks_to_backfill` is an upper bound.
+    pub has_data: bool,
+    /// Extraction that costs RPC calls per block, beyond the shared `getLogs`.
+    pub per_block_rpc: Vec<&'static str>,
+    pub incoming_mb: Option<u64>,
+    pub projected_mb: Option<u64>,
+    pub ceiling_mb: u64,
+    /// What a real mount would answer, if it would be refused.
+    pub refusal: Option<String>,
+    pub refusal_status: Option<u16>,
+}
+
+/// What [`RuntimeHandles::admit`] found: the chain, how to reach its cursor, and what it would cost.
+struct Admission {
+    chain: String,
+    dormant: Option<DormantChain>,
+    lifecycle: Option<tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>>,
+    incoming_mb: u64,
+    projected_mb: u64,
 }
 
 /// Where a mount's dataset lives, and the registry to fetch it from when it is not there yet.
@@ -2943,6 +3032,134 @@ impl RuntimeHandles {
         mounted
     }
 
+    /// Every check that decides whether a nest may join its chain's cursor (RFC-0027 §3). A mount and
+    /// its dry run both call this, so they cannot disagree about a refusal (#1550).
+    fn admit(&self, name: &str, config: &Config, dir: &Path) -> Result<Admission> {
+        let chain = config.nest.chain.clone();
+        let dormant = self
+            .mount_ctx
+            .dormant
+            .get(&chain)
+            .filter(|d| d.endpoint.chain_id == config.nest.chain_id)
+            .cloned();
+        if !self.mount_ctx.sources.contains_key(&chain) && dormant.is_none() {
+            return Err(MountRefusal::UndeclaredChain {
+                nest: name.to_string(),
+                chain,
+            }
+            .into());
+        }
+        // A chain with no running cursor gets one (#1545), unless it had one that died: that
+        // quarantine holds until restart, and nests may still be serving from it.
+        let lifecycle = self
+            .lifecycle
+            .get(&chain)
+            .filter(|tx| !tx.is_closed())
+            .cloned();
+        if lifecycle.is_none()
+            && (self.health.cursor_quarantined(&chain)
+                || self.states.iter().any(|(_, s)| s.chain == chain))
+        {
+            return Err(MountRefusal::CursorStopped {
+                nest: name.to_string(),
+                chain,
+            }
+            .into());
+        }
+        // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
+        // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
+        // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
+        let has_labels = !crate::labels::load(dir).is_empty();
+        let (entity_count, entity_rows) = declared_entities(dir);
+        let incoming_mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows);
+        let existing: u64 = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.chain == chain)
+            .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
+            .sum();
+        let projected_mb = RUNTIME_BASE_RSS_MB + existing + incoming_mb;
+        if projected_mb > self.mount_ctx.max_rss_mb {
+            return Err(MountRefusal::OverBudget {
+                nest: name.to_string(),
+                chain,
+                projected_mb,
+                ceiling_mb: self.mount_ctx.max_rss_mb,
+            }
+            .into());
+        }
+        Ok(Admission {
+            chain,
+            dormant,
+            lifecycle,
+            incoming_mb,
+            projected_mb,
+        })
+    }
+
+    /// A mount's dry run (#1550), once [`Self::plan_mount`] has placed its dataset on disk. Runs the
+    /// same admission a mount does and changes nothing.
+    pub async fn dry_run(&self, name: &str, plan: &MountPlan, fetched: bool) -> Result<DryRun> {
+        let mut report = DryRun {
+            name: name.to_string(),
+            nid: plan.nid.clone(),
+            fetched,
+            shares: None,
+            chain: None,
+            start_block: None,
+            tip: None,
+            blocks_to_backfill: None,
+            has_data: plan.dir.join(crate::config::DB_FILE).exists(),
+            per_block_rpc: Vec::new(),
+            incoming_mb: None,
+            projected_mb: None,
+            ceiling_mb: self.mount_ctx.max_rss_mb,
+            refusal: None,
+            refusal_status: None,
+        };
+        if let Some((holder, _)) = self.states.iter().find(|(_, s)| s.dir == plan.dir) {
+            report.shares = Some(holder.clone());
+            return Ok(report);
+        }
+        let config = Config::load(&plan.dir)
+            .with_context(|| format!("loading nest '{name}' from {}", plan.dir.display()))?;
+        report.chain = Some(config.nest.chain.clone());
+        report.start_block = self
+            .mount_ctx
+            .backfill
+            .or_else(|| config.contracts.iter().filter_map(|c| c.start_block).min());
+        let x = &config.extract;
+        for (on, what) in [
+            (x.blocks, "[extract] blocks"),
+            (x.traces, "[extract] traces"),
+            (x.top_level_calls, "[extract] top_level_calls"),
+            (x.state, "[extract] state"),
+            (!config.calls.is_empty(), "[[calls]]"),
+        ] {
+            if on {
+                report.per_block_rpc.push(what);
+            }
+        }
+        match self.admit(name, &config, &plan.dir) {
+            Ok(adm) => {
+                report.incoming_mb = Some(adm.incoming_mb);
+                report.projected_mb = Some(adm.projected_mb);
+            }
+            Err(e) => {
+                report.refusal_status = e.downcast_ref::<MountRefusal>().map(MountRefusal::status);
+                report.refusal = Some(format!("{e:#}"));
+            }
+        }
+        if let Some(source) = self.mount_ctx.sources.get(&config.nest.chain) {
+            report.tip = source.tip().await.ok();
+        }
+        report.blocks_to_backfill = report
+            .tip
+            .zip(report.start_block)
+            .map(|(tip, start)| tip.saturating_sub(start));
+        Ok(report)
+    }
+
     /// Resolve a mount's dataset and whether it must be fetched first, refusing what can be refused
     /// without doing any work.
     pub fn plan_mount(&self, name: &str, nid: Option<&Nid>) -> Result<MountPlan> {
@@ -3027,59 +3244,13 @@ impl RuntimeHandles {
                     .copied()
                     .unwrap_or(self.mount_ctx.freshness);
                 stamp_operator_settings(&mut config, dial, self.mount_ctx.ipfs_window_deadline);
-                let chain = config.nest.chain.clone();
-
-                let dormant = self
-                    .mount_ctx
-                    .dormant
-                    .get(&chain)
-                    .filter(|d| d.endpoint.chain_id == config.nest.chain_id)
-                    .cloned();
-                if !self.mount_ctx.sources.contains_key(&chain) && dormant.is_none() {
-                    return Err(MountRefusal::UndeclaredChain {
-                        nest: name.to_string(),
-                        chain,
-                    }
-                    .into());
-                }
-                // A chain with no running cursor gets one below (#1545), unless it had one that
-                // died: that quarantine holds until restart, and nests may still be serving from it.
-                let lifecycle = self
-                    .lifecycle
-                    .get(&chain)
-                    .filter(|tx| !tx.is_closed())
-                    .cloned();
-                if lifecycle.is_none()
-                    && (self.health.cursor_quarantined(&chain)
-                        || self.states.iter().any(|(_, s)| s.chain == chain))
-                {
-                    bail!(
-                        "the cursor on {chain} has stopped; restart the runtime to mount '{name}' onto it"
-                    );
-                }
-
-                // The budget check is the reason this is a refusal rather than a warning: `CLAUDE.md`'s
-                // per-cursor ceiling stops being a budget the moment a mount may quietly exceed it. Projected
-                // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
-                let has_labels = !crate::labels::load(&dir).is_empty();
-                let (entity_count, entity_rows) = declared_entities(&dir);
-                let incoming = estimate_nest_rss_mb(&config, has_labels, entity_count, entity_rows);
-                let existing: u64 = self
-                    .states
-                    .iter()
-                    .filter(|(_, s)| s.chain == chain)
-                    .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
-                    .sum();
-                let projected = RUNTIME_BASE_RSS_MB + existing + incoming;
-                if projected > self.mount_ctx.max_rss_mb {
-                    return Err(MountRefusal::OverBudget {
-                        nest: name.to_string(),
-                        chain,
-                        projected_mb: projected,
-                        ceiling_mb: self.mount_ctx.max_rss_mb,
-                    }
-                    .into());
-                }
+                let Admission {
+                    chain,
+                    dormant,
+                    lifecycle,
+                    incoming_mb: incoming,
+                    ..
+                } = self.admit(name, &config, &dir)?;
 
                 // After the budget, so a refused mount never dials anything.
                 if let Some(d) = dormant {
