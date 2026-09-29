@@ -255,7 +255,7 @@ Bundle a nest into one portable, content-addressed `.bundle` file - its authored
 
 Load a bundle: verify a `.bundle` (or a URL to one, or an unpacked bundle dir) and install it as a runnable nest. Checks the manifest format, every file's hash, and that the decode registry regenerated from the inputs matches the manifest - so a loaded nest decodes exactly as authored. With `--registry`, the positional is a `name[@version]` reference resolved against that store
 
-- `<BUNDLE>` - The bundle to load: a `.bundle` file, an `http(s)://` URL to one, or an unpacked bundle directory - or, with `--registry`, a `name[@version]` reference (no `@version` → `latest`)
+- `<BUNDLE>` - The bundle to load: a `.bundle` file, an `http(s)://` URL to one, or an unpacked bundle directory - or, with `--registry`, a `name[@version]` reference (no `@version` → `latest`), or a NID as `nuthatch nest nid` prints it, whose bundle must compute to that NID
 - `--dir <DIR>` - Target directory to install the nest into (default: the nest's name)
 - `--expect <EXPECT>` - Assert the bundle's content-address hash equals this value before installing
 - `--registry <REGISTRY>` - Resolve the positional as a `name[@version]` reference against this registry (RFC-0019). A filesystem path, or `s3://bucket/prefix` (S3/MinIO/R2, via the usual `AWS_*` env). The pulled blob is hash-verified on install

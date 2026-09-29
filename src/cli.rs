@@ -635,7 +635,8 @@ pub struct NestBundleArgs {
 #[derive(Args)]
 pub struct NestLoadArgs {
     /// The bundle to load: a `.bundle` file, an `http(s)://` URL to one, or an unpacked bundle
-    /// directory - or, with `--registry`, a `name[@version]` reference (no `@version` → `latest`).
+    /// directory - or, with `--registry`, a `name[@version]` reference (no `@version` → `latest`), or a
+    /// NID as `nuthatch nest nid` prints it, whose bundle must compute to that NID.
     pub bundle: String,
 
     /// Target directory to install the nest into (default: the nest's name).
