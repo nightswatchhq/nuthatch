@@ -130,6 +130,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--publish-interval <PUBLISH_INTERVAL>` - How often the mirror reconciles when no seal has woken it
 - `--publish-parallelism <PUBLISH_PARALLELISM>` - Objects the mirror uploads at once
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN` to be set AND each request to present it as `?token=…` (or it self-disables with a log line)
+- `--registry <REGISTRY>` - A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`
 
 ## `nuthatch doctor`
 
@@ -255,7 +256,7 @@ Bundle a nest into one portable, content-addressed `.bundle` file - its authored
 
 Load a bundle: verify a `.bundle` (or a URL to one, or an unpacked bundle dir) and install it as a runnable nest. Checks the manifest format, every file's hash, and that the decode registry regenerated from the inputs matches the manifest - so a loaded nest decodes exactly as authored. With `--registry`, the positional is a `name[@version]` reference resolved against that store
 
-- `<BUNDLE>` - The bundle to load: a `.bundle` file, an `http(s)://` URL to one, or an unpacked bundle directory - or, with `--registry`, a `name[@version]` reference (no `@version` → `latest`)
+- `<BUNDLE>` - The bundle to load: a `.bundle` file, an `http(s)://` URL to one, or an unpacked bundle directory - or, with `--registry`, a `name[@version]` reference (no `@version` → `latest`), or a NID as `nuthatch nest nid` prints it, whose bundle must compute to that NID
 - `--dir <DIR>` - Target directory to install the nest into (default: the nest's name)
 - `--expect <EXPECT>` - Assert the bundle's content-address hash equals this value before installing
 - `--registry <REGISTRY>` - Resolve the positional as a `name[@version]` reference against this registry (RFC-0019). A filesystem path, or `s3://bucket/prefix` (S3/MinIO/R2, via the usual `AWS_*` env). The pulled blob is hash-verified on install

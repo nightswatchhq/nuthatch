@@ -247,6 +247,8 @@ rpc_urls = ["https://…"]
 max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048)
 default_tenant = "acme"       # optional; the tenant a mount belongs to when it does not say
                               # (default "default"). Opaque - nuthatch refcounts it, nothing more.
+suspended = ["usdc"]          # runtime state: mounts suspended over the admin API. Kept on disk,
+                              # neither indexed nor served (503) until `POST /_admin/resume/<name>`.
 
 [[mounts]]                    # what is mounted; `nests = [...]` is gone
 alias = "usdc"
