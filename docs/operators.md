@@ -748,7 +748,8 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /_admin/`, `/_admin/events` | admin UI. Token-gated off-localhost; removable with `--no-admin` |
 
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
-`GET /health`.
+`GET /health`, and `GET /metrics` (the whole runtime's exposition, served before anything is mounted;
+each mount's `/metrics` serves the same).
 
 **Runtime admin routes** (3.13.0), token-gated off-localhost like the admin UI and removed by
 `--no-admin`. The full request and response shapes are in [admin-api.md](admin-api.md).

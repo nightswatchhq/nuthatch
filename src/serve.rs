@@ -518,6 +518,8 @@ pub fn compose_runtime(
         })
         .collect();
     let ready_nests = Arc::new(shared.clone());
+    let metrics_nests = ready_nests.clone();
+    let metrics_health = health.clone();
     let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
         // `GET /nests` - the roster (name, chain, registry hash, table count) across mounted nests,
@@ -530,6 +532,16 @@ pub fn compose_runtime(
                 let r = roster.clone();
                 let h = roster_health.clone();
                 async move { Json(merge_roster_health(&r, &h)) }
+            }),
+        )
+        // `GET /metrics` at the root, so a runtime is scrapeable before anything is mounted and a
+        // scrape target does not depend on which mounts exist. Every mount's `/metrics` serves this too.
+        .route(
+            "/metrics",
+            get(move || {
+                let h = metrics_health.clone();
+                let n = metrics_nests.clone();
+                async move { runtime_metrics(&h, &n) }
             }),
         )
         // `GET /ready` at the runtime root - the runtime-wide readiness a supervisor polls. The per-nest
@@ -1058,6 +1070,25 @@ async fn count_request(
 }
 
 /// `GET /metrics` - Prometheus text exposition (RFC-0005 §6).
+/// The runtime root's `/metrics`: the process registry, the health series and every mount's entity series.
+fn runtime_metrics(
+    health: &crate::health::RuntimeHealth,
+    nests: &[(String, SharedNest)],
+) -> impl IntoResponse {
+    let mut body = crate::metrics::METRICS.render();
+    body.push_str(&health.render_metrics());
+    for (_, nest) in nests {
+        body.push_str(&entity_metrics(&nest.current()));
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+}
+
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     let mut body = crate::metrics::METRICS.render();
     // In a runtime, append the health series (RFC-0026 §5) so an operator can alert on "anything

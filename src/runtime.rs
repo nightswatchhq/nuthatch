@@ -226,14 +226,14 @@ impl MountRef {
     /// The path this mount is served under (RFC-0032 §7), and the key its health and footprint are
     /// recorded against.
     ///
-    /// `multi_tenant` decides whether the tenant appears: with one tenant in the runtime the segment
-    /// would be pure ceremony, and today's URLs must not move for the overwhelming majority of
-    /// users who will never type the word "tenant".
-    pub fn route_key(&self, multi_tenant: bool) -> String {
-        if multi_tenant {
-            format!("{}/{}", self.tenant, self.alias)
-        } else {
+    /// The default tenant's mounts are served by alias and every other tenant's as `tenant/alias`,
+    /// each decided by the mount alone. It used to depend on how many tenants the table held, so a
+    /// restart after a second tenant arrived moved routes nobody had touched (#1565).
+    pub fn route_key(&self, default_tenant: &str) -> String {
+        if self.tenant == default_tenant {
             self.alias.clone()
+        } else {
+            format!("{}/{}", self.tenant, self.alias)
         }
     }
 }
@@ -314,6 +314,48 @@ fn safe_segment(value: &str, what: &str) -> Result<()> {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
         bail!("{what} '{value}' is invalid (allowed: letters, digits, '_', '-')");
+    }
+    Ok(())
+}
+
+/// What a move appends to a name while the new nest catches up. Valid under [`safe_segment`], so a
+/// restart mid-move boots, and reserved: an operator's own names may not end in it.
+pub const STAGING_SUFFIX: &str = "__moving";
+
+/// A mount name as the admin API accepts it: `alias` or `tenant/alias`, each part as boot accepts it
+/// and at most 64 characters. Anything boot would refuse is refused here, since a name the API
+/// accepted is persisted, and the next start would fail on it.
+pub fn check_mount_name(name: &str, default_tenant: &str) -> Result<()> {
+    let refuse = |why: String| Err(MountRefusal::InvalidName(why).into());
+    let (tenant, alias) = match name.split('/').collect::<Vec<_>>().as_slice() {
+        [alias] => (None, *alias),
+        [tenant, alias] => (Some(*tenant), *alias),
+        _ => return refuse(format!("mount name '{name}' has more than one '/'")),
+    };
+    for (what, part) in tenant
+        .map(|t| ("tenant", t))
+        .into_iter()
+        .chain([("alias", alias)])
+    {
+        if part.len() > 64 {
+            return refuse(format!(
+                "{what} '{}…' is longer than 64 characters",
+                part.chars().take(16).collect::<String>()
+            ));
+        }
+        if let Err(e) = safe_segment(part, what) {
+            return refuse(format!("{e:#}"));
+        }
+    }
+    if alias.ends_with(STAGING_SUFFIX) {
+        return refuse(format!(
+            "alias '{alias}' ends in '{STAGING_SUFFIX}', which a move reserves"
+        ));
+    }
+    if tenant == Some(default_tenant) {
+        return refuse(format!(
+            "'{name}' names the default tenant; mount it as '{alias}'"
+        ));
     }
     Ok(())
 }
@@ -1262,7 +1304,7 @@ fn commit_derived_state(staging: &Path, dataset: &Path, staged: &[&'static str])
 pub fn load_mounted(
     dir: &Path,
     datasets: &[Dataset],
-    multi_tenant: bool,
+    default_tenant: &str,
 ) -> Result<Vec<(String, PathBuf, Config)>> {
     let mut out = Vec::with_capacity(datasets.len());
     for ds in datasets {
@@ -1282,7 +1324,7 @@ pub fn load_mounted(
             )
         })?;
         out.push((
-            ds.canonical().route_key(multi_tenant),
+            ds.canonical().route_key(default_tenant),
             ds.dir.clone(),
             config,
         ));
@@ -1295,26 +1337,32 @@ pub fn load_mounted(
 pub fn spawn_publishers(
     dir: &Path,
     mounts: &[Mount],
-    multi_tenant: bool,
+    default_tenant: &str,
 ) -> Result<Vec<(String, crate::publish::Publisher)>> {
     let mut out = Vec::new();
     for m in mounts {
         if let Some(publish) = &m.publish {
             // The first mount of a dataset is the one its cursor indexes under, as `Dataset::canonical`.
             let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
-            let cursor_key = mount_route(canonical, multi_tenant);
-            out.push(spawn_publisher(dir, m, publish, multi_tenant, &cursor_key)?);
+            let cursor_key = mount_route(canonical, default_tenant);
+            out.push(spawn_publisher(
+                dir,
+                m,
+                publish,
+                default_tenant,
+                &cursor_key,
+            )?);
         }
     }
     Ok(out)
 }
 
-fn mount_route(m: &Mount, multi_tenant: bool) -> String {
+fn mount_route(m: &Mount, default_tenant: &str) -> String {
     MountRef {
         tenant: m.tenant.clone(),
         alias: m.alias.clone(),
     }
-    .route_key(multi_tenant)
+    .route_key(default_tenant)
 }
 
 /// Reports under `cursor_key`, where the dataset's cursor records `sealed_through`, so publish lag compares
@@ -1323,10 +1371,10 @@ fn spawn_publisher(
     dir: &Path,
     m: &Mount,
     publish: &MountPublish,
-    multi_tenant: bool,
+    default_tenant: &str,
     cursor_key: &str,
 ) -> Result<(String, crate::publish::Publisher)> {
-    let key = mount_route(m, multi_tenant);
+    let key = mount_route(m, default_tenant);
     let dataset = MountTable::data_dir(dir, &m.nid);
     let publisher = crate::publish::spawn(dataset, cursor_key.to_string(), publish.settings()?)
         .with_context(|| format!("publishing mount '{key}'"))?;
@@ -1334,13 +1382,13 @@ fn spawn_publisher(
 }
 
 /// The identity of the dataset serving `route_key`, for the provenance stamp (RFC-0035 §3).
-fn ds_nid_for(datasets: &[Dataset], route_key: &str, multi_tenant: bool) -> Option<Arc<str>> {
+fn ds_nid_for(datasets: &[Dataset], route_key: &str, default_tenant: &str) -> Option<Arc<str>> {
     datasets
         .iter()
         .find(|d| {
             d.mounts
                 .iter()
-                .any(|m| m.route_key(multi_tenant) == route_key)
+                .any(|m| m.route_key(default_tenant) == route_key)
         })
         .and_then(|d| d.nid.as_deref().map(Arc::from))
 }
@@ -1359,16 +1407,16 @@ pub fn fan_out_aliases(
     mut states: Vec<(String, crate::serve::AppState)>,
     health: &crate::health::RuntimeHealth,
     estimates: &mut std::collections::HashMap<String, u64>,
-    multi_tenant: bool,
+    default_tenant: &str,
 ) -> Vec<(String, crate::serve::AppState)> {
     let mut extra = Vec::new();
     for ds in datasets {
-        let canonical = ds.canonical().route_key(multi_tenant);
+        let canonical = ds.canonical().route_key(default_tenant);
         let Some((_, state)) = states.iter().find(|(n, _)| n == &canonical) else {
             continue;
         };
         for m in &ds.mounts[1..] {
-            let key = m.route_key(multi_tenant);
+            let key = m.route_key(default_tenant);
             health.register_alias(&key, &canonical, &state.chain);
             // The footprint was charged once, to the dataset. Charging it again per mount would make
             // the per-cursor budget refuse a mount that costs nothing - sharing must not be taxed.
@@ -1418,6 +1466,7 @@ fn live_datasets(
     dir: &Path,
     states: &[(String, crate::serve::AppState)],
     mounts: &[Mount],
+    default_tenant: &str,
 ) -> Vec<Dataset> {
     let mut out: Vec<Dataset> = Vec::new();
     for (name, _) in states {
@@ -1427,10 +1476,10 @@ fn live_datasets(
         };
         let record = mounts
             .iter()
-            .find(|m| m.alias == alias && tenant_seg.is_none_or(|t| m.tenant == t));
+            .find(|m| mount_route(m, default_tenant) == *name);
         let tenant = record
             .map(|m| m.tenant.clone())
-            .unwrap_or_else(|| tenant_seg.unwrap_or(DEFAULT_TENANT).to_string());
+            .unwrap_or_else(|| tenant_seg.unwrap_or(default_tenant).to_string());
         let nid = record.map(|m| m.nid.clone());
         let path = match &nid {
             Some(nid) => MountTable::data_dir(dir, nid),
@@ -1463,7 +1512,7 @@ fn live_datasets(
 fn build_roster_entries(
     states: &[(String, crate::serve::AppState)],
     datasets: &[Dataset],
-    multi_tenant: bool,
+    default_tenant: &str,
     estimates: &std::collections::HashMap<String, u64>,
 ) -> Vec<serde_json::Value> {
     states
@@ -1473,17 +1522,22 @@ fn build_roster_entries(
             // operator seeing two entries has no way to tell one shared dataset from two backfills.
             // `None` when this mount has no dataset record - a nest mounted live from a bare directory
             // with nothing yet in `mounts.toml` - and the fields below degrade gracefully to that.
-            let ds = datasets
-                .iter()
-                .find(|d| d.mounts.iter().any(|m| &m.route_key(multi_tenant) == name));
-            let this =
-                ds.and_then(|d| d.mounts.iter().find(|m| &m.route_key(multi_tenant) == name));
+            let ds = datasets.iter().find(|d| {
+                d.mounts
+                    .iter()
+                    .any(|m| &m.route_key(default_tenant) == name)
+            });
+            let this = ds.and_then(|d| {
+                d.mounts
+                    .iter()
+                    .find(|m| &m.route_key(default_tenant) == name)
+            });
             let tenant = this.map(|m| m.tenant.clone());
             let shared_with: Vec<String> = ds
                 .map(|d| {
                     d.mounts
                         .iter()
-                        .map(|m| m.route_key(multi_tenant))
+                        .map(|m| m.route_key(default_tenant))
                         .filter(|k| k != name)
                         .collect()
                 })
@@ -1647,8 +1701,9 @@ pub async fn dev(
 
     // The whole table decides the tenancy shape, suspended records included, or a route key would
     // change with a suspend.
-    let multi_tenant = all_mounts.is_multi_tenant();
-    let mut mounted = load_mounted(&dir, &datasets, multi_tenant)?;
+    let default_tenant_owned = all_mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
+    let mut mounted = load_mounted(&dir, &datasets, default_tenant)?;
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
     for (_, _, config) in &mut mounted {
@@ -1668,7 +1723,7 @@ pub async fn dev(
                     .find(|r| r.tenant == m.tenant && r.alias == m.alias)
                 {
                     rec.surface()
-                        .validate_within(&ceiling, &m.route_key(multi_tenant))?;
+                        .validate_within(&ceiling, &m.route_key(default_tenant))?;
                 }
             }
         }
@@ -1688,7 +1743,11 @@ pub async fn dev(
             );
         }
     }
-    if multi_tenant {
+    if all_mounts
+        .mount_refs()
+        .iter()
+        .any(|m| m.tenant != default_tenant)
+    {
         tracing::info!(
             "multi-tenant: routes are /<tenant>/<nest>/… ({} tenants)",
             mounts
@@ -1888,8 +1947,13 @@ pub async fn dev(
         ingests.len()
     );
 
-    let mut all_states =
-        fan_out_aliases(&datasets, all_states, &health, &mut estimates, multi_tenant);
+    let mut all_states = fan_out_aliases(
+        &datasets,
+        all_states,
+        &health,
+        &mut estimates,
+        default_tenant,
+    );
 
     // Overlay each mount's SQL surface (RFC-0034 §2). Applied **per mount, not per dataset**: that is
     // the whole reason the allowlist is mount config rather than manifest. Two tenants sharing one
@@ -1900,7 +1964,7 @@ pub async fn dev(
                 tenant: m.tenant.clone(),
                 alias: m.alias.clone(),
             }
-            .route_key(multi_tenant)
+            .route_key(default_tenant)
                 == key
         }) else {
             continue;
@@ -1923,14 +1987,14 @@ pub async fn dev(
         {
             state.counter = m.counter.clone().map(Arc::new);
         }
-        state.nid = ds_nid_for(&datasets, key, multi_tenant);
+        state.nid = ds_nid_for(&datasets, key, default_tenant);
     }
     let all_states = all_states;
-    let publishers = spawn_publishers(&dir, &mounts.mounts, multi_tenant)?;
+    let publishers = spawn_publishers(&dir, &mounts.mounts, default_tenant)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
-    let roster_entries = build_roster_entries(&all_states, &datasets, multi_tenant, &estimates);
+    let roster_entries = build_roster_entries(&all_states, &datasets, default_tenant, &estimates);
     let roster = serde_json::json!({
         // The runtime's own name. Called `roost` pre-2.0; the blanket rename briefly made this
         // `mounts`, which read as "the mount list" while holding a single name string.
@@ -1959,7 +2023,7 @@ pub async fn dev(
         health: health.clone(),
         roster,
         estimates: estimates.clone(),
-        multi_tenant,
+        default_tenant: default_tenant_owned.clone(),
         suspended,
         mount_ctx: MountContext {
             dir: dir.clone(),
@@ -2179,6 +2243,17 @@ pub fn lifecycle_routes(
         )
     }
 
+    /// A body that would not parse, answered after the token check so a caller without one learns
+    /// nothing about the request shape.
+    fn bad_body(
+        e: axum::extract::rejection::JsonRejection,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            e.status(),
+            Json(serde_json::json!({"error": e.body_text()})),
+        )
+    }
+
     if !admin_enabled {
         return axum::Router::new();
     }
@@ -2195,10 +2270,20 @@ pub fn lifecycle_routes(
         State((handles, jobs, required)): State<Shared>,
         Query(q): Query<MountQuery>,
         headers: HeaderMap,
-        Json(body): Json<MountBody>,
+        body: Result<Json<MountBody>, axum::extract::rejection::JsonRejection>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
             return unauthorized();
+        }
+        let body = match body {
+            Ok(Json(body)) => body,
+            Err(e) => return bad_body(e),
+        };
+        if let Err(e) = check_mount_name(&body.name, jobs.default_tenant()) {
+            return (
+                status_for(&e),
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            );
         }
         // Validate before the caller's `nid` touches anything, not after: RuntimeHandles::mount
         // requires an `Nid` and cannot be called without one, but a bad value should read as a
@@ -2294,8 +2379,17 @@ pub fn lifecycle_routes(
                 }
             }
         }
-        let job = MountJob::new(&body.name, nid_str.as_deref(), MountPhase::Accepted);
-        jobs.put(job.clone());
+        let job = match jobs.claim(MountJob::new(
+            &body.name,
+            nid_str.as_deref(),
+            MountPhase::Accepted,
+        )) {
+            Ok(job) => job,
+            Err(running) if running.nid == nid_str => {
+                return (StatusCode::ACCEPTED, Json(serde_json::json!(running)))
+            }
+            Err(running) => return (StatusCode::CONFLICT, Json(serde_json::json!(running))),
+        };
         spawn_mount_job(handles, jobs, body.name, nid);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
@@ -2462,10 +2556,20 @@ pub fn lifecycle_routes(
         AxPath(name): AxPath<String>,
         Query(q): Query<MountQuery>,
         headers: HeaderMap,
-        Json(body): Json<MoveBody>,
+        body: Result<Json<MoveBody>, axum::extract::rejection::JsonRejection>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
             return unauthorized();
+        }
+        let body = match body {
+            Ok(Json(body)) => body,
+            Err(e) => return bad_body(e),
+        };
+        if let Err(e) = check_mount_name(&name, jobs.default_tenant()) {
+            return (
+                status_for(&e),
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            );
         }
         let nid = match Nid::parse(&body.nid) {
             Ok(nid) => nid,
@@ -2495,8 +2599,12 @@ pub fn lifecycle_routes(
         if let Some(job) = jobs.get(&name).filter(|j| !j.phase.finished()) {
             return (StatusCode::CONFLICT, Json(serde_json::json!(job)));
         }
-        let job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
-        jobs.put(job.clone());
+        let mut job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
+        job.is_move = true;
+        let job = match jobs.claim(job) {
+            Ok(job) => job,
+            Err(running) => return (StatusCode::CONFLICT, Json(serde_json::json!(running))),
+        };
         spawn_move_job(handles, jobs, name, nid);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
@@ -2533,8 +2641,14 @@ pub fn lifecycle_routes(
         if let Some(job) = jobs.get(&name).filter(|j| !j.phase.finished()) {
             return (StatusCode::ACCEPTED, Json(serde_json::json!(job)));
         }
-        let job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
-        jobs.put(job.clone());
+        let job = match jobs.claim(MountJob::new(
+            &name,
+            Some(nid.as_str()),
+            MountPhase::Accepted,
+        )) {
+            Ok(job) => job,
+            Err(running) => return (StatusCode::ACCEPTED, Json(serde_json::json!(running))),
+        };
         spawn_mount_job(handles, jobs, name, Some(nid));
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
@@ -2579,13 +2693,14 @@ fn persist_mounted_nests(
     // `nests` here are **route keys** - tenant-qualified when the runtime is multi-tenant - because
     // that is what the serving layer and the admin API name a mount by. Matching them against
     // `alias` alone would drop every mount in a multi-tenant mounts on the first unmount.
-    let multi_tenant = mounts.is_multi_tenant();
+    let default_tenant_owned = mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
     let key_of = |m: &Mount| {
         MountRef {
             tenant: m.tenant.clone(),
             alias: m.alias.clone(),
         }
-        .route_key(multi_tenant)
+        .route_key(default_tenant)
     };
     // A runtime that started empty has neither list nor records, and its first mount must be
     // recorded by nid rather than by name (#1545). Only a file already on the pre-2.0 list, or with no
@@ -2661,7 +2776,7 @@ pub struct RuntimeHandles {
     pub estimates: std::collections::HashMap<String, u64>,
     /// Whether the runtime serves more than one tenant, for [`build_roster_entries`]'s route keys.
     /// Frozen at startup like `mount_ctx.mounts` - tenancy shape is not something a mount changes.
-    pub multi_tenant: bool,
+    pub default_tenant: String,
     /// Suspended mounts (#1548), route key to NID: kept on disk and in `mounts.toml`, answering 503.
     pub suspended: std::collections::BTreeMap<String, String>,
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
@@ -2784,6 +2899,8 @@ pub enum MountRefusal {
     NotHeld { nid: String },
     /// The chain's cursor died; its quarantine holds until restart (#1545).
     CursorStopped { nest: String, chain: String },
+    /// A name boot would refuse, so it may never be persisted.
+    InvalidName(String),
 }
 
 impl std::fmt::Display for MountRefusal {
@@ -2808,6 +2925,7 @@ impl std::fmt::Display for MountRefusal {
                 "mounting '{nest}' would put the {chain} cursor at ~{projected_mb} MB against a \
                  {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another mounts"
             ),
+            MountRefusal::InvalidName(why) => write!(f, "{why}"),
             MountRefusal::CursorStopped { nest, chain } => write!(
                 f,
                 "the cursor on {chain} has stopped; restart the runtime to mount '{nest}' onto it"
@@ -2832,6 +2950,7 @@ impl MountRefusal {
             | MountRefusal::CursorStopped { .. } => 409,
             MountRefusal::OverBudget { .. } => 507,
             MountRefusal::NotHeld { .. } => 404,
+            MountRefusal::InvalidName(_) => 400,
         }
     }
 }
@@ -2843,6 +2962,51 @@ impl MountRefusal {
 /// unmount so much as a refusal to guess: we would rather report that the cursor has not let go than
 /// tear the routes down while it is still writing.
 const UNMOUNT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+type CursorTx = tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>;
+
+/// Rename a nest on a cursor, failing if the cursor did not apply it.
+async fn rename_on(tx: &CursorTx, chain: &str, from: &str, to: &str) -> Result<()> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tx.send(indexer::CursorCommand::Rename {
+        from: from.to_string(),
+        to: to.to_string(),
+        ack: Some(ack_tx),
+    })
+    .map_err(|_| anyhow::anyhow!("the {chain} cursor is gone"))?;
+    match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => bail!("the {chain} cursor could not rename '{from}' to '{to}'"),
+        _ => bail!("the {chain} cursor did not acknowledge renaming '{from}' to '{to}'"),
+    }
+}
+
+/// A move's cursor half: `name`'s key passes to `holder` (a mount left on the shared dataset), then to
+/// the `incoming` staged nest. If the second rename fails the first is undone, so a failed move leaves
+/// the cursor as the runtime's own records still describe it.
+async fn swap_cursor_keys(
+    tx: &CursorTx,
+    chain: &str,
+    name: &str,
+    incoming: Option<&str>,
+    holder: Option<&str>,
+) -> Result<()> {
+    if let Some(holder) = holder {
+        rename_on(tx, chain, name, holder).await?;
+    }
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    let Err(e) = rename_on(tx, chain, incoming, name).await else {
+        return Ok(());
+    };
+    if let Some(holder) = holder {
+        if let Err(back) = rename_on(tx, chain, holder, name).await {
+            tracing::error!("the {chain} cursor could not give '{name}' back its key: {back:#}");
+        }
+    }
+    Err(e)
+}
 
 /// The alert delivery task holds a `Store` clone. Dropping its `JoinHandle` detaches it, so a
 /// mount that never publishes routes has to abort the task or redb keeps the file (#1535).
@@ -2924,10 +3088,18 @@ pub async fn start_mount_jobs(
     use crate::mount_jobs::{MountJob, MountJobs, MountPhase};
     // Before any job runs, so a fetch a killed process left staged cannot be mistaken for one running.
     crate::mount_jobs::clear_stale_fetches(dir);
-    let jobs = Arc::new(MountJobs::load(dir));
+    let tenant = handles.lock().await.default_tenant.clone();
+    let jobs = Arc::new(MountJobs::load(dir).with_default_tenant(&tenant));
     {
         let h = handles.lock().await;
         for (name, state) in &h.states {
+            // A move interrupted by the restart is live on its old nest and not done.
+            if jobs
+                .get(name)
+                .is_some_and(|j| j.is_move && !j.phase.finished())
+            {
+                continue;
+            }
             jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live));
         }
         for (name, nid) in &h.suspended {
@@ -2938,7 +3110,14 @@ pub async fn start_mount_jobs(
         for job in jobs.unfinished() {
             tracing::info!("resuming the mount of '{}' a restart interrupted", job.name);
             let nid = job.nid.as_deref().and_then(|n| Nid::parse(n).ok());
-            spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid);
+            match (job.is_move, nid) {
+                (true, Some(nid)) => {
+                    spawn_move_job(handles.clone(), jobs.clone(), job.name, nid);
+                }
+                (_, nid) => {
+                    spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid);
+                }
+            }
         }
     }
     jobs
@@ -2953,6 +3132,7 @@ pub fn spawn_mount_job(
     nid: Option<Nid>,
 ) -> tokio::task::JoinHandle<()> {
     use crate::mount_jobs::MountPhase;
+    let wanted = nid.as_ref().map(|n| n.as_str().to_string());
     tokio::spawn(async move {
         let outcome = async {
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
@@ -2974,8 +3154,22 @@ pub fn spawn_mount_job(
             mounted
         }
         .await;
+        // Already mounted on the very NID asked for is this job's goal reached, not a failure.
+        let reached = |h: &RuntimeHandles| {
+            h.states.iter().any(|(n, s)| {
+                *n == name && (wanted.is_none() || s.nid.as_deref() == wanted.as_deref())
+            })
+        };
         match outcome {
             Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<MountRefusal>(),
+                    Some(MountRefusal::AlreadyMounted(_))
+                ) && reached(&*handles.lock().await) =>
+            {
+                jobs.advance(&name, MountPhase::Live, None)
+            }
             Err(e) => {
                 tracing::warn!("mounting '{name}' failed: {e:#}");
                 jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));
@@ -2989,13 +3183,14 @@ pub fn spawn_mount_job(
 pub fn split_suspended(
     table: &MountTable,
 ) -> (MountTable, std::collections::BTreeMap<String, String>) {
-    let multi_tenant = table.is_multi_tenant();
+    let default_tenant_owned = table.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
     let key_of = |m: &Mount| {
         MountRef {
             tenant: m.tenant.clone(),
             alias: m.alias.clone(),
         }
-        .route_key(multi_tenant)
+        .route_key(default_tenant)
     };
     let mut active = table.clone();
     let mut suspended = std::collections::BTreeMap::new();
@@ -3271,6 +3466,19 @@ impl RuntimeHandles {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
         let (tenant, alias) = split_route_key(name);
+        for part in tenant.into_iter().chain([alias]) {
+            if let Err(e) = safe_segment(part, "mount name part") {
+                return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
+            }
+        }
+        // Keys are per mount (#1565): a name spelling out the default tenant would be served under
+        // it now and by alias alone after a restart.
+        if tenant == Some(self.default_tenant.as_str()) {
+            return Err(MountRefusal::InvalidName(format!(
+                "'{name}' names the default tenant; mount it as '{alias}'"
+            ))
+            .into());
+        }
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the
         // caller does not know it, e.g. remounting a nest this runtime has already seen.
@@ -3278,7 +3486,7 @@ impl RuntimeHandles {
             self.mount_ctx
                 .mounts
                 .iter()
-                .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+                .find(|m| mount_route(m, &self.default_tenant) == name)
                 .map(|m| m.nid.clone())
         });
         let dir = match &nid {
@@ -3330,7 +3538,7 @@ impl RuntimeHandles {
                     .mount_ctx
                     .mounts
                     .iter()
-                    .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t));
+                    .find(|m| mount_route(m, &self.default_tenant) == name);
                 state.surface = Arc::new(record.map(Mount::surface).unwrap_or_default());
                 #[cfg(feature = "counter")]
                 {
@@ -3411,7 +3619,7 @@ impl RuntimeHandles {
                     .mount_ctx
                     .mounts
                     .iter()
-                    .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+                    .find(|m| mount_route(m, &self.default_tenant) == name)
                     .cloned();
 
                 let (state, worker) = match lifecycle {
@@ -3538,14 +3746,14 @@ impl RuntimeHandles {
             .mount_ctx
             .mounts
             .iter()
-            .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+            .find(|m| mount_route(m, &self.default_tenant) == name)
         {
             if let (Some(publish), Some(_)) = (&record.publish, &nid) {
                 match spawn_publisher(
                     &self.mount_ctx.dir,
                     record,
                     publish,
-                    self.multi_tenant,
+                    &self.default_tenant,
                     &cursor_key,
                 ) {
                     Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
@@ -3562,7 +3770,7 @@ impl RuntimeHandles {
         // unmount already does for removal. A pre-2.0 mount (no `nid`) has no record to keep; `persist`
         // already falls back to the flat `nests` list for that layout.
         if let Some(nid) = &nid {
-            let record_tenant = tenant.map(str::to_string).unwrap_or_else(default_tenant);
+            let record_tenant = tenant.map_or_else(|| self.default_tenant.clone(), str::to_string);
             match self
                 .mount_ctx
                 .mounts
@@ -3585,11 +3793,16 @@ impl RuntimeHandles {
         // The roster (`GET /nests`) is rebuilt from the live `states`, not patched - #554 was exactly
         // this step missing, which left the roster reporting its startup snapshot while the mount
         // otherwise worked in full: dataset resolved, cursor caught up, routes serving.
-        let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
+        let datasets = live_datasets(
+            &self.mount_ctx.dir,
+            &self.states,
+            &self.mount_ctx.mounts,
+            &self.default_tenant,
+        );
         self.roster["nests"] = serde_json::json!(build_roster_entries(
             &self.states,
             &datasets,
-            self.multi_tenant,
+            &self.default_tenant,
             &self.estimates,
         ));
         self.live.swap(self.compose());
@@ -3637,7 +3850,14 @@ impl RuntimeHandles {
     /// reported failure and a completed change - the worst of both. A loud warning is the honest
     /// outcome, and the operator can fix the file.
     fn persist(&self) {
-        let names: Vec<String> = self.states.iter().map(|(n, _)| n.clone()).collect();
+        // A move's staging mount is never recorded: a restart mid-move keeps the old nest, and the
+        // move job, resumed, stages the new one again.
+        let names: Vec<String> = self
+            .states
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| !n.ends_with(STAGING_SUFFIX))
+            .collect();
         let suspended: Vec<String> = self.suspended.keys().cloned().collect();
         if let Err(e) = persist_mounted_nests(
             &self.mount_ctx.dir,
@@ -3720,9 +3940,35 @@ impl RuntimeHandles {
         Ok(())
     }
 
+    /// The mounts other than `name` on the dataset behind `store`, the first of which inherits its key.
+    fn dataset_sharers(&self, name: &str, store: &Arc<dyn crate::store::HotStore>) -> Vec<String> {
+        self.states
+            .iter()
+            .filter(|(n, s)| n != name && Arc::ptr_eq(&s.store, store))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Record that a shared dataset's cursor key has passed from `name`, moving off it, to `holder`.
+    fn finish_rehome(&mut self, chain: &str, name: &str, holder: &str, sharers: &[String]) {
+        let holder = holder.to_string();
+        let health = self.health.clone();
+        for (n, s) in self.states.iter_mut().filter(|(n, _)| sharers.contains(n)) {
+            s.runtime_health = Some((holder.clone(), health.clone()));
+            if *n != holder {
+                health.register_alias(n, &holder, chain);
+            }
+        }
+        health.make_canonical(&holder, chain);
+        if let Some(w) = self.alert_workers.iter_mut().find(|(n, _)| n == name) {
+            w.0 = holder.clone();
+        }
+        tracing::info!("the dataset '{name}' moves off is now known as '{holder}'");
+    }
+
     /// The name a move stages its incoming nest under while it catches up.
     pub fn staging_name(name: &str) -> String {
-        format!("{name}.moving")
+        format!("{name}{STAGING_SUFFIX}")
     }
 
     /// Move a live name to another NID without a gap (#1549).
@@ -3772,20 +4018,43 @@ impl RuntimeHandles {
             self.drain_cursor_nest(&chain, &old_key, name).await?;
             crate::metrics::METRICS.remove_nest(&old_key);
         }
+        // A shared dataset known on the cursor by the name moving off it keeps indexing for the
+        // mounts left on it: one of them takes the key, or the incoming nest cannot.
+        let sharers = if old_shared && old_key == name {
+            self.dataset_sharers(name, &old_store)
+        } else {
+            Vec::new()
+        };
+        let incoming = (new_key == staging).then_some(staging.as_str());
+        if !sharers.is_empty() || incoming.is_some() {
+            let swapped = match self.lifecycle.get(&chain).cloned() {
+                Some(tx) => {
+                    swap_cursor_keys(
+                        &tx,
+                        &chain,
+                        name,
+                        incoming,
+                        sharers.first().map(String::as_str),
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!("the {chain} cursor is gone")),
+            };
+            if let Err(e) = swapped {
+                let _ = self.unmount(&staging).await;
+                return Err(e);
+            }
+        }
+        if let Some(holder) = sharers.first() {
+            self.finish_rehome(&chain, name, holder, &sharers);
+        }
+        let new_idx = self
+            .states
+            .iter()
+            .position(|(n, _)| *n == staging)
+            .expect("still staged");
         let (_, mut new_state) = self.states.remove(new_idx);
         if new_key == staging {
-            let tx = self
-                .lifecycle
-                .get(&chain)
-                .cloned()
-                .context("the cursor the move joined is gone")?;
-            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(indexer::CursorCommand::Rename {
-                from: staging.clone(),
-                to: name.to_string(),
-                ack: Some(ack_tx),
-            });
-            let _ = tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await;
             new_state.runtime_health = Some((name.to_string(), self.health.clone()));
             self.health.register(name, &chain);
             self.health.mark_indexing(name);
@@ -3809,16 +4078,14 @@ impl RuntimeHandles {
         for p in self.publishers.iter_mut().filter(|(n, _)| *n == staging) {
             p.0 = name.to_string();
         }
-        let (tenant, alias) = split_route_key(name);
-        let (_, staging_alias) = split_route_key(&staging);
         self.mount_ctx
             .mounts
-            .retain(|m| !(m.alias == staging_alias && tenant.is_none_or(|t| m.tenant == t)));
+            .retain(|m| mount_route(m, &self.default_tenant) != staging);
         for m in self
             .mount_ctx
             .mounts
             .iter_mut()
-            .filter(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+            .filter(|m| mount_route(m, &self.default_tenant) == name)
         {
             m.nid = nid.as_str().to_string();
         }
@@ -3894,11 +4161,16 @@ impl RuntimeHandles {
     fn recompose(&mut self) {
         // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
         // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
-        let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
+        let datasets = live_datasets(
+            &self.mount_ctx.dir,
+            &self.states,
+            &self.mount_ctx.mounts,
+            &self.default_tenant,
+        );
         self.roster["nests"] = serde_json::json!(build_roster_entries(
             &self.states,
             &datasets,
-            self.multi_tenant,
+            &self.default_tenant,
             &self.estimates,
         ));
         self.live.swap(self.compose());
@@ -4011,7 +4283,7 @@ mod tests {
         // First, so `quiet` is the route the dataset's cursor records under (#1415).
         table.mounts.insert(0, quiet);
 
-        let publishers = spawn_publishers(root.path(), &table.mounts, false).unwrap();
+        let publishers = spawn_publishers(root.path(), &table.mounts, "default").unwrap();
         let keys: Vec<&str> = publishers.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["usdc"]);
 
@@ -4879,8 +5151,58 @@ mod tests {
         );
     }
 
-    /// #1534: the file still has one tenant, so route keys are aliases, but the live name of the
-    /// new mount is `tenant/alias`. That record has to be written or the mount vanishes on restart.
+    /// #1565, and the 3.13.0 tyre-kick: a mount's route key depends on its own tenant alone, so it
+    /// is the same before and after a restart whatever else is mounted, and a suspended
+    /// `tenant/alias` is still found suspended when the table is read back.
+    #[test]
+    fn route_keys_are_per_mount_and_survive_a_second_tenant() {
+        let refs = |t: &MountTable| -> Vec<String> {
+            let d = t.tenant_default();
+            t.mount_refs().iter().map(|m| m.route_key(&d)).collect()
+        };
+        let one: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\n\n[[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(refs(&one), vec!["acme/usdc"], "one non-default tenant");
+        let two: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\n\n\
+             [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"x\"\n\n\
+             [[mounts]]\nalias = \"usdc2\"\nnid = \"y\"\n\n\
+             [[mounts]]\ntenant = \"globex\"\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            refs(&two),
+            vec!["acme/usdc", "usdc2", "globex/usdc"],
+            "a second tenant moves nobody"
+        );
+        let configured: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\ndefault_tenant = \"acme\"\n\n\
+             [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            refs(&configured),
+            vec!["usdc"],
+            "a configured default tenant keeps its routes"
+        );
+
+        let suspended: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\nsuspended = [\"acme/usdc\"]\n\n\
+             [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        let (active, held) = split_suspended(&suspended);
+        assert!(
+            active.mounts.is_empty(),
+            "a suspended tenant mount booted live"
+        );
+        assert_eq!(held.get("acme/usdc").map(String::as_str), Some("x"));
+    }
+
+    /// #1534: a second tenant mounted live has to be written, or the mount vanishes on restart. Keys
+    /// are per mount (#1565), so both tenants here are keyed `tenant/alias`.
     #[test]
     fn a_second_tenant_mounted_live_is_written_while_the_file_is_still_single_tenant() {
         let d = tempfile::tempdir().unwrap();
@@ -4906,7 +5228,7 @@ mod tests {
 
         persist_mounted_nests(
             root,
-            &["usdc".to_string(), "globex/usdc".to_string()],
+            &["acme/usdc".to_string(), "globex/usdc".to_string()],
             &known.mounts,
             &[],
         )
@@ -5551,5 +5873,46 @@ mod tests {
             .await
             .expect("a closed intake with nothing left must end the runtime")
             .expect("a clean finish is not an error");
+    }
+
+    /// A cursor that answers renames in turn from `answers`, and reports what it was asked.
+    fn scripted_cursor(answers: Vec<bool>) -> (CursorTx, tokio::task::JoinHandle<Vec<String>>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let seen = tokio::spawn(async move {
+            let mut answers = answers.into_iter();
+            let mut seen = Vec::new();
+            while let Some(cmd) = rx.recv().await {
+                let indexer::CursorCommand::Rename { from, to, ack } = cmd else {
+                    panic!("not a rename: {cmd:?}");
+                };
+                seen.push(format!("{from}->{to}"));
+                ack.unwrap()
+                    .send(answers.next().expect("an unscripted rename"))
+                    .unwrap();
+            }
+            seen
+        });
+        (tx, seen)
+    }
+
+    #[tokio::test]
+    async fn a_refused_incoming_rename_gives_the_holder_key_back() {
+        let (tx, seen) = scripted_cursor(vec![true, false, true]);
+        let moved = swap_cursor_keys(&tx, "c", "usdc", Some("usdc__moving"), Some("other")).await;
+        drop(tx);
+        assert!(moved.is_err());
+        assert_eq!(
+            seen.await.unwrap(),
+            ["usdc->other", "usdc__moving->usdc", "other->usdc"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_holder_rename_stops_the_swap() {
+        let (tx, seen) = scripted_cursor(vec![false]);
+        let moved = swap_cursor_keys(&tx, "c", "usdc", Some("usdc__moving"), Some("other")).await;
+        drop(tx);
+        assert!(moved.is_err());
+        assert_eq!(seen.await.unwrap(), ["usdc->other"]);
     }
 }

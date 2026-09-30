@@ -248,9 +248,10 @@ async fn bring_up_mounted_runtime(
 
     let mounts = MountTable::load(root).unwrap();
     let datasets = mounts.datasets(root);
-    let multi_tenant = mounts.is_multi_tenant();
+    let default_tenant_owned = mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
     assert!(
-        !multi_tenant,
+        !mounts.is_multi_tenant(),
         "a single mount must not become multi-tenant - route_key would gain a tenant segment"
     );
 
@@ -271,9 +272,9 @@ async fn bring_up_mounted_runtime(
 
     let health = Arc::new(RuntimeHealth::new());
     for ds in &datasets {
-        health.register(&ds.canonical().route_key(multi_tenant), "arbitrum-one");
+        health.register(&ds.canonical().route_key(default_tenant), "arbitrum-one");
     }
-    let mounted = runtime::load_mounted(root, &datasets, multi_tenant).expect("load_mounted");
+    let mounted = runtime::load_mounted(root, &datasets, default_tenant).expect("load_mounted");
     let cursor = indexer::spawn_runtime(
         tape.clone(),
         mounted,
@@ -304,7 +305,7 @@ async fn bring_up_mounted_runtime(
         cursor.states,
         &health,
         &mut estimates,
-        multi_tenant,
+        default_tenant,
     );
 
     let nid = datasets[0]

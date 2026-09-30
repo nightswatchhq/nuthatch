@@ -47,6 +47,9 @@ pub struct MountJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub since_unixtime: u64,
+    /// A move to `nid` rather than a mount of it, so a restart resumes it as a move (#1549).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_move: bool,
 }
 
 impl MountJob {
@@ -57,6 +60,7 @@ impl MountJob {
             phase,
             reason: None,
             since_unixtime: now_unix(),
+            is_move: false,
         }
     }
 }
@@ -72,6 +76,8 @@ fn now_unix() -> u64 {
 pub struct MountJobs {
     file: PathBuf,
     jobs: std::sync::Mutex<BTreeMap<String, MountJob>>,
+    /// The runtime's default tenant, for refusing a name that spells it out before a job starts.
+    default_tenant: String,
 }
 
 impl MountJobs {
@@ -95,7 +101,17 @@ impl MountJobs {
         MountJobs {
             file,
             jobs: std::sync::Mutex::new(jobs),
+            default_tenant: crate::runtime::DEFAULT_TENANT.to_string(),
         }
+    }
+
+    pub fn with_default_tenant(mut self, tenant: &str) -> MountJobs {
+        self.default_tenant = tenant.to_string();
+        self
+    }
+
+    pub fn default_tenant(&self) -> &str {
+        &self.default_tenant
     }
 
     pub fn get(&self, name: &str) -> Option<MountJob> {
@@ -118,6 +134,18 @@ impl MountJobs {
         let mut jobs = self.jobs.lock().unwrap();
         jobs.insert(job.name.clone(), job);
         self.persist(&jobs);
+    }
+
+    /// Record `job` unless one is already running for its name, which is returned instead. One step
+    /// under the lock, so of several identical requests exactly one starts a worker.
+    pub fn claim(&self, job: MountJob) -> Result<MountJob, MountJob> {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(running) = jobs.get(&job.name).filter(|j| !j.phase.finished()) {
+            return Err(running.clone());
+        }
+        jobs.insert(job.name.clone(), job.clone());
+        self.persist(&jobs);
+        Ok(job)
     }
 
     /// Move a job on. A reason is kept only for a failure.
@@ -202,6 +230,23 @@ mod tests {
 
         again.forget("b");
         assert!(MountJobs::load(d.path()).get("b").is_none());
+    }
+
+    #[test]
+    fn only_one_of_several_identical_claims_wins() {
+        let d = tempfile::tempdir().unwrap();
+        let jobs = MountJobs::load(d.path());
+        let job = || MountJob::new("race", Some("aa"), MountPhase::Accepted);
+        assert!(jobs.claim(job()).is_ok());
+        let running = jobs
+            .claim(job())
+            .expect_err("a second claim while the first runs");
+        assert_eq!(running.phase, MountPhase::Accepted);
+        jobs.advance("race", MountPhase::Failed, Some("x".into()));
+        assert!(
+            jobs.claim(job()).is_ok(),
+            "a finished job does not block a new one"
+        );
     }
 
     #[test]

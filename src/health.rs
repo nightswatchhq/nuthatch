@@ -85,6 +85,13 @@ impl RuntimeHealth {
             .insert(alias.to_string(), canonical.to_string());
     }
 
+    /// Make a former alias the mount its shared dataset is known by (#1549): a move took the old
+    /// canonical name off the dataset, and this mount indexes it now.
+    pub fn make_canonical(&self, nest: &str, chain: &str) {
+        self.shares.write().unwrap().remove(nest);
+        self.register(nest, chain);
+    }
+
     /// Quarantine one nest. `next_retry_secs` is `None` for a terminal fault (§3).
     pub fn quarantine_nest(
         &self,

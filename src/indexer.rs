@@ -1912,7 +1912,7 @@ fn drain_lifecycle(
                 }
             }
             CursorCommand::Rename { from, to, ack } => {
-                match (sup.index_of(&from), sup.index_of(&to)) {
+                let applied = match (sup.index_of(&from), sup.index_of(&to)) {
                     (Some(i), None) => {
                         sup.names[i] = to.clone();
                         if let Some(n) = nests[i].as_mut() {
@@ -1920,14 +1920,18 @@ fn drain_lifecycle(
                         }
                         crate::metrics::METRICS.rename_nest(&from, &to);
                         tracing::info!("nest '{from}' is now '{to}' on this cursor");
+                        true
                     }
                     (_, Some(_)) => {
-                        tracing::warn!("cannot rename '{from}' to '{to}': '{to}' is on this cursor")
+                        tracing::warn!(
+                            "cannot rename '{from}' to '{to}': '{to}' is on this cursor"
+                        );
+                        false
                     }
-                    (None, _) => tracing::debug!("rename of '{from}' is not for this cursor"),
-                }
+                    (None, _) => false,
+                };
                 if let Some(ack) = ack {
-                    let _ = ack.send(());
+                    let _ = ack.send(applied);
                 }
             }
         }
@@ -1975,10 +1979,11 @@ pub enum CursorCommand {
     },
     /// Give a nest on this cursor another name (#1549), so a move's incoming nest is known by the
     /// name it took over rather than the one it was staged under.
+    /// The acknowledgement says whether the rename applied.
     Rename {
         from: String,
         to: String,
-        ack: Option<tokio::sync::oneshot::Sender<()>>,
+        ack: Option<tokio::sync::oneshot::Sender<bool>>,
     },
 }
 
