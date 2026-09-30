@@ -2841,6 +2841,12 @@ async fn a_restart_mid_move_resumes_the_move() {
 /// job, and the job ends live; a second worker must never mark a live nest failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identical_mounts_sent_at_once_end_live() {
+    for _ in 0..8 {
+        identical_mounts_once().await;
+    }
+}
+
+async fn identical_mounts_once() {
     let roost = tempfile::tempdir().unwrap();
     let nid = "f6".repeat(32);
     let (handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
@@ -2848,8 +2854,14 @@ async fn identical_mounts_sent_at_once_end_live() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
     let body = format!(r#"{{"name":"race","nid":"{nid}"}}"#);
-    let calls = (0..16).map(|_| call(&routes, "POST", "/_admin/nests", None, Some(&body)));
-    for (status, answer) in futures::future::join_all(calls).await {
+    // One task per request, as hyper serves them: on a single task the check and insert never
+    // interleave, and the race cannot happen.
+    let calls = (0..16).map(|_| {
+        let (routes, body) = (routes.clone(), body.clone());
+        tokio::spawn(async move { call(&routes, "POST", "/_admin/nests", None, Some(&body)).await })
+    });
+    for answer in futures::future::join_all(calls).await {
+        let (status, answer) = answer.unwrap();
         assert!(
             status == axum::http::StatusCode::ACCEPTED || status == axum::http::StatusCode::OK,
             "{status}: {answer}"
