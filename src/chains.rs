@@ -459,6 +459,20 @@ const ROBINHOOD: Chain = Chain {
 /// A by-id lookup exists for callers that have the id but not the name - `bench`, which threads
 /// `chain_id` through its harness. It matters because a benchmark that seals on a different rule
 /// from production measures a cadence nobody runs (#1199).
+/// What an operator should know before indexing `chain` through `rpc_urls`, when it matters (#1570).
+///
+/// `arb1.arbitrum.io` sends `blockTimestamp: 0x0` on every log, so every block's timestamp costs a
+/// header, and keyless `arb1` rations those: a backfill through it runs at about chain speed and a
+/// long one can be refused outright. Correct timestamps are the point; the note says what they cost.
+pub fn keyless_caveat(chain: &str, rpc_urls: &[String]) -> Option<&'static str> {
+    let arbitrum = lookup(chain).is_some_and(|c| c.chain_id == 42161);
+    (arbitrum && rpc_urls.iter().any(|u| u.contains("arb1.arbitrum.io"))).then_some(
+        "arb1.arbitrum.io sends no timestamp on its logs, so each block's comes from a header, and \
+         keyless endpoints ration those: a backfill here runs at about chain speed and a long one may \
+         be refused. For history, add a keyed Arbitrum RPC (`--rpc <url>`, first in rpc_urls).",
+    )
+}
+
 pub fn lookup_by_id(chain_id: u64) -> Option<&'static Chain> {
     all().iter().copied().find(|c| c.chain_id == chain_id)
 }
@@ -590,6 +604,18 @@ pub fn all() -> &'static [&'static Chain] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1570: the caveat is for Arbitrum through `arb1`, under any name the chain goes by, and not
+    /// for a nest that brought its own endpoint or another chain.
+    #[test]
+    fn the_keyless_arbitrum_caveat_names_only_the_case_it_is_about() {
+        let arb1 = vec!["https://arb1.arbitrum.io/rpc".to_string()];
+        let keyed = vec!["https://arb-mainnet.g.alchemy.com/v2/k".to_string()];
+        assert!(keyless_caveat("arbitrum-one", &arb1).is_some());
+        assert!(keyless_caveat("arbitrum", &arb1).is_some());
+        assert!(keyless_caveat("arbitrum-one", &keyed).is_none());
+        assert!(keyless_caveat("base", &arb1).is_none());
+    }
 
     #[test]
     fn arbitrum_is_registered_with_l2_finality() {

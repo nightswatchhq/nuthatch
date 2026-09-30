@@ -2835,6 +2835,9 @@ async fn build_nest(
         window,
         &identity[..12],
     );
+    if let Some(note) = chains::keyless_caveat(&config.nest.chain, &config.nest.rpc_urls) {
+        tracing::warn!("{note}");
+    }
 
     // Governed semantic layer (RFC-0016): if `semantic.toml` describes a table/column the registry
     // doesn't have, the semantics are stale - worse than none. Warn loudly at startup.
