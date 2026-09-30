@@ -3307,6 +3307,41 @@ pub fn entity_output_columns(
     session.column_names(sql)
 }
 
+/// `sql` with every wide integer column it reads cast to `HUGEINT`: the checked `i128` the entity
+/// circuit narrows it to (#1587), so `check` refuses and overflows where `dev` does. The analytical
+/// views keep the exact decimal string, which no aggregate accepts. Entity SQL admits no CTEs, so a
+/// leading `WITH` cannot collide with the author's own.
+pub fn entity_check_sql(schema: &[crate::registry::TableSchema], sql: &str) -> Result<String> {
+    let reads = crate::entities::dependencies(sql)?;
+    let ctes: Vec<String> = schema
+        .iter()
+        .filter(|t| reads.iter().any(|r| r.eq_ignore_ascii_case(&t.table)))
+        .filter_map(|t| {
+            let casts: Vec<String> = t
+                .columns
+                .iter()
+                .filter(|c| matches!(c.storage.as_str(), "word16" | "word32"))
+                .map(|c| {
+                    let col = c.name.replace('"', "\"\"");
+                    format!("CAST(\"{col}\" AS HUGEINT) AS \"{col}\"")
+                })
+                .collect();
+            let table = t.table.replace('"', "\"\"");
+            (!casts.is_empty()).then(|| {
+                format!(
+                    "\"{table}\" AS (SELECT * REPLACE ({}) FROM main.\"{table}\")",
+                    casts.join(", ")
+                )
+            })
+        })
+        .collect();
+    Ok(if ctes.is_empty() {
+        sql.to_string()
+    } else {
+        format!("WITH {}\n{sql}", ctes.join(",\n"))
+    })
+}
+
 /// Every table and authored view name a nest has, lowercased, read from its files without binding
 /// anything: what a fold's own name must not collide with.
 #[cfg(feature = "folds")]

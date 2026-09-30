@@ -245,6 +245,13 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
                 )),
             }
             if let Some(schema) = &schema {
+                let sql = match crate::analytics::entity_check_sql(schema, &sql) {
+                    Ok(sql) => sql,
+                    Err(e) => {
+                        issues.push(issue(&name, format!("entity SQL does not bind: {e}")));
+                        continue;
+                    }
+                };
                 match crate::analytics::entity_output_columns(dir, schema, &sql) {
                     Ok(columns) => {
                         for key in &entity.key {
@@ -1201,6 +1208,62 @@ mod tests {
                 .iter()
                 .any(|i| i.name == "offchain__x" && i.error.contains("namespace")),
             "{issues:?}"
+        );
+    }
+
+    /// #1587: the circuit reads a `uint256` as a checked `i128`, so `check` must too. It bound the
+    /// column as its decimal string and refused `SUM(tokensRewards)`, which `dev` maintains exactly.
+    #[test]
+    fn check_binds_a_wide_integer_the_way_the_circuit_reads_it() {
+        let dir = nest();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/svc.json"),
+            r#"[{"type":"event","name":"Collected","anonymous":false,"inputs":[
+                {"name":"indexer","type":"address","indexed":true},
+                {"name":"tokensRewards","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("nuthatch.toml"),
+            "[nest]\nname=\"svc\"\nchain=\"mainnet\"\nchain_id=1\nrpc_urls=[]\n\
+             [[contracts]]\nalias=\"svc\"\naddress=\"0x00000000000000000000000000000000000000aa\"\n\
+             abi=\"abis/svc.json\"\n",
+        )
+        .unwrap();
+        let row = |indexer: &str, amount: &str, block: u64| {
+            format!(
+                r#"{{"table":"svc__collected","indexer":"{indexer}","tokensRewards":"{amount}","block_number":{block},"log_index":0,"block_timestamp":1,"tx_hash":"0xt","address":"0x00000000000000000000000000000000000000aa"}}"#
+            )
+        };
+        let a = "0x00000000000000000000000000000000000000a1";
+        let b = "0x00000000000000000000000000000000000000b2";
+        crate::seal::seal_range(
+            dir.path(),
+            &[row(a, "5", 10), row(a, "7", 11), row(b, "1", 12)],
+            10,
+            12,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(ENTITY_FILE),
+            "[[entities]]\nname='rewards'\nsql='entities/rewards.sql'\nkey=['indexer']\nmax_rows=10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/rewards.sql"),
+            "SELECT indexer, SUM(tokensRewards) AS total FROM svc__collected GROUP BY indexer",
+        )
+        .unwrap();
+        let issues = validate(dir.path());
+        assert!(issues.is_empty(), "{issues:?}");
+
+        // Past i128 the circuit faults rather than truncating; `check` has to refuse it too.
+        crate::seal::seal_range(dir.path(), &[row(b, &"9".repeat(40), 13)], 13, 13).unwrap();
+        let issues = validate(dir.path());
+        assert!(
+            issues.iter().any(|i| i.name == "rewards" && i.error.contains("INT128")),
+            "a value the circuit cannot hold must not pass check: {issues:?}"
         );
     }
 
