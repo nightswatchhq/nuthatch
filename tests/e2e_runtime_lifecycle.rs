@@ -1778,6 +1778,17 @@ async fn status_of(
     status(&h.live, "/usdc/health").await
 }
 
+/// #1588: a trailing slash answers as its bare form does, in every state a mount can be in.
+async fn slash_agrees(
+    handles: &Arc<tokio::sync::Mutex<runtime::RuntimeHandles>>,
+    want: axum::http::StatusCode,
+) {
+    let h = handles.lock().await;
+    for path in ["/usdc", "/usdc/", "/usdc/health/"] {
+        assert_eq!(status(&h.live, path).await, want, "{path}");
+    }
+}
+
 /// #1544: a mount that fails says why, and leaves nothing on disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_mount_is_reported_with_its_reason() {
@@ -1953,8 +1964,10 @@ async fn suspend_and_resume_over_the_admin_api() {
         "resuming a live mount"
     );
 
+    slash_agrees(&handles, axum::http::StatusCode::OK).await;
     let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    slash_agrees(&handles, axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
     let (status, body) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
     assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
     let job = wait_for_phase(&routes, "usdc", "live").await;
@@ -1967,6 +1980,7 @@ async fn suspend_and_resume_over_the_admin_api() {
     assert_eq!(status, axum::http::StatusCode::OK);
     assert!(body.contains("\"was_mounted\":true"), "{body}");
     assert_eq!(status_of(&handles).await, axum::http::StatusCode::NOT_FOUND);
+    slash_agrees(&handles, axum::http::StatusCode::NOT_FOUND).await;
     let file = runtime::MountTable::load(roost.path()).unwrap();
     assert!(file.runtime.suspended.is_empty() && file.mounts.is_empty());
 
