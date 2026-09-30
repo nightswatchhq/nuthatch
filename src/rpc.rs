@@ -37,13 +37,6 @@ async fn retry_pause(pause: Duration) {
 /// a node. Splitting into bounded sub-batches keeps each request within common limits.
 const MAX_TIMESTAMP_BATCH: usize = 200;
 
-/// The header batch widths asked of each endpoint, widest first (#1570).
-const HEADER_WIDTH_PROBES: [usize; 8] = [200, 100, 50, 20, 10, 5, 2, 1];
-
-/// How long a measured header batch width stands before it is measured again. A throttle during the
-/// measurement reads as a narrow width; this bounds how long that mistake lasts.
-const HEADER_WIDTH_TTL: Duration = Duration::from_secs(15 * 60);
-
 /// Return type of the self-recursive [`RpcClient::fetch_timestamp_batch`]. Boxed because an `async fn`
 /// cannot recurse into itself without a heap indirection.
 type TimestampBatchFuture<'a> =
@@ -710,8 +703,6 @@ pub struct RpcClient {
     /// re-execution determinism. The RFC proposes the cache without noting this; the invalidation hook
     /// is the condition that makes it safe, not an optimisation on top.
     timestamps: std::sync::Mutex<HashMap<u64, u64>>,
-    /// The header batch width the primaries all take, and when it was measured (#1570).
-    header_width: tokio::sync::Mutex<Option<(usize, Instant)>>,
 }
 
 impl RpcClient {
@@ -735,7 +726,6 @@ impl RpcClient {
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
-            header_width: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -1077,54 +1067,6 @@ impl RpcClient {
         self.send_classified(&url, body).await
     }
 
-    /// The widest header batch every primary endpoint takes, measured rather than inferred (#1570).
-    ///
-    /// A refused batch cannot say whether the size or a throttle refused it, and treating it as either
-    /// is wrong half the time (#1297 is what reading a throttle as a size costs a quota). So each
-    /// primary is asked directly with batches of `eth_blockNumber`, as cheap as a request gets, widest
-    /// first, and its width is the first it answers in full; the
-    /// pool's is the narrowest, so no endpoint in it is sent a batch it refuses. An endpoint that
-    /// answers no width is left out, and with none answering the fixed width stands. Refusals keep
-    /// their classification either way; the measurement stands for [`HEADER_WIDTH_TTL`].
-    async fn header_batch_width(&self) -> usize {
-        let mut held = self.header_width.lock().await;
-        if let Some((width, at)) = *held {
-            if at.elapsed() < HEADER_WIDTH_TTL {
-                return width;
-            }
-        }
-        let mut widths = Vec::new();
-        for url in &self.urls[..self.primaries] {
-            for n in HEADER_WIDTH_PROBES {
-                let body = Value::Array(
-                    (0..n)
-                        .map(|i| {
-                            json!({"jsonrpc": "2.0", "id": i, "method": "eth_blockNumber", "params": []})
-                        })
-                        .collect(),
-                );
-                let whole = self.post_one(url, &body).await.is_ok_and(|v| {
-                    v.as_array().is_some_and(|items| {
-                        items.len() == n
-                            && items
-                                .iter()
-                                .all(|i| i.get("result").is_some_and(|r| !r.is_null()))
-                    })
-                });
-                if whole {
-                    widths.push(n);
-                    break;
-                }
-            }
-        }
-        let width = widths.iter().copied().min().unwrap_or(MAX_TIMESTAMP_BATCH);
-        if width < MAX_TIMESTAMP_BATCH {
-            tracing::info!("header batches of {width}: the widest every RPC endpoint here takes");
-        }
-        *held = Some((width, Instant::now()));
-        width
-    }
-
     async fn post_one(&self, url: &str, body: &Value) -> Result<Value> {
         let resp: Value = self.send_classified(url, body).await?;
         // A whole-batch rejection - e.g. a keyless endpoint answering HTTP 200 with
@@ -1443,14 +1385,13 @@ impl RpcClient {
             return Ok(out);
         }
         let blocks = &missing[..];
-        let width = self.header_batch_width().await;
 
         const TIMESTAMP_FANOUT: usize = 4;
         use futures::stream::StreamExt;
         // Futures built eagerly rather than mapped inside the stream: the borrow of each chunk has to
         // outlive the stream, and a closure producing them cannot express that.
         let futures: Vec<_> = blocks
-            .chunks(width)
+            .chunks(MAX_TIMESTAMP_BATCH)
             .map(|c| self.fetch_timestamp_batch(c, false, true))
             .collect();
         let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -1553,11 +1494,10 @@ impl RpcClient {
         const ROUNDS: usize = 8;
         let mut out: HashMap<u64, Value> = HashMap::new();
         let mut missing: Vec<u64> = blocks.to_vec();
-        let width = self.header_batch_width().await;
         for round in 0..ROUNDS {
             use futures::stream::StreamExt;
             let futures: Vec<_> = missing
-                .chunks(width)
+                .chunks(MAX_TIMESTAMP_BATCH)
                 .map(|c| self.fetch_timestamp_batch(c, full, true))
                 .collect();
             let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -2486,93 +2426,6 @@ mod tests {
         );
     }
 
-    /// #1570: an endpoint shaped like `arb1.arbitrum.io` (403 above 100 headers a batch, 429 above ten)
-    /// is measured, and sent batches it takes; one that throttles everything is not narrowed at all, so
-    /// a throttle keeps costing one refusal per attempt rather than a cascade (#1297).
-    #[tokio::test]
-    async fn header_batches_are_sized_to_what_every_endpoint_takes() {
-        use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
-        use serde_json::{json, Value};
-        use std::sync::{Arc, Mutex};
-
-        // (items in the request, whether it was the width measurement) per request.
-        type Seen = Arc<Mutex<Vec<(usize, bool)>>>;
-        async fn serve(throttle_all: bool) -> (String, Seen) {
-            let seen: Seen = Arc::default();
-            let log = seen.clone();
-            let app = Router::new().route(
-                "/",
-                post(move |Json(req): Json<Value>| {
-                    let log = log.clone();
-                    async move {
-                        let items = match &req {
-                            Value::Array(items) => items.clone(),
-                            item => vec![item.clone()],
-                        };
-                        let probe = items[0]["method"] == "eth_blockNumber";
-                        log.lock().unwrap().push((items.len(), probe));
-                        if throttle_all || items.len() > 10 {
-                            let code = if items.len() > 100 && !throttle_all {
-                                StatusCode::FORBIDDEN
-                            } else {
-                                StatusCode::TOO_MANY_REQUESTS
-                            };
-                            return (code, "{\"error\":\"refused\"}").into_response();
-                        }
-                        let answer = |item: &Value| {
-                            let b = item["params"][0]
-                                .as_str()
-                                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                                .unwrap_or(1);
-                            json!({"jsonrpc":"2.0","id":item["id"],
-                                   "result":{"number":format!("0x{b:x}"),"timestamp":format!("0x{:x}", b * 10)}})
-                        };
-                        Json(Value::Array(items.iter().map(answer).collect())).into_response()
-                    }
-                }),
-            );
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = l.local_addr().unwrap();
-            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-            (format!("http://{addr}"), seen)
-        }
-
-        let (url, seen) = serve(false).await;
-        let c = RpcClient::new(vec![url]).unwrap();
-        let blocks: Vec<u64> = (1_000..1_300).collect();
-        let got = c
-            .block_timestamps(&blocks)
-            .await
-            .expect("batches the endpoint takes");
-        assert!(blocks.iter().all(|b| got[b] == b * 10));
-        let real: Vec<usize> = seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, p)| !p)
-            .map(|(n, _)| *n)
-            .collect();
-        assert!(
-            !real.is_empty() && real.iter().all(|&n| n <= 10),
-            "a batch wider than the endpoint takes was sent: {real:?}"
-        );
-
-        let (url, seen) = serve(true).await;
-        let c = RpcClient::new(vec![url]).unwrap();
-        assert!(c.block_timestamps(&[1, 2, 3, 4]).await.is_err());
-        let real: Vec<usize> = seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, p)| !p)
-            .map(|(n, _)| *n)
-            .collect();
-        assert!(
-            !real.is_empty() && real.iter().all(|&n| n == 4),
-            "a throttle was answered by narrowing: {real:?}"
-        );
-    }
-
     #[tokio::test]
     async fn timestamps_carried_on_logs_cost_no_header_calls() {
         use axum::{routing::post, Json, Router};
@@ -2608,8 +2461,6 @@ mod tests {
                     let one = |item: &Value| {
                         if item["method"] == "eth_getLogs" {
                             json!({"jsonrpc":"2.0","id":item["id"],"result":logs})
-                        } else if item["method"] == "eth_blockNumber" {
-                            json!({"jsonrpc":"2.0","id":item["id"],"result":"0x1"})
                         } else {
                             HEADERS.fetch_add(1, Ordering::SeqCst);
                             json!({"jsonrpc":"2.0","id":item["id"],"result":{"timestamp":"0x7"}})
