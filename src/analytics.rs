@@ -1368,8 +1368,11 @@ fn strip_all_sql_comments(sql: &str) -> String {
             i += 2;
             out.push(' ');
         } else {
-            out.push(b[i] as char);
-            i += 1;
+            // Whole characters: a byte pushed as a char turns `é` into two, and every byte offset the
+            // checks downstream take stops lining up with the text.
+            let c = sql[i..].chars().next().expect("i is on a char boundary");
+            out.push(c);
+            i += c.len_utf8();
         }
     }
     out
@@ -1411,11 +1414,9 @@ fn reject_with_prefixed_dml(sql: &str) -> Result<()> {
 /// True when `s` opens with `kw` as a whole SQL word (case-insensitive, not `without` for `with`).
 fn sql_keyword_at(s: &str, kw: &str) -> bool {
     let s = s.trim_start();
-    if s.len() < kw.len() {
-        return false;
-    }
-    if !s[..kw.len()].eq_ignore_ascii_case(kw) {
-        return false;
+    match s.get(..kw.len()) {
+        Some(head) if head.eq_ignore_ascii_case(kw) => {}
+        _ => return false,
     }
     match s[kw.len()..].chars().next() {
         None => true,
@@ -1424,7 +1425,8 @@ fn sql_keyword_at(s: &str, kw: &str) -> bool {
 }
 
 fn sql_ident_cont(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    // DuckDB takes unquoted non-ASCII identifiers (`abéé`), so this must too.
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Consume `WITH [RECURSIVE] name AS [(…)] [, name AS (…)]*` and return the remainder.
@@ -5823,6 +5825,9 @@ template="pool"
             "WITH t AS NOT MATERIALIZED (SELECT 1 AS x) SELECT x FROM t",
             // INSERT is data, not a statement, when it lives in a string inside the CTE.
             "WITH t AS (SELECT 'INSERT' AS s) SELECT s FROM t",
+            // Non-ASCII after a keyword once sliced a character in half and answered 500.
+            "WITH abéé AS (SELECT 1 AS x) SELECT x FROM abéé",
+            "/* é */ WITH t AS (SELECT 'é' AS s) SELECT s FROM t",
             "SELECT 1",
         ] {
             assert!(
@@ -5840,6 +5845,8 @@ template="pool"
             "WITH t AS (SELECT 1 AS x) CREATE TABLE x AS SELECT 1",
             // Comments must not smuggle DML past the CTE list.
             "WITH t AS (SELECT 1 AS x) /* hi */ INSERT INTO t SELECT 1",
+            "WITH t AS (SELECT 1 AS x) /* é */ INSERT INTO t SELECT 1",
+            "WITH x AS (SELECT 1) aéé",
         ] {
             let err = reject_with_prefixed_dml(bad)
                 .expect_err(&format!("must be refused: {bad}"))
