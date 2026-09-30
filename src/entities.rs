@@ -1666,6 +1666,15 @@ mod tests {
                 "SELECT indexer, count(*) AS n FROM svc__collected GROUP BY indexer, unused",
                 "must be the same set",
             ),
+            (
+                "SELECT indexer, sum(tokensRewards + '1') AS total FROM svc__collected \
+                 GROUP BY indexer",
+                "arithmetic needs Int, got Str",
+            ),
+            (
+                "SELECT indexer, sum(indexer) AS total FROM svc__collected GROUP BY indexer",
+                "SUM and AVG need integers",
+            ),
         ] {
             let issues = rewards_issues(dir.path(), sql);
             assert!(

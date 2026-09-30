@@ -1331,7 +1331,7 @@ fn the_running_total_is_absent_from_the_view_and_the_view_says_where_it_went() {
     );
     assert!(
         view.sql
-            .contains("maintained incrementally as `pool_totals`"),
+            .contains("a running total answered by `pool_totals`"),
         "RFC-0044 §6 wants the artefact to say which of the two a field landed in:\n{}",
         view.sql
     );
@@ -1474,44 +1474,45 @@ export function handlePoolSwap(event: Swap): void {
     write_imported_nest(nest.path(), true);
     let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
 
-    // **One entity per arm** (#1590): the circuit reads one table, so a `UNION ALL` inside an entity
-    // could never start. Each arm is an entity `dev` lowers, over its own table.
-    let arms: Vec<_> = result
-        .entities
-        .iter()
-        .filter(|e| e.entity == "Pool")
-        .collect();
-    assert_eq!(arms.len(), 2, "two arms, two entities: {arms:?}");
-    for (arm, table) in arms.iter().zip(["factory__pool_created", "pool__swap"]) {
-        assert!(
-            arm.name.starts_with("pool_totals__") && arm.sql.contains(&format!("FROM \"{table}\"")),
-            "`{table}` must be an arm, not a skipped field:\n{}",
-            arm.sql
-        );
-        assert!(
-            nuthatch::entity_lower::lower(arm.sql.as_str()).is_ok(),
-            "dev lowers each arm:\n{}",
-            arm.sql
-        );
-    }
-
-    // And one view under the totals name adds them up by id.
+    // **Two tables, so a view, not an entity** (#1595). The circuit reads one table, so a `UNION ALL`
+    // entity could never start; RFC-0041 keeps what it cannot maintain as a view.
+    assert!(
+        !result.entities.iter().any(|e| e.entity == "Pool"),
+        "a multi-arm total is not an entity: {:?}",
+        result.entities
+    );
     let view = std::fs::read_to_string(nest.path().join("views/30-pool_totals.sql")).unwrap();
     assert!(
         view.contains("CREATE VIEW \"pool_totals\"") && view.matches("UNION ALL").count() == 1,
-        "two arms, one union, in the view:\n{view}"
+        "two arms, one union, in the totals view:\n{view}"
     );
+    for table in ["factory__pool_created", "pool__swap"] {
+        assert!(
+            view.contains(&format!("FROM \"{table}\"")),
+            "`{table}` must be an arm, not a skipped field:\n{view}"
+        );
+    }
+    // Each arm contributes the field it writes, through the checked cast, and the total folds once.
     assert!(
-        view.contains("sum(\"totalFees\") AS \"totalFees\"")
-            && view.contains("sum(\"swapVolume\") AS \"swapVolume\""),
-        "both fields are summed across arms:\n{view}"
+        view.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))")
+            && view.contains("TRY_CAST(\"amount0\" AS DECIMAL(38,0))")
+            && view.contains("sum(\"totalFees\") AS \"totalFees\""),
+        "each arm casts its own column and the outer aggregate sums across arms:\n{view}"
     );
     // **`swapVolume` is written by the swap arm only**, so the `pool_created` arm has to fill it - and it
     // must fill it with **zero**. `sum` skips NULLs, so a NULL fill makes the total NULL for any key that
     // appears only in arms which do not write the field, where graph-node has 0.
     assert!(
-        view.contains("CAST(0 AS HUGEINT) AS \"swapVolume\"") && !view.contains("NULL"),
+        view.contains("CAST(0 AS DECIMAL(38,0)) AS \"swapVolume\"")
+            && !view.contains("CAST(NULL AS"),
         "the arm that does not write `swapVolume` contributes zero, never NULL:\n{view}"
+    );
+    // **The overflow flag folds with `max`, not `min`.** `min` would report "no overflow" as soon as any
+    // single arm was clean, which is the wrong way round for a flag that means "some contributing row
+    // could not be represented".
+    assert!(
+        view.contains("max(\"totalFees_overflow\")"),
+        "the overflow flag is an OR across arms, so `max`:\n{view}"
     );
     assert!(
         !result.skipped_fields.iter().any(|f| {
@@ -1520,8 +1521,17 @@ export function handlePoolSwap(event: Swap): void {
         "nothing should still be skipped for being a second relation: {:?}",
         result.skipped_fields
     );
-    let issues = nuthatch::entities::validate(nest.path());
-    assert!(issues.is_empty(), "both arms check: {issues:?}");
+    // The whole nest checks, views and all, which is what `dev` loads.
+    let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
+        name: None,
+        dir: nest.path().display().to_string(),
+        update: false,
+        #[cfg(feature = "folds")]
+        folds: false,
+        #[cfg(feature = "folds")]
+        from_genesis: false,
+    });
+    assert!(check.is_ok(), "the ported nest must check: {check:?}");
 }
 
 /// A singleton the mapping keys with a constant gets that constant as its key.

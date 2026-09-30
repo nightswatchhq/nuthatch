@@ -144,6 +144,85 @@ impl Expr {
     }
 }
 
+impl Expr {
+    /// The type this expression evaluates to over a row whose columns have `cols` types, or the
+    /// refusal [`Expr::eval`] would raise on the first row (#1590). `None` is a NULL literal, which
+    /// takes any type. Checked at load, so an entity that could only fault is refused before it
+    /// starts rather than on the first block that reaches it.
+    pub fn static_type(&self, cols: &[Type]) -> Result<Option<Type>> {
+        let unify = |what: &str, a: Option<Type>, b: Option<Type>| match (a, b) {
+            (Some(x), Some(y)) if x != y => {
+                bail!("{what} mixes {x:?} and {y:?}: the entity subset has no implicit coercion")
+            }
+            (Some(x), _) | (_, Some(x)) => Ok(Some(x)),
+            (None, None) => Ok(None),
+        };
+        let expect = |what: &str, got: Option<Type>, want: Type| match got {
+            Some(t) if t != want => bail!("{what} needs {want:?}, got {t:?}"),
+            _ => Ok(()),
+        };
+        Ok(match self {
+            Expr::Column(i) => Some(
+                *cols
+                    .get(*i)
+                    .ok_or_else(|| anyhow::anyhow!("column {i} is outside the row"))?,
+            ),
+            Expr::Literal(s) => match s {
+                Scalar::Null => None,
+                Scalar::Bool(_) => Some(Type::Bool),
+                Scalar::Int(_) => Some(Type::Int),
+                Scalar::Str(_) => Some(Type::Str),
+            },
+            Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) => {
+                expect("arithmetic", a.static_type(cols)?, Type::Int)?;
+                expect("arithmetic", b.static_type(cols)?, Type::Int)?;
+                Some(Type::Int)
+            }
+            Expr::Compare(_, a, b) => {
+                unify("a comparison", a.static_type(cols)?, b.static_type(cols)?)?;
+                Some(Type::Bool)
+            }
+            Expr::And(a, b) | Expr::Or(a, b) => {
+                expect("a logical operator", a.static_type(cols)?, Type::Bool)?;
+                expect("a logical operator", b.static_type(cols)?, Type::Bool)?;
+                Some(Type::Bool)
+            }
+            Expr::Not(a) => {
+                expect("NOT", a.static_type(cols)?, Type::Bool)?;
+                Some(Type::Bool)
+            }
+            Expr::IsNull(a) => {
+                a.static_type(cols)?;
+                Some(Type::Bool)
+            }
+            Expr::Case { whens, otherwise } => {
+                let mut out = None;
+                for (when, then) in whens {
+                    expect("a CASE condition", when.static_type(cols)?, Type::Bool)?;
+                    out = unify("CASE", out, then.static_type(cols)?)?;
+                }
+                if let Some(e) = otherwise {
+                    out = unify("CASE", out, e.static_type(cols)?)?;
+                }
+                out
+            }
+            Expr::Coalesce(args) => {
+                let mut out = None;
+                for a in args {
+                    out = unify("COALESCE", out, a.static_type(cols)?)?;
+                }
+                out
+            }
+            Expr::Cast(a, ty) => {
+                if a.static_type(cols)? == Some(Type::Str) && *ty == Type::Bool {
+                    bail!("cast from VARCHAR to BOOLEAN is not in the entity subset")
+                }
+                Some(*ty)
+            }
+        })
+    }
+}
+
 /// Checked integer arithmetic with NULL propagation. §3.3.1: an unrepresentable result is a fault.
 fn arith(
     whole: &Expr,
@@ -346,5 +425,43 @@ mod tests {
         // Implicit coercion is where engines quietly disagree; the subset has none.
         let e = Expr::Compare(Cmp::Eq, col(0), int(1));
         assert!(e.eval(&row(vec![Scalar::Str("1".into())])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod static_type_tests {
+    use super::*;
+
+    fn col(i: usize) -> Box<Expr> {
+        Box::new(Expr::Column(i))
+    }
+    fn lit(s: Scalar) -> Box<Expr> {
+        Box::new(Expr::Literal(s))
+    }
+
+    /// The typer refuses what `eval` would refuse on every row, and admits what it would evaluate.
+    #[test]
+    fn static_types_follow_the_evaluator() {
+        let cols = [Type::Int, Type::Str, Type::Bool];
+        let ok = |e: Expr| e.static_type(&cols).unwrap();
+        let err = |e: Expr| e.static_type(&cols).unwrap_err().to_string();
+
+        assert_eq!(ok(Expr::Add(col(0), lit(Scalar::Int(1)))), Some(Type::Int));
+        assert!(err(Expr::Add(col(0), lit(Scalar::Str("1".into())))).contains("needs Int"));
+        assert_eq!(ok(Expr::Add(col(0), lit(Scalar::Null))), Some(Type::Int));
+        assert!(err(Expr::Compare(Cmp::Eq, col(0), col(1))).contains("no implicit coercion"));
+        assert_eq!(
+            ok(Expr::Compare(Cmp::Eq, col(1), lit(Scalar::Null))),
+            Some(Type::Bool)
+        );
+        assert!(err(Expr::And(col(2), col(0))).contains("needs Bool"));
+        assert!(err(Expr::Coalesce(vec![Expr::Column(0), Expr::Column(1)])).contains("COALESCE"));
+        assert_eq!(ok(Expr::Cast(col(1), Type::Int)), Some(Type::Int));
+        assert!(err(Expr::Cast(col(1), Type::Bool)).contains("VARCHAR to BOOLEAN"));
+        let case = Expr::Case {
+            whens: vec![(Expr::Column(2), Expr::Column(0))],
+            otherwise: Some(Box::new(Expr::Column(1))),
+        };
+        assert!(err(case).contains("CASE"));
     }
 }

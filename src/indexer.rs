@@ -19536,7 +19536,7 @@ rpc_urls = ["https://rpc.example"]
         entity_fixture::write(
             dir.path(),
             "[[entities]]\nname='paired'\nkey=['k']\nmax_rows=100\n\
-             query='SELECT a.k, sum(b.v) AS v FROM offchain__a a \
+             query='SELECT a.k, sum(CAST(b.v AS INTEGER)) AS v FROM offchain__a a \
              JOIN offchain__b b ON a.k = b.k GROUP BY a.k'\n",
         )
         .unwrap();

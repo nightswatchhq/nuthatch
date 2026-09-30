@@ -20,7 +20,7 @@
 //! first, then the event's own parameters, which is the same order `/tables`, `schema.json` and the
 //! MCP schema tool report. There is deliberately no second opinion about a table's shape.
 
-use crate::entity_expr::Expr;
+use crate::entity_expr::{Expr, Type};
 use crate::entity_offchain::{
     table_of, Column as OffchainColumn, Snapshot, Tables, OFFCHAIN_NAMESPACE,
 };
@@ -64,6 +64,8 @@ enum Columns {
 pub struct BoundSource {
     pub table: String,
     columns: Columns,
+    /// Each column's type as the circuit will see it, for [`Binding::check_types`].
+    types: Vec<Type>,
 }
 
 impl BoundSource {
@@ -115,6 +117,7 @@ impl Binding {
 
         let binding = Binding { left, right };
         binding.check_indices(plan)?;
+        binding.check_types(plan)?;
         Ok(binding)
     }
 
@@ -165,6 +168,54 @@ impl Binding {
                 Agg::Count => {}
                 Agg::Sum(e) | Agg::Min(e) | Agg::Max(e) | Agg::Avg(e) => {
                     check_expr(e, joined, "an aggregate", "the joined row")?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every expression the plan evaluates must type-check against the columns it will see, by the
+    /// rules [`Expr::eval`] enforces per row (#1590). DuckDB's binder coerces where the circuit does
+    /// not, so `check` passing through DuckDB alone let `fee + '1'` through to fault on its first row.
+    fn check_types(&self, plan: &Plan) -> Result<()> {
+        let left = &self.left.types;
+        let joined: Vec<Type> = left
+            .iter()
+            .chain(self.right.iter().flat_map(|r| r.types.iter()))
+            .copied()
+            .collect();
+        let context = |what: &str| format!("{what} does not type-check");
+        if let Some(f) = &plan.left_filter {
+            f.static_type(left).with_context(|| context("the filter"))?;
+        }
+        if let (Some(join), Some(right)) = (&plan.join, &self.right) {
+            if let Some(f) = &join.right_filter {
+                f.static_type(&right.types)
+                    .with_context(|| context("the joined table's filter"))?;
+            }
+            let (l, r) = (left[join.on.0], right.types[join.on.1]);
+            if l != r {
+                bail!("the join compares {l:?} with {r:?}: the entity subset has no implicit coercion");
+            }
+        }
+        for e in &plan.key {
+            e.static_type(&joined)
+                .with_context(|| context("a grouping key"))?;
+        }
+        for a in &plan.aggregates {
+            match a {
+                Agg::Count => {}
+                Agg::Min(e) | Agg::Max(e) => {
+                    e.static_type(&joined)
+                        .with_context(|| context("an aggregate"))?;
+                }
+                Agg::Sum(e) | Agg::Avg(e) => {
+                    let t = e
+                        .static_type(&joined)
+                        .with_context(|| context("an aggregate"))?;
+                    if let Some(t) = t.filter(|t| *t != Type::Int) {
+                        bail!("SUM and AVG need integers, got {t:?}");
+                    }
                 }
             }
         }
@@ -316,18 +367,35 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
                     )
                 })?;
             // The registry's spelling from here on: rows are matched and checked against it.
-            let name = &table.columns[position].name;
-            Ok(if position < implicit {
-                implicit_extract(name)?
+            let column = &table.columns[position];
+            let extract = if position < implicit {
+                implicit_extract(&column.name)?
             } else {
-                Extract::Param(position - implicit, name.clone())
-            })
+                Extract::Param(position - implicit, column.name.clone())
+            };
+            let ty = match extract {
+                Extract::BlockNumber
+                | Extract::BlockTimestamp
+                | Extract::LogIndex
+                | Extract::Seq => Type::Int,
+                Extract::BlockHash | Extract::TxHash | Extract::Address => Type::Str,
+                // As [`scalar`] converts them: every integer is an `i128`, a bool a bool, and
+                // everything else the string the SQL surface shows.
+                Extract::Param(..) => match column.storage.as_str() {
+                    "u64" | "i64" | "word16" | "word32" => Type::Int,
+                    "bool" => Type::Bool,
+                    _ => Type::Str,
+                },
+            };
+            Ok((extract, ty))
         })
         .collect::<Result<Vec<_>>>()?;
+    let (columns, types) = columns.into_iter().unzip();
 
     Ok(BoundSource {
         table: table.table.clone(),
         columns: Columns::Chain(columns),
+        types,
     })
 }
 
@@ -377,9 +445,19 @@ fn bind_offchain(source: &Source, table: &str, offchain: &Tables) -> Result<Boun
             }
         )
     };
+    let columns = found.bind(&source.table, &source.columns)?;
+    let types = columns
+        .iter()
+        .map(|c| match c.kind {
+            crate::entity_offchain::Kind::Int => Type::Int,
+            crate::entity_offchain::Kind::Str => Type::Str,
+            crate::entity_offchain::Kind::Bool => Type::Bool,
+        })
+        .collect();
     Ok(BoundSource {
         table: source.table.clone(),
-        columns: Columns::Offchain(found.bind(&source.table, &source.columns)?),
+        columns: Columns::Offchain(columns),
+        types,
     })
 }
 
