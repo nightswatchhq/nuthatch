@@ -856,6 +856,10 @@ fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value], typed: bool) ->
                     .parse::<i128>()
                     .map_or(DuckValue::Null, DuckValue::HugeInt),
                 ("BOOLEAN", Some(v)) => v.as_bool().map_or(DuckValue::Null, DuckValue::Boolean),
+                // Not the event converter: it types by column name, and would read a relation's text
+                // `log_index` as a counter.
+                (_, Some(Value::String(s))) if typed => DuckValue::Text(s.clone()),
+                (_, Some(v)) if typed => DuckValue::Text(v.to_string()),
                 _ => json_to_duck(row.get(c), c),
             })
             .collect();

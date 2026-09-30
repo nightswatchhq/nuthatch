@@ -1786,6 +1786,20 @@ name = "counts"
 query = "SELECT t.to, COUNT(*) AS n, MAX(CASE WHEN t.to = 'never' THEN 1 END) AS nothing FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
+
+# Astra's review of #1583: a relation carrying block_number is still a relation, and a text
+# column named like an event counter keeps its text.
+[[entities]]
+name = "by_block"
+query = "SELECT t.block_number, COUNT(*) AS n FROM usdc__transfer t GROUP BY t.block_number"
+key = ["block_number"]
+max_rows = 10000
+
+[[entities]]
+name = "named_like_counters"
+query = "SELECT t.to AS log_index, COUNT(*) AS n FROM usdc__transfer t GROUP BY t.to"
+key = ["log_index"]
+max_rows = 10000
 "#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1797,7 +1811,9 @@ async fn a_maintained_count_is_numeric_in_sql() {
     }
     tape.advance_tip_to(CHAIN_LEN);
     let rt = spawn_declared(dir.path(), tape, CHAIN_LEN, COUNTS).await;
-    rt.state.entities[0].flush();
+    for e in rt.state.entities.iter() {
+        e.flush();
+    }
     let one = |sql: &'static str| {
         let rt = &rt;
         async move {
@@ -1818,5 +1834,14 @@ async fn a_maintained_count_is_numeric_in_sql() {
     let summed = one("SELECT sum(n) AS s FROM counts").await["s"].to_string();
     let raw = one("SELECT count(*) AS c FROM usdc__transfer").await["c"].to_string();
     assert_eq!(summed.trim_matches('"'), raw.trim_matches('"'));
+    assert_eq!(
+        one("SELECT any_value(typeof(n)) AS t FROM by_block").await["t"],
+        "HUGEINT"
+    );
+    let named = one("SELECT log_index FROM named_like_counters LIMIT 1").await["log_index"].clone();
+    assert!(
+        named.as_str().is_some_and(|a| a.starts_with("0x")),
+        "a text column named log_index lost its text: {named}"
+    );
     shutdown_and_settle(rt).await;
 }

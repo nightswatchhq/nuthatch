@@ -2518,6 +2518,11 @@ fn define_views_bound(
     if let Some(wanted) = wanted {
         tables.retain(|t| wanted.contains(&t.to_ascii_lowercase()));
     }
+    // The maintained relations, by the declaration that makes them so: their rows are typed from their
+    // own cells rather than loaded as event text (#1572).
+    let relations: std::collections::BTreeSet<String> = crate::entities::load(dir)
+        .map(|d| d.into_iter().map(|e| e.name.to_ascii_lowercase()).collect())
+        .unwrap_or_default();
 
     for table in &tables {
         let cols = cols_of(table);
@@ -2626,11 +2631,7 @@ fn define_views_bound(
         // The hot tip: load this table's unsealed rows into a temp table, then union it in. Columns are
         // derived from the rows themselves (like the sealed Parquet, `seal::rows_to_batch`), so this
         // works with or without a `schema.json`. The `*_dec` derived columns still come from the schema.
-        // Undeclared, never sealed and unstamped is a maintained relation, typed from its own cells;
-        // every event row carries `block_number`.
-        let relation = cols.is_empty()
-            && sealed.is_empty()
-            && hot_rows.iter().all(|r| r.get("block_number").is_none());
+        let relation = relations.contains(&table.to_ascii_lowercase());
         let hot_loaded = !hot_rows.is_empty()
             && match if relation {
                 session.load_relation(table, &hot_rows)
