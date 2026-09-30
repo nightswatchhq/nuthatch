@@ -2727,30 +2727,44 @@ fn table_scan(files: &[(PathBuf, u64)]) -> TableScan {
 
 /// The DuckDB column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
 /// columns are `UBIGINT`, everything else is stored as canonical text (`VARCHAR`).
-/// The entity names `entities.toml` declares in `dir`, lowercased. Held from the first good read: a
-/// running nest's declarations cannot change without a restart (they are part of its content address),
-/// so a file an operator leaves half-edited must not turn its relations back into event text.
+type HeldRelations = Mutex<std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>>;
+
+fn held_relations() -> &'static HeldRelations {
+    static HELD: OnceLock<HeldRelations> = OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// Record the entities a successful read of `dir/entities.toml` declared. Called by
+/// [`crate::entities::load`], so the read a nest starts from is the one its queries type by.
+pub(crate) fn hold_relations(dir: &Path, decls: &[crate::entities::EntityDecl]) {
+    let names = decls.iter().map(|e| e.name.to_ascii_lowercase()).collect();
+    held_relations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf(), names);
+}
+
+/// The entity names `entities.toml` declares in `dir`, lowercased, as last read successfully. A running
+/// nest's declarations cannot change without a restart (they are part of its content address), and its
+/// start read them, so a file an operator leaves half-edited does not turn its relations into text.
 fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
-    type Held = Mutex<std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>>;
-    static HELD: OnceLock<Held> = OnceLock::new();
-    let held = HELD.get_or_init(Default::default);
-    if let Some(names) = held.lock().unwrap_or_else(|e| e.into_inner()).get(dir) {
+    if let Some(names) = held_relations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(dir)
+    {
         return names.clone();
     }
     match crate::entities::load(dir) {
-        Ok(decls) => {
-            let names: std::collections::BTreeSet<String> = decls
-                .into_iter()
-                .map(|e| e.name.to_ascii_lowercase())
-                .collect();
-            held.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(dir.to_path_buf(), names.clone());
-            names
-        }
+        Ok(decls) => decls
+            .into_iter()
+            .map(|e| e.name.to_ascii_lowercase())
+            .collect(),
+        // Never read successfully in this process, so no entity circuit is running from it: nothing
+        // here is a maintained relation to mistype.
         Err(e) => {
             tracing::warn!(
-                "{} could not be read, so maintained relations load as text this query: {e:#}",
+                "{} could not be read: {e:#}",
                 dir.join("entities.toml").display()
             );
             Default::default()

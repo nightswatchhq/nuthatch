@@ -1852,3 +1852,25 @@ async fn a_maintained_count_is_numeric_in_sql() {
     );
     shutdown_and_settle(rt).await;
 }
+
+/// Astra's third review of #1583: the declarations a nest started from type its relations, even when
+/// `entities.toml` is broken before the first query ever reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_broken_before_the_first_query_keeps_the_started_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for block in 1..=CHAIN_LEN {
+        tape.insert_block(block, canonical_block(block));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_declared(dir.path(), tape, CHAIN_LEN, COUNTS).await;
+    for e in rt.state.entities.iter() {
+        e.flush();
+    }
+    std::fs::write(dir.path().join("entities.toml"), "[[entities\nnot toml").unwrap();
+    let sql = "SELECT typeof(n) AS t FROM counts LIMIT 1";
+    let (status, body) = get_json(&rt, &format!("/sql?q={}", urlencoding_lite(sql))).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["t"], "HUGEINT", "{body}");
+    shutdown_and_settle(rt).await;
+}

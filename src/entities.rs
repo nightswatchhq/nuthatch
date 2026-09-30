@@ -175,6 +175,7 @@ pub fn load(dir: &Path) -> Result<Vec<EntityDecl>> {
     };
     let file: EntityFile =
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    crate::analytics::hold_relations(dir, &file.entities);
     Ok(file.entities)
 }
 
