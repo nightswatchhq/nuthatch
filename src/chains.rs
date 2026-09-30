@@ -459,20 +459,6 @@ const ROBINHOOD: Chain = Chain {
 /// A by-id lookup exists for callers that have the id but not the name - `bench`, which threads
 /// `chain_id` through its harness. It matters because a benchmark that seals on a different rule
 /// from production measures a cadence nobody runs (#1199).
-/// What an operator should know before indexing `chain` through `rpc_urls`, when it matters (#1570).
-///
-/// `arb1.arbitrum.io` sends `blockTimestamp: 0x0` on every log, so every block's timestamp costs a
-/// header, and keyless `arb1` rations those: a backfill through it runs at about chain speed and a
-/// long one can be refused outright. Correct timestamps are the point; the note says what they cost.
-pub fn keyless_caveat(chain: &str, rpc_urls: &[String]) -> Option<&'static str> {
-    let arbitrum = lookup(chain).is_some_and(|c| c.chain_id == 42161);
-    (arbitrum && rpc_urls.iter().any(|u| u.contains("arb1.arbitrum.io"))).then_some(
-        "arb1.arbitrum.io sends no timestamp on its logs, so each block's comes from a header, and \
-         keyless endpoints ration those: a backfill here runs at about chain speed and a long one may \
-         be refused. For history, add a keyed Arbitrum RPC (`--rpc <url>`, first in rpc_urls).",
-    )
-}
-
 pub fn lookup_by_id(chain_id: u64) -> Option<&'static Chain> {
     all().iter().copied().find(|c| c.chain_id == chain_id)
 }
@@ -490,6 +476,26 @@ pub fn lookup(name: &str) -> Option<&'static Chain> {
         "robinhood" | "robinhood-chain" | "robinhood-mainnet" | "rh" => Some(&ROBINHOOD),
         _ => None,
     }
+}
+
+/// What an operator should know before indexing `chain` through the endpoints actually in use, when
+/// it matters (#1570): only when timestamps are being fetched, and only for `arb1.arbitrum.io` itself.
+///
+/// `arb1` sends `blockTimestamp: 0x0` on every log, so every block's timestamp costs a header, and it
+/// takes header batches of about ten at most. The header batch width is the narrowest any endpoint in
+/// the pool takes, so while `arb1` is in the pool it bounds the rest: the note says so, and says to
+/// replace it rather than add to it.
+pub fn keyless_caveat(chain: &str, rpc_urls: &[String], timestamps: bool) -> Option<&'static str> {
+    let arbitrum = lookup(chain).is_some_and(|c| c.chain_id == 42161);
+    let arb1 = rpc_urls.iter().any(|u| {
+        reqwest::Url::parse(u).is_ok_and(|url| url.host_str() == Some("arb1.arbitrum.io"))
+    });
+    (timestamps && arbitrum && arb1).then_some(
+        "arb1.arbitrum.io sends no timestamp on its logs, so each block's comes from a header, and it \
+         takes header batches of about ten: a backfill through it runs at about chain speed, and a \
+         long one may be refused. For history, use a keyed Arbitrum RPC in place of arb1 in \
+         rpc_urls (or --rpc <url>).",
+    )
 }
 
 /// Policy for a chain with no registry entry: the same "assume L1, wait for real depth, and a
@@ -611,10 +617,19 @@ mod tests {
     fn the_keyless_arbitrum_caveat_names_only_the_case_it_is_about() {
         let arb1 = vec!["https://arb1.arbitrum.io/rpc".to_string()];
         let keyed = vec!["https://arb-mainnet.g.alchemy.com/v2/k".to_string()];
-        assert!(keyless_caveat("arbitrum-one", &arb1).is_some());
-        assert!(keyless_caveat("arbitrum", &arb1).is_some());
-        assert!(keyless_caveat("arbitrum-one", &keyed).is_none());
-        assert!(keyless_caveat("base", &arb1).is_none());
+        assert!(keyless_caveat("arbitrum-one", &arb1, true).is_some());
+        assert!(keyless_caveat("arbitrum", &arb1, true).is_some());
+        assert!(keyless_caveat("arbitrum-one", &keyed, true).is_none());
+        assert!(keyless_caveat("base", &arb1, true).is_none());
+        assert!(
+            keyless_caveat("arbitrum-one", &arb1, false).is_none(),
+            "no timestamps, no headers"
+        );
+        let lookalike = vec!["https://proxy.example/arb1.arbitrum.io/rpc".to_string()];
+        assert!(
+            keyless_caveat("arbitrum-one", &lookalike, true).is_none(),
+            "the host, not a substring"
+        );
     }
 
     #[test]

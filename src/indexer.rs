@@ -60,6 +60,11 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
     // touching the nest's config on disk.
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
+    if let Some(note) =
+        chains::keyless_caveat(&config.nest.chain, &rpc_urls, config.nest.block_timestamps)
+    {
+        tracing::warn!("{note}");
+    }
     let endpoint_count = rpc_urls.len();
     let rpc = RpcClient::with_fallbacks(rpc_urls, args.rpc_fallback.clone())?;
     // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a
@@ -2835,9 +2840,6 @@ async fn build_nest(
         window,
         &identity[..12],
     );
-    if let Some(note) = chains::keyless_caveat(&config.nest.chain, &config.nest.rpc_urls) {
-        tracing::warn!("{note}");
-    }
 
     // Governed semantic layer (RFC-0016): if `semantic.toml` describes a table/column the registry
     // doesn't have, the semantics are stale - worse than none. Warn loudly at startup.

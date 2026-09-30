@@ -1811,6 +1811,12 @@ pub async fn dev(
                 group.endpoint.chain
             );
         }
+        let timestamps = group.nests.iter().any(|(_, _, c)| c.nest.block_timestamps);
+        if let Some(note) =
+            crate::chains::keyless_caveat(&group.endpoint.chain, &rpc_urls, timestamps)
+        {
+            tracing::warn!("{note}");
+        }
         let names: Vec<&str> = group
             .nests
             .iter()
