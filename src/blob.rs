@@ -553,7 +553,7 @@ fn url_carries_credential(url: &str) -> bool {
             && s.chars().any(|c| c.is_ascii_digit())
             && s.chars().any(|c| c.is_ascii_alphabetic())
             // Avalanche's `/ext/bc/<blockchain id>/rpc`: a public chain id, not a key.
-            && !(i > 0 && segments[i - 1] == "bc")
+            && !(i > 1 && segments[i - 2] == "ext" && segments[i - 1] == "bc")
     })
 }
 
