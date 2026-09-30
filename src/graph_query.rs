@@ -465,6 +465,18 @@ fn resolve_spreads(
                         "fragment `{name}` spreads itself"
                     )));
                 }
+                // A chain of fragments nests here, not in the parser; and a spread costs budget of its
+                // own, so a diamond ending in an empty fragment is not free.
+                if visiting.len() >= MAX_NESTING {
+                    return Err(Unsupported::Syntax(format!(
+                        "the document nests more than {MAX_NESTING} levels deep"
+                    )));
+                }
+                *budget = budget.checked_sub(1).ok_or_else(|| {
+                    Unsupported::Syntax(format!(
+                        "the document expands to more than {MAX_SELECTIONS} selections"
+                    ))
+                })?;
                 visiting.push(name.clone());
                 out.extend(resolve_spreads(body, fragments, visiting, budget)?);
                 visiting.pop();
@@ -795,7 +807,7 @@ impl<'a> Cursor<'a> {
         self.trivia();
         if self.peek() == Some(b'[') {
             self.i += 1;
-            self.type_ref()?;
+            self.nested(Self::type_ref)?;
             self.trivia();
             if self.peek() != Some(b']') {
                 return Err(Unsupported::Syntax("unclosed list type".into()));
@@ -3154,6 +3166,27 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
                     matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
                     "{e:?}"
                 );
+                // Astra's review of #1583: a variable's list type recursed without the guard.
+                let ty = format!(
+                    "query Q($v: {}Int{}) {{ a {{ id }} }}",
+                    "[".repeat(deep),
+                    "]".repeat(deep)
+                );
+                let e = parse(&ty).expect_err("deep type");
+                assert!(
+                    matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
+                    "{e:?}"
+                );
+                // And a chain of fragments nests in resolution, which the parser never sees.
+                let mut chain: String = (0..10_000)
+                    .map(|i| format!("fragment F{i} on X {{ ...F{n} }} ", n = i + 1))
+                    .collect();
+                chain.push_str("fragment F10000 on X { id } { pools { ...F0 } }");
+                let e = parse(&chain).expect_err("fragment chain");
+                assert!(
+                    matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
+                    "{e:?}"
+                );
             })
             .unwrap()
             .join()
@@ -3164,6 +3197,14 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
             .collect();
         diamond.push_str("fragment F40 on X { id } { pools { ...F0 } }");
         let e = parse(&diamond).expect_err("exponential expansion");
+        assert!(
+            matches!(&e, Unsupported::Syntax(m) if m.contains("expands to more")),
+            "{e:?}"
+        );
+        // A diamond ending in an empty fragment expands no fields, and must still be refused.
+        let empty = diamond.replace("fragment F40 on X { id }", "fragment F40 on X { }");
+        assert_ne!(empty, diamond);
+        let e = parse(&empty).expect_err("exponential expansion of nothing");
         assert!(
             matches!(&e, Unsupported::Syntax(m) if m.contains("expands to more")),
             "{e:?}"
