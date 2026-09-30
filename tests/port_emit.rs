@@ -1521,6 +1521,14 @@ export function handlePoolSwap(event: Swap): void {
         "nothing should still be skipped for being a second relation: {:?}",
         result.skipped_fields
     );
+    // Reported and counted as answered, like any view.
+    assert!(
+        result.views.iter().any(|v| v.file == "30-pool_totals.sql"
+            && v.exact_fields.contains(&"totalFees".to_string())
+            && v.exact_fields.contains(&"swapVolume".to_string())),
+        "the totals view is an emitted view: {:?}",
+        result.views.iter().map(|v| &v.file).collect::<Vec<_>>()
+    );
     // The whole nest checks, views and all, which is what `dev` loads.
     let check = nuthatch::check::check(nuthatch::cli::CheckArgs {
         name: None,

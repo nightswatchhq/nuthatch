@@ -178,20 +178,29 @@ impl Binding {
     /// rules [`Expr::eval`] enforces per row (#1590). DuckDB's binder coerces where the circuit does
     /// not, so `check` passing through DuckDB alone let `fee + '1'` through to fault on its first row.
     fn check_types(&self, plan: &Plan) -> Result<()> {
+        use crate::entity_expr::Types;
         let left = &self.left.types;
         let joined: Vec<Type> = left
             .iter()
             .chain(self.right.iter().flat_map(|r| r.types.iter()))
             .copied()
             .collect();
-        let context = |what: &str| format!("{what} does not type-check");
+        // `admits` keeps a row only on TRUE, and faults on anything but a boolean or NULL.
+        let filter = |f: &Expr, cols: &[Type], what: &str| -> Result<()> {
+            let t = f
+                .static_type(cols)
+                .with_context(|| format!("{what} does not type-check"))?;
+            if !t.admits(Type::Bool) {
+                bail!("{what} must be a condition, but it is {t:?}");
+            }
+            Ok(())
+        };
         if let Some(f) = &plan.left_filter {
-            f.static_type(left).with_context(|| context("the filter"))?;
+            filter(f, left, "the filter")?;
         }
         if let (Some(join), Some(right)) = (&plan.join, &self.right) {
             if let Some(f) = &join.right_filter {
-                f.static_type(&right.types)
-                    .with_context(|| context("the joined table's filter"))?;
+                filter(f, &right.types, "the joined table's filter")?;
             }
             let (l, r) = (left[join.on.0], right.types[join.on.1]);
             if l != r {
@@ -200,22 +209,19 @@ impl Binding {
         }
         for e in &plan.key {
             e.static_type(&joined)
-                .with_context(|| context("a grouping key"))?;
+                .context("a grouping key does not type-check")?;
         }
         for a in &plan.aggregates {
-            match a {
-                Agg::Count => {}
-                Agg::Min(e) | Agg::Max(e) => {
+            let t: Option<Types> = match a {
+                Agg::Count => None,
+                Agg::Min(e) | Agg::Max(e) | Agg::Sum(e) | Agg::Avg(e) => Some(
                     e.static_type(&joined)
-                        .with_context(|| context("an aggregate"))?;
-                }
-                Agg::Sum(e) | Agg::Avg(e) => {
-                    let t = e
-                        .static_type(&joined)
-                        .with_context(|| context("an aggregate"))?;
-                    if let Some(t) = t.filter(|t| *t != Type::Int) {
-                        bail!("SUM and AVG need integers, got {t:?}");
-                    }
+                        .context("an aggregate does not type-check")?,
+                ),
+            };
+            if let (Agg::Sum(_) | Agg::Avg(_), Some(t)) = (a, t) {
+                if !t.admits(Type::Int) {
+                    bail!("SUM and AVG need integers, got {t:?}");
                 }
             }
         }

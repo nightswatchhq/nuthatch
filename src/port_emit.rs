@@ -245,7 +245,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         .with_context(|| format!("build the decode registry for {}", nest.display()))?
         .schema();
 
-    let (entities, mut skipped_fields, view_totals) =
+    let (entities, mut skipped_fields, totals_views) =
         write_entities(nest, &report, &mappings, &config, &schema)?;
     // Where each field landed, so the view path reports "materialised as an entity" rather than
     // "not in this view" - RFC-0044 §6 requires the artefacts to say which of the two it was.
@@ -259,13 +259,15 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         .iter()
         .cloned()
         .chain(
-            view_totals
+            totals_views
                 .iter()
-                .flat_map(|(e, fields)| fields.iter().map(|f| (e.clone(), f.clone()))),
+                .flat_map(|v| v.exact_fields.iter().map(|f| (v.entity.clone(), f.clone()))),
         )
         .collect();
-    let (views, view_skipped, entities_without_views) =
+    let (mut views, view_skipped, entities_without_views) =
         write_exact_views(nest, &report, &mappings, &config, &schema, &totalled)?;
+    // Answered fields, so they count in coverage and get projection checks like any view.
+    views.extend(totals_views);
     skipped_fields.extend(view_skipped);
     write_checks(nest, &views)?;
 
@@ -487,11 +489,7 @@ fn write_entities(
     mappings: &crate::port_report::Mappings,
     config: &Config,
     schema: &[nuthatch_decode::registry::TableSchema],
-) -> Result<(
-    Vec<EmittedEntity>,
-    Vec<SkippedField>,
-    Vec<(String, Vec<String>)>,
-)> {
+) -> Result<(Vec<EmittedEntity>, Vec<SkippedField>, Vec<EmittedView>)> {
     let mut exact_by_entity: BTreeMap<String, Vec<&crate::port_report::FieldRow>> = BTreeMap::new();
     for f in &report.fields {
         if f.class == Class::Exact && f.entity != "_Schema_" {
@@ -500,8 +498,7 @@ fn write_entities(
     }
 
     let mut emitted: Vec<EmittedEntity> = Vec::new();
-    let mut totals_views: Vec<(String, String)> = Vec::new();
-    let mut view_totals: Vec<(String, Vec<String>)> = Vec::new();
+    let mut totals_views: Vec<EmittedView> = Vec::new();
     let mut skipped: Vec<SkippedField> = Vec::new();
     for (entity, fields) in &exact_by_entity {
         let accumulated = map_accumulating_fields(entity, fields, mappings, config, schema);
@@ -726,8 +723,12 @@ fn write_entities(
             inner.join("\n  UNION ALL\n")
         ));
         sql.push_str(";\n");
-        totals_views.push((format!("30-{totals}.sql"), sql));
-        view_totals.push((entity.clone(), fields.clone()));
+        totals_views.push(EmittedView {
+            entity: entity.clone(),
+            file: format!("30-{totals}.sql"),
+            sql,
+            exact_fields: fields.clone(),
+        });
     }
 
     // The views that sum a multi-arm entity's totals carry the entities' header, so a previous run's
@@ -736,8 +737,9 @@ fn write_entities(
     remove_generated_sql(&views)?;
     if !totals_views.is_empty() {
         std::fs::create_dir_all(&views).with_context(|| format!("create {}", views.display()))?;
-        for (file, sql) in &totals_views {
-            std::fs::write(views.join(file), sql).with_context(|| format!("write views/{file}"))?;
+        for v in &totals_views {
+            std::fs::write(views.join(&v.file), &v.sql)
+                .with_context(|| format!("write views/{}", v.file))?;
         }
     }
 
@@ -752,7 +754,7 @@ fn write_entities(
         } else {
             write_operator_entity_declarations(nest, &operator_declarations)?;
         }
-        return Ok((emitted, skipped, view_totals));
+        return Ok((emitted, skipped, totals_views));
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut toml = String::from(
@@ -775,7 +777,7 @@ fn write_entities(
         toml.push_str(&toml::to_string(&toml::Value::Table(root))?);
     }
     std::fs::write(nest.join(crate::entities::ENTITY_FILE), toml).context("write entities.toml")?;
-    Ok((emitted, skipped, view_totals))
+    Ok((emitted, skipped, totals_views))
 }
 
 fn load_operator_entity_declarations(
@@ -1605,11 +1607,15 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
     let mut labels: Vec<(String, String, Vec<String>)> = views
         .iter()
         .map(|v| {
-            (
-                v.entity.clone(),
-                to_alias(&v.entity),
-                v.exact_fields.clone(),
-            )
+            // The relation the file creates: `20-pool.sql` is `pool`, and a multi-arm total's
+            // `30-pool_totals.sql` is `pool_totals`.
+            let relation = v
+                .file
+                .split_once('-')
+                .map_or(v.file.as_str(), |(_, rest)| rest)
+                .trim_end_matches(".sql")
+                .to_string();
+            (v.entity.clone(), relation, v.exact_fields.clone())
         })
         .collect();
     labels.sort();

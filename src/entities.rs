@@ -1675,6 +1675,11 @@ mod tests {
                 "SELECT indexer, sum(indexer) AS total FROM svc__collected GROUP BY indexer",
                 "SUM and AVG need integers",
             ),
+            (
+                "SELECT indexer, count(*) AS n FROM svc__collected WHERE tokensRewards \
+                 GROUP BY indexer",
+                "must be a condition",
+            ),
         ] {
             let issues = rewards_issues(dir.path(), sql);
             assert!(
