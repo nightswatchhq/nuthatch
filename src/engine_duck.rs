@@ -8,7 +8,7 @@
 use crate::engine::{
     value_bytes, Died, Engine, FactWindow, Interrupt, Session, SQL_MAX_RESULT_BYTES,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use duckdb::arrow::datatypes::DataType;
 use duckdb::types::{Value as DuckValue, ValueRef};
 use duckdb::{Config, Connection};
@@ -100,8 +100,16 @@ impl Session for DuckSession {
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
         self.conn.load_hot(table, rows)
     }
-    fn load_relation(&self, table: &str, rows: &[&Value]) -> Result<()> {
-        self.conn.load_relation(table, rows)
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        self.conn.drop_relation(name)
+    }
+    fn load_relation(
+        &self,
+        table: &str,
+        cols: &[(String, &'static str)],
+        rows: &[&Value],
+    ) -> Result<()> {
+        self.conn.load_relation(table, cols, rows)
     }
     fn bind_facts(
         &self,
@@ -289,8 +297,24 @@ impl Session for Connection {
         physical_parquet_scans(&plan)
     }
 
-    fn load_relation(&self, table: &str, rows: &[&Value]) -> Result<()> {
-        load_hot_temp(self, &hot_table(table), rows, true)
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        self.execute_batch(&format!(
+            "DROP VIEW IF EXISTS \"{}\"",
+            name.replace('"', "\"\"")
+        ))?;
+        Ok(())
+    }
+
+    fn load_relation(
+        &self,
+        table: &str,
+        cols: &[(String, &'static str)],
+        rows: &[&Value],
+    ) -> Result<()> {
+        if cols.is_empty() {
+            return load_hot_temp(self, &hot_table(table), rows, true);
+        }
+        load_declared_relation(self, &hot_table(table), cols, rows)
     }
 
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
@@ -894,6 +918,56 @@ fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value], typed: bool) ->
                 _ => json_to_duck(row.get(c), c),
             })
             .collect();
+        let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+        app.append_row(refs.as_slice())?;
+    }
+    app.flush()?;
+    Ok(())
+}
+
+/// A maintained relation with the columns and types its plan declares (#1598): it exists with no
+/// rows, and a column keeps its type whatever its values, where typing by cells turned a sum that
+/// outgrew a JSON number into text.
+fn load_declared_relation(
+    conn: &Connection,
+    name: &str,
+    cols: &[(String, &'static str)],
+    rows: &[&Value],
+) -> Result<()> {
+    // Every row is converted before the table is touched, so a row that does not match leaves no
+    // empty or partial table behind.
+    let mut converted: Vec<Vec<DuckValue>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let vals: Vec<DuckValue> = cols
+            .iter()
+            .map(|(c, t)| match (*t, row.get(c)) {
+                (_, None | Some(Value::Null)) => Ok(DuckValue::Null),
+                ("HUGEINT", Some(v)) => {
+                    let text = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    text.parse::<i128>()
+                        .map(DuckValue::HugeInt)
+                        .map_err(|_| anyhow!("{c} = {text} is not the integer its plan declares"))
+                }
+                ("BOOLEAN", Some(v)) => v
+                    .as_bool()
+                    .map(DuckValue::Boolean)
+                    .ok_or_else(|| anyhow!("{c} = {v} is not the boolean its plan declares")),
+                (_, Some(Value::String(s))) => Ok(DuckValue::Text(s.clone())),
+                (_, Some(v)) => Ok(DuckValue::Text(v.to_string())),
+            })
+            .collect::<Result<_>>()?;
+        converted.push(vals);
+    }
+    let coldefs: Vec<String> = cols.iter().map(|(c, t)| format!("\"{c}\" {t}")).collect();
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS \"{name}\"; CREATE TEMP TABLE \"{name}\" ({})",
+        coldefs.join(", ")
+    ))?;
+    let mut app = conn.appender(name)?;
+    for vals in &converted {
         let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
         app.append_row(refs.as_slice())?;
     }

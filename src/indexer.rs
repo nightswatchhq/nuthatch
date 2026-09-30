@@ -1581,6 +1581,12 @@ fn start_entities(
         let (plan, columns) = crate::entity_lower::lower_with_columns(&sql)
             .with_context(|| format!("lowering entity `{}`", decl.name))?;
         let (binding, offchain) = crate::entities::bind_as_dev(dir, &decl.name, &plan, registry)?;
+        crate::analytics::hold_relation_types(
+            dir,
+            &decl.name,
+            &columns,
+            &binding.output_types(&plan),
+        );
         let view =
             EntityView::start_bound(&decl.name, &plan, binding, &columns, decl.max_rows, warm)?;
         // A cold entity takes every present snapshot before its first window (#1437). A warm one is

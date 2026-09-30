@@ -407,6 +407,36 @@ fn plan_ast(conn: &Connection, sql: &str) -> Result<Value> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+/// Lower and bind each declared entity as `dev` starts it, record its output types, and return the
+/// names that bound (#1599): the relations an authored view may read. One that does not bind is left
+/// out, and `validate` reports why.
+pub(crate) fn hold_declared_relations(dir: &Path) -> Vec<String> {
+    let Some(registry) = crate::config::Config::load(dir)
+        .ok()
+        .and_then(|cfg| crate::registry::from_nest(dir, &cfg).ok())
+    else {
+        return Vec::new();
+    };
+    let Ok(decls) = load(dir) else {
+        return Vec::new();
+    };
+    decls
+        .into_iter()
+        .filter_map(|decl| {
+            let sql = decl.read_sql(dir).ok()?;
+            let (plan, columns) = crate::entity_lower::lower_with_columns(&sql).ok()?;
+            let (binding, _) = bind_as_dev(dir, &decl.name, &plan, &registry).ok()?;
+            crate::analytics::hold_relation_types(
+                dir,
+                &decl.name,
+                &columns,
+                &binding.output_types(&plan),
+            );
+            Some(decl.name)
+        })
+        .collect()
+}
+
 /// Bind a lowered entity to this nest the way it is started: its name must not shadow a decoded or
 /// offchain table, and every table and column it reads must exist. `dev` and `check` both call this,
 /// so neither can accept an entity the other refuses (#1590).
@@ -1590,6 +1620,34 @@ mod tests {
                 .iter()
                 .any(|i| i.name == "rewards" && i.error.contains("does not fit")),
             "a value the circuit cannot hold must not pass check: {issues:?}"
+        );
+    }
+
+    /// #1599: an authored view that reads an entity checks exactly when `dev` would serve it, on a
+    /// nest that has indexed nothing yet, and a column the entity does not have still fails.
+    #[test]
+    fn a_view_over_an_entity_checks() {
+        let dir = wide_nest();
+        std::fs::write(
+            dir.path().join("entities/rewards.sql"),
+            "SELECT indexer, SUM(tokensRewards) AS total FROM svc__collected GROUP BY indexer",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        let view = |sql: &str| {
+            std::fs::write(dir.path().join("views/10-top.sql"), sql).unwrap();
+            let cfg = crate::config::Config::load(dir.path()).unwrap();
+            let schema = crate::registry::from_nest(dir.path(), &cfg)
+                .unwrap()
+                .schema();
+            crate::analytics::validate_nest_views(dir.path(), &schema)
+        };
+        let issues = view("CREATE VIEW top AS SELECT indexer, total + 1 AS next FROM rewards;");
+        assert!(issues.is_empty(), "{issues:?}");
+        let issues = view("CREATE VIEW top AS SELECT indexer, missing FROM rewards;");
+        assert!(
+            !issues.is_empty(),
+            "a column the entity lacks must still fail"
         );
     }
 

@@ -175,6 +175,28 @@ impl Binding {
         Ok(())
     }
 
+    /// The type of each output column, key then aggregates, as the circuit fills it (#1598): counts,
+    /// sums and averages are integers, a key or a MIN/MAX is its expression's type when that is
+    /// certain, and `None` when it is not.
+    pub fn output_types(&self, plan: &Plan) -> Vec<Option<Type>> {
+        let joined: Vec<Option<Type>> = self
+            .left
+            .types
+            .iter()
+            .chain(self.right.iter().flat_map(|r| r.types.iter()))
+            .copied()
+            .collect();
+        let of = |e: &Expr| e.definite_type(&joined).ok().flatten();
+        plan.key
+            .iter()
+            .map(of)
+            .chain(plan.aggregates.iter().map(|a| match a {
+                Agg::Count | Agg::Sum(_) | Agg::Avg(_) => Some(Type::Int),
+                Agg::Min(e) | Agg::Max(e) => of(e),
+            }))
+            .collect()
+    }
+
     /// Every expression the plan evaluates must type-check against the columns it will see, by the
     /// rules [`Expr::eval`] enforces per row (#1590). DuckDB's binder coerces where the circuit does
     /// not, so `check` passing through DuckDB alone let `fee + '1'` through to fault on its first row.
