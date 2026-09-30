@@ -2179,6 +2179,17 @@ pub fn lifecycle_routes(
         )
     }
 
+    /// A body that would not parse, answered after the token check so a caller without one learns
+    /// nothing about the request shape.
+    fn bad_body(
+        e: axum::extract::rejection::JsonRejection,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            e.status(),
+            Json(serde_json::json!({"error": e.body_text()})),
+        )
+    }
+
     if !admin_enabled {
         return axum::Router::new();
     }
@@ -2195,11 +2206,15 @@ pub fn lifecycle_routes(
         State((handles, jobs, required)): State<Shared>,
         Query(q): Query<MountQuery>,
         headers: HeaderMap,
-        Json(body): Json<MountBody>,
+        body: Result<Json<MountBody>, axum::extract::rejection::JsonRejection>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
             return unauthorized();
         }
+        let body = match body {
+            Ok(Json(body)) => body,
+            Err(e) => return bad_body(e),
+        };
         // Validate before the caller's `nid` touches anything, not after: RuntimeHandles::mount
         // requires an `Nid` and cannot be called without one, but a bad value should read as a
         // caller error (400) rather than the 500 an unwrapped `Result` would produce here.
@@ -2462,11 +2477,15 @@ pub fn lifecycle_routes(
         AxPath(name): AxPath<String>,
         Query(q): Query<MountQuery>,
         headers: HeaderMap,
-        Json(body): Json<MoveBody>,
+        body: Result<Json<MoveBody>, axum::extract::rejection::JsonRejection>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
             return unauthorized();
         }
+        let body = match body {
+            Ok(Json(body)) => body,
+            Err(e) => return bad_body(e),
+        };
         let nid = match Nid::parse(&body.nid) {
             Ok(nid) => nid,
             Err(e) => {
@@ -3754,7 +3773,10 @@ impl RuntimeHandles {
             .filter(|(n, s)| n != name && Arc::ptr_eq(&s.store, store))
             .map(|(n, _)| n.clone())
             .collect();
-        let holder = sharers.first().cloned().context("no mount left on the dataset")?;
+        let holder = sharers
+            .first()
+            .cloned()
+            .context("no mount left on the dataset")?;
         self.rename_on_cursor(chain, name, &holder).await?;
         let health = self.health.clone();
         for (n, s) in self.states.iter_mut().filter(|(n, _)| sharers.contains(n)) {

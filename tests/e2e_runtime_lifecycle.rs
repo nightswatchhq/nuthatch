@@ -2601,3 +2601,59 @@ async fn moving_a_name_off_a_shared_dataset_leaves_the_other_tenant_indexing() {
         "unmounting the moved name stopped the other tenant's indexing"
     );
 }
+
+/// From the 3.13.0 tyre-kick: the token is checked before the body is parsed, so a caller without
+/// it gets 401 whatever it sends, and learns nothing about the request shape. With the token, a bad
+/// body keeps its own status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_token_is_checked_before_the_body() {
+    use tower::ServiceExt;
+    const TOKEN: &str = "body-order-token";
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "a1".repeat(32);
+    let (handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles, test_jobs(), true, Some(TOKEN.to_string()));
+    let send = |uri: &'static str, ctype: Option<&'static str>, token: bool, body: &'static str| {
+        let routes = routes.clone();
+        async move {
+            let mut req = axum::http::Request::builder().method("POST").uri(uri);
+            if let Some(c) = ctype {
+                req = req.header(axum::http::header::CONTENT_TYPE, c);
+            }
+            if token {
+                req = req.header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+            }
+            let req = req.body(axum::body::Body::from(body)).unwrap();
+            routes.oneshot(req).await.unwrap().status().as_u16()
+        }
+    };
+    for uri in ["/_admin/nests", "/_admin/move/usdc"] {
+        let json = Some("application/json");
+        assert_eq!(
+            send(uri, json, false, "{").await,
+            401,
+            "{uri}: malformed, no token"
+        );
+        assert_eq!(
+            send(uri, None, false, "{}").await,
+            401,
+            "{uri}: no content type, no token"
+        );
+        assert_eq!(
+            send(uri, json, true, "{").await,
+            400,
+            "{uri}: malformed, with token"
+        );
+        assert_eq!(
+            send(uri, json, true, "{}").await,
+            422,
+            "{uri}: missing field, with token"
+        );
+        assert_eq!(
+            send(uri, None, true, "{}").await,
+            415,
+            "{uri}: no content type, with token"
+        );
+    }
+}
