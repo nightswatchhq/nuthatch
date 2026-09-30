@@ -196,11 +196,6 @@ impl Types {
         self.null || self.has(ty)
     }
 
-    /// Only NULL, so an operator over it never inspects a type.
-    fn only_null(self) -> bool {
-        self == Types::NULL
-    }
-
     fn named(self) -> String {
         let mut out = Vec::new();
         for (on, name) in [
@@ -222,16 +217,13 @@ impl Expr {
     /// [`Expr::eval`] would raise on every row it evaluated (#1590). Checked at load, so an entity that
     /// could only fault is refused before it starts rather than on the first block that reaches it.
     pub fn static_type(&self, cols: &[Type]) -> Result<Types> {
-        let need = |what: &str, got: Types, want: Type| {
-            if got.admits(want) {
+        // What a condition may be when `truth` reads it: anything but a boolean or NULL faults.
+        let condition = |what: &str, t: Types| {
+            if t.admits(Type::Bool) {
                 Ok(())
             } else {
-                bail!("{what} needs {want:?}, got {}", got.named())
+                bail!("{what} needs Bool, got {}", t.named())
             }
-        };
-        let with_null = |t: Types, from: &[Types]| Types {
-            null: from.iter().any(|f| f.null),
-            ..t
         };
         Ok(match self {
             Expr::Column(i) => Types::of(
@@ -245,72 +237,136 @@ impl Expr {
                 Scalar::Int(_) => Types::of(Type::Int),
                 Scalar::Str(_) => Types::of(Type::Str),
             },
+            // Both operands are evaluated, and NULL returns before either type is looked at.
             Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) => {
                 let (a, b) = (a.static_type(cols)?, b.static_type(cols)?);
-                need("arithmetic", a, Type::Int)?;
-                need("arithmetic", b, Type::Int)?;
-                with_null(Types::of(Type::Int), &[a, b])
+                let null = a.null || b.null;
+                let int = a.int && b.int;
+                if !null && !int {
+                    bail!("arithmetic needs Int, got {} and {}", a.named(), b.named());
+                }
+                Types {
+                    int,
+                    null,
+                    ..Types::default()
+                }
             }
             Expr::Compare(_, a, b) => {
                 let (a, b) = (a.static_type(cols)?, b.static_type(cols)?);
-                let comparable = a.null
-                    || b.null
-                    || [Type::Int, Type::Str, Type::Bool]
-                        .iter()
-                        .any(|t| a.has(*t) && b.has(*t));
-                if !comparable {
+                let null = a.null || b.null;
+                let same = [Type::Int, Type::Str, Type::Bool]
+                    .iter()
+                    .any(|t| a.has(*t) && b.has(*t));
+                if !null && !same {
                     bail!(
                         "a comparison of {} with {}: the entity subset has no implicit coercion",
                         a.named(),
                         b.named()
                     );
                 }
-                with_null(Types::of(Type::Bool), &[a, b])
+                Types {
+                    bool: same,
+                    null,
+                    ..Types::default()
+                }
             }
             Expr::And(a, b) | Expr::Or(a, b) => {
                 let (a, b) = (a.static_type(cols)?, b.static_type(cols)?);
-                need("a logical operator", a, Type::Bool)?;
-                need("a logical operator", b, Type::Bool)?;
-                with_null(Types::of(Type::Bool), &[a, b])
+                condition("a logical operator", a)?;
+                condition("a logical operator", b)?;
+                Types {
+                    bool: true,
+                    null: a.null || b.null,
+                    ..Types::default()
+                }
             }
             Expr::Not(a) => {
                 let a = a.static_type(cols)?;
-                need("NOT", a, Type::Bool)?;
-                with_null(Types::of(Type::Bool), &[a])
+                condition("NOT", a)?;
+                Types {
+                    bool: a.bool,
+                    null: a.null,
+                    ..Types::default()
+                }
             }
             Expr::IsNull(a) => {
                 a.static_type(cols)?;
                 Types::of(Type::Bool)
             }
+            // Conditions are read in order and only the taken branch is evaluated. A branch that
+            // faults faults only its rows; a condition that must fault ends every path through it.
             Expr::Case { whens, otherwise } => {
                 let mut out = Types::default();
-                for (when, then) in whens {
-                    need("a CASE condition", when.static_type(cols)?, Type::Bool)?;
-                    out = out.union(then.static_type(cols)?);
+                let mut reached_else = true;
+                for (i, (when, then)) in whens.iter().enumerate() {
+                    match when.static_type(cols) {
+                        Ok(t) if t.admits(Type::Bool) => {}
+                        failed if i == 0 => {
+                            condition("a CASE condition", failed?)?;
+                        }
+                        _ => {
+                            reached_else = false;
+                            break;
+                        }
+                    }
+                    if let Ok(t) = then.static_type(cols) {
+                        out = out.union(t);
+                    }
                 }
-                match otherwise {
-                    Some(e) => out.union(e.static_type(cols)?),
-                    None => out.union(Types::NULL),
+                if reached_else {
+                    match otherwise {
+                        Some(e) => {
+                            if let Ok(t) = e.static_type(cols) {
+                                out = out.union(t);
+                            }
+                        }
+                        None => out = out.union(Types::NULL),
+                    }
                 }
+                if out == Types::default() {
+                    bail!("every branch of this CASE fails");
+                }
+                out
             }
+            // Arguments are evaluated in order until one is not NULL, so an argument after one that
+            // is never NULL is never reached, and the result is NULL only if every argument can be.
             Expr::Coalesce(args) => {
                 let mut out = Types::default();
-                for a in args {
-                    out = out.union(a.static_type(cols)?);
+                let mut all_null = true;
+                for (i, a) in args.iter().enumerate() {
+                    let t = match a.static_type(cols) {
+                        Ok(t) => t,
+                        Err(e) if i == 0 => return Err(e),
+                        Err(_) => {
+                            all_null = false;
+                            break;
+                        }
+                    };
+                    out = out.union(Types { null: false, ..t });
+                    if !t.null {
+                        all_null = false;
+                        break;
+                    }
+                }
+                out.null = all_null;
+                if out == Types::default() {
+                    bail!("every argument of this COALESCE fails");
                 }
                 out
             }
             Expr::Cast(a, ty) => {
                 let a = a.static_type(cols)?;
-                if a.only_null() {
-                    Types::NULL
-                } else {
-                    let only_str = a.str && !a.int && !a.bool;
-                    if only_str && *ty == Type::Bool {
-                        bail!("cast from VARCHAR to BOOLEAN is not in the entity subset")
-                    }
-                    with_null(Types::of(*ty), &[a])
+                let converts = a.int || a.bool || (a.str && *ty != Type::Bool);
+                if !converts && !a.null {
+                    bail!("cast from VARCHAR to BOOLEAN is not in the entity subset")
                 }
+                let mut out = if converts {
+                    Types::of(*ty)
+                } else {
+                    Types::default()
+                };
+                out.null = a.null;
+                out
             }
         })
     }
@@ -531,39 +587,125 @@ mod static_type_tests {
     fn lit(s: Scalar) -> Box<Expr> {
         Box::new(Expr::Literal(s))
     }
+    fn s(v: &str) -> Box<Expr> {
+        lit(Scalar::Str(v.into()))
+    }
+    fn i(v: i128) -> Box<Expr> {
+        lit(Scalar::Int(v))
+    }
+    fn null() -> Box<Expr> {
+        lit(Scalar::Null)
+    }
+    fn gt0() -> Expr {
+        Expr::Compare(Cmp::Gt, col(0), i(0))
+    }
 
-    /// The typer refuses only what `eval` would refuse on every row it evaluated, and admits what it
-    /// runs cleanly on some rows: a `CASE` evaluates one branch, and a typed NULL is never compared.
+    /// Held against the evaluator itself: over rows of an Int, a Str and a Bool column, an expression
+    /// the typer refuses must fail on every row, and one it admits must succeed on at least one,
+    /// with its result inside the admitted set. As a filter or a SUM input, the same holds for the
+    /// condition and integer rules the binder adds.
     #[test]
-    fn static_types_follow_the_evaluator() {
+    fn the_typer_agrees_with_the_evaluator() {
         let cols = [Type::Int, Type::Str, Type::Bool];
-        let ok = |e: Expr| e.static_type(&cols).unwrap();
-        let err = |e: Expr| e.static_type(&cols).unwrap_err().to_string();
-
-        // Refused: no row could evaluate these.
-        assert!(err(Expr::Add(col(0), lit(Scalar::Str("1".into())))).contains("needs Int"));
-        assert!(err(Expr::Compare(Cmp::Eq, col(0), col(1))).contains("no implicit coercion"));
-        assert!(err(Expr::And(col(2), col(0))).contains("needs Bool"));
-        assert!(err(Expr::Cast(col(1), Type::Bool)).contains("VARCHAR to BOOLEAN"));
-
-        // Admitted: each runs cleanly on real rows.
-        assert!(ok(Expr::Add(col(0), lit(Scalar::Null))).admits(Type::Int));
-        let mixed = Expr::Case {
-            whens: vec![(
-                Expr::Compare(Cmp::Gt, col(0), lit(Scalar::Int(0))),
-                Expr::Literal(Scalar::Str("1".into())),
-            )],
-            otherwise: Some(lit(Scalar::Int(0))),
+        let rows: Vec<Row> = [5, 0, -1]
+            .iter()
+            .map(|v| {
+                Row(vec![
+                    Scalar::Int(*v),
+                    Scalar::Str("x".into()),
+                    Scalar::Bool(*v > 0),
+                ])
+            })
+            .collect();
+        let within = |t: Types, v: &Scalar| match v {
+            Scalar::Null => t.null,
+            Scalar::Int(_) => t.int,
+            Scalar::Str(_) => t.str,
+            Scalar::Bool(_) => t.bool,
         };
-        assert!(ok(mixed.clone()).admits(Type::Int));
-        assert!(ok(Expr::Cast(Box::new(mixed), Type::Int)).admits(Type::Int));
-        let fallback = Expr::Coalesce(vec![
-            Expr::Column(0),
-            Expr::Literal(Scalar::Str("0".into())),
-        ]);
-        assert!(ok(fallback).admits(Type::Int));
-        let typed_null = Expr::Cast(lit(Scalar::Null), Type::Str);
-        assert_eq!(ok(typed_null.clone()), Types::NULL);
-        assert!(ok(Expr::Compare(Cmp::Eq, Box::new(typed_null), col(0))).admits(Type::Bool));
+        let cases: Vec<(&str, Expr, bool)> = vec![
+            ("NULL + '1'", Expr::Add(null(), s("1")), true),
+            ("fee + '1'", Expr::Add(col(0), s("1")), false),
+            (
+                "COALESCE(fee, fee + '1')",
+                Expr::Coalesce(vec![Expr::Column(0), Expr::Add(col(0), s("1"))]),
+                true,
+            ),
+            (
+                "COALESCE('1', 0) + 1",
+                Expr::Add(Box::new(Expr::Coalesce(vec![*s("1"), *i(0)])), i(1)),
+                false,
+            ),
+            (
+                "CASE WHEN fee > 0 THEN '1' ELSE 0 END",
+                Expr::Case {
+                    whens: vec![(gt0(), *s("1"))],
+                    otherwise: Some(i(0)),
+                },
+                true,
+            ),
+            (
+                "CAST(CASE WHEN fee > 0 THEN 'x' ELSE NULL END AS BOOLEAN)",
+                Expr::Cast(
+                    Box::new(Expr::Case {
+                        whens: vec![(gt0(), *s("x"))],
+                        otherwise: Some(null()),
+                    }),
+                    Type::Bool,
+                ),
+                true,
+            ),
+            (
+                "CAST(sym AS BOOLEAN)",
+                Expr::Cast(col(1), Type::Bool),
+                false,
+            ),
+            (
+                "CAST(NULL AS VARCHAR) = fee",
+                Expr::Compare(Cmp::Eq, Box::new(Expr::Cast(null(), Type::Str)), col(0)),
+                true,
+            ),
+            ("fee = sym", Expr::Compare(Cmp::Eq, col(0), col(1)), false),
+            ("flag AND fee", Expr::And(col(2), col(0)), false),
+            (
+                "CASE WHEN sym THEN 1 END",
+                Expr::Case {
+                    whens: vec![(Expr::Column(1), *i(1))],
+                    otherwise: None,
+                },
+                false,
+            ),
+        ];
+        for (name, e, admitted) in cases {
+            let typed = e.static_type(&cols);
+            let evals: Vec<Result<Scalar>> = rows.iter().map(|r| e.eval(r)).collect();
+            assert_eq!(typed.is_ok(), admitted, "{name}: {typed:?}");
+            match typed {
+                Ok(t) => {
+                    assert!(evals.iter().any(|v| v.is_ok()), "{name} never succeeds");
+                    for v in evals.iter().flatten() {
+                        assert!(within(t, v), "{name} gave {v:?} outside {t:?}");
+                    }
+                }
+                Err(_) => assert!(
+                    evals.iter().all(|v| v.is_err()),
+                    "{name} succeeds somewhere"
+                ),
+            }
+        }
+
+        // The binder's rules on top: a filter must be able to be a condition, and SUM needs an Int.
+        let cond = |e: &Expr| e.static_type(&cols).unwrap().admits(Type::Bool);
+        let int = |e: &Expr| e.static_type(&cols).unwrap().admits(Type::Int);
+        assert!(
+            !cond(&Expr::Coalesce(vec![*null(), Expr::Column(0)])),
+            "COALESCE(NULL, fee)"
+        );
+        assert!(
+            !int(&Expr::Coalesce(vec![*null(), *s("1")])),
+            "COALESCE(NULL, '1')"
+        );
+        assert!(!cond(&Expr::Column(0)), "WHERE fee");
+        assert!(cond(&gt0()));
     }
 }

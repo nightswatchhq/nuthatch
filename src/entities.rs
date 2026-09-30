@@ -1669,7 +1669,7 @@ mod tests {
             (
                 "SELECT indexer, sum(tokensRewards + '1') AS total FROM svc__collected \
                  GROUP BY indexer",
-                "arithmetic needs Int, got Str",
+                "arithmetic needs Int, got Int and Str",
             ),
             (
                 "SELECT indexer, sum(indexer) AS total FROM svc__collected GROUP BY indexer",
