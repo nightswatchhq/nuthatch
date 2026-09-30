@@ -2166,6 +2166,9 @@ async fn runtime_index_loop(
             tip,
         )
         .await;
+        for &i in &live {
+            live_ref(&nests, i).metrics.set_ceiling(ceiling);
+        }
         // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
         let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
         if max_next > 0
@@ -6912,6 +6915,7 @@ async fn index_loop(
         // unfinalised rows still in its hot store - the check runs exactly as before, because those
         // rows are as exposed as they ever were.
         let ceiling = cursor_ceiling(source.as_ref(), nest.finality, nest.freshness, tip).await;
+        nest.metrics.set_ceiling(ceiling);
         if reorg_check_due(nest.freshness, next, ceiling)
             && reorg_gate.due(tip, next, next > ceiling)
         {
@@ -17706,12 +17710,21 @@ template="pool"
         dir: &std::path::Path,
         freshness: crate::freshness::Freshness,
     ) -> NestIngest {
+        // Unique per call: per-nest metrics are a process-wide registry keyed by name, so tests
+        // running in parallel under one name read each other's values.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "dialled-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
-            "[nest]\nname = \"n\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
-             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
-             abi = \"abis/tok.json\"\n",
+            format!(
+                "[nest]\nname = \"{name}\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+                 abi = \"abis/tok.json\"\n"
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -17754,8 +17767,9 @@ template="pool"
     /// report the highest block any `getLogs` covered. The committed cursor position is the condition
     /// the nest itself asserts, unlike a quiet window count which says only that a loaded test process
     /// happened not to schedule more work for 400 ms.
-    async fn highest_block_indexed(nest: NestIngest, boundary: u64) -> (u64, usize) {
+    async fn highest_block_indexed(nest: NestIngest, boundary: u64) -> (u64, usize, u64) {
         let store = nest.store.clone();
+        let metrics = nest.metrics.clone();
         let src = Arc::new(FinalityRecordingSource::new());
         let recorder = src.clone();
         let task = tokio::spawn(index_loop(
@@ -17785,7 +17799,11 @@ template="pool"
             store.get_meta(LAST_BLOCK_KEY).ok().flatten(),
         );
         task.abort();
-        (recorder.highest_asked().unwrap_or(0), recorder.probes())
+        (
+            recorder.highest_asked().unwrap_or(0),
+            recorder.probes(),
+            metrics.ceiling(),
+        )
     }
 
     /// `--finality-only` caps the cursor at the chain's `finalized` block (RFC-0040 §3 knob 2): a
@@ -17803,8 +17821,10 @@ template="pool"
             },
         )
         .await;
-        let (highest, probes) =
+        let (highest, probes, ceiling) =
             highest_block_indexed(nest, FinalityRecordingSource::FINALIZED).await;
+        // `/ready` judges a wedge against this, not the tip (#1575).
+        assert_eq!(ceiling, FinalityRecordingSource::FINALIZED);
         assert_eq!(
             highest,
             FinalityRecordingSource::FINALIZED,
@@ -17821,8 +17841,10 @@ template="pool"
     async fn the_tip_path_still_indexes_to_the_tip() {
         let tmp = tempfile::tempdir().unwrap();
         let nest = build_dialled_nest(tmp.path(), crate::freshness::Freshness::default()).await;
-        let (highest, _probes) = highest_block_indexed(nest, FinalityRecordingSource::TIP).await;
+        let (highest, _probes, ceiling) =
+            highest_block_indexed(nest, FinalityRecordingSource::TIP).await;
         assert_eq!(highest, FinalityRecordingSource::TIP);
+        assert_eq!(ceiling, FinalityRecordingSource::TIP);
     }
 
     /// `--poll-interval` is how long a caught-up cursor waits before asking again (knob 1). Under a

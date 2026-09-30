@@ -86,6 +86,9 @@ pub struct NestMetrics {
     ///
     /// Every nest on the same cursor holds the same value, which is correct: they share a chain.
     tip: AtomicU64,
+    /// The highest block the cursor may index now: the tip, or under `--finality-only` the finality
+    /// boundary. `/ready` judges a wedge by the distance to this, not to the tip (#1575).
+    ceiling: AtomicU64,
     last_poll_ok: AtomicU64,
     /// Set after a failed source poll and cleared by the next success. This distinguishes "the
     /// process has only just begun" from "the process has already proved its only RPC pool dead".
@@ -186,6 +189,13 @@ impl NestMetrics {
     }
     pub fn tip(&self) -> u64 {
         self.tip.load(Relaxed)
+    }
+    pub fn set_ceiling(&self, v: u64) {
+        self.ceiling.store(v, Relaxed);
+        METRICS.set_ceiling(v);
+    }
+    pub fn ceiling(&self) -> u64 {
+        self.ceiling.load(Relaxed)
     }
     pub fn mark_poll_ok(&self) {
         self.last_poll_ok.store(now_unix(), Relaxed);
@@ -539,6 +549,7 @@ impl NestMetrics {
 pub struct Metrics {
     // Ingestion - the "is it keeping up?" signals an operator alerts on.
     tip_height: AtomicU64,
+    ceiling: AtomicU64,
     last_block: AtomicU64,
     sealed_through: AtomicU64,
     /// Unix seconds of the last *successful* source poll (tip fetch). `0` = never polled yet. The
@@ -623,6 +634,7 @@ impl Metrics {
     const fn new() -> Self {
         Self {
             tip_height: AtomicU64::new(0),
+            ceiling: AtomicU64::new(0),
             last_block: AtomicU64::new(0),
             sealed_through: AtomicU64::new(0),
             last_poll_ok: AtomicU64::new(0),
@@ -697,6 +709,12 @@ impl Metrics {
 
     pub fn set_tip(&self, v: u64) {
         self.tip_height.store(v, Relaxed);
+    }
+    pub fn set_ceiling(&self, v: u64) {
+        self.ceiling.store(v, Relaxed);
+    }
+    pub fn ceiling(&self) -> u64 {
+        self.ceiling.load(Relaxed)
     }
     pub fn set_last_block(&self, v: u64) {
         if self.last_block.swap(v, Relaxed) != v {

@@ -1632,6 +1632,12 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
     let lag = tip.saturating_sub(last);
+    // A wedge is judged against where the cursor may go: under `--finality-only` that is the finality
+    // boundary, and one waiting there for the next finalized block is caught up (#1575).
+    let ceiling = nest
+        .as_ref()
+        .map_or_else(|| METRICS.ceiling(), |m| m.ceiling());
+    let target = if ceiling == 0 { tip } else { ceiling };
     let wedged = !seal_direct_active
         && progress_stalled(
             last_progress,
@@ -1639,7 +1645,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
             now,
             s.freshness
                 .stall_threshold_secs(READINESS_PROGRESS_STALL_SECS),
-            lag,
+            target.saturating_sub(last),
         );
     let initial_failure = initial_poll_failed(last_poll, poll_failed);
     // #846: `seal_direct_active` used to suppress every term above with nothing put in its place, so
@@ -5242,6 +5248,42 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "a cursor frozen mid-backfill must fail readiness: {json}"
         );
+        assert_eq!(json["wedged"], json!(true));
+    }
+
+    /// #1575: under `--finality-only` a cursor waits at the finality boundary, below the tip, for the
+    /// next finalized block, which on Arbitrum takes minutes. Level with its ceiling it is caught up;
+    /// behind it and not moving, it is still wedged.
+    #[tokio::test]
+    async fn a_finality_cursor_at_its_ceiling_is_ready_and_one_behind_it_is_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "finality-cursor";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_last_block(1_000);
+        handle.set_tip(1_100);
+        handle.set_ceiling(1_000);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now.saturating_sub(200));
+        let (code, body) = get(router.clone(), &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "waiting at finality is caught up: {json}"
+        );
+        assert_eq!(json["wedged"], json!(false));
+
+        handle.set_ceiling(1_050);
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{json}");
         assert_eq!(json["wedged"], json!(true));
     }
 
