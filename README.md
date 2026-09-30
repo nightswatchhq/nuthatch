@@ -1,62 +1,68 @@
 # nuthatch
 
-> **Turn any contract into a local SQL database.**
-> One command. One tiny binary. Your box, your data - no subgraph to author, no Postgres to run, no
-> monthly bill, no third-party API.
+> **Turn an EVM contract's history into a local SQL database.** One Rust binary, no Postgres, no
+> subgraph to write, and an MCP server built in.
 
 [![ci](https://github.com/nightswatchhq/nuthatch/actions/workflows/ci.yml/badge.svg)](https://github.com/nightswatchhq/nuthatch/actions/workflows/ci.yml)
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
 ```sh
-curl -fsSL https://nuthatch-indexer.com/install.sh | sh   # prebuilt binary, no compiler needed
-
-nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC - chain auto-detected
-nuthatch dev            # backfills from deployment, follows the tip, serves an API
-nuthatch sql "SELECT count(*), sum(CAST(value AS DECIMAL(38,0))) FROM usdc__transfer"
+curl -fsSL https://nuthatch-indexer.com/install.sh | sh                  # macOS Apple Silicon, Linux x86_64
+nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC; the chain is detected
+nuthatch dev                                                            # reads its history, then keeps up
+nuthatch sql "SELECT count(*) FROM usdc__transfer"                      # in a second terminal
 ```
 
-That's the whole thing. You had an address ninety seconds ago; now you're running `SELECT` over its
-on-chain activity, on your own machine.
+The Linux binary needs glibc 2.34 or newer to run (it is built on 2.35). No Intel Mac binary is
+published: there, and on other platforms, build from source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
+`init` creates a **nest**: a directory holding the contract's ABI, its config and, once `dev` runs,
+its indexed data.
+
+| | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
+|---|---|---|---|---|---|
+| **The Graph** | yes | yes (AssemblyScript) | indexers on the network | nothing, or graph-node + Postgres + IPFS | GraphQL |
+| **Ponder** | no | yes (TypeScript) | your RPC endpoint | Node.js, plus Postgres in production | SQL, GraphQL |
+| **nuthatch** | no | no: tables come from the ABI | your RPC endpoint | one binary | SQL, HTTP, MCP |
+
+Like Ponder, nuthatch reads the chain over JSON-RPC, so it needs an endpoint, and a provider may
+charge for one. The public endpoints it bundles are for trying it out, not for keeping it running.
+It complements The Graph rather than replacing it: a subgraph serves an application from a network
+of indexers, while a nest puts a contract's history in a database on your own machine.
+
+**Why.** Getting at a contract's history usually means writing a subgraph or handler code, running a
+database, or renting someone else's copy. nuthatch generates the tables from the ABI, runs as one
+process with nothing else to install, and keeps the data on your machine: at most 2 GB of RAM per
+chain, no telemetry, no account. The built-in MCP server lets Claude or any MCP client query it.
 
 ---
 
-## Why nuthatch
+## What you get
 
-Every other way to get your contract's data fails the solo dev *somewhere*:
-
-| | author a subgraph? | infra to run | query | yours? | pay? |
-|---|---|---|---|---|---|
-| **The Graph** | yes - schema + manifest + AS mappings | - (decentralised) | GraphQL | no | query fees |
-| **Goldsky / hosted** | no | - (their servers) | SQL/GraphQL | **no** | **monthly** |
-| **Ponder** | yes - TS handlers | Node + Postgres | SQL | yes | free |
-| **Subsquid** | yes | archive + Postgres | GraphQL | yes | free |
-| **nuthatch** | **no - init from an address** | **one static binary** | **SQL (DuckDB)** | **yes** | **free** |
-
-Nobody else hits all four of *zero authoring*, *zero infra*, *it's just SQL*, and *it's yours and it's
-tiny*. That combination is the point - not any single feature.
-
-- **Zero authoring.** `init 0xAddr` resolves the ABI (Sourcify → Etherscan), generates the schema and
+- **No authoring.** `init 0xAddr` resolves the ABI (Sourcify, then Etherscan), generates the schema and
   decoders, and scaffolds the project. You write nothing.
-- **Zero infra.** A single static Rust binary. Embedded mode needs no Postgres, no Docker, no IPFS.
+- **No infra.** A single static Rust binary. Embedded mode needs no Postgres, no Docker, no IPFS.
 - **It's just SQL.** Your contract's events become per-event tables you query with real analytical SQL -
   the live tip *and* sealed history, one surface.
-- **It's yours, and it's tiny.** ≤2 GB RAM for single-chain tip-following, CI-enforced. No telemetry, no
+- **It's yours, and it's small.** ≤2 GB RAM for single-chain tip-following, CI-enforced. No telemetry, no
   phone-home, no mandatory API token, ever.
 
 ---
 
 ## Who runs it
 
-Two deployments that are not demos:
-
 - **[Lodestar](https://www.lodestar-dashboard.com)**, an analytics dashboard for The Graph Protocol on
   Arbitrum One, serves live panels from self-hosted nests instead of The Graph gateway.
-- **[Arcaidia](https://arcaidia.io)**, a speed layer over Circle's CCTP built at ETHOnline 2026, reads
-  its indexed state from two nests on Ethereum Sepolia and Arc Testnet. Its solver discovers intents
-  there, its settlement agent tracks CCTP there, and its web console renders from them. The nests were
-  serving within two hours of the builder asking The Graph for a higher Studio rate limit.
 
-More on both at [nuthatch-indexer.com/stories](https://www.nuthatch-indexer.com/stories).
+An earlier example, now finished: **[Arcaidia](https://arcaidia.io)**, a speed layer over Circle's
+CCTP built at ETHOnline 2026, read its indexed state from two nests on Ethereum Sepolia and Arc
+Testnet. Its solver discovered intents there, its settlement agent tracked CCTP there, and its web
+console rendered from them. The nests were serving within two hours of the builder asking The Graph
+for a higher Studio rate limit. They were stopped on 2026-09-29.
+
+More at [nuthatch-indexer.com/stories](https://www.nuthatch-indexer.com/stories).
+
+Nightswatch does not run a hosted nest service. GraphOps plans to offer hosted nests on its own
+platform, running the same binary as anyone else; there is no date for it yet.
 
 ---
 
@@ -68,58 +74,46 @@ curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 
 That downloads the prebuilt binary for your platform from the latest release, verifies its SHA-256,
 and installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). **No compiler is
-involved**, so whichever rustc you happen to have is irrelevant. Prebuilt binaries cover macOS Apple
-Silicon and Linux x86_64 and are attached to every release with their checksums, if you would rather
-fetch one by hand.
+involved.** Prebuilt binaries cover macOS Apple Silicon and Linux x86_64 and are attached to every
+release with their checksums, if you would rather fetch one by hand. **No Intel Mac binary is
+published**; the installer says so and points at the source build below.
 
 **The Linux binary is dynamically linked and needs two things**, both measured off the published
 artifact with `objdump -T` rather than inferred:
 
-- **glibc 2.34 or newer** - the measured ABI floor, read off the published artifact with `objdump -T`.
-  The release is *built* on glibc 2.35, but building on 2.35 does not make 2.35 a runtime
-  requirement: the binary references no symbol newer than `GLIBC_2.34`, and that reference set is
-  what a loader checks. The two numbers answer different questions - **2.34 is what you need to run
-  it, 2.35 is what we compile it on** - and stating the build baseline as the requirement excluded a
-  platform we actually support (#978: the list below names RHEL 9, which ships glibc 2.34).
-- **libstdc++ from GCC 11 or newer** (`GLIBCXX_3.4.29`, `CXXABI_1.3.13`). This one has a cause worth
-  knowing: the binary embeds DuckDB, which is C++, so it links `libstdc++.so.6` alongside `libc`,
-  `libm` and `libgcc`.
+- **glibc 2.34 or newer** - the measured ABI floor. The release is *built* on glibc 2.35, but the
+  binary references no symbol newer than `GLIBC_2.34`: **2.34 is what you need to run it, 2.35 is what
+  we compile it on** ([#978](https://github.com/nightswatchhq/nuthatch/issues/978)).
+- **libstdc++ from GCC 11 or newer** (`GLIBCXX_3.4.29`, `CXXABI_1.3.13`), because the binary embeds
+  DuckDB, which is C++, so it links `libstdc++.so.6` alongside `libc`, `libm` and `libgcc`.
 
-Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear both. A system with new glibc and an old
-libstdc++ would not, which is why both are stated rather than only the first.
+Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear both.
 
-**Verify who built it.** The SHA-256 sidecar beside each tarball tells you the file did not corrupt in
-transit, and nothing more: whoever could replace the tarball could replace the sidecar in the same
-breath. Every release binary therefore carries a **build provenance attestation**, signed by GitHub's
-identity for the workflow run that produced it and recorded in a public transparency log. One command,
-and it needs no key from us:
+**Verify who built it.** Every release binary carries a build provenance attestation, which a
+checksum cannot give you:
 
 ```sh
 gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nightswatchhq/nuthatch
 ```
 
-That answers what a checksum cannot: which repository, which commit and which workflow built this
-file. `--repo` is the load-bearing part - without it, an attestation from *any* repository is accepted,
-which is most of the property you are checking for. The release workflow runs the same verification
-against its own assets before it publishes, so a release whose provenance does not verify never becomes
-public in the first place.
-
-**From source**, which is the only route on a platform we do not publish a binary for:
+**From source**, which is the only route on a platform we do not publish a binary for, Intel Macs
+included (the Intel build has not been verified on Intel hardware):
 
 ```sh
 rustup toolchain install 1.95.0
 cargo +1.95.0 install --git https://github.com/nightswatchhq/nuthatch nuthatch
 ```
 
-The toolchain pin is load-bearing, not decoration. `rust-toolchain.toml` pins 1.95.0 because `dbsp`
-hits a next-trait-solver ICE on 1.97, and **that file does not apply to `cargo install --git`**,
-which builds in a temporary directory of its own. Without `+1.95.0`, a 1.97 default toolchain fails
-after a full dependency build with `error: could not compile dbsp` and installs nothing
-([#534](https://github.com/nightswatchhq/nuthatch/issues/534)).
+The `+1.95.0` is required: `cargo install --git` ignores the repo's toolchain pin, and a newer
+default toolchain fails to compile a dependency.
 
 **Container images** are published per release to `ghcr.io/nightswatchhq/nuthatch` - `:<version>` for
 embedded, `:<version>-scaled` for the scaled build. The image ships the *same binary attached to the
 release*, so the two cannot drift.
+
+[docs/install.md](docs/install.md) has the detail behind each of these: why the two ABI floors are
+different numbers, what the attestation proves and what `--repo` is for, and why the toolchain pin
+exists.
 
 **Chains.** Ethereum, Arbitrum One, Base, BSC, Polygon, Gnosis, Optimism, Monad and Robinhood Chain are *built in*, with
 measured public endpoints and tuned finality settings - **omit `--chain` and nuthatch probes each for
@@ -602,7 +596,8 @@ the findings we closed as *not ours to fix* and why, is in
 
 ## Project
 
-- **Design** lives in [RFCs](docs/rfcs/) (0001-0036); the north star and the CLI/UX direction are
+- **Design** lives in [RFCs](docs/rfcs/) (0001-0061, statuses in the
+  [index](docs/rfcs/README.md)); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
 - **Governance:** a grant-funded public good (NLnet / EF-ESP). No hosted service, no token, no
