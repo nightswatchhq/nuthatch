@@ -576,8 +576,8 @@ A major version is a promise about **stability**, not a claim of completeness.
 - **Monthly minors, immediate fixes.** A released 4.x only gets patch releases. Features wait for the
   next monthly minor (4.1, 4.2, ...); correctness and security fixes ship at once as patches.
 - **Upgrades are a binary swap.** No data migration, no conversion step. Proven on a production box
-  across 0.3.0 → 0.6.0 → 0.7.2 and at each major since. No CI job yet runs an older release's data
-  directory through a newer binary.
+  across 0.3.0 → 0.6.0 → 0.7.2 and at each major since, and in CI: every build opens a frozen
+  v3.13.2 data directory and reads it back exactly (`tests/upgrade_golden.rs`).
 - **MSRV 1.95**, measured rather than asserted - it is what CI, `rust-toolchain.toml` and the release
   build all use. (Before 1.0 this file claimed 1.85, which `cargo +1.85.0 check` refutes in one
   command. A version nobody tests is not a promise.)

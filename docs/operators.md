@@ -1404,20 +1404,26 @@ Stated because a platform team will ask, and because a vague promise is worse th
 Partly by tests, partly by release practice, and the difference is stated here rather than left to
 be found. What a test enforces in the required CI job:
 
-- **Config:** four committed `nuthatch.toml` files must parse with no unknown key
-  (`only_keys_nothing_reads_are_unknown` in `src/config.rs`), and two inline pre-4.0 shapes must
-  still load. No committed `mounts.toml` or `entities.toml` is checked.
+- **Data directories:** `tests/upgrade_golden.rs` (#1597) copies a runtime directory written by
+  v3.13.2 and never regenerated (`tests/fixtures/upgrade/`), opens it with the current build and
+  checks exact values: both mount records, the NID recomputed from the stored nest, the sealed
+  segment's hash, the hot store's rows and watermarks, `/sql` over sealed and hot rows, `/entity`
+  point reads and an authored entity's value. It then indexes two more blocks and seals, and checks
+  those too. Renaming a redb table or changing the NID derivation turns it red. Each 4.x minor adds
+  its own directory beside it; none is ever rewritten.
+- **Config:** the same file freezes a `nuthatch.toml`, `mounts.toml` and `entities.toml` as a 4.0
+  user writes them, and checks what each key means, not only that it parses. Four more committed
+  `nuthatch.toml` files must parse with no unknown key (`only_keys_nothing_reads_are_unknown`).
 - **Data identity:** the decoder's registry hash for ERC-20 and tuple ABIs is pinned to the value
-  3.6.1 printed (`decode/src/registry.rs`), so a change that would move those nests' identity fails.
+  3.6.1 printed (`decode/src/registry.rs`).
 - **HTTP and MCP:** the core routes must exist and answer, and the generic MCP tools must be
   advertised by name.
 
-What no test enforces yet: no CI job opens a data directory written by an earlier release, the NID
-and the redb table definitions are not pinned to a frozen value, and there is no golden of a nest's
-generated SQL tables and columns, of HTTP response shapes, or of MCP tool arguments. Until there is,
-each release's notes carry a checked compatibility section (what `src/cli.rs`, `src/metrics.rs`,
-`src/blob.rs` and the registry did between the two tags), and a release that cannot state it is not
-tagged.
+What no test enforces yet: the fixture is one ERC-20 nest, so factories, calls, `[[ipfs]]` and
+offchain data have no frozen store behind them; and there is no golden of HTTP response shapes
+beyond the fields the upgrade test reads, nor of MCP tool arguments. Until there is, each release's
+notes carry a checked compatibility section (what `src/cli.rs`, `src/metrics.rs`, `src/blob.rs` and
+the registry did between the two tags), and a release that cannot state it is not tagged.
 
 ### History
 
