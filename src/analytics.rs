@@ -6430,13 +6430,8 @@ template="pool"
 
         // **The fixture is the condition it claims to be.** #430's probe still says this file is fine,
         // so nothing in the footer-corrupt path can be what makes the assertions below pass.
-        let conn = Connection::open_in_memory().unwrap();
-        let probe = format!(
-            "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-            path.display()
-        );
         assert!(
-            conn.prepare(&probe).is_ok(),
+            crate::seal::footer_reads(&path),
             "this test is about a segment that BINDS and then will not read - if it no longer binds \
              it is #430's case and this test has stopped testing #433"
         );
@@ -6580,13 +6575,8 @@ template="pool"
         );
         // The fixture is the condition it claims to be: #430's probe still passes this file, so the
         // footer-corrupt path cannot be what sets the flag below.
-        let conn = Connection::open_in_memory().unwrap();
         assert!(
-            conn.prepare(&format!(
-                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-                path.display()
-            ))
-            .is_ok(),
+            crate::seal::footer_reads(&path),
             "if it no longer binds this is #430's case and the test has stopped testing #433's"
         );
 
@@ -6798,14 +6788,8 @@ template="pool"
         let manifest = crate::seal::load_manifest(dir.path()).unwrap();
         for seg in &manifest.tables["t__transfer"] {
             let path = crate::seal::segment_path(dir.path(), &seg.file, &seg.hash);
-            let probe = Connection::open_in_memory().unwrap();
             assert!(
-                probe
-                    .prepare(&format!(
-                        "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-                        path.display()
-                    ))
-                    .is_ok(),
+                crate::seal::footer_reads(&path),
                 "every segment must still bind on its own for this to be the undefinable-view arm"
             );
         }

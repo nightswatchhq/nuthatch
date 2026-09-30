@@ -1461,6 +1461,15 @@ mod sealed_rows {
     }
 }
 
+/// Whether a file's Parquet footer and schema read: what "the segment binds" means, checked without an
+/// engine, for a test that must know its corrupt fixture is the corruption it claims.
+#[cfg(test)]
+pub(crate) fn footer_reads(path: &Path) -> bool {
+    std::fs::File::open(path).is_ok_and(|f| {
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f).is_ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1767,13 +1776,8 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         // **The fixture is the condition it names.** Still a Parquet file as far as binding goes.
-        let conn = duckdb::Connection::open_in_memory().unwrap();
         assert!(
-            conn.prepare(&format!(
-                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-                path.display()
-            ))
-            .is_ok(),
+            footer_reads(&path),
             "if this no longer binds, the fixture has become #430's footer-corrupt case and this \
              test has stopped testing #433"
         );

@@ -9,3 +9,11 @@
 #![allow(dead_code)]
 
 pub mod tape;
+
+/// Whether a file's Parquet footer and schema read: what "the segment binds" means, checked without an
+/// engine, for a test that must know its corrupt fixture is the corruption it claims.
+pub fn footer_reads(path: &std::path::Path) -> bool {
+    std::fs::File::open(path).is_ok_and(|f| {
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f).is_ok()
+    })
+}
