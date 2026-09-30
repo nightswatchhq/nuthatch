@@ -1,6 +1,6 @@
 -- Derived from graph-network-subgraph 3ca039189e35912729e878f54ceb1ae684276ae6,
 -- paymentsEscrow.ts and graphTallyCollector.ts. See LICENSE-upstream.
--- Keep amounts arbitrary precision; a uint256 does not fit in HUGEINT.
+-- Amounts as BIGNUM: arbitrary precision on DuckDB, 38 digits on Burrmill, which refuses past them.
 CREATE VIEW escrow_movement AS
 SELECT payer, collector, receiver, CAST(tokens AS BIGNUM) AS delta FROM escrow__deposit
 UNION ALL
