@@ -1623,6 +1623,34 @@ mod tests {
         );
     }
 
+    /// #1599: an authored view that reads an entity checks exactly when `dev` would serve it, on a
+    /// nest that has indexed nothing yet, and a column the entity does not have still fails.
+    #[test]
+    fn a_view_over_an_entity_checks() {
+        let dir = wide_nest();
+        std::fs::write(
+            dir.path().join("entities/rewards.sql"),
+            "SELECT indexer, SUM(tokensRewards) AS total FROM svc__collected GROUP BY indexer",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        let view = |sql: &str| {
+            std::fs::write(dir.path().join("views/10-top.sql"), sql).unwrap();
+            let cfg = crate::config::Config::load(dir.path()).unwrap();
+            let schema = crate::registry::from_nest(dir.path(), &cfg)
+                .unwrap()
+                .schema();
+            crate::analytics::validate_nest_views(dir.path(), &schema)
+        };
+        let issues = view("CREATE VIEW top AS SELECT indexer, total + 1 AS next FROM rewards;");
+        assert!(issues.is_empty(), "{issues:?}");
+        let issues = view("CREATE VIEW top AS SELECT indexer, missing FROM rewards;");
+        assert!(
+            !issues.is_empty(),
+            "a column the entity lacks must still fail"
+        );
+    }
+
     /// The circuit seeds from the hot tail as well as sealed history, so a value only the hot store
     /// holds must be probed too.
     #[test]
