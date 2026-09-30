@@ -1847,7 +1847,7 @@ async fn a_maintained_count_is_numeric_in_sql() {
     // its relations back into text (astra's re-review).
     std::fs::write(dir.path().join("entities.toml"), "[[entities\nnot toml").unwrap();
     assert_eq!(
-        one("SELECT typeof(n) AS t FROM counts LIMIT 1").await["t"],
+        one("SELECT typeof(n) AS t FROM counts ORDER BY n LIMIT 1").await["t"],
         "HUGEINT"
     );
     shutdown_and_settle(rt).await;
