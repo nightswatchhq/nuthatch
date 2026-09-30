@@ -1,0 +1,42 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.nightswatchhq/nuthatch",
+  "title": "nuthatch",
+  "description": "Query an EVM contract's indexed history with SQL, via a local nuthatch nest and nuthatch dev.",
+  "version": "4.0.0",
+  "repository": {
+    "url": "https://github.com/nightswatchhq/nuthatch",
+    "source": "github"
+  },
+  "websiteUrl": "https://www.nuthatch-indexer.com",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/nightswatchhq/nuthatch:4.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--add-host",
+          "value": "host.docker.internal:host-gateway",
+          "description": "Lets the container reach the `nuthatch dev` API on the host (needed on Linux; harmless on Docker Desktop)"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "command",
+          "value": "mcp"
+        },
+        {
+          "type": "named",
+          "name": "--url",
+          "description": "Base URL of the running `nuthatch dev` HTTP API",
+          "default": "http://host.docker.internal:8288"
+        }
+      ]
+    }
+  ]
+}
