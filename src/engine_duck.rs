@@ -1001,6 +1001,9 @@ mod tests {
     /// validator's job (RFC-0047 C4).
     #[test]
     fn unconfigured_duckdb_still_opens_at_todays_walls() {
+        let _env = crate::analytics_budget::tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let resources = crate::analytics_budget::from_env();
         assert_eq!(resources.memory_limit_mb, 512);
         assert_eq!(resources.threads, 2);
