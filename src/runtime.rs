@@ -2963,6 +2963,51 @@ impl MountRefusal {
 /// tear the routes down while it is still writing.
 const UNMOUNT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+type CursorTx = tokio::sync::mpsc::UnboundedSender<indexer::CursorCommand>;
+
+/// Rename a nest on a cursor, failing if the cursor did not apply it.
+async fn rename_on(tx: &CursorTx, chain: &str, from: &str, to: &str) -> Result<()> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tx.send(indexer::CursorCommand::Rename {
+        from: from.to_string(),
+        to: to.to_string(),
+        ack: Some(ack_tx),
+    })
+    .map_err(|_| anyhow::anyhow!("the {chain} cursor is gone"))?;
+    match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => bail!("the {chain} cursor could not rename '{from}' to '{to}'"),
+        _ => bail!("the {chain} cursor did not acknowledge renaming '{from}' to '{to}'"),
+    }
+}
+
+/// A move's cursor half: `name`'s key passes to `holder` (a mount left on the shared dataset), then to
+/// the `incoming` staged nest. If the second rename fails the first is undone, so a failed move leaves
+/// the cursor as the runtime's own records still describe it.
+async fn swap_cursor_keys(
+    tx: &CursorTx,
+    chain: &str,
+    name: &str,
+    incoming: Option<&str>,
+    holder: Option<&str>,
+) -> Result<()> {
+    if let Some(holder) = holder {
+        rename_on(tx, chain, name, holder).await?;
+    }
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    let Err(e) = rename_on(tx, chain, incoming, name).await else {
+        return Ok(());
+    };
+    if let Some(holder) = holder {
+        if let Err(back) = rename_on(tx, chain, holder, name).await {
+            tracing::error!("the {chain} cursor could not give '{name}' back its key: {back:#}");
+        }
+    }
+    Err(e)
+}
+
 /// The alert delivery task holds a `Store` clone. Dropping its `JoinHandle` detaches it, so a
 /// mount that never publishes routes has to abort the task or redb keeps the file (#1535).
 fn abort_alert_worker(worker: &mut Option<tokio::task::JoinHandle<()>>) {
@@ -3895,45 +3940,18 @@ impl RuntimeHandles {
         Ok(())
     }
 
-    /// Rename a nest on its chain's cursor, failing if the cursor did not apply it.
-    async fn rename_on_cursor(&self, chain: &str, from: &str, to: &str) -> Result<()> {
-        let tx = self
-            .lifecycle
-            .get(chain)
-            .cloned()
-            .with_context(|| format!("the {chain} cursor is gone"))?;
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        tx.send(indexer::CursorCommand::Rename {
-            from: from.to_string(),
-            to: to.to_string(),
-            ack: Some(ack_tx),
-        })
-        .map_err(|_| anyhow::anyhow!("the {chain} cursor is gone"))?;
-        match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
-            Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => bail!("the {chain} cursor could not rename '{from}' to '{to}'"),
-            _ => bail!("the {chain} cursor did not acknowledge renaming '{from}' to '{to}'"),
-        }
-    }
-
-    /// Hand a shared dataset's cursor key from `name`, which is moving off it, to a mount still on it.
-    async fn rehome_shared_dataset(
-        &mut self,
-        chain: &str,
-        name: &str,
-        store: &Arc<dyn crate::store::HotStore>,
-    ) -> Result<()> {
-        let sharers: Vec<String> = self
-            .states
+    /// The mounts other than `name` on the dataset behind `store`, the first of which inherits its key.
+    fn dataset_sharers(&self, name: &str, store: &Arc<dyn crate::store::HotStore>) -> Vec<String> {
+        self.states
             .iter()
             .filter(|(n, s)| n != name && Arc::ptr_eq(&s.store, store))
             .map(|(n, _)| n.clone())
-            .collect();
-        let holder = sharers
-            .first()
-            .cloned()
-            .context("no mount left on the dataset")?;
-        self.rename_on_cursor(chain, name, &holder).await?;
+            .collect()
+    }
+
+    /// Record that a shared dataset's cursor key has passed from `name`, moving off it, to `holder`.
+    fn finish_rehome(&mut self, chain: &str, name: &str, holder: &str, sharers: &[String]) {
+        let holder = holder.to_string();
         let health = self.health.clone();
         for (n, s) in self.states.iter_mut().filter(|(n, _)| sharers.contains(n)) {
             s.runtime_health = Some((holder.clone(), health.clone()));
@@ -3946,7 +3964,6 @@ impl RuntimeHandles {
             w.0 = holder.clone();
         }
         tracing::info!("the dataset '{name}' moves off is now known as '{holder}'");
-        Ok(())
     }
 
     /// The name a move stages its incoming nest under while it catches up.
@@ -4000,19 +4017,36 @@ impl RuntimeHandles {
         if !old_shared {
             self.drain_cursor_nest(&chain, &old_key, name).await?;
             crate::metrics::METRICS.remove_nest(&old_key);
-        } else if old_key == name {
-            // The shared dataset is known on the cursor by the name moving off it, and keeps indexing
-            // for the mounts left on it: one of them takes the key, or the incoming nest cannot.
-            if let Err(e) = self.rehome_shared_dataset(&chain, name, &old_store).await {
+        }
+        // A shared dataset known on the cursor by the name moving off it keeps indexing for the
+        // mounts left on it: one of them takes the key, or the incoming nest cannot.
+        let sharers = if old_shared && old_key == name {
+            self.dataset_sharers(name, &old_store)
+        } else {
+            Vec::new()
+        };
+        let incoming = (new_key == staging).then_some(staging.as_str());
+        if !sharers.is_empty() || incoming.is_some() {
+            let swapped = match self.lifecycle.get(&chain).cloned() {
+                Some(tx) => {
+                    swap_cursor_keys(
+                        &tx,
+                        &chain,
+                        name,
+                        incoming,
+                        sharers.first().map(String::as_str),
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!("the {chain} cursor is gone")),
+            };
+            if let Err(e) = swapped {
                 let _ = self.unmount(&staging).await;
                 return Err(e);
             }
         }
-        if new_key == staging {
-            if let Err(e) = self.rename_on_cursor(&chain, &staging, name).await {
-                let _ = self.unmount(&staging).await;
-                return Err(e);
-            }
+        if let Some(holder) = sharers.first() {
+            self.finish_rehome(&chain, name, holder, &sharers);
         }
         let new_idx = self
             .states
@@ -5839,5 +5873,46 @@ mod tests {
             .await
             .expect("a closed intake with nothing left must end the runtime")
             .expect("a clean finish is not an error");
+    }
+
+    /// A cursor that answers renames in turn from `answers`, and reports what it was asked.
+    fn scripted_cursor(answers: Vec<bool>) -> (CursorTx, tokio::task::JoinHandle<Vec<String>>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let seen = tokio::spawn(async move {
+            let mut answers = answers.into_iter();
+            let mut seen = Vec::new();
+            while let Some(cmd) = rx.recv().await {
+                let indexer::CursorCommand::Rename { from, to, ack } = cmd else {
+                    panic!("not a rename: {cmd:?}");
+                };
+                seen.push(format!("{from}->{to}"));
+                ack.unwrap()
+                    .send(answers.next().expect("an unscripted rename"))
+                    .unwrap();
+            }
+            seen
+        });
+        (tx, seen)
+    }
+
+    #[tokio::test]
+    async fn a_refused_incoming_rename_gives_the_holder_key_back() {
+        let (tx, seen) = scripted_cursor(vec![true, false, true]);
+        let moved = swap_cursor_keys(&tx, "c", "usdc", Some("usdc__moving"), Some("other")).await;
+        drop(tx);
+        assert!(moved.is_err());
+        assert_eq!(
+            seen.await.unwrap(),
+            ["usdc->other", "usdc__moving->usdc", "other->usdc"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_holder_rename_stops_the_swap() {
+        let (tx, seen) = scripted_cursor(vec![false]);
+        let moved = swap_cursor_keys(&tx, "c", "usdc", Some("usdc__moving"), Some("other")).await;
+        drop(tx);
+        assert!(moved.is_err());
+        assert_eq!(seen.await.unwrap(), ["usdc->other"]);
     }
 }
