@@ -1751,6 +1751,21 @@ fn live_ref(nests: &[Option<NestIngest>], i: usize) -> &NestIngest {
         .expect("a live index must have an ingest state; retirement clears both together")
 }
 
+/// A waiting cursor quarantines any live nest whose circuit died after its last window was handed
+/// over: the check after that window can miss it, and at the tip no next window comes.
+fn check_live_health(
+    nests: &[Option<NestIngest>],
+    sup: &mut Supervisor,
+    live: &[usize],
+) -> Result<()> {
+    for &i in live {
+        if let Err(e) = live_ref(nests, i).ensure_views_healthy() {
+            sup.quarantine(i, &e)?;
+        }
+    }
+    Ok(())
+}
+
 fn fan_out_rollback(
     nests: &mut [Option<NestIngest>],
     nexts: &mut [u64],
@@ -2138,6 +2153,7 @@ async fn runtime_index_loop(
 
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
+            check_live_health(&nests, &mut sup, &live)?;
             sleep_for(freshness.poll_interval).await;
             continue;
         }
@@ -2210,6 +2226,8 @@ async fn runtime_index_loop(
                 // Caught up as of this iteration's tip: wait the interval here as well as at the
                 // top, for the reason the solo loop gives (#1190).
                 if to == ceiling {
+                    let live = sup.live();
+                    check_live_health(&nests, &mut sup, &live)?;
                     sleep_for(freshness.poll_interval).await;
                 }
             }
@@ -6858,6 +6876,9 @@ async fn index_loop(
                 p.finish(next.saturating_sub(1), true);
             }
             caught_up = true;
+            // A circuit dies on its own thread after the window that killed it was handed over, so
+            // the check after that window can miss it; at the tip there is no next window to catch it.
+            nest.ensure_views_healthy()?;
             // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
             // when the tip has moved, a reorg check, a checkpoint header and a `finalized` probe -
             // whether or not any block carried an event. At two seconds that is the whole bill of a
