@@ -242,7 +242,7 @@ fn walk(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
     }
 }
 
-fn walk_mut(v: &mut Value, f: &mut impl FnMut(&mut serde_json::Map<String, Value>)) {
+pub(crate) fn walk_mut(v: &mut Value, f: &mut impl FnMut(&mut serde_json::Map<String, Value>)) {
     match v {
         Value::Object(map) => {
             f(map);
