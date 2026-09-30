@@ -497,7 +497,38 @@ pub(crate) static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 fn spill_parent() -> PathBuf {
     crate::analytics_budget::from_env()
         .temp_directory
-        .unwrap_or_else(std::env::temp_dir)
+        .unwrap_or_else(default_spill_parent)
+}
+
+/// Where spill goes unless `analytics.temp_directory` says. Not the process temp dir on Linux: that is
+/// often a tmpfs, where spill is RAM the per-cursor budget does not count (Jules on #1583). The user's
+/// cache directory is on disk; the temp dir remains the fallback where there is no home.
+fn default_spill_parent() -> PathBuf {
+    spill_parent_for(
+        cfg!(target_os = "linux"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn spill_parent_for(
+    linux: bool,
+    xdg_cache: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if linux {
+        let cache = xdg_cache
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                home.filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".cache"))
+            });
+        if let Some(cache) = cache {
+            return cache.join("nuthatch");
+        }
+    }
+    std::env::temp_dir()
 }
 
 /// A directory no other DuckDB instance in this process (or any other) will write to.
@@ -513,11 +544,11 @@ fn spill_parent() -> PathBuf {
 pub(crate) fn new_spill_dir() -> Result<SpillDir> {
     static SWEPT: std::sync::Once = std::sync::Once::new();
     SWEPT.call_once(|| {
+        // The temp dir too: it was the default parent before 3.13.2, and may hold dead ones.
         sweep_dead_spill_dirs(&std::env::temp_dir());
-        if let Some(ref p) = crate::analytics_budget::from_env().temp_directory {
-            if *p != std::env::temp_dir() {
-                sweep_dead_spill_dirs(p);
-            }
+        let parent = spill_parent();
+        if parent != std::env::temp_dir() {
+            sweep_dead_spill_dirs(&parent);
         }
     });
     let parent = spill_parent();
@@ -1003,6 +1034,25 @@ mod tests {
     /// An unconfigured process still opens DuckDB at today's 512 MB / 2 threads. Raising the permit
     /// count no longer silently shrinks the per-connection ceiling: that product is the startup
     /// validator's job (RFC-0047 C4).
+    /// Jules on #1583: on Linux the temp dir is often a tmpfs, where spill is RAM outside the budget.
+    #[test]
+    fn spill_defaults_to_the_cache_dir_on_linux_and_the_temp_dir_without_a_home() {
+        let s = |x: &str| Some(std::ffi::OsString::from(x));
+        assert_eq!(
+            spill_parent_for(true, s("/x"), s("/h")),
+            PathBuf::from("/x/nuthatch")
+        );
+        assert_eq!(
+            spill_parent_for(true, None, s("/h")),
+            PathBuf::from("/h/.cache/nuthatch")
+        );
+        assert_eq!(spill_parent_for(true, s(""), None), std::env::temp_dir());
+        assert_eq!(
+            spill_parent_for(false, s("/x"), s("/h")),
+            std::env::temp_dir()
+        );
+    }
+
     #[test]
     fn the_security_walk_takes_a_non_ascii_name_and_still_refuses_a_path() {
         let d = tempfile::tempdir().unwrap();
