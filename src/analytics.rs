@@ -2301,15 +2301,32 @@ fn define_children_views(session: &dyn Session, dir: &Path) {
 /// store has already pruned it. Integers are interpolated (not user text), so no injection surface.
 pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> {
     let manifest = crate::seal::load_manifest(dir)?;
-    for table in manifest.tables.keys() {
-        let sql = format!(
-            "SELECT * FROM \"{table}\" WHERE block_number = {block} AND log_index = {log_index} LIMIT 1"
-        );
-        if let Some(row) = query(dir, &sql)?.into_iter().next() {
-            return Ok(Some(row));
-        }
+    // The id names no table. Asking each in turn cost a query per table (#1574), so one probe finds
+    // the table and the row is then read from it alone, in the shape a single-table query gives.
+    let probe = manifest
+        .tables
+        .keys()
+        .map(|t| {
+            format!(
+                "SELECT '{}' AS t FROM \"{t}\" WHERE block_number = {block} AND log_index = {log_index}",
+                t.replace('\'', "''")
+            )
+        })
+        .collect::<Vec<_>>();
+    if probe.is_empty() {
+        return Ok(None);
     }
-    Ok(None)
+    let found = query(
+        dir,
+        &format!("{} ORDER BY t LIMIT 1", probe.join(" UNION ALL ")),
+    )?;
+    let Some(table) = found.first().and_then(|r| r["t"].as_str()) else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "SELECT * FROM \"{table}\" WHERE block_number = {block} AND log_index = {log_index} LIMIT 1"
+    );
+    Ok(query(dir, &sql)?.into_iter().next())
 }
 
 /// Expose each table's sealed segments as a read-only DuckDB view named after the table. Tables with
@@ -4152,6 +4169,7 @@ template="pool"
         assert_eq!(one["to"], Value::from("0xc"));
         let appr = get_row(dir.path(), 10, 2).unwrap().unwrap();
         assert_eq!(appr["spender"], Value::from("0xd"));
+        assert_eq!(get_row(dir.path(), 10, 3).unwrap(), None);
     }
 
     fn sealed_bytes(dir: &Path, table: &str) -> u64 {
