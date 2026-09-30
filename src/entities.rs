@@ -184,6 +184,7 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
         .ok()
         .and_then(|cfg| crate::registry::from_nest(dir, &cfg).ok());
     let schema = registry.as_ref().map(|registry| registry.schema());
+    let data = std::cell::OnceCell::new();
     let path = dir.join(ENTITY_FILE);
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -254,12 +255,13 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
                 }
             };
             if let (Some(registry), Some(schema)) = (&registry, &schema) {
+                let data = data.get_or_init(|| NestData::load(dir));
                 if let Err(e) = bind_as_dev(dir, &name, &plan, registry) {
                     issues.push(issue(&name, format!("{e:#}")));
                     continue;
                 }
                 let reads = wide_reads(schema, &plan);
-                match first_unnarrowable(dir, schema, &reads) {
+                match first_unnarrowable(dir, schema, data, &reads) {
                     Ok(None) => {}
                     Ok(Some(found)) => {
                         issues.push(issue(
@@ -300,9 +302,10 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
                             issues.push(issue(&name, "declared key repeats a column"));
                         }
                         if !entity.key.is_empty() && !issues.iter().any(|i| i.name == name) {
-                            match cold_query(
+                            match nest_query(
                                 dir,
                                 schema,
+                                data,
                                 &sql,
                                 crate::analytics::QueryGuard {
                                     // Authoring validation must be bounded too. `max_rows` is an
@@ -539,28 +542,60 @@ fn quote_ident(s: &str) -> String {
 /// circuit converts every column it reads on every row it is fed, before any `WHERE`, so this scans
 /// whole columns rather than what the entity's own query keeps. A probe that cannot finish is an
 /// error, not a pass: an unscanned column proves nothing.
-/// A query over sealed history only, with every declared table bound. The declared schema gives a
-/// table that has never been sealed its empty typed view: without it a fresh nest, which is when an
-/// author runs `check`, failed every entity with "failed to prepare query".
-fn cold_query(
+/// What `check` reads an entity's inputs from: sealed history and, when the store is free, the hot
+/// tail, since the circuit seeds from both (#1587). `dev` holding the store leaves the hot tail
+/// unread, and `check` says so rather than implying it looked.
+struct NestData {
+    hot: crate::analytics::HotRows,
+    sealed_through: u64,
+}
+
+impl NestData {
+    fn load(dir: &Path) -> Self {
+        let cold = NestData {
+            hot: Default::default(),
+            sealed_through: u64::MAX,
+        };
+        let db = dir.join(crate::config::DB_FILE);
+        if !db.exists() {
+            return cold;
+        }
+        let read = crate::store::Store::open_existing(&db)
+            .and_then(|store| Ok((store.hot_rows_by_table()?, store.sealed_through())));
+        match read {
+            Ok((hot, sealed_through)) => NestData {
+                hot,
+                sealed_through,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "entities checked against sealed history only: the hot store could not be \
+                     read ({e:#}); a running nuthatch holds it and feeds that tail to its entities \
+                     itself"
+                );
+                cold
+            }
+        }
+    }
+}
+
+/// A query over the nest's data with every declared table bound. The declared schema gives a table
+/// that has never been sealed its empty typed view: without it a fresh nest, which is when an author
+/// runs `check`, failed every entity with "failed to prepare query".
+fn nest_query(
     dir: &Path,
     schema: &[crate::registry::TableSchema],
+    data: &NestData,
     sql: &str,
     guard: crate::analytics::QueryGuard,
 ) -> Result<crate::analytics::QueryOutput> {
-    crate::analytics::query_hot_cold(
-        dir,
-        sql,
-        guard,
-        &crate::analytics::HotRows::new(),
-        u64::MAX,
-        schema,
-    )
+    crate::analytics::query_hot_cold(dir, sql, guard, &data.hot, data.sealed_through, schema)
 }
 
 fn first_unnarrowable(
     dir: &Path,
     schema: &[crate::registry::TableSchema],
+    data: &NestData,
     reads: &WideReads,
 ) -> Result<Option<String>> {
     for (table, cols) in reads.values() {
@@ -575,7 +610,7 @@ fn first_unnarrowable(
                 timeout: Duration::from_secs(60),
                 max_rows: 1,
             };
-            let out = cold_query(dir, schema, &probe, guard).with_context(|| {
+            let out = nest_query(dir, schema, data, &probe, guard).with_context(|| {
                 format!("checking {table}.{col} fits the entity's integer type")
             })?;
             if out.degraded() {
@@ -1529,6 +1564,34 @@ mod tests {
                 .iter()
                 .any(|i| i.name == "rewards" && i.error.contains("does not fit")),
             "a value the circuit cannot hold must not pass check: {issues:?}"
+        );
+    }
+
+    /// The circuit seeds from the hot tail as well as sealed history, so a value only the hot store
+    /// holds must be probed too.
+    #[test]
+    fn check_probes_the_hot_tail() {
+        let dir = wide_nest();
+        let a = "0x00000000000000000000000000000000000000a1";
+        crate::seal::seal_range(dir.path(), &[wide_row(a, "1", "0", 10)], 10, 10).unwrap();
+        let sql =
+            "SELECT indexer, SUM(tokensRewards) AS total FROM svc__collected GROUP BY indexer";
+        assert!(rewards_issues(dir.path(), sql).is_empty());
+        {
+            let store =
+                crate::store::Store::open(&dir.path().join(crate::config::DB_FILE)).unwrap();
+            store.set_meta("sealed_through", "10").unwrap();
+            store
+                .put_entity(
+                    &crate::store::Store::entity_key(20, 0),
+                    &wide_row(a, &"9".repeat(40), "0", 20),
+                )
+                .unwrap();
+        }
+        let issues = rewards_issues(dir.path(), sql);
+        assert!(
+            issues.iter().any(|i| i.error.contains("does not fit")),
+            "an overflow in the hot tail must not pass check: {issues:?}"
         );
     }
 
