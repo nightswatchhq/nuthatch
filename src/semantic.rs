@@ -496,8 +496,8 @@ pub fn compose(
 
     if let Some(c) = coverage {
         out.push_str(&format!(
-            "COVERAGE\n  sealed_through = {} (the `sql` tool sees rows at or below this block);\n  \
-             tip = {} - rows above sealed_through are served by `table`/`entity`, not `sql`.\n\n",
+            "COVERAGE\n  sealed_through = {} (rows at or below this block are sealed Parquet);\n  \
+             tip = {} - the `sql` tool reads both the sealed rows and the live tip above them.\n\n",
             c.sealed_through, c.tip
         ));
     }
