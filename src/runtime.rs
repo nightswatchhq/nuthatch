@@ -3024,7 +3024,10 @@ pub async fn start_mount_jobs(
         let h = handles.lock().await;
         for (name, state) in &h.states {
             // A move interrupted by the restart is live on its old nest and not done.
-            if jobs.get(name).is_some_and(|j| j.is_move && !j.phase.finished()) {
+            if jobs
+                .get(name)
+                .is_some_and(|j| j.is_move && !j.phase.finished())
+            {
                 continue;
             }
             jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live));

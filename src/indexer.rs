@@ -1923,7 +1923,9 @@ fn drain_lifecycle(
                         true
                     }
                     (_, Some(_)) => {
-                        tracing::warn!("cannot rename '{from}' to '{to}': '{to}' is on this cursor");
+                        tracing::warn!(
+                            "cannot rename '{from}' to '{to}': '{to}' is on this cursor"
+                        );
                         false
                     }
                     (None, _) => false,
