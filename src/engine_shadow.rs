@@ -496,6 +496,10 @@ impl Session for ShadowSession {
         Arc::new(Both(handles))
     }
 
+    fn spill_limit(&self) -> Option<(std::path::PathBuf, u64)> {
+        self.primary.spill_limit()
+    }
+
     fn cold_scan_operators(&self, sql: &str) -> Result<u64> {
         self.primary.cold_scan_operators(sql)
     }

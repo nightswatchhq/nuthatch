@@ -3500,6 +3500,14 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
         )
             .into_response();
     }
+    if let Some(cut) = e.downcast_ref::<crate::analytics::QuerySpillExceeded>() {
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::TooLarge);
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            Json(json!({ "error": cut.to_string(), "spill_cap_bytes": cut.cap_bytes })),
+        )
+            .into_response();
+    }
     let reason = if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
         || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
             .is_some()

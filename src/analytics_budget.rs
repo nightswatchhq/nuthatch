@@ -33,7 +33,7 @@ pub struct AnalyticsConfig {
     /// Parent of per-instance spill directories. `None` → `std::env::temp_dir()`. Instance dirs
     /// remain `nuthatch-duckdb-{pid}-{seq}` under it (#1165).
     pub temp_directory: Option<PathBuf>,
-    /// DuckDB `max_temp_directory_size`. `None` → unset, today's unbounded spill.
+    /// Spill cap per analytics connection. `None` → [`DEFAULT_MAX_TEMP_MB`]; see [`spill_cap_bytes`].
     pub max_temp_size: Option<String>,
     /// Named ingest floor, in MB. `None` → [`derived_ingestion_reservation_mb`].
     pub ingestion_reservation_mb: Option<u64>,
@@ -259,6 +259,22 @@ pub fn parse_memory_mb(raw: &str) -> Option<u64> {
     }
 }
 
+/// The spill cap when `max_temp_size` is unset. DuckDB's own default is 90% of the free space where
+/// it spills, and that is often a tmpfs `/tmp`, which is RAM.
+pub const DEFAULT_MAX_TEMP_MB: u64 = 2048;
+
+/// The bytes one analytics connection may spill before its query is stopped. DuckDB does not enforce
+/// `max_temp_directory_size` on every spill (a cross join wrote 1.3 GB past a 128 MB cap), so the
+/// `/sql` guard measures the spill directory against this itself.
+pub fn spill_cap_bytes(cfg: &AnalyticsConfig) -> u64 {
+    let mb = cfg
+        .max_temp_size
+        .as_deref()
+        .and_then(parse_memory_mb)
+        .unwrap_or(DEFAULT_MAX_TEMP_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
 /// Normalise an operator size into a string DuckDB's `max_temp_directory_size` accepts.
 pub fn parse_size_for_duckdb(raw: &str) -> Option<String> {
     let (n, unit) = split_size(raw)?;
@@ -281,12 +297,13 @@ fn split_size(raw: &str) -> Option<(u64, String)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::runtime::DEFAULT_MAX_RSS_MB;
     use crate::serve::{SQL_MAX_CONCURRENCY, SQL_MAX_CONCURRENCY_CEILING};
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
+    /// Held by every test that sets or reads the `NUTHATCH_ANALYTICS_*` environment.
+    pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
         static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         L.get_or_init(|| std::sync::Mutex::new(()))
     }

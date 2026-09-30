@@ -133,6 +133,12 @@ pub(crate) trait Session: Send {
     /// A handle another thread can use to cancel whatever this session is running.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
 
+    /// This session's private spill directory and the bytes it may hold, for the `/sql` guard to
+    /// measure. `None` for a session that does not spill to a directory of its own.
+    fn spill_limit(&self) -> Option<(std::path::PathBuf, u64)> {
+        None
+    }
+
     /// The guard's deadline for the statement about to run, so an engine that does extra work
     /// beside the answer (a shadow) can decline it when the budget is nearly spent. Advisory; the
     /// watchdog still enforces the deadline.

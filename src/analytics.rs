@@ -182,6 +182,55 @@ impl std::fmt::Display for QueryBudgetExceeded {
 
 impl std::error::Error for QueryBudgetExceeded {}
 
+/// A query the guard stopped for spilling more than its connection's cap to disk (or to a tmpfs,
+/// which is RAM). Its own type so `/sql` answers 507 with the cap, rather than the timeout's 504.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuerySpillExceeded {
+    pub cap_bytes: u64,
+}
+
+impl std::fmt::Display for QuerySpillExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "query spilled more than {} MB to temporary storage on the read-only SQL surface; \
+             narrow it, or raise analytics.max_temp_size",
+            self.cap_bytes / (1024 * 1024)
+        )
+    }
+}
+
+impl std::error::Error for QuerySpillExceeded {}
+
+/// How often the `/sql` watchdog measures a running query's spill directory.
+const SPILL_POLL: Duration = Duration::from_millis(250);
+
+/// The error for a query the watchdog interrupted: the spill cap when that was what it hit, else the
+/// deadline.
+fn stopped(guard: Option<QueryGuard>, spilled: &AtomicU64) -> anyhow::Error {
+    match spilled.load(Ordering::SeqCst) {
+        0 => QueryBudgetExceeded {
+            secs: guard.map(|g| g.timeout.as_secs()).unwrap_or(0),
+        }
+        .into(),
+        cap_bytes => QuerySpillExceeded { cap_bytes }.into(),
+    }
+}
+
+/// Bytes allocated under a spill directory, counted by blocks so a sparse file is not overcounted.
+fn spilled_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.blocks().saturating_mul(512))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
 /// interrupting the running DuckDB query) and a cap on materialised rows. Trusted internal callers
 /// (`net_balances`, `get_row`) run *unguarded* - their SQL is registry-built, never user text, and
@@ -1022,7 +1071,7 @@ fn attempt(
     }
     let mut slot = slot.expect("just inserted");
     slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
-    let (referenced, offchain, degraded_tables, interrupted, outcome, cap, scan) = {
+    let (referenced, offchain, degraded_tables, interrupted, spilled, outcome, cap, scan) = {
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
         let walked = reject_unknown_table_refs(session, sql)?;
@@ -1100,17 +1149,36 @@ fn attempt(
         // (#476) - `run` computes `deadline` once and threads it through both calls. A deadline already in
         // the past (the sweep between attempts ran long) makes `recv_timeout` fire immediately.
         let interrupted = Arc::new(AtomicBool::new(false));
+        // The cap, set before `interrupted`, when it was the spill and not the deadline that stopped it.
+        let spilled = Arc::new(AtomicU64::new(0));
         let watchdog = guard.zip(deadline).map(|(_, d)| {
             let handle = session.interrupt_handle();
-            let flag = interrupted.clone();
+            let spill = session.spill_limit();
+            let (flag, over) = (interrupted.clone(), spilled.clone());
             let (tx, rx) = mpsc::channel::<()>();
-            let join = std::thread::spawn(move || {
+            let join = std::thread::spawn(move || loop {
                 let remaining = d.saturating_duration_since(Instant::now());
+                let tick = match spill {
+                    Some(_) => remaining.min(SPILL_POLL),
+                    None => remaining,
+                };
                 // Only a genuine timeout interrupts; a value (normal completion) or a dropped sender
                 // (panic) leaves the query alone.
-                if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(remaining) {
+                if !matches!(rx.recv_timeout(tick), Err(mpsc::RecvTimeoutError::Timeout)) {
+                    break;
+                }
+                if let Some((dir, cap)) = &spill {
+                    if spilled_bytes(dir) > *cap {
+                        over.store(*cap, Ordering::SeqCst);
+                        flag.store(true, Ordering::SeqCst);
+                        handle.interrupt();
+                        break;
+                    }
+                }
+                if Instant::now() >= d {
                     flag.store(true, Ordering::SeqCst);
                     handle.interrupt();
+                    break;
                 }
             });
             (tx, join)
@@ -1160,6 +1228,7 @@ fn attempt(
             offchain,
             degraded_tables,
             interrupted,
+            spilled,
             outcome,
             cap,
             scan,
@@ -1173,8 +1242,7 @@ fn attempt(
 
     let scan = match scan {
         Some(Err(_)) if interrupted.load(Ordering::SeqCst) => {
-            let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-            return Err(QueryBudgetExceeded { secs }.into());
+            return Err(stopped(guard, &spilled));
         }
         Some(Err(e)) => return Err(e),
         Some(Ok(bound)) => Some(bound),
@@ -1201,15 +1269,13 @@ fn attempt(
         // internal DuckDB error string - the same class of bug this guard exists to prevent.
         Err(Died::Binding(e)) => {
             if interrupted.load(Ordering::SeqCst) {
-                let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-                return Err(QueryBudgetExceeded { secs }.into());
+                return Err(stopped(guard, &spilled));
             }
             return Err(e);
         }
         Err(Died::Executing(e)) => {
             if interrupted.load(Ordering::SeqCst) {
-                let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-                return Err(QueryBudgetExceeded { secs }.into());
+                return Err(stopped(guard, &spilled));
             }
             // Handed back rather than returned: the caller decides whether a corrupt segment explains
             // it and is worth one reduced retry (#433). The tables ride along because they come from
@@ -6822,6 +6888,43 @@ template="pool"
     /// scheduling jitter needs even under heavy contention. The two outcomes no longer share a
     /// finish line to race across; one is already over before the sweep starts, the other has ample
     /// room regardless of load.
+    #[test]
+    fn a_query_spilling_past_its_cap_is_stopped_by_the_guard() {
+        // DuckDB reports this cap and spills past it anyway: 1.3 GB in ten seconds on this query.
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(60),
+            max_rows: 10,
+        };
+        let started = Instant::now();
+        let result = {
+            let _env = crate::analytics_budget::tests::env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE, "64MB");
+            let r = query_hot_cold(
+                dir.path(),
+                "SELECT sum(i * j) FROM range(1000000000) a(i), range(1000000000) b(j)",
+                guard,
+                &HotRows::new(),
+                0,
+                &[],
+            );
+            std::env::remove_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE);
+            r
+        };
+        let err = result.expect_err("the cross join must not run to completion");
+        let cut = err
+            .downcast_ref::<QuerySpillExceeded>()
+            .unwrap_or_else(|| panic!("stopped for the wrong reason: {err:#}"));
+        assert_eq!(cut.cap_bytes, 64 * 1024 * 1024);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "stopped by the deadline, not the spill: {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
         let dir = tempfile::tempdir().unwrap();

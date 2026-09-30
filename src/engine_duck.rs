@@ -23,24 +23,26 @@ pub(crate) struct DuckEngine;
 impl Engine for DuckEngine {
     fn open(&self, dir: &Path) -> Result<Box<dyn Session>> {
         let (conn, spill) = open_locked_duckdb(dir)?;
+        let cap = crate::analytics_budget::spill_cap_bytes(&crate::analytics_budget::from_env());
         Ok(Box::new(DuckSession {
             conn,
-            _spill: Some(spill),
+            spill: Some((spill, cap)),
         }))
     }
 
     fn open_bare(&self) -> Result<Box<dyn Session>> {
         let conn = Connection::open_in_memory()?;
         register_extensions(&conn)?;
-        Ok(Box::new(DuckSession { conn, _spill: None }))
+        Ok(Box::new(DuckSession { conn, spill: None }))
     }
 }
 
 pub(crate) struct DuckSession {
     conn: Connection,
-    /// This instance's private spill directory, removed when the session is dropped (#1165). Held
-    /// here so its lifetime is exactly the connection's. A bare session has none.
-    _spill: Option<SpillDir>,
+    /// This instance's private spill directory and its cap in bytes. The directory is removed when
+    /// the session is dropped (#1165), so its lifetime is exactly the connection's. A bare session
+    /// has none.
+    spill: Option<(SpillDir, u64)>,
 }
 
 impl Interrupt for duckdb::InterruptHandle {
@@ -88,6 +90,9 @@ impl Session for DuckSession {
     }
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
         Session::interrupt_handle(&self.conn)
+    }
+    fn spill_limit(&self) -> Option<(PathBuf, u64)> {
+        self.spill.as_ref().map(|(dir, cap)| (dir.0.clone(), *cap))
     }
     fn cold_scan_operators(&self, sql: &str) -> Result<u64> {
         self.conn.cold_scan_operators(sql)
@@ -571,11 +576,11 @@ fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
         // shared default - and before `lock_configuration`, which freezes it (#1165).
         .with("temp_directory", spill.0.display().to_string())
         .context("duckdb temp_directory")?;
-    if let Some(ref size) = resources.max_temp_size {
-        config = config
-            .with("max_temp_directory_size", size)
-            .context("duckdb max_temp_directory_size")?;
-    }
+    // DuckDB's own limit, where it holds; the `/sql` guard enforces the same cap where it does not.
+    let cap_mb = crate::analytics_budget::spill_cap_bytes(&resources) / (1024 * 1024);
+    config = config
+        .with("max_temp_directory_size", format!("{cap_mb}MB"))
+        .context("duckdb max_temp_directory_size")?;
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
     register_extensions(&conn)?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
