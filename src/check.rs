@@ -26,6 +26,19 @@ pub fn check(args: CheckArgs) -> Result<()> {
         return check_folds(&dir, args.from_genesis);
     }
 
+    // A misspelt key is dropped and its default used, silently (#1582); this is where an author learns.
+    if let Ok(raw) = std::fs::read_to_string(dir.join(crate::config::CONFIG_FILE)) {
+        let unknown = crate::config::Config::unknown_keys(&raw);
+        if !unknown.is_empty() {
+            bail!(
+                "{} has key(s) nuthatch does not read, so their defaults apply instead: {}. Check \
+                 the spelling against the config reference.",
+                crate::config::CONFIG_FILE,
+                unknown.join(", ")
+            );
+        }
+    }
+
     // Grafting (RFC-0033) is reported **before** the parity checks, and before the no-checks bail: a
     // nest with no `checks/*.sql` is the common case, and its author still deserves to know which of
     // their views can never be reused. Reporting it after the bail made this dead code for most

@@ -555,7 +555,15 @@ impl Config {
         })?;
         // v2 first; fall back to migrating a v1 file.
         let cfg = match toml::from_str::<Config>(&raw) {
-            Ok(cfg) => cfg,
+            Ok(cfg) => {
+                for key in Self::unknown_keys(&raw) {
+                    tracing::warn!(
+                        "{CONFIG_FILE}: `{key}` is not a key nuthatch reads, so it is ignored and \
+                         its default applies - check the spelling (`nuthatch check` fails on it)"
+                    );
+                }
+                cfg
+            }
             Err(v2_err) => Self::from_v1(&raw).map_err(|v1_err| {
                 anyhow!("nuthatch.toml is neither v2 ({v2_err}) nor v1 ({v1_err})")
             })?,
@@ -582,6 +590,21 @@ impl Config {
         cfg.refuse_tip_finality_webhooks()?;
         refuse_feature_only_files(dir)?;
         Ok(cfg)
+    }
+
+    /// Keys in a v2 `nuthatch.toml` that no field reads, as dotted paths (`contracts.0.start_blok`).
+    /// Serde drops them, so a misspelling silently takes the default (#1582): `start_blok` backfilled
+    /// from recent history instead of the declared block. Empty when the file does not parse as v2.
+    pub fn unknown_keys(raw: &str) -> Vec<String> {
+        let mut unknown = Vec::new();
+        let parsed: Result<Config, _> =
+            serde_ignored::deserialize(toml::Deserializer::new(raw), |path| {
+                unknown.push(path.to_string())
+            });
+        if parsed.is_err() {
+            return Vec::new();
+        }
+        unknown
     }
 
     /// Parse and validate a nest **without** the serving-path policy refusals.
@@ -790,6 +813,39 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1582: a misspelt key is reported, and nothing a real config says, or a parsed one writes
+    /// back, is. A false positive would make every nest warn and `check` fail.
+    #[test]
+    fn only_keys_nothing_reads_are_unknown() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut seen = 0;
+        for rel in [
+            "docs/bench/nests/usdc-120",
+            "tests/fixtures/dune_emit/nest",
+            "obib-case2",
+            "obib-case3",
+        ] {
+            let raw = std::fs::read_to_string(root.join(rel).join(CONFIG_FILE)).unwrap();
+            assert_eq!(Config::unknown_keys(&raw), Vec::<String>::new(), "{rel}");
+            let parsed: Config = toml::from_str(&raw).unwrap();
+            let written = toml::to_string(&parsed).unwrap();
+            assert_eq!(
+                Config::unknown_keys(&written),
+                Vec::<String>::new(),
+                "{rel} written back"
+            );
+            seen += 1;
+            if rel == "docs/bench/nests/usdc-120" {
+                let typo = raw.replacen("start_block", "start_blok", 1);
+                assert_ne!(typo, raw, "premise: the fixture declares start_block");
+                let unknown = Config::unknown_keys(&typo);
+                assert_eq!(unknown.len(), 1, "{unknown:?}");
+                assert!(unknown[0].ends_with("start_blok"), "{unknown:?}");
+            }
+        }
+        assert_eq!(seen, 4);
+    }
 
     #[test]
     fn migrates_a_v1_file() {
