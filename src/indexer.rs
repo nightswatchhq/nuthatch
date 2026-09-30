@@ -2180,6 +2180,13 @@ async fn runtime_index_loop(
 
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
+            // An entity records a failed step on its own thread, after the window that fed it has
+            // been checked, so on a chain with no new block its fault would wait for one to be seen.
+            for &i in &live {
+                if let Err(e) = live_ref(&nests, i).ensure_views_healthy() {
+                    sup.quarantine(i, &e)?;
+                }
+            }
             sleep_for(freshness.poll_interval).await;
             continue;
         }
@@ -6929,6 +6936,9 @@ async fn index_loop(
                 p.finish(next.saturating_sub(1), true);
             }
             caught_up = true;
+            // As in the runtime loop: an entity fault recorded after its window was checked surfaces
+            // here rather than waiting for a block.
+            nest.ensure_views_healthy()?;
             // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
             // when the tip has moved, a reorg check, a checkpoint header and a `finalized` probe -
             // whether or not any block carried an event. At two seconds that is the whole bill of a
