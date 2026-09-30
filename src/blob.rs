@@ -499,7 +499,12 @@ fn bundled_credentials(dir: &Path) -> Vec<String> {
     };
     let shown = crate::rpc::redact_url;
     let mut found = Vec::new();
-    for url in config.nest.rpc_urls.iter().filter(|u| url_carries_credential(u)) {
+    for url in config
+        .nest
+        .rpc_urls
+        .iter()
+        .filter(|u| url_carries_credential(u))
+    {
         found.push(format!("rpc_urls: {} (a key in the URL)", shown(url)));
     }
     for w in &config.webhooks {
@@ -507,10 +512,18 @@ fn bundled_credentials(dir: &Path) -> Vec<String> {
             found.push(format!("webhook '{}': its HMAC secret", w.name));
         }
         if url_carries_credential(&w.url) {
-            found.push(format!("webhook '{}': {} (a key in the URL)", w.name, shown(&w.url)));
+            found.push(format!(
+                "webhook '{}': {} (a key in the URL)",
+                w.name,
+                shown(&w.url)
+            ));
         }
     }
-    for a in config.alerts.iter().filter(|a| url_carries_credential(&a.url)) {
+    for a in config
+        .alerts
+        .iter()
+        .filter(|a| url_carries_credential(&a.url))
+    {
         found.push(format!("alert sink: {} (a key in the URL)", shown(&a.url)));
     }
     found
@@ -526,18 +539,21 @@ fn url_carries_credential(url: &str) -> bool {
     if !u.username().is_empty() || u.password().is_some() {
         return true;
     }
-    let keyish = ["key", "token", "secret", "auth", "pass", "sig"];
     if u.query_pairs().any(|(k, _)| {
         let k = k.to_ascii_lowercase();
-        keyish.iter().any(|w| k.contains(w))
+        ["key", "token", "secret"].iter().any(|w| k.ends_with(w))
+            || ["auth", "pass", "password", "sig"].contains(&k.as_str())
     }) {
         return true;
     }
-    u.path_segments().into_iter().flatten().any(|s| {
+    let segments: Vec<&str> = u.path_segments().into_iter().flatten().collect();
+    segments.iter().enumerate().any(|(i, s)| {
         s.len() >= 20
             && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             && s.chars().any(|c| c.is_ascii_digit())
             && s.chars().any(|c| c.is_ascii_alphabetic())
+            // Avalanche's `/ext/bc/<blockchain id>/rpc`: a public chain id, not a key.
+            && !(i > 0 && segments[i - 1] == "bc")
     })
 }
 
@@ -909,6 +925,8 @@ abi = "abis/c.json"
             "https://ethereum-rpc.publicnode.com",
             "https://rpc.ankr.com/eth",
             "https://api.avax.network/ext/bc/C/rpc",
+            "https://api.avax.network/ext/bc/2q9e4r6Mu3U68nU1fYjgbR6JvwrRx36CohpAX5UQxse55x1Q5/rpc",
+            "https://h.example/in?signature=required",
             "http://127.0.0.1:8469/hooks",
             "https://x",
         ] {
@@ -931,19 +949,32 @@ abi = "abis/c.json"
             src.path().join(CONFIG_FILE),
             config.replace(
                 "rpc_urls = [\"https://x\"]",
-                "rpc_urls = [\"https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161\"]",
+                "rpc_urls = [\"https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161\", \"https://alice:SECRETPW@rpc.example.com\"]",
             ) + "\n[[webhooks]]\nname = \"w\"\ntable = \"c__transfer\"\nurl = \"https://h.example/in\"\nsecret = \"FAKE_HMAC\"\n",
         )
         .unwrap();
         let err = bundle(src.path(), Some(&out.path().join("b.bundle")), false, false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("webhook 'w'") && err.contains("secret"), "{err}");
+        assert!(
+            err.contains("webhook 'w'") && err.contains("secret"),
+            "{err}"
+        );
         assert!(err.contains("https://mainnet.infura.io"), "{err}");
-        assert!(!err.contains("9aa3d95b"), "the refusal must not print the key: {err}");
+        assert!(
+            !err.contains("9aa3d95b"),
+            "the refusal must not print the key: {err}"
+        );
+        assert!(
+            err.contains("https://rpc.example.com") && !err.contains("SECRETPW"),
+            "{err}"
+        );
         assert!(!out.path().join("b.bundle").exists());
         bundle(src.path(), Some(&out.path().join("c.bundle")), false, true).unwrap();
-        assert!(out.path().join("c.bundle").exists(), "--allow-secrets bundles anyway");
+        assert!(
+            out.path().join("c.bundle").exists(),
+            "--allow-secrets bundles anyway"
+        );
 
         std::fs::write(src.path().join(CONFIG_FILE), config).unwrap();
         assert_eq!(build_manifest(src.path(), None).unwrap().nid(), clean_nid);

@@ -1262,7 +1262,9 @@ mod tests {
         crate::seal::seal_range(dir.path(), &[row(b, &"9".repeat(40), 13)], 13, 13).unwrap();
         let issues = validate(dir.path());
         assert!(
-            issues.iter().any(|i| i.name == "rewards" && i.error.contains("INT128")),
+            issues
+                .iter()
+                .any(|i| i.name == "rewards" && i.error.contains("INT128")),
             "a value the circuit cannot hold must not pass check: {issues:?}"
         );
     }
