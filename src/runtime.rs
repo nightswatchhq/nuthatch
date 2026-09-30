@@ -3720,6 +3720,57 @@ impl RuntimeHandles {
         Ok(())
     }
 
+    /// Rename a nest on its chain's cursor, failing if the cursor did not apply it.
+    async fn rename_on_cursor(&self, chain: &str, from: &str, to: &str) -> Result<()> {
+        let tx = self
+            .lifecycle
+            .get(chain)
+            .cloned()
+            .with_context(|| format!("the {chain} cursor is gone"))?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(indexer::CursorCommand::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+            ack: Some(ack_tx),
+        })
+        .map_err(|_| anyhow::anyhow!("the {chain} cursor is gone"))?;
+        match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => bail!("the {chain} cursor could not rename '{from}' to '{to}'"),
+            _ => bail!("the {chain} cursor did not acknowledge renaming '{from}' to '{to}'"),
+        }
+    }
+
+    /// Hand a shared dataset's cursor key from `name`, which is moving off it, to a mount still on it.
+    async fn rehome_shared_dataset(
+        &mut self,
+        chain: &str,
+        name: &str,
+        store: &Arc<dyn crate::store::HotStore>,
+    ) -> Result<()> {
+        let sharers: Vec<String> = self
+            .states
+            .iter()
+            .filter(|(n, s)| n != name && Arc::ptr_eq(&s.store, store))
+            .map(|(n, _)| n.clone())
+            .collect();
+        let holder = sharers.first().cloned().context("no mount left on the dataset")?;
+        self.rename_on_cursor(chain, name, &holder).await?;
+        let health = self.health.clone();
+        for (n, s) in self.states.iter_mut().filter(|(n, _)| sharers.contains(n)) {
+            s.runtime_health = Some((holder.clone(), health.clone()));
+            if *n != holder {
+                health.register_alias(n, &holder, chain);
+            }
+        }
+        health.make_canonical(&holder, chain);
+        if let Some(w) = self.alert_workers.iter_mut().find(|(n, _)| n == name) {
+            w.0 = holder.clone();
+        }
+        tracing::info!("the dataset '{name}' moves off is now known as '{holder}'");
+        Ok(())
+    }
+
     /// The name a move stages its incoming nest under while it catches up.
     pub fn staging_name(name: &str) -> String {
         format!("{name}.moving")
@@ -3771,21 +3822,27 @@ impl RuntimeHandles {
         if !old_shared {
             self.drain_cursor_nest(&chain, &old_key, name).await?;
             crate::metrics::METRICS.remove_nest(&old_key);
+        } else if old_key == name {
+            // The shared dataset is known on the cursor by the name moving off it, and keeps indexing
+            // for the mounts left on it: one of them takes the key, or the incoming nest cannot.
+            if let Err(e) = self.rehome_shared_dataset(&chain, name, &old_store).await {
+                let _ = self.unmount(&staging).await;
+                return Err(e);
+            }
         }
+        if new_key == staging {
+            if let Err(e) = self.rename_on_cursor(&chain, &staging, name).await {
+                let _ = self.unmount(&staging).await;
+                return Err(e);
+            }
+        }
+        let new_idx = self
+            .states
+            .iter()
+            .position(|(n, _)| *n == staging)
+            .expect("still staged");
         let (_, mut new_state) = self.states.remove(new_idx);
         if new_key == staging {
-            let tx = self
-                .lifecycle
-                .get(&chain)
-                .cloned()
-                .context("the cursor the move joined is gone")?;
-            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(indexer::CursorCommand::Rename {
-                from: staging.clone(),
-                to: name.to_string(),
-                ack: Some(ack_tx),
-            });
-            let _ = tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await;
             new_state.runtime_health = Some((name.to_string(), self.health.clone()));
             self.health.register(name, &chain);
             self.health.mark_indexing(name);

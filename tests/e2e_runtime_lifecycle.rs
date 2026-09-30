@@ -2520,3 +2520,84 @@ async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
     assert_eq!(job["phase"], "live", "{job}");
     assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
 }
+
+/// From the 3.13.0 tyre-kick: moving a name whose dataset another tenant shares. The shared
+/// dataset must keep indexing for the tenant left on it, the moved name must serve the new NID, and
+/// unmounting the moved name afterwards must release the new store and leave the other tenant alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moving_a_name_off_a_shared_dataset_leaves_the_other_tenant_indexing() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("5e".repeat(32), "6f".repeat(32));
+    let (mut handles, tape) = one_live_mount(roost.path(), &old_nid).await;
+    handles
+        .mount("other", Some(runtime::Nid::parse(&old_nid).unwrap()))
+        .await
+        .expect("a second mount of the same dataset");
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+
+    handles
+        .move_name("usdc", runtime::Nid::parse(&new_nid).unwrap())
+        .await
+        .expect("move");
+    let served = |h: &runtime::RuntimeHandles, name: &str| {
+        h.states
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, s)| s.nid.as_deref().map(str::to_string))
+    };
+    assert_eq!(served(&handles, "usdc").as_deref(), Some(new_nid.as_str()));
+    assert_eq!(served(&handles, "other").as_deref(), Some(old_nid.as_str()));
+
+    let other_last = |h: &runtime::RuntimeHandles| {
+        h.states
+            .iter()
+            .find(|(n, _)| n == "other")
+            .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
+    };
+    let (a1, a2) = (account(1), account(2));
+    tape.insert_block(
+        4,
+        transfers_block(
+            4,
+            0,
+            1_700_000_004,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 400)],
+        ),
+    );
+    tape.advance_tip_to(4);
+    assert!(
+        wait_until(POLL_TIMEOUT, || other_last(&handles).as_deref()
+            == Some("4"))
+        .await,
+        "the tenant left on the shared dataset stopped indexing after the move"
+    );
+
+    handles
+        .unmount("usdc")
+        .await
+        .expect("unmount the moved name");
+    drop(
+        Store::open(&new_dir.join("nuthatch.redb"))
+            .expect("unmounting the moved name did not release its new store"),
+    );
+    tape.insert_block(
+        5,
+        transfers_block(
+            5,
+            0,
+            1_700_000_005,
+            USDC,
+            &[(a1.as_str(), a2.as_str(), 500)],
+        ),
+    );
+    tape.advance_tip_to(5);
+    assert!(
+        wait_until(POLL_TIMEOUT, || other_last(&handles).as_deref()
+            == Some("5"))
+        .await,
+        "unmounting the moved name stopped the other tenant's indexing"
+    );
+}
