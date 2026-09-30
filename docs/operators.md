@@ -1106,6 +1106,14 @@ segments are written strictly past finality and are immutable, so the columnar l
 reorg deeper than the sealed watermark is a terminal fault by design: finality was violated, and
 silently rewriting sealed history would be worse than stopping.
 
+A reorg of either kind is seen on the next poll, not the instant the chain changes. Until then the nest
+answers from what it last indexed, discarded blocks included, and `/ready` says so only once the poll
+has run. Measured against a forked chain: about half a second at a one-second poll interval. The
+window is the poll interval. For an ordinary reorg that is the near-tip provisionality every indexer
+has, and sealed history is untouched. For one below the seal the sealed rows are themselves on the
+abandoned branch, so they are served until that poll and then the nest halts; the only protection is a
+finality depth the chain actually honours.
+
 **Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is
 checkpointed and rows are keyed by `(block, log_index)`, so a restart resumes without gaps or
 duplicates.
