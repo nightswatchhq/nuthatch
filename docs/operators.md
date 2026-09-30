@@ -319,8 +319,8 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 |---|---|---|---|
 | `analytics.memory_limit` | `NUTHATCH_ANALYTICS_MEMORY_LIMIT` | 512MB | DuckDB `max_memory` per connection |
 | `analytics.threads` | `NUTHATCH_ANALYTICS_THREADS` | 2 (ceiling 16) | DuckDB worker threads. Above 16 is refused; not a term in the RAM equation |
-| `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | process temp dir | parent of per-instance spill dirs (`nuthatch-duckdb-{pid}-{seq}`; do not point two processes at one directory) |
-| `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | unset (DuckDB's disk default) | spill bound; this is disk, not RAM, and does not buy room in the equation above |
+| `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | Linux: `$XDG_CACHE_HOME/nuthatch` or `~/.cache/nuthatch`; elsewhere the process temp dir | parent of per-instance spill dirs (`nuthatch-duckdb-{pid}-{seq}`; do not point two processes at one directory). Not `/tmp` on Linux by default, because that is often a tmpfs, where spill is RAM outside the per-cursor budget; do not point this at one |
+| `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | 2GB | spill per analytics connection. A `/sql` query that spills past it is stopped and answered `507`; the guard measures the spill itself, because DuckDB does not enforce its own limit on every spill. On disk it does not buy room in the equation above; on a tmpfs it is RAM |
 | `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest, and **raise-only**: 1024 is the remainder of today's 2 GiB split after 2 × 512 MB DuckDB, **not** a measured ingest RSS high-water (RFC-0047 §6). A lower value is refused at startup, because nothing caps ingest at this figure - writing a smaller number would not shrink ingest, only hand DuckDB headroom against a reservation no code enforces |
 | `runtime_headroom` | (not settable) | 0 | unmeasured. Named in the inequality so the term is visible; counted as zero until someone measures it on the box that enforces the budget |
 

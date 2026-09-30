@@ -544,7 +544,13 @@ async fn fetch(req: reqwest::RequestBuilder, url: &str) -> Result<String> {
     let resp = req.send().await.map_err(|e| {
         anyhow!("cannot reach nuthatch at {url} - is `nuthatch dev` running? ({e})")
     })?;
-    Ok(resp.text().await?)
+    let status = resp.status();
+    let body = resp.text().await?;
+    // A 404 or a refused query is a failed tool call, with the body as the agent's explanation.
+    if !status.is_success() {
+        bail!("HTTP {}: {body}", status.as_u16());
+    }
+    Ok(body)
 }
 
 fn ok(id: Value, result: Value) -> Value {
@@ -897,7 +903,15 @@ mod tests {
             .route(
                 "/entity/{id}",
                 get(|Path(id): Path<String>| async move {
-                    Json(json!({"id": id, "table": "usdc__transfer"}))
+                    use axum::response::IntoResponse;
+                    if id == "000000000000-000000" {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            Json(json!({"error": "not found", "id": id})),
+                        )
+                            .into_response();
+                    }
+                    Json(json!({"id": id, "table": "usdc__transfer"})).into_response()
                 }),
             )
             .route(
@@ -1014,6 +1028,15 @@ mod tests {
             tool_text(&entity).contains("000000000042-000001"),
             "{entity}"
         );
+        let missing = call(
+            &client,
+            &base,
+            "entity",
+            json!({ "id": "000000000000-000000" }),
+        )
+        .await;
+        assert_eq!(missing["result"]["isError"], true, "{missing}");
+        assert!(tool_text(&missing).contains("not found"), "{missing}");
 
         let balance = call(&client, &base, "balance", json!({ "address": "0xabc" })).await;
         assert!(tool_text(&balance).contains("0xabc"), "{balance}");

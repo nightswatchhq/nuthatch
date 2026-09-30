@@ -496,6 +496,10 @@ impl Session for ShadowSession {
         Arc::new(Both(handles))
     }
 
+    fn spill_limit(&self) -> Option<(std::path::PathBuf, u64)> {
+        self.primary.spill_limit()
+    }
+
     fn cold_scan_operators(&self, sql: &str) -> Result<u64> {
         self.primary.cold_scan_operators(sql)
     }
@@ -504,6 +508,17 @@ impl Session for ShadowSession {
         self.both(
             &format!("load_hot {table}"),
             |s| s.load_hot(table, rows),
+            |r| match r {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("{e:#}"),
+            },
+        )
+    }
+
+    fn load_relation(&self, table: &str, rows: &[&Value]) -> Result<()> {
+        self.both(
+            &format!("load_relation {table}"),
+            |s| s.load_relation(table, rows),
             |r| match r {
                 Ok(()) => "ok".into(),
                 Err(e) => format!("{e:#}"),

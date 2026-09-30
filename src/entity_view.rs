@@ -483,7 +483,7 @@ impl EntityView {
             .map(|(k, v)| {
                 let mut obj = serde_json::Map::new();
                 for (name, cell) in self.columns.iter().zip(k.0.iter().chain(v.0.iter())) {
-                    obj.insert(name.clone(), serde_json::Value::String(cell.to_string()));
+                    obj.insert(name.clone(), sql_cell(cell));
                 }
                 serde_json::Value::Object(obj)
             })
@@ -940,6 +940,19 @@ fn step(
     circuit.apply(&batch.left, &batch.right, into)?;
     *live = next;
     Ok(())
+}
+
+/// A cell as the SQL loader takes it: typed, so an integer stays numeric and a NULL is not the text
+/// `"NULL"`. `arbitrary_precision` carries every `i128` exactly.
+fn sql_cell(cell: &crate::entity_row::Scalar) -> serde_json::Value {
+    use crate::entity_row::Scalar;
+    match cell {
+        Scalar::Null => serde_json::Value::Null,
+        Scalar::Bool(b) => serde_json::Value::Bool(*b),
+        Scalar::Int(i) => serde_json::Number::from_i128(*i)
+            .map_or_else(|| serde_json::Value::String(i.to_string()), Into::into),
+        Scalar::Str(s) => serde_json::Value::String(s.clone()),
+    }
 }
 
 #[cfg(test)]

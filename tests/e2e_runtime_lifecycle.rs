@@ -1963,11 +1963,19 @@ async fn suspend_and_resume_over_the_admin_api() {
 
     let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let (status, _) = call(&routes, "DELETE", "/_admin/nests/usdc", None, None).await;
+    let (status, body) = call(&routes, "DELETE", "/_admin/nests/usdc", None, None).await;
     assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(body.contains("\"was_mounted\":true"), "{body}");
     assert_eq!(status_of(&handles).await, axum::http::StatusCode::NOT_FOUND);
     let file = runtime::MountTable::load(roost.path()).unwrap();
     assert!(file.runtime.suspended.is_empty() && file.mounts.is_empty());
+
+    // A retry is still a 200, and says it was a no-op; a name no mount could have is a 400.
+    let (status, body) = call(&routes, "DELETE", "/_admin/nests/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(body.contains("\"was_mounted\":false"), "{body}");
+    let (status, body) = call(&routes, "DELETE", "/_admin/nests/a/b/c", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
 }
 
 /// #1547: an API-only operator can free a dataset's disk. Unmounting one of two mounts of a NID with

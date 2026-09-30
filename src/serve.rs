@@ -1631,7 +1631,25 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     ) = seal_direct;
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
-    let lag = tip.saturating_sub(last);
+    // Before its first commit a cursor stands just below its start block, not at block 0: a nest
+    // waiting for finality to reach its start is not the whole chain behind.
+    let position = if last == 0 {
+        s.store
+            .get_meta(crate::indexer::START_BLOCK_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(0, |start| start.saturating_sub(1))
+    } else {
+        last
+    };
+    let lag = tip.saturating_sub(position);
+    // A wedge is judged against where the cursor may go: under `--finality-only` that is the finality
+    // boundary, and one waiting there for the next finalized block is caught up (#1575).
+    let ceiling = nest
+        .as_ref()
+        .map_or_else(|| METRICS.ceiling(), |m| m.ceiling());
+    let target = if ceiling == 0 { tip } else { ceiling };
     let wedged = !seal_direct_active
         && progress_stalled(
             last_progress,
@@ -1639,7 +1657,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
             now,
             s.freshness
                 .stall_threshold_secs(READINESS_PROGRESS_STALL_SECS),
-            lag,
+            target.saturating_sub(position),
         );
     let initial_failure = initial_poll_failed(last_poll, poll_failed);
     // #846: `seal_direct_active` used to suppress every term above with nothing put in its place, so
@@ -3500,6 +3518,14 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
         )
             .into_response();
     }
+    if let Some(cut) = e.downcast_ref::<crate::analytics::QuerySpillExceeded>() {
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::TooLarge);
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            Json(json!({ "error": cut.to_string(), "spill_cap_bytes": cut.cap_bytes })),
+        )
+            .into_response();
+    }
     let reason = if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
         || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
             .is_some()
@@ -5235,6 +5261,80 @@ mod tests {
             "a cursor frozen mid-backfill must fail readiness: {json}"
         );
         assert_eq!(json["wedged"], json!(true));
+    }
+
+    /// #1575: under `--finality-only` a cursor waits at the finality boundary, below the tip, for the
+    /// next finalized block, which on Arbitrum takes minutes. Level with its ceiling it is caught up;
+    /// behind it and not moving, it is still wedged.
+    #[tokio::test]
+    async fn a_finality_cursor_at_its_ceiling_is_ready_and_one_behind_it_is_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "finality-cursor";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_last_block(1_000);
+        handle.set_tip(1_100);
+        handle.set_ceiling(1_000);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now.saturating_sub(200));
+        let (code, body) = get(router.clone(), &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "waiting at finality is caught up: {json}"
+        );
+        assert_eq!(json["wedged"], json!(false));
+
+        handle.set_ceiling(1_050);
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["wedged"], json!(true));
+    }
+
+    /// #1575, found on Base: a new finality-only nest whose start block is above the finality boundary
+    /// has committed nothing, so its position is just below its start, not block 0. Waiting for
+    /// finality to reach it is not being the whole chain behind.
+    #[tokio::test]
+    async fn a_new_finality_cursor_waiting_below_its_start_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "finality-cursor-fresh";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let state = test_state(&dir.path().join(name), 4);
+        state
+            .store
+            .set_meta(crate::indexer::START_BLOCK_KEY, "1200")
+            .unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let router = compose_runtime(roster, vec![(name.to_string(), state)], health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_tip(1_300);
+        handle.set_ceiling(1_000);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now.saturating_sub(200));
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "waiting for finality to reach its start: {json}"
+        );
+        assert_eq!(json["wedged"], json!(false));
+        assert_eq!(
+            json["lag_blocks"],
+            json!(101),
+            "lag is from its position, not block 0"
+        );
     }
 
     /// #583/#589: a cursor level with tip - caught up, doing exactly what it should - must stay ready

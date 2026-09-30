@@ -305,6 +305,7 @@ pub fn parse_named(
         i: 0,
         vars,
         defaults: BTreeMap::new(),
+        depth: 0,
     };
     // A document is a list of definitions in any order, so fragments are collected as they are met
     // and spreads are resolved once the whole document has been read - a fragment may legally be
@@ -379,7 +380,13 @@ pub fn parse_named(
             _ => return Err(Unsupported::OperationNameRequired),
         },
     };
-    let roots = resolve_spreads(&operation, &fragments, &mut Vec::new())?;
+    let roots = resolve_spreads(
+        &operation,
+        &fragments,
+        &mut Vec::new(),
+        &mut { MAX_SELECTIONS },
+        0,
+    )?;
     Ok(roots
         .into_iter()
         .map(|s| RootField {
@@ -425,21 +432,46 @@ enum Sel {
 /// `visiting` is the spread stack, so a fragment that refers to itself is an error rather than a
 /// stack overflow - a client cannot send one by accident, but a malformed document should not take the
 /// node down.
+///
+/// `budget` is the selections still allowed. A diamond of fragments (each spreading the next twice)
+/// doubles per level, so a few kB would otherwise expand without bound (#1581).
 fn resolve_spreads(
     sel: &[Sel],
     fragments: &BTreeMap<String, Vec<Sel>>,
     visiting: &mut Vec<String>,
+    budget: &mut usize,
+    depth: usize,
 ) -> Result<Vec<Selection>, Unsupported> {
+    // Fields, inline fragments and spreads share this one bound: each fragment of a chain may nest
+    // its own fields, so bounding spreads and fields apart still composes to an overflow.
+    if depth >= MAX_NESTING {
+        return Err(Unsupported::Syntax(format!(
+            "the document nests more than {MAX_NESTING} levels deep"
+        )));
+    }
     let mut out: Vec<Selection> = Vec::new();
     for s in sel {
         match s {
-            Sel::Field(f, sub) => out.push(Selection {
-                key: f.key.clone(),
-                name: f.name.clone(),
-                args: f.args.clone(),
-                sub: resolve_spreads(sub, fragments, visiting)?,
-            }),
-            Sel::Inline(inner) => out.extend(resolve_spreads(inner, fragments, visiting)?),
+            Sel::Field(f, sub) => {
+                *budget = budget.checked_sub(1).ok_or_else(|| {
+                    Unsupported::Syntax(format!(
+                        "the document expands to more than {MAX_SELECTIONS} selections"
+                    ))
+                })?;
+                out.push(Selection {
+                    key: f.key.clone(),
+                    name: f.name.clone(),
+                    args: f.args.clone(),
+                    sub: resolve_spreads(sub, fragments, visiting, budget, depth + 1)?,
+                })
+            }
+            Sel::Inline(inner) => out.extend(resolve_spreads(
+                inner,
+                fragments,
+                visiting,
+                budget,
+                depth + 1,
+            )?),
             Sel::Spread(name) => {
                 let Some(body) = fragments.get(name) else {
                     return Err(Unsupported::Syntax(format!(
@@ -451,14 +483,33 @@ fn resolve_spreads(
                         "fragment `{name}` spreads itself"
                     )));
                 }
+                // A spread costs budget of its own, so a diamond ending in an empty fragment is not free.
+                *budget = budget.checked_sub(1).ok_or_else(|| {
+                    Unsupported::Syntax(format!(
+                        "the document expands to more than {MAX_SELECTIONS} selections"
+                    ))
+                })?;
                 visiting.push(name.clone());
-                out.extend(resolve_spreads(body, fragments, visiting)?);
+                out.extend(resolve_spreads(
+                    body,
+                    fragments,
+                    visiting,
+                    budget,
+                    depth + 1,
+                )?);
                 visiting.pop();
             }
         }
     }
     Ok(out)
 }
+
+/// How deep selection sets and values may nest. A stack guard, far above any real query: an
+/// introspection query nests about a dozen levels.
+const MAX_NESTING: usize = 128;
+
+/// How many selections a document may expand to once its fragments are spliced in (#1581).
+const MAX_SELECTIONS: usize = 10_000;
 
 struct Cursor<'a> {
     b: &'a [u8],
@@ -471,6 +522,9 @@ struct Cursor<'a> {
     /// forget that a variable existed.
     vars: &'a BTreeMap<String, Value>,
     defaults: BTreeMap<String, Value>,
+    /// Selection sets and list/object values currently open. Capped so a deeply nested document is a
+    /// refusal rather than a stack overflow, which aborts the process (#1581).
+    depth: usize,
 }
 
 impl<'a> Cursor<'a> {
@@ -627,6 +681,9 @@ impl<'a> Cursor<'a> {
     /// detect it by searching the raw text - and a filter value of `"__schema"` then routed a
     /// perfectly ordinary query to the schema document (Jules on #1282).
     fn selection_set(&mut self) -> Result<Vec<Sel>, Unsupported> {
+        self.nested(Self::selection_set_inner)
+    }
+    fn selection_set_inner(&mut self) -> Result<Vec<Sel>, Unsupported> {
         self.i += 1; // '{'
         let mut out = Vec::new();
         loop {
@@ -768,7 +825,7 @@ impl<'a> Cursor<'a> {
         self.trivia();
         if self.peek() == Some(b'[') {
             self.i += 1;
-            self.type_ref()?;
+            self.nested(Self::type_ref)?;
             self.trivia();
             if self.peek() != Some(b']') {
                 return Err(Unsupported::Syntax("unclosed list type".into()));
@@ -808,6 +865,24 @@ impl<'a> Cursor<'a> {
         }
     }
     fn value(&mut self) -> Result<Value, Unsupported> {
+        self.nested(Self::value_inner)
+    }
+    /// Run one level of a recursive parse, refusing past [`MAX_NESTING`] levels.
+    fn nested<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, Unsupported>,
+    ) -> Result<T, Unsupported> {
+        if self.depth >= MAX_NESTING {
+            return Err(Unsupported::Syntax(format!(
+                "the document nests more than {MAX_NESTING} levels deep"
+            )));
+        }
+        self.depth += 1;
+        let out = parse(self);
+        self.depth -= 1;
+        out
+    }
+    fn value_inner(&mut self) -> Result<Value, Unsupported> {
         self.trivia();
         match self.peek() {
             Some(b'"') => Ok(Value::Str(self.string()?)),
@@ -3081,6 +3156,98 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
         );
         // And one that spreads itself is an error rather than a stack overflow.
         assert!(parse("fragment F on Pool { ...F } { pools { ...F } }").is_err());
+    }
+
+    /// #1581: nesting and fragment expansion are bounded, so a small document cannot overflow the
+    /// stack (which aborts the process) or expand without limit; a deep real query still parses.
+    #[test]
+    fn nesting_and_expansion_are_bounded() {
+        // Run on a thread with the default 2 MiB stack a tokio worker has, so an unbounded recursion
+        // fails the test by overflowing rather than passing on a larger test-harness stack.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let deep = 100_000;
+                let sel = format!("{}{}", "{a".repeat(deep), "}".repeat(deep));
+                let e = parse(&sel).expect_err("deep selection");
+                assert!(
+                    matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
+                    "{e:?}"
+                );
+                let val = format!(
+                    "{{ a(w: {}1{}) {{ id }} }}",
+                    "[".repeat(deep),
+                    "]".repeat(deep)
+                );
+                let e = parse(&val).expect_err("deep value");
+                assert!(
+                    matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
+                    "{e:?}"
+                );
+                // Astra's review of #1583: a variable's list type recursed without the guard.
+                let ty = format!(
+                    "query Q($v: {}Int{}) {{ a {{ id }} }}",
+                    "[".repeat(deep),
+                    "]".repeat(deep)
+                );
+                let e = parse(&ty).expect_err("deep type");
+                assert!(
+                    matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
+                    "{e:?}"
+                );
+                // And a chain of fragments nests in resolution, which the parser never sees.
+                let mut chain: String = (0..10_000)
+                    .map(|i| format!("fragment F{i} on X {{ ...F{n} }} ", n = i + 1))
+                    .collect();
+                chain.push_str("fragment F10000 on X { id } { pools { ...F0 } }");
+                let e = parse(&chain).expect_err("fragment chain");
+                assert!(
+                    matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
+                    "{e:?}"
+                );
+                // Astra's re-review: each fragment under the parser's limit, chained, composes to
+                // some 8,400 levels. One bound across fields and spreads refuses it.
+                let nest =
+                    |inner: String| format!("{}{inner}{}", "a { ".repeat(120), " }".repeat(120));
+                let mut composed: String = (0..70)
+                    .map(|i| {
+                        format!(
+                            "fragment F{i} on X {{ {} }} ",
+                            nest(format!("...F{}", i + 1))
+                        )
+                    })
+                    .collect();
+                composed.push_str("fragment F70 on X { id } { pools { ...F0 } }");
+                let e = parse(&composed).expect_err("composed nesting");
+                assert!(
+                    matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
+                    "{e:?}"
+                );
+            })
+            .unwrap()
+            .join()
+            .expect("parsing a deep document overflowed the stack");
+
+        let mut diamond: String = (0..40)
+            .map(|i| format!("fragment F{i} on X {{ ...F{n} ...F{n} }} ", n = i + 1))
+            .collect();
+        diamond.push_str("fragment F40 on X { id } { pools { ...F0 } }");
+        let e = parse(&diamond).expect_err("exponential expansion");
+        assert!(
+            matches!(&e, Unsupported::Syntax(m) if m.contains("expands to more")),
+            "{e:?}"
+        );
+        // A diamond ending in an empty fragment expands no fields, and must still be refused.
+        let empty = diamond.replace("fragment F40 on X { id }", "fragment F40 on X { }");
+        assert_ne!(empty, diamond);
+        let e = parse(&empty).expect_err("exponential expansion of nothing");
+        assert!(
+            matches!(&e, Unsupported::Syntax(m) if m.contains("expands to more")),
+            "{e:?}"
+        );
+
+        let twenty = format!("{}id{}", "{ a ".repeat(20), " }".repeat(20));
+        parse(&twenty).expect("twenty levels is an ordinary query");
     }
 
     /// `_not_in` must not be read as `_not`, which would compare against a list and produce a

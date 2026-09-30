@@ -59,8 +59,12 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
             .iter()
             .flat_map(|t| derive_footguns(t).big_ints)
             .collect();
+        // DuckDB names the columns in scope; a hint drawn from every table's columns can name one this
+        // query cannot see, so every suggestion below is held to that scope, or not made.
+        let in_scope = candidate_bindings(raw);
         if big_ints.iter().any(|b| format!("{b}_dec") == col)
             && !all_cols.contains(&col.to_string())
+            && in_scope.iter().any(|c| c == col.trim_end_matches("_dec"))
         {
             return Some(format!(
                 "`{col}` is derived on the fly - it isn't a stored column, but you *can* select it. If \
@@ -81,7 +85,7 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
                 ));
             }
         }
-        let refs: Vec<&str> = all_cols.iter().map(String::as_str).collect();
+        let refs: Vec<&str> = in_scope.iter().map(String::as_str).collect();
         return Some(match closest(&col, &refs) {
             Some(c) => format!(
                 "no column `{col}`; the closest is `{c}`. Call `schema` for this table's columns."
@@ -240,6 +244,19 @@ fn between<'a>(s: &'a str, a: &str, b: &str) -> Option<&'a str> {
 }
 
 /// The text inside the first pair of double-quotes that appears after `marker`.
+/// The columns DuckDB lists as in scope, from `Candidate bindings: "a", "t.b"`, unqualified.
+fn candidate_bindings(raw: &str) -> Vec<String> {
+    let Some(at) = raw.find("Candidate bindings:") else {
+        return Vec::new();
+    };
+    let line = raw[at..].lines().next().unwrap_or("");
+    line.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+        .collect()
+}
+
 fn quoted_after(s: &str, marker: &str) -> Option<String> {
     let after = &s[s.find(marker)? + marker.len()..];
     let open = after.find('"')? + 1;
@@ -544,10 +561,35 @@ mod tests {
 
     #[test]
     fn unknown_column_suggests_the_closest_real_column() {
-        let raw = r#"Binder Error: Referenced column "valu" not found in FROM clause!"#;
+        // As DuckDB words it: the columns in scope follow on the next line.
+        let raw = "Binder Error: Referenced column \"valu\" not found in FROM clause!\n\
+                   Candidate bindings: \"from\", \"to\", \"value\"";
         let hint = enrich(raw, "SELECT valu FROM usdc__transfer", &schema()).unwrap();
         assert!(hint.contains("no column `valu`"));
         assert!(hint.contains("value"), "suggests value");
+    }
+
+    /// The hint suggested `amount`, from another table, for a query on one without it.
+    #[test]
+    fn unknown_column_suggests_only_a_column_in_scope() {
+        let raw = "Binder Error: Referenced column \"tox\" not found in FROM clause!\nCandidate bindings: \"value\", \"x.address\"";
+        let hint = enrich(raw, "SELECT tox FROM x", &schema()).unwrap();
+        assert!(
+            !hint.contains("`to`"),
+            "suggested a column out of scope: {hint}"
+        );
+        let raw = "Binder Error: Referenced column \"valeu\" not found in FROM clause!\nCandidate bindings: \"value\", \"x.address\"";
+        let hint = enrich(raw, "SELECT valeu FROM x", &schema()).unwrap();
+        assert!(hint.contains("the closest is `value`"), "{hint}");
+        // With no scope to go on, no column is suggested at all, rather than one from any table.
+        let raw = "Binder Error: Referenced column \"tox\" not found in FROM clause!";
+        let hint = enrich(raw, "SELECT tox FROM x", &schema()).unwrap();
+        assert!(!hint.contains("closest"), "{hint}");
+        // Nor is a `_dec` column's base named as present when this query cannot see it.
+        let raw = "Binder Error: Referenced column \"value_dec\" not found in FROM clause!\n\
+                   Candidate bindings: \"owner\", \"spender\"";
+        let hint = enrich(raw, "SELECT value_dec FROM x", &schema()).unwrap();
+        assert!(!hint.contains("exists as"), "{hint}");
     }
 
     #[test]
