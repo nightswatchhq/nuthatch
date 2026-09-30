@@ -53,7 +53,8 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 `acme/usdc` for any other tenant. Each mount's route depends on its own tenant alone, so it never
 changes on a restart, whatever else is mounted. A name is one or two parts, `alias` or `tenant/alias`,
 each of letters, digits, `_` and `-` and at most 64 characters; an alias may not end in `__moving`,
-which a move reserves, and the default tenant is never spelled out (`usdc`, not `default/usdc`). Any
+which a move reserves, and the default tenant is never spelled out (`usdc`, not `default/usdc`, nor
+`acme/usdc` when `[runtime] default_tenant = "acme"`). Any
 other name is refused with `400` before anything is recorded. `/<name>/ready` answers for the nest
 itself, and `GET /nests` lists the roster.
 
