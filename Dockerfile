@@ -9,6 +9,9 @@
 # every tag for no benefit, and would make the image's provenance harder to state, not easier.
 FROM debian:bookworm-slim
 
+# The MCP Registry verifies an image belongs to its entry (server.json) by this label.
+LABEL io.modelcontextprotocol.server.name="io.github.nightswatchhq/nuthatch"
+
 # `ca-certificates` is the only runtime dependency: outbound HTTPS to RPC endpoints, ABI resolvers and
 # webhook sinks. Everything else nuthatch needs is statically in the binary - that is the point of it.
 RUN apt-get update \
