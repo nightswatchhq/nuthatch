@@ -37,9 +37,6 @@ async fn retry_pause(pause: Duration) {
 /// a node. Splitting into bounded sub-batches keeps each request within common limits.
 const MAX_TIMESTAMP_BATCH: usize = 200;
 
-/// Clean header batches at the learned width before it is doubled again (#1570).
-const TIMESTAMP_WIDEN_AFTER: usize = 32;
-
 /// Return type of the self-recursive [`RpcClient::fetch_timestamp_batch`]. Boxed because an `async fn`
 /// cannot recurse into itself without a heap indirection.
 type TimestampBatchFuture<'a> =
@@ -212,31 +209,6 @@ impl std::fmt::Display for ClassifiedError {
 }
 
 impl std::error::Error for ClassifiedError {}
-
-/// A 403 or 429 on a **multi-item batch** is read as a refusal of the batch, not of the caller (#1570).
-///
-/// `arb1.arbitrum.io` answers 403 (a firewall page) to 200 headers in one batch and 429 to 50, and
-/// answers 10 at once: the size is the objection, so the pool neither benches the endpoint for bad
-/// credentials nor retries the same batch. The halves say which it was: a size limit passes them, and a
-/// real throttle or auth failure reaches a single request, which keeps its own classification.
-fn refused_batch(err: anyhow::Error, body: &Value) -> anyhow::Error {
-    let batch = body.as_array().is_some_and(|items| items.len() > 1);
-    if !batch
-        || !matches!(
-            class_of(&err),
-            Some(FailureClass::Terminal) | Some(FailureClass::RateLimited { .. })
-        )
-    {
-        return err;
-    }
-    anyhow::Error::new(ClassifiedError {
-        class: FailureClass::Narrowable {
-            suggested: None,
-            escalated_from_rate_limit: false,
-        },
-        detail: format!("the batch was refused, so it is narrowed: {err:#}"),
-    })
-}
 
 /// Re-classify an all-endpoints failure as [`FailureClass::Narrowable`] when **every** attempt was a
 /// rate limit (RFC-0028 §3d).
@@ -731,11 +703,6 @@ pub struct RpcClient {
     /// re-execution determinism. The RFC proposes the cache without noting this; the invalidation hook
     /// is the condition that makes it safe, not an optimisation on top.
     timestamps: std::sync::Mutex<HashMap<u64, u64>>,
-    /// The header batch width that last went through (#1570). An endpoint that refuses 200 at once
-    /// but takes 10 pays for the descent once rather than per chunk; clean batches widen it again.
-    timestamp_width: AtomicUsize,
-    /// Clean batches at the learned width since it last changed.
-    timestamp_wins: AtomicUsize,
 }
 
 impl RpcClient {
@@ -759,8 +726,6 @@ impl RpcClient {
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
-            timestamp_width: AtomicUsize::new(MAX_TIMESTAMP_BATCH),
-            timestamp_wins: AtomicUsize::new(0),
         })
     }
 
@@ -986,7 +951,6 @@ impl RpcClient {
                         true,
                         attempts > 1,
                     );
-                    let e = refused_batch(e, body);
                     if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
                         rate_limited += 1;
                     }
@@ -1427,7 +1391,7 @@ impl RpcClient {
         // Futures built eagerly rather than mapped inside the stream: the borrow of each chunk has to
         // outlive the stream, and a closure producing them cannot express that.
         let futures: Vec<_> = blocks
-            .chunks(self.timestamp_width.load(Ordering::Relaxed).max(1))
+            .chunks(MAX_TIMESTAMP_BATCH)
             .map(|c| self.fetch_timestamp_batch(c, false, true))
             .collect();
         let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -1533,7 +1497,7 @@ impl RpcClient {
         for round in 0..ROUNDS {
             use futures::stream::StreamExt;
             let futures: Vec<_> = missing
-                .chunks(self.timestamp_width.load(Ordering::Relaxed).max(1))
+                .chunks(MAX_TIMESTAMP_BATCH)
                 .map(|c| self.fetch_timestamp_batch(c, full, true))
                 .collect();
             let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -1640,31 +1604,6 @@ impl RpcClient {
     /// Reading the descent backwards off the final width was the tempting shortcut and it is unsound
     /// for exactly that second reason. So the width is carried rather than inferred, and the class is
     /// logged at each level instead of being reconstructed afterwards.
-    /// Record a header batch that went through. Narrowed below where it entered, its width is the most
-    /// this endpoint pool takes now; at full width, [`TIMESTAMP_WIDEN_AFTER`] in a row double it again,
-    /// so a passing throttle does not leave the client asking one header at a time.
-    fn learn_timestamp_width(&self, width: usize, entered_at: usize) {
-        if width < entered_at {
-            self.timestamp_width
-                .fetch_min(width.max(1), Ordering::Relaxed);
-            self.timestamp_wins.store(0, Ordering::Relaxed);
-            return;
-        }
-        let current = self.timestamp_width.load(Ordering::Relaxed);
-        if width < current || current >= MAX_TIMESTAMP_BATCH {
-            return;
-        }
-        if self.timestamp_wins.fetch_add(1, Ordering::Relaxed) + 1 >= TIMESTAMP_WIDEN_AFTER {
-            self.timestamp_wins.store(0, Ordering::Relaxed);
-            let _ = self.timestamp_width.compare_exchange(
-                current,
-                (current * 2).min(MAX_TIMESTAMP_BATCH),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-        }
-    }
-
     fn fetch_timestamp_batch_from<'a>(
         &'a self,
         blocks: &'a [u64],
@@ -1677,10 +1616,7 @@ impl RpcClient {
                 .fetch_timestamp_batch_once(blocks, full, entered_at)
                 .await
             {
-                Ok(v) => {
-                    self.learn_timestamp_width(blocks.len(), entered_at);
-                    Ok(v)
-                }
+                Ok(v) => Ok(v),
                 // A single block that still fails is a real failure - there is nothing left to halve,
                 // and recursing further would spin on a dead endpoint (the failure RFC-0028 avoided).
                 Err(e) if blocks.len() > 1 && batch_is_narrowable(&e) => {
@@ -2488,96 +2424,6 @@ mod tests {
             cache.len() <= super::TIMESTAMP_CACHE_MAX,
             "the cache must never exceed its ceiling"
         );
-    }
-
-    /// #1570: an endpoint shaped like `arb1.arbitrum.io`, which answers 403 to a 200-header batch, 429
-    /// to one over ten, and serves ten at once. Every timestamp arrives, the next request starts at the
-    /// width that worked, and an endpoint that refuses a single header still fails rather than spins.
-    #[tokio::test]
-    async fn a_batch_size_refusal_narrows_and_is_remembered() {
-        use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
-        use serde_json::{json, Value};
-        use std::sync::{Arc, Mutex};
-
-        async fn serve(refuse_singles: bool) -> (String, Arc<Mutex<Vec<usize>>>) {
-            let sizes: Arc<Mutex<Vec<usize>>> = Arc::default();
-            let seen = sizes.clone();
-            let app = Router::new().route(
-                "/",
-                post(move |Json(req): Json<Value>| {
-                    let seen = seen.clone();
-                    async move {
-                        let items = match &req {
-                            Value::Array(items) => items.clone(),
-                            item => vec![item.clone()],
-                        };
-                        seen.lock().unwrap().push(items.len());
-                        if items.len() > 100 {
-                            return (StatusCode::FORBIDDEN, "<html><body><h1>403</h1></body></html>")
-                                .into_response();
-                        }
-                        if items.len() > 10 || refuse_singles {
-                            let code = if refuse_singles {
-                                StatusCode::FORBIDDEN
-                            } else {
-                                StatusCode::TOO_MANY_REQUESTS
-                            };
-                            return (code, Json(json!({"jsonrpc":"2.0","error":{"code":429,"message":"Too Many Requests"}})))
-                                .into_response();
-                        }
-                        let answer = |item: &Value| {
-                            let b = u64::from_str_radix(
-                                item["params"][0].as_str().unwrap().trim_start_matches("0x"),
-                                16,
-                            )
-                            .unwrap();
-                            json!({"jsonrpc":"2.0","id":item["id"],"result":{"number":format!("0x{b:x}"),"timestamp":format!("0x{:x}", b * 10)}})
-                        };
-                        match req {
-                            Value::Array(items) => {
-                                Json(Value::Array(items.iter().map(answer).collect())).into_response()
-                            }
-                            item => Json(answer(&item)).into_response(),
-                        }
-                    }
-                }),
-            );
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = l.local_addr().unwrap();
-            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-            (format!("http://{addr}"), sizes)
-        }
-
-        let (url, sizes) = serve(false).await;
-        let c = RpcClient::new(vec![url]).unwrap();
-        let blocks: Vec<u64> = (1_000..1_300).collect();
-        let got = c
-            .block_timestamps(&blocks)
-            .await
-            .expect("narrowed to what the endpoint takes");
-        assert_eq!(got.len(), 300);
-        assert!(blocks.iter().all(|b| got[b] == b * 10));
-        // Distinct blocks, so nothing is served from the cache: the second call really asks.
-        sizes.lock().unwrap().clear();
-        let more: Vec<u64> = (2_000..2_300).collect();
-        c.block_timestamps(&more)
-            .await
-            .expect("the endpoint is still in use");
-        let second = sizes.lock().unwrap().clone();
-        assert!(
-            second.iter().all(|&n| n <= 10),
-            "the second call started over the learned width: {second:?}"
-        );
-
-        let (url, _) = serve(true).await;
-        let c = RpcClient::new(vec![url]).unwrap();
-        let refused = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            c.block_timestamps(&[1, 2, 3, 4]),
-        )
-        .await
-        .expect("a refusal of every request must end, not spin");
-        assert!(refused.is_err());
     }
 
     #[tokio::test]
