@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The engine every query runs on. One implementation until phase 2b puts a shadow beside it.
+/// The engine every query runs on: the one [`install_engine`] chose, else DuckDB.
 pub(crate) fn engine() -> &'static dyn Engine {
     static ENGINE: crate::engine_duck::DuckEngine = crate::engine_duck::DuckEngine;
     #[cfg(all(test, feature = "shadow-burrmill"))]
@@ -31,7 +31,63 @@ pub(crate) fn engine() -> &'static dyn Engine {
     if let Some(e) = TEST_PRIMARY.get() {
         return *e;
     }
+    if let Some(e) = PRIMARY.get() {
+        return *e;
+    }
     crate::engine_shadow::installed().unwrap_or(&ENGINE)
+}
+
+static PRIMARY: OnceLock<&'static dyn Engine> = OnceLock::new();
+
+/// The operator's switch between engines, read from this variable at startup.
+pub const ENV_ENGINE: &str = "NUTHATCH_ENGINE";
+
+/// Which engine serves: DuckDB, Burrmill alone, or DuckDB with Burrmill beside it in shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineChoice {
+    DuckDb,
+    Burrmill,
+    Shadow,
+}
+
+/// [`ENV_ENGINE`]'s value as a choice. Unset, a build carrying Burrmill shadows as it always has;
+/// asking a build without Burrmill for it is refused rather than served by DuckDB.
+pub fn choose_engine(value: Option<&str>) -> Result<EngineChoice> {
+    choose(value, cfg!(feature = "shadow-burrmill"))
+}
+
+fn choose(value: Option<&str>, built_with_burrmill: bool) -> Result<EngineChoice> {
+    let choice = match value.map(str::trim) {
+        None | Some("") if built_with_burrmill => return Ok(EngineChoice::Shadow),
+        None | Some("") => return Ok(EngineChoice::DuckDb),
+        Some("duckdb") => EngineChoice::DuckDb,
+        Some("burrmill") => EngineChoice::Burrmill,
+        Some("shadow") => EngineChoice::Shadow,
+        Some(other) => bail!("{ENV_ENGINE}={other}: expected duckdb, burrmill or shadow"),
+    };
+    if choice != EngineChoice::DuckDb && !built_with_burrmill {
+        bail!("{ENV_ENGINE} asks for {choice:?}, and this build has no Burrmill (feature `shadow-burrmill`)");
+    }
+    Ok(choice)
+}
+
+/// Install `choice` for the process. Once, before the first query.
+pub fn install_engine(choice: EngineChoice) -> Result<()> {
+    match choice {
+        EngineChoice::DuckDb => Ok(()),
+        #[cfg(feature = "shadow-burrmill")]
+        EngineChoice::Shadow => crate::engine_burrmill::enable_shadow(),
+        #[cfg(feature = "shadow-burrmill")]
+        EngineChoice::Burrmill => {
+            static BURRMILL: crate::engine_burrmill::BurrmillEngine =
+                crate::engine_burrmill::BurrmillEngine;
+            PRIMARY
+                .set(&BURRMILL)
+                .map_err(|_| anyhow::anyhow!("an engine is already installed"))
+        }
+        #[cfg(not(feature = "shadow-burrmill"))]
+        other => bail!("{other:?} needs a build with the `shadow-burrmill` feature"),
+    }
 }
 
 // The whole process on another engine, for a test whose queries run on threads it does not own.
@@ -4172,6 +4228,23 @@ template="pool"
             a[0]["parent_address"],
             Value::from("0x1f98431c8ad98523631ae4a59f267346ea31f984")
         );
+    }
+
+    /// The operator's switch: unset keeps what each build did before it, a build without Burrmill
+    /// refuses to pretend, and a typo is an error rather than a quiet default.
+    #[test]
+    fn the_engine_switch_reads_as_written() {
+        use EngineChoice::*;
+        assert_eq!(choose(None, true).unwrap(), Shadow);
+        assert_eq!(choose(Some(""), true).unwrap(), Shadow);
+        assert_eq!(choose(None, false).unwrap(), DuckDb);
+        assert_eq!(choose(Some("burrmill"), true).unwrap(), Burrmill);
+        assert_eq!(choose(Some(" duckdb "), true).unwrap(), DuckDb);
+        assert_eq!(choose(Some("shadow"), true).unwrap(), Shadow);
+        assert_eq!(choose(Some("duckdb"), false).unwrap(), DuckDb);
+        assert!(choose(Some("burrmill"), false).is_err());
+        assert!(choose(Some("shadow"), false).is_err());
+        assert!(choose(Some("burmill"), true).is_err());
     }
 
     /// A runaway query is interrupted by the watchdog and surfaced as a timeout, not left to hang.

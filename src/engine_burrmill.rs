@@ -1,6 +1,6 @@
-//! Burrmill behind [`crate::engine`], the second engine of shadow mode (RFC-0044 Amendment 2,
-//! phase 2b). Compiled only with the `shadow-burrmill` feature, and installed by
-//! [`enable_shadow`]; a release build never names it.
+//! Burrmill behind [`crate::engine`]: the second engine of shadow mode (RFC-0044 Amendment 2,
+//! phase 2b), or the only one when `NUTHATCH_ENGINE=burrmill` (phase 3a). Compiled only with the
+//! `shadow-burrmill` feature; chosen by [`crate::analytics::install_engine`].
 //!
 //! A session is one `burrmill::Engine` opened empty, with the tables the policy code binds registered
 //! as it binds them: the same segment list, the same hot rows, the same declared columns and window
