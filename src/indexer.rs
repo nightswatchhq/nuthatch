@@ -6308,10 +6308,16 @@ impl NestIngest {
         if ancestor < sealed_through {
             // Terminal (RFC-0026 §3): the next attempt re-derives the same watermark and bails
             // identically, so this nest is quarantined until an operator raises the finality depth.
+            // `detect_reorg` answers 0 when no checkpoint it holds is canonical, which is not a fork
+            // at genesis and must not read as one.
+            let fork = if ancestor == 0 {
+                "a fork deeper than every checkpoint this nest holds".to_string()
+            } else {
+                format!("a reorg to block {ancestor}")
+            };
             anyhow::bail!(TerminalFault(format!(
-                "reorg to block {ancestor} is below the sealed/finalized watermark \
-                 {sealed_through} - a finality violation this indexer cannot repair; \
-                 halting. Raise the chain's finality depth."
+                "{fork} is below the sealed/finalized watermark {sealed_through} - a finality \
+                 violation this indexer cannot repair; halting. Raise the chain's finality depth."
             )));
         }
         let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
@@ -10696,6 +10702,26 @@ template = "pool"
             behind.store.get_meta(LAST_BLOCK_KEY).unwrap().as_deref(),
             Some("30")
         );
+    }
+
+    /// A finality violation names the fork it saw. `detect_reorg` answers 0 when no checkpoint the
+    /// nest holds is canonical, and the halt used to report that as "reorg to block 0", sending an
+    /// operator to look for a fork at genesis.
+    #[tokio::test]
+    async fn a_finality_violation_says_when_no_checkpoint_survived() {
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0x0000000000000000000000000000000000000003").await;
+        seed_blocks(&nest, &[10, 20, 60, 100]);
+        nest.store.set_meta(SEALED_THROUGH_KEY, "60").unwrap();
+
+        let deep = format!("{:#}", nest.rollback_reorg(0).unwrap_err());
+        assert!(
+            deep.contains("deeper than every checkpoint") && !deep.contains("block 0"),
+            "{deep}"
+        );
+        let known = format!("{:#}", nest.rollback_reorg(50).unwrap_err());
+        assert!(known.contains("a reorg to block 50"), "{known}");
     }
 
     /// A supervisor over `n` nests named a, b, c… with a throwaway health surface.
