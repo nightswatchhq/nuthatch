@@ -3007,6 +3007,17 @@ async fn build_nest(
             // this surface: "sealed_through has not advanced" or "went backwards" fires after every
             // restart of a perfectly healthy nest, and an alert that cries wolf gets muted.
             m.set_sealed_through(shared_store.sealed_through());
+            // The cursor position likewise: until the next commit `/ready` read 0, measured a lag
+            // from the start block, and on a quiet chain declared a caught-up nest wedged after the
+            // stall grace.
+            if let Some(last) = shared_store
+                .get_meta(LAST_BLOCK_KEY)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                m.set_last_block(last);
+            }
             m
         },
         addresses,
