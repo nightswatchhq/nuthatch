@@ -81,7 +81,14 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
                 ));
             }
         }
-        let refs: Vec<&str> = all_cols.iter().map(String::as_str).collect();
+        // DuckDB names the columns in scope; every table's columns would suggest one this query cannot see.
+        let in_scope = candidate_bindings(raw);
+        let pool = if in_scope.is_empty() {
+            &all_cols
+        } else {
+            &in_scope
+        };
+        let refs: Vec<&str> = pool.iter().map(String::as_str).collect();
         return Some(match closest(&col, &refs) {
             Some(c) => format!(
                 "no column `{col}`; the closest is `{c}`. Call `schema` for this table's columns."
@@ -240,6 +247,19 @@ fn between<'a>(s: &'a str, a: &str, b: &str) -> Option<&'a str> {
 }
 
 /// The text inside the first pair of double-quotes that appears after `marker`.
+/// The columns DuckDB lists as in scope, from `Candidate bindings: "a", "t.b"`, unqualified.
+fn candidate_bindings(raw: &str) -> Vec<String> {
+    let Some(at) = raw.find("Candidate bindings:") else {
+        return Vec::new();
+    };
+    let line = raw[at..].lines().next().unwrap_or("");
+    line.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+        .collect()
+}
+
 fn quoted_after(s: &str, marker: &str) -> Option<String> {
     let after = &s[s.find(marker)? + marker.len()..];
     let open = after.find('"')? + 1;
@@ -548,6 +568,20 @@ mod tests {
         let hint = enrich(raw, "SELECT valu FROM usdc__transfer", &schema()).unwrap();
         assert!(hint.contains("no column `valu`"));
         assert!(hint.contains("value"), "suggests value");
+    }
+
+    /// The hint suggested `amount`, from another table, for a query on one without it.
+    #[test]
+    fn unknown_column_suggests_only_a_column_in_scope() {
+        let raw = "Binder Error: Referenced column \"tox\" not found in FROM clause!\nCandidate bindings: \"value\", \"x.address\"";
+        let hint = enrich(raw, "SELECT tox FROM x", &schema()).unwrap();
+        assert!(
+            !hint.contains("`to`"),
+            "suggested a column out of scope: {hint}"
+        );
+        let raw = "Binder Error: Referenced column \"valeu\" not found in FROM clause!\nCandidate bindings: \"value\", \"x.address\"";
+        let hint = enrich(raw, "SELECT valeu FROM x", &schema()).unwrap();
+        assert!(hint.contains("the closest is `value`"), "{hint}");
     }
 
     #[test]
