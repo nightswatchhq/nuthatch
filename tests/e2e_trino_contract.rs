@@ -498,8 +498,10 @@ fn translated_views(nest: &Path) -> serde_json::Map<String, serde_json::Value> {
     );
     assert_eq!(refused[0].0, "mean_value");
     assert!(refused[0].1.contains("`avg`"), "{}", refused[0].1);
+    let mut names = out.keys().map(String::as_str).collect::<Vec<_>>();
+    names.sort_unstable();
     assert_eq!(
-        out.keys().map(String::as_str).collect::<Vec<_>>(),
+        names,
         [
             "drift_summary",
             "sender_kinds",

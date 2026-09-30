@@ -1551,6 +1551,18 @@ pub(crate) mod duck_oracle {
     use duckdb::Connection;
     use serde_json::Value;
 
+    /// `v` with its keys sorted, as the port's `constant` writes them: DataFusion turns on serde_json's
+    /// `preserve_order`, under which DuckDB's own key order would print.
+    fn sorted_keys(v: &Value) -> String {
+        match v {
+            Value::Object(m) => {
+                serde_json::to_string(&m.iter().collect::<std::collections::BTreeMap<_, _>>())
+                    .unwrap_or_default()
+            }
+            v => v.to_string(),
+        }
+    }
+
     /// Parse and lower one authored entity `SELECT`, discarding its output column names.
     ///
     /// Most callers want only the relational shape: a circuit and a batch evaluator index by position and
@@ -2391,7 +2403,7 @@ pub(crate) mod duck_oracle {
                 raw.as_i64()
                     .map(i128::from)
                     .or_else(|| raw.as_str().and_then(|s| s.parse().ok()))
-                    .ok_or_else(|| anyhow!("{raw} does not fit an exact integer"))?,
+                    .ok_or_else(|| anyhow!("{} does not fit an exact integer", sorted_keys(raw)))?,
             ),
             "VARCHAR" => Scalar::Str(
                 raw.as_str()
