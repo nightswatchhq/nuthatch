@@ -3771,28 +3771,50 @@ mod tests {
 
     #[test]
     fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE token(id VARCHAR, symbol VARCHAR);\
-             INSERT INTO token VALUES ('yes', 'WETH'), ('yes', 'WETH'),\
-                 ('no', 'OTHER'), (NULL, 'WETH');\
-             CREATE TABLE pool(id VARCHAR, token0 VARCHAR);\
-             INSERT INTO pool VALUES ('a', 'yes'), ('b', 'no'), ('c', 'missing'), ('d', NULL);",
+        crate::engine::each_engine(
+            relation_membership_preserves_existence_with_nulls_and_duplicates_on,
+        );
+    }
+
+    fn relation_membership_preserves_existence_with_nulls_and_duplicates_on(
+        conn: &dyn crate::engine::Session,
+    ) {
+        conn.execute(
+            "CREATE TABLE token AS SELECT CAST(a AS VARCHAR) AS id, CAST(b AS VARCHAR) AS symbol \
+             FROM (VALUES ('yes', 'WETH'), ('yes', 'WETH'), ('no', 'OTHER'), (NULL, 'WETH')) v(a, b)",
         )
         .unwrap();
+        conn.execute(
+            "CREATE TABLE pool AS SELECT CAST(a AS VARCHAR) AS id, CAST(b AS VARCHAR) AS token0 \
+             FROM (VALUES ('a', 'yes'), ('b', 'no'), ('c', 'missing'), ('d', NULL)) v(a, b)",
+        )
+        .unwrap();
+        // Each statement here selects one column: the ids, in the statement's own order.
+        let ids = |sql: &str| -> Vec<String> {
+            let (rows, _) = conn
+                .collect(sql, None)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
+                .unwrap();
+            rows.iter()
+                .map(|r| {
+                    r.as_object()
+                        .unwrap()
+                        .values()
+                        .next()
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
         let schema = crate::graph_schema::parse("type Pool @entity { id: ID! token0: Token! } type Token @entity { id: ID! symbol: String! }").unwrap();
         let roots = crate::graph_query::parse(
             r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#,
         )
         .unwrap();
         let compiled = crate::graph_query::compile(&schema, &roots[0]).unwrap();
-        let mut stmt = conn.prepare(&compiled.sql).unwrap();
-        let actual: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(actual, ["a"]);
+        assert_eq!(ids(&compiled.sql), ["a"]);
         // SQL NULL must be false just as EXISTS is, even when the child set contains NULL.
         let predicate = compiled
             .sql
@@ -3803,13 +3825,7 @@ mod tests {
             .unwrap()
             .0;
         let sql = format!("SELECT b.id FROM pool b WHERE NOT ({predicate}) ORDER BY b.id");
-        let mut stmt = conn.prepare(&sql).unwrap();
-        let rejected: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(rejected, ["b", "c", "d"]);
+        assert_eq!(ids(&sql), ["b", "c", "d"]);
     }
 
     use super::*;
