@@ -2411,7 +2411,17 @@ pub fn lifecycle_routes(
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
             return unauthorized();
         }
+        // A name no mount could have is a caller's mistake. An absent valid name stays a 200 so a
+        // retried DELETE is not a failure, but says so, so a typo does not read as an unmount.
+        if let Err(e) = check_mount_name(&name, jobs.default_tenant()) {
+            return (
+                status_for(&e),
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            );
+        }
         let mut h = handles.lock().await;
+        let was_mounted =
+            h.states.iter().any(|(n, _)| *n == name) || h.suspended.contains_key(&name);
         let nid = h
             .states
             .iter()
@@ -2426,7 +2436,10 @@ pub fn lifecycle_routes(
         }
         jobs.forget(&name);
         if !q.reclaim {
-            return (StatusCode::OK, Json(serde_json::json!({"unmounted": name})));
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"unmounted": name, "was_mounted": was_mounted})),
+            );
         }
         let reclaim = match nid {
             Ok(Some(nid)) => h.reclaim(&nid).map_err(|e| format!("{e:#}")),
