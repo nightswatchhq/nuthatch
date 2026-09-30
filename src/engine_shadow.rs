@@ -515,6 +515,17 @@ impl Session for ShadowSession {
         )
     }
 
+    fn load_relation(&self, table: &str, rows: &[&Value]) -> Result<()> {
+        self.both(
+            &format!("load_relation {table}"),
+            |s| s.load_relation(table, rows),
+            |r| match r {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("{e:#}"),
+            },
+        )
+    }
+
     fn bind_facts(
         &self,
         table: &str,

@@ -1778,3 +1778,40 @@ max_rows = 10000
     assert!(two.iter().any(|(k, _)| k == "USDCe"), "{two:?}");
     shutdown_and_settle(rt).await;
 }
+
+/// From the 3.13.1 hardening pass: every maintained cell reached `/sql` as text, so a `COUNT(*)`
+/// column was VARCHAR, `sum(n)` would not bind and `max(n)` compared strings ("5" over "29").
+const COUNTS: &str = r#"[[entities]]
+name = "counts"
+query = "SELECT t.to, COUNT(*) AS n FROM usdc__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 10000
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_maintained_count_is_numeric_in_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for block in 1..=CHAIN_LEN {
+        tape.insert_block(block, canonical_block(block));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_declared(dir.path(), tape, CHAIN_LEN, COUNTS).await;
+    rt.state.entities[0].flush();
+    let one = |sql: &'static str| {
+        let rt = &rt;
+        async move {
+            let (status, body) = get_json(rt, &format!("/sql?q={}", urlencoding_lite(sql))).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{sql} -> {body}");
+            body["rows"][0].clone()
+        }
+    };
+    assert_eq!(
+        one("SELECT typeof(n) AS t FROM counts LIMIT 1").await["t"],
+        "HUGEINT"
+    );
+    let summed = one("SELECT sum(n) AS s FROM counts").await["s"].to_string();
+    let raw = one("SELECT count(*) AS c FROM usdc__transfer").await["c"].to_string();
+    assert_eq!(summed.trim_matches('"'), raw.trim_matches('"'));
+    shutdown_and_settle(rt).await;
+}

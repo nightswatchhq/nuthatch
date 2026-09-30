@@ -100,6 +100,9 @@ impl Session for DuckSession {
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
         self.conn.load_hot(table, rows)
     }
+    fn load_relation(&self, table: &str, rows: &[&Value]) -> Result<()> {
+        self.conn.load_relation(table, rows)
+    }
     fn bind_facts(
         &self,
         table: &str,
@@ -286,8 +289,12 @@ impl Session for Connection {
         physical_parquet_scans(&plan)
     }
 
+    fn load_relation(&self, table: &str, rows: &[&Value]) -> Result<()> {
+        load_hot_temp(self, &hot_table(table), rows, true)
+    }
+
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
-        load_hot_temp(self, &hot_table(table), rows)
+        load_hot_temp(self, &hot_table(table), rows, false)
     }
 
     fn bind_facts(
@@ -803,7 +810,11 @@ fn quote_identifier(name: &str) -> String {
 /// exactly how `seal::rows_to_batch` derives the Parquet schema - so no `schema.json` is required.
 /// Value marshalling mirrors seal exactly: counter columns are `u64` (0 if absent), every other column
 /// is the JSON string as-is, or the JSON value stringified, or NULL when absent/null.
-fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value]) -> Result<()> {
+///
+/// `typed` is a maintained relation's load: a column whose values are all JSON integers is `HUGEINT`
+/// (the cell is an `i128`) and one whose values are all booleans is `BOOLEAN`, so `sum(n)` over a
+/// `count(*)` works. Event tables keep their text columns, which must match the sealed Parquet.
+fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value], typed: bool) -> Result<()> {
     let mut columns: BTreeSet<String> = BTreeSet::new();
     for r in rows {
         if let Some(obj) = r.as_object() {
@@ -814,9 +825,20 @@ fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value]) -> Result<()> {
     if columns.is_empty() {
         bail!("hot rows have no columns");
     }
+    let types: Vec<&'static str> = columns
+        .iter()
+        .map(|c| {
+            if typed {
+                relation_col_type(rows, c)
+            } else {
+                crate::analytics::hot_col_type(c)
+            }
+        })
+        .collect();
     let coldefs: Vec<String> = columns
         .iter()
-        .map(|c| format!("\"{c}\" {}", crate::analytics::hot_col_type(c)))
+        .zip(&types)
+        .map(|(c, t)| format!("\"{c}\" {t}"))
         .collect();
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS \"{name}\"; CREATE TEMP TABLE \"{name}\" ({})",
@@ -826,13 +848,43 @@ fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value]) -> Result<()> {
     for row in rows {
         let vals: Vec<DuckValue> = columns
             .iter()
-            .map(|c| json_to_duck(row.get(c), c))
+            .zip(&types)
+            .map(|(c, t)| match (*t, row.get(c)) {
+                (_, None | Some(Value::Null)) if typed => DuckValue::Null,
+                ("HUGEINT", Some(v)) => v
+                    .to_string()
+                    .parse::<i128>()
+                    .map_or(DuckValue::Null, DuckValue::HugeInt),
+                ("BOOLEAN", Some(v)) => v.as_bool().map_or(DuckValue::Null, DuckValue::Boolean),
+                _ => json_to_duck(row.get(c), c),
+            })
             .collect();
         let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
         app.append_row(refs.as_slice())?;
     }
     app.flush()?;
     Ok(())
+}
+
+/// A maintained relation's column type, from its non-null cells.
+fn relation_col_type(rows: &[&Value], col: &str) -> &'static str {
+    let cells: Vec<&Value> = rows
+        .iter()
+        .filter_map(|r| r.get(col))
+        .filter(|v| !v.is_null())
+        .collect();
+    if cells.is_empty() {
+        "VARCHAR"
+    } else if cells
+        .iter()
+        .all(|v| v.is_number() && v.to_string().parse::<i128>().is_ok())
+    {
+        "HUGEINT"
+    } else if cells.iter().all(|v| v.is_boolean()) {
+        "BOOLEAN"
+    } else {
+        "VARCHAR"
+    }
 }
 
 /// One JSON cell → a DuckDB value, mirroring `seal::rows_to_batch`'s marshalling for a matching schema.

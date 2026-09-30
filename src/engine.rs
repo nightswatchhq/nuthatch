@@ -151,6 +151,12 @@ pub(crate) trait Session: Send {
     /// Load one table's hot rows so that `bind_facts(.., hot = true, ..)` can union them in.
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()>;
 
+    /// [`Session::load_hot`] for a maintained relation: it has no sealed Parquet to line up with, so
+    /// its columns are typed from its own cells (all integers `HUGEINT`, all booleans `BOOLEAN`).
+    fn load_relation(&self, table: &str, rows: &[&Value]) -> Result<()> {
+        self.load_hot(table, rows)
+    }
+
     /// Define `table` over its sealed segments and, when `hot`, the rows `load_hot` staged, with
     /// every declared column present and the derived `*_dec`/`*_overflow` columns projected.
     /// `Ok(false)` when there was nothing to define: no segments, no hot rows and no declared

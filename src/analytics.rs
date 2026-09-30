@@ -2609,8 +2609,14 @@ fn define_views_bound(
         // The hot tip: load this table's unsealed rows into a temp table, then union it in. Columns are
         // derived from the rows themselves (like the sealed Parquet, `seal::rows_to_batch`), so this
         // works with or without a `schema.json`. The `*_dec` derived columns still come from the schema.
+        // Undeclared and never sealed is a maintained relation, typed from its own cells.
+        let relation = cols.is_empty() && sealed.is_empty();
         let hot_loaded = !hot_rows.is_empty()
-            && match session.load_hot(table, &hot_rows) {
+            && match if relation {
+                session.load_relation(table, &hot_rows)
+            } else {
+                session.load_hot(table, &hot_rows)
+            } {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
