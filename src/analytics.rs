@@ -3866,13 +3866,14 @@ mod tests {
 
     #[test]
     fn dependency_closure_reaches_sources_beyond_eight_views() {
+        each_engine(dependency_closure_reaches_sources_beyond_eight_views_on);
+    }
+
+    fn dependency_closure_reaches_sources_beyond_eight_views_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE source_facts (amount INTEGER); INSERT INTO source_facts VALUES (7)",
-        )
-        .unwrap();
+        conn.execute("CREATE TABLE source_facts AS SELECT 7 AS amount")
+            .unwrap();
         for i in 0..12 {
             let source = if i == 0 {
                 "source_facts".to_string()
@@ -3881,7 +3882,7 @@ mod tests {
             };
             let sql = format!("CREATE VIEW layer_{i} AS SELECT amount FROM {source};");
             std::fs::write(dir.path().join(format!("views/{i:02}.sql")), &sql).unwrap();
-            conn.execute_batch(&sql).unwrap();
+            conn.execute(&sql).unwrap();
         }
         let named = ["layer_11".to_string()].into_iter().collect();
         let expected: std::collections::BTreeSet<_> = (0..12)
@@ -3889,22 +3890,28 @@ mod tests {
             .chain(std::iter::once("source_facts".to_string()))
             .collect();
         assert_eq!(
-            reachable_tables(&conn, dir.path(), &named).unwrap(),
+            reachable_tables(conn, dir.path(), &named).unwrap(),
             expected
         );
-        assert_eq!(expand_through_views(&conn, &named), expected);
+        assert_eq!(expand_through_views(conn, &named), expected);
         // Even invalid, cyclic authored definitions must terminate during discovery.
         std::fs::write(dir.path().join("views/12.sql"),
             "CREATE VIEW cycle_a AS SELECT * FROM cycle_b; CREATE VIEW cycle_b AS SELECT * FROM cycle_a;").unwrap();
         let cycle = ["cycle_a".to_string(), "cycle_b".to_string()]
             .into_iter()
             .collect();
-        assert_eq!(reachable_tables(&conn, dir.path(), &cycle).unwrap(), cycle);
+        assert_eq!(reachable_tables(conn, dir.path(), &cycle).unwrap(), cycle);
     }
     /// RFC-0059: a two-sided window exposes only `(after, through]`, across sealed and hot, and names
     /// only the segments that overlap it. The count alone cannot tell pruning from the predicate.
     #[test]
     fn a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments() {
+        each_engine(a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments_on);
+    }
+
+    fn a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments_on(
+        conn: &dyn Session,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("schema.json"),
@@ -3926,9 +3933,8 @@ mod tests {
                 .collect(),
         );
         let count = |after: Option<u64>, through: Option<u64>| {
-            let conn = Connection::open_in_memory().unwrap();
             let defined = define_views_bound(
-                &conn,
+                conn,
                 dir.path(),
                 &hot,
                 30,
@@ -3939,11 +3945,20 @@ mod tests {
                 false,
             )
             .unwrap();
-            let n: u64 = conn
-                .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            let n = conn
+                .one_value("SELECT count(*) FROM t")
+                .unwrap()
+                .as_u64()
                 .unwrap();
-            let hot_loaded: u64 = conn
-                .query_row("SELECT count(*) FROM \"__hot_t\"", [], |r| r.get(0))
+            // Where each engine keeps the hot rows it was handed.
+            let hot = match conn.engine_version().starts_with("burrmill") {
+                true => "t__hot",
+                false => "__hot_t",
+            };
+            let hot_loaded = conn
+                .one_value(&format!("SELECT count(*) FROM \"{hot}\""))
+                .ok()
+                .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             (n, defined.tables["t"].segments, hot_loaded)
         };
@@ -7290,6 +7305,10 @@ template="pool"
     /// quietly.
     #[test]
     fn an_authored_view_resolves_on_a_cold_nest_with_no_rows() {
+        each_engine(an_authored_view_resolves_on_a_cold_nest_with_no_rows_on);
+    }
+
+    fn an_authored_view_resolves_on_a_cold_nest_with_no_rows_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -7306,10 +7325,9 @@ template="pool"
         )
         .unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &empty,
             u64::MAX,
@@ -7318,17 +7336,19 @@ template="pool"
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path(), None);
+        define_nest_views(conn, dir.path(), None);
 
         // The base table exists as an empty typed view…
         let n: i64 = conn
-            .query_row("SELECT count(*) FROM tok__transfer", [], |r| r.get(0))
+            .one_value("SELECT count(*) FROM tok__transfer")
+            .map(|v| v.as_i64().expect("an integer count"))
             .expect("a declared table with no rows must still resolve");
         assert_eq!(n, 0);
 
         // …and so does the authored view built on it, including the derived `_dec` column.
         let n: i64 = conn
-            .query_row("SELECT count(*) FROM big_transfers", [], |r| r.get(0))
+            .one_value("SELECT count(*) FROM big_transfers")
+            .map(|v| v.as_i64().expect("an integer count"))
             .expect("an authored view on an empty table must resolve to zero rows, not fail");
         assert_eq!(n, 0);
     }
@@ -7341,6 +7361,10 @@ template="pool"
     /// mechanism is missing passes for the wrong reason.
     #[test]
     fn a_view_the_statement_cannot_reach_is_not_redefined() {
+        each_engine(a_view_the_statement_cannot_reach_is_not_redefined_on);
+    }
+
+    fn a_view_the_statement_cannot_reach_is_not_redefined_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -7361,9 +7385,8 @@ template="pool"
         )
         .unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &HotRows::new(),
             u64::MAX,
@@ -7376,21 +7399,21 @@ template="pool"
             ["a".to_string(), "tok__transfer".to_string()]
                 .into_iter()
                 .collect();
-        define_nest_views(&conn, dir.path(), Some(&wanted));
+        define_nest_views(conn, dir.path(), Some(&wanted));
         assert!(
-            conn.prepare("SELECT * FROM a").is_ok(),
+            conn.has_relation("a"),
             "the view the statement reaches is defined"
         );
         assert!(
-            conn.prepare("SELECT * FROM b").is_err(),
+            !conn.has_relation("b"),
             "a view the statement cannot reach must not be bound - that bind, over every segment \
              behind every table it touches, was the fixed cost under every request"
         );
 
         // The positive control: `None` still defines everything, as the warm-restart callers rely on.
-        define_nest_views(&conn, dir.path(), None);
+        define_nest_views(conn, dir.path(), None);
         assert!(
-            conn.prepare("SELECT * FROM b").is_ok(),
+            conn.has_relation("b"),
             "with no reachability set every authored view is defined"
         );
     }
@@ -7440,6 +7463,12 @@ template="pool"
     /// `refresh_stale_artifacts` regenerates a missing schema before anything reads it.
     #[test]
     fn without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it() {
+        each_engine(without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it_on);
+    }
+
+    fn without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it_on(
+        conn: &dyn Session,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -7448,10 +7477,9 @@ template="pool"
         )
         .unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &empty,
             u64::MAX,
@@ -7460,11 +7488,10 @@ template="pool"
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path(), None);
+        define_nest_views(conn, dir.path(), None);
 
         assert!(
-            conn.query_row("SELECT count(*) FROM big_transfers", [], |r| r
-                .get::<_, i64>(0))
+            conn.one_value("SELECT count(*) FROM big_transfers")
                 .is_err(),
             "with no schema.json there is no typed empty view, so the authored view cannot resolve - \
              this is the failure `refresh_stale_artifacts` prevents by regenerating the schema"
@@ -7626,6 +7653,10 @@ template="pool"
     /// commit that added the event without regenerating.
     #[test]
     fn the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it() {
+        each_engine(the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it_on);
+    }
+
+    fn the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("abis")).unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
@@ -7719,9 +7750,8 @@ events = ["Minted", "Withdrawn"]
 
         // Before the fix this view fails to bind at all (pinned with a hand-built fixture above);
         // here, with everything built through the real chain, it must resolve.
-        let conn = Connection::open_in_memory().unwrap();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &hot,
             u64::MAX,
@@ -7730,25 +7760,19 @@ events = ["Minted", "Withdrawn"]
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path(), None);
-        let row = conn
-            .query_row(
+        define_nest_views(conn, dir.path(), None);
+        let (rows, _) = conn
+            .collect(
                 "SELECT minted_pool, minted_value, withdrawn_recipient, withdrawn_value FROM tok_network",
-                [],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                    ))
-                },
+                None,
             )
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
             .expect("real constructor chain: the view must resolve, not just the hand-built one");
-        assert_eq!(row.0, "0xpool");
-        assert_eq!(row.1, "42");
-        assert_eq!(row.2, None);
-        assert_eq!(row.3, None);
+        let row = &rows[0];
+        assert_eq!(row["minted_pool"], "0xpool");
+        assert_eq!(row["minted_value"], "42");
+        assert_eq!(row["withdrawn_recipient"], Value::Null);
+        assert_eq!(row["withdrawn_value"], Value::Null);
     }
 
     /// #729's counterpart to the #663 test above: the table itself is never missing, only its *column
@@ -7931,6 +7955,10 @@ events = ["Transfer"]
     /// granularity.
     #[test]
     fn one_premature_view_does_not_kill_the_others_in_its_file() {
+        each_engine(one_premature_view_does_not_kill_the_others_in_its_file_on);
+    }
+
+    fn one_premature_view_does_not_kill_the_others_in_its_file_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -7949,10 +7977,9 @@ events = ["Transfer"]
         )
         .unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &empty,
             u64::MAX,
@@ -7961,17 +7988,16 @@ events = ["Transfer"]
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path(), None);
+        define_nest_views(conn, dir.path(), None);
 
         for v in ["ok_one", "ok_two"] {
-            conn.query_row(&format!("SELECT count(*) FROM {v}"), [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap_or_else(|e| panic!("{v} must exist despite a sibling statement failing: {e}"));
+            conn.one_value(&format!("SELECT count(*) FROM {v}"))
+                .unwrap_or_else(|e| {
+                    panic!("{v} must exist despite a sibling statement failing: {e}")
+                });
         }
         assert!(
-            conn.query_row("SELECT count(*) FROM premature", [], |r| r.get::<_, i64>(0))
-                .is_err(),
+            conn.one_value("SELECT count(*) FROM premature").is_err(),
             "the genuinely-unresolvable view is still absent, which is correct"
         );
     }
@@ -8095,8 +8121,8 @@ events = ["Transfer"]
     ///
     /// The cases below are deliberately ones the denylist does **not** list: if this test passes, the
     /// allowlist is carrying weight of its own rather than shadowing the older control.
-    /// The walks `/sql`'s allowlist runs on: DuckDB's, and Burrmill's where it is built in.
-    fn allowlist_sessions() -> Vec<Box<dyn Session>> {
+    /// A bare session on every engine this build carries: DuckDB, and Burrmill where it is built in.
+    fn engines() -> Vec<Box<dyn Session>> {
         #[allow(unused_mut)]
         let mut sessions: Vec<Box<dyn Session>> =
             vec![Box::new(Connection::open_in_memory().unwrap())];
@@ -8107,9 +8133,17 @@ events = ["Transfer"]
         sessions
     }
 
+    /// Run a test body once on each engine, from its own setup, naming the engine for a failure.
+    fn each_engine(body: impl Fn(&dyn Session)) {
+        for session in engines() {
+            eprintln!("on {}", session.engine_version());
+            body(session.as_ref());
+        }
+    }
+
     #[test]
     fn the_allowlist_refuses_functions_the_denylist_never_heard_of() {
-        for (conn, q) in allowlist_sessions().iter().flat_map(|c| {
+        for (conn, q) in engines().iter().flat_map(|c| {
             [
                 // Not in FORBIDDEN_FNS - inert today only because the extension is not bundled.
                 "SELECT * FROM read_xlsx('/etc/passwd')",
@@ -8136,7 +8170,7 @@ events = ["Transfer"]
     /// distinguish it from a real table, so the name has to be checked.
     #[test]
     fn a_path_in_table_position_is_not_a_table_name() {
-        for (conn, q) in allowlist_sessions().iter().flat_map(|c| {
+        for (conn, q) in engines().iter().flat_map(|c| {
             [
                 "SELECT * FROM '/etc/passwd'",
                 "SELECT * FROM '/x.parquet'",
@@ -8156,7 +8190,7 @@ events = ["Transfer"]
     /// which is a broken dashboard rather than a breach, but still a bug.
     #[test]
     fn ordinary_analytical_sql_still_passes_the_allowlist() {
-        for (conn, q) in allowlist_sessions().iter().flat_map(|c| {
+        for (conn, q) in engines().iter().flat_map(|c| {
             [
                 "SELECT * FROM usdc__transfer",
                 r#"SELECT "from", "to", value_dec FROM usdc__transfer WHERE value_dec > 100"#,
