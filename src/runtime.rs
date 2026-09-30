@@ -2584,7 +2584,8 @@ pub fn lifecycle_routes(
         if let Some(job) = jobs.get(&name).filter(|j| !j.phase.finished()) {
             return (StatusCode::CONFLICT, Json(serde_json::json!(job)));
         }
-        let job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
+        let mut job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
+        job.is_move = true;
         jobs.put(job.clone());
         spawn_move_job(handles, jobs, name, nid);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
@@ -3022,6 +3023,10 @@ pub async fn start_mount_jobs(
     {
         let h = handles.lock().await;
         for (name, state) in &h.states {
+            // A move interrupted by the restart is live on its old nest and not done.
+            if jobs.get(name).is_some_and(|j| j.is_move && !j.phase.finished()) {
+                continue;
+            }
             jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live));
         }
         for (name, nid) in &h.suspended {
@@ -3032,7 +3037,14 @@ pub async fn start_mount_jobs(
         for job in jobs.unfinished() {
             tracing::info!("resuming the mount of '{}' a restart interrupted", job.name);
             let nid = job.nid.as_deref().and_then(|n| Nid::parse(n).ok());
-            spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid);
+            match (job.is_move, nid) {
+                (true, Some(nid)) => {
+                    spawn_move_job(handles.clone(), jobs.clone(), job.name, nid);
+                }
+                (_, nid) => {
+                    spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid);
+                }
+            }
         }
     }
     jobs
@@ -3745,7 +3757,14 @@ impl RuntimeHandles {
     /// reported failure and a completed change - the worst of both. A loud warning is the honest
     /// outcome, and the operator can fix the file.
     fn persist(&self) {
-        let names: Vec<String> = self.states.iter().map(|(n, _)| n.clone()).collect();
+        // A move's staging mount is never recorded: a restart mid-move keeps the old nest, and the
+        // move job, resumed, stages the new one again.
+        let names: Vec<String> = self
+            .states
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| !n.ends_with(STAGING_SUFFIX))
+            .collect();
         let suspended: Vec<String> = self.suspended.keys().cloned().collect();
         if let Err(e) = persist_mounted_nests(
             &self.mount_ctx.dir,

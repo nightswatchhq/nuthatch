@@ -2781,3 +2781,58 @@ async fn names_boot_would_refuse_are_refused_at_the_api() {
         table.mounts
     );
 }
+
+/// From the 3.13.0 tyre-kick: a restart in the middle of a move. The staging mount is never
+/// written to `mounts.toml`, so the table still loads and names only the old nest, and the move job
+/// resumes as a move and finishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_mid_move_resumes_the_move() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("d4".repeat(32), "e5".repeat(32));
+    let (mut handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+
+    // Where a crash would find a move: the new nest staged beside the old one.
+    let staging = runtime::RuntimeHandles::staging_name("usdc");
+    handles
+        .mount(&staging, Some(runtime::Nid::parse(&new_nid).unwrap()))
+        .await
+        .expect("stage");
+    let table = runtime::MountTable::load(roost.path()).expect("the table loads mid-move");
+    assert_eq!(
+        table.mounts.len(),
+        1,
+        "the staging mount was persisted: {:?}",
+        table.mounts
+    );
+    assert_eq!(table.mounts[0].nid, old_nid);
+
+    // The restart: the staging mount is gone, and the move job is on disk, unfinished.
+    handles.unmount(&staging).await.unwrap();
+    std::fs::write(
+        roost.path().join(nuthatch::mount_jobs::JOBS_FILE),
+        format!(
+            r#"[{{"name":"usdc","nid":"{new_nid}","phase":"joining","since_unixtime":1,"is_move":true}}]"#
+        ),
+    )
+    .unwrap();
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    let served = handles
+        .lock()
+        .await
+        .states
+        .iter()
+        .find(|(n, _)| n == "usdc")
+        .and_then(|(_, s)| s.nid.as_deref().map(str::to_string));
+    assert_eq!(
+        served.as_deref(),
+        Some(new_nid.as_str()),
+        "the resumed move did not finish"
+    );
+}

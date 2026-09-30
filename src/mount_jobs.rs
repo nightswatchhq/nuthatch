@@ -47,6 +47,9 @@ pub struct MountJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub since_unixtime: u64,
+    /// A move to `nid` rather than a mount of it, so a restart resumes it as a move (#1549).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_move: bool,
 }
 
 impl MountJob {
@@ -57,6 +60,7 @@ impl MountJob {
             phase,
             reason: None,
             since_unixtime: now_unix(),
+            is_move: false,
         }
     }
 }
