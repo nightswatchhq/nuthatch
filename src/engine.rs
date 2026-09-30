@@ -210,8 +210,7 @@ pub(crate) trait Session: Send {
 #[cfg(test)]
 pub(crate) fn test_sessions() -> Vec<Box<dyn Session>> {
     #[allow(unused_mut)]
-    let mut sessions: Vec<Box<dyn Session>> =
-        vec![Box::new(duckdb::Connection::open_in_memory().unwrap())];
+    let mut sessions: Vec<Box<dyn Session>> = vec![crate::engine_duck::in_memory()];
     #[cfg(feature = "shadow-burrmill")]
     sessions.push(crate::engine_burrmill::BurrmillEngine.open_bare().unwrap());
     sessions

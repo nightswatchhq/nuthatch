@@ -63,8 +63,6 @@ const KNOWN: &[&str] = &[
     "engine_duck.rs", // the `engine::Session` implementation: what analytics.rs used to hold
     "analytics_scalars.rs", // bounded pure Arrow scalar conversions, registered by analytics
     "graft.rs",     // canonical plan, engine version, determinism gate
-    "seal.rs",      // segment-binding oracle (test-only)
-    "port_emit.rs", // emitted-check oracle (test-only)
     "authored_entity_spike.rs", // RFC-0041 spike, reachable via `nuthatch bench`
     "dune_views.rs", // AST of authored views, for RFC-0055 S3's translation
 ];
