@@ -180,10 +180,10 @@ pub fn load(dir: &Path) -> Result<Vec<EntityDecl>> {
 }
 
 pub fn validate(dir: &Path) -> Vec<EntityIssue> {
-    let schema = crate::config::Config::load(dir)
+    let registry = crate::config::Config::load(dir)
         .ok()
-        .and_then(|cfg| crate::registry::from_nest(dir, &cfg).ok())
-        .map(|registry| registry.schema());
+        .and_then(|cfg| crate::registry::from_nest(dir, &cfg).ok());
+    let schema = registry.as_ref().map(|registry| registry.schema());
     let path = dir.join(ENTITY_FILE);
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -244,13 +244,22 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
                     format!("cannot determine entity dependencies: {e}"),
                 )),
             }
-            if let Some(schema) = &schema {
-                // Only SQL the lowerer accepts is typed as the circuit reads it. Anything else
-                // binds as before, so typing cannot admit a shape `dev` refuses.
-                let reads = crate::entity_lower::lower(&sql)
-                    .map(|plan| wide_reads(schema, &plan))
-                    .unwrap_or_default();
-                match first_unnarrowable(dir, &reads) {
+            // `dev` starts an entity by lowering and binding it (`indexer::start_entities`), so
+            // `check` refuses whatever those refuse, with their words (#1590).
+            let plan = match crate::entity_lower::lower(&sql) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    issues.push(issue(&name, format!("{e:#}")));
+                    continue;
+                }
+            };
+            if let (Some(registry), Some(schema)) = (&registry, &schema) {
+                if let Err(e) = bind_as_dev(dir, &name, &plan, registry) {
+                    issues.push(issue(&name, format!("{e:#}")));
+                    continue;
+                }
+                let reads = wide_reads(schema, &plan);
+                match first_unnarrowable(dir, schema, &reads) {
                     Ok(None) => {}
                     Ok(Some(found)) => {
                         issues.push(issue(
@@ -291,8 +300,9 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
                             issues.push(issue(&name, "declared key repeats a column"));
                         }
                         if !entity.key.is_empty() && !issues.iter().any(|i| i.name == name) {
-                            match crate::analytics::query_guarded(
+                            match cold_query(
                                 dir,
+                                schema,
                                 &sql,
                                 crate::analytics::QueryGuard {
                                     // Authoring validation must be bounded too. `max_rows` is an
@@ -386,6 +396,49 @@ fn plan_ast(conn: &Connection, sql: &str) -> Result<Value> {
             r.get(0)
         })?;
     Ok(serde_json::from_str(&raw)?)
+}
+
+/// Bind a lowered entity to this nest the way it is started: its name must not shadow a decoded or
+/// offchain table, and every table and column it reads must exist. `dev` and `check` both call this,
+/// so neither can accept an entity the other refuses (#1590).
+pub(crate) fn bind_as_dev(
+    dir: &Path,
+    name: &str,
+    plan: &crate::entity_plan::Plan,
+    registry: &crate::registry::DecodeRegistry,
+) -> Result<(crate::entity_bind::Binding, crate::entity_offchain::Tables)> {
+    // An entity that shadows a decoded table would silently take that table's name on the
+    // analytical surface, so `SELECT * FROM usdc__transfer` would answer from a maintained
+    // relation instead of the facts. Refused at load, where it is a typo, rather than at the
+    // first query, where it is a mystery.
+    if let Some(t) = registry
+        .schema()
+        .iter()
+        .find(|t| t.table.eq_ignore_ascii_case(name))
+    {
+        bail!(
+            "entity `{name}` has the same name as the decoded table `{}`. Rename the entity: on the \
+             SQL surface one would shadow the other",
+            t.table
+        )
+    }
+    if crate::entity_offchain::table_of(name).is_some() {
+        bail!(
+            "entity `{name}` is named inside the `{}` namespace, where it would shadow an offchain \
+             table on the SQL surface. Rename the entity",
+            crate::entity_offchain::OFFCHAIN_NAMESPACE
+        )
+    }
+    // The manifest is read only for an entity that names an offchain table, so a damaged one
+    // cannot stop a chain-only nest from starting.
+    let offchain = if crate::entity_offchain::reads_offchain(plan) {
+        crate::entity_offchain::Tables::load(dir)?
+    } else {
+        crate::entity_offchain::Tables::none()
+    };
+    let binding = crate::entity_bind::Binding::bind_with_offchain(plan, registry, &offchain)
+        .with_context(|| format!("binding entity `{name}` to this nest's tables"))?;
+    Ok((binding, offchain))
 }
 
 /// Whether a column is stored as a decimal string but read by the entity circuit as a checked `i128`.
@@ -486,7 +539,30 @@ fn quote_ident(s: &str) -> String {
 /// circuit converts every column it reads on every row it is fed, before any `WHERE`, so this scans
 /// whole columns rather than what the entity's own query keeps. A probe that cannot finish is an
 /// error, not a pass: an unscanned column proves nothing.
-fn first_unnarrowable(dir: &Path, reads: &WideReads) -> Result<Option<String>> {
+/// A query over sealed history only, with every declared table bound. The declared schema gives a
+/// table that has never been sealed its empty typed view: without it a fresh nest, which is when an
+/// author runs `check`, failed every entity with "failed to prepare query".
+fn cold_query(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    sql: &str,
+    guard: crate::analytics::QueryGuard,
+) -> Result<crate::analytics::QueryOutput> {
+    crate::analytics::query_hot_cold(
+        dir,
+        sql,
+        guard,
+        &crate::analytics::HotRows::new(),
+        u64::MAX,
+        schema,
+    )
+}
+
+fn first_unnarrowable(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    reads: &WideReads,
+) -> Result<Option<String>> {
     for (table, cols) in reads.values() {
         for col in cols {
             let c = quote_ident(col);
@@ -499,7 +575,7 @@ fn first_unnarrowable(dir: &Path, reads: &WideReads) -> Result<Option<String>> {
                 timeout: Duration::from_secs(60),
                 max_rows: 1,
             };
-            let out = crate::analytics::query_guarded(dir, &probe, guard).with_context(|| {
+            let out = cold_query(dir, schema, &probe, guard).with_context(|| {
                 format!("checking {table}.{col} fits the entity's integer type")
             })?;
             if out.degraded() {
@@ -903,7 +979,11 @@ mod tests {
             "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['owner']\nmax_rows=10\n",
         )
         .unwrap();
-        std::fs::write(dir.path().join("entities/totals.sql"), "SELECT 1 AS owner").unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT owner, count(*) AS n FROM facts GROUP BY owner",
+        )
+        .unwrap();
         assert!(validate(dir.path()).is_empty());
 
         std::fs::write(
@@ -961,7 +1041,8 @@ mod tests {
 
         std::fs::write(
             dir.path().join("entities/totals.sql"),
-            "SELECT 'ORDER BY' AS owner -- LIMIT is prose here\n",
+            "SELECT owner, count(*) AS n FROM facts WHERE note = 'ORDER BY' GROUP BY owner \
+             -- LIMIT is prose here\n",
         )
         .unwrap();
         assert!(validate(dir.path()).is_empty());
@@ -1168,19 +1249,22 @@ mod tests {
 
     #[test]
     fn declared_key_must_be_unique_in_the_reference_result() {
-        let dir = configured_nest();
+        let dir = wide_nest();
+        // Grouped by indexer but keyed by its count, and two indexers share a count.
         std::fs::write(
             dir.path().join(ENTITY_FILE),
-            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['owner']\nmax_rows=10\n",
+            "[[entities]]\nname='rewards'\nsql='entities/rewards.sql'\nkey=['n']\nmax_rows=10\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("entities/totals.sql"),
-            "SELECT owner FROM (VALUES (1), (1)) AS source(owner)",
-        )
-        .unwrap();
-
-        let issues = validate(dir.path());
+        let rows = [
+            wide_row("0x00000000000000000000000000000000000000a1", "1", "0", 10),
+            wide_row("0x00000000000000000000000000000000000000b2", "2", "0", 11),
+        ];
+        crate::seal::seal_range(dir.path(), &rows, 10, 11).unwrap();
+        let issues = rewards_issues(
+            dir.path(),
+            "SELECT indexer, count(*) AS n FROM svc__collected GROUP BY indexer",
+        );
         assert!(
             issues
                 .iter()
@@ -1191,19 +1275,21 @@ mod tests {
 
     #[test]
     fn reference_result_cannot_exceed_declared_max_rows() {
-        let dir = configured_nest();
+        let dir = wide_nest();
         std::fs::write(
             dir.path().join(ENTITY_FILE),
-            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['owner']\nmax_rows=1\n",
+            "[[entities]]\nname='rewards'\nsql='entities/rewards.sql'\nkey=['indexer']\nmax_rows=1\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("entities/totals.sql"),
-            "SELECT owner FROM (VALUES (1), (2)) AS source(owner)",
-        )
-        .unwrap();
-
-        let issues = validate(dir.path());
+        let rows = [
+            wide_row("0x00000000000000000000000000000000000000a1", "1", "0", 10),
+            wide_row("0x00000000000000000000000000000000000000b2", "2", "0", 11),
+        ];
+        crate::seal::seal_range(dir.path(), &rows, 10, 11).unwrap();
+        let issues = rewards_issues(
+            dir.path(),
+            "SELECT indexer, count(*) AS n FROM svc__collected GROUP BY indexer",
+        );
         assert!(
             issues
                 .iter()
@@ -1443,6 +1529,56 @@ mod tests {
                 .iter()
                 .any(|i| i.name == "rewards" && i.error.contains("does not fit")),
             "a value the circuit cannot hold must not pass check: {issues:?}"
+        );
+    }
+
+    /// #1590: `check` refuses what `dev` refuses at start, because both lower and bind through the
+    /// same code. Each of these passed `check` and stopped `dev`.
+    #[test]
+    fn check_refuses_what_dev_would_not_start() {
+        let dir = wide_nest();
+        for (sql, says) in [
+            (
+                "SELECT indexer, count(*) AS n FROM svc__collected GROUP BY indexer \
+                 HAVING count(*) > 1",
+                "HAVING",
+            ),
+            (
+                "SELECT indexer, count(*) AS n FROM svc__elsewhere GROUP BY indexer",
+                "no table svc__elsewhere",
+            ),
+            (
+                "SELECT indexer, count(*) AS n FROM svc__collected GROUP BY indexer, unused",
+                "must be the same set",
+            ),
+        ] {
+            let issues = rewards_issues(dir.path(), sql);
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.name == "rewards" && format!("{i:?}").contains(says)),
+                "{sql}: {issues:?}"
+            );
+        }
+
+        std::fs::write(
+            dir.path().join(ENTITY_FILE),
+            "[[entities]]\nname='SVC__Collected'\nsql='entities/SVC__Collected.sql'\nkey=['indexer']\n\
+             max_rows=10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/SVC__Collected.sql"),
+            "SELECT indexer, count(*) AS n FROM svc__collected GROUP BY indexer",
+        )
+        .unwrap();
+        std::fs::remove_file(dir.path().join("entities/rewards.sql")).unwrap();
+        let issues = validate(dir.path());
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.error.contains("same name as the decoded table")),
+            "{issues:?}"
         );
     }
 

@@ -364,7 +364,26 @@ mod tests {
             "[[entities]]\nname = \"constant\"\nsql = \"entities/constant.sql\"\nkey = [\"id\"]\nmax_rows = 1\n",
         )
         .unwrap();
-        std::fs::write(dir.path().join("entities/constant.sql"), "SELECT 1 AS id").unwrap();
+        // A shape `dev` would start: a real table, and SQL the lowerer accepts (#1590).
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/t.json"),
+            r#"[{"type":"event","name":"Seen","anonymous":false,"inputs":[
+                {"name":"who","type":"address","indexed":true}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("nuthatch.toml"),
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x00000000000000000000000000000000000000aa\"\n\
+             abi = \"abis/t.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/constant.sql"),
+            "SELECT who AS id, count(*) AS n FROM t__seen GROUP BY who",
+        )
+        .unwrap();
 
         let result = check(CheckArgs {
             name: None,
