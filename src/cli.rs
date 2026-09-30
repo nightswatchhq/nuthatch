@@ -630,6 +630,11 @@ pub struct NestBundleArgs {
     /// bundle's contents).
     #[arg(long)]
     pub as_dir: bool,
+
+    /// Bundle even though `nuthatch.toml` holds credentials (a keyed RPC URL, a webhook secret).
+    /// The bundle carries the file verbatim, so they are published with it.
+    #[arg(long)]
+    pub allow_secrets: bool,
 }
 
 #[derive(Args)]

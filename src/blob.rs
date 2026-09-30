@@ -296,7 +296,26 @@ pub fn nest_nid(dir: &Path) -> Result<String> {
 /// content-addressed `.bundle` file holding its authored inputs plus `manifest.json`. With `--as-dir`,
 /// write an unpacked bundle *directory* instead (handy for inspecting contents). Prints the bundle's
 /// content address. Default output is `<nest-name>-<hash12>.bundle` beside the nest.
-pub fn bundle(dir: &Path, out: Option<&Path>, as_dir: bool) -> Result<()> {
+pub fn bundle(dir: &Path, out: Option<&Path>, as_dir: bool, allow_secrets: bool) -> Result<()> {
+    let found = bundled_credentials(dir);
+    if !found.is_empty() {
+        let list = found
+            .iter()
+            .map(|f| format!("  - {f}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !allow_secrets {
+            bail!(
+                "{} would publish {} credential(s) with it, because the bundle carries it verbatim:\n\
+                 {list}\n\
+                 Remove them before bundling (an RPC endpoint can be passed at run time with --rpc), \
+                 or pass --allow-secrets if publishing them is intended.",
+                crate::config::CONFIG_FILE,
+                found.len()
+            );
+        }
+        eprintln!("warning: bundling credential(s) because of --allow-secrets:\n{list}");
+    }
     let manifest = build_manifest(dir, None)?;
     let hash = manifest.blob_hash();
     let default_out = |ext: &str| {
@@ -472,6 +491,56 @@ pub async fn load(bundle: &str, target: Option<&Path>, expect: Option<&str>) -> 
 /// Whether a URL's host is loopback - the one case that needs no warning, since it cannot reach
 /// anything the operator's own machine cannot already reach. Parsed by hand (no `url` dep): scheme,
 /// then authority up to the first `/`, `?` or `#`, then userinfo and port stripped.
+/// The credentials `nuthatch.toml` would carry into a bundle (#1589), each described with its URL
+/// redacted. A config that will not parse yields nothing here; the manifest build reports it.
+fn bundled_credentials(dir: &Path) -> Vec<String> {
+    let Ok(config) = crate::config::Config::load(dir) else {
+        return Vec::new();
+    };
+    let shown = crate::rpc::redact_url;
+    let mut found = Vec::new();
+    for url in config.nest.rpc_urls.iter().filter(|u| url_carries_credential(u)) {
+        found.push(format!("rpc_urls: {} (a key in the URL)", shown(url)));
+    }
+    for w in &config.webhooks {
+        if w.secret.is_some() {
+            found.push(format!("webhook '{}': its HMAC secret", w.name));
+        }
+        if url_carries_credential(&w.url) {
+            found.push(format!("webhook '{}': {} (a key in the URL)", w.name, shown(&w.url)));
+        }
+    }
+    for a in config.alerts.iter().filter(|a| url_carries_credential(&a.url)) {
+        found.push(format!("alert sink: {} (a key in the URL)", shown(&a.url)));
+    }
+    found
+}
+
+/// Whether a URL looks like it embeds a credential: userinfo, a key-named query parameter, or a path
+/// segment shaped like a token (long, and mixing letters with digits), as provider keys and Slack
+/// hooks are. `/rpc` and `/ext/bc/C/rpc` are not.
+fn url_carries_credential(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !u.username().is_empty() || u.password().is_some() {
+        return true;
+    }
+    let keyish = ["key", "token", "secret", "auth", "pass", "sig"];
+    if u.query_pairs().any(|(k, _)| {
+        let k = k.to_ascii_lowercase();
+        keyish.iter().any(|w| k.contains(w))
+    }) {
+        return true;
+    }
+    u.path_segments().into_iter().flatten().any(|s| {
+        s.len() >= 20
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && s.chars().any(|c| c.is_ascii_digit())
+            && s.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
 fn is_loopback_url(url: &str) -> bool {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = after_scheme
@@ -825,6 +894,62 @@ abi = "abis/c.json"
     }
 
     #[test]
+    fn a_url_credential_is_told_from_a_public_path() {
+        for keyed in [
+            "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+            "https://eth-mainnet.g.alchemy.com/v2/Xk2mP9qLr4TzW8vN3bY6cD1e",
+            "https://lb.drpc.org/ogrpc?network=ethereum&dkey=abc",
+            "https://user:pass@rpc.example.com",
+            "https://hooks.example.com/services/x7Yz4Q9mW2rT8kL5pN3vJ6hG",
+        ] {
+            assert!(url_carries_credential(keyed), "{keyed}");
+        }
+        for public in [
+            "https://arb1.arbitrum.io/rpc",
+            "https://ethereum-rpc.publicnode.com",
+            "https://rpc.ankr.com/eth",
+            "https://api.avax.network/ext/bc/C/rpc",
+            "http://127.0.0.1:8469/hooks",
+            "https://x",
+        ] {
+            assert!(!url_carries_credential(public), "{public}");
+        }
+    }
+
+    /// #1589: `nuthatch.toml` is bundled verbatim, so `bundle` refuses one that holds a credential
+    /// unless told otherwise, and the NID of a clean nest is untouched by the check.
+    #[test]
+    fn bundle_refuses_a_nest_carrying_credentials() {
+        let src = tempfile::tempdir().unwrap();
+        write_nest(src.path());
+        let clean_nid = build_manifest(src.path(), None).unwrap().nid();
+        let out = tempfile::tempdir().unwrap();
+        bundle(src.path(), Some(&out.path().join("a.bundle")), false, false).unwrap();
+
+        let config = std::fs::read_to_string(src.path().join(CONFIG_FILE)).unwrap();
+        std::fs::write(
+            src.path().join(CONFIG_FILE),
+            config.replace(
+                "rpc_urls = [\"https://x\"]",
+                "rpc_urls = [\"https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161\"]",
+            ) + "\n[[webhooks]]\nname = \"w\"\ntable = \"c__transfer\"\nurl = \"https://h.example/in\"\nsecret = \"FAKE_HMAC\"\n",
+        )
+        .unwrap();
+        let err = bundle(src.path(), Some(&out.path().join("b.bundle")), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("webhook 'w'") && err.contains("secret"), "{err}");
+        assert!(err.contains("https://mainnet.infura.io"), "{err}");
+        assert!(!err.contains("9aa3d95b"), "the refusal must not print the key: {err}");
+        assert!(!out.path().join("b.bundle").exists());
+        bundle(src.path(), Some(&out.path().join("c.bundle")), false, true).unwrap();
+        assert!(out.path().join("c.bundle").exists(), "--allow-secrets bundles anyway");
+
+        std::fs::write(src.path().join(CONFIG_FILE), config).unwrap();
+        assert_eq!(build_manifest(src.path(), None).unwrap().nid(), clean_nid);
+    }
+
+    #[test]
     fn manifest_is_deterministic_and_pins_the_registry_hash() {
         let a = tempfile::tempdir().unwrap();
         write_nest(a.path());
@@ -1103,7 +1228,7 @@ abi = "abis/c.json"
         let src = tempfile::tempdir().unwrap();
         write_nest(src.path());
         let blob = tempfile::tempdir().unwrap();
-        bundle(src.path(), Some(blob.path()), true).unwrap();
+        bundle(src.path(), Some(blob.path()), true, false).unwrap();
 
         let manifest = load_manifest(blob.path()).unwrap();
         let target = tempfile::tempdir().unwrap();
@@ -1160,7 +1285,7 @@ abi = "abis/c.json"
         let src = tempfile::tempdir().unwrap();
         write_nest(src.path());
         let blob = tempfile::tempdir().unwrap();
-        bundle(src.path(), Some(blob.path()), true).unwrap();
+        bundle(src.path(), Some(blob.path()), true, false).unwrap();
 
         // Wrong expected hash → refuse before touching disk.
         let t0 = tempfile::tempdir().unwrap();
@@ -1180,7 +1305,7 @@ abi = "abis/c.json"
         let src = tempfile::tempdir().unwrap();
         write_nest(src.path());
         let blob = tempfile::tempdir().unwrap();
-        bundle(src.path(), Some(blob.path()), true).unwrap();
+        bundle(src.path(), Some(blob.path()), true, false).unwrap();
         // Rewrite the manifest claiming a future format version.
         let mut m = load_manifest(blob.path()).unwrap();
         m.blob_format_version = BLOB_FORMAT_VERSION + 1;

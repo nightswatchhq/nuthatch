@@ -1592,7 +1592,7 @@ async fn registry_with_one_nest(registry: &std::path::Path) -> String {
     let nid = nuthatch::blob::nest_nid(src.path()).unwrap();
     let bundle = tempfile::tempdir().unwrap();
     let file = bundle.path().join("usdc.bundle");
-    nuthatch::blob::bundle(src.path(), Some(&file), false).unwrap();
+    nuthatch::blob::bundle(src.path(), Some(&file), false, false).unwrap();
     let store = nuthatch::distribution::open(registry.to_str().unwrap()).unwrap();
     nuthatch::distribution::publish(store.as_ref(), &file, Some("usdc"), None)
         .await
