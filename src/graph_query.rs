@@ -380,9 +380,13 @@ pub fn parse_named(
             _ => return Err(Unsupported::OperationNameRequired),
         },
     };
-    let roots = resolve_spreads(&operation, &fragments, &mut Vec::new(), &mut {
-        MAX_SELECTIONS
-    })?;
+    let roots = resolve_spreads(
+        &operation,
+        &fragments,
+        &mut Vec::new(),
+        &mut { MAX_SELECTIONS },
+        0,
+    )?;
     Ok(roots
         .into_iter()
         .map(|s| RootField {
@@ -436,7 +440,15 @@ fn resolve_spreads(
     fragments: &BTreeMap<String, Vec<Sel>>,
     visiting: &mut Vec<String>,
     budget: &mut usize,
+    depth: usize,
 ) -> Result<Vec<Selection>, Unsupported> {
+    // Fields, inline fragments and spreads share this one bound: each fragment of a chain may nest
+    // its own fields, so bounding spreads and fields apart still composes to an overflow.
+    if depth >= MAX_NESTING {
+        return Err(Unsupported::Syntax(format!(
+            "the document nests more than {MAX_NESTING} levels deep"
+        )));
+    }
     let mut out: Vec<Selection> = Vec::new();
     for s in sel {
         match s {
@@ -450,10 +462,16 @@ fn resolve_spreads(
                     key: f.key.clone(),
                     name: f.name.clone(),
                     args: f.args.clone(),
-                    sub: resolve_spreads(sub, fragments, visiting, budget)?,
+                    sub: resolve_spreads(sub, fragments, visiting, budget, depth + 1)?,
                 })
             }
-            Sel::Inline(inner) => out.extend(resolve_spreads(inner, fragments, visiting, budget)?),
+            Sel::Inline(inner) => out.extend(resolve_spreads(
+                inner,
+                fragments,
+                visiting,
+                budget,
+                depth + 1,
+            )?),
             Sel::Spread(name) => {
                 let Some(body) = fragments.get(name) else {
                     return Err(Unsupported::Syntax(format!(
@@ -465,20 +483,20 @@ fn resolve_spreads(
                         "fragment `{name}` spreads itself"
                     )));
                 }
-                // A chain of fragments nests here, not in the parser; and a spread costs budget of its
-                // own, so a diamond ending in an empty fragment is not free.
-                if visiting.len() >= MAX_NESTING {
-                    return Err(Unsupported::Syntax(format!(
-                        "the document nests more than {MAX_NESTING} levels deep"
-                    )));
-                }
+                // A spread costs budget of its own, so a diamond ending in an empty fragment is not free.
                 *budget = budget.checked_sub(1).ok_or_else(|| {
                     Unsupported::Syntax(format!(
                         "the document expands to more than {MAX_SELECTIONS} selections"
                     ))
                 })?;
                 visiting.push(name.clone());
-                out.extend(resolve_spreads(body, fragments, visiting, budget)?);
+                out.extend(resolve_spreads(
+                    body,
+                    fragments,
+                    visiting,
+                    budget,
+                    depth + 1,
+                )?);
                 visiting.pop();
             }
         }
@@ -3183,6 +3201,24 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
                     .collect();
                 chain.push_str("fragment F10000 on X { id } { pools { ...F0 } }");
                 let e = parse(&chain).expect_err("fragment chain");
+                assert!(
+                    matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
+                    "{e:?}"
+                );
+                // Astra's re-review: each fragment under the parser's limit, chained, composes to
+                // some 8,400 levels. One bound across fields and spreads refuses it.
+                let nest =
+                    |inner: String| format!("{}{inner}{}", "a { ".repeat(120), " }".repeat(120));
+                let mut composed: String = (0..70)
+                    .map(|i| {
+                        format!(
+                            "fragment F{i} on X {{ {} }} ",
+                            nest(format!("...F{}", i + 1))
+                        )
+                    })
+                    .collect();
+                composed.push_str("fragment F70 on X { id } { pools { ...F0 } }");
+                let e = parse(&composed).expect_err("composed nesting");
                 assert!(
                     matches!(&e, Unsupported::Syntax(m) if m.contains("nests more")),
                     "{e:?}"
