@@ -434,6 +434,26 @@ async fn run_sql(args: cli::SqlArgs) -> Result<()> {
 /// issue is about - the whole point is that a caller who ignores the flag still gets told. A reduced
 /// table looks identical to a small one from here, so absent the line the operator sums a column and
 /// gets a confident wrong number off their own machine.
+/// A maintained entity is folded in memory by the running node and never written to disk, so a query
+/// with no node running cannot see it (#1577). Say that, rather than leave "does not exist" standing.
+fn offline_entity_hint(dir: &std::path::Path, raw: &str) -> Option<String> {
+    let marker = "Table with name ";
+    let name = raw[raw.find(marker)? + marker.len()..]
+        .split_whitespace()
+        .next()?;
+    let declared = nuthatch::entities::load(dir).ok()?;
+    declared
+        .iter()
+        .any(|e| e.name.eq_ignore_ascii_case(name))
+        .then(|| {
+            format!(
+                "`{name}` is a maintained entity: the running node keeps it in memory and it is not \
+                 stored on disk, so it cannot be read with no node running. Start `nuthatch dev` and \
+                 run this again (`nuthatch sql` then goes through it), or GET /derived/{name}."
+            )
+        })
+}
+
 fn report_caveats(out: &analytics::QueryOutput) {
     for line in caveats(out) {
         eprintln!("{line}");
@@ -651,8 +671,9 @@ impl SqlBackend {
                         // Errors as prompts (RFC-0016 §3), same as the HTTP path: classify against the
                         // nest's schema and append a fix hint.
                         let raw = format!("{e:#}");
-                        let hint =
-                            nuthatch::analytics::enrich_query_error(dir, &raw, sql, &declared);
+                        let hint = offline_entity_hint(dir, &raw).or_else(|| {
+                            nuthatch::analytics::enrich_query_error(dir, &raw, sql, &declared)
+                        });
                         match hint {
                             Some(h) => anyhow::bail!("{raw}\n\nhint: {h}"),
                             None => anyhow::bail!("{raw}"),
@@ -938,6 +959,27 @@ fn hostname_or_bail() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_offline_query_of_an_entity_says_it_needs_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT \"to\" AS recipient, count(*) AS n FROM usdc__transfer GROUP BY \"to\"",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname = \"totals\"\nsql = \"entities/totals.sql\"\nkey = [\"recipient\"]\nmax_rows = 100\n",
+        )
+        .unwrap();
+        let raw = "failed to prepare query: Catalog Error: Table with name totals does not exist!";
+        let hint = offline_entity_hint(dir.path(), raw).expect("an entity is named");
+        assert!(hint.contains("maintained entity"), "{hint}");
+        let other = "Catalog Error: Table with name usdc__nothing does not exist!";
+        assert_eq!(offline_entity_hint(dir.path(), other), None);
+    }
 
     fn out(truncated: bool, degraded: &[&str]) -> analytics::QueryOutput {
         analytics::QueryOutput {
