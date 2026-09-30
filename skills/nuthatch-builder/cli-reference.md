@@ -251,6 +251,7 @@ Bundle a nest into one portable, content-addressed `.bundle` file - its authored
 - `<DIR>` - Nest directory to bundle
 - `--out <OUT>` - Output path for the `.bundle` (default: `<nest-name>-<hash>.bundle` beside the nest). With `--as-dir`, an unpacked bundle *directory* is written here instead of a single file
 - `--as-dir` - Write an unpacked bundle directory instead of a single `.bundle` file (handy for inspecting a bundle's contents)
+- `--allow-secrets` - Bundle even though `nuthatch.toml` holds credentials (a keyed RPC URL, a webhook secret). The bundle carries the file verbatim, so they are published with it
 
 ## `nuthatch nest load`
 

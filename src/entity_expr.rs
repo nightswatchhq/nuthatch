@@ -144,6 +144,81 @@ impl Expr {
     }
 }
 
+impl Expr {
+    /// The type this expression has on every row it does not fault on, when that is certain; or the
+    /// refusal [`Expr::eval`] raises on **every** row (#1590).
+    ///
+    /// Deliberately partial. `Some(t)` means each evaluation either faults or yields a non-null `t`,
+    /// which holds for columns that are never NULL, non-null literals and the eager operators over
+    /// them. `CASE`, `COALESCE`, NULL and a column that may be NULL give `None`: which branch runs,
+    /// and whether a NULL short-circuits, depends on the row, and a check that tried to follow it
+    /// either refused entities that run or passed ones that do not. So a refusal here is always
+    /// right, and what this cannot judge still faults loudly at runtime, as it always has.
+    ///
+    /// `cols` holds each column's type, or `None` for one that may be NULL. The guarantee covers a
+    /// well-bound expression, every column index checked, evaluated on rows that match `cols`.
+    pub fn definite_type(&self, cols: &[Option<Type>]) -> Result<Option<Type>> {
+        let need = |what: &str, got: Option<Type>, want: Type| match got {
+            Some(t) if t != want => bail!("{what} needs {want:?}, got {t:?}"),
+            _ => Ok(()),
+        };
+        Ok(match self {
+            Expr::Column(i) => *cols
+                .get(*i)
+                .ok_or_else(|| anyhow::anyhow!("column {i} is outside the row"))?,
+            Expr::Literal(s) => match s {
+                Scalar::Null => None,
+                Scalar::Bool(_) => Some(Type::Bool),
+                Scalar::Int(_) => Some(Type::Int),
+                Scalar::Str(_) => Some(Type::Str),
+            },
+            Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) => {
+                // NULL returns before either type is read, so only two certain operands can fault.
+                match (a.definite_type(cols)?, b.definite_type(cols)?) {
+                    (Some(x), Some(y)) if x != Type::Int || y != Type::Int => {
+                        bail!("arithmetic needs Int, got {x:?} and {y:?}")
+                    }
+                    (Some(_), Some(_)) => Some(Type::Int),
+                    _ => None,
+                }
+            }
+            Expr::Compare(_, a, b) => {
+                let (a, b) = (a.definite_type(cols)?, b.definite_type(cols)?);
+                match (a, b) {
+                    (Some(x), Some(y)) if x != y => bail!(
+                        "a comparison of {x:?} with {y:?}: the entity subset has no implicit coercion"
+                    ),
+                    (Some(_), Some(_)) => Some(Type::Bool),
+                    _ => None,
+                }
+            }
+            Expr::And(a, b) | Expr::Or(a, b) => {
+                let (a, b) = (a.definite_type(cols)?, b.definite_type(cols)?);
+                need("a logical operator", a, Type::Bool)?;
+                need("a logical operator", b, Type::Bool)?;
+                (a.is_some() && b.is_some()).then_some(Type::Bool)
+            }
+            Expr::Not(a) => {
+                let a = a.definite_type(cols)?;
+                need("NOT", a, Type::Bool)?;
+                a
+            }
+            Expr::IsNull(a) => {
+                a.definite_type(cols)?;
+                Some(Type::Bool)
+            }
+            Expr::Case { .. } | Expr::Coalesce(_) => None,
+            Expr::Cast(a, ty) => {
+                let a = a.definite_type(cols)?;
+                if a == Some(Type::Str) && *ty == Type::Bool {
+                    bail!("cast from VARCHAR to BOOLEAN is not in the entity subset")
+                }
+                a.map(|_| *ty)
+            }
+        })
+    }
+}
+
 /// Checked integer arithmetic with NULL propagation. §3.3.1: an unrepresentable result is a fault.
 fn arith(
     whole: &Expr,
@@ -346,5 +421,104 @@ mod tests {
         // Implicit coercion is where engines quietly disagree; the subset has none.
         let e = Expr::Compare(Cmp::Eq, col(0), int(1));
         assert!(e.eval(&row(vec![Scalar::Str("1".into())])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod definite_type_tests {
+    use super::*;
+
+    fn col(i: usize) -> Box<Expr> {
+        Box::new(Expr::Column(i))
+    }
+    fn lit(s: Scalar) -> Box<Expr> {
+        Box::new(Expr::Literal(s))
+    }
+    fn s(v: &str) -> Box<Expr> {
+        lit(Scalar::Str(v.into()))
+    }
+    fn i(v: i128) -> Box<Expr> {
+        lit(Scalar::Int(v))
+    }
+    fn null() -> Box<Expr> {
+        lit(Scalar::Null)
+    }
+    fn gt0() -> Expr {
+        Expr::Compare(Cmp::Gt, col(0), i(0))
+    }
+
+    /// Held against the evaluator: whatever is refused fails on every row. Over an Int, a Str and a
+    /// Bool column that are never NULL, and a fourth that may be.
+    #[test]
+    fn a_refusal_fails_on_every_row() {
+        let cols = [Some(Type::Int), Some(Type::Str), Some(Type::Bool), None];
+        let rows: Vec<Row> = [
+            (5, Scalar::Null),
+            (0, Scalar::Str("v".into())),
+            (-1, Scalar::Int(2)),
+        ]
+        .into_iter()
+        .map(|(v, maybe)| {
+            Row(vec![
+                Scalar::Int(v),
+                Scalar::Str("x".into()),
+                Scalar::Bool(v > 0),
+                maybe,
+            ])
+        })
+        .collect();
+        let refused = [
+            ("fee + '1'", Expr::Add(col(0), s("1"))),
+            (
+                "(fee + 1) * sym",
+                Expr::Mul(Box::new(Expr::Add(col(0), i(1))), col(1)),
+            ),
+            ("fee = sym", Expr::Compare(Cmp::Eq, col(0), col(1))),
+            ("flag AND fee", Expr::And(col(2), col(0))),
+            ("NOT sym", Expr::Not(col(1))),
+            ("CAST(sym AS BOOLEAN)", Expr::Cast(col(1), Type::Bool)),
+            (
+                "(fee + 'x') IS NULL",
+                Expr::IsNull(Box::new(Expr::Add(col(0), s("x")))),
+            ),
+        ];
+        for (name, e) in refused {
+            assert!(e.definite_type(&cols).is_err(), "{name} must be refused");
+            for r in &rows {
+                assert!(
+                    e.eval(r).is_err(),
+                    "{name} was refused but evaluates on {r:?}"
+                );
+            }
+        }
+
+        // Judged at runtime instead: each depends on the row, and some run cleanly.
+        let left_alone = [
+            ("NULL + '1'", Expr::Add(null(), s("1"))),
+            ("maybe + 1", Expr::Add(col(3), i(1))),
+            (
+                "COALESCE(fee, fee + '1')",
+                Expr::Coalesce(vec![Expr::Column(0), Expr::Add(col(0), s("1"))]),
+            ),
+            (
+                "CASE WHEN fee > 0 THEN fee + 'x' ELSE 0 END",
+                Expr::Case {
+                    whens: vec![(gt0(), Expr::Add(col(0), s("x")))],
+                    otherwise: Some(i(0)),
+                },
+            ),
+            (
+                "CAST(NULL AS VARCHAR) = fee",
+                Expr::Compare(Cmp::Eq, Box::new(Expr::Cast(null(), Type::Str)), col(0)),
+            ),
+        ];
+        for (name, e) in left_alone {
+            assert!(
+                e.definite_type(&cols).is_ok(),
+                "{name} must be left to runtime"
+            );
+        }
+        assert_eq!(gt0().definite_type(&cols).unwrap(), Some(Type::Bool));
+        assert_eq!(Expr::Add(col(3), i(1)).definite_type(&cols).unwrap(), None);
     }
 }

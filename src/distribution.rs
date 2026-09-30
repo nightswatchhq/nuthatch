@@ -626,7 +626,7 @@ abi = "abis/c.json"
         )
         .unwrap();
         std::fs::write(nest.path().join("llms.txt"), marker).unwrap();
-        crate::blob::bundle(nest.path(), Some(out), false).unwrap();
+        crate::blob::bundle(nest.path(), Some(out), false, false).unwrap();
         (
             crate::blob::bundle_manifest(out).unwrap().blob_hash(),
             crate::blob::nest_nid(nest.path()).unwrap(),

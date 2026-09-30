@@ -262,6 +262,7 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&a.dir),
                 a.out.as_deref().map(std::path::Path::new),
                 a.as_dir,
+                a.allow_secrets,
             ),
             cli::NestWhat::Load(a) => match a.registry.as_deref() {
                 Some(registry) => {

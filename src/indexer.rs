@@ -1580,36 +1580,7 @@ fn start_entities(
             .with_context(|| format!("reading SQL for entity `{}`", decl.name))?;
         let (plan, columns) = crate::entity_lower::lower_with_columns(&sql)
             .with_context(|| format!("lowering entity `{}`", decl.name))?;
-        // An entity that shadows a decoded table would silently take that table's name on the
-        // analytical surface, so `SELECT * FROM usdc__transfer` would answer from a maintained
-        // relation instead of the facts. Refused at load, where it is a typo, rather than at the
-        // first query, where it is a mystery.
-        if let Some(t) = registry.schema().iter().find(|t| t.table == decl.name) {
-            anyhow::bail!(
-                "entity `{}` has the same name as the decoded table `{}`. Rename the entity: on the \
-                 SQL surface one would shadow the other",
-                decl.name,
-                t.table
-            )
-        }
-        if crate::entity_offchain::table_of(&decl.name).is_some() {
-            anyhow::bail!(
-                "entity `{}` is named inside the `{}` namespace, where it would shadow an offchain \
-                 table on the SQL surface. Rename the entity",
-                decl.name,
-                crate::entity_offchain::OFFCHAIN_NAMESPACE
-            )
-        }
-        // The manifest is read only for an entity that names an offchain table, so a damaged one
-        // cannot stop a chain-only nest from starting.
-        let offchain = if crate::entity_offchain::reads_offchain(&plan) {
-            crate::entity_offchain::Tables::load(dir)?
-        } else {
-            crate::entity_offchain::Tables::none()
-        };
-        let binding =
-            crate::entity_bind::Binding::bind_with_offchain(&plan, registry, &offchain)
-                .with_context(|| format!("binding entity `{}` to this nest's tables", decl.name))?;
+        let (binding, offchain) = crate::entities::bind_as_dev(dir, &decl.name, &plan, registry)?;
         let view =
             EntityView::start_bound(&decl.name, &plan, binding, &columns, decl.max_rows, warm)?;
         // A cold entity takes every present snapshot before its first window (#1437). A warm one is
@@ -19565,7 +19536,7 @@ rpc_urls = ["https://rpc.example"]
         entity_fixture::write(
             dir.path(),
             "[[entities]]\nname='paired'\nkey=['k']\nmax_rows=100\n\
-             query='SELECT a.k, sum(b.v) AS v FROM offchain__a a \
+             query='SELECT a.k, sum(CAST(b.v AS INTEGER)) AS v FROM offchain__a a \
              JOIN offchain__b b ON a.k = b.k GROUP BY a.k'\n",
         )
         .unwrap();
