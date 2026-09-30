@@ -1783,7 +1783,7 @@ max_rows = 10000
 /// column was VARCHAR, `sum(n)` would not bind and `max(n)` compared strings ("5" over "29").
 const COUNTS: &str = r#"[[entities]]
 name = "counts"
-query = "SELECT t.to, COUNT(*) AS n FROM usdc__transfer t GROUP BY t.to"
+query = "SELECT t.to, COUNT(*) AS n, MAX(CASE WHEN t.to = 'never' THEN 1 END) AS nothing FROM usdc__transfer t GROUP BY t.to"
 key = ["to"]
 max_rows = 10000
 "#;
@@ -1809,6 +1809,11 @@ async fn a_maintained_count_is_numeric_in_sql() {
     assert_eq!(
         one("SELECT typeof(n) AS t FROM counts LIMIT 1").await["t"],
         "HUGEINT"
+    );
+    assert_eq!(
+        one("SELECT count(*) AS c FROM counts WHERE nothing IS NULL").await["c"],
+        one("SELECT count(*) AS c FROM counts").await["c"],
+        "a NULL cell must be NULL, not the text \"NULL\""
     );
     let summed = one("SELECT sum(n) AS s FROM counts").await["s"].to_string();
     let raw = one("SELECT count(*) AS c FROM usdc__transfer").await["c"].to_string();
