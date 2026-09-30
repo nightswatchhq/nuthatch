@@ -245,17 +245,29 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
                 )),
             }
             if let Some(schema) = &schema {
-                if let Some(found) = first_unnarrowable(dir, schema, &sql) {
-                    issues.push(issue(
-                        &name,
-                        format!(
-                            "{found} does not fit the 128-bit integer the entity reads it as; \
-                             `dev` would fault on that row"
-                        ),
-                    ));
-                    continue;
+                // Only SQL the lowerer accepts is typed as the circuit reads it. Anything else
+                // binds as before, so typing cannot admit a shape `dev` refuses.
+                let reads = crate::entity_lower::lower(&sql)
+                    .map(|plan| wide_reads(schema, &plan))
+                    .unwrap_or_default();
+                match first_unnarrowable(dir, &reads) {
+                    Ok(None) => {}
+                    Ok(Some(found)) => {
+                        issues.push(issue(
+                            &name,
+                            format!(
+                                "{found} does not fit the 128-bit integer the entity reads it \
+                                 as; `dev` would fault on that row"
+                            ),
+                        ));
+                        continue;
+                    }
+                    Err(e) => {
+                        issues.push(issue(&name, format!("{e:#}")));
+                        continue;
+                    }
                 }
-                let sql = match typed_for_check(schema, &sql) {
+                let sql = match typed_for_check(&sql, &reads) {
                     Ok(sql) => sql,
                     Err(e) => {
                         issues.push(issue(&name, format!("entity SQL does not bind: {e}")));
@@ -381,11 +393,48 @@ fn is_wide(column: &crate::registry::ColumnSchema) -> bool {
     matches!(column.storage.as_str(), "word16" | "word32")
 }
 
-/// `sql` as `check` binds it (#1587): each table's wide integer columns as `HUGEINT`, the checked
-/// `i128` the circuit narrows them to. The analytical views keep the exact decimal string, which no
-/// aggregate accepts. Table qualifiers are dropped first, since the lowerer reads only the table name
-/// and `main.t` would otherwise reach past the typed CTE. Entity SQL admits no CTEs of its own.
-fn typed_for_check(schema: &[crate::registry::TableSchema], sql: &str) -> Result<String> {
+/// Per table the circuit reads, keyed case-insensitively: its name and the wide columns the plan
+/// reads from it, across both sides of a self-join. Only these are cast and probed, because the
+/// circuit converts nothing else (#1587).
+type WideReads = std::collections::BTreeMap<String, (String, BTreeSet<String>)>;
+
+fn wide_reads(
+    schema: &[crate::registry::TableSchema],
+    plan: &crate::entity_plan::Plan,
+) -> WideReads {
+    let mut reads = WideReads::new();
+    for source in std::iter::once(&plan.left).chain(plan.join.as_ref().map(|j| &j.right)) {
+        // The registry keeps a schema entry per decoder, so a table can appear more than once.
+        for t in schema
+            .iter()
+            .filter(|t| t.table.eq_ignore_ascii_case(&source.table))
+        {
+            let read = t.columns.iter().filter(|c| {
+                is_wide(c)
+                    && source
+                        .columns
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&c.name))
+            });
+            reads
+                .entry(t.table.to_ascii_lowercase())
+                .or_insert_with(|| (t.table.clone(), BTreeSet::new()))
+                .1
+                .extend(read.map(|c| c.name.clone()));
+        }
+    }
+    reads.retain(|_, (_, cols)| !cols.is_empty());
+    reads
+}
+
+/// `sql` as `check` binds it (#1587): each wide column the circuit reads as `HUGEINT`, the checked
+/// `i128` it narrows them to. The analytical views keep the exact decimal string, which no aggregate
+/// accepts. Table qualifiers are dropped first, since the lowerer reads only the table name and
+/// `main.t` would otherwise reach past the typed CTE. Entity SQL admits no CTEs of its own.
+fn typed_for_check(sql: &str, reads: &WideReads) -> Result<String> {
+    if reads.is_empty() {
+        return Ok(sql.to_string());
+    }
     let conn = Connection::open_in_memory()?;
     let mut ast = plan_ast(&conn, sql)?;
     let mut qualified = false;
@@ -412,92 +461,59 @@ fn typed_for_check(schema: &[crate::registry::TableSchema], sql: &str) -> Result
     } else {
         sql.to_string()
     };
-    // One CTE per name, case-insensitively: the registry keeps a schema entry per decoder, so two
-    // contracts sharing an alias repeat a table, and DuckDB refuses a repeated CTE name.
-    let mut casts: std::collections::BTreeMap<String, (String, BTreeSet<String>)> =
-        Default::default();
-    for table in crate::graft::table_refs(&ast) {
-        for t in schema
-            .iter()
-            .filter(|t| t.table.eq_ignore_ascii_case(&table))
-        {
-            let entry = casts
-                .entry(t.table.to_ascii_lowercase())
-                .or_insert_with(|| (t.table.clone(), BTreeSet::new()));
-            entry.1.extend(
-                t.columns
-                    .iter()
-                    .filter(|c| is_wide(c))
-                    .map(|c| c.name.clone()),
-            );
-        }
-    }
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    let ctes: Vec<String> = casts
+    let ctes: Vec<String> = reads
         .values()
-        .filter(|(_, cols)| !cols.is_empty())
         .map(|(table, cols)| {
             let replaced: Vec<String> = cols
                 .iter()
-                .map(|c| format!("CAST({0} AS HUGEINT) AS {0}", quote(c)))
+                .map(|c| format!("CAST({0} AS HUGEINT) AS {0}", quote_ident(c)))
                 .collect();
             format!(
                 "{0} AS (SELECT * REPLACE ({1}) FROM main.{0})",
-                quote(table),
+                quote_ident(table),
                 replaced.join(", ")
             )
         })
         .collect();
-    Ok(if ctes.is_empty() {
-        sql
-    } else {
-        format!("WITH {}\n{sql}", ctes.join(",\n"))
-    })
+    Ok(format!("WITH {}\n{sql}", ctes.join(",\n")))
+}
+
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// The first stored value the circuit could not narrow, as `table.column = value` (#1587). The
-/// circuit converts every column it reads on every row it is fed, before any `WHERE`, so this looks
-/// at whole tables rather than at what the entity's own query would keep.
-fn first_unnarrowable(
-    dir: &Path,
-    schema: &[crate::registry::TableSchema],
-    sql: &str,
-) -> Option<String> {
-    let plan = crate::entity_lower::lower(sql).ok()?;
-    let sources = std::iter::once(&plan.left).chain(plan.join.as_ref().map(|j| &j.right));
-    for source in sources {
-        let Some(t) = schema
-            .iter()
-            .find(|t| t.table.eq_ignore_ascii_case(&source.table))
-        else {
-            continue;
-        };
-        for column in t.columns.iter().filter(|c| is_wide(c)) {
-            if !source
-                .columns
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(&column.name))
-            {
-                continue;
-            }
-            let col = format!("\"{}\"", column.name.replace('"', "\"\""));
+/// circuit converts every column it reads on every row it is fed, before any `WHERE`, so this scans
+/// whole columns rather than what the entity's own query keeps. A probe that cannot finish is an
+/// error, not a pass: an unscanned column proves nothing.
+fn first_unnarrowable(dir: &Path, reads: &WideReads) -> Result<Option<String>> {
+    for (table, cols) in reads.values() {
+        for col in cols {
+            let c = quote_ident(col);
             let probe = format!(
-                "SELECT CAST({col} AS VARCHAR) AS v FROM \"{}\" \
-                 WHERE {col} IS NOT NULL AND TRY_CAST({col} AS HUGEINT) IS NULL LIMIT 1",
-                t.table.replace('"', "\"\"")
+                "SELECT CAST({c} AS VARCHAR) AS v FROM {} \
+                 WHERE {c} IS NOT NULL AND TRY_CAST({c} AS HUGEINT) IS NULL LIMIT 1",
+                quote_ident(table)
             );
             let guard = crate::analytics::QueryGuard {
                 timeout: Duration::from_secs(60),
                 max_rows: 1,
             };
-            if let Ok(out) = crate::analytics::query_guarded(dir, &probe, guard) {
-                if let Some(v) = out.rows.first().and_then(|r| r.get("v")) {
-                    return Some(format!("{}.{} = {v}", t.table, column.name));
-                }
+            let out = crate::analytics::query_guarded(dir, &probe, guard).with_context(|| {
+                format!("checking {table}.{col} fits the entity's integer type")
+            })?;
+            if out.degraded() {
+                bail!(
+                    "checking {table}.{col} fits the entity's integer type: some of its segments \
+                     could not be read"
+                );
+            }
+            if let Some(v) = out.rows.first().and_then(|r| r.get("v")) {
+                return Ok(Some(format!("{table}.{col} = {v}")));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Aggregates whose maintenance under insert **and retraction** the v1 lowerer can express.
@@ -1345,17 +1361,17 @@ mod tests {
         );
     }
 
-    /// #1587: the circuit reads a `uint256` as a checked `i128`, so `check` must too. It bound the
-    /// column as its decimal string and refused `SUM(tokensRewards)`, which `dev` maintains exactly.
-    #[test]
-    fn check_binds_a_wide_integer_the_way_the_circuit_reads_it() {
+    /// A nest with one event carrying two `uint256`s, `tokensRewards` and `unused`, and an entity
+    /// declared over it whose SQL the caller writes.
+    fn wide_nest() -> tempfile::TempDir {
         let dir = nest();
         std::fs::create_dir_all(dir.path().join("abis")).unwrap();
         std::fs::write(
             dir.path().join("abis/svc.json"),
             r#"[{"type":"event","name":"Collected","anonymous":false,"inputs":[
                 {"name":"indexer","type":"address","indexed":true},
-                {"name":"tokensRewards","type":"uint256","indexed":false}]}]"#,
+                {"name":"tokensRewards","type":"uint256","indexed":false},
+                {"name":"unused","type":"uint256","indexed":false}]}]"#,
         )
         .unwrap();
         std::fs::write(
@@ -1365,48 +1381,63 @@ mod tests {
              abi=\"abis/svc.json\"\n",
         )
         .unwrap();
-        let row = |indexer: &str, amount: &str, block: u64| {
-            format!(
-                r#"{{"table":"svc__collected","indexer":"{indexer}","tokensRewards":"{amount}","block_number":{block},"log_index":0,"block_timestamp":1,"tx_hash":"0xt","address":"0x00000000000000000000000000000000000000aa"}}"#
-            )
-        };
-        let a = "0x00000000000000000000000000000000000000a1";
-        let b = "0x00000000000000000000000000000000000000b2";
-        crate::seal::seal_range(
-            dir.path(),
-            &[row(a, "5", 10), row(a, "7", 11), row(b, "1", 12)],
-            10,
-            12,
-        )
-        .unwrap();
         std::fs::write(
             dir.path().join(ENTITY_FILE),
             "[[entities]]\nname='rewards'\nsql='entities/rewards.sql'\nkey=['indexer']\nmax_rows=10\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("entities/rewards.sql"),
-            "SELECT indexer, SUM(tokensRewards) AS total FROM svc__collected GROUP BY indexer",
+        dir
+    }
+
+    fn wide_row(indexer: &str, amount: &str, unused: &str, block: u64) -> String {
+        format!(
+            r#"{{"table":"svc__collected","indexer":"{indexer}","tokensRewards":"{amount}","unused":"{unused}","block_number":{block},"log_index":0,"block_timestamp":1,"tx_hash":"0xt","address":"0x00000000000000000000000000000000000000aa"}}"#
         )
-        .unwrap();
-        let issues = validate(dir.path());
+    }
+
+    fn rewards_issues(dir: &Path, sql: &str) -> Vec<EntityIssue> {
+        std::fs::write(dir.join("entities/rewards.sql"), sql).unwrap();
+        validate(dir)
+    }
+
+    /// #1587: the circuit reads a `uint256` as a checked `i128`, so `check` must too. It bound the
+    /// column as its decimal string and refused `SUM(tokensRewards)`, which `dev` maintains exactly.
+    #[test]
+    fn check_binds_a_wide_integer_the_way_the_circuit_reads_it() {
+        let dir = wide_nest();
+        let (a, b) = (
+            "0x00000000000000000000000000000000000000a1",
+            "0x00000000000000000000000000000000000000b2",
+        );
+        let rows = [
+            wide_row(a, "5", "0", 10),
+            wide_row(a, "7", "0", 11),
+            wide_row(b, "1", "0", 12),
+        ];
+        crate::seal::seal_range(dir.path(), &rows, 10, 12).unwrap();
+        let plain =
+            "SELECT indexer, SUM(tokensRewards) AS total FROM svc__collected GROUP BY indexer";
+        assert!(rewards_issues(dir.path(), plain).is_empty());
+
+        // The lowerer ignores a table qualifier, so `check` must not let one reach the untyped view.
+        let filtered = "SELECT indexer, SUM(tokensRewards) AS total FROM main.svc__collected \
+                        WHERE block_number < 13 GROUP BY indexer";
+        let issues = rewards_issues(dir.path(), filtered);
         assert!(issues.is_empty(), "{issues:?}");
 
-        // Past i128 the circuit faults rather than truncating; `check` has to refuse it too.
-        // The lowerer ignores a table qualifier, so `check` must not let one reach the untyped view.
-        std::fs::write(
-            dir.path().join("entities/rewards.sql"),
-            "SELECT indexer, SUM(tokensRewards) AS total FROM main.svc__collected \
-             WHERE block_number < 13 GROUP BY indexer",
-        )
-        .unwrap();
-        let issues = validate(dir.path());
+        // The circuit converts only the columns it reads, so a column it never reads may hold
+        // anything, on either side of a self-join.
+        let huge = "9".repeat(40);
+        crate::seal::seal_range(dir.path(), &[wide_row(b, "1", &huge, 13)], 13, 13).unwrap();
+        let self_join = "SELECT l.indexer, SUM(l.tokensRewards) AS total FROM svc__collected l \
+                         JOIN svc__collected r ON l.indexer = r.indexer GROUP BY l.indexer";
+        let issues = rewards_issues(dir.path(), self_join);
         assert!(issues.is_empty(), "{issues:?}");
 
         // Past i128 the circuit faults rather than truncating, and it converts the row before the
-        // `WHERE` that would drop it, so `check` must refuse it even though the query never keeps it.
-        crate::seal::seal_range(dir.path(), &[row(b, &"9".repeat(40), 13)], 13, 13).unwrap();
-        let issues = validate(dir.path());
+        // `WHERE` that would drop it, so `check` must refuse it though the query never keeps it.
+        crate::seal::seal_range(dir.path(), &[wide_row(b, &huge, "0", 14)], 14, 14).unwrap();
+        let issues = rewards_issues(dir.path(), filtered);
         assert!(
             issues
                 .iter()
@@ -1415,25 +1446,30 @@ mod tests {
         );
     }
 
+    /// Typing applies only to SQL the lowerer accepts, so it cannot admit a shape `dev` refuses:
+    /// `HAVING` over a wide column still fails to bind, as it did before #1587.
+    #[test]
+    fn typing_does_not_admit_what_the_lowerer_refuses() {
+        let dir = wide_nest();
+        let rows = [wide_row(
+            "0x00000000000000000000000000000000000000a1",
+            "5",
+            "0",
+            10,
+        )];
+        crate::seal::seal_range(dir.path(), &rows, 10, 10).unwrap();
+        let having = "SELECT indexer, SUM(tokensRewards) AS total FROM svc__collected \
+                      GROUP BY indexer HAVING SUM(tokensRewards) > 0";
+        assert!(crate::entity_lower::lower(having).is_err());
+        let issues = rewards_issues(dir.path(), having);
+        assert!(issues.iter().any(|i| i.name == "rewards"), "{issues:?}");
+    }
+
     /// The registry keeps a schema entry per decoder, so a table can appear twice; DuckDB refuses a
     /// repeated CTE name, and a table named in two cases is still one table to it.
     #[test]
     fn a_repeated_table_gets_one_typed_cte() {
-        let dir = nest();
-        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
-        std::fs::write(
-            dir.path().join("abis/svc.json"),
-            r#"[{"type":"event","name":"Collected","anonymous":false,"inputs":[
-                {"name":"tokensRewards","type":"uint256","indexed":false}]}]"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("nuthatch.toml"),
-            "[nest]\nname=\"svc\"\nchain=\"mainnet\"\nchain_id=1\nrpc_urls=[]\n\
-             [[contracts]]\nalias=\"svc\"\naddress=\"0x00000000000000000000000000000000000000aa\"\n\
-             abi=\"abis/svc.json\"\n",
-        )
-        .unwrap();
+        let dir = wide_nest();
         let cfg = crate::config::Config::load(dir.path()).unwrap();
         let mut schema = crate::registry::from_nest(dir.path(), &cfg)
             .unwrap()
@@ -1442,12 +1478,14 @@ mod tests {
         shouting.table = shouting.table.to_ascii_uppercase();
         schema.push(schema[0].clone());
         schema.push(shouting);
-        let sql = typed_for_check(
-            &schema,
-            "SELECT SUM(tokensRewards) AS s FROM svc__collected",
-        )
-        .unwrap();
-        assert_eq!(sql.matches(" AS (SELECT").count(), 1, "{sql}");
+        let sql = "SELECT indexer, SUM(tokensRewards) AS s FROM svc__collected GROUP BY indexer";
+        let reads = wide_reads(&schema, &crate::entity_lower::lower(sql).unwrap());
+        let typed = typed_for_check(sql, &reads).unwrap();
+        assert_eq!(typed.matches(" AS (SELECT").count(), 1, "{typed}");
+        assert!(
+            !typed.contains("unused"),
+            "only the columns the plan reads: {typed}"
+        );
     }
 
     /// #1437: the offchain table and the columns it is read through are the definition; the
