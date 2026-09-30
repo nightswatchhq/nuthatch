@@ -2657,3 +2657,44 @@ async fn the_token_is_checked_before_the_body() {
         );
     }
 }
+
+/// From the 3.13.0 tyre-kick: a runtime serves `/metrics` at its root, before anything is mounted
+/// and with every mount's series once there are some. It was only under a mount's route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runtime_serves_metrics_at_its_root() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "b2".repeat(32);
+    let (mut handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
+    assert_eq!(
+        status(&handles.live, "/metrics").await,
+        axum::http::StatusCode::OK,
+        "an empty runtime has no /metrics"
+    );
+    handles
+        .mount("rootmetrics", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    let text = {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri("/metrics")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = handles.live.service().oneshot(req).await.unwrap();
+        String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    };
+    for series in [
+        "nuthatch_hot_store_bytes ",
+        "nuthatch_nest_last_block{nest=\"rootmetrics\"}",
+        "nuthatch_nest_hot_store_bytes{nest=\"rootmetrics\"}",
+        "nuthatch_nest_health{nest=\"rootmetrics\"",
+    ] {
+        assert!(text.contains(series), "root /metrics lacks {series}");
+    }
+}
