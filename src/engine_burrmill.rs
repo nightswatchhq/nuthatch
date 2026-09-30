@@ -47,6 +47,9 @@ pub(crate) struct BurrmillSession {
     engine: Mutex<burrmill::Engine>,
     /// Hot rows staged by `load_hot`, bound by the next `bind_facts` for that table.
     hot: Mutex<HashMap<String, Vec<Value>>>,
+    /// The declared columns of each maintained relation `load_relation` staged, so one with no rows
+    /// still binds (#1598). Burrmill types columns by name, so these carry names only.
+    relations: Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
 impl BurrmillSession {
@@ -59,6 +62,7 @@ impl BurrmillSession {
                 .map_err(engine_err)?,
             ),
             hot: Mutex::new(HashMap::new()),
+            relations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -282,6 +286,23 @@ impl Session for BurrmillSession {
         Ok(())
     }
 
+    fn load_relation(
+        &self,
+        table: &str,
+        cols: &[(String, &'static str)],
+        rows: &[&Value],
+    ) -> Result<()> {
+        let declared = cols
+            .iter()
+            .map(|(c, _)| (c.clone(), "string".into()))
+            .collect();
+        self.relations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(table.to_string(), declared);
+        self.load_hot(table, rows)
+    }
+
     fn bind_facts(
         &self,
         table: &str,
@@ -290,6 +311,19 @@ impl Session for BurrmillSession {
         hot: bool,
         window: FactWindow,
     ) -> Result<bool> {
+        let staged;
+        let cols = if cols.is_empty() && hot {
+            staged = self
+                .relations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(table)
+                .cloned()
+                .unwrap_or_default();
+            staged.as_slice()
+        } else {
+            cols
+        };
         let hot_rows: Vec<Value> = if hot {
             self.hot
                 .lock()

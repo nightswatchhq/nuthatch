@@ -2529,6 +2529,15 @@ fn define_views_bound(
     // The maintained relations, by the declaration that makes them so: their rows are typed from their
     // own cells rather than loaded as event text (#1572).
     let relations = declared_relations(dir);
+    // A pooled connection keeps the views an earlier request defined. An entity that has since
+    // faulted is left out of `hot`, and one whose rows fail to load is not rebound, so without this
+    // either would still answer from its old relation. Each is rebuilt below only if it loads.
+    for r in &relations {
+        let _ = session.execute(&format!(
+            "DROP VIEW IF EXISTS \"{}\"",
+            r.replace('"', "\"\"")
+        ));
+    }
 
     for table in &tables {
         let cols = cols_of(table);
@@ -3823,6 +3832,31 @@ mod tests {
             "1000000000000000000000000000001",
             "{:?}",
             out.rows
+        );
+
+        // The cached session keeps the view the queries above defined. An entity that has since
+        // faulted is left out of `hot`, and must not answer from that view; nor may one whose rows
+        // do not match their declared types.
+        let hot: super::HotRows = Default::default();
+        let gone = super::query_hot_cold(
+            dir.path(),
+            "SELECT count(*) AS faulted FROM totals",
+            guard(),
+            &hot,
+            u64::MAX,
+            &[],
+        );
+        assert!(
+            gone.is_err(),
+            "a faulted entity answered: {:?}",
+            gone.map(|o| o.rows)
+        );
+        let bad = serde_json::json!({"k": "a", "n": "not an integer"});
+        let mistyped = run(vec![bad], "SELECT count(*) AS mistyped FROM totals");
+        assert!(
+            mistyped.is_err(),
+            "a mistyped load answered: {:?}",
+            mistyped.map(|o| o.rows)
         );
     }
 

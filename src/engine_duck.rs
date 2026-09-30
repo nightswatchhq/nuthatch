@@ -923,12 +923,9 @@ fn load_declared_relation(
     cols: &[(String, &'static str)],
     rows: &[&Value],
 ) -> Result<()> {
-    let coldefs: Vec<String> = cols.iter().map(|(c, t)| format!("\"{c}\" {t}")).collect();
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS \"{name}\"; CREATE TEMP TABLE \"{name}\" ({})",
-        coldefs.join(", ")
-    ))?;
-    let mut app = conn.appender(name)?;
+    // Every row is converted before the table is touched, so a row that does not match leaves no
+    // empty or partial table behind.
+    let mut converted: Vec<Vec<DuckValue>> = Vec::with_capacity(rows.len());
     for row in rows {
         let vals: Vec<DuckValue> = cols
             .iter()
@@ -951,6 +948,15 @@ fn load_declared_relation(
                 (_, Some(v)) => Ok(DuckValue::Text(v.to_string())),
             })
             .collect::<Result<_>>()?;
+        converted.push(vals);
+    }
+    let coldefs: Vec<String> = cols.iter().map(|(c, t)| format!("\"{c}\" {t}")).collect();
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS \"{name}\"; CREATE TEMP TABLE \"{name}\" ({})",
+        coldefs.join(", ")
+    ))?;
+    let mut app = conn.appender(name)?;
+    for vals in &converted {
         let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
         app.append_row(refs.as_slice())?;
     }
