@@ -59,8 +59,12 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
             .iter()
             .flat_map(|t| derive_footguns(t).big_ints)
             .collect();
+        // DuckDB names the columns in scope; a hint drawn from every table's columns can name one this
+        // query cannot see, so every suggestion below is held to that scope, or not made.
+        let in_scope = candidate_bindings(raw);
         if big_ints.iter().any(|b| format!("{b}_dec") == col)
             && !all_cols.contains(&col.to_string())
+            && in_scope.iter().any(|c| c == col.trim_end_matches("_dec"))
         {
             return Some(format!(
                 "`{col}` is derived on the fly - it isn't a stored column, but you *can* select it. If \
@@ -81,14 +85,7 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
                 ));
             }
         }
-        // DuckDB names the columns in scope; every table's columns would suggest one this query cannot see.
-        let in_scope = candidate_bindings(raw);
-        let pool = if in_scope.is_empty() {
-            &all_cols
-        } else {
-            &in_scope
-        };
-        let refs: Vec<&str> = pool.iter().map(String::as_str).collect();
+        let refs: Vec<&str> = in_scope.iter().map(String::as_str).collect();
         return Some(match closest(&col, &refs) {
             Some(c) => format!(
                 "no column `{col}`; the closest is `{c}`. Call `schema` for this table's columns."
@@ -564,7 +561,9 @@ mod tests {
 
     #[test]
     fn unknown_column_suggests_the_closest_real_column() {
-        let raw = r#"Binder Error: Referenced column "valu" not found in FROM clause!"#;
+        // As DuckDB words it: the columns in scope follow on the next line.
+        let raw = "Binder Error: Referenced column \"valu\" not found in FROM clause!\n\
+                   Candidate bindings: \"from\", \"to\", \"value\"";
         let hint = enrich(raw, "SELECT valu FROM usdc__transfer", &schema()).unwrap();
         assert!(hint.contains("no column `valu`"));
         assert!(hint.contains("value"), "suggests value");
@@ -582,6 +581,15 @@ mod tests {
         let raw = "Binder Error: Referenced column \"valeu\" not found in FROM clause!\nCandidate bindings: \"value\", \"x.address\"";
         let hint = enrich(raw, "SELECT valeu FROM x", &schema()).unwrap();
         assert!(hint.contains("the closest is `value`"), "{hint}");
+        // With no scope to go on, no column is suggested at all, rather than one from any table.
+        let raw = "Binder Error: Referenced column \"tox\" not found in FROM clause!";
+        let hint = enrich(raw, "SELECT tox FROM x", &schema()).unwrap();
+        assert!(!hint.contains("closest"), "{hint}");
+        // Nor is a `_dec` column's base named as present when this query cannot see it.
+        let raw = "Binder Error: Referenced column \"value_dec\" not found in FROM clause!\n\
+                   Candidate bindings: \"owner\", \"spender\"";
+        let hint = enrich(raw, "SELECT value_dec FROM x", &schema()).unwrap();
+        assert!(!hint.contains("exists as"), "{hint}");
     }
 
     #[test]
