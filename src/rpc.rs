@@ -1859,7 +1859,8 @@ impl RpcClient {
             .filter_map(|l| {
                 let block = parse_hex_u64(l.get("blockNumber")?.as_str()?).ok()?;
                 let ts = parse_hex_u64(l.get("blockTimestamp")?.as_str()?).ok()?;
-                Some((block, ts))
+                // arb1.arbitrum.io sends `0x0` on every log: absent, not the epoch.
+                (ts != 0).then_some((block, ts))
             })
             .collect();
         if found.is_empty() {
@@ -2450,6 +2451,7 @@ mod tests {
             log(11, Some(1_012), false),
             log(12, None, false),
             log(13, Some(9_999), true),
+            log(14, Some(0), false),
         ]);
         let app = Router::new().route(
             "/",
@@ -2474,7 +2476,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
 
         let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
-        c.get_logs(&[], &["0x01".into()], 10, 13).await.unwrap();
+        c.get_logs(&[], &["0x01".into()], 10, 14).await.unwrap();
         let got = c.block_timestamps(&[10, 11]).await.unwrap();
         assert_eq!(got, HashMap::from([(10, 1_000), (11, 1_012)]));
         assert_eq!(
@@ -2483,11 +2485,11 @@ mod tests {
             "the logs already said when"
         );
 
-        // A log without the field, and a removed one, still go to the header.
-        let got = c.block_timestamps(&[12, 13]).await.unwrap();
+        // A log without the field, a removed one, and one saying 0x0 still go to the header.
+        let got = c.block_timestamps(&[12, 13, 14]).await.unwrap();
         server.abort();
-        assert_eq!(got, HashMap::from([(12, 7), (13, 7)]));
-        assert_eq!(HEADERS.load(Ordering::SeqCst), 2);
+        assert_eq!(got, HashMap::from([(12, 7), (13, 7), (14, 7)]));
+        assert_eq!(HEADERS.load(Ordering::SeqCst), 3);
     }
 
     #[test]
