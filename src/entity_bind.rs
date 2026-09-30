@@ -64,8 +64,9 @@ enum Columns {
 pub struct BoundSource {
     pub table: String,
     columns: Columns,
-    /// Each column's type as the circuit will see it, for [`Binding::check_types`].
-    types: Vec<Type>,
+    /// Each column's type as the circuit will see it, or `None` for one that may be NULL, for
+    /// [`Binding::check_types`]. A decoded value is never NULL; an offchain cell may be.
+    types: Vec<Option<Type>>,
 }
 
 impl BoundSource {
@@ -178,22 +179,21 @@ impl Binding {
     /// rules [`Expr::eval`] enforces per row (#1590). DuckDB's binder coerces where the circuit does
     /// not, so `check` passing through DuckDB alone let `fee + '1'` through to fault on its first row.
     fn check_types(&self, plan: &Plan) -> Result<()> {
-        use crate::entity_expr::Types;
         let left = &self.left.types;
-        let joined: Vec<Type> = left
+        let joined: Vec<Option<Type>> = left
             .iter()
             .chain(self.right.iter().flat_map(|r| r.types.iter()))
             .copied()
             .collect();
         // `admits` keeps a row only on TRUE, and faults on anything but a boolean or NULL.
-        let filter = |f: &Expr, cols: &[Type], what: &str| -> Result<()> {
-            let t = f
-                .static_type(cols)
-                .with_context(|| format!("{what} does not type-check"))?;
-            if !t.admits(Type::Bool) {
-                bail!("{what} must be a condition, but it is {t:?}");
+        let filter = |f: &Expr, cols: &[Option<Type>], what: &str| -> Result<()> {
+            match f
+                .definite_type(cols)
+                .with_context(|| format!("{what} does not type-check"))?
+            {
+                Some(t) if t != Type::Bool => bail!("{what} must be a condition, but it is {t:?}"),
+                _ => Ok(()),
             }
-            Ok(())
         };
         if let Some(f) = &plan.left_filter {
             filter(f, left, "the filter")?;
@@ -202,26 +202,31 @@ impl Binding {
             if let Some(f) = &join.right_filter {
                 filter(f, &right.types, "the joined table's filter")?;
             }
-            let (l, r) = (left[join.on.0], right.types[join.on.1]);
-            if l != r {
-                bail!("the join compares {l:?} with {r:?}: the entity subset has no implicit coercion");
+            // Not a fault but never a match: an equijoin across two types joins nothing.
+            if let (Some(l), Some(r)) = (left[join.on.0], right.types[join.on.1]) {
+                if l != r {
+                    bail!("the join compares {l:?} with {r:?}, which are never equal");
+                }
             }
         }
         for e in &plan.key {
-            e.static_type(&joined)
+            e.definite_type(&joined)
                 .context("a grouping key does not type-check")?;
         }
         for a in &plan.aggregates {
-            let t: Option<Types> = match a {
-                Agg::Count => None,
-                Agg::Min(e) | Agg::Max(e) | Agg::Sum(e) | Agg::Avg(e) => Some(
-                    e.static_type(&joined)
-                        .context("an aggregate does not type-check")?,
-                ),
-            };
-            if let (Agg::Sum(_) | Agg::Avg(_), Some(t)) = (a, t) {
-                if !t.admits(Type::Int) {
-                    bail!("SUM and AVG need integers, got {t:?}");
+            match a {
+                Agg::Count => {}
+                Agg::Min(e) | Agg::Max(e) => {
+                    e.definite_type(&joined)
+                        .context("an aggregate does not type-check")?;
+                }
+                Agg::Sum(e) | Agg::Avg(e) => {
+                    let t = e
+                        .definite_type(&joined)
+                        .context("an aggregate does not type-check")?;
+                    if let Some(t) = t.filter(|t| *t != Type::Int) {
+                        bail!("SUM and AVG need integers, got {t:?}");
+                    }
                 }
             }
         }
@@ -393,7 +398,7 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
                     _ => Type::Str,
                 },
             };
-            Ok((extract, ty))
+            Ok((extract, Some(ty)))
         })
         .collect::<Result<Vec<_>>>()?;
     let (columns, types) = columns.into_iter().unzip();
@@ -452,14 +457,7 @@ fn bind_offchain(source: &Source, table: &str, offchain: &Tables) -> Result<Boun
         )
     };
     let columns = found.bind(&source.table, &source.columns)?;
-    let types = columns
-        .iter()
-        .map(|c| match c.kind {
-            crate::entity_offchain::Kind::Int => Type::Int,
-            crate::entity_offchain::Kind::Str => Type::Str,
-            crate::entity_offchain::Kind::Bool => Type::Bool,
-        })
-        .collect();
+    let types = columns.iter().map(|_| None).collect();
     Ok(BoundSource {
         table: source.table.clone(),
         columns: Columns::Offchain(columns),
