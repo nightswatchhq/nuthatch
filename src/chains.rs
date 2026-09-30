@@ -492,7 +492,7 @@ pub fn keyless_caveat(chain: &str, rpc_urls: &[String], timestamps: bool) -> Opt
         "arb1.arbitrum.io sends no timestamp on its logs, so each block's comes from a header, and it \
          takes header batches of about ten. While it is anywhere in the pool, primary or fallback, \
          every header batch goes out at ten, keyed endpoints included: a backfill here runs at a few \
-         blocks a second, and a long one may be refused. For history, use a keyed Arbitrum RPC in \
+         times chain speed, and a long one may be refused. For history, use a keyed Arbitrum RPC in \
          place of arb1 (in rpc_urls, or --rpc <url>).",
     )
 }
