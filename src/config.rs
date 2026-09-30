@@ -639,7 +639,7 @@ impl Config {
                 format!("{parent}.{candidate}")
             };
             toml::from_str::<Config>(&text).is_ok()
-                && !Self::unknown_keys(&text).iter().any(|k| *k == at)
+                && !Self::unknown_keys(&text).contains(&at)
         })
     }
 
