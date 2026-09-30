@@ -1466,6 +1466,7 @@ fn live_datasets(
     dir: &Path,
     states: &[(String, crate::serve::AppState)],
     mounts: &[Mount],
+    default_tenant: &str,
 ) -> Vec<Dataset> {
     let mut out: Vec<Dataset> = Vec::new();
     for (name, _) in states {
@@ -1475,10 +1476,10 @@ fn live_datasets(
         };
         let record = mounts
             .iter()
-            .find(|m| m.alias == alias && tenant_seg.is_none_or(|t| m.tenant == t));
+            .find(|m| mount_route(m, default_tenant) == *name);
         let tenant = record
             .map(|m| m.tenant.clone())
-            .unwrap_or_else(|| tenant_seg.unwrap_or(DEFAULT_TENANT).to_string());
+            .unwrap_or_else(|| tenant_seg.unwrap_or(default_tenant).to_string());
         let nid = record.map(|m| m.nid.clone());
         let path = match &nid {
             Some(nid) => MountTable::data_dir(dir, nid),
@@ -3440,7 +3441,7 @@ impl RuntimeHandles {
             self.mount_ctx
                 .mounts
                 .iter()
-                .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+                .find(|m| mount_route(m, &self.default_tenant) == name)
                 .map(|m| m.nid.clone())
         });
         let dir = match &nid {
@@ -3492,7 +3493,7 @@ impl RuntimeHandles {
                     .mount_ctx
                     .mounts
                     .iter()
-                    .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t));
+                    .find(|m| mount_route(m, &self.default_tenant) == name);
                 state.surface = Arc::new(record.map(Mount::surface).unwrap_or_default());
                 #[cfg(feature = "counter")]
                 {
@@ -3573,7 +3574,7 @@ impl RuntimeHandles {
                     .mount_ctx
                     .mounts
                     .iter()
-                    .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+                    .find(|m| mount_route(m, &self.default_tenant) == name)
                     .cloned();
 
                 let (state, worker) = match lifecycle {
@@ -3700,7 +3701,7 @@ impl RuntimeHandles {
             .mount_ctx
             .mounts
             .iter()
-            .find(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+            .find(|m| mount_route(m, &self.default_tenant) == name)
         {
             if let (Some(publish), Some(_)) = (&record.publish, &nid) {
                 match spawn_publisher(
@@ -3724,7 +3725,7 @@ impl RuntimeHandles {
         // unmount already does for removal. A pre-2.0 mount (no `nid`) has no record to keep; `persist`
         // already falls back to the flat `nests` list for that layout.
         if let Some(nid) = &nid {
-            let record_tenant = tenant.map(str::to_string).unwrap_or_else(default_tenant);
+            let record_tenant = tenant.map_or_else(|| self.default_tenant.clone(), str::to_string);
             match self
                 .mount_ctx
                 .mounts
@@ -3747,7 +3748,12 @@ impl RuntimeHandles {
         // The roster (`GET /nests`) is rebuilt from the live `states`, not patched - #554 was exactly
         // this step missing, which left the roster reporting its startup snapshot while the mount
         // otherwise worked in full: dataset resolved, cursor caught up, routes serving.
-        let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
+        let datasets = live_datasets(
+            &self.mount_ctx.dir,
+            &self.states,
+            &self.mount_ctx.mounts,
+            &self.default_tenant,
+        );
         self.roster["nests"] = serde_json::json!(build_roster_entries(
             &self.states,
             &datasets,
@@ -4038,16 +4044,14 @@ impl RuntimeHandles {
         for p in self.publishers.iter_mut().filter(|(n, _)| *n == staging) {
             p.0 = name.to_string();
         }
-        let (tenant, alias) = split_route_key(name);
-        let (_, staging_alias) = split_route_key(&staging);
         self.mount_ctx
             .mounts
-            .retain(|m| !(m.alias == staging_alias && tenant.is_none_or(|t| m.tenant == t)));
+            .retain(|m| mount_route(m, &self.default_tenant) != staging);
         for m in self
             .mount_ctx
             .mounts
             .iter_mut()
-            .filter(|m| m.alias == alias && tenant.is_none_or(|t| m.tenant == t))
+            .filter(|m| mount_route(m, &self.default_tenant) == name)
         {
             m.nid = nid.as_str().to_string();
         }
@@ -4123,7 +4127,12 @@ impl RuntimeHandles {
     fn recompose(&mut self) {
         // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
         // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
-        let datasets = live_datasets(&self.mount_ctx.dir, &self.states, &self.mount_ctx.mounts);
+        let datasets = live_datasets(
+            &self.mount_ctx.dir,
+            &self.states,
+            &self.mount_ctx.mounts,
+            &self.default_tenant,
+        );
         self.roster["nests"] = serde_json::json!(build_roster_entries(
             &self.states,
             &datasets,

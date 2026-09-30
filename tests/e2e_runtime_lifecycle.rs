@@ -2903,3 +2903,56 @@ async fn a_configured_default_tenant_spelled_out_is_refused_at_the_api() {
     let (_, jobs) = call(&routes, "GET", "/_admin/mounts", None, None).await;
     assert!(!jobs.contains("acme/usdc"), "a job was recorded: {jobs}");
 }
+
+/// From the follow-up on the box: with `default_tenant = "acme"`, a mount of `usdc` was recorded under
+/// the literal `default` tenant, matched no route key, and was never written, so a restart lost it.
+/// And a bare name matched a record of any tenant, so moving `usdc` rewrote `globex/usdc` as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_default_tenant_keeps_its_mounts_and_moves_one_alone() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("7a".repeat(32), "8b".repeat(32));
+    std::fs::write(
+        roost.path().join(runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\ndefault_tenant = \"acme\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
+    )
+    .unwrap();
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &old_nid).await;
+    handles.default_tenant = "acme".to_string();
+    handles.mount_ctx.mounts.clear();
+    for name in ["usdc", "globex/usdc"] {
+        handles
+            .mount(name, Some(runtime::Nid::parse(&old_nid).unwrap()))
+            .await
+            .unwrap_or_else(|e| panic!("mount {name}: {e:#}"));
+    }
+    let records = || {
+        let raw = std::fs::read_to_string(roost.path().join(runtime::MOUNTS_FILE)).unwrap();
+        let table: runtime::MountTable = toml::from_str(&raw).unwrap();
+        let mut out: Vec<(String, String, String)> = table
+            .mounts
+            .into_iter()
+            .map(|m| (m.tenant, m.alias, m.nid))
+            .collect();
+        out.sort();
+        out
+    };
+    let rec = |t: &str, n: &str| (t.to_string(), "usdc".to_string(), n.to_string());
+    assert_eq!(
+        records(),
+        vec![rec("acme", &old_nid), rec("globex", &old_nid)],
+        "both mounts are recorded, the default one under the configured tenant"
+    );
+
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+    handles
+        .move_name("usdc", runtime::Nid::parse(&new_nid).unwrap())
+        .await
+        .expect("move");
+    assert_eq!(
+        records(),
+        vec![rec("acme", &new_nid), rec("globex", &old_nid)],
+        "moving usdc leaves globex/usdc on its own nid"
+    );
+}
