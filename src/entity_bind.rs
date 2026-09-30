@@ -273,7 +273,7 @@ impl Binding {
 fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
     let table = schema
         .iter()
-        .find(|t| t.table == source.table)
+        .find(|t| t.table.eq_ignore_ascii_case(&source.table))
         .ok_or_else(|| {
             let mut known: Vec<&str> = schema.iter().map(|t| t.table.as_str()).collect();
             known.sort_unstable();
@@ -300,7 +300,7 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
             let position = table
                 .columns
                 .iter()
-                .position(|c| &c.name == name)
+                .position(|c| c.name.eq_ignore_ascii_case(name))
                 .ok_or_else(|| {
                     anyhow!(
                         "no column {name} in {}. Its columns are: {}",
@@ -313,6 +313,8 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
                             .join(", ")
                     )
                 })?;
+            // The registry's spelling from here on: rows are matched and checked against it.
+            let name = &table.columns[position].name;
             Ok(if position < implicit {
                 implicit_extract(name)?
             } else {
@@ -322,7 +324,7 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(BoundSource {
-        table: source.table.clone(),
+        table: table.table.clone(),
         columns: Columns::Chain(columns),
     })
 }
@@ -519,6 +521,34 @@ mod tests {
             table: "usdc__transfer".into(),
             columns: columns.iter().map(|c| c.to_string()).collect(),
         }
+    }
+
+    /// #1591: SQL identifiers are case-insensitive on every surface, and `check` binds through one,
+    /// so the binder must be too, and must match rows by the registry's own spelling.
+    #[test]
+    fn a_table_and_column_bind_in_any_case() {
+        let reg = registry();
+        let plan = Plan {
+            left: Source {
+                table: "USDC__Transfer".into(),
+                columns: vec!["TO".into(), "Value".into(), "BLOCK_NUMBER".into()],
+            },
+            left_filter: None,
+            join: None,
+            key: vec![Expr::Column(0)],
+            aggregates: vec![Agg::Sum(Expr::Column(1))],
+        };
+        let binding = Binding::bind(&plan, &reg).unwrap();
+        let rows = decode(&reg, &[transfer(ALICE, BOB, "64", 10, 0)]);
+        let (left, _) = binding.window(&rows).unwrap();
+        assert_eq!(
+            left,
+            vec![Row(vec![
+                Scalar::Str(BOB.into()),
+                Scalar::Int(100),
+                Scalar::Int(10)
+            ])]
+        );
     }
 
     /// **§5.1, end to end.** Logs decode through the real registry, the binding turns that window
