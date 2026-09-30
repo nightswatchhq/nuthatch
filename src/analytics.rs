@@ -3866,7 +3866,7 @@ mod tests {
 
     #[test]
     fn dependency_closure_reaches_sources_beyond_eight_views() {
-        each_engine(dependency_closure_reaches_sources_beyond_eight_views_on);
+        crate::engine::each_engine(dependency_closure_reaches_sources_beyond_eight_views_on);
     }
 
     fn dependency_closure_reaches_sources_beyond_eight_views_on(conn: &dyn Session) {
@@ -3906,7 +3906,9 @@ mod tests {
     /// only the segments that overlap it. The count alone cannot tell pruning from the predicate.
     #[test]
     fn a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments() {
-        each_engine(a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments_on);
+        crate::engine::each_engine(
+            a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments_on,
+        );
     }
 
     fn a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments_on(
@@ -7289,7 +7291,7 @@ template="pool"
     /// quietly.
     #[test]
     fn an_authored_view_resolves_on_a_cold_nest_with_no_rows() {
-        each_engine(an_authored_view_resolves_on_a_cold_nest_with_no_rows_on);
+        crate::engine::each_engine(an_authored_view_resolves_on_a_cold_nest_with_no_rows_on);
     }
 
     fn an_authored_view_resolves_on_a_cold_nest_with_no_rows_on(conn: &dyn Session) {
@@ -7345,7 +7347,7 @@ template="pool"
     /// mechanism is missing passes for the wrong reason.
     #[test]
     fn a_view_the_statement_cannot_reach_is_not_redefined() {
-        each_engine(a_view_the_statement_cannot_reach_is_not_redefined_on);
+        crate::engine::each_engine(a_view_the_statement_cannot_reach_is_not_redefined_on);
     }
 
     fn a_view_the_statement_cannot_reach_is_not_redefined_on(conn: &dyn Session) {
@@ -7447,7 +7449,9 @@ template="pool"
     /// `refresh_stale_artifacts` regenerates a missing schema before anything reads it.
     #[test]
     fn without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it() {
-        each_engine(without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it_on);
+        crate::engine::each_engine(
+            without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it_on,
+        );
     }
 
     fn without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it_on(
@@ -7637,7 +7641,9 @@ template="pool"
     /// commit that added the event without regenerating.
     #[test]
     fn the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it() {
-        each_engine(the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it_on);
+        crate::engine::each_engine(
+            the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it_on,
+        );
     }
 
     fn the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it_on(conn: &dyn Session) {
@@ -7939,7 +7945,7 @@ events = ["Transfer"]
     /// granularity.
     #[test]
     fn one_premature_view_does_not_kill_the_others_in_its_file() {
-        each_engine(one_premature_view_does_not_kill_the_others_in_its_file_on);
+        crate::engine::each_engine(one_premature_view_does_not_kill_the_others_in_its_file_on);
     }
 
     fn one_premature_view_does_not_kill_the_others_in_its_file_on(conn: &dyn Session) {
@@ -8105,29 +8111,9 @@ events = ["Transfer"]
     ///
     /// The cases below are deliberately ones the denylist does **not** list: if this test passes, the
     /// allowlist is carrying weight of its own rather than shadowing the older control.
-    /// A bare session on every engine this build carries: DuckDB, and Burrmill where it is built in.
-    fn engines() -> Vec<Box<dyn Session>> {
-        #[allow(unused_mut)]
-        let mut sessions: Vec<Box<dyn Session>> =
-            vec![Box::new(Connection::open_in_memory().unwrap())];
-        #[cfg(feature = "shadow-burrmill")]
-        sessions.push(
-            crate::engine::Engine::open_bare(&crate::engine_burrmill::BurrmillEngine).unwrap(),
-        );
-        sessions
-    }
-
-    /// Run a test body once on each engine, from its own setup, naming the engine for a failure.
-    fn each_engine(body: impl Fn(&dyn Session)) {
-        for session in engines() {
-            eprintln!("on {}", session.engine_version());
-            body(session.as_ref());
-        }
-    }
-
     #[test]
     fn the_allowlist_refuses_functions_the_denylist_never_heard_of() {
-        for (conn, q) in engines().iter().flat_map(|c| {
+        for (conn, q) in crate::engine::test_sessions().iter().flat_map(|c| {
             [
                 // Not in FORBIDDEN_FNS - inert today only because the extension is not bundled.
                 "SELECT * FROM read_xlsx('/etc/passwd')",
@@ -8154,7 +8140,7 @@ events = ["Transfer"]
     /// distinguish it from a real table, so the name has to be checked.
     #[test]
     fn a_path_in_table_position_is_not_a_table_name() {
-        for (conn, q) in engines().iter().flat_map(|c| {
+        for (conn, q) in crate::engine::test_sessions().iter().flat_map(|c| {
             [
                 "SELECT * FROM '/etc/passwd'",
                 "SELECT * FROM '/x.parquet'",
@@ -8174,7 +8160,7 @@ events = ["Transfer"]
     /// which is a broken dashboard rather than a breach, but still a bug.
     #[test]
     fn ordinary_analytical_sql_still_passes_the_allowlist() {
-        for (conn, q) in engines().iter().flat_map(|c| {
+        for (conn, q) in crate::engine::test_sessions().iter().flat_map(|c| {
             [
                 "SELECT * FROM usdc__transfer",
                 r#"SELECT "from", "to", value_dec FROM usdc__transfer WHERE value_dec > 100"#,

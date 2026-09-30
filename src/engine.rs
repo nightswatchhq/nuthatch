@@ -205,3 +205,23 @@ pub(crate) trait Session: Send {
     /// Define the `labels` view over the `*.json` snapshots in `labels_dir`.
     fn bind_labels(&self, labels_dir: &Path) -> Result<()>;
 }
+
+/// A bare session on every engine this build carries: DuckDB, and Burrmill where it is built in.
+#[cfg(test)]
+pub(crate) fn test_sessions() -> Vec<Box<dyn Session>> {
+    #[allow(unused_mut)]
+    let mut sessions: Vec<Box<dyn Session>> =
+        vec![Box::new(duckdb::Connection::open_in_memory().unwrap())];
+    #[cfg(feature = "shadow-burrmill")]
+    sessions.push(crate::engine_burrmill::BurrmillEngine.open_bare().unwrap());
+    sessions
+}
+
+/// Run a test body once on each engine, from its own setup, naming the engine for a failure.
+#[cfg(test)]
+pub(crate) fn each_engine(body: impl Fn(&dyn Session)) {
+    for session in test_sessions() {
+        eprintln!("on {}", session.engine_version());
+        body(session.as_ref());
+    }
+}
