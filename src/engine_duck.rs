@@ -239,10 +239,10 @@ impl Session for Connection {
                 "QUALIFIED_SCHEMA" => surveys = true,
                 // A DuckDB *replacement scan* (`FROM '/x.parquet'`) parses as a BASE_TABLE whose
                 // name is the path, so the AST alone cannot tell it from a real table - the name has
-                // to be checked.
+                // to be checked. A path needs `/`, `.` or `:`; a non-ASCII name (`abéé`) needs none.
                 "BASE_TABLE"
                     if name.is_empty()
-                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                        || !name.chars().all(|c| c.is_alphanumeric() || c == '_') =>
                 {
                     bad = Some(format!(
                         "`{name}` is not a table name - a quoted path in table position reads a file"
@@ -999,6 +999,21 @@ mod tests {
     /// An unconfigured process still opens DuckDB at today's 512 MB / 2 threads. Raising the permit
     /// count no longer silently shrinks the per-connection ceiling: that product is the startup
     /// validator's job (RFC-0047 C4).
+    #[test]
+    fn the_security_walk_takes_a_non_ascii_name_and_still_refuses_a_path() {
+        let d = tempfile::tempdir().unwrap();
+        let (conn, _spill) = open_locked_duckdb(d.path()).unwrap();
+        let cte = "WITH abéé AS (SELECT 1 AS x) SELECT x FROM abéé";
+        assert!(matches!(Session::reach(&conn, cte), Some(Ok(_))), "{cte}");
+        for q in [
+            "SELECT * FROM '/x.parquet'",
+            "SELECT * FROM 'dé/x.csv'",
+            "SELECT * FROM 'é.json'",
+        ] {
+            assert!(matches!(Session::reach(&conn, q), Some(Err(_))), "{q}");
+        }
+    }
+
     #[test]
     fn unconfigured_duckdb_still_opens_at_todays_walls() {
         let _env = crate::analytics_budget::tests::env_lock()
