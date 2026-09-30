@@ -151,6 +151,15 @@ pub(crate) trait Session: Send {
     /// Load one table's hot rows so that `bind_facts(.., hot = true, ..)` can union them in.
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()>;
 
+    /// Remove a maintained relation's public name, so a pooled session cannot answer from one an
+    /// earlier request defined after the entity faulted (#1598). An engine that cannot remove a
+    /// relation keeps it; Burrmill has no way to, so under the shadow its stale relation shows as a
+    /// divergence rather than passing unseen.
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+
     /// [`Session::load_hot`] for a maintained relation: it has no sealed Parquet to line up with, so
     /// its columns take the types its plan declares (`cols`, #1598), or, with none declared, the types
     /// of its own cells. With declared columns it exists even with no rows.

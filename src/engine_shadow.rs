@@ -515,6 +515,17 @@ impl Session for ShadowSession {
         )
     }
 
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        self.both(
+            &format!("drop_relation {name}"),
+            |s| s.drop_relation(name),
+            |r| match r {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("{e:#}"),
+            },
+        )
+    }
+
     fn load_relation(
         &self,
         table: &str,

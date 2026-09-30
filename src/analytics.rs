@@ -2533,10 +2533,7 @@ fn define_views_bound(
     // faulted is left out of `hot`, and one whose rows fail to load is not rebound, so without this
     // either would still answer from its old relation. Each is rebuilt below only if it loads.
     for r in &relations {
-        let _ = session.execute(&format!(
-            "DROP VIEW IF EXISTS \"{}\"",
-            r.replace('"', "\"\"")
-        ));
+        let _ = session.drop_relation(r);
     }
 
     for table in &tables {

@@ -100,6 +100,9 @@ impl Session for DuckSession {
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
         self.conn.load_hot(table, rows)
     }
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        self.conn.drop_relation(name)
+    }
     fn load_relation(
         &self,
         table: &str,
@@ -292,6 +295,14 @@ impl Session for Connection {
             ))
         })?;
         physical_parquet_scans(&plan)
+    }
+
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        self.execute_batch(&format!(
+            "DROP VIEW IF EXISTS \"{}\"",
+            name.replace('"', "\"\"")
+        ))?;
+        Ok(())
     }
 
     fn load_relation(
