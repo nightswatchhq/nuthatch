@@ -638,8 +638,7 @@ impl Config {
             } else {
                 format!("{parent}.{candidate}")
             };
-            toml::from_str::<Config>(&text).is_ok()
-                && !Self::unknown_keys(&text).contains(&at)
+            toml::from_str::<Config>(&text).is_ok() && !Self::unknown_keys(&text).contains(&at)
         })
     }
 

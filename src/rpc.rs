@@ -2511,6 +2511,16 @@ mod tests {
         assert!(blocks.iter().all(|b| got[b] == b * 10));
         let sent = seen.lock().unwrap().clone();
         assert!(sent.iter().all(|&n| n <= 10), "{sent:?}");
+        // The header and block-body path chunks separately, and at the same width (astra on #1586).
+        seen.lock().unwrap().clear();
+        let more: Vec<u64> = (2_000..2_300).collect();
+        let headers = c
+            .block_headers(&more)
+            .await
+            .expect("headers at the capped width");
+        assert_eq!(headers.len(), 300);
+        let sent = seen.lock().unwrap().clone();
+        assert!(sent.iter().all(|&n| n <= 10), "{sent:?}");
 
         let (url, seen) = serve(true).await;
         let mut c = RpcClient::new(vec![url]).unwrap();

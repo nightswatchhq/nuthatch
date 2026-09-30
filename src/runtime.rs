@@ -1812,8 +1812,12 @@ pub async fn dev(
             );
         }
         let timestamps = group.nests.iter().any(|(_, _, c)| c.nest.block_timestamps);
-        if let Some(note) =
-            crate::chains::keyless_caveat(&group.endpoint.chain, &rpc_urls, timestamps)
+        let pool: Vec<String> = rpc_urls
+            .iter()
+            .chain(rpc_fallback.iter())
+            .cloned()
+            .collect();
+        if let Some(note) = crate::chains::keyless_caveat(&group.endpoint.chain, &pool, timestamps)
         {
             tracing::warn!("{note}");
         }
