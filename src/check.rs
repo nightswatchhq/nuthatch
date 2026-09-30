@@ -30,11 +30,18 @@ pub fn check(args: CheckArgs) -> Result<()> {
     if let Ok(raw) = std::fs::read_to_string(dir.join(crate::config::CONFIG_FILE)) {
         let unknown = crate::config::Config::unknown_keys(&raw);
         if !unknown.is_empty() {
+            let named: Vec<String> = unknown
+                .iter()
+                .map(|k| match crate::config::Config::suggest_key(&raw, k) {
+                    Some(s) => format!("{k} (did you mean `{s}`?)"),
+                    None => k.clone(),
+                })
+                .collect();
             bail!(
                 "{} has key(s) nuthatch does not read, so their defaults apply instead: {}. Check \
                  the spelling against the config reference.",
                 crate::config::CONFIG_FILE,
-                unknown.join(", ")
+                named.join(", ")
             );
         }
     }
