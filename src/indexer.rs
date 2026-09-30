@@ -42,7 +42,7 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// configuration, which is what a nest's content address is a statement about.
 use crate::store::{IDENTITY_FORMULA, IDENTITY_FORMULA_KEY, REGISTRY_KEY};
 const SEALED_THROUGH_KEY: &str = "sealed_through";
-const START_BLOCK_KEY: &str = "start_block";
+pub(crate) const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
 const DEFAULT_BACKFILL: u64 = 5_000;
 

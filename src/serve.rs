@@ -1631,7 +1631,19 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     ) = seal_direct;
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
-    let lag = tip.saturating_sub(last);
+    // Before its first commit a cursor stands just below its start block, not at block 0: a nest
+    // waiting for finality to reach its start is not the whole chain behind.
+    let position = if last == 0 {
+        s.store
+            .get_meta(crate::indexer::START_BLOCK_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(0, |start| start.saturating_sub(1))
+    } else {
+        last
+    };
+    let lag = tip.saturating_sub(position);
     // A wedge is judged against where the cursor may go: under `--finality-only` that is the finality
     // boundary, and one waiting there for the next finalized block is caught up (#1575).
     let ceiling = nest
@@ -1645,7 +1657,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
             now,
             s.freshness
                 .stall_threshold_secs(READINESS_PROGRESS_STALL_SECS),
-            target.saturating_sub(last),
+            target.saturating_sub(position),
         );
     let initial_failure = initial_poll_failed(last_poll, poll_failed);
     // #846: `seal_direct_active` used to suppress every term above with nothing put in its place, so
@@ -5285,6 +5297,44 @@ mod tests {
         let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{json}");
         assert_eq!(json["wedged"], json!(true));
+    }
+
+    /// #1575, found on Base: a new finality-only nest whose start block is above the finality boundary
+    /// has committed nothing, so its position is just below its start, not block 0. Waiting for
+    /// finality to reach it is not being the whole chain behind.
+    #[tokio::test]
+    async fn a_new_finality_cursor_waiting_below_its_start_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "finality-cursor-fresh";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let state = test_state(&dir.path().join(name), 4);
+        state
+            .store
+            .set_meta(crate::indexer::START_BLOCK_KEY, "1200")
+            .unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let router = compose_runtime(roster, vec![(name.to_string(), state)], health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_tip(1_300);
+        handle.set_ceiling(1_000);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now.saturating_sub(200));
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "waiting for finality to reach its start: {json}"
+        );
+        assert_eq!(json["wedged"], json!(false));
+        assert_eq!(
+            json["lag_blocks"],
+            json!(101),
+            "lag is from its position, not block 0"
+        );
     }
 
     /// #583/#589: a cursor level with tip - caught up, doing exactly what it should - must stay ready
