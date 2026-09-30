@@ -152,8 +152,15 @@ pub(crate) trait Session: Send {
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()>;
 
     /// [`Session::load_hot`] for a maintained relation: it has no sealed Parquet to line up with, so
-    /// its columns are typed from its own cells (all integers `HUGEINT`, all booleans `BOOLEAN`).
-    fn load_relation(&self, table: &str, rows: &[&Value]) -> Result<()> {
+    /// its columns take the types its plan declares (`cols`, #1598), or, with none declared, the types
+    /// of its own cells. With declared columns it exists even with no rows.
+    fn load_relation(
+        &self,
+        table: &str,
+        cols: &[(String, &'static str)],
+        rows: &[&Value],
+    ) -> Result<()> {
+        let _ = cols;
         self.load_hot(table, rows)
     }
 

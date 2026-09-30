@@ -2638,9 +2638,16 @@ fn define_views_bound(
         // derived from the rows themselves (like the sealed Parquet, `seal::rows_to_batch`), so this
         // works with or without a `schema.json`. The `*_dec` derived columns still come from the schema.
         let relation = relations.contains(&table.to_ascii_lowercase());
-        let hot_loaded = !hot_rows.is_empty()
+        // A relation with declared types exists empty: an entity with no rows yet is a table of none,
+        // not a missing one (#1598).
+        let declared_relation = if relation {
+            relation_types(dir, table)
+        } else {
+            Vec::new()
+        };
+        let hot_loaded = (!hot_rows.is_empty() || !declared_relation.is_empty())
             && match if relation {
-                session.load_relation(table, &hot_rows)
+                session.load_relation(table, &declared_relation, &hot_rows)
             } else {
                 session.load_hot(table, &hot_rows)
             } {
@@ -2742,6 +2749,52 @@ pub(crate) fn hold_relations(dir: &Path, decls: &[crate::entities::EntityDecl]) 
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(dir.to_path_buf(), names);
+}
+
+type HeldRelationTypes =
+    Mutex<std::collections::HashMap<(PathBuf, String), Vec<(String, &'static str)>>>;
+
+fn held_relation_types() -> &'static HeldRelationTypes {
+    static HELD: OnceLock<HeldRelationTypes> = OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// Record an entity's output columns with the types its plan gives them (#1598), so its relation
+/// exists before it holds a row and keeps one type whatever its values. A column whose type the plan
+/// cannot fix, a `CASE` over mixed branches for one, is text.
+pub(crate) fn hold_relation_types(
+    dir: &Path,
+    name: &str,
+    columns: &[String],
+    types: &[Option<crate::entity_expr::Type>],
+) {
+    use crate::entity_expr::Type;
+    let cols = columns
+        .iter()
+        .zip(types)
+        .map(|(c, t)| {
+            let ty = match t {
+                Some(Type::Int) => "HUGEINT",
+                Some(Type::Bool) => "BOOLEAN",
+                Some(Type::Str) | None => "VARCHAR",
+            };
+            (c.clone(), ty)
+        })
+        .collect();
+    held_relation_types()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((dir.to_path_buf(), name.to_ascii_lowercase()), cols);
+}
+
+/// The declared columns of `dir`'s relation `name`, or none when it was never started here.
+fn relation_types(dir: &Path, name: &str) -> Vec<(String, &'static str)> {
+    held_relation_types()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dir.to_path_buf(), name.to_ascii_lowercase()))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The entity names `entities.toml` declares in `dir`, lowercased, as last read successfully. A running
@@ -3224,7 +3277,12 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     };
     // Base surface the views bind against. `u64::MAX` includes every sealed segment (or, on a fresh
     // nest, yields the empty typed views) so a view referencing `usdc__transfer` resolves.
-    let empty_hot = HotRows::new();
+    // Each entity that binds is an empty relation of its declared types, so a view over it checks
+    // exactly when `dev` would serve it (#1599).
+    let empty_hot: HotRows = crate::entities::hold_declared_relations(dir)
+        .into_iter()
+        .map(|name| (name, Vec::new()))
+        .collect();
     let _ = define_views(
         &*session,
         dir,
@@ -3720,6 +3778,53 @@ mod tests {
         empty_view_ddl, new_spill_dir, physical_parquet_scans, with_declared_base_cols, SPILL_SEQ,
     };
     use duckdb::Connection;
+
+    /// #1598: an entity's relation takes the types its plan declares. It exists with no rows, and a
+    /// sum past what a JSON number holds stays an integer rather than becoming text.
+    #[test]
+    fn an_entity_relation_keeps_its_declared_types_empty_or_large() {
+        use crate::entity_expr::Type;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['k']\nmax_rows=10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT k, sum(v) AS n FROM t GROUP BY k",
+        )
+        .unwrap();
+        crate::entities::load(dir.path()).unwrap();
+        super::hold_relation_types(
+            dir.path(),
+            "totals",
+            &["k".into(), "n".into()],
+            &[Some(Type::Str), Some(Type::Int)],
+        );
+        let guard = || super::QueryGuard {
+            timeout: std::time::Duration::from_secs(10),
+            max_rows: 10,
+        };
+        let run = |rows: Vec<serde_json::Value>, sql: &str| {
+            let hot: super::HotRows = [("totals".to_string(), rows)].into_iter().collect();
+            super::query_hot_cold(dir.path(), sql, guard(), &hot, u64::MAX, &[])
+        };
+
+        let empty = run(Vec::new(), "SELECT count(*) AS c, sum(n) AS s FROM totals").unwrap();
+        assert_eq!(empty.rows[0]["c"], serde_json::json!(0), "{:?}", empty.rows);
+
+        // What `sql_cell` renders for an i128 beyond a JSON number: a string.
+        let big = serde_json::json!({"k": "a", "n": "1000000000000000000000000000000"});
+        let out = run(vec![big], "SELECT n + 1 AS m FROM totals").unwrap();
+        assert_eq!(
+            out.rows[0]["m"].to_string().trim_matches('"'),
+            "1000000000000000000000000000001",
+            "{:?}",
+            out.rows
+        );
+    }
 
     #[test]
     fn relation_membership_preserves_existence_with_nulls_and_duplicates() {

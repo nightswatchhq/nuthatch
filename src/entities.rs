@@ -407,6 +407,36 @@ fn plan_ast(conn: &Connection, sql: &str) -> Result<Value> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+/// Lower and bind each declared entity as `dev` starts it, record its output types, and return the
+/// names that bound (#1599): the relations an authored view may read. One that does not bind is left
+/// out, and `validate` reports why.
+pub(crate) fn hold_declared_relations(dir: &Path) -> Vec<String> {
+    let Some(registry) = crate::config::Config::load(dir)
+        .ok()
+        .and_then(|cfg| crate::registry::from_nest(dir, &cfg).ok())
+    else {
+        return Vec::new();
+    };
+    let Ok(decls) = load(dir) else {
+        return Vec::new();
+    };
+    decls
+        .into_iter()
+        .filter_map(|decl| {
+            let sql = decl.read_sql(dir).ok()?;
+            let (plan, columns) = crate::entity_lower::lower_with_columns(&sql).ok()?;
+            let (binding, _) = bind_as_dev(dir, &decl.name, &plan, &registry).ok()?;
+            crate::analytics::hold_relation_types(
+                dir,
+                &decl.name,
+                &columns,
+                &binding.output_types(&plan),
+            );
+            Some(decl.name)
+        })
+        .collect()
+}
+
 /// Bind a lowered entity to this nest the way it is started: its name must not shadow a decoded or
 /// offchain table, and every table and column it reads must exist. `dev` and `check` both call this,
 /// so neither can accept an entity the other refuses (#1590).
