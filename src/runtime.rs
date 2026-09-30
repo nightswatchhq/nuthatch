@@ -325,7 +325,7 @@ pub const STAGING_SUFFIX: &str = "__moving";
 /// A mount name as the admin API accepts it: `alias` or `tenant/alias`, each part as boot accepts it
 /// and at most 64 characters. Anything boot would refuse is refused here, since a name the API
 /// accepted is persisted, and the next start would fail on it.
-pub fn check_mount_name(name: &str) -> Result<()> {
+pub fn check_mount_name(name: &str, default_tenant: &str) -> Result<()> {
     let refuse = |why: String| Err(MountRefusal::InvalidName(why).into());
     let (tenant, alias) = match name.split('/').collect::<Vec<_>>().as_slice() {
         [alias] => (None, *alias),
@@ -350,6 +350,11 @@ pub fn check_mount_name(name: &str) -> Result<()> {
     if alias.ends_with(STAGING_SUFFIX) {
         return refuse(format!(
             "alias '{alias}' ends in '{STAGING_SUFFIX}', which a move reserves"
+        ));
+    }
+    if tenant == Some(default_tenant) {
+        return refuse(format!(
+            "'{name}' names the default tenant; mount it as '{alias}'"
         ));
     }
     Ok(())
@@ -2273,7 +2278,7 @@ pub fn lifecycle_routes(
             Ok(Json(body)) => body,
             Err(e) => return bad_body(e),
         };
-        if let Err(e) = check_mount_name(&body.name) {
+        if let Err(e) = check_mount_name(&body.name, jobs.default_tenant()) {
             return (
                 status_for(&e),
                 Json(serde_json::json!({"error": format!("{e:#}")})),
@@ -2559,7 +2564,7 @@ pub fn lifecycle_routes(
             Ok(Json(body)) => body,
             Err(e) => return bad_body(e),
         };
-        if let Err(e) = check_mount_name(&name) {
+        if let Err(e) = check_mount_name(&name, jobs.default_tenant()) {
             return (
                 status_for(&e),
                 Json(serde_json::json!({"error": format!("{e:#}")})),
@@ -3037,7 +3042,8 @@ pub async fn start_mount_jobs(
     use crate::mount_jobs::{MountJob, MountJobs, MountPhase};
     // Before any job runs, so a fetch a killed process left staged cannot be mistaken for one running.
     crate::mount_jobs::clear_stale_fetches(dir);
-    let jobs = Arc::new(MountJobs::load(dir));
+    let tenant = handles.lock().await.default_tenant.clone();
+    let jobs = Arc::new(MountJobs::load(dir).with_default_tenant(&tenant));
     {
         let h = handles.lock().await;
         for (name, state) in &h.states {

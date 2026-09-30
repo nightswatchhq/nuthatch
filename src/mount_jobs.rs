@@ -76,6 +76,8 @@ fn now_unix() -> u64 {
 pub struct MountJobs {
     file: PathBuf,
     jobs: std::sync::Mutex<BTreeMap<String, MountJob>>,
+    /// The runtime's default tenant, for refusing a name that spells it out before a job starts.
+    default_tenant: String,
 }
 
 impl MountJobs {
@@ -99,7 +101,17 @@ impl MountJobs {
         MountJobs {
             file,
             jobs: std::sync::Mutex::new(jobs),
+            default_tenant: crate::runtime::DEFAULT_TENANT.to_string(),
         }
+    }
+
+    pub fn with_default_tenant(mut self, tenant: &str) -> MountJobs {
+        self.default_tenant = tenant.to_string();
+        self
+    }
+
+    pub fn default_tenant(&self) -> &str {
+        &self.default_tenant
     }
 
     pub fn get(&self, name: &str) -> Option<MountJob> {

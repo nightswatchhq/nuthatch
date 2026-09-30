@@ -2725,6 +2725,7 @@ async fn names_boot_would_refuse_are_refused_at_the_api() {
         "usdc__moving",
         "acme/usdc.v2",
         "acme/",
+        "default/usdc",
     ] {
         let body = serde_json::json!({"name": name, "nid": nid}).to_string();
         let (status, answer) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
@@ -2875,4 +2876,30 @@ async fn identical_mounts_once() {
         after.contains("\"live\""),
         "a late worker changed the job: {after}"
     );
+}
+
+/// A configured default tenant, spelled out, is refused before a job starts, not by a job that then
+/// fails after the caller was told 202.
+#[tokio::test]
+async fn a_configured_default_tenant_spelled_out_is_refused_at_the_api() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c4".repeat(32);
+    let (mut handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
+    handles.default_tenant = "acme".to_string();
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let body = serde_json::json!({"name": "acme/usdc", "nid": nid}).to_string();
+    let (status, answer) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{answer}");
+    assert!(answer.contains("mount it as 'usdc'"), "{answer}");
+    let (status, answer) = call(&routes, "POST", "/_admin/move/acme/usdc", None, Some(&body)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "move: {answer}"
+    );
+    let (_, jobs) = call(&routes, "GET", "/_admin/mounts", None, None).await;
+    assert!(!jobs.contains("acme/usdc"), "a job was recorded: {jobs}");
 }
