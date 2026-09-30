@@ -226,14 +226,14 @@ impl MountRef {
     /// The path this mount is served under (RFC-0032 §7), and the key its health and footprint are
     /// recorded against.
     ///
-    /// `multi_tenant` decides whether the tenant appears: with one tenant in the runtime the segment
-    /// would be pure ceremony, and today's URLs must not move for the overwhelming majority of
-    /// users who will never type the word "tenant".
-    pub fn route_key(&self, multi_tenant: bool) -> String {
-        if multi_tenant {
-            format!("{}/{}", self.tenant, self.alias)
-        } else {
+    /// The default tenant's mounts are served by alias and every other tenant's as `tenant/alias`,
+    /// each decided by the mount alone. It used to depend on how many tenants the table held, so a
+    /// restart after a second tenant arrived moved routes nobody had touched (#1565).
+    pub fn route_key(&self, default_tenant: &str) -> String {
+        if self.tenant == default_tenant {
             self.alias.clone()
+        } else {
+            format!("{}/{}", self.tenant, self.alias)
         }
     }
 }
@@ -1262,7 +1262,7 @@ fn commit_derived_state(staging: &Path, dataset: &Path, staged: &[&'static str])
 pub fn load_mounted(
     dir: &Path,
     datasets: &[Dataset],
-    multi_tenant: bool,
+    default_tenant: &str,
 ) -> Result<Vec<(String, PathBuf, Config)>> {
     let mut out = Vec::with_capacity(datasets.len());
     for ds in datasets {
@@ -1282,7 +1282,7 @@ pub fn load_mounted(
             )
         })?;
         out.push((
-            ds.canonical().route_key(multi_tenant),
+            ds.canonical().route_key(default_tenant),
             ds.dir.clone(),
             config,
         ));
@@ -1295,26 +1295,32 @@ pub fn load_mounted(
 pub fn spawn_publishers(
     dir: &Path,
     mounts: &[Mount],
-    multi_tenant: bool,
+    default_tenant: &str,
 ) -> Result<Vec<(String, crate::publish::Publisher)>> {
     let mut out = Vec::new();
     for m in mounts {
         if let Some(publish) = &m.publish {
             // The first mount of a dataset is the one its cursor indexes under, as `Dataset::canonical`.
             let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
-            let cursor_key = mount_route(canonical, multi_tenant);
-            out.push(spawn_publisher(dir, m, publish, multi_tenant, &cursor_key)?);
+            let cursor_key = mount_route(canonical, default_tenant);
+            out.push(spawn_publisher(
+                dir,
+                m,
+                publish,
+                default_tenant,
+                &cursor_key,
+            )?);
         }
     }
     Ok(out)
 }
 
-fn mount_route(m: &Mount, multi_tenant: bool) -> String {
+fn mount_route(m: &Mount, default_tenant: &str) -> String {
     MountRef {
         tenant: m.tenant.clone(),
         alias: m.alias.clone(),
     }
-    .route_key(multi_tenant)
+    .route_key(default_tenant)
 }
 
 /// Reports under `cursor_key`, where the dataset's cursor records `sealed_through`, so publish lag compares
@@ -1323,10 +1329,10 @@ fn spawn_publisher(
     dir: &Path,
     m: &Mount,
     publish: &MountPublish,
-    multi_tenant: bool,
+    default_tenant: &str,
     cursor_key: &str,
 ) -> Result<(String, crate::publish::Publisher)> {
-    let key = mount_route(m, multi_tenant);
+    let key = mount_route(m, default_tenant);
     let dataset = MountTable::data_dir(dir, &m.nid);
     let publisher = crate::publish::spawn(dataset, cursor_key.to_string(), publish.settings()?)
         .with_context(|| format!("publishing mount '{key}'"))?;
@@ -1334,13 +1340,13 @@ fn spawn_publisher(
 }
 
 /// The identity of the dataset serving `route_key`, for the provenance stamp (RFC-0035 §3).
-fn ds_nid_for(datasets: &[Dataset], route_key: &str, multi_tenant: bool) -> Option<Arc<str>> {
+fn ds_nid_for(datasets: &[Dataset], route_key: &str, default_tenant: &str) -> Option<Arc<str>> {
     datasets
         .iter()
         .find(|d| {
             d.mounts
                 .iter()
-                .any(|m| m.route_key(multi_tenant) == route_key)
+                .any(|m| m.route_key(default_tenant) == route_key)
         })
         .and_then(|d| d.nid.as_deref().map(Arc::from))
 }
@@ -1359,16 +1365,16 @@ pub fn fan_out_aliases(
     mut states: Vec<(String, crate::serve::AppState)>,
     health: &crate::health::RuntimeHealth,
     estimates: &mut std::collections::HashMap<String, u64>,
-    multi_tenant: bool,
+    default_tenant: &str,
 ) -> Vec<(String, crate::serve::AppState)> {
     let mut extra = Vec::new();
     for ds in datasets {
-        let canonical = ds.canonical().route_key(multi_tenant);
+        let canonical = ds.canonical().route_key(default_tenant);
         let Some((_, state)) = states.iter().find(|(n, _)| n == &canonical) else {
             continue;
         };
         for m in &ds.mounts[1..] {
-            let key = m.route_key(multi_tenant);
+            let key = m.route_key(default_tenant);
             health.register_alias(&key, &canonical, &state.chain);
             // The footprint was charged once, to the dataset. Charging it again per mount would make
             // the per-cursor budget refuse a mount that costs nothing - sharing must not be taxed.
@@ -1463,7 +1469,7 @@ fn live_datasets(
 fn build_roster_entries(
     states: &[(String, crate::serve::AppState)],
     datasets: &[Dataset],
-    multi_tenant: bool,
+    default_tenant: &str,
     estimates: &std::collections::HashMap<String, u64>,
 ) -> Vec<serde_json::Value> {
     states
@@ -1473,17 +1479,22 @@ fn build_roster_entries(
             // operator seeing two entries has no way to tell one shared dataset from two backfills.
             // `None` when this mount has no dataset record - a nest mounted live from a bare directory
             // with nothing yet in `mounts.toml` - and the fields below degrade gracefully to that.
-            let ds = datasets
-                .iter()
-                .find(|d| d.mounts.iter().any(|m| &m.route_key(multi_tenant) == name));
-            let this =
-                ds.and_then(|d| d.mounts.iter().find(|m| &m.route_key(multi_tenant) == name));
+            let ds = datasets.iter().find(|d| {
+                d.mounts
+                    .iter()
+                    .any(|m| &m.route_key(default_tenant) == name)
+            });
+            let this = ds.and_then(|d| {
+                d.mounts
+                    .iter()
+                    .find(|m| &m.route_key(default_tenant) == name)
+            });
             let tenant = this.map(|m| m.tenant.clone());
             let shared_with: Vec<String> = ds
                 .map(|d| {
                     d.mounts
                         .iter()
-                        .map(|m| m.route_key(multi_tenant))
+                        .map(|m| m.route_key(default_tenant))
                         .filter(|k| k != name)
                         .collect()
                 })
@@ -1647,8 +1658,9 @@ pub async fn dev(
 
     // The whole table decides the tenancy shape, suspended records included, or a route key would
     // change with a suspend.
-    let multi_tenant = all_mounts.is_multi_tenant();
-    let mut mounted = load_mounted(&dir, &datasets, multi_tenant)?;
+    let default_tenant_owned = all_mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
+    let mut mounted = load_mounted(&dir, &datasets, default_tenant)?;
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
     for (_, _, config) in &mut mounted {
@@ -1668,7 +1680,7 @@ pub async fn dev(
                     .find(|r| r.tenant == m.tenant && r.alias == m.alias)
                 {
                     rec.surface()
-                        .validate_within(&ceiling, &m.route_key(multi_tenant))?;
+                        .validate_within(&ceiling, &m.route_key(default_tenant))?;
                 }
             }
         }
@@ -1688,7 +1700,11 @@ pub async fn dev(
             );
         }
     }
-    if multi_tenant {
+    if all_mounts
+        .mount_refs()
+        .iter()
+        .any(|m| m.tenant != default_tenant)
+    {
         tracing::info!(
             "multi-tenant: routes are /<tenant>/<nest>/… ({} tenants)",
             mounts
@@ -1888,8 +1904,13 @@ pub async fn dev(
         ingests.len()
     );
 
-    let mut all_states =
-        fan_out_aliases(&datasets, all_states, &health, &mut estimates, multi_tenant);
+    let mut all_states = fan_out_aliases(
+        &datasets,
+        all_states,
+        &health,
+        &mut estimates,
+        default_tenant,
+    );
 
     // Overlay each mount's SQL surface (RFC-0034 §2). Applied **per mount, not per dataset**: that is
     // the whole reason the allowlist is mount config rather than manifest. Two tenants sharing one
@@ -1900,7 +1921,7 @@ pub async fn dev(
                 tenant: m.tenant.clone(),
                 alias: m.alias.clone(),
             }
-            .route_key(multi_tenant)
+            .route_key(default_tenant)
                 == key
         }) else {
             continue;
@@ -1923,14 +1944,14 @@ pub async fn dev(
         {
             state.counter = m.counter.clone().map(Arc::new);
         }
-        state.nid = ds_nid_for(&datasets, key, multi_tenant);
+        state.nid = ds_nid_for(&datasets, key, default_tenant);
     }
     let all_states = all_states;
-    let publishers = spawn_publishers(&dir, &mounts.mounts, multi_tenant)?;
+    let publishers = spawn_publishers(&dir, &mounts.mounts, default_tenant)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
-    let roster_entries = build_roster_entries(&all_states, &datasets, multi_tenant, &estimates);
+    let roster_entries = build_roster_entries(&all_states, &datasets, default_tenant, &estimates);
     let roster = serde_json::json!({
         // The runtime's own name. Called `roost` pre-2.0; the blanket rename briefly made this
         // `mounts`, which read as "the mount list" while holding a single name string.
@@ -1959,7 +1980,7 @@ pub async fn dev(
         health: health.clone(),
         roster,
         estimates: estimates.clone(),
-        multi_tenant,
+        default_tenant: default_tenant_owned.clone(),
         suspended,
         mount_ctx: MountContext {
             dir: dir.clone(),
@@ -2598,13 +2619,14 @@ fn persist_mounted_nests(
     // `nests` here are **route keys** - tenant-qualified when the runtime is multi-tenant - because
     // that is what the serving layer and the admin API name a mount by. Matching them against
     // `alias` alone would drop every mount in a multi-tenant mounts on the first unmount.
-    let multi_tenant = mounts.is_multi_tenant();
+    let default_tenant_owned = mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
     let key_of = |m: &Mount| {
         MountRef {
             tenant: m.tenant.clone(),
             alias: m.alias.clone(),
         }
-        .route_key(multi_tenant)
+        .route_key(default_tenant)
     };
     // A runtime that started empty has neither list nor records, and its first mount must be
     // recorded by nid rather than by name (#1545). Only a file already on the pre-2.0 list, or with no
@@ -2680,7 +2702,7 @@ pub struct RuntimeHandles {
     pub estimates: std::collections::HashMap<String, u64>,
     /// Whether the runtime serves more than one tenant, for [`build_roster_entries`]'s route keys.
     /// Frozen at startup like `mount_ctx.mounts` - tenancy shape is not something a mount changes.
-    pub multi_tenant: bool,
+    pub default_tenant: String,
     /// Suspended mounts (#1548), route key to NID: kept on disk and in `mounts.toml`, answering 503.
     pub suspended: std::collections::BTreeMap<String, String>,
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
@@ -3008,13 +3030,14 @@ pub fn spawn_mount_job(
 pub fn split_suspended(
     table: &MountTable,
 ) -> (MountTable, std::collections::BTreeMap<String, String>) {
-    let multi_tenant = table.is_multi_tenant();
+    let default_tenant_owned = table.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
     let key_of = |m: &Mount| {
         MountRef {
             tenant: m.tenant.clone(),
             alias: m.alias.clone(),
         }
-        .route_key(multi_tenant)
+        .route_key(default_tenant)
     };
     let mut active = table.clone();
     let mut suspended = std::collections::BTreeMap::new();
@@ -3564,7 +3587,7 @@ impl RuntimeHandles {
                     &self.mount_ctx.dir,
                     record,
                     publish,
-                    self.multi_tenant,
+                    &self.default_tenant,
                     &cursor_key,
                 ) {
                     Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
@@ -3608,7 +3631,7 @@ impl RuntimeHandles {
         self.roster["nests"] = serde_json::json!(build_roster_entries(
             &self.states,
             &datasets,
-            self.multi_tenant,
+            &self.default_tenant,
             &self.estimates,
         ));
         self.live.swap(self.compose());
@@ -3977,7 +4000,7 @@ impl RuntimeHandles {
         self.roster["nests"] = serde_json::json!(build_roster_entries(
             &self.states,
             &datasets,
-            self.multi_tenant,
+            &self.default_tenant,
             &self.estimates,
         ));
         self.live.swap(self.compose());
@@ -4090,7 +4113,7 @@ mod tests {
         // First, so `quiet` is the route the dataset's cursor records under (#1415).
         table.mounts.insert(0, quiet);
 
-        let publishers = spawn_publishers(root.path(), &table.mounts, false).unwrap();
+        let publishers = spawn_publishers(root.path(), &table.mounts, "default").unwrap();
         let keys: Vec<&str> = publishers.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["usdc"]);
 
@@ -4958,8 +4981,58 @@ mod tests {
         );
     }
 
-    /// #1534: the file still has one tenant, so route keys are aliases, but the live name of the
-    /// new mount is `tenant/alias`. That record has to be written or the mount vanishes on restart.
+    /// #1565, and the 3.13.0 tyre-kick: a mount's route key depends on its own tenant alone, so it
+    /// is the same before and after a restart whatever else is mounted, and a suspended
+    /// `tenant/alias` is still found suspended when the table is read back.
+    #[test]
+    fn route_keys_are_per_mount_and_survive_a_second_tenant() {
+        let refs = |t: &MountTable| -> Vec<String> {
+            let d = t.tenant_default();
+            t.mount_refs().iter().map(|m| m.route_key(&d)).collect()
+        };
+        let one: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\n\n[[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(refs(&one), vec!["acme/usdc"], "one non-default tenant");
+        let two: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\n\n\
+             [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"x\"\n\n\
+             [[mounts]]\nalias = \"usdc2\"\nnid = \"y\"\n\n\
+             [[mounts]]\ntenant = \"globex\"\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            refs(&two),
+            vec!["acme/usdc", "usdc2", "globex/usdc"],
+            "a second tenant moves nobody"
+        );
+        let configured: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\ndefault_tenant = \"acme\"\n\n\
+             [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            refs(&configured),
+            vec!["usdc"],
+            "a configured default tenant keeps its routes"
+        );
+
+        let suspended: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\nsuspended = [\"acme/usdc\"]\n\n\
+             [[mounts]]\ntenant = \"acme\"\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        let (active, held) = split_suspended(&suspended);
+        assert!(
+            active.mounts.is_empty(),
+            "a suspended tenant mount booted live"
+        );
+        assert_eq!(held.get("acme/usdc").map(String::as_str), Some("x"));
+    }
+
+    /// #1534: a second tenant mounted live has to be written, or the mount vanishes on restart. Keys
+    /// are per mount (#1565), so both tenants here are keyed `tenant/alias`.
     #[test]
     fn a_second_tenant_mounted_live_is_written_while_the_file_is_still_single_tenant() {
         let d = tempfile::tempdir().unwrap();
@@ -4985,7 +5058,7 @@ mod tests {
 
         persist_mounted_nests(
             root,
-            &["usdc".to_string(), "globex/usdc".to_string()],
+            &["acme/usdc".to_string(), "globex/usdc".to_string()],
             &known.mounts,
             &[],
         )

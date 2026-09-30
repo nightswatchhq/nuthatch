@@ -88,7 +88,7 @@ async fn two_nest_roost(
             ("usdc".to_string(), 90),
             ("arb".to_string(), 90),
         ]),
-        multi_tenant: false,
+        default_tenant: "default".to_string(),
         suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
@@ -485,7 +485,7 @@ async fn route_named_runtime(
         health,
         roster,
         estimates: std::collections::HashMap::from([(route.to_string(), 90)]),
-        multi_tenant: false,
+        default_tenant: "default".to_string(),
         suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: nest_dir.to_path_buf(),
@@ -694,7 +694,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         health,
         roster,
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
-        multi_tenant: false,
+        default_tenant: "default".to_string(),
         suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
@@ -872,7 +872,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
         health,
         roster,
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
-        multi_tenant: false,
+        default_tenant: "default".to_string(),
         suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
@@ -1247,7 +1247,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
         health,
         roster,
         estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
-        multi_tenant: false,
+        default_tenant: "default".to_string(),
         suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
@@ -1391,7 +1391,7 @@ async fn empty_runtime(
         health,
         roster,
         estimates: Default::default(),
-        multi_tenant: false,
+        default_tenant: "default".to_string(),
         suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
@@ -2043,7 +2043,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
         health,
         roster,
         estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
-        multi_tenant: false,
+        default_tenant: "default".to_string(),
         suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),

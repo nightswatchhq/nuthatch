@@ -89,7 +89,8 @@ async fn bring_up(
 ) {
     let mounts = MountTable::load(root).unwrap();
     let datasets = mounts.datasets(root);
-    let multi_tenant = mounts.is_multi_tenant();
+    let default_tenant_owned = mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
 
     let tape = Arc::new(TapeSource::new());
     let a1 = account(1);
@@ -113,13 +114,17 @@ async fn bring_up(
         .iter()
         .map(|ds| {
             let cfg = nuthatch::config::Config::load(&ds.dir).unwrap();
-            (ds.canonical().route_key(multi_tenant), ds.dir.clone(), cfg)
+            (
+                ds.canonical().route_key(default_tenant),
+                ds.dir.clone(),
+                cfg,
+            )
         })
         .collect();
 
     let health = Arc::new(RuntimeHealth::new());
     for ds in &datasets {
-        health.register(&ds.canonical().route_key(multi_tenant), "arbitrum-one");
+        health.register(&ds.canonical().route_key(default_tenant), "arbitrum-one");
     }
     let mut cursor = indexer::spawn_runtime(
         tape.clone(),
@@ -166,8 +171,13 @@ async fn bring_up(
     cursor.shutdown().await;
 
     let mut estimates = std::collections::HashMap::new();
-    let states =
-        runtime::fan_out_aliases(&datasets, states_in, &health, &mut estimates, multi_tenant);
+    let states = runtime::fan_out_aliases(
+        &datasets,
+        states_in,
+        &health,
+        &mut estimates,
+        default_tenant,
+    );
     (states, tape, estimates)
 }
 
@@ -391,7 +401,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
         ds[0]
             .mounts
             .iter()
-            .map(|m| m.route_key(true))
+            .map(|m| m.route_key("default"))
             .collect::<Vec<_>>(),
         vec!["acme/usdc", "globex/usdc"],
         "each tenant gets its own path onto the shared dataset"
