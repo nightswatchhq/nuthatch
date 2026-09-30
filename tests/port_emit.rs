@@ -1187,26 +1187,19 @@ export function handlePoolCreated(event: PoolCreated): void {
         entity.fields
     );
 
-    let sql = std::fs::read_to_string(nest.path().join("entities/pool.sql")).unwrap();
-    // One per row in the arm, summed outside - the same answer as `count(*)` and the shape that works
-    // when an entity has several arms.
+    let sql = std::fs::read_to_string(nest.path().join("entities/pool_totals.sql")).unwrap();
     assert!(
-        sql.contains(r#"1 AS "txCount""#) && sql.contains(r#"sum("txCount") AS "txCount""#),
-        "a unit increment contributes one per row and is summed:\n{sql}"
+        sql.contains(r#"count(*) AS "txCount""#),
+        "a unit increment counts rows:\n{sql}"
     );
     assert!(
         !sql.contains(r#""txCount_overflow""#),
         "a row count cannot overflow, so the flag must not be emitted:\n{sql}"
     );
-    // The column-sourced total beside it keeps both the cast and the flag.
+    // The column-sourced total beside it sums the column, which the circuit reads as an integer.
     assert!(
-        sql.contains(r#"TRY_CAST("fee" AS DECIMAL(38,0)) AS "liquidity""#)
-            && sql.contains(r#"sum("liquidity") AS "liquidity""#),
-        "a column total is still cast then summed:\n{sql}"
-    );
-    assert!(
-        sql.contains(r#""liquidity_overflow""#),
-        "and keeps its overflow flag:\n{sql}"
+        sql.contains(r#"sum("fee") AS "liquidity""#),
+        "a column total sums its column:\n{sql}"
     );
     // The comment says which it is, since the two read very differently to a porter.
     assert!(
@@ -1269,31 +1262,32 @@ fn an_accumulated_field_is_emitted_as_an_incremental_entity_that_validates() {
             )
         });
     assert_eq!(entity.fields, vec!["totalFees".to_string()]);
-    // The cast is in the arm and the fold is outside it, since an entity may now have several arms.
+    // One table, grouped by its key: the shape the circuit maintains (#1590). It reads the column as
+    // a checked 128-bit integer and faults on a value it cannot hold, so there is no cast to
+    // narrow silently and no overflow flag to carry.
     assert!(
-        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))"),
-        "the delta goes through the checked cast RFC-0047 §2 C1 names:\n{}",
+        entity.sql.contains("sum(\"fee\") AS \"totalFees\"")
+            && entity.sql.contains("FROM \"factory__pool_created\"")
+            && !entity.sql.contains("TRY_CAST")
+            && !entity.sql.contains("_overflow"),
+        "the total is the sum of the deltas, read as the circuit reads them:\n{}",
         entity.sql
     );
     assert!(
-        entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
-        "and the total is the sum of those deltas:\n{}",
-        entity.sql
-    );
-    // The half that keeps the cast honest. `TRY_CAST` yields NULL past 38 digits and `sum` skips
-    // NULLs, so without this a real uint256 would leave a total silently short.
-    assert!(
-        entity.sql.contains("AS \"totalFees_overflow\""),
-        "a checked cast must report the values it could not represent:\n{}",
+        nuthatch::entity_lower::lower(entity.sql.as_str()).is_ok(),
+        "dev lowers it:\n{}",
         entity.sql
     );
 
     // Declared, and declared consistently: `entities.toml` requires the name to match the file stem
     // and the path to be exactly `entities/<name>.sql`.
     let toml = std::fs::read_to_string(nest.path().join("entities.toml")).unwrap();
-    assert!(toml.contains("name = \"pool\""), "{toml}");
-    assert!(toml.contains("sql = \"entities/pool.sql\""), "{toml}");
-    assert!(nest.path().join("entities/pool.sql").is_file());
+    assert!(toml.contains("name = \"pool_totals\""), "{toml}");
+    assert!(
+        toml.contains("sql = \"entities/pool_totals.sql\""),
+        "{toml}"
+    );
+    assert!(nest.path().join("entities/pool_totals.sql").is_file());
 
     // RFC-0041's shape gate and the binder, via the real validator.
     let issues = nuthatch::entities::validate(nest.path());
@@ -1337,7 +1331,7 @@ fn the_running_total_is_absent_from_the_view_and_the_view_says_where_it_went() {
     );
     assert!(
         view.sql
-            .contains("maintained incrementally in entities/pool.sql"),
+            .contains("maintained incrementally as `pool_totals`"),
         "RFC-0044 §6 wants the artefact to say which of the two a field landed in:\n{}",
         view.sql
     );
@@ -1392,7 +1386,7 @@ fn rerunning_without_a_running_total_removes_the_prior_generated_entity() {
     write_imported_nest(nest.path(), false);
     nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("initial emitting port");
     assert!(nest.path().join("entities.toml").is_file());
-    assert!(nest.path().join("entities/pool.sql").is_file());
+    assert!(nest.path().join("entities/pool_totals.sql").is_file());
 
     std::fs::write(subgraph.path().join("schema.graphql"), OPS_SCHEMA).unwrap();
     std::fs::write(subgraph.path().join("src/mappings/core.ts"), OPS_MAPPING).unwrap();
@@ -1480,60 +1474,44 @@ export function handlePoolSwap(event: Swap): void {
     write_imported_nest(nest.path(), true);
     let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
 
-    let entity = result
+    // **One entity per arm** (#1590): the circuit reads one table, so a `UNION ALL` inside an entity
+    // could never start. Each arm is an entity `dev` lowers, over its own table.
+    let arms: Vec<_> = result
         .entities
         .iter()
-        .find(|e| e.entity == "Pool")
-        .unwrap_or_else(|| panic!("Pool must be emitted: {:?}", result.entities));
-
-    // Both tables appear, as two arms under one UNION ALL.
-    for table in ["factory__pool_created", "pool__swap"] {
+        .filter(|e| e.entity == "Pool")
+        .collect();
+    assert_eq!(arms.len(), 2, "two arms, two entities: {arms:?}");
+    for (arm, table) in arms.iter().zip(["factory__pool_created", "pool__swap"]) {
         assert!(
-            entity.sql.contains(&format!("FROM \"{table}\"")),
+            arm.name.starts_with("pool_totals__") && arm.sql.contains(&format!("FROM \"{table}\"")),
             "`{table}` must be an arm, not a skipped field:\n{}",
-            entity.sql
+            arm.sql
+        );
+        assert!(
+            nuthatch::entity_lower::lower(arm.sql.as_str()).is_ok(),
+            "dev lowers each arm:\n{}",
+            arm.sql
         );
     }
+
+    // And one view under the totals name adds them up by id.
+    let view = std::fs::read_to_string(nest.path().join("views/30-pool_totals.sql")).unwrap();
     assert!(
-        entity.sql.matches("UNION ALL").count() == 1,
-        "two arms, one union:\n{}",
-        entity.sql
+        view.contains("CREATE VIEW \"pool_totals\"") && view.matches("UNION ALL").count() == 1,
+        "two arms, one union, in the view:\n{view}"
     );
-    // Each arm contributes the field it writes; neither is zero-filled, because both write it.
     assert!(
-        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))")
-            && entity
-                .sql
-                .contains("TRY_CAST(\"amount0\" AS DECIMAL(38,0))"),
-        "each arm casts its own column:\n{}",
-        entity.sql
-    );
-    // And the total is folded once, outside.
-    assert!(
-        entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
-        "the outer aggregate sums across arms:\n{}",
-        entity.sql
+        view.contains("sum(\"totalFees\") AS \"totalFees\"")
+            && view.contains("sum(\"swapVolume\") AS \"swapVolume\""),
+        "both fields are summed across arms:\n{view}"
     );
     // **`swapVolume` is written by the swap arm only**, so the `pool_created` arm has to fill it - and it
     // must fill it with **zero**. `sum` skips NULLs, so a NULL fill makes the total NULL for any key that
-    // appears only in arms which do not write the field, where graph-node has 0. A mutation changing the
-    // fill to NULL survived until this fixture had a field that is actually zero-filled.
+    // appears only in arms which do not write the field, where graph-node has 0.
     assert!(
-        entity
-            .sql
-            .contains("CAST(0 AS DECIMAL(38,0)) AS \"swapVolume\""),
-        "the arm that does not write `swapVolume` contributes zero:\n{}",
-        entity.sql
-    );
-    assert!(
-        !entity.sql.contains("CAST(NULL AS"),
-        "and never NULL - `sum` would skip it:\n{}",
-        entity.sql
-    );
-    assert!(
-        entity.sql.contains("sum(\"swapVolume\") AS \"swapVolume\""),
-        "both fields are folded outside:\n{}",
-        entity.sql
+        view.contains("CAST(0 AS HUGEINT) AS \"swapVolume\"") && !view.contains("NULL"),
+        "the arm that does not write `swapVolume` contributes zero, never NULL:\n{view}"
     );
     assert!(
         !result.skipped_fields.iter().any(|f| {
@@ -1542,15 +1520,8 @@ export function handlePoolSwap(event: Swap): void {
         "nothing should still be skipped for being a second relation: {:?}",
         result.skipped_fields
     );
-    // **The overflow flag folds with `max`, not `min`.** With one arm the two are identical, which is why
-    // a mutation swapping them survived until this test had two. `min` would report "no overflow" as soon
-    // as any single arm was clean, which is the wrong way round for a flag that means "some contributing
-    // row could not be represented".
-    assert!(
-        entity.sql.contains("max(\"totalFees_overflow\")"),
-        "the overflow flag is an OR across arms, so `max`:\n{}",
-        entity.sql
-    );
+    let issues = nuthatch::entities::validate(nest.path());
+    assert!(issues.is_empty(), "both arms check: {issues:?}");
 }
 
 /// A singleton the mapping keys with a constant gets that constant as its key.
@@ -1597,14 +1568,15 @@ export function handlePoolCreated(event: PoolCreated): void {
         entity.sql
     );
     assert!(
-        entity.sql.contains("GROUP BY \"id\""),
+        entity.sql.contains("GROUP BY '1'"),
         "and it still groups, so one row comes out:\n{}",
         entity.sql
     );
     assert!(
-        entity.sql.contains("sum(\"txCount\") AS \"txCount\"")
-            && entity.sql.contains("sum(\"totalFees\") AS \"totalFees\""),
-        "both totals fold:\n{}",
+        entity.sql.contains("AS \"txCount\"")
+            && entity.sql.contains("AS \"totalFees\"")
+            && nuthatch::entity_lower::lower(entity.sql.as_str()).is_ok(),
+        "both totals fold, in a shape dev lowers:\n{}",
         entity.sql
     );
     assert!(
@@ -1684,15 +1656,15 @@ export function handlePoolCreated(event: PoolCreated): void {
         panic!("Pool must be emitted: {:?}", result.entities);
     };
     assert!(
-        entity.sql.contains("TRY_CAST(\"fee\" AS DECIMAL(38,0))"),
-        "the arm that writes the field casts its column:\n{}",
+        entity.sql.contains("sum(\"fee\") AS \"created\""),
+        "the arm that writes the field sums its column:\n{}",
         entity.sql
     );
     // The zero-fill only appears when an entity has more than one arm, so the two-arm test above is where
     // it is observable. Pinned there as a literal, because the difference between 0 and NULL is the whole
     // point and a reader cannot see it from `sum`.
     assert!(
-        !entity.sql.contains("CAST(NULL AS DECIMAL(38,0))"),
+        !entity.sql.contains("NULL"),
         "a missing contribution must never be NULL - `sum` would skip it and the total would be NULL \
          where graph-node has 0:\n{}",
         entity.sql
@@ -1746,8 +1718,8 @@ type Token @entity {
     let nest = tempfile::tempdir().unwrap();
     write_imported_nest(nest.path(), false);
     nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("initial emitting port");
-    assert!(nest.path().join("entities/pool.sql").is_file());
-    assert!(nest.path().join("entities/token.sql").is_file());
+    assert!(nest.path().join("entities/pool_totals.sql").is_file());
+    assert!(nest.path().join("entities/token_totals.sql").is_file());
     std::fs::write(
         nest.path().join("entities/manual.sql"),
         "SELECT id FROM factory__pool_created",
@@ -1763,9 +1735,9 @@ type Token @entity {
     std::fs::write(subgraph.path().join("src/mappings/core.ts"), ACCUM_MAPPING).unwrap();
     nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("re-emitting port");
 
-    assert!(nest.path().join("entities/pool.sql").is_file());
+    assert!(nest.path().join("entities/pool_totals.sql").is_file());
     assert!(
-        !nest.path().join("entities/token.sql").exists(),
+        !nest.path().join("entities/token_totals.sql").exists(),
         "a generator-owned entity omitted by a non-empty re-emission must disappear"
     );
     let manifest = std::fs::read_to_string(nest.path().join("entities.toml")).unwrap();

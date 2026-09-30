@@ -444,9 +444,10 @@ pub(crate) fn bind_as_dev(
     Ok((binding, offchain))
 }
 
-/// Whether a column is stored as a decimal string but read by the entity circuit as a checked `i128`.
-fn is_wide(column: &crate::registry::ColumnSchema) -> bool {
-    matches!(column.storage.as_str(), "word16" | "word32")
+/// Whether a decoded parameter is sealed as decimal text but read by the entity circuit as a checked
+/// `i128`: every integer, not only the wide ones, since a `uint24` is text on the SQL surface too.
+fn is_integer(column: &crate::registry::ColumnSchema) -> bool {
+    matches!(column.storage.as_str(), "u64" | "i64" | "word16" | "word32")
 }
 
 /// Per table the circuit reads, keyed case-insensitively: its name and the wide columns the plan
@@ -466,7 +467,7 @@ fn wide_reads(
             .filter(|t| t.table.eq_ignore_ascii_case(&source.table))
         {
             let read = t.columns.iter().filter(|c| {
-                is_wide(c)
+                is_integer(c)
                     && source
                         .columns
                         .iter()
