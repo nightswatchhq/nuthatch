@@ -255,7 +255,13 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
                 }
             };
             if let (Some(registry), Some(schema)) = (&registry, &schema) {
-                let data = data.get_or_init(|| NestData::load(dir));
+                let data = match data.get_or_init(|| NestData::load(dir)) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        issues.push(issue(&name, format!("{e:#}")));
+                        continue;
+                    }
+                };
                 if let Err(e) = bind_as_dev(dir, &name, &plan, registry) {
                     issues.push(issue(&name, format!("{e:#}")));
                     continue;
@@ -552,32 +558,51 @@ struct NestData {
 }
 
 impl NestData {
-    fn load(dir: &Path) -> Self {
+    /// Sealed history only when there is no store yet, or when a running nuthatch holds it and so
+    /// feeds that tail to its entities itself. Any other failure to read the store is an error: an
+    /// unread hot tail must not pass as a checked one.
+    ///
+    /// The store is opened as `nuthatch sql` opens it, so for the length of the scan a starting `dev`
+    /// is refused its lock; the scan is bounded to what `/sql` will read for the same reason.
+    fn load(dir: &Path) -> Result<Self> {
         let cold = NestData {
             hot: Default::default(),
             sealed_through: u64::MAX,
         };
         let db = dir.join(crate::config::DB_FILE);
         if !db.exists() {
-            return cold;
+            return Ok(cold);
         }
-        let read = crate::store::Store::open_existing(&db)
-            .and_then(|store| Ok((store.hot_rows_by_table()?, store.sealed_through())));
-        match read {
-            Ok((hot, sealed_through)) => NestData {
-                hot,
-                sealed_through,
-            },
-            Err(e) => {
+        let store = match crate::store::Store::open_existing(&db) {
+            Ok(store) => store,
+            Err(e) if held_by_another_process(&e) => {
                 tracing::warn!(
-                    "entities checked against sealed history only: the hot store could not be \
-                     read ({e:#}); a running nuthatch holds it and feeds that tail to its entities \
-                     itself"
+                    "entities checked against sealed history only: a running nuthatch holds {}, and \
+                     feeds its hot tail to its entities itself",
+                    db.display()
                 );
-                cold
+                return Ok(cold);
             }
-        }
+            Err(e) => return Err(e.context("reading the hot store to check entities against it")),
+        };
+        let hot = store
+            .hot_rows_by_table_bounded(crate::serve::SQL_MAX_HOT_ROWS)
+            .context("reading the hot store to check entities against it")?;
+        Ok(NestData {
+            hot,
+            sealed_through: store.sealed_through(),
+        })
     }
+}
+
+/// Whether opening the store failed only because another process has it open.
+fn held_by_another_process(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<redb::DatabaseError>(),
+            Some(redb::DatabaseError::DatabaseAlreadyOpen)
+        )
+    })
 }
 
 /// A query over the nest's data with every declared table bound. The declared schema gives a table
@@ -1593,6 +1618,32 @@ mod tests {
         assert!(
             issues.iter().any(|i| i.error.contains("does not fit")),
             "an overflow in the hot tail must not pass check: {issues:?}"
+        );
+    }
+
+    /// Only a store another process holds falls back to sealed history; one that cannot be read is an
+    /// issue, not a silently unchecked hot tail.
+    #[test]
+    fn only_a_held_store_falls_back_to_sealed_history() {
+        let dir = wide_nest();
+        let a = "0x00000000000000000000000000000000000000a1";
+        crate::seal::seal_range(dir.path(), &[wide_row(a, "1", "0", 10)], 10, 10).unwrap();
+        let sql =
+            "SELECT indexer, SUM(tokensRewards) AS total FROM svc__collected GROUP BY indexer";
+        let db = dir.path().join(crate::config::DB_FILE);
+        {
+            let _held = crate::store::Store::open(&db).unwrap();
+            let issues = rewards_issues(dir.path(), sql);
+            assert!(
+                issues.is_empty(),
+                "a held store is dev's to read: {issues:?}"
+            );
+        }
+        std::fs::write(&db, b"not a redb file").unwrap();
+        let issues = rewards_issues(dir.path(), sql);
+        assert!(
+            issues.iter().any(|i| i.error.contains("hot store")),
+            "an unreadable store must not pass as checked: {issues:?}"
         );
     }
 

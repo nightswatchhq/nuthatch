@@ -271,10 +271,8 @@ impl Binding {
 }
 
 fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
-    let table = schema
-        .iter()
-        .find(|t| t.table.eq_ignore_ascii_case(&source.table))
-        .ok_or_else(|| {
+    let table =
+        resolve(schema, |t| t.table.as_str(), &source.table, "table")?.ok_or_else(|| {
             let mut known: Vec<&str> = schema.iter().map(|t| t.table.as_str()).collect();
             known.sort_unstable();
             anyhow!(
@@ -297,10 +295,14 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
         .columns
         .iter()
         .map(|name| {
-            let position = table
-                .columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(name))
+            let position = resolve(&table.columns, |c| c.name.as_str(), name, "column")?
+                .map(|c| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|x| std::ptr::eq(x, c))
+                        .expect("resolved from this slice")
+                })
                 .ok_or_else(|| {
                     anyhow!(
                         "no column {name} in {}. Its columns are: {}",
@@ -327,6 +329,35 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
         table: table.table.clone(),
         columns: Columns::Chain(columns),
     })
+}
+
+/// The item named `wanted`: an exact match first, else the one whose name matches ignoring case, as
+/// every SQL surface reads it (#1591). Two names that differ only in case are both what the SQL means,
+/// so choosing one would bind an entity to rows it never asked for; that is refused.
+fn resolve<'a, T>(
+    items: &'a [T],
+    name: impl Fn(&T) -> &str,
+    wanted: &str,
+    what: &str,
+) -> Result<Option<&'a T>> {
+    if let Some(exact) = items.iter().find(|i| name(i) == wanted) {
+        return Ok(Some(exact));
+    }
+    let mut matches = items
+        .iter()
+        .filter(|i| name(i).eq_ignore_ascii_case(wanted));
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if let Some(other) = matches.find(|i| name(i) != name(first)) {
+        bail!(
+            "{what} {wanted} matches both {} and {}, which differ only in case. Name it exactly as \
+             one of them is spelled",
+            name(first),
+            name(other)
+        );
+    }
+    Ok(Some(first))
 }
 
 fn bind_offchain(source: &Source, table: &str, offchain: &Tables) -> Result<BoundSource> {
@@ -549,6 +580,46 @@ mod tests {
                 Scalar::Int(10)
             ])]
         );
+    }
+
+    /// Two tables whose names differ only in case are both what a case-insensitive reference means, so
+    /// binding one silently would read the wrong contract's rows. The exact spelling still binds.
+    #[test]
+    fn a_name_matching_two_tables_by_case_is_refused() {
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        let reg = DecodeRegistry::build(vec![
+            ContractSpec {
+                alias: "Token".into(),
+                address: TOKEN.parse().unwrap(),
+                abi: abi.clone(),
+                events: Vec::new(),
+            },
+            ContractSpec {
+                alias: "token".into(),
+                address: "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                abi,
+                events: Vec::new(),
+            },
+        ])
+        .unwrap();
+        let plan = |table: &str| Plan {
+            left: Source {
+                table: table.into(),
+                columns: vec!["to".into(), "value".into()],
+            },
+            left_filter: None,
+            join: None,
+            key: vec![Expr::Column(0)],
+            aggregates: vec![Agg::Sum(Expr::Column(1))],
+        };
+        let err = Binding::bind(&plan("TOKEN__transfer"), &reg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("differ only in case"), "{err}");
+        let bound = Binding::bind(&plan("token__transfer"), &reg).unwrap();
+        assert_eq!(bound.left.table, "token__transfer");
     }
 
     /// **§5.1, end to end.** Logs decode through the real registry, the binding turns that window
