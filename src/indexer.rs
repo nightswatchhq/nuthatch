@@ -60,6 +60,12 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
     // touching the nest's config on disk.
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
+    let pool: Vec<String> = rpc_urls.iter().chain(&args.rpc_fallback).cloned().collect();
+    if let Some(note) =
+        chains::keyless_caveat(&config.nest.chain, &pool, config.nest.block_timestamps)
+    {
+        tracing::warn!("{note}");
+    }
     let endpoint_count = rpc_urls.len();
     let rpc = RpcClient::with_fallbacks(rpc_urls, args.rpc_fallback.clone())?;
     // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a

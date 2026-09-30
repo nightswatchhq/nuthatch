@@ -703,6 +703,9 @@ pub struct RpcClient {
     /// re-execution determinism. The RFC proposes the cache without noting this; the invalidation hook
     /// is the condition that makes it safe, not an optimisation on top.
     timestamps: std::sync::Mutex<HashMap<u64, u64>>,
+    /// Headers per batch: [`MAX_TIMESTAMP_BATCH`], or less where a known endpoint in the pool takes
+    /// less ([`crate::chains::header_batch_cap`], #1570).
+    header_width: usize,
 }
 
 impl RpcClient {
@@ -715,6 +718,8 @@ impl RpcClient {
             .build()
             .context("failed to build HTTP client")?;
         let n = urls.len();
+        let header_width = crate::chains::header_batch_cap(&urls)
+            .map_or(MAX_TIMESTAMP_BATCH, |cap| cap.clamp(1, MAX_TIMESTAMP_BATCH));
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         let heads = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
@@ -726,6 +731,7 @@ impl RpcClient {
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
+            header_width,
         })
     }
 
@@ -1391,7 +1397,7 @@ impl RpcClient {
         // Futures built eagerly rather than mapped inside the stream: the borrow of each chunk has to
         // outlive the stream, and a closure producing them cannot express that.
         let futures: Vec<_> = blocks
-            .chunks(MAX_TIMESTAMP_BATCH)
+            .chunks(self.header_width)
             .map(|c| self.fetch_timestamp_batch(c, false, true))
             .collect();
         let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -1497,7 +1503,7 @@ impl RpcClient {
         for round in 0..ROUNDS {
             use futures::stream::StreamExt;
             let futures: Vec<_> = missing
-                .chunks(MAX_TIMESTAMP_BATCH)
+                .chunks(self.header_width)
                 .map(|c| self.fetch_timestamp_batch(c, full, true))
                 .collect();
             let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -1859,7 +1865,8 @@ impl RpcClient {
             .filter_map(|l| {
                 let block = parse_hex_u64(l.get("blockNumber")?.as_str()?).ok()?;
                 let ts = parse_hex_u64(l.get("blockTimestamp")?.as_str()?).ok()?;
-                Some((block, ts))
+                // arb1.arbitrum.io sends `0x0` on every log: absent, not the epoch.
+                (ts != 0).then_some((block, ts))
             })
             .collect();
         if found.is_empty() {
@@ -2425,6 +2432,107 @@ mod tests {
         );
     }
 
+    /// #1570: a pool holding `arb1.arbitrum.io`, as primary or fallback, sends header batches of ten,
+    /// which it takes; anything else keeps the full width.
+    #[test]
+    fn a_pool_with_arb1_sends_header_batches_it_takes() {
+        let arb1 = "https://arb1.arbitrum.io/rpc".to_string();
+        let keyed = "https://arb-mainnet.g.alchemy.com/v2/k".to_string();
+        assert_eq!(RpcClient::new(vec![arb1.clone()]).unwrap().header_width, 10);
+        assert_eq!(
+            RpcClient::with_fallbacks(vec![keyed.clone()], vec![arb1])
+                .unwrap()
+                .header_width,
+            10
+        );
+        assert_eq!(
+            RpcClient::new(vec![keyed]).unwrap().header_width,
+            super::MAX_TIMESTAMP_BATCH
+        );
+    }
+
+    /// And sent at that width, an endpoint shaped like `arb1` (429 above ten headers, 403 above a
+    /// hundred) answers every one; a throttle is still not narrowed, so it costs one refusal per
+    /// attempt rather than a cascade (#1297).
+    #[tokio::test]
+    async fn header_batches_go_out_at_the_capped_width() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+
+        async fn serve(throttle_all: bool) -> (String, Arc<Mutex<Vec<usize>>>) {
+            let seen: Arc<Mutex<Vec<usize>>> = Arc::default();
+            let log = seen.clone();
+            let app = Router::new().route(
+                "/",
+                post(move |Json(req): Json<Value>| {
+                    let log = log.clone();
+                    async move {
+                        let items = match &req {
+                            Value::Array(items) => items.clone(),
+                            item => vec![item.clone()],
+                        };
+                        log.lock().unwrap().push(items.len());
+                        if throttle_all || items.len() > 10 {
+                            let code = if items.len() > 100 && !throttle_all {
+                                StatusCode::FORBIDDEN
+                            } else {
+                                StatusCode::TOO_MANY_REQUESTS
+                            };
+                            return (code, "{\"error\":\"refused\"}").into_response();
+                        }
+                        let answer = |item: &Value| {
+                            let b = u64::from_str_radix(
+                                item["params"][0].as_str().unwrap().trim_start_matches("0x"),
+                                16,
+                            )
+                            .unwrap();
+                            json!({"jsonrpc":"2.0","id":item["id"],
+                                   "result":{"number":format!("0x{b:x}"),"timestamp":format!("0x{:x}", b * 10)}})
+                        };
+                        Json(Value::Array(items.iter().map(answer).collect())).into_response()
+                    }
+                }),
+            );
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+            (format!("http://{addr}"), seen)
+        }
+
+        let (url, seen) = serve(false).await;
+        let mut c = RpcClient::new(vec![url]).unwrap();
+        c.header_width = 10;
+        let blocks: Vec<u64> = (1_000..1_300).collect();
+        let got = c
+            .block_timestamps(&blocks)
+            .await
+            .expect("batches the endpoint takes");
+        assert!(blocks.iter().all(|b| got[b] == b * 10));
+        let sent = seen.lock().unwrap().clone();
+        assert!(sent.iter().all(|&n| n <= 10), "{sent:?}");
+        // The header and block-body path chunks separately, and at the same width (astra on #1586).
+        seen.lock().unwrap().clear();
+        let more: Vec<u64> = (2_000..2_300).collect();
+        let headers = c
+            .block_headers(&more)
+            .await
+            .expect("headers at the capped width");
+        assert_eq!(headers.len(), 300);
+        let sent = seen.lock().unwrap().clone();
+        assert!(sent.iter().all(|&n| n <= 10), "{sent:?}");
+
+        let (url, seen) = serve(true).await;
+        let mut c = RpcClient::new(vec![url]).unwrap();
+        c.header_width = 10;
+        assert!(c.block_timestamps(&[1, 2, 3, 4]).await.is_err());
+        let sent = seen.lock().unwrap().clone();
+        assert!(
+            sent.iter().all(|&n| n == 4),
+            "a throttle was narrowed: {sent:?}"
+        );
+    }
+
     #[tokio::test]
     async fn timestamps_carried_on_logs_cost_no_header_calls() {
         use axum::{routing::post, Json, Router};
@@ -2450,6 +2558,7 @@ mod tests {
             log(11, Some(1_012), false),
             log(12, None, false),
             log(13, Some(9_999), true),
+            log(14, Some(0), false),
         ]);
         let app = Router::new().route(
             "/",
@@ -2474,7 +2583,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
 
         let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
-        c.get_logs(&[], &["0x01".into()], 10, 13).await.unwrap();
+        c.get_logs(&[], &["0x01".into()], 10, 14).await.unwrap();
         let got = c.block_timestamps(&[10, 11]).await.unwrap();
         assert_eq!(got, HashMap::from([(10, 1_000), (11, 1_012)]));
         assert_eq!(
@@ -2483,11 +2592,11 @@ mod tests {
             "the logs already said when"
         );
 
-        // A log without the field, and a removed one, still go to the header.
-        let got = c.block_timestamps(&[12, 13]).await.unwrap();
+        // A log without the field, a removed one, and one saying 0x0 still go to the header.
+        let got = c.block_timestamps(&[12, 13, 14]).await.unwrap();
         server.abort();
-        assert_eq!(got, HashMap::from([(12, 7), (13, 7)]));
-        assert_eq!(HEADERS.load(Ordering::SeqCst), 2);
+        assert_eq!(got, HashMap::from([(12, 7), (13, 7), (14, 7)]));
+        assert_eq!(HEADERS.load(Ordering::SeqCst), 3);
     }
 
     #[test]
