@@ -1923,17 +1923,18 @@ fn now_millis() -> u64 {
 }
 
 /// Reduce an RPC URL to `scheme://host[:port]` for logging - provider endpoints routinely carry the API
-/// key in the path (`.../v3/<KEY>`) or query string, and the failure log fires on exactly the outages an
-/// operator debugs with `RUST_LOG=debug`. Log *where* it failed, never the key. Returns a slice of the
-/// original (the `scheme://host` prefix), so it is zero-alloc.
-pub(crate) fn redact_url(url: &str) -> &str {
-    match url.split_once("://") {
-        // Truncate at the first '/' or '?' after the scheme, i.e. keep scheme://host[:port] only.
-        Some((scheme, rest)) => {
-            let host_len = rest.find(['/', '?']).unwrap_or(rest.len());
-            &url[..scheme.len() + 3 + host_len]
-        }
-        None => url.split(['/', '?']).next().unwrap_or(url),
+/// key in the path (`.../v3/<KEY>`), the query string or the userinfo (`user:pass@`), and the failure
+/// log fires on exactly the outages an operator debugs with `RUST_LOG=debug`. Log *where* it failed,
+/// never the key. Rebuilt from the parsed URL rather than sliced, because userinfo sits inside the
+/// prefix a slice would keep (#1589).
+pub(crate) fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
+            (Some(host), None) => format!("{}://{host}", u.scheme()),
+            (None, _) => format!("{}:<no host>", u.scheme()),
+        },
+        Err(_) => "<unparseable url>".to_string(),
     }
 }
 
@@ -3084,6 +3085,16 @@ mod tests {
         );
         assert_eq!(redact_url("http://localhost:8545"), "http://localhost:8545");
         assert_eq!(redact_url("https://host:8545/"), "https://host:8545");
+        // Userinfo sits before the host, so a prefix kept it (#1589).
+        assert_eq!(
+            redact_url("https://alice:SECRET@rpc.example.com/path"),
+            "https://rpc.example.com"
+        );
+        assert_eq!(
+            redact_url("https://tok@rpc.example.com:8545"),
+            "https://rpc.example.com:8545"
+        );
+        assert!(!redact_url("not a url with SECRET").contains("SECRET"));
     }
 
     /// **RFC-0029 §6g.** A body-read *timeout* must narrow; a body *syntax* error must not.

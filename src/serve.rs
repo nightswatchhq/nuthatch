@@ -597,10 +597,13 @@ impl LiveRuntime {
     /// The router to serve: a fallback that resolves the current composition per request.
     pub fn service(&self) -> Router {
         let current = self.current.clone();
-        Router::new().fallback(move |req: axum::extract::Request| {
+        Router::new().fallback(move |mut req: axum::extract::Request| {
             let current = current.clone();
             async move {
                 use tower::ServiceExt;
+                // `nest("/usdc")` matches `/usdc` and `/usdc/x` but not `/usdc/`, which fell through
+                // to an empty 404 whatever the mount's state (#1588).
+                trim_trailing_slash(&mut req);
                 // `Router::clone` is cheap (its state is behind an `Arc`), and `oneshot` drives this
                 // request through the composed router exactly as `axum::serve` would have.
                 let router = (**current.load()).clone();
@@ -612,6 +615,26 @@ impl LiveRuntime {
                 }
             }
         })
+    }
+}
+
+fn trim_trailing_slash(req: &mut axum::extract::Request) {
+    let path = req.uri().path();
+    if path.len() <= 1 || !path.ends_with('/') {
+        return;
+    }
+    let trimmed = path.trim_end_matches('/');
+    let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
+    let rebuilt = match req.uri().query() {
+        Some(q) => format!("{trimmed}?{q}"),
+        None => trimmed.to_string(),
+    };
+    let mut parts = req.uri().clone().into_parts();
+    if let Ok(pq) = rebuilt.parse() {
+        parts.path_and_query = Some(pq);
+        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+            *req.uri_mut() = uri;
+        }
     }
 }
 
@@ -6020,6 +6043,24 @@ mod tests {
                 direct, dispatched,
                 "{path} must be identical through the dispatcher; got {direct:?} vs {dispatched:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_is_trimmed_and_the_query_kept() {
+        for (from, to) in [
+            ("/usdc/", "/usdc"),
+            ("/usdc/sql/?q=SELECT%201", "/usdc/sql?q=SELECT%201"),
+            ("/acme/usdc//", "/acme/usdc"),
+            ("/", "/"),
+            ("/usdc", "/usdc"),
+        ] {
+            let mut req = axum::http::Request::builder()
+                .uri(from)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            trim_trailing_slash(&mut req);
+            assert_eq!(req.uri().to_string(), to, "{from}");
         }
     }
 

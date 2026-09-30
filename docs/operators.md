@@ -1245,6 +1245,12 @@ The registry is **decoupled** from the binary: a filesystem path or S3-compatibl
 private-nest authentication. nuthatch pulls; it never becomes the registry, and resolution stays
 local-first. (Live S3 verification against a real bucket is still pending an operator run.)
 
+A bundle carries `nuthatch.toml` verbatim, so `nest bundle` refuses one holding a webhook `secret`, or an RPC,
+webhook or alert URL that looks keyed (userinfo, a key-named query parameter, or a long token in the
+path). That test is a heuristic and cannot recognise every key, so keep credentials out of the file you
+bundle: pass RPC endpoints at run time with `--rpc`. `--allow-secrets` bundles anyway, for a bundle that
+is never meant to leave the box.
+
 **Upgrading a nest without the resync tax** (RFC-0020):
 
 ```sh

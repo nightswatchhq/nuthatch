@@ -20,7 +20,7 @@
 //! first, then the event's own parameters, which is the same order `/tables`, `schema.json` and the
 //! MCP schema tool report. There is deliberately no second opinion about a table's shape.
 
-use crate::entity_expr::Expr;
+use crate::entity_expr::{Expr, Type};
 use crate::entity_offchain::{
     table_of, Column as OffchainColumn, Snapshot, Tables, OFFCHAIN_NAMESPACE,
 };
@@ -64,6 +64,9 @@ enum Columns {
 pub struct BoundSource {
     pub table: String,
     columns: Columns,
+    /// Each column's type as the circuit will see it, or `None` for one that may be NULL, for
+    /// [`Binding::check_types`]. A decoded value is never NULL; an offchain cell may be.
+    types: Vec<Option<Type>>,
 }
 
 impl BoundSource {
@@ -115,6 +118,7 @@ impl Binding {
 
         let binding = Binding { left, right };
         binding.check_indices(plan)?;
+        binding.check_types(plan)?;
         Ok(binding)
     }
 
@@ -165,6 +169,80 @@ impl Binding {
                 Agg::Count => {}
                 Agg::Sum(e) | Agg::Min(e) | Agg::Max(e) | Agg::Avg(e) => {
                     check_expr(e, joined, "an aggregate", "the joined row")?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The type of each output column, key then aggregates, as the circuit fills it (#1598): counts,
+    /// sums and averages are integers, a key or a MIN/MAX is its expression's type when that is
+    /// certain, and `None` when it is not.
+    pub fn output_types(&self, plan: &Plan) -> Vec<Option<Type>> {
+        let joined: Vec<Option<Type>> = self
+            .left
+            .types
+            .iter()
+            .chain(self.right.iter().flat_map(|r| r.types.iter()))
+            .copied()
+            .collect();
+        let of = |e: &Expr| e.definite_type(&joined).ok().flatten();
+        plan.key
+            .iter()
+            .map(of)
+            .chain(plan.aggregates.iter().map(|a| match a {
+                Agg::Count | Agg::Sum(_) | Agg::Avg(_) => Some(Type::Int),
+                Agg::Min(e) | Agg::Max(e) => of(e),
+            }))
+            .collect()
+    }
+
+    /// Every expression the plan evaluates must type-check against the columns it will see, by the
+    /// rules [`Expr::eval`] enforces per row (#1590). DuckDB's binder coerces where the circuit does
+    /// not, so `check` passing through DuckDB alone let `fee + '1'` through to fault on its first row.
+    fn check_types(&self, plan: &Plan) -> Result<()> {
+        let left = &self.left.types;
+        let joined: Vec<Option<Type>> = left
+            .iter()
+            .chain(self.right.iter().flat_map(|r| r.types.iter()))
+            .copied()
+            .collect();
+        // `admits` keeps a row only on TRUE, and faults on anything but a boolean or NULL.
+        let filter = |f: &Expr, cols: &[Option<Type>], what: &str| -> Result<()> {
+            match f
+                .definite_type(cols)
+                .with_context(|| format!("{what} does not type-check"))?
+            {
+                Some(t) if t != Type::Bool => bail!("{what} must be a condition, but it is {t:?}"),
+                _ => Ok(()),
+            }
+        };
+        if let Some(f) = &plan.left_filter {
+            filter(f, left, "the filter")?;
+        }
+        if let (Some(join), Some(right)) = (&plan.join, &self.right) {
+            if let Some(f) = &join.right_filter {
+                filter(f, &right.types, "the joined table's filter")?;
+            }
+        }
+        for e in &plan.key {
+            e.definite_type(&joined)
+                .context("a grouping key does not type-check")?;
+        }
+        for a in &plan.aggregates {
+            match a {
+                Agg::Count => {}
+                Agg::Min(e) | Agg::Max(e) => {
+                    e.definite_type(&joined)
+                        .context("an aggregate does not type-check")?;
+                }
+                Agg::Sum(e) | Agg::Avg(e) => {
+                    let t = e
+                        .definite_type(&joined)
+                        .context("an aggregate does not type-check")?;
+                    if let Some(t) = t.filter(|t| *t != Type::Int) {
+                        bail!("SUM and AVG need integers, got {t:?}");
+                    }
                 }
             }
         }
@@ -271,10 +349,8 @@ impl Binding {
 }
 
 fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
-    let table = schema
-        .iter()
-        .find(|t| t.table == source.table)
-        .ok_or_else(|| {
+    let table =
+        resolve(schema, |t| t.table.as_str(), &source.table, "table")?.ok_or_else(|| {
             let mut known: Vec<&str> = schema.iter().map(|t| t.table.as_str()).collect();
             known.sort_unstable();
             anyhow!(
@@ -297,10 +373,14 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
         .columns
         .iter()
         .map(|name| {
-            let position = table
-                .columns
-                .iter()
-                .position(|c| &c.name == name)
+            let position = resolve(&table.columns, |c| c.name.as_str(), name, "column")?
+                .map(|c| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|x| std::ptr::eq(x, c))
+                        .expect("resolved from this slice")
+                })
                 .ok_or_else(|| {
                     anyhow!(
                         "no column {name} in {}. Its columns are: {}",
@@ -313,18 +393,66 @@ fn bind_source(source: &Source, schema: &[TableSchema]) -> Result<BoundSource> {
                             .join(", ")
                     )
                 })?;
-            Ok(if position < implicit {
-                implicit_extract(name)?
+            // The registry's spelling from here on: rows are matched and checked against it.
+            let column = &table.columns[position];
+            let extract = if position < implicit {
+                implicit_extract(&column.name)?
             } else {
-                Extract::Param(position - implicit, name.clone())
-            })
+                Extract::Param(position - implicit, column.name.clone())
+            };
+            let ty = match extract {
+                Extract::BlockNumber
+                | Extract::BlockTimestamp
+                | Extract::LogIndex
+                | Extract::Seq => Type::Int,
+                Extract::BlockHash | Extract::TxHash | Extract::Address => Type::Str,
+                // As [`scalar`] converts them: every integer is an `i128`, a bool a bool, and
+                // everything else the string the SQL surface shows.
+                Extract::Param(..) => match column.storage.as_str() {
+                    "u64" | "i64" | "word16" | "word32" => Type::Int,
+                    "bool" => Type::Bool,
+                    _ => Type::Str,
+                },
+            };
+            Ok((extract, Some(ty)))
         })
         .collect::<Result<Vec<_>>>()?;
+    let (columns, types) = columns.into_iter().unzip();
 
     Ok(BoundSource {
-        table: source.table.clone(),
+        table: table.table.clone(),
         columns: Columns::Chain(columns),
+        types,
     })
+}
+
+/// The item named `wanted`: an exact match first, else the one whose name matches ignoring case, as
+/// every SQL surface reads it (#1591). Two names that differ only in case are both what the SQL means,
+/// so choosing one would bind an entity to rows it never asked for; that is refused.
+fn resolve<'a, T>(
+    items: &'a [T],
+    name: impl Fn(&T) -> &str,
+    wanted: &str,
+    what: &str,
+) -> Result<Option<&'a T>> {
+    if let Some(exact) = items.iter().find(|i| name(i) == wanted) {
+        return Ok(Some(exact));
+    }
+    let mut matches = items
+        .iter()
+        .filter(|i| name(i).eq_ignore_ascii_case(wanted));
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if let Some(other) = matches.find(|i| name(i) != name(first)) {
+        bail!(
+            "{what} {wanted} matches both {} and {}, which differ only in case. Name it exactly as \
+             one of them is spelled",
+            name(first),
+            name(other)
+        );
+    }
+    Ok(Some(first))
 }
 
 fn bind_offchain(source: &Source, table: &str, offchain: &Tables) -> Result<BoundSource> {
@@ -344,9 +472,12 @@ fn bind_offchain(source: &Source, table: &str, offchain: &Tables) -> Result<Boun
             }
         )
     };
+    let columns = found.bind(&source.table, &source.columns)?;
+    let types = columns.iter().map(|_| None).collect();
     Ok(BoundSource {
         table: source.table.clone(),
-        columns: Columns::Offchain(found.bind(&source.table, &source.columns)?),
+        columns: Columns::Offchain(columns),
+        types,
     })
 }
 
@@ -519,6 +650,74 @@ mod tests {
             table: "usdc__transfer".into(),
             columns: columns.iter().map(|c| c.to_string()).collect(),
         }
+    }
+
+    /// #1591: SQL identifiers are case-insensitive on every surface, and `check` binds through one,
+    /// so the binder must be too, and must match rows by the registry's own spelling.
+    #[test]
+    fn a_table_and_column_bind_in_any_case() {
+        let reg = registry();
+        let plan = Plan {
+            left: Source {
+                table: "USDC__Transfer".into(),
+                columns: vec!["TO".into(), "Value".into(), "BLOCK_NUMBER".into()],
+            },
+            left_filter: None,
+            join: None,
+            key: vec![Expr::Column(0)],
+            aggregates: vec![Agg::Sum(Expr::Column(1))],
+        };
+        let binding = Binding::bind(&plan, &reg).unwrap();
+        let rows = decode(&reg, &[transfer(ALICE, BOB, "64", 10, 0)]);
+        let (left, _) = binding.window(&rows).unwrap();
+        assert_eq!(
+            left,
+            vec![Row(vec![
+                Scalar::Str(BOB.into()),
+                Scalar::Int(100),
+                Scalar::Int(10)
+            ])]
+        );
+    }
+
+    /// Two tables whose names differ only in case are both what a case-insensitive reference means, so
+    /// binding one silently would read the wrong contract's rows. The exact spelling still binds.
+    #[test]
+    fn a_name_matching_two_tables_by_case_is_refused() {
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        let reg = DecodeRegistry::build(vec![
+            ContractSpec {
+                alias: "Token".into(),
+                address: TOKEN.parse().unwrap(),
+                abi: abi.clone(),
+                events: Vec::new(),
+            },
+            ContractSpec {
+                alias: "token".into(),
+                address: "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                abi,
+                events: Vec::new(),
+            },
+        ])
+        .unwrap();
+        let plan = |table: &str| Plan {
+            left: Source {
+                table: table.into(),
+                columns: vec!["to".into(), "value".into()],
+            },
+            left_filter: None,
+            join: None,
+            key: vec![Expr::Column(0)],
+            aggregates: vec![Agg::Sum(Expr::Column(1))],
+        };
+        let err = Binding::bind(&plan("TOKEN__transfer"), &reg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("differ only in case"), "{err}");
+        let bound = Binding::bind(&plan("token__transfer"), &reg).unwrap();
+        assert_eq!(bound.left.table, "token__transfer");
     }
 
     /// **§5.1, end to end.** Logs decode through the real registry, the binding turns that window
