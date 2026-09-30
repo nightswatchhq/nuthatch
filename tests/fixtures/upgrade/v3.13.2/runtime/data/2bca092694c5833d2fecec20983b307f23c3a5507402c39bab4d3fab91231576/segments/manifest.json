@@ -1,0 +1,16 @@
+{
+  "manifest_version": 1,
+  "tables": {
+    "usdc__transfer": [
+      {
+        "hash": "48ef579c891823d4fa21fbbc1a7f57fee856342ac232b856581f454a80e66816",
+        "from_block": 1,
+        "to_block": 4,
+        "rows": 4,
+        "file": "usdc__transfer-48ef579c891823d4fa21fbbc1a7f57fee856342ac232b856581f454a80e66816.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1"
+      }
+    ]
+  }
+}
