@@ -2698,3 +2698,86 @@ async fn a_runtime_serves_metrics_at_its_root() {
         assert!(text.contains(series), "root /metrics lacks {series}");
     }
 }
+
+/// From the 3.13.0 tyre-kick: the admin API refuses any name boot would refuse, since an accepted
+/// name is persisted and the next start fails on it. Nothing refused is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn names_boot_would_refuse_are_refused_at_the_api() {
+    let roost = tempfile::tempdir().unwrap();
+    std::fs::write(
+        roost.path().join(runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
+    )
+    .unwrap();
+    let nid = "c3".repeat(32);
+    let (handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+
+    let long = "a".repeat(300);
+    let wide = "é".repeat(70);
+    for name in [
+        "../escape",
+        "",
+        long.as_str(),
+        wide.as_str(),
+        "a/b/c",
+        "usdc__moving",
+        "acme/usdc.v2",
+        "acme/",
+    ] {
+        let body = serde_json::json!({"name": name, "nid": nid}).to_string();
+        let (status, answer) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{name:?}: {answer}"
+        );
+        let (status, _) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?wait=true",
+            None,
+            Some(&body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{name:?} with wait"
+        );
+    }
+    let move_body = serde_json::json!({"nid": nid}).to_string();
+    let (status, _) = call(
+        &routes,
+        "POST",
+        "/_admin/move/usdc__moving",
+        None,
+        Some(&move_body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "a move to a reserved name"
+    );
+
+    let body = serde_json::json!({"name": "default/usdc", "nid": nid}).to_string();
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{answer}");
+    assert!(answer.contains("mount it as 'usdc'"), "{answer}");
+
+    let table = runtime::MountTable::load(roost.path()).expect("the table still loads");
+    assert!(
+        table.mounts.is_empty(),
+        "a refused name was persisted: {:?}",
+        table.mounts
+    );
+}

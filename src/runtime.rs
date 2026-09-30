@@ -318,6 +318,43 @@ fn safe_segment(value: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// What a move appends to a name while the new nest catches up. Valid under [`safe_segment`], so a
+/// restart mid-move boots, and reserved: an operator's own names may not end in it.
+pub const STAGING_SUFFIX: &str = "__moving";
+
+/// A mount name as the admin API accepts it: `alias` or `tenant/alias`, each part as boot accepts it
+/// and at most 64 characters. Anything boot would refuse is refused here, since a name the API
+/// accepted is persisted, and the next start would fail on it.
+pub fn check_mount_name(name: &str) -> Result<()> {
+    let refuse = |why: String| Err(MountRefusal::InvalidName(why).into());
+    let (tenant, alias) = match name.split('/').collect::<Vec<_>>().as_slice() {
+        [alias] => (None, *alias),
+        [tenant, alias] => (Some(*tenant), *alias),
+        _ => return refuse(format!("mount name '{name}' has more than one '/'")),
+    };
+    for (what, part) in tenant
+        .map(|t| ("tenant", t))
+        .into_iter()
+        .chain([("alias", alias)])
+    {
+        if part.len() > 64 {
+            return refuse(format!(
+                "{what} '{}…' is longer than 64 characters",
+                part.chars().take(16).collect::<String>()
+            ));
+        }
+        if let Err(e) = safe_segment(part, what) {
+            return refuse(format!("{e:#}"));
+        }
+    }
+    if alias.ends_with(STAGING_SUFFIX) {
+        return refuse(format!(
+            "alias '{alias}' ends in '{STAGING_SUFFIX}', which a move reserves"
+        ));
+    }
+    Ok(())
+}
+
 /// The default per-cursor RSS ceiling: the CLAUDE.md ≤2 GB budget (RFC-0021 - now per active-chain
 /// cursor, not per whole runtime).
 pub const DEFAULT_MAX_RSS_MB: u64 = 2048;
@@ -2236,6 +2273,12 @@ pub fn lifecycle_routes(
             Ok(Json(body)) => body,
             Err(e) => return bad_body(e),
         };
+        if let Err(e) = check_mount_name(&body.name) {
+            return (
+                status_for(&e),
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            );
+        }
         // Validate before the caller's `nid` touches anything, not after: RuntimeHandles::mount
         // requires an `Nid` and cannot be called without one, but a bad value should read as a
         // caller error (400) rather than the 500 an unwrapped `Result` would produce here.
@@ -2507,6 +2550,12 @@ pub fn lifecycle_routes(
             Ok(Json(body)) => body,
             Err(e) => return bad_body(e),
         };
+        if let Err(e) = check_mount_name(&name) {
+            return (
+                status_for(&e),
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            );
+        }
         let nid = match Nid::parse(&body.nid) {
             Ok(nid) => nid,
             Err(e) => {
@@ -2825,6 +2874,8 @@ pub enum MountRefusal {
     NotHeld { nid: String },
     /// The chain's cursor died; its quarantine holds until restart (#1545).
     CursorStopped { nest: String, chain: String },
+    /// A name boot would refuse, so it may never be persisted.
+    InvalidName(String),
 }
 
 impl std::fmt::Display for MountRefusal {
@@ -2849,6 +2900,7 @@ impl std::fmt::Display for MountRefusal {
                 "mounting '{nest}' would put the {chain} cursor at ~{projected_mb} MB against a \
                  {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another mounts"
             ),
+            MountRefusal::InvalidName(why) => write!(f, "{why}"),
             MountRefusal::CursorStopped { nest, chain } => write!(
                 f,
                 "the cursor on {chain} has stopped; restart the runtime to mount '{nest}' onto it"
@@ -2873,6 +2925,7 @@ impl MountRefusal {
             | MountRefusal::CursorStopped { .. } => 409,
             MountRefusal::OverBudget { .. } => 507,
             MountRefusal::NotHeld { .. } => 404,
+            MountRefusal::InvalidName(_) => 400,
         }
     }
 }
@@ -3313,6 +3366,19 @@ impl RuntimeHandles {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
         let (tenant, alias) = split_route_key(name);
+        for part in tenant.into_iter().chain([alias]) {
+            if let Err(e) = safe_segment(part, "mount name part") {
+                return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
+            }
+        }
+        // Keys are per mount (#1565): a name spelling out the default tenant would be served under
+        // it now and by alias alone after a restart.
+        if tenant == Some(self.default_tenant.as_str()) {
+            return Err(MountRefusal::InvalidName(format!(
+                "'{name}' names the default tenant; mount it as '{alias}'"
+            ))
+            .into());
+        }
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the
         // caller does not know it, e.g. remounting a nest this runtime has already seen.
@@ -3818,7 +3884,7 @@ impl RuntimeHandles {
 
     /// The name a move stages its incoming nest under while it catches up.
     pub fn staging_name(name: &str) -> String {
-        format!("{name}.moving")
+        format!("{name}{STAGING_SUFFIX}")
     }
 
     /// Move a live name to another NID without a gap (#1549).
