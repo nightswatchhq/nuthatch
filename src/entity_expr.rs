@@ -656,6 +656,14 @@ mod static_type_tests {
                 true,
             ),
             (
+                "CASE WHEN fee > 0 THEN fee + 'x' ELSE 0 END",
+                Expr::Case {
+                    whens: vec![(gt0(), Expr::Add(col(0), s("x")))],
+                    otherwise: Some(i(0)),
+                },
+                true,
+            ),
+            (
                 "CAST(sym AS BOOLEAN)",
                 Expr::Cast(col(1), Type::Bool),
                 false,
