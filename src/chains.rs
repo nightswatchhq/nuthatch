@@ -487,15 +487,31 @@ pub fn lookup(name: &str) -> Option<&'static Chain> {
 /// replace it rather than add to it.
 pub fn keyless_caveat(chain: &str, rpc_urls: &[String], timestamps: bool) -> Option<&'static str> {
     let arbitrum = lookup(chain).is_some_and(|c| c.chain_id == 42161);
-    let arb1 = rpc_urls.iter().any(|u| {
-        reqwest::Url::parse(u).is_ok_and(|url| url.host_str() == Some("arb1.arbitrum.io"))
-    });
+    let arb1 = rpc_urls.iter().any(|u| host_is(u, ARB1));
     (timestamps && arbitrum && arb1).then_some(
         "arb1.arbitrum.io sends no timestamp on its logs, so each block's comes from a header, and it \
          takes header batches of about ten: a backfill through it runs at about chain speed, and a \
          long one may be refused. For history, use a keyed Arbitrum RPC in place of arb1 in \
          rpc_urls (or --rpc <url>).",
     )
+}
+
+/// Arbitrum's own keyless RPC, which the registry ships first for `arbitrum-one`.
+const ARB1: &str = "arb1.arbitrum.io";
+
+fn host_is(url: &str, host: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| u.host_str() == Some(host))
+}
+
+/// The most block headers an endpoint in `rpc_urls` answers in one batch, where a known keyless one
+/// answers fewer than nuthatch would send (#1570).
+///
+/// `arb1.arbitrum.io` answers ten and refuses fifty, and refuses them with a 429 that no response can
+/// tell from a throttle. Inferring the limit from refusals (or probing for it) therefore mistakes a
+/// throttle for a size limit and spends quota doing it, so the fact is recorded here, beside the
+/// endpoint itself, as the registry records the rest of what it knows about the endpoints it ships.
+pub fn header_batch_cap(rpc_urls: &[String]) -> Option<usize> {
+    rpc_urls.iter().any(|u| host_is(u, ARB1)).then_some(10)
 }
 
 /// Policy for a chain with no registry entry: the same "assume L1, wait for real depth, and a
@@ -621,6 +637,8 @@ mod tests {
         assert!(keyless_caveat("arbitrum", &arb1, true).is_some());
         assert!(keyless_caveat("arbitrum-one", &keyed, true).is_none());
         assert!(keyless_caveat("base", &arb1, true).is_none());
+        assert_eq!(header_batch_cap(&arb1), Some(10));
+        assert_eq!(header_batch_cap(&keyed), None);
         assert!(
             keyless_caveat("arbitrum-one", &arb1, false).is_none(),
             "no timestamps, no headers"
