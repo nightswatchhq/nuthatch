@@ -1843,5 +1843,12 @@ async fn a_maintained_count_is_numeric_in_sql() {
         named.as_str().is_some_and(|a| a.starts_with("0x")),
         "a text column named log_index lost its text: {named}"
     );
+    // A running nest keeps the declarations it started with: a half-edited file on disk must not turn
+    // its relations back into text (astra's re-review).
+    std::fs::write(dir.path().join("entities.toml"), "[[entities\nnot toml").unwrap();
+    assert_eq!(
+        one("SELECT typeof(n) AS t FROM counts LIMIT 1").await["t"],
+        "HUGEINT"
+    );
     shutdown_and_settle(rt).await;
 }

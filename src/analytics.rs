@@ -2520,9 +2520,7 @@ fn define_views_bound(
     }
     // The maintained relations, by the declaration that makes them so: their rows are typed from their
     // own cells rather than loaded as event text (#1572).
-    let relations: std::collections::BTreeSet<String> = crate::entities::load(dir)
-        .map(|d| d.into_iter().map(|e| e.name.to_ascii_lowercase()).collect())
-        .unwrap_or_default();
+    let relations = declared_relations(dir);
 
     for table in &tables {
         let cols = cols_of(table);
@@ -2721,6 +2719,37 @@ fn table_scan(files: &[(PathBuf, u64)]) -> TableScan {
 
 /// The DuckDB column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
 /// columns are `UBIGINT`, everything else is stored as canonical text (`VARCHAR`).
+/// The entity names `entities.toml` declares in `dir`, lowercased. Held from the first good read: a
+/// running nest's declarations cannot change without a restart (they are part of its content address),
+/// so a file an operator leaves half-edited must not turn its relations back into event text.
+fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
+    type Held = Mutex<std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>>;
+    static HELD: OnceLock<Held> = OnceLock::new();
+    let held = HELD.get_or_init(Default::default);
+    if let Some(names) = held.lock().unwrap_or_else(|e| e.into_inner()).get(dir) {
+        return names.clone();
+    }
+    match crate::entities::load(dir) {
+        Ok(decls) => {
+            let names: std::collections::BTreeSet<String> = decls
+                .into_iter()
+                .map(|e| e.name.to_ascii_lowercase())
+                .collect();
+            held.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(dir.to_path_buf(), names.clone());
+            names
+        }
+        Err(e) => {
+            tracing::warn!(
+                "{} could not be read, so maintained relations load as text this query: {e:#}",
+                dir.join("entities.toml").display()
+            );
+            Default::default()
+        }
+    }
+}
+
 pub(crate) fn hot_col_type(name: &str) -> &'static str {
     if matches!(
         name,
