@@ -124,6 +124,18 @@ impl MountJobs {
         self.persist(&jobs);
     }
 
+    /// Record `job` unless one is already running for its name, which is returned instead. One step
+    /// under the lock, so of several identical requests exactly one starts a worker.
+    pub fn claim(&self, job: MountJob) -> Result<MountJob, MountJob> {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(running) = jobs.get(&job.name).filter(|j| !j.phase.finished()) {
+            return Err(running.clone());
+        }
+        jobs.insert(job.name.clone(), job.clone());
+        self.persist(&jobs);
+        Ok(job)
+    }
+
     /// Move a job on. A reason is kept only for a failure.
     pub fn advance(&self, name: &str, phase: MountPhase, reason: Option<String>) {
         let mut jobs = self.jobs.lock().unwrap();
@@ -206,6 +218,23 @@ mod tests {
 
         again.forget("b");
         assert!(MountJobs::load(d.path()).get("b").is_none());
+    }
+
+    #[test]
+    fn only_one_of_several_identical_claims_wins() {
+        let d = tempfile::tempdir().unwrap();
+        let jobs = MountJobs::load(d.path());
+        let job = || MountJob::new("race", Some("aa"), MountPhase::Accepted);
+        assert!(jobs.claim(job()).is_ok());
+        let running = jobs
+            .claim(job())
+            .expect_err("a second claim while the first runs");
+        assert_eq!(running.phase, MountPhase::Accepted);
+        jobs.advance("race", MountPhase::Failed, Some("x".into()));
+        assert!(
+            jobs.claim(job()).is_ok(),
+            "a finished job does not block a new one"
+        );
     }
 
     #[test]

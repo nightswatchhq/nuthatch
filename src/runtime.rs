@@ -2373,8 +2373,17 @@ pub fn lifecycle_routes(
                 }
             }
         }
-        let job = MountJob::new(&body.name, nid_str.as_deref(), MountPhase::Accepted);
-        jobs.put(job.clone());
+        let job = match jobs.claim(MountJob::new(
+            &body.name,
+            nid_str.as_deref(),
+            MountPhase::Accepted,
+        )) {
+            Ok(job) => job,
+            Err(running) if running.nid == nid_str => {
+                return (StatusCode::ACCEPTED, Json(serde_json::json!(running)))
+            }
+            Err(running) => return (StatusCode::CONFLICT, Json(serde_json::json!(running))),
+        };
         spawn_mount_job(handles, jobs, body.name, nid);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
@@ -2586,7 +2595,10 @@ pub fn lifecycle_routes(
         }
         let mut job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
         job.is_move = true;
-        jobs.put(job.clone());
+        let job = match jobs.claim(job) {
+            Ok(job) => job,
+            Err(running) => return (StatusCode::CONFLICT, Json(serde_json::json!(running))),
+        };
         spawn_move_job(handles, jobs, name, nid);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
@@ -2623,8 +2635,14 @@ pub fn lifecycle_routes(
         if let Some(job) = jobs.get(&name).filter(|j| !j.phase.finished()) {
             return (StatusCode::ACCEPTED, Json(serde_json::json!(job)));
         }
-        let job = MountJob::new(&name, Some(nid.as_str()), MountPhase::Accepted);
-        jobs.put(job.clone());
+        let job = match jobs.claim(MountJob::new(
+            &name,
+            Some(nid.as_str()),
+            MountPhase::Accepted,
+        )) {
+            Ok(job) => job,
+            Err(running) => return (StatusCode::ACCEPTED, Json(serde_json::json!(running))),
+        };
         spawn_mount_job(handles, jobs, name, Some(nid));
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
@@ -3062,6 +3080,7 @@ pub fn spawn_mount_job(
     nid: Option<Nid>,
 ) -> tokio::task::JoinHandle<()> {
     use crate::mount_jobs::MountPhase;
+    let wanted = nid.as_ref().map(|n| n.as_str().to_string());
     tokio::spawn(async move {
         let outcome = async {
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
@@ -3083,8 +3102,22 @@ pub fn spawn_mount_job(
             mounted
         }
         .await;
+        // Already mounted on the very NID asked for is this job's goal reached, not a failure.
+        let reached = |h: &RuntimeHandles| {
+            h.states.iter().any(|(n, s)| {
+                *n == name && (wanted.is_none() || s.nid.as_deref() == wanted.as_deref())
+            })
+        };
         match outcome {
             Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<MountRefusal>(),
+                    Some(MountRefusal::AlreadyMounted(_))
+                ) && reached(&*handles.lock().await) =>
+            {
+                jobs.advance(&name, MountPhase::Live, None)
+            }
             Err(e) => {
                 tracing::warn!("mounting '{name}' failed: {e:#}");
                 jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));

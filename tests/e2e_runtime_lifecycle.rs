@@ -2836,3 +2836,31 @@ async fn a_restart_mid_move_resumes_the_move() {
         "the resumed move did not finish"
     );
 }
+
+/// From the 3.13.0 tyre-kick, second pass: identical mounts sent at once. Every caller gets the
+/// job, and the job ends live; a second worker must never mark a live nest failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_mounts_sent_at_once_end_live() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "f6".repeat(32);
+    let (handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let body = format!(r#"{{"name":"race","nid":"{nid}"}}"#);
+    let calls = (0..16).map(|_| call(&routes, "POST", "/_admin/nests", None, Some(&body)));
+    for (status, answer) in futures::future::join_all(calls).await {
+        assert!(
+            status == axum::http::StatusCode::ACCEPTED || status == axum::http::StatusCode::OK,
+            "{status}: {answer}"
+        );
+    }
+    let job = wait_for_phase(&routes, "race", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (_, after) = call(&routes, "GET", "/_admin/mounts/race", None, None).await;
+    assert!(
+        after.contains("\"live\""),
+        "a late worker changed the job: {after}"
+    );
+}
