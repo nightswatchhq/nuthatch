@@ -155,7 +155,8 @@ impl Expr {
     /// either refused entities that run or passed ones that do not. So a refusal here is always
     /// right, and what this cannot judge still faults loudly at runtime, as it always has.
     ///
-    /// `cols` holds each column's type, or `None` for one that may be NULL.
+    /// `cols` holds each column's type, or `None` for one that may be NULL. The guarantee covers a
+    /// well-bound expression, every column index checked, evaluated on rows that match `cols`.
     pub fn definite_type(&self, cols: &[Option<Type>]) -> Result<Option<Type>> {
         let need = |what: &str, got: Option<Type>, want: Type| match got {
             Some(t) if t != want => bail!("{what} needs {want:?}, got {t:?}"),

@@ -202,12 +202,6 @@ impl Binding {
             if let Some(f) = &join.right_filter {
                 filter(f, &right.types, "the joined table's filter")?;
             }
-            // Not a fault but never a match: an equijoin across two types joins nothing.
-            if let (Some(l), Some(r)) = (left[join.on.0], right.types[join.on.1]) {
-                if l != r {
-                    bail!("the join compares {l:?} with {r:?}, which are never equal");
-                }
-            }
         }
         for e in &plan.key {
             e.definite_type(&joined)
