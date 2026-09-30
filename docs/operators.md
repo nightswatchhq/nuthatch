@@ -86,7 +86,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:3.13.2
+  ghcr.io/nightswatchhq/nuthatch:4.0.0
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -123,7 +123,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:3.13.2-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:4.0.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -1314,81 +1314,120 @@ advertises the tools it can actually answer.
 
 ## Stability contract
 
-Nuthatch follows **semantic versioning** from 1.0 onwards. This section is the commitment, not a
-description of habits: it says what a minor may do to you, what is reserved for a major, and what is
-deliberately outside the promise.
+Nuthatch follows **semantic versioning**, and **4.x is the stable line**. This section is the
+commitment, not a description of habits: what a release on the 4.x line may do to you, what waits for
+5.0, and what is deliberately outside the promise.
 
-It is published *before* the first major bump rather than alongside it. A stability promise that first
-appears in the release that breaks things reads as an apology.
+### The promise, for 4.x
 
-### What a patch may do
+From 4.0.0 to the last 4.x release:
 
-Fix behaviour. Nothing in the surfaces below changes.
+1. **Config keeps working.** A `nuthatch.toml`, `mounts.toml` or `entities.toml` that works on a 4.x
+   release works on every later 4.x release, with the same meaning.
+2. **Data directories upgrade drop-in.** A later 4.x opens a data directory written by an earlier 4.x
+   in place: replace the binary and restart. No re-index, no re-seal, no migration command.
+3. **The HTTP, SQL and MCP surfaces do not break.** No route, response field, generated table or
+   column, or MCP tool is removed, renamed or retyped.
 
-### What a minor may change, and what is reserved for a major
+**Upgrade only.** The promise runs forwards. A later 4.x may update the on-disk format as it opens a
+directory, and an earlier 4.x is not promised to read the result. To keep a way back, copy the data
+directory before upgrading.
 
-The bullets above are the observed practice. This table is the promise, and it applies to the `2.x`
-line: a minor is `2.1`, `2.2`, and so on; breaking changes wait for `3.0`.
+### How releases are cut on 4.x
 
-| Surface | A minor release may | Reserved for a major |
+- **A released 4.x only ever gets patch releases** (4.0.1, 4.0.2, ...), and a patch only fixes.
+- **Features wait for the next monthly minor** (4.1, 4.2, ...). A minor may add; it may not break
+  anything in the table below.
+- **Correctness and security fixes ship immediately**, as a patch, without waiting for the month.
+- **A correctness fix is not a break**, even where an answer changes: a wrong answer made right is
+  the fix. Nuthatch never re-decodes stored history, so where rows were stored wrong the notes name
+  the affected range to index again (3.13.2's Arbitrum timestamps are the model). Where a config was
+  accepted but silently produced wrong data, the fix may refuse it at startup, and the refusal says
+  what to change. A security fix with no compatible form may break a surface in a patch. In every one
+  of these cases the release notes say so, name the fix, and explain why.
+
+### What a minor may change, and what waits for 5.0
+
+| Surface | A 4.x minor may | Reserved for 5.0 |
 |---|---|---|
-| `nuthatch.toml` / `mounts.toml` keys | add a key; deprecate one with a startup warning | remove or rename a key, or change its type or meaning |
-| nest `schema_version` | bump it when the upgrade is in-place and automatic | a bump that requires a re-index |
-| On-disk layout (redb tables, segment layout, `manifest.json`, `schema.json`) | change it when the upgrade is in-place and automatic | a layout needing a reseal or re-index |
+| `nuthatch.toml`, `mounts.toml`, `entities.toml` keys | add a key; deprecate one with a startup warning | remove or rename a key, or change its type or meaning |
+| nest `schema_version` | bump it when the upgrade is in place and automatic | a bump that requires a re-index |
+| On-disk layout (redb tables, segment layout, `manifest.json`, `schema.json`, `data/<nid>/`) | change it when the upgrade is in place and automatic | a layout needing a re-seal, a re-index or a migration command |
 | HTTP routes and response shapes | add a route; add a field | remove a route, remove a field, or change a field's type or units |
+| SQL: generated tables and columns (`{alias}__{event}`, the fixed columns, the event's params), authored views and entities by name | add a table or a column | remove or rename a table or column, or change a column's type |
+| MCP tools | add a tool | remove or rename a tool, remove an argument, or make an optional argument required |
 | CLI flags | add a flag; deprecate one with a warning | remove or rename a flag on `init`, `dev`, `sql`, `add` or `check` |
 | Metric names and labels | add a metric or a label | remove or rename a `nuthatch_*` series, change its unit, or change what a label means |
-| MCP tools | add a tool | (not covered - see below) |
 
-**Upgrades are in-place by default.** A release that requires a data migration says so in its notes
-and ships the command that performs it. The record so far is five consecutive in-place production
-upgrades; 2.0's layout change ships `nuthatch migrate`, which moves data and never re-indexes.
+**MCP tools are advertised per nest** (RFC-0025): a nest lists the tools it can answer, so discover
+them with `tools/list` rather than hardcoding the list. The promise is that a tool a nest advertises
+on a 4.x release is still advertised, under the same name and with compatible arguments, for that
+nest on every later 4.x. Tool descriptions and the layout of result text may change; the data a
+result carries does not.
 
-**Deprecation window.** A deprecation is announced in at least one minor release before removal,
-removal comes **no sooner than 90 days** after that release, and removal itself waits for the next
-major. The warning names the replacement.
+**Deprecation window.** A deprecation is announced in at least one minor before removal, removal
+comes **no sooner than 90 days** after that release, and removal itself waits for 5.0. The warning
+names the replacement. That is the floor rather than the target: anything an operator wires into a
+unit file, a scrape config or a dashboard gets longer.
 
-That is the **floor rather than the target**: anything an operator wires into a unit file, a scrape
-config or a dashboard gets longer, because the cost of breaking it is not paid by us.
-
-If a removal ever has to move faster - a security fix with no compatible form - the release notes say
-so explicitly and explain why. That has not happened.
-
-### Not covered by 2.x, deliberately
+### Not covered by 4.x, deliberately
 
 Stated because a platform team will ask, and because a vague promise is worse than a narrow one.
 
-- **The MCP surface and `semantic.toml`.** Both are documented as in-design rather than shipped
-  (RFC-0016, RFC-0017), and both are moving. The MCP tool surface is also advertised *adaptively per
-  nest* (RFC-0025) - it is a function of the nest, not of the release - so **discover it with
-  `tools/list` and never hardcode a tool name**. `semantic.toml`'s derived `[table.*.footguns]` are
-  regenerated from the ABI; your **authored descriptions are preserved**, and that half is covered.
-  If you build against the rest inside 2.x, pin the version.
+- **Downgrades**, above. Upgrade only.
+- **Off-by-default cargo features: `graph`, `folds`, `counter`, `exex` and `shadow-burrmill`.**
+  None is in the published binaries or images, and all are experimental: their config keys, routes,
+  on-disk state and behaviour may change or go in any 4.x release. A build that enables one is not
+  covered by any line above for what that feature adds. (`graph` is RFC-0053's partial read surface
+  and RFC-0060's parked endpoint; `folds` is RFC-0059, parked; `counter` is x402.)
+- **The SQL dialect itself.** The tables and columns are nuthatch's and are covered; the functions and
+  planner behind `/sql` are DuckDB's. A DuckDB upgrade that changes a function's behaviour ships in a
+  minor, and its notes say so. The resource guards (timeout, row cap, spill cap) may tighten in a
+  patch when that is the security fix.
 - **Segment identity across `arrow-rs` releases.** Byte-identical segments are a correctness
   boundary, not an API, and the boundary belongs to a dependency we do not control: a segment's hash
   covers the Parquet bytes including arrow-rs's `created_by` stamp, so identical decoded rows can
   hash differently under a different build. What *is* promised is that sealed segments stay readable
-  and are never rewritten - compare decoded rows, not hashes, across versions. A release that changes
-  segment bytes says so in its notes; semver is the wrong instrument for it. (Same reason RFC-0033
-  puts the engine and its version inside the derivation reuse key.)
+  and are never rewritten; compare decoded rows, not hashes, across versions.
+- **`semantic.toml`'s derived half.** Its `[table.*.footguns]` are regenerated from the ABI; your
+  authored descriptions are preserved, and that half is covered.
+- **Rejecting what was never read.** Since 3.13.2, `nuthatch check` fails on a `nuthatch.toml` key
+  nuthatch does not read. A config using a key added in 4.2 is not promised to pass `check` on 4.1.
 - **The admin UI's internals.** `/_admin` is a human surface, not an API. Its HTML and internal
-  endpoints may change in any release; the JSON APIs it consumes are covered by the HTTP row above.
-- **Anything behind an unreleased feature flag**, and the `postgres-store` build's internal schema
-  while scaled mode is young. Scaled mode's *external* surfaces - its HTTP API, its CLI, its
-  config - are covered like everything else.
+  endpoints may change in any release; the JSON admin API (`docs/admin-api.md`) is covered by the
+  HTTP row.
+- **The `postgres-store` build's internal schema** while scaled mode is young. Scaled mode's external
+  surfaces (its HTTP API, its CLI, its config) are covered like everything else.
 
-### What "1.0" claimed, and what it did not
+### How the promise is checked
 
-Until 1.0.1 this section was headed "Stability contract (0.x)" and described a 0.x deprecation policy;
-the heading was not revisited when 1.0 shipped, so for four releases the document promised less than
-the version number implied. That is fixed here, and the gap is recorded rather than quietly closed -
-issue #312.
+Partly by tests, partly by release practice, and the difference is stated here rather than left to
+be found. What a test enforces in the required CI job:
 
-At 2.0 the table was retargeted from the `1.x` line to `2.x` **as part of cutting the release**, which
-is the only way this section stays true: a version line is not a detail you revisit when someone
-notices. What 2.0 itself broke is listed in the upgrade notes below, and every one of those breaks is
-a row in the table above - which is the test of whether a contract published before the major bump
-was worth publishing.
+- **Config:** four committed `nuthatch.toml` files must parse with no unknown key
+  (`only_keys_nothing_reads_are_unknown` in `src/config.rs`), and two inline pre-4.0 shapes must
+  still load. No committed `mounts.toml` or `entities.toml` is checked.
+- **Data identity:** the decoder's registry hash for ERC-20 and tuple ABIs is pinned to the value
+  3.6.1 printed (`decode/src/registry.rs`), so a change that would move those nests' identity fails.
+- **HTTP and MCP:** the core routes must exist and answer, and the generic MCP tools must be
+  advertised by name.
+
+What no test enforces yet: no CI job opens a data directory written by an earlier release, the NID
+and the redb table definitions are not pinned to a frozen value, and there is no golden of a nest's
+generated SQL tables and columns, of HTTP response shapes, or of MCP tool arguments. Until there is,
+each release's notes carry a checked compatibility section (what `src/cli.rs`, `src/metrics.rs`,
+`src/blob.rs` and the registry did between the two tags), and a release that cannot state it is not
+tagged.
+
+### History
+
+This table covered `1.x`, then `2.x`, and was retargeted at each major **as part of cutting the
+release**. At 3.0 it was not: through the whole 3.x line it still said `2.x`, the same gap #312
+recorded at 1.0. The 3.x minors also did what the table reserves for a major more than once, each as
+a correctness fix and each named in its notes: a config an earlier 3.x accepted was refused (3.1.0,
+3.9.0), a nest had to be re-indexed (3.7.0, 3.8.0), and `POST /_admin/nests` moved from `200` to `202`
+(3.13.0). 4.0 retargets the table, adds the release cadence above, and makes the correctness-fix
+exception explicit rather than habitual.
 
 ---
 
