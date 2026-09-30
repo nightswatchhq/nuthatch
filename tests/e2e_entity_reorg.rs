@@ -1874,3 +1874,57 @@ async fn a_file_broken_before_the_first_query_keeps_the_started_types() {
     assert_eq!(body["rows"][0]["t"], "HUGEINT", "{body}");
     shutdown_and_settle(rt).await;
 }
+
+/// The same quarantine when the fault lands on the **last** window and no block follows. An entity
+/// records a failed step on its own thread, after the window that fed it has been checked, so on a
+/// quiet chain the nest reported healthy until another block arrived. Found on a stationary fork:
+/// `/ready` said faulted while `/nests` and the health gauge said indexing, for as long as the chain
+/// stayed still.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entity_that_faults_on_the_last_block_is_quarantined_without_another() {
+    use nuthatch::health::RuntimeHealth;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let cfg = scaffold_nest(dir.path(), "lastfault", USDC);
+    // One transfer a block: the bound admits every input but the last block's.
+    entity_fixture::write(
+        dir.path(),
+        &format!(
+            r#"[[entities]]
+name = "received"
+query = "SELECT t.to, SUM(t.value) FROM lastfault__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = {}
+"#,
+            CHAIN_LEN - 1
+        ),
+    )
+    .unwrap();
+    let health = Arc::new(RuntimeHealth::new());
+    health.register("lastfault", &cfg.nest.chain);
+    let _cursor = indexer::spawn_runtime(
+        tape,
+        vec![("lastfault".to_string(), dir.path().to_path_buf(), cfg)],
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+
+    let quarantined = wait_until(POLL_TIMEOUT, || health.status("lastfault").is_some()).await;
+    assert!(
+        quarantined,
+        "a nest whose entity faulted on the last block must be quarantined without another block"
+    );
+}

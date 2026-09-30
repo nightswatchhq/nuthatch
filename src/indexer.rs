@@ -2180,6 +2180,13 @@ async fn runtime_index_loop(
 
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
+            // An entity records a failed step on its own thread, after the window that fed it has
+            // been checked, so on a chain with no new block its fault would wait for one to be seen.
+            for &i in &live {
+                if let Err(e) = live_ref(&nests, i).ensure_views_healthy() {
+                    sup.quarantine(i, &e)?;
+                }
+            }
             sleep_for(freshness.poll_interval).await;
             continue;
         }
@@ -3007,6 +3014,17 @@ async fn build_nest(
             // this surface: "sealed_through has not advanced" or "went backwards" fires after every
             // restart of a perfectly healthy nest, and an alert that cries wolf gets muted.
             m.set_sealed_through(shared_store.sealed_through());
+            // The cursor position likewise: until the next commit `/ready` read 0, measured a lag
+            // from the start block, and on a quiet chain declared a caught-up nest wedged after the
+            // stall grace.
+            if let Some(last) = shared_store
+                .get_meta(LAST_BLOCK_KEY)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                m.set_last_block(last);
+            }
             m
         },
         addresses,
@@ -6290,10 +6308,16 @@ impl NestIngest {
         if ancestor < sealed_through {
             // Terminal (RFC-0026 §3): the next attempt re-derives the same watermark and bails
             // identically, so this nest is quarantined until an operator raises the finality depth.
+            // `detect_reorg` answers 0 when no checkpoint it holds is canonical, which is not a fork
+            // at genesis and must not read as one.
+            let fork = if ancestor == 0 {
+                "a fork deeper than every checkpoint this nest holds".to_string()
+            } else {
+                format!("a reorg to block {ancestor}")
+            };
             anyhow::bail!(TerminalFault(format!(
-                "reorg to block {ancestor} is below the sealed/finalized watermark \
-                 {sealed_through} - a finality violation this indexer cannot repair; \
-                 halting. Raise the chain's finality depth."
+                "{fork} is below the sealed/finalized watermark {sealed_through} - a finality \
+                 violation this indexer cannot repair; halting. Raise the chain's finality depth."
             )));
         }
         let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
@@ -6918,6 +6942,9 @@ async fn index_loop(
                 p.finish(next.saturating_sub(1), true);
             }
             caught_up = true;
+            // As in the runtime loop: an entity fault recorded after its window was checked surfaces
+            // here rather than waiting for a block.
+            nest.ensure_views_healthy()?;
             // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
             // when the tip has moved, a reorg check, a checkpoint header and a `finalized` probe -
             // whether or not any block carried an event. At two seconds that is the whole bill of a
@@ -10675,6 +10702,26 @@ template = "pool"
             behind.store.get_meta(LAST_BLOCK_KEY).unwrap().as_deref(),
             Some("30")
         );
+    }
+
+    /// A finality violation names the fork it saw. `detect_reorg` answers 0 when no checkpoint the
+    /// nest holds is canonical, and the halt used to report that as "reorg to block 0", sending an
+    /// operator to look for a fork at genesis.
+    #[tokio::test]
+    async fn a_finality_violation_says_when_no_checkpoint_survived() {
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0x0000000000000000000000000000000000000003").await;
+        seed_blocks(&nest, &[10, 20, 60, 100]);
+        nest.store.set_meta(SEALED_THROUGH_KEY, "60").unwrap();
+
+        let deep = format!("{:#}", nest.rollback_reorg(0).unwrap_err());
+        assert!(
+            deep.contains("deeper than every checkpoint") && !deep.contains("block 0"),
+            "{deep}"
+        );
+        let known = format!("{:#}", nest.rollback_reorg(50).unwrap_err());
+        assert!(known.contains("a reorg to block 50"), "{known}");
     }
 
     /// A supervisor over `n` nests named a, b, c… with a throwaway health surface.
