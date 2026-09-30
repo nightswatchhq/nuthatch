@@ -537,7 +537,15 @@ pub fn degraded_tables(
 /// Run a read-only query to completion. Only SELECT/WITH statements are accepted - this is a query
 /// surface, not a mutation surface. Unguarded: for trusted, registry-built SQL that must finish.
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
+    #[cfg(test)]
+    QUERIES.with(|n| n.set(n.get() + 1));
     Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[], None, None)?.rows)
+}
+
+// How many trusted queries this thread has run, so a test can hold a point read to its count (#1574).
+#[cfg(test)]
+thread_local! {
+    static QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Run a trusted read-only query over **only the segments finalized at/below `sealed_through`** (the
@@ -4185,6 +4193,7 @@ template="pool"
             r#"{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"5","block_number":10,"tx_hash":"0xt","log_index":0}"#.to_string(),
             r#"{"table":"usdc__transfer","from":"0xa","to":"0xc","value":"7","block_number":10,"tx_hash":"0xt","log_index":1}"#.to_string(),
             r#"{"table":"usdc__approval","owner":"0xa","spender":"0xd","value":"9","block_number":10,"tx_hash":"0xt","log_index":2}"#.to_string(),
+            r#"{"table":"usdc__zmint","to":"0xe","value":"3","block_number":10,"tx_hash":"0xt","log_index":3}"#.to_string(),
         ];
         crate::seal::seal_range(dir.path(), &entities, 10, 10).unwrap();
 
@@ -4199,7 +4208,21 @@ template="pool"
         assert_eq!(one["to"], Value::from("0xc"));
         let appr = get_row(dir.path(), 10, 2).unwrap().unwrap();
         assert_eq!(appr["spender"], Value::from("0xd"));
-        assert_eq!(get_row(dir.path(), 10, 3).unwrap(), None);
+
+        // #1574: one probe then one read, whichever table holds the row, not a query per table. The
+        // row is in the last of three tables, so asking each in turn would take three.
+        let queries = |f: &dyn Fn()| {
+            let before = QUERIES.with(|n| n.get());
+            f();
+            QUERIES.with(|n| n.get()) - before
+        };
+        let n = queries(&|| {
+            let last = get_row(dir.path(), 10, 3).unwrap().unwrap();
+            assert_eq!(last["to"], Value::from("0xe"));
+        });
+        assert_eq!(n, 2, "a point read in the last table");
+        let n = queries(&|| assert_eq!(get_row(dir.path(), 10, 4).unwrap(), None));
+        assert_eq!(n, 1, "a miss is the probe alone");
     }
 
     fn sealed_bytes(dir: &Path, table: &str) -> u64 {
