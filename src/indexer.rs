@@ -7039,8 +7039,24 @@ async fn index_loop(
                 // A refusal carrying no width information - a 429 or a 403. Retrying at the same width is
                 // right: endpoint failover happens beneath this, and the growth that used to walk into an
                 // unserveable width is bounded by evidence in the chunker now (#672).
+                if !caught_up
+                    && matches!(
+                        crate::rpc::class_of(&e),
+                        Some(crate::rpc::FailureClass::HistoryUnavailable)
+                    )
+                {
+                    return Err(e)
+                        .with_context(|| format!("backfill cannot fetch blocks {next}..={to}"));
+                }
                 tracing::warn!("get_logs {next}..={to} failed: {e:#}; retrying");
-                no_progress_tick(&mut no_progress, next, to, caught_up, "fetch failing")?;
+                // The error goes into the bail: it names the cause, the limit's own advice may not (#1607).
+                no_progress_tick(
+                    &mut no_progress,
+                    next,
+                    to,
+                    caught_up,
+                    &format!("fetch failing: {e:#}"),
+                )?;
                 sleep_secs(3).await;
             }
         }
@@ -17733,6 +17749,97 @@ template="pool"
             (10..=30).contains(&polls),
             "expected roughly twelve tip polls in a virtual hour at a five-minute interval on a \
              chain that moves between polls, got {polls}"
+        );
+    }
+
+    /// A pool whose every `getLogs` fails with one fixed classified error.
+    struct RefusingSource {
+        class: crate::rpc::FailureClass,
+        detail: &'static str,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for RefusingSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(10_000)
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            Ok(Some(9_900))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::Error::new(crate::rpc::ClassifiedError {
+                class: self.class.clone(),
+                detail: self.detail.into(),
+            }))
+        }
+    }
+
+    async fn run_refused(class: crate::rpc::FailureClass, detail: &'static str) -> (String, usize) {
+        let tmp = tempfile::tempdir().unwrap();
+        let nest = build_dialled_nest(tmp.path(), crate::freshness::Freshness::default()).await;
+        let src = Arc::new(RefusingSource {
+            class,
+            detail,
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let task = tokio::spawn(index_loop(
+            src.clone() as Arc<dyn Source>,
+            nest,
+            Some(1_000),
+            false,
+            1,
+            50,
+        ));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(3_600), task)
+            .await
+            .expect("a backfill no endpoint can serve must end, not retry for an hour")
+            .unwrap();
+        let err = ended.expect_err("a backfill no endpoint can serve must not succeed");
+        (
+            format!("{err:#}"),
+            src.fetches.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// #1607: when no endpoint keeps the history, no retry can help, so the backfill stops on the
+    /// first refusal and says what to supply.
+    #[tokio::test(start_paused = true)]
+    async fn a_backfill_no_endpoint_keeps_history_for_stops_at_once() {
+        let (text, fetches) = run_refused(
+            crate::rpc::FailureClass::HistoryUnavailable,
+            "no configured RPC endpoint keeps blocks this old; supply an archive-capable RPC with \
+             `--rpc` or `rpc_urls`",
+        )
+        .await;
+        assert_eq!(fetches, 1, "{text}");
+        assert!(text.contains("--rpc"), "{text}");
+    }
+
+    /// #1607: a throttle beside a pruned endpoint is still retried, but when it never lifts, the
+    /// bail carries the cause. It used to say only "fetch failing" and suggest a smaller window.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_backfill_bails_with_its_cause() {
+        let (text, fetches) = run_refused(
+            crate::rpc::FailureClass::RateLimited { retry_after: None },
+            "https://eth.drpc.org keeps no blocks this old, so the rest of the pool must serve \
+             them; if this persists, supply an archive-capable RPC with `--rpc` or `rpc_urls`",
+        )
+        .await;
+        assert_eq!(fetches, NO_PROGRESS_LIMIT, "{text}");
+        assert!(
+            text.contains("https://eth.drpc.org keeps no blocks"),
+            "{text}"
         );
     }
 

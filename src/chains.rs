@@ -109,6 +109,9 @@ const MAINNET: Chain = Chain {
         //   eth-pokt.nodies.app   archive YES, topic0-only YES
         //   eth.drpc.org          archive YES, topic0-only YES (batch-of-5 500s; the timestamp
         //                         fetcher already splits down to the cap)
+        // 2026-10-01 (#1607): eth.drpc.org no longer keeps history. Every getLogs below its pruning
+        // horizon is HTTP 400 "Unknown state. First available state is 1"; the tip still serves.
+        // eth-pokt.nodies.app keeps history but caps getLogs at 50 blocks.
         // `eth.api.onfinality.io/public` dropped: the 23rd's doctor probe did not complete (empty
         // hang). A spare that stalls the run is not failover. It answered the same probes on the
         // 24th; it stays off the list until it survives a doctor run, not a one-shot getLogs.
