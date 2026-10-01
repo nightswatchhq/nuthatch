@@ -5101,15 +5101,19 @@ template="pool"
         let dir = tempfile::tempdir().unwrap();
         crate::seal::seal_range(dir.path(), &[fold_row(0)], 0, 0).unwrap();
         let committed = Arc::new(AtomicU64::new(1));
+        let answered = Arc::new(AtomicU64::new(0));
         let done = Arc::new(AtomicBool::new(false));
         const FOLDS: u64 = 120;
 
         let readers: Vec<_> = (0..4)
             .map(|_| {
-                let (dir, committed, done) =
-                    (dir.path().to_path_buf(), committed.clone(), done.clone());
+                let (dir, committed, answered, done) = (
+                    dir.path().to_path_buf(),
+                    committed.clone(),
+                    answered.clone(),
+                    done.clone(),
+                );
                 std::thread::spawn(move || {
-                    let mut answered = 0u64;
                     while !done.load(Ordering::SeqCst) {
                         let before = committed.load(Ordering::SeqCst);
                         let out = count(&dir);
@@ -5123,9 +5127,8 @@ template="pool"
                             n >= before,
                             "a read answered {n} rows with {before} committed before it began"
                         );
-                        answered += 1;
+                        answered.fetch_add(1, Ordering::SeqCst);
                     }
-                    answered
                 })
             })
             .collect();
@@ -5133,13 +5136,23 @@ template="pool"
         for b in 1..=FOLDS {
             crate::seal::seal_range(dir.path(), &[fold_row(b)], b, b).unwrap();
             committed.store(b + 1, Ordering::SeqCst);
+            // Each fold waits for an answer that finished after it, so every later fold begins with
+            // the readers mid-query: on a loaded machine 120 seals can otherwise outrun them.
+            let seen = answered.load(Ordering::SeqCst);
+            let waiting = Instant::now();
+            while answered.load(Ordering::SeqCst) == seen {
+                assert!(
+                    waiting.elapsed() < Duration::from_secs(60)
+                        && !readers.iter().all(|r| r.is_finished()),
+                    "no reader answered during fold {b}"
+                );
+                std::thread::yield_now();
+            }
         }
         done.store(true, Ordering::SeqCst);
-        let answered: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
-        assert!(
-            answered > FOLDS,
-            "the readers must have raced the folds, not trailed them"
-        );
+        for reader in readers {
+            reader.join().unwrap();
+        }
 
         let manifest = crate::seal::load_manifest(dir.path()).unwrap();
         let named: std::collections::BTreeSet<String> = manifest
