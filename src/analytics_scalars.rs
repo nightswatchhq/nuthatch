@@ -265,6 +265,26 @@ mod tests {
         assert_eq!(values, vec![0, 16_083_151]);
     }
 
+    #[cfg(feature = "shadow-burrmill")]
+    #[test]
+    fn a_case_guard_does_not_decode_an_empty_predeployment_word_on_burrmill() {
+        let mut engine = burrmill::Engine::open_empty().unwrap();
+        register_burrmill(&mut engine);
+        let word = format!("0x{:064x}", 16_083_151);
+        let sql = format!(
+            "SELECT DISTINCT CASE WHEN reverted OR result = '0x' THEN 0 \
+             ELSE CAST(nuthatch_uint256(result) AS INTEGER) END AS value \
+             FROM (VALUES ('0x', false), ('{word}', false)) t(result, reverted) ORDER BY value"
+        );
+        let batches = engine.sql(&sql).unwrap();
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| burrmill::df::encode::rows(b).unwrap())
+            .map(|r| r["value"].as_i64().unwrap())
+            .collect();
+        assert_eq!(values, vec![0, 16_083_151]);
+    }
+
     #[test]
     fn sql_scalars_preserve_full_width_and_nulls_and_refuse_bad_inputs() {
         let conn = Connection::open_in_memory().unwrap();

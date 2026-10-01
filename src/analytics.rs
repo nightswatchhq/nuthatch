@@ -6827,6 +6827,10 @@ template="pool"
     /// this sprint is about, in my own new fixture.
     #[test]
     fn collect_separates_a_bind_failure_from_a_read_failure() {
+        crate::engine::each_engine(collect_separates_a_bind_failure_from_a_read_failure_on);
+    }
+
+    fn collect_separates_a_bind_failure_from_a_read_failure_on(conn: &dyn crate::engine::Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("schema.json"),
@@ -6847,10 +6851,9 @@ template="pool"
         let path = crate::seal::segment_path(dir.path(), &seg.file, &seg.hash);
         corrupt_pages_leaving_the_footer_intact(&path);
 
-        let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &empty,
             u64::MAX,

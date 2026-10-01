@@ -55,18 +55,8 @@ pub(crate) struct BurrmillSession {
 
 impl BurrmillSession {
     fn new() -> Result<Self> {
-        let cfg = crate::analytics_budget::from_env();
         let spill = crate::engine_duck::new_spill_dir()?;
-        let cap = cfg
-            .max_temp_size
-            .as_deref()
-            .and_then(crate::analytics_budget::parse_memory_mb)
-            .map_or(100 << 30, |mb| mb << 20);
-        let budget = burrmill::Budget {
-            memory_bytes: (cfg.memory_limit_mb as usize) << 20,
-            threads: cfg.threads.max(1) as usize,
-            spill: Some((spill.0.clone(), cap)),
-        };
+        let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
         #[allow(unused_mut)]
         let mut engine = burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?;
         #[cfg(feature = "graph")]
@@ -84,6 +74,20 @@ impl BurrmillSession {
     }
 }
 
+/// The walls `analytics_budget` sets for DuckDB, as Burrmill's budget.
+fn budget(cfg: &crate::analytics_budget::AnalyticsConfig, spill: &Path) -> burrmill::Budget {
+    let cap = cfg
+        .max_temp_size
+        .as_deref()
+        .and_then(crate::analytics_budget::parse_memory_mb)
+        .map_or(100 << 30, |mb| mb << 20);
+    burrmill::Budget {
+        memory_bytes: (cfg.memory_limit_mb as usize) << 20,
+        threads: cfg.threads.max(1) as usize,
+        spill: Some((spill.to_path_buf(), cap)),
+    }
+}
+
 fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
     anyhow!("{e}")
 }
@@ -92,7 +96,7 @@ fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
 fn died(e: burrmill::BurrmillError) -> Died {
     use burrmill::BurrmillError::*;
     match e {
-        NotAllowed(_) | Parse(_) | NoSegments(_) => Died::Binding(engine_err(e)),
+        NotAllowed(_) | Parse(_) | Plan(_) | NoSegments(_) => Died::Binding(engine_err(e)),
         _ => Died::Executing(engine_err(e)),
     }
 }
@@ -435,6 +439,20 @@ impl Session for BurrmillSession {
 
 #[cfg(test)]
 mod tests {
+    /// `unconfigured_duckdb_still_opens_at_todays_walls`, for Burrmill: the same memory, threads and
+    /// private spill directory, unless the operator says otherwise.
+    #[test]
+    fn unconfigured_burrmill_opens_at_todays_walls() {
+        let cfg = crate::analytics_budget::from_env();
+        assert_eq!((cfg.memory_limit_mb, cfg.threads), (512, 2));
+        let spill = crate::engine_duck::new_spill_dir().unwrap();
+        let budget = super::budget(&cfg, &spill.0);
+        assert_eq!(budget.memory_bytes, 512 << 20);
+        assert_eq!(budget.threads, 2);
+        assert_eq!(budget.spill, Some((spill.0.clone(), 100 << 30)));
+        assert!(super::BurrmillSession::new().is_ok());
+    }
+
     #[test]
     fn burrmill_keys_derivations_by_its_own_parse_and_build() {
         use crate::engine::Session;
