@@ -31,16 +31,34 @@ impl Engine for BurrmillEngine {
 /// Records go to the log, and also as JSON lines to the file `NUTHATCH_SHADOW_LOG` names, when it
 /// names one; so do the running counts of every statement shadowed.
 pub fn enable_shadow() -> Result<()> {
-    use crate::engine_shadow::{both_sinks, file_sink, log_sink};
+    install_pair(false)
+}
+
+/// The same pair the other way round: Burrmill is served and DuckDB checks behind it.
+pub fn enable_checked() -> Result<()> {
+    install_pair(true)
+}
+
+fn install_pair(burrmill_serves: bool) -> Result<()> {
+    use crate::engine_shadow::{both_sinks, file_sink, log_sink, ShadowEngine};
     let sink = match std::env::var_os("NUTHATCH_SHADOW_LOG") {
         Some(path) => both_sinks(log_sink(), file_sink(Path::new(&path))?),
         None => log_sink(),
     };
-    let engine = crate::engine_shadow::ShadowEngine::new(
-        Box::new(crate::engine_duck::DuckEngine),
-        Box::new(BurrmillEngine),
-        sink,
-    );
+    let engine = if burrmill_serves {
+        ShadowEngine::new(
+            Box::new(BurrmillEngine),
+            Box::new(crate::engine_duck::DuckEngine),
+            sink,
+        )
+        .reversed()
+    } else {
+        ShadowEngine::new(
+            Box::new(crate::engine_duck::DuckEngine),
+            Box::new(BurrmillEngine),
+            sink,
+        )
+    };
     crate::engine_shadow::install(match std::env::var_os("NUTHATCH_SHADOW_LOG") {
         Some(path) => engine.with_tally_in(Path::new(&path))?,
         None => engine,
@@ -748,11 +766,26 @@ type Swap @entity { id: ID! pool: Pool! }
             ),
             None => recording,
         };
-        crate::engine_shadow::install(ShadowEngine::new(
-            Box::new(crate::engine_duck::DuckEngine),
-            Box::new(BurrmillEngine),
-            sink,
-        ))
+        // `NUTHATCH_ENGINE=checked` replays with Burrmill served, as that switch runs a nest.
+        let checked = std::env::var(crate::analytics::ENV_ENGINE).as_deref() == Ok("checked");
+        let pair = if checked {
+            ShadowEngine::new(
+                Box::new(BurrmillEngine),
+                Box::new(crate::engine_duck::DuckEngine),
+                sink,
+            )
+            .reversed()
+        } else {
+            ShadowEngine::new(
+                Box::new(crate::engine_duck::DuckEngine),
+                Box::new(BurrmillEngine),
+                sink,
+            )
+        };
+        crate::engine_shadow::install(match std::env::var_os("NUTHATCH_SHADOW_LOG") {
+            Some(path) => pair.with_tally_in(Path::new(&path)).unwrap(),
+            None => pair,
+        })
         .unwrap();
         let mut views: Vec<String> = crate::analytics::nest_view_files(dir)
             .iter()
