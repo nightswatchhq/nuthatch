@@ -20,8 +20,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The engine every query runs on: the one [`install_engine`] chose, else DuckDB.
+/// The engine every query runs on: the one [`install_engine`] chose, else Burrmill where the build
+/// carries it.
 pub(crate) fn engine() -> &'static dyn Engine {
+    #[cfg(feature = "shadow-burrmill")]
+    static ENGINE: crate::engine_burrmill::BurrmillEngine = crate::engine_burrmill::BurrmillEngine;
+    #[cfg(not(feature = "shadow-burrmill"))]
     static ENGINE: crate::engine_duck::DuckEngine = crate::engine_duck::DuckEngine;
     #[cfg(all(test, feature = "shadow-burrmill"))]
     if let Some(e) = TEST_ENGINE.with(std::cell::Cell::get) {
@@ -44,12 +48,16 @@ pub(crate) fn resident_engines() -> (u64, u64) {
     // A pair counts as a pair even if a primary were set beside it: over, never under.
     if crate::engine_shadow::installed().is_some() {
         (1, 1)
-    } else if PRIMARY.get().is_some() {
-        (0, 1)
-    } else {
+    } else if DUCKDB_SERVES.load(std::sync::atomic::Ordering::Relaxed)
+        || !cfg!(feature = "shadow-burrmill")
+    {
         (1, 0)
+    } else {
+        (0, 1)
     }
 }
+
+static DUCKDB_SERVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The operator's switch between engines, read from this variable at startup.
 pub const ENV_ENGINE: &str = "NUTHATCH_ENGINE";
@@ -72,7 +80,7 @@ pub fn choose_engine(value: Option<&str>) -> Result<EngineChoice> {
 
 fn choose(value: Option<&str>, built_with_burrmill: bool) -> Result<EngineChoice> {
     let choice = match value.map(str::trim) {
-        None | Some("") if built_with_burrmill => return Ok(EngineChoice::Shadow),
+        None | Some("") if built_with_burrmill => return Ok(EngineChoice::Burrmill),
         None | Some("") => return Ok(EngineChoice::DuckDb),
         Some("duckdb") => EngineChoice::DuckDb,
         Some("burrmill") => EngineChoice::Burrmill,
@@ -91,7 +99,13 @@ fn choose(value: Option<&str>, built_with_burrmill: bool) -> Result<EngineChoice
 /// Install `choice` for the process. Once, before the first query.
 pub fn install_engine(choice: EngineChoice) -> Result<()> {
     match choice {
-        EngineChoice::DuckDb => Ok(()),
+        EngineChoice::DuckDb => {
+            static DUCKDB: crate::engine_duck::DuckEngine = crate::engine_duck::DuckEngine;
+            DUCKDB_SERVES.store(true, std::sync::atomic::Ordering::Relaxed);
+            PRIMARY
+                .set(&DUCKDB)
+                .map_err(|_| anyhow::anyhow!("an engine is already installed"))
+        }
         #[cfg(feature = "shadow-burrmill")]
         EngineChoice::Shadow => crate::engine_burrmill::enable_shadow(),
         #[cfg(feature = "shadow-burrmill")]
@@ -4579,8 +4593,8 @@ template="pool"
     #[test]
     fn the_engine_switch_reads_as_written() {
         use EngineChoice::*;
-        assert_eq!(choose(None, true).unwrap(), Shadow);
-        assert_eq!(choose(Some(""), true).unwrap(), Shadow);
+        assert_eq!(choose(None, true).unwrap(), Burrmill);
+        assert_eq!(choose(Some(""), true).unwrap(), Burrmill);
         assert_eq!(choose(None, false).unwrap(), DuckDb);
         assert_eq!(choose(Some("burrmill"), true).unwrap(), Burrmill);
         assert_eq!(choose(Some(" duckdb "), true).unwrap(), DuckDb);
@@ -7486,7 +7500,7 @@ template="pool"
     /// room regardless of load.
     #[test]
     fn a_query_spilling_past_its_cap_is_stopped_by_the_guard() {
-        // DuckDB reports this cap and spills past it anyway: 1.3 GB in ten seconds on this query.
+        // A sort of 600 million rows, far past the memory limit, so it spills at once.
         let dir = tempfile::tempdir().unwrap();
         let guard = QueryGuard {
             timeout: Duration::from_secs(60),
@@ -7500,7 +7514,8 @@ template="pool"
             std::env::set_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE, "64MB");
             let r = query_hot_cold(
                 dir.path(),
-                "SELECT sum(i * j) FROM range(1000000000) a(i), range(1000000000) b(j)",
+                "SELECT a.i FROM range(5000000) a(i), range(120) b(j) \
+                 ORDER BY (a.i * 2654435761) % 1000003, b.j",
                 guard,
                 &HotRows::new(),
                 0,
@@ -8726,37 +8741,21 @@ events = ["Transfer"]
 mod fold_connections {
     use super::*;
 
-    fn setting(session: &dyn Session, name: &str) -> String {
-        session
-            .one_value(&format!("SELECT current_setting('{name}')::VARCHAR"))
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string()
-    }
-
-    /// Both fold connections carry `/sql`'s budget and lockdown. A bare in-memory DuckDB takes 80%
-    /// of RAM and every core, and reads any file the process can.
+    /// Neither fold session reads a file the nest did not bind. Their memory and threads are the
+    /// budget every Burrmill session is opened with, which leaves nothing here to compare.
     #[test]
-    fn fold_connections_are_bounded_and_locked_down_like_sql() {
+    fn fold_connections_read_nothing_outside_the_nest() {
         let dir = tempfile::tempdir().unwrap();
-        let reference = engine().open(dir.path()).unwrap();
         let binder = FoldBinder::open(dir.path()).unwrap();
         let eval = FoldEvaluator::new(dir.path(), &[]).unwrap();
         for (what, session) in [("binder", &*binder.session), ("evaluator", &*eval.session)] {
-            for name in ["memory_limit", "threads", "enable_external_access"] {
-                assert_eq!(
-                    setting(session, name),
-                    setting(&*reference, name),
-                    "{what} {name}"
-                );
+            for sql in [
+                "SELECT * FROM read_text('/etc/hosts')",
+                "SELECT * FROM read_csv_auto('/etc/hosts')",
+                "SELECT * FROM '/etc/hosts'",
+            ] {
+                assert!(session.execute(sql).is_err(), "{what} ran {sql}");
             }
-            assert!(
-                session
-                    .execute("SELECT * FROM read_text('/etc/hosts')")
-                    .is_err(),
-                "{what} reads outside the nest"
-            );
         }
     }
 

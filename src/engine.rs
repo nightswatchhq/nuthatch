@@ -198,9 +198,7 @@ pub(crate) trait Session: Send {
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()>;
 
     /// Remove a maintained relation's public name, so a pooled session cannot answer from one an
-    /// earlier request defined after the entity faulted (#1598). An engine that cannot remove a
-    /// relation keeps it; Burrmill has no way to, so under the shadow its stale relation shows as a
-    /// divergence rather than passing unseen.
+    /// earlier request defined after the entity faulted (#1598).
     fn drop_relation(&self, name: &str) -> Result<()> {
         let _ = name;
         Ok(())

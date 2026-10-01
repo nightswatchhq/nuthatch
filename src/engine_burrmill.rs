@@ -73,12 +73,70 @@ pub(crate) struct BurrmillSession {
     _spill: crate::engine_duck::SpillDir,
     /// Each view's `CREATE VIEW` text as defined, for the integrity sweep's walk through views.
     views: Mutex<std::collections::BTreeMap<String, String>>,
-    /// The declared columns of each maintained relation `load_relation` staged, so one with no rows
-    /// still binds (#1598). Burrmill types columns by name, so these carry names only.
-    relations: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// The declared columns of each maintained relation `load_relation` staged, with the SQL type
+    /// its plan gives each, so one with no rows still binds and a count is a number (#1598).
+    relations: Mutex<HashMap<String, Vec<(String, &'static str)>>>,
 }
 
 impl BurrmillSession {
+    /// A maintained relation as a table of its declared types: its rows as text under a hidden
+    /// name (`register_rows` makes every column text), and a view under its own that casts each
+    /// column. A marker column keeps the one placeholder row an empty relation needs out of it.
+    fn bind_relation(&self, table: &str, declared: &[(String, &'static str)]) -> Result<bool> {
+        let staged = self
+            .hot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
+        let mut rows: Vec<Value> = staged
+            .iter()
+            .map(|row| {
+                let mut out = serde_json::Map::new();
+                for (c, _) in declared {
+                    out.insert(
+                        c.clone(),
+                        match row.get(c) {
+                            None | Some(Value::Null) => Value::Null,
+                            Some(v @ (Value::Bool(_) | Value::String(_))) => v.clone(),
+                            Some(v) => Value::String(v.to_string()),
+                        },
+                    );
+                }
+                out.insert("__present".into(), Value::Bool(true));
+                Value::Object(out)
+            })
+            .collect();
+        if rows.is_empty() {
+            let mut out: serde_json::Map<String, Value> = declared
+                .iter()
+                .map(|(c, _)| (c.clone(), Value::Null))
+                .collect();
+            out.insert("__present".into(), Value::Bool(false));
+            rows.push(Value::Object(out));
+        }
+        let raw = format!("{table}__raw");
+        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let columns: Vec<String> = declared
+            .iter()
+            .map(|(c, t)| format!("CAST({0} AS {t}) AS {0}", quote(c)))
+            .collect();
+        let mut engine = self.engine();
+        engine.register_rows(&raw, &rows).map_err(engine_err)?;
+        engine
+            .register_view(
+                table,
+                &format!(
+                    "SELECT {} FROM {} WHERE \"__present\" = 'true'",
+                    columns.join(", "),
+                    quote(&raw)
+                ),
+            )
+            .map_err(engine_err)?;
+        Ok(true)
+    }
+
     fn new() -> Result<Self> {
         let spill = crate::engine_duck::new_spill_dir()?;
         let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
@@ -121,6 +179,18 @@ fn died(e: burrmill::BurrmillError) -> Died {
     use burrmill::BurrmillError::*;
     match e {
         NotAllowed(_) | Parse(_) | Plan(_) | NoSegments(_) => Died::Binding(engine_err(e)),
+        // DataFusion's disk manager stops the statement itself, well inside the watchdog's poll,
+        // and names a setting of its own. `/sql` answers this as it does the watchdog's stop.
+        Substrate(m) if m.contains("disk space during the spilling process has exceeded") => {
+            Died::Executing(
+                crate::analytics::QuerySpillExceeded {
+                    cap_bytes: crate::analytics_budget::spill_cap_bytes(
+                        &crate::analytics_budget::from_env(),
+                    ),
+                }
+                .into(),
+            )
+        }
         _ => Died::Executing(engine_err(e)),
     }
 }
@@ -258,6 +328,12 @@ impl Session for BurrmillSession {
             Err(_) if over => true,
             Err(e) => return Err(died(e)),
         };
+        // An answer with no rows has no batch to read the names from; the plan has them (#1609).
+        if columns.is_empty() {
+            if let Ok(described) = engine.describe(sql) {
+                columns = described.into_iter().map(|(name, _)| name).collect();
+            }
+        }
         Ok(Collected {
             rows: out,
             columns,
@@ -390,20 +466,50 @@ impl Session for BurrmillSession {
         Ok(())
     }
 
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        self.hot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name);
+        self.relations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name);
+        let mut engine = self.engine();
+        engine.drop_relation(name);
+        engine.drop_relation(&format!("{name}__raw"));
+        Ok(())
+    }
+
     fn load_relation(
         &self,
         table: &str,
         cols: &[(String, &'static str)],
         rows: &[&Value],
     ) -> Result<()> {
-        let declared = cols
-            .iter()
-            .map(|(c, _)| (c.clone(), "string".into()))
-            .collect();
+        // Every row is checked before anything is staged, as DuckDB's appender refuses one: a row
+        // that is not what its plan declares leaves no relation, not a wrong one.
+        for row in rows {
+            for (c, t) in cols {
+                match (*t, row.get(c)) {
+                    (_, None | Some(Value::Null)) => {}
+                    ("HUGEINT", Some(v)) => {
+                        let text = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+                        text.parse::<i128>().map_err(|_| {
+                            anyhow!("{c} = {text} is not the integer its plan declares")
+                        })?;
+                    }
+                    ("BOOLEAN", Some(v)) if !v.is_boolean() => {
+                        return Err(anyhow!("{c} = {v} is not the boolean its plan declares"));
+                    }
+                    _ => {}
+                }
+            }
+        }
         self.relations
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(table.to_string(), declared);
+            .insert(table.to_string(), cols.to_vec());
         self.load_hot(table, rows)
     }
 
@@ -415,19 +521,19 @@ impl Session for BurrmillSession {
         hot: bool,
         window: FactWindow,
     ) -> Result<bool> {
-        let staged;
-        let cols = if cols.is_empty() && hot {
-            staged = self
-                .relations
+        let declared = if cols.is_empty() && hot && sealed.is_empty() {
+            self.relations
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .get(table)
                 .cloned()
-                .unwrap_or_default();
-            staged.as_slice()
+                .unwrap_or_default()
         } else {
-            cols
+            Vec::new()
         };
+        if !declared.is_empty() {
+            return self.bind_relation(table, &declared);
+        }
         let hot_rows: Vec<Value> = if hot {
             self.hot
                 .lock()
