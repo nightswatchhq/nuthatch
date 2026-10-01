@@ -565,12 +565,16 @@ The guide covers the questions people actually hit:
 
 A major version is a promise about **stability**, not a claim of completeness.
 
-- **Semantic versioning.** Within a major version we do not rename or remove a CLI flag, an HTTP route, a config
-  key, or a generated column without a major bump. The one thing that has never needed a promise is
-  on-disk state: a newer binary has always read an older release's hot store and sealed segments as
-  they are, and that stays true.
-- **Upgrades are a binary swap.** No data migration, no re-backfill, no conversion step. Proven on a
-  production box across 0.3.0 → 0.6.0 → 0.7.2, and in CI on every release since.
+- **4.x is the stable line.** Within 4.x, `nuthatch.toml`, `mounts.toml` and `entities.toml` keep
+  working; a data directory upgrades drop-in, with no re-index; and the HTTP, SQL and MCP surfaces do
+  not break. Upgrade only: a downgrade is not promised. Off-by-default cargo features are
+  experimental and not covered. The full terms are the
+  [stability contract](docs/operators.md#stability-contract).
+- **Monthly minors, immediate fixes.** A released 4.x only gets patch releases. Features wait for the
+  next monthly minor (4.1, 4.2, ...); correctness and security fixes ship at once as patches.
+- **Upgrades are a binary swap.** No data migration, no conversion step. Proven on a production box
+  across 0.3.0 → 0.6.0 → 0.7.2 and at each major since, and in CI: every build opens a frozen
+  v3.13.2 data directory and reads it back exactly (`tests/upgrade_golden.rs`).
 - **MSRV 1.95**, measured rather than asserted - it is what CI, `rust-toolchain.toml` and the release
   build all use. (Before 1.0 this file claimed 1.85, which `cargo +1.85.0 check` refutes in one
   command. A version nobody tests is not a promise.)
