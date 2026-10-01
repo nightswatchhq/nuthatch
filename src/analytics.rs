@@ -2244,18 +2244,19 @@ fn cold_exposure_sql(table: &str, from_col: &str, to_col: &str, value_col: &str)
            SELECT lower(t.\"{to_col}\") AS addr, l.label, 'in', \
                   {d} AS d \
            FROM \"{table}\" t JOIN labels l ON lower(t.\"{from_col}\") = l.address\
-         ) GROUP BY addr, label, dir"
+         ) WHERE d IS NOT NULL GROUP BY addr, label, dir"
     )
 }
 
 fn cold_velocity_sql(table: &str, from_col: &str, value_col: &str, window: u64) -> String {
     let w = window.max(1);
-    // window_start = (block // W) * W; sum outbound volume + count per (sender, window).
+    // window_start = (block // W) * W; sum outbound volume + count per (sender, window). A value
+    // past 38 digits leaves the count too, as the hot replay never feeds that transfer at all.
     let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
     format!(
         "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
                 SUM({d})::VARCHAR AS vol, COUNT(*) AS cnt \
-         FROM \"{table}\" GROUP BY addr, ws"
+         FROM \"{table}\" WHERE {d} IS NOT NULL GROUP BY addr, ws"
     )
 }
 
@@ -6533,6 +6534,44 @@ template="pool"
         assert!(
             !got.iter().any(|(a, _)| a == "0xwhale"),
             "the sender of a dropped transfer must not be debited: {got:?}"
+        );
+
+        // Exposure and velocity count transfers as well as summing them, and the hot replay counts
+        // a dropped transfer nowhere. Labels take real addresses, so these are their own nests.
+        const MIXER: &str = "0x1111111111111111111111111111111111111111";
+        const SENDER: &str = "0x00000000000000000000000000000000000000aa";
+        let labeled = |rows: &[String]| {
+            let dir = tempfile::tempdir().unwrap();
+            let labels = dir.path().join("l.csv");
+            std::fs::write(&labels, format!("{MIXER},mixer\n")).unwrap();
+            crate::labels::import(dir.path(), &labels).unwrap();
+            crate::seal::seal_range(dir.path(), rows, 1, 6).unwrap();
+            dir
+        };
+        let mixed = labeled(&[
+            row(SENDER, MIXER, "100", 1, 0),
+            row(SENDER, MIXER, TOO_BIG, 2, 0),
+        ]);
+        let reference = labeled(&[row(SENDER, MIXER, "100", 1, 0)]);
+        let sorted = |mut v: Vec<(String, i128, i128)>| {
+            v.sort();
+            v
+        };
+        let exposure = |dir: &std::path::Path| {
+            sorted(cold_exposure(dir, "t__transfer", "from", "to", "value", 6).unwrap())
+        };
+        let velocity = |dir: &std::path::Path| {
+            sorted(cold_velocity(dir, "t__transfer", "from", "value", 10, 6).unwrap())
+        };
+        assert_eq!(exposure(mixed.path()), exposure(reference.path()));
+        assert_eq!(
+            exposure(mixed.path()),
+            [(format!("{SENDER}\u{1f}mixer\u{1f}out"), 100, 1)]
+        );
+        assert_eq!(velocity(mixed.path()), velocity(reference.path()));
+        assert_eq!(
+            velocity(mixed.path()),
+            [(format!("{SENDER}\u{1f}0"), 100, 1)]
         );
     }
 
