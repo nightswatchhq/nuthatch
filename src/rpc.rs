@@ -189,6 +189,9 @@ pub(crate) enum FailureClass {
     RateLimited { retry_after: Option<Duration> },
     /// The request is fine, this endpoint is having a moment. Fail over, retry at the same width.
     Transient,
+    /// This endpoint keeps no blocks this old (#1607). Not about width, so never narrowed, and not
+    /// about its health at the tip, which it may serve perfectly well.
+    HistoryUnavailable,
     /// This endpoint will not serve us until something changes outside the process. Long cooldown,
     /// and say so loudly.
     Terminal,
@@ -239,6 +242,49 @@ fn escalate_pool_wide_rate_limit(
         });
     }
     err
+}
+
+/// One call's failures across the pool, with refusals for want of history kept apart (#1607).
+///
+/// Such a refusal says nothing about the request or our pacing, so it must not stand in for another
+/// endpoint's answer: as the last error it hid a throttle and a cap, and the window never moved. It
+/// is named, with the remedy, and is the verdict only when every endpoint gave it.
+#[derive(Default)]
+struct PoolFailures {
+    other: Option<anyhow::Error>,
+    pruned: Vec<String>,
+    last_pruned: Option<anyhow::Error>,
+}
+
+impl PoolFailures {
+    fn push(&mut self, url: &str, e: anyhow::Error) {
+        if matches!(class_of(&e), Some(FailureClass::HistoryUnavailable)) {
+            self.pruned.push(redact_url(url));
+            self.last_pruned = Some(e);
+        } else {
+            self.other = Some(e);
+        }
+    }
+
+    fn verdict(self, attempts: usize, rate_limited: usize) -> anyhow::Error {
+        let remedy = "supply an archive-capable RPC with `--rpc` or `rpc_urls`";
+        let pruned = self.pruned.join(", ");
+        match (self.other, self.last_pruned) {
+            (None, Some(e)) => anyhow::Error::new(ClassifiedError {
+                class: FailureClass::HistoryUnavailable,
+                detail: format!(
+                    "no configured RPC endpoint keeps blocks this old ({pruned}); {remedy}. \
+                     Last answer: {e:#}"
+                ),
+            }),
+            (None, None) => anyhow!("all RPC endpoints failed"),
+            (Some(e), None) => escalate_pool_wide_rate_limit(e, attempts, rate_limited),
+            (Some(e), Some(_)) => e.context(format!(
+                "{pruned} keeps no blocks this old, so the rest of the pool must serve them; if \
+                 this persists, {remedy}"
+            )),
+        }
+    }
 }
 
 /// Did this failure's "narrowable" verdict come only from a **pool-wide 429**?
@@ -336,7 +382,9 @@ fn batch_is_narrowable(err: &anyhow::Error) -> bool {
         // Auth and rate limits are positive findings about something other than size: splitting an
         // unauthorised request into two unauthorised requests helps nobody, and splitting under a rate
         // limit doubles the request count in exactly the wrong direction.
-        Some(FailureClass::Terminal) | Some(FailureClass::RateLimited { .. }) => false,
+        Some(FailureClass::Terminal)
+        | Some(FailureClass::RateLimited { .. })
+        | Some(FailureClass::HistoryUnavailable) => false,
         _ => true,
     }
 }
@@ -353,6 +401,7 @@ fn class_label(class: Option<&FailureClass>) -> &'static str {
         Some(FailureClass::RateLimited { .. }) => "RateLimited",
         Some(FailureClass::Transient) => "Transient",
         Some(FailureClass::Terminal) => "Terminal",
+        Some(FailureClass::HistoryUnavailable) => "HistoryUnavailable",
         None => "unclassified",
     }
 }
@@ -517,6 +566,11 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         return FailureClass::RateLimited {
             retry_after: retry_hint_of(err),
         };
+    }
+    // eth.drpc.org, 2026-10-01 (#1607): HTTP 400, code 27, for every block below its pruning horizon.
+    const HISTORY: &[&str] = &["first available state"];
+    if HISTORY.iter().any(|p| msg.contains(p)) {
+        return FailureClass::HistoryUnavailable;
     }
     if NARROWABLE.iter().any(|p| msg.contains(p)) {
         return FailureClass::Narrowable {
@@ -865,7 +919,7 @@ impl RpcClient {
         params: Value,
         need: Option<u64>,
     ) -> Result<(Value, usize)> {
-        let mut last_err = anyhow!("all RPC endpoints failed");
+        let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
         for j in self.endpoint_order_holding(need) {
@@ -897,21 +951,17 @@ impl RpcClient {
                         rate_limited += 1;
                     }
                     self.record_failure(j, method, &e);
-                    last_err = e;
+                    failures.push(url, e);
                 }
             }
         }
-        Err(escalate_pool_wide_rate_limit(
-            last_err,
-            attempts,
-            rate_limited,
-        ))
+        Err(failures.verdict(attempts, rate_limited))
     }
 
     /// POST a raw JSON-RPC body (single object or a batch array) with the same health-ordered failover
     /// as `call`, returning the parsed response. Used for batch requests `call` can't express.
     async fn post_with_failover(&self, body: &Value) -> Result<Value> {
-        let mut last_err = anyhow!("all RPC endpoints failed");
+        let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
         for j in self.endpoint_order() {
@@ -961,15 +1011,11 @@ impl RpcClient {
                         rate_limited += 1;
                     }
                     self.record_failure(j, "batch", &e);
-                    last_err = e;
+                    failures.push(url, e);
                 }
             }
         }
-        Err(escalate_pool_wide_rate_limit(
-            last_err,
-            attempts,
-            rate_limited,
-        ))
+        Err(failures.verdict(attempts, rate_limited))
     }
 
     /// POST `body` and parse the response, attaching a [`FailureClass`] to any failure (RFC-0028 §3).
@@ -3949,6 +3995,140 @@ mod rfc0036_tests {
             !batch_is_narrowable(&err),
             "splitting under a rate limit doubles the request count in the wrong direction"
         );
+    }
+
+    /// eth.drpc.org's answer to any getLogs below its pruning horizon, measured 2026-10-01 (#1607).
+    const DRPC_PRUNED: &str = r#"{"id":1,"jsonrpc":"2.0","error":{"message":"Unknown state. First available state is 1","code":27}}"#;
+    /// eth-pokt.nodies.app's throttle as #761 recorded it; #1607's log elides the message's tail.
+    const NODIES_THROTTLED: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Rate limit exceeded on Nodies public endpoints. For higher limits, create a free account"}}"#;
+    /// eth-pokt.nodies.app's answer to an 80-block getLogs, measured 2026-10-01.
+    const NODIES_CAPPED: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Block range too large: maximum allowed is 50 blocks on your current plan. Upgrade your subscription at https://nodies.app/pricing for larger ranges."}}"#;
+
+    /// An endpoint answering every request with `status` and `body`, counting the requests.
+    async fn answering(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<AtomicU64>,
+    ) {
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicU64::new(0));
+        let app = Router::new()
+            .route(
+                "/",
+                post(move |State(hits): State<Arc<AtomicU64>>| async move {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }),
+            )
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle, hits)
+    }
+
+    /// #1607: the README demo's pool, one endpoint pruned and the other throttled. Every attempt
+    /// reached both, yet the error carried only whichever was tried last, so the log repeated a 429
+    /// and nothing said the other endpoint could never serve the range. The throttle must stay the
+    /// verdict, so the caller still retries it, and the pruned endpoint and the remedy must be named.
+    #[tokio::test]
+    async fn a_pruned_endpoint_beside_a_throttled_one_is_named_with_the_remedy() {
+        let (pruned, hp, pruned_hits) = answering(400, DRPC_PRUNED).await;
+        let (throttled, ht, throttled_hits) = answering(429, NODIES_THROTTLED).await;
+        for urls in [
+            vec![pruned.clone(), throttled.clone()],
+            vec![throttled.clone(), pruned.clone()],
+        ] {
+            let c = RpcClient::new(urls).unwrap();
+            for _ in 0..3 {
+                let err = c
+                    .get_logs(&["0xa0b8".into()], &[], 6_082_525, 6_082_604)
+                    .await
+                    .unwrap_err();
+                let text = format!("{err:#}");
+                assert!(
+                    matches!(class_of(&err), Some(FailureClass::RateLimited { .. })),
+                    "the throttle is the only thing waiting can fix: {text}"
+                );
+                assert!(
+                    text.contains(&redact_url(&pruned)),
+                    "the pruned endpoint is not named: {text}"
+                );
+                assert!(
+                    text.contains("--rpc") && text.contains("rpc_urls"),
+                    "the remedy is not named: {text}"
+                );
+            }
+        }
+        assert!(pruned_hits.load(Ordering::Relaxed) >= 6);
+        assert!(throttled_hits.load(Ordering::Relaxed) >= 6);
+        hp.abort();
+        ht.abort();
+    }
+
+    /// The same masking with today's Nodies answer: its cap is the one narrowing can satisfy, and
+    /// when the pruned endpoint was tried last its 400 replaced the cap, so the window never shrank.
+    #[tokio::test]
+    async fn a_pruned_endpoint_does_not_hide_another_endpoints_cap() {
+        let (pruned, hp, _) = answering(400, DRPC_PRUNED).await;
+        let (capped, hc, _) = answering(200, NODIES_CAPPED).await;
+        for urls in [
+            vec![pruned.clone(), capped.clone()],
+            vec![capped.clone(), pruned.clone()],
+        ] {
+            let c = RpcClient::new(urls).unwrap();
+            for _ in 0..3 {
+                let err = c
+                    .get_logs(&["0xa0b8".into()], &[], 6_082_525, 6_082_604)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    crate::chunker::is_result_too_large(&err),
+                    "the cap was lost: {err:#}"
+                );
+            }
+        }
+        hp.abort();
+        hc.abort();
+    }
+
+    /// When every endpoint is pruned no retry can help, so the verdict says so, names them all, and
+    /// is never mistaken for a cap.
+    #[tokio::test]
+    async fn a_pool_of_pruned_endpoints_has_no_history_to_offer() {
+        let (a, ha, _) = answering(400, DRPC_PRUNED).await;
+        let (b, hb, _) = answering(200, DRPC_PRUNED).await;
+        let c = RpcClient::new(vec![a.clone(), b.clone()]).unwrap();
+        let err = c
+            .get_logs(&["0xa0b8".into()], &[], 6_082_525, 6_082_604)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert_eq!(
+            class_of(&err),
+            Some(FailureClass::HistoryUnavailable),
+            "{text}"
+        );
+        assert!(!crate::chunker::is_result_too_large(&err), "{text}");
+        for url in [&a, &b] {
+            assert!(text.contains(&redact_url(url)), "{text}");
+        }
+        assert!(
+            text.contains("--rpc") && text.contains("Unknown state"),
+            "{text}"
+        );
+        ha.abort();
+        hb.abort();
     }
 
     /// A genuine size refusal must still narrow - the fix above must not swallow the case the
