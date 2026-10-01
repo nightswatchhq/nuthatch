@@ -107,7 +107,7 @@ num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
 # The second engine of shadow mode (RFC-0044 Amendment 2, phase 2b). Optional and off by default:
 # a release build does not carry it. Its arrow is not ours, so no batch crosses; rows cross as JSON.
-burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "06bad8b4d6443c68d59f42d3917eb3a66b9f772b", default-features = false, features = ["datafusion"], optional = true }
+burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "20863783b6f31a7fcfd219e311820c7c7ef95ed6", default-features = false, features = ["datafusion"], optional = true }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
 # satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via
