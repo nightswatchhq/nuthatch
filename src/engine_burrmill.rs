@@ -29,18 +29,22 @@ impl Engine for BurrmillEngine {
 
 /// Put Burrmill beside DuckDB on every nest this process serves. Once per process.
 /// Records go to the log, and also as JSON lines to the file `NUTHATCH_SHADOW_LOG` names, when it
-/// names one.
+/// names one; so do the running counts of every statement shadowed.
 pub fn enable_shadow() -> Result<()> {
     use crate::engine_shadow::{both_sinks, file_sink, log_sink};
     let sink = match std::env::var_os("NUTHATCH_SHADOW_LOG") {
         Some(path) => both_sinks(log_sink(), file_sink(Path::new(&path))?),
         None => log_sink(),
     };
-    crate::engine_shadow::install(crate::engine_shadow::ShadowEngine::new(
+    let engine = crate::engine_shadow::ShadowEngine::new(
         Box::new(crate::engine_duck::DuckEngine),
         Box::new(BurrmillEngine),
         sink,
-    ))
+    );
+    crate::engine_shadow::install(match std::env::var_os("NUTHATCH_SHADOW_LOG") {
+        Some(path) => engine.with_tally_in(Path::new(&path))?,
+        None => engine,
+    })
 }
 
 pub(crate) struct BurrmillSession {

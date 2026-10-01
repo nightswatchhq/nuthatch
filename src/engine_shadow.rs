@@ -17,6 +17,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -129,6 +130,114 @@ pub(crate) fn both_sinks(a: Sink, b: Sink) -> Sink {
     })
 }
 
+/// What became of one shadowed statement.
+#[derive(Clone, Copy)]
+enum Outcome {
+    Agreed,
+    BothRefused,
+    /// Both truncated, so nothing was compared.
+    BothTruncated,
+    /// Recorded as a `Difference` of some kind, explained or not.
+    Differed,
+    Skipped,
+}
+
+/// Every shadowed statement counted, differing or not: a log of differences alone reads the same
+/// for a nest that agreed a thousand times and one that was never asked.
+#[derive(Default)]
+pub(crate) struct Tally {
+    agreed: AtomicU64,
+    both_refused: AtomicU64,
+    both_truncated: AtomicU64,
+    differed: AtomicU64,
+    skipped: AtomicU64,
+    file: Option<std::sync::Mutex<std::fs::File>>,
+}
+
+/// The counts since this process started, as one line of the shadow file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Counts {
+    kind: &'static str,
+    pid: u32,
+    pub(crate) statements: u64,
+    pub(crate) agreed: u64,
+    pub(crate) both_refused: u64,
+    pub(crate) both_truncated: u64,
+    pub(crate) differed: u64,
+    pub(crate) skipped: u64,
+}
+
+impl Tally {
+    /// Counts appended to `path` beside the differences, as lines whose `kind` is `Tally`.
+    fn to_file(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Self {
+            file: Some(std::sync::Mutex::new(file)),
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn counts(&self) -> Counts {
+        let [agreed, both_refused, both_truncated, differed, skipped] = [
+            &self.agreed,
+            &self.both_refused,
+            &self.both_truncated,
+            &self.differed,
+            &self.skipped,
+        ]
+        .map(|c| c.load(Relaxed));
+        Counts {
+            kind: "Tally",
+            pid: std::process::id(),
+            statements: agreed + both_refused + both_truncated + differed + skipped,
+            agreed,
+            both_refused,
+            both_truncated,
+            differed,
+            skipped,
+        }
+    }
+
+    fn note(&self, outcome: Outcome) {
+        match outcome {
+            Outcome::Agreed => &self.agreed,
+            Outcome::BothRefused => &self.both_refused,
+            Outcome::BothTruncated => &self.both_truncated,
+            Outcome::Differed => &self.differed,
+            Outcome::Skipped => &self.skipped,
+        }
+        .fetch_add(1, Relaxed);
+        let counts = self.counts();
+        // Written at 1, 2, 4, 8, … and every thousandth: the first statement shows at once, and a
+        // busy nest does not fill the file with counts.
+        if !(counts.statements.is_power_of_two() || counts.statements.is_multiple_of(1000)) {
+            return;
+        }
+        tracing::info!(
+            target: "shadow",
+            statements = counts.statements,
+            agreed = counts.agreed,
+            both_refused = counts.both_refused,
+            both_truncated = counts.both_truncated,
+            differed = counts.differed,
+            skipped = counts.skipped,
+            "shadow tally"
+        );
+        let Some(file) = &self.file else { return };
+        use std::io::Write;
+        let Ok(line) = serde_json::to_string(&counts) else {
+            return;
+        };
+        let mut f = file.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = writeln!(f, "{line}") {
+            tracing::warn!(target: "shadow", "tally not written: {e}");
+        }
+    }
+}
+
 fn rss_mb() -> u64 {
     crate::metrics::rss_bytes() / (1024 * 1024)
 }
@@ -143,6 +252,7 @@ pub(crate) struct ShadowEngine {
     primary: Box<dyn Engine>,
     secondary: Box<dyn Engine>,
     sink: Sink,
+    tally: Arc<Tally>,
     /// How much of a guard's budget the primary may use before the shadow is skipped.
     budget_share: f64,
 }
@@ -153,8 +263,20 @@ impl ShadowEngine {
             primary,
             secondary,
             sink,
+            tally: Arc::default(),
             budget_share: 0.5,
         }
+    }
+
+    /// Also append the running counts to `path`, the file the differences go to.
+    pub(crate) fn with_tally_in(mut self, path: &Path) -> Result<Self> {
+        self.tally = Arc::new(Tally::to_file(path)?);
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> Counts {
+        self.tally.counts()
     }
 }
 
@@ -181,6 +303,7 @@ impl Engine for ShadowEngine {
             primary,
             secondary,
             sink: self.sink.clone(),
+            tally: self.tally.clone(),
             budget_share: self.budget_share,
             deadline: std::sync::Mutex::new(None),
         }))
@@ -210,6 +333,7 @@ pub(crate) struct ShadowSession {
     /// `None` once the secondary could not be opened; the primary then runs alone, and said so.
     secondary: Option<Box<dyn Session>>,
     sink: Sink,
+    tally: Arc<Tally>,
     budget_share: f64,
     /// The guard's deadline for the statement in flight, when the caller told us one.
     deadline: std::sync::Mutex<Option<Instant>>,
@@ -255,6 +379,10 @@ fn outcome(r: &Result<Collected, Died>) -> String {
         Err(Died::Binding(e)) => format!("refused binding: {e:#}"),
         Err(Died::Executing(e)) => format!("refused executing: {e:#}"),
     }
+}
+
+fn truncated_answer(r: &Result<Collected, Died>) -> bool {
+    r.as_ref().is_ok_and(|c| c.truncated)
 }
 
 /// A `LIMIT` with no `ORDER BY` anywhere: the rows kept are whichever the engine met first. A
@@ -352,6 +480,7 @@ impl Session for ShadowSession {
                     primary_rss_mb,
                     secondary_rss_mb: 0,
                 });
+                self.tally.note(Outcome::Skipped);
                 return primary;
             }
         }
@@ -378,6 +507,12 @@ impl Session for ShadowSession {
             (Err(_), Ok(_)) => Some((Kind::Looser, String::new())),
             (Err(_), Err(_)) => None,
         };
+        self.tally.note(match (&kind, &primary, &shadow) {
+            (Some(_), ..) => Outcome::Differed,
+            (None, Ok(_), Ok(_)) if truncated_answer(&primary) => Outcome::BothTruncated,
+            (None, Err(_), _) => Outcome::BothRefused,
+            (None, ..) => Outcome::Agreed,
+        });
         if let Some((kind, why)) = kind {
             let secondary_text = outcome(&shadow);
             (self.sink)(&Difference {
@@ -763,6 +898,44 @@ mod tests {
         );
     }
 
+    /// An empty log must be told apart from a nest nobody queried: every statement is counted, and
+    /// the counts reach the file the differences go to.
+    #[test]
+    fn every_shadowed_statement_is_counted_whether_or_not_it_differs() {
+        let (sink, seen) = recording();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("shadow.jsonl");
+        let engine = ShadowEngine::new(Box::new(DuckEngine), Box::new(DuckEngine), sink)
+            .with_tally_in(&log)
+            .unwrap();
+        let session = engine.open(dir.path()).unwrap();
+        session
+            .execute("CREATE TABLE t AS SELECT * FROM range(5) r(n)")
+            .unwrap();
+        for _ in 0..3 {
+            session.collect("SELECT n FROM t ORDER BY n", None).unwrap();
+        }
+        assert!(session.collect("SELECT nothing FROM t", None).is_err());
+        assert!(seen.lock().unwrap().is_empty());
+        let counts = engine.counts();
+        assert_eq!(
+            (counts.statements, counts.agreed, counts.both_refused),
+            (4, 3, 1)
+        );
+        let lines: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let written: Vec<u64> = lines
+            .iter()
+            .map(|l| l["statements"].as_u64().unwrap())
+            .collect();
+        assert_eq!(written, [1, 2, 4], "{lines:?}");
+        assert_eq!(lines[2]["kind"], "Tally");
+        assert_eq!(lines[2]["agreed"], 3);
+    }
+
     #[test]
     fn a_planted_difference_is_recorded_and_the_primary_is_served() {
         let (sink, seen) = recording();
@@ -784,6 +957,10 @@ mod tests {
             seen[0].secondary
         );
         assert_eq!(seen[0].sql, "SELECT n FROM t");
+        assert_eq!(
+            (engine.counts().statements, engine.counts().differed),
+            (1, 1)
+        );
     }
 
     #[test]
