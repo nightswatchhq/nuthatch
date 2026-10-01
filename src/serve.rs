@@ -109,7 +109,11 @@ pub fn sql_max_concurrency() -> usize {
     }
 }
 /// Wall-clock deadline for a single analytical query; a runaway (e.g. cartesian) is interrupted.
-const SQL_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Ten times that under test: the tests through the router are built unoptimised, where the engine
+/// plans the network nest's thirty-view queries in tens of seconds and not the release build's one.
+/// They test answers, not latency, as `tests/network_contract.rs` says of its own allowance.
+const SQL_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 300 } else { 30 });
 /// How long a request waits for an analytical permit before it is told the node is busy (#1319).
 ///
 /// The permit count still caps what *runs*; this only caps how long a caller waits to be told no.
@@ -8085,7 +8089,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("graph/history.toml"),
-            "version = 1\nfirst_block = 42440000\nmax_head_age_seconds = 60\n",
+            "version = 1\nfirst_block = 42440000\nmax_head_age_seconds = 600\n",
         )
         .unwrap();
         for entry in std::fs::read_dir(source.join("views")).unwrap() {
@@ -8228,7 +8232,8 @@ mod tests {
             }
             let document = std::fs::read_to_string(&path).unwrap();
             // This corpus checks document compatibility, not elapsed freshness. Keep the synthetic
-            // head current for each request: on CI the preceding documents can take over 60 seconds.
+            // head current for each request: on CI the preceding documents can take minutes, and one
+            // alone over 60 seconds unoptimised, which is why the fixture's limit is 600.
             state
                 .store
                 .set_block_timestamp(42_460_000, crate::metrics::now_unix())
@@ -8343,7 +8348,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("graph/history.toml"),
-            "version = 1\nfirst_block = 10\nmax_head_age_seconds = 60\n",
+            "version = 1\nfirst_block = 10\nmax_head_age_seconds = 600\n",
         )
         .unwrap();
         for entry in std::fs::read_dir(source.join("views")).unwrap() {
