@@ -163,6 +163,8 @@ mod semantic_layer;
 mod tape_clean;
 #[path = "tip_gauges_are_published_per_nest.rs"]
 mod tip_gauges_are_published_per_nest;
+#[path = "upgrade_golden.rs"]
+mod upgrade_golden;
 #[path = "verification_non_claims.rs"]
 mod verification_non_claims;
 #[path = "workflow_permission_keys.rs"]

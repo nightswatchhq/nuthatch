@@ -12,7 +12,7 @@
 //! primary's result stands. The fold and describe paths (`for_each_row`, `one_value`,
 //! `query_arrow`, `column_names`, `describe`) go to the primary alone.
 
-use crate::engine::{Died, Engine, FactWindow, Interrupt, Session};
+use crate::engine::{Collected, Died, Engine, FactWindow, Interrupt, Session};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -243,9 +243,11 @@ impl ShadowSession {
     }
 }
 
-fn outcome(r: &Result<(Vec<Value>, bool), Died>) -> String {
+fn outcome(r: &Result<Collected, Died>) -> String {
     match r {
-        Ok((rows, truncated)) => format!(
+        Ok(Collected {
+            rows, truncated, ..
+        }) => format!(
             "{} rows{}",
             rows.len(),
             if *truncated { ", truncated" } else { "" }
@@ -328,7 +330,7 @@ impl Session for ShadowSession {
         )
     }
 
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
         let started = Instant::now();
         let primary = self.primary.collect(sql, cap);
         let primary_ms = started.elapsed();
@@ -360,11 +362,11 @@ impl Session for ShadowSession {
         let kind = match (&primary, &shadow) {
             // A truncated answer is a prefix in the engine's own row order, and the two orders
             // need not agree; once both have truncated there is nothing sound left to compare.
-            (Ok((_, true)), Ok((_, true))) => None,
-            (Ok((_, true)), Ok(_)) | (Ok(_), Ok((_, true))) => {
+            (Ok(a), Ok(b)) if a.truncated && b.truncated => None,
+            (Ok(a), Ok(b)) if a.truncated || b.truncated => {
                 Some((Kind::Rows, "truncation differs".to_string()))
             }
-            (Ok((a, _)), Ok((b, _))) => same_rows(a, b).map(|d| match d {
+            (Ok(a), Ok(b)) => same_rows(&a.rows, &b.rows).map(|d| match d {
                 Differ::Rows(why) if limits_without_order(sql) => (Kind::Unordered, why),
                 Differ::Rows(why) => (Kind::Rows, why),
                 Differ::FloatOrder(why) => (Kind::FloatOrder, why),
@@ -634,10 +636,10 @@ mod tests {
         fn execute(&self, sql: &str) -> Result<()> {
             self.0.execute(sql)
         }
-        fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
-            let (mut rows, t) = self.0.collect(sql, cap)?;
-            rows.pop();
-            Ok((rows, t))
+        fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
+            let mut out = self.0.collect(sql, cap)?;
+            out.rows.pop();
+            Ok(out)
         }
         fn for_each_row(&self, sql: &str, f: &mut dyn FnMut(&[Value]) -> Result<()>) -> Result<()> {
             self.0.for_each_row(sql, f)
@@ -708,7 +710,9 @@ mod tests {
         session
             .execute("CREATE TABLE t AS SELECT * FROM range(5) r(n)")
             .unwrap();
-        let (rows, truncated) = session.collect("SELECT n FROM t ORDER BY n", None).unwrap();
+        let Collected {
+            rows, truncated, ..
+        } = session.collect("SELECT n FROM t ORDER BY n", None).unwrap();
         assert_eq!(rows.len(), 5);
         assert!(!truncated);
         assert!(
@@ -727,7 +731,7 @@ mod tests {
         session
             .execute("CREATE TABLE t AS SELECT * FROM range(5) r(n)")
             .unwrap();
-        let (rows, _) = session.collect("SELECT n FROM t", None).unwrap();
+        let rows = session.collect("SELECT n FROM t", None).unwrap().rows;
         assert_eq!(rows.len(), 5, "the primary's answer is what is served");
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "{seen:?}");
@@ -788,7 +792,7 @@ mod tests {
         session
             .execute("CREATE TABLE t AS SELECT * FROM range(5) r(n)")
             .unwrap();
-        let (rows, _) = session.collect("SELECT n FROM t", None).unwrap();
+        let rows = session.collect("SELECT n FROM t", None).unwrap().rows;
         assert_eq!(rows.len(), 5);
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "{seen:?}");
