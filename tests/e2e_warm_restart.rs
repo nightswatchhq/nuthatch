@@ -369,3 +369,42 @@ async fn a_restarted_nest_reports_its_sealed_watermark_before_it_seals_again() {
     );
     shutdown(restarted).await;
 }
+
+/// A restarted nest must report the cursor position its store holds, before it commits again. The
+/// gauge used to start at 0, so `/ready` measured a lag from the start block and, on a quiet chain,
+/// declared a caught-up nest wedged once the stall grace ran out. Found by driving a fork with no
+/// new blocks after a restart.
+#[tokio::test]
+async fn a_restarted_nest_reports_its_cursor_position_before_it_commits_again() {
+    const NEST: &str = "wlast";
+    let dir = tempfile::tempdir().unwrap();
+    let tape = tape_with_ten_transfers();
+    let rt = spawn_named(dir.path(), tape.clone(), NEST).await;
+    let store = rt.state.store.clone();
+    assert!(
+        wait_indexed(&store).await,
+        "first run did not reach the tip"
+    );
+    // Beyond the tape, so nothing the respawned nest commits could write it: if the gauge holds it,
+    // it was seeded from the store.
+    const SENTINEL: u64 = 999;
+    store
+        .set_meta("last_block", &SENTINEL.to_string())
+        .expect("pin the sentinel position");
+    shutdown(rt).await;
+    drop(store);
+
+    let restarted = spawn_named(dir.path(), tape.clone(), NEST).await;
+    let gauge = nuthatch::metrics::METRICS.render();
+    let needle = format!("nuthatch_nest_last_block{{nest=\"{NEST}\"}} ");
+    let reported: u64 = gauge
+        .lines()
+        .find_map(|l| l.strip_prefix(needle.as_str()))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{needle} must appear in /metrics:\n{gauge}"));
+    assert_eq!(
+        reported, SENTINEL,
+        "a restarted nest reported last_block={reported} while its store holds {SENTINEL}"
+    );
+    shutdown(restarted).await;
+}

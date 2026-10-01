@@ -12,6 +12,8 @@ not to infer work that remains.
   their head targets, and the nuthatch release hosted nests depends on.
 - [Frozen for 2027](frozen-for-2027.md) - capability work deliberately deferred during the 2026
   feature freeze. These issues are closed, with an explicit reopening rule.
+- [Parked issues closed, 2026-09-28](parked-closed.md) - the open `parked` queue, closed with the
+  decision kept. Reopening one is a new decision.
 - [RFC index](rfcs/README.md) - design and implementation status for each RFC.
 
 ## Porting a subgraph
@@ -28,6 +30,7 @@ not to infer work that remains.
 - [Verification](verification.md)
 - [Production guide](production.md)
 - [Operator reference](operators.md)
+- [Runtime admin API](admin-api.md): mount by NID, jobs, suspend, move, reclaim, dry run - for a platform driving a runtime
 - [Reading sealed segments without nuthatch](reading-segments.md)
 - [Reading a published nest](reading-published-nest.md)
 - [Offchain data: file drops and scheduled price pulls](offchain.md)

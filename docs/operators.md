@@ -86,7 +86,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:3.12.1
+  ghcr.io/nightswatchhq/nuthatch:3.13.3
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -123,7 +123,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:3.12.1-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:3.13.3-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -319,8 +319,8 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 |---|---|---|---|
 | `analytics.memory_limit` | `NUTHATCH_ANALYTICS_MEMORY_LIMIT` | 512MB | DuckDB `max_memory` per connection |
 | `analytics.threads` | `NUTHATCH_ANALYTICS_THREADS` | 2 (ceiling 16) | DuckDB worker threads. Above 16 is refused; not a term in the RAM equation |
-| `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | process temp dir | parent of per-instance spill dirs (`nuthatch-duckdb-{pid}-{seq}`; do not point two processes at one directory) |
-| `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | unset (DuckDB's disk default) | spill bound; this is disk, not RAM, and does not buy room in the equation above |
+| `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | Linux: `$XDG_CACHE_HOME/nuthatch` or `~/.cache/nuthatch`; elsewhere the process temp dir | parent of per-instance spill dirs (`nuthatch-duckdb-{pid}-{seq}`; do not point two processes at one directory). Not `/tmp` on Linux by default, because that is often a tmpfs, where spill is RAM outside the per-cursor budget; do not point this at one |
+| `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | 2GB | spill per analytics connection. A `/sql` query that spills past it is stopped and answered `507`; the guard measures the spill itself, because DuckDB does not enforce its own limit on every spill. On disk it does not buy room in the equation above; on a tmpfs it is RAM |
 | `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest, and **raise-only**: 1024 is the remainder of today's 2 GiB split after 2 × 512 MB DuckDB, **not** a measured ingest RSS high-water (RFC-0047 §6). A lower value is refused at startup, because nothing caps ingest at this figure - writing a smaller number would not shrink ingest, only hand DuckDB headroom against a reservation no code enforces |
 | `runtime_headroom` | (not settable) | 0 | unmeasured. Named in the inequality so the term is visible; counted as zero until someone measures it on the box that enforces the budget |
 
@@ -748,7 +748,20 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /_admin/`, `/_admin/events` | admin UI. Token-gated off-localhost; removable with `--no-admin` |
 
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
-`GET /health`.
+`GET /health`, and `GET /metrics` (the whole runtime's exposition, served before anything is mounted;
+each mount's `/metrics` serves the same).
+
+**Runtime admin routes** (3.13.0), token-gated off-localhost like the admin UI and removed by
+`--no-admin`. The full request and response shapes are in [admin-api.md](admin-api.md).
+
+| Route | Purpose |
+|---|---|
+| `POST /_admin/nests` | mount `{name, nid}` as a job (`202`); `?wait=true` answers when done, `?dry_run=true` prices it |
+| `GET /_admin/mounts`, `GET /_admin/mounts/{name}` | every mount job, or one: `accepted`, `fetching`, `joining`, `live`, `failed` |
+| `POST /_admin/suspend/{name}`, `POST /_admin/resume/{name}` | pause a mount behind a `503`, and catch it up again |
+| `POST /_admin/move/{name}` | move a name to another `nid` without a gap |
+| `DELETE /_admin/nests/{name}` | unmount; `?reclaim=true` also frees the dataset once nothing mounts it |
+| `DELETE /_admin/datasets/{nid}` | reclaim a dataset unmounted earlier |
 
 ---
 
@@ -951,6 +964,9 @@ per-nest series below.
 
 Per-nest series, labelled `{nest="…"}` with the nest's route in a runtime (its alias, or `tenant/alias`)
 and its name in a single-nest `dev` (#1415) - the ones that make co-tenancy operable:
+`nuthatch_nest_hot_store_bytes` and `nuthatch_nest_sealed_segments_bytes` (the segments this nest's
+manifest names; a segment two datasets share is counted under both, so for disk used read the
+unlabelled `nuthatch_sealed_segments_bytes`, which counts each store once),
 `nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
 `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`,
@@ -1090,6 +1106,17 @@ segments are written strictly past finality and are immutable, so the columnar l
 reorg deeper than the sealed watermark is a terminal fault by design: finality was violated, and
 silently rewriting sealed history would be worse than stopping.
 
+A reorg of either kind is found by a reorg check, not the instant the chain changes, and until then
+the nest answers from what it last indexed, discarded blocks included. There is no fixed bound on that
+window. A check runs when a poll sees the tip move; a fork that leaves the tip height unchanged is
+re-checked at most every 12 seconds while the cursor is idle; a failing RPC delays it further; and under
+`--finality-only` no check runs while the cursor sits inside its finality ceiling. Measured once against
+a forked chain at a one-second poll interval, the rows of the abandoned branch were served for about
+half a second. For an ordinary reorg this is the near-tip provisionality every indexer has, and sealed
+history is untouched. For one below the seal the sealed rows are themselves on the abandoned branch, so
+they are served until the check runs and then the nest halts; the only protection is a finality depth
+the chain actually honours.
+
 **Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is
 checkpointed and rows are keyed by `(block, log_index)`, so a restart resumes without gaps or
 duplicates.
@@ -1221,11 +1248,19 @@ nuthatch nest bundle <dir>                        # produce a .bundle, prints it
 nuthatch nest publish <bundle> --registry <ref>   # publish as name@version, advance latest
 nuthatch nest load <ref> --registry <ref>         # pull and install, hash-verified
 nuthatch nest load <bundle|url|dir> --expect <h>  # or install directly, asserting the hash
+nuthatch nest nid --dir <dir>                     # the NID a runtime stores the nest under
+nuthatch nest load <nid> --registry <ref>         # pull by NID, refused unless the bundle computes to it
 ```
 
 The registry is **decoupled** from the binary: a filesystem path or S3-compatible object storage, with
 private-nest authentication. nuthatch pulls; it never becomes the registry, and resolution stays
 local-first. (Live S3 verification against a real bucket is still pending an operator run.)
+
+A bundle carries `nuthatch.toml` verbatim, so `nest bundle` refuses one holding a webhook `secret`, or an RPC,
+webhook or alert URL that looks keyed (userinfo, a key-named query parameter, or a long token in the
+path). That test is a heuristic and cannot recognise every key, so keep credentials out of the file you
+bundle: pass RPC endpoints at run time with `--rpc`. `--allow-secrets` bundles anyway, for a bundle that
+is never meant to leave the box.
 
 **Upgrading a nest without the resync tax** (RFC-0020):
 
@@ -1245,9 +1280,22 @@ nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking
   its successor; the new is served under `--new-endpoint` (default `/next`). Consumers migrate on
   their own clock.
 
-**Adding or removing a nest no longer requires a restart** (RFC-0027). Mount and unmount are live, so
-onboarding one tenant's nest no longer stops every co-tenant's. This used to be the largest operational
-gap for a team running nests on behalf of others.
+**Hosting nests on a runtime** (RFC-0027, 3.13.0). A runtime runs its own nests' lifecycle: a caller
+hands it a NID and it does the rest, with no restart and no co-tenant interrupted.
+
+- Declare the chains in `mounts.toml` and start with `--registry`. The runtime may start with nothing
+  mounted; the first mount onto a chain starts that chain's cursor.
+- `POST /_admin/nests {name, nid}` fetches a NID the runtime does not hold, verifies it, installs it
+  at `data/<nid>/` and indexes it, reporting progress as a job. A refused mount leaves nothing behind.
+- `?dry_run=true` first, to see the backfill, the per-block RPC work and the memory against the
+  cursor's ceiling, and whether it would be refused.
+- Suspend and resume a mount, move a name to a new NID without a gap, and unmount with
+  `?reclaim=true` to free the disk once nothing else mounts the dataset.
+- Meter per nest from `/metrics`: `nuthatch_nest_hot_store_bytes` and
+  `nuthatch_nest_sealed_segments_bytes`.
+
+Tenants are opaque labels the runtime refcounts; sign-in, plans, billing and per-tenant authorisation
+belong to the gateway in front of it. The walkthrough is [admin-api.md](admin-api.md).
 
 **Compliance operations** (RFC-0008), if you serve regulated customers:
 

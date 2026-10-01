@@ -76,6 +76,17 @@ impl From<Died> for anyhow::Error {
     }
 }
 
+/// A materialised result.
+#[derive(Debug)]
+pub(crate) struct Collected {
+    pub rows: Vec<Value>,
+    /// In the statement's projection order. Each row is a `serde_json::Map`, which sorts its keys,
+    /// so this is the only record of that order (#1609).
+    pub columns: Vec<String>,
+    /// More rows were available than the cap allowed.
+    pub truncated: bool,
+}
+
 /// One engine instance over one nest: a catalogue being built up and statements run against it.
 /// `Send`, because the connection cache hands a session from one request's thread to the next.
 // The methods only `folds` calls are part of the contract without it.
@@ -86,9 +97,9 @@ pub(crate) trait Session: Send {
 
     /// Prepare, execute and materialise the result as nuthatch-encoded JSON rows. With
     /// `cap = Some(n)` it stops after `n + 1` rows so the caller can report truncation precisely
-    /// (the bool is true when that extra row existed), and also caps cumulative result bytes;
+    /// (`truncated` is true when that extra row existed), and also caps cumulative result bytes;
     /// `cap = None` materialises every row.
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died>;
+    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died>;
 
     /// Stream a result row by row, each as its cells in column order, so a large result is never
     /// held whole.
@@ -168,6 +179,12 @@ pub(crate) trait Session: Send {
     /// A handle another thread can use to cancel whatever this session is running.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
 
+    /// This session's private spill directory and the bytes it may hold, for the `/sql` guard to
+    /// measure. `None` for a session that does not spill to a directory of its own.
+    fn spill_limit(&self) -> Option<(std::path::PathBuf, u64)> {
+        None
+    }
+
     /// The guard's deadline for the statement about to run, so an engine that does extra work
     /// beside the answer (a shadow) can decline it when the budget is nearly spent. Advisory; the
     /// watchdog still enforces the deadline.
@@ -179,6 +196,28 @@ pub(crate) trait Session: Send {
 
     /// Load one table's hot rows so that `bind_facts(.., hot = true, ..)` can union them in.
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()>;
+
+    /// Remove a maintained relation's public name, so a pooled session cannot answer from one an
+    /// earlier request defined after the entity faulted (#1598). An engine that cannot remove a
+    /// relation keeps it; Burrmill has no way to, so under the shadow its stale relation shows as a
+    /// divergence rather than passing unseen.
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+
+    /// [`Session::load_hot`] for a maintained relation: it has no sealed Parquet to line up with, so
+    /// its columns take the types its plan declares (`cols`, #1598), or, with none declared, the types
+    /// of its own cells. With declared columns it exists even with no rows.
+    fn load_relation(
+        &self,
+        table: &str,
+        cols: &[(String, &'static str)],
+        rows: &[&Value],
+    ) -> Result<()> {
+        let _ = cols;
+        self.load_hot(table, rows)
+    }
 
     /// Define `table` over its sealed segments and, when `hot`, the rows `load_hot` staged, with
     /// every declared column present and the derived `*_dec`/`*_overflow` columns projected.

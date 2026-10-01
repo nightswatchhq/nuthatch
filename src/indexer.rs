@@ -42,7 +42,7 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// configuration, which is what a nest's content address is a statement about.
 use crate::store::{IDENTITY_FORMULA, IDENTITY_FORMULA_KEY, REGISTRY_KEY};
 const SEALED_THROUGH_KEY: &str = "sealed_through";
-const START_BLOCK_KEY: &str = "start_block";
+pub(crate) const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
 const DEFAULT_BACKFILL: u64 = 5_000;
 
@@ -60,6 +60,12 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
     // touching the nest's config on disk.
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
+    let pool: Vec<String> = rpc_urls.iter().chain(&args.rpc_fallback).cloned().collect();
+    if let Some(note) =
+        chains::keyless_caveat(&config.nest.chain, &pool, config.nest.block_timestamps)
+    {
+        tracing::warn!("{note}");
+    }
     let endpoint_count = rpc_urls.len();
     let rpc = RpcClient::with_fallbacks(rpc_urls, args.rpc_fallback.clone())?;
     // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a
@@ -1513,9 +1519,13 @@ impl Supervisor {
         self.names.len() - 1
     }
 
-    /// The index of a nest by name, for a lifecycle command naming one.
+    /// The index of a nest by name, for a lifecycle command naming one. A retired slot is not on the
+    /// cursor: matching it acknowledged a remount of that name and never admitted it.
     fn index_of(&self, name: &str) -> Option<usize> {
-        self.names.iter().position(|n| n == name)
+        self.names
+            .iter()
+            .zip(&self.states)
+            .position(|(n, s)| n == name && !matches!(s, NestState::Retired))
     }
 
     /// Every quarantine reason, for the cursor's own death notice.
@@ -1570,36 +1580,13 @@ fn start_entities(
             .with_context(|| format!("reading SQL for entity `{}`", decl.name))?;
         let (plan, columns) = crate::entity_lower::lower_with_columns(&sql)
             .with_context(|| format!("lowering entity `{}`", decl.name))?;
-        // An entity that shadows a decoded table would silently take that table's name on the
-        // analytical surface, so `SELECT * FROM usdc__transfer` would answer from a maintained
-        // relation instead of the facts. Refused at load, where it is a typo, rather than at the
-        // first query, where it is a mystery.
-        if let Some(t) = registry.schema().iter().find(|t| t.table == decl.name) {
-            anyhow::bail!(
-                "entity `{}` has the same name as the decoded table `{}`. Rename the entity: on the \
-                 SQL surface one would shadow the other",
-                decl.name,
-                t.table
-            )
-        }
-        if crate::entity_offchain::table_of(&decl.name).is_some() {
-            anyhow::bail!(
-                "entity `{}` is named inside the `{}` namespace, where it would shadow an offchain \
-                 table on the SQL surface. Rename the entity",
-                decl.name,
-                crate::entity_offchain::OFFCHAIN_NAMESPACE
-            )
-        }
-        // The manifest is read only for an entity that names an offchain table, so a damaged one
-        // cannot stop a chain-only nest from starting.
-        let offchain = if crate::entity_offchain::reads_offchain(&plan) {
-            crate::entity_offchain::Tables::load(dir)?
-        } else {
-            crate::entity_offchain::Tables::none()
-        };
-        let binding =
-            crate::entity_bind::Binding::bind_with_offchain(&plan, registry, &offchain)
-                .with_context(|| format!("binding entity `{}` to this nest's tables", decl.name))?;
+        let (binding, offchain) = crate::entities::bind_as_dev(dir, &decl.name, &plan, registry)?;
+        crate::analytics::hold_relation_types(
+            dir,
+            &decl.name,
+            &columns,
+            &binding.output_types(&plan),
+        );
         let view =
             EntityView::start_bound(&decl.name, &plan, binding, &columns, decl.max_rows, warm)?;
         // A cold entity takes every present snapshot before its first window (#1437). A warm one is
@@ -1865,6 +1852,12 @@ fn drain_lifecycle(
     while let Ok(cmd) = rx.try_recv() {
         match cmd {
             CursorCommand::Unmount { name, ack } => {
+                // The driver drops the receiver when its wait times out, and it leaves the routes
+                // up. Retiring after that stops a nest that is still being served (#1535).
+                if ack.as_ref().is_some_and(|a| a.is_closed()) {
+                    tracing::warn!("unmount of '{name}' was abandoned; leaving it on the cursor");
+                    continue;
+                }
                 match sup.index_of(&name) {
                     // Retire *and release*: dropping the `NestIngest` drops this cursor's `Store`
                     // clone, its view handles and its screener. redb only lets go of the file when
@@ -1886,7 +1879,15 @@ fn drain_lifecycle(
             }
             CursorCommand::Mount { nest, next, ack } => {
                 let name = nest.name.clone();
-                if sup.index_of(&name).is_some() {
+                // Same abandonment as unmount: the driver timed out and did not publish routes.
+                // Admitting holds the store, and the retry cannot open it (#1535).
+                let abandoned = ack.as_ref().is_some_and(|a| a.is_closed());
+                let mut admitted = false;
+                if abandoned {
+                    tracing::warn!(
+                        "mount of '{name}' was abandoned before the cursor reached it; not admitting"
+                    );
+                } else if sup.index_of(&name).is_some() {
                     // Mounting over a live name is an upgrade, and that is RFC-0020's job. Refusing
                     // here keeps the two from silently overlapping.
                     tracing::warn!("nest '{name}' is already on this cursor; ignoring the mount");
@@ -1896,10 +1897,39 @@ fn drain_lifecycle(
                     nests.push(Some(*nest));
                     nexts.push(next);
                     sup.admit(&name);
+                    admitted = true;
                     tracing::info!("nest '{name}' mounted onto this cursor at block {next}");
                 }
                 if let Some(ack) = ack {
-                    let _ = ack.send(());
+                    if ack.send(()).is_err() && admitted {
+                        // The receiver went away between the check and the admit.
+                        let i = sup.index_of(&name).expect("just admitted");
+                        sup.retire(i);
+                        nests[i] = None;
+                    }
+                }
+            }
+            CursorCommand::Rename { from, to, ack } => {
+                let applied = match (sup.index_of(&from), sup.index_of(&to)) {
+                    (Some(i), None) => {
+                        sup.names[i] = to.clone();
+                        if let Some(n) = nests[i].as_mut() {
+                            n.name = to.clone();
+                        }
+                        crate::metrics::METRICS.rename_nest(&from, &to);
+                        tracing::info!("nest '{from}' is now '{to}' on this cursor");
+                        true
+                    }
+                    (_, Some(_)) => {
+                        tracing::warn!(
+                            "cannot rename '{from}' to '{to}': '{to}' is on this cursor"
+                        );
+                        false
+                    }
+                    (None, _) => false,
+                };
+                if let Some(ack) = ack {
+                    let _ = ack.send(applied);
                 }
             }
         }
@@ -1925,8 +1955,8 @@ pub enum CursorCommand {
     /// which matters because redb only releases the file once every clone drops - the cursor's, the
     /// serving state's, and the alert worker's.
     ///
-    /// A dropped `ack` sender is not an error: the driver may have stopped caring, and the cursor's
-    /// job is done either way.
+    /// A closed receiver means the driver gave up waiting and left the routes in place, so the
+    /// nest stays (#1535). `None` is the fire-and-forget path, and that one does retire.
     Unmount {
         name: String,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1944,6 +1974,14 @@ pub enum CursorCommand {
         nest: Box<NestIngest>,
         next: u64,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    /// Give a nest on this cursor another name (#1549), so a move's incoming nest is known by the
+    /// name it took over rather than the one it was staged under.
+    /// The acknowledgement says whether the rename applied.
+    Rename {
+        from: String,
+        to: String,
+        ack: Option<tokio::sync::oneshot::Sender<bool>>,
     },
 }
 
@@ -1968,6 +2006,7 @@ impl std::fmt::Debug for CursorCommand {
             CursorCommand::Mount { nest, next, .. } => {
                 write!(f, "Mount({} at {next})", nest.name)
             }
+            CursorCommand::Rename { from, to, .. } => write!(f, "Rename({from} -> {to})"),
         }
     }
 }
@@ -2037,10 +2076,10 @@ async fn runtime_index_loop(
         // windows" holds (RFC-0027 §2).
         drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
         if sup.all_retired() {
-            // Every nest was unmounted by the operator. Nothing left to advance, and nothing wrong -
-            // so this returns cleanly rather than bailing, and the runtime stays up (RFC-0027 §6).
-            tracing::info!("every nest on this cursor has been unmounted; retiring the cursor");
-            return Ok(());
+            // Every nest was unmounted. The cursor idles rather than returning: a return raced the
+            // next mount onto this chain, and the last cursor to return ended the runtime (#1545).
+            sleep_secs(1).await;
+            continue;
         }
         // Re-admit anything whose backoff elapsed, then take the live set for this iteration. Every
         // min/max/union below is derived from it - never from all nests (RFC-0026 §3.1).
@@ -2125,6 +2164,9 @@ async fn runtime_index_loop(
             tip,
         )
         .await;
+        for &i in &live {
+            live_ref(&nests, i).metrics.set_ceiling(ceiling);
+        }
         // The shared cursor advances from the *least* caught-up live nest, so no nest ever skips a block.
         let global_next = live.iter().map(|&i| nexts[i]).min().unwrap();
         if max_next > 0
@@ -2339,7 +2381,13 @@ pub async fn spawn_runtime(
     // declaring an entity is enough to make `--seal-direct` wrong for the whole cursor, which is the
     // only granularity the flag has.
     for nest in &ingests {
-        refuse_seal_direct_with_entities(seal_direct, nest)?;
+        // A live mount reaches this too (#1545), so the refusal must not leave a store locked (#1535).
+        if let Err(e) = refuse_seal_direct_with_entities(seal_direct, nest) {
+            for (_, w) in &alert_workers {
+                w.abort();
+            }
+            return Err(e);
+        }
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let ingest = tokio::spawn(runtime_index_loop(
@@ -2442,13 +2490,14 @@ pub async fn build_and_prepare_nest(
     // is handed the shared store the writer is filling; `None` keeps the embedded behaviour, which is
     // every existing caller.
     store_override: Option<Arc<dyn crate::store::HotStore>>,
+    sql_gate: Arc<tokio::sync::Semaphore>,
 ) -> Result<(
     NestIngest,
     serve::AppState,
     Option<tokio::task::JoinHandle<()>>,
     u64,
 )> {
-    let (mut nest, state, worker, window) = build_nest(
+    let (mut nest, state, mut worker, window) = build_nest(
         source,
         dataset.into_dir(),
         config,
@@ -2456,10 +2505,19 @@ pub async fn build_and_prepare_nest(
         admin_enabled,
         admin_token,
         store_override,
-        // One nest built on its own is one cursor (#1024).
-        serve::new_sql_gate(),
+        // The caller passes the cursor's gate. A fresh one here gave a live-mounted nest its own
+        // budget on top of the nests already on that cursor (#1538).
+        sql_gate,
     )
     .await?;
+    // The same refusal as `spawn_nest`. Inside `prepare` it would arrive after seal-direct had
+    // already written history the entity never sees (#1537).
+    if let Err(e) = refuse_seal_direct_with_entities(seal_direct, &nest) {
+        if let Some(w) = worker.take() {
+            w.abort();
+        }
+        return Err(e);
+    }
     let next = nest
         .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
         .await?;
@@ -2949,6 +3007,7 @@ async fn build_nest(
                 crate::seal::shared_store(&dir)
                     .unwrap_or_else(|| dir.join(crate::seal::SEGMENTS_DIR)),
             );
+            m.set_dataset_dir(dir.to_path_buf());
             // **#918: seed the sealed watermark from the store, not from the next seal.**
             //
             // The watermark is durable - `SEALED_THROUGH_KEY` in the store's meta - and the query path
@@ -2966,6 +3025,17 @@ async fn build_nest(
             // this surface: "sealed_through has not advanced" or "went backwards" fires after every
             // restart of a perfectly healthy nest, and an alert that cries wolf gets muted.
             m.set_sealed_through(shared_store.sealed_through());
+            // The cursor position likewise: until the next commit `/ready` read 0, measured a lag
+            // from the start block, and on a quiet chain declared a caught-up nest wedged after the
+            // stall grace.
+            if let Some(last) = shared_store
+                .get_meta(LAST_BLOCK_KEY)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                m.set_last_block(last);
+            }
             m
         },
         addresses,
@@ -6249,10 +6319,16 @@ impl NestIngest {
         if ancestor < sealed_through {
             // Terminal (RFC-0026 §3): the next attempt re-derives the same watermark and bails
             // identically, so this nest is quarantined until an operator raises the finality depth.
+            // `detect_reorg` answers 0 when no checkpoint it holds is canonical, which is not a fork
+            // at genesis and must not read as one.
+            let fork = if ancestor == 0 {
+                "a fork deeper than every checkpoint this nest holds".to_string()
+            } else {
+                format!("a reorg to block {ancestor}")
+            };
             anyhow::bail!(TerminalFault(format!(
-                "reorg to block {ancestor} is below the sealed/finalized watermark \
-                 {sealed_through} - a finality violation this indexer cannot repair; \
-                 halting. Raise the chain's finality depth."
+                "{fork} is below the sealed/finalized watermark {sealed_through} - a finality \
+                 violation this indexer cannot repair; halting. Raise the chain's finality depth."
             )));
         }
         let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
@@ -6857,6 +6933,7 @@ async fn index_loop(
         // unfinalised rows still in its hot store - the check runs exactly as before, because those
         // rows are as exposed as they ever were.
         let ceiling = cursor_ceiling(source.as_ref(), nest.finality, nest.freshness, tip).await;
+        nest.metrics.set_ceiling(ceiling);
         if reorg_check_due(nest.freshness, next, ceiling)
             && reorg_gate.due(tip, next, next > ceiling)
         {
@@ -6876,8 +6953,8 @@ async fn index_loop(
                 p.finish(next.saturating_sub(1), true);
             }
             caught_up = true;
-            // A circuit dies on its own thread after the window that killed it was handed over, so
-            // the check after that window can miss it; at the tip there is no next window to catch it.
+            // As in the runtime loop: an entity fault recorded after its window was checked surfaces
+            // here rather than waiting for a block.
             nest.ensure_views_healthy()?;
             // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
             // when the tip has moved, a reorg check, a checkpoint header and a `finalized` probe -
@@ -6973,8 +7050,24 @@ async fn index_loop(
                 // A refusal carrying no width information - a 429 or a 403. Retrying at the same width is
                 // right: endpoint failover happens beneath this, and the growth that used to walk into an
                 // unserveable width is bounded by evidence in the chunker now (#672).
+                if !caught_up
+                    && matches!(
+                        crate::rpc::class_of(&e),
+                        Some(crate::rpc::FailureClass::HistoryUnavailable)
+                    )
+                {
+                    return Err(e)
+                        .with_context(|| format!("backfill cannot fetch blocks {next}..={to}"));
+                }
                 tracing::warn!("get_logs {next}..={to} failed: {e:#}; retrying");
-                no_progress_tick(&mut no_progress, next, to, caught_up, "fetch failing")?;
+                // The error goes into the bail: it names the cause, the limit's own advice may not (#1607).
+                no_progress_tick(
+                    &mut no_progress,
+                    next,
+                    to,
+                    caught_up,
+                    &format!("fetch failing: {e:#}"),
+                )?;
                 sleep_secs(3).await;
             }
         }
@@ -10638,6 +10731,26 @@ template = "pool"
         );
     }
 
+    /// A finality violation names the fork it saw. `detect_reorg` answers 0 when no checkpoint the
+    /// nest holds is canonical, and the halt used to report that as "reorg to block 0", sending an
+    /// operator to look for a fork at genesis.
+    #[tokio::test]
+    async fn a_finality_violation_says_when_no_checkpoint_survived() {
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0x0000000000000000000000000000000000000003").await;
+        seed_blocks(&nest, &[10, 20, 60, 100]);
+        nest.store.set_meta(SEALED_THROUGH_KEY, "60").unwrap();
+
+        let deep = format!("{:#}", nest.rollback_reorg(0).unwrap_err());
+        assert!(
+            deep.contains("deeper than every checkpoint") && !deep.contains("block 0"),
+            "{deep}"
+        );
+        let known = format!("{:#}", nest.rollback_reorg(50).unwrap_err());
+        assert!(known.contains("a reorg to block 50"), "{known}");
+    }
+
     /// A supervisor over `n` nests named a, b, c… with a throwaway health surface.
     fn test_supervisor(n: usize) -> Supervisor {
         Supervisor::new(
@@ -10758,6 +10871,94 @@ template = "pool"
              treat its `next` as unknown, i.e. genesis, and drag every co-tenant back with it"
         );
         assert_eq!(sup.index_of("late-arrival"), Some(1));
+    }
+
+    /// #1535: the driver drops the receiver when its wait times out and leaves the routes up.
+    /// Applying the unmount after that retires a nest that is still being served.
+    #[test]
+    fn an_abandoned_unmount_leaves_the_nest_on_the_cursor() {
+        let mut sup = test_supervisor(1);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+        let mut nests: Vec<Option<NestIngest>> = vec![None];
+        let mut nexts = vec![10u64];
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        drop(ack_rx);
+        tx.send(CursorCommand::Unmount {
+            name: "nest0".into(),
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
+
+        assert_eq!(sup.live(), vec![0], "the nest is still indexing");
+        assert!(nests[0].is_none(), "the slot was empty and stays empty");
+    }
+
+    /// #1535: a mount whose caller has gone is not admitted, and the store it was holding can be
+    /// opened again. Admitting it would leave the file locked with no routes.
+    #[tokio::test]
+    async fn an_abandoned_mount_is_not_admitted_and_releases_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(dir.path(), "0x00000000000000000000000000000000000000aa").await;
+        let name = nest.name.clone();
+
+        let mut sup = test_supervisor(1);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+        let mut nests: Vec<Option<NestIngest>> = vec![None];
+        let mut nexts = vec![10u64];
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        drop(ack_rx);
+        tx.send(CursorCommand::Mount {
+            nest: Box::new(nest),
+            next: 12,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
+
+        assert_eq!(sup.live(), vec![0]);
+        assert_eq!(sup.index_of(&name), None);
+        assert_eq!(nests.len(), 1);
+        assert_eq!(nexts.len(), 1);
+        Store::open(&dir.path().join(crate::config::DB_FILE))
+            .expect("the abandoned mount must have dropped its store");
+    }
+
+    /// The receiver is still there, so the mount joins the working set and the arrays stay aligned.
+    #[tokio::test]
+    async fn an_acknowledged_mount_joins_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(dir.path(), "0x00000000000000000000000000000000000000ab").await;
+        let name = nest.name.clone();
+
+        let mut sup = test_supervisor(1);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+        let mut nests: Vec<Option<NestIngest>> = vec![None];
+        let mut nexts = vec![10u64];
+
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(CursorCommand::Mount {
+            nest: Box::new(nest),
+            next: 12,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
+
+        assert!(ack_rx.try_recv().is_ok(), "the mount was acknowledged");
+        assert_eq!(sup.index_of(&name), Some(1));
+        assert_eq!(sup.live(), vec![0, 1]);
+        assert_eq!(nests.len(), 2);
+        assert_eq!(nexts, vec![10, 12]);
+        assert!(
+            Store::open(&dir.path().join(crate::config::DB_FILE)).is_err(),
+            "the cursor is holding the store"
+        );
     }
 
     /// A mount is applied at a window boundary like any other command, keeps the arrays in step, and
@@ -17562,16 +17763,116 @@ template="pool"
         );
     }
 
+    /// A pool whose every `getLogs` fails with one fixed classified error.
+    struct RefusingSource {
+        class: crate::rpc::FailureClass,
+        detail: &'static str,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for RefusingSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(10_000)
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            Ok(Some(9_900))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::Error::new(crate::rpc::ClassifiedError {
+                class: self.class.clone(),
+                detail: self.detail.into(),
+            }))
+        }
+    }
+
+    async fn run_refused(class: crate::rpc::FailureClass, detail: &'static str) -> (String, usize) {
+        let tmp = tempfile::tempdir().unwrap();
+        let nest = build_dialled_nest(tmp.path(), crate::freshness::Freshness::default()).await;
+        let src = Arc::new(RefusingSource {
+            class,
+            detail,
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let task = tokio::spawn(index_loop(
+            src.clone() as Arc<dyn Source>,
+            nest,
+            Some(1_000),
+            false,
+            1,
+            50,
+        ));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(3_600), task)
+            .await
+            .expect("a backfill no endpoint can serve must end, not retry for an hour")
+            .unwrap();
+        let err = ended.expect_err("a backfill no endpoint can serve must not succeed");
+        (
+            format!("{err:#}"),
+            src.fetches.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// #1607: when no endpoint keeps the history, no retry can help, so the backfill stops on the
+    /// first refusal and says what to supply.
+    #[tokio::test(start_paused = true)]
+    async fn a_backfill_no_endpoint_keeps_history_for_stops_at_once() {
+        let (text, fetches) = run_refused(
+            crate::rpc::FailureClass::HistoryUnavailable,
+            "no configured RPC endpoint keeps blocks this old; supply an archive-capable RPC with \
+             `--rpc` or `rpc_urls`",
+        )
+        .await;
+        assert_eq!(fetches, 1, "{text}");
+        assert!(text.contains("--rpc"), "{text}");
+    }
+
+    /// #1607: a throttle beside a pruned endpoint is still retried, but when it never lifts, the
+    /// bail carries the cause. It used to say only "fetch failing" and suggest a smaller window.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_backfill_bails_with_its_cause() {
+        let (text, fetches) = run_refused(
+            crate::rpc::FailureClass::RateLimited { retry_after: None },
+            "https://eth.drpc.org keeps no blocks this old, so the rest of the pool must serve \
+             them; if this persists, supply an archive-capable RPC with `--rpc` or `rpc_urls`",
+        )
+        .await;
+        assert_eq!(fetches, NO_PROGRESS_LIMIT, "{text}");
+        assert!(
+            text.contains("https://eth.drpc.org keeps no blocks"),
+            "{text}"
+        );
+    }
+
     async fn build_dialled_nest(
         dir: &std::path::Path,
         freshness: crate::freshness::Freshness,
     ) -> NestIngest {
+        // Unique per call: per-nest metrics are a process-wide registry keyed by name, so tests
+        // running in parallel under one name read each other's values.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "dialled-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
-            "[nest]\nname = \"n\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
-             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
-             abi = \"abis/tok.json\"\n",
+            format!(
+                "[nest]\nname = \"{name}\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+                 abi = \"abis/tok.json\"\n"
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -17614,8 +17915,9 @@ template="pool"
     /// report the highest block any `getLogs` covered. The committed cursor position is the condition
     /// the nest itself asserts, unlike a quiet window count which says only that a loaded test process
     /// happened not to schedule more work for 400 ms.
-    async fn highest_block_indexed(nest: NestIngest, boundary: u64) -> (u64, usize) {
+    async fn highest_block_indexed(nest: NestIngest, boundary: u64) -> (u64, usize, u64) {
         let store = nest.store.clone();
+        let metrics = nest.metrics.clone();
         let src = Arc::new(FinalityRecordingSource::new());
         let recorder = src.clone();
         let task = tokio::spawn(index_loop(
@@ -17645,7 +17947,11 @@ template="pool"
             store.get_meta(LAST_BLOCK_KEY).ok().flatten(),
         );
         task.abort();
-        (recorder.highest_asked().unwrap_or(0), recorder.probes())
+        (
+            recorder.highest_asked().unwrap_or(0),
+            recorder.probes(),
+            metrics.ceiling(),
+        )
     }
 
     /// `--finality-only` caps the cursor at the chain's `finalized` block (RFC-0040 §3 knob 2): a
@@ -17663,8 +17969,10 @@ template="pool"
             },
         )
         .await;
-        let (highest, probes) =
+        let (highest, probes, ceiling) =
             highest_block_indexed(nest, FinalityRecordingSource::FINALIZED).await;
+        // `/ready` judges a wedge against this, not the tip (#1575).
+        assert_eq!(ceiling, FinalityRecordingSource::FINALIZED);
         assert_eq!(
             highest,
             FinalityRecordingSource::FINALIZED,
@@ -17681,8 +17989,10 @@ template="pool"
     async fn the_tip_path_still_indexes_to_the_tip() {
         let tmp = tempfile::tempdir().unwrap();
         let nest = build_dialled_nest(tmp.path(), crate::freshness::Freshness::default()).await;
-        let (highest, _probes) = highest_block_indexed(nest, FinalityRecordingSource::TIP).await;
+        let (highest, _probes, ceiling) =
+            highest_block_indexed(nest, FinalityRecordingSource::TIP).await;
         assert_eq!(highest, FinalityRecordingSource::TIP);
+        assert_eq!(ceiling, FinalityRecordingSource::TIP);
     }
 
     /// `--poll-interval` is how long a caught-up cursor waits before asking again (knob 1). Under a
@@ -19397,7 +19707,7 @@ rpc_urls = ["https://rpc.example"]
         entity_fixture::write(
             dir.path(),
             "[[entities]]\nname='paired'\nkey=['k']\nmax_rows=100\n\
-             query='SELECT a.k, sum(b.v) AS v FROM offchain__a a \
+             query='SELECT a.k, sum(CAST(b.v AS INTEGER)) AS v FROM offchain__a a \
              JOIN offchain__b b ON a.k = b.k GROUP BY a.k'\n",
         )
         .unwrap();

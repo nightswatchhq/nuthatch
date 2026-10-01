@@ -8,7 +8,7 @@
 //! and the DuckDB catalogue text (`view_definitions`) are not Burrmill's to answer and are refused;
 //! the shadow session only ever asks the primary for those.
 
-use crate::engine::{Died, Engine, FactWindow, Interrupt, Session};
+use crate::engine::{Collected, Died, Engine, FactWindow, Interrupt, Session};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -51,6 +51,9 @@ pub(crate) struct BurrmillSession {
     _spill: crate::engine_duck::SpillDir,
     /// Each view's `CREATE VIEW` text as defined, for the integrity sweep's walk through views.
     views: Mutex<std::collections::BTreeMap<String, String>>,
+    /// The declared columns of each maintained relation `load_relation` staged, so one with no rows
+    /// still binds (#1598). Burrmill types columns by name, so these carry names only.
+    relations: Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
 impl BurrmillSession {
@@ -66,6 +69,7 @@ impl BurrmillSession {
             hot: Mutex::new(HashMap::new()),
             _spill: spill,
             views: Mutex::new(std::collections::BTreeMap::new()),
+            relations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -76,15 +80,13 @@ impl BurrmillSession {
 
 /// The walls `analytics_budget` sets for DuckDB, as Burrmill's budget.
 fn budget(cfg: &crate::analytics_budget::AnalyticsConfig, spill: &Path) -> burrmill::Budget {
-    let cap = cfg
-        .max_temp_size
-        .as_deref()
-        .and_then(crate::analytics_budget::parse_memory_mb)
-        .map_or(100 << 30, |mb| mb << 20);
     burrmill::Budget {
         memory_bytes: (cfg.memory_limit_mb as usize) << 20,
         threads: cfg.threads.max(1) as usize,
-        spill: Some((spill.to_path_buf(), cap)),
+        spill: Some((
+            spill.to_path_buf(),
+            crate::analytics_budget::spill_cap_bytes(cfg) as _,
+        )),
     }
 }
 
@@ -191,15 +193,24 @@ impl Session for BurrmillSession {
         Ok(())
     }
 
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
         // The same two caps `engine_duck` applies, so the shadow truncates where the primary does.
         let hard = cap.map(|c| c + 1);
         let byte_cap = cap.map(|_| crate::engine::SQL_MAX_RESULT_BYTES);
         let mut bytes = 0usize;
         let mut out = Vec::new();
         let mut over = false;
+        let mut columns: Vec<String> = Vec::new();
         let engine = self.engine();
         let r = engine.sql_for_each(sql, |batch| {
+            if columns.is_empty() {
+                columns = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+            }
             for row in burrmill::df::encode::rows(&batch)? {
                 if byte_cap.is_some() {
                     bytes += row
@@ -220,11 +231,16 @@ impl Session for BurrmillSession {
             }
             Ok(())
         });
-        match r {
-            Ok(()) => Ok((out, false)),
-            Err(_) if over => Ok((out, true)),
-            Err(e) => Err(died(e)),
-        }
+        let truncated = match r {
+            Ok(()) => false,
+            Err(_) if over => true,
+            Err(e) => return Err(died(e)),
+        };
+        Ok(Collected {
+            rows: out,
+            columns,
+            truncated,
+        })
     }
 
     fn for_each_row(&self, sql: &str, f: &mut dyn FnMut(&[Value]) -> Result<()>) -> Result<()> {
@@ -257,10 +273,11 @@ impl Session for BurrmillSession {
     }
 
     fn one_value(&self, sql: &str) -> Result<Value> {
-        let (rows, _) = self.collect(sql, Some(1))?;
-        rows.into_iter()
-            .next()
-            .and_then(|r| r.as_object().and_then(|o| o.values().next().cloned()))
+        let out = self.collect(sql, Some(1))?;
+        let first = out.columns.first();
+        out.rows
+            .first()
+            .and_then(|r| first.and_then(|c| r.get(c)).cloned())
             .ok_or_else(|| anyhow!("no rows"))
     }
 
@@ -351,6 +368,23 @@ impl Session for BurrmillSession {
         Ok(())
     }
 
+    fn load_relation(
+        &self,
+        table: &str,
+        cols: &[(String, &'static str)],
+        rows: &[&Value],
+    ) -> Result<()> {
+        let declared = cols
+            .iter()
+            .map(|(c, _)| (c.clone(), "string".into()))
+            .collect();
+        self.relations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(table.to_string(), declared);
+        self.load_hot(table, rows)
+    }
+
     fn bind_facts(
         &self,
         table: &str,
@@ -359,6 +393,19 @@ impl Session for BurrmillSession {
         hot: bool,
         window: FactWindow,
     ) -> Result<bool> {
+        let staged;
+        let cols = if cols.is_empty() && hot {
+            staged = self
+                .relations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(table)
+                .cloned()
+                .unwrap_or_default();
+            staged.as_slice()
+        } else {
+            cols
+        };
         let hot_rows: Vec<Value> = if hot {
             self.hot
                 .lock()
@@ -443,13 +490,16 @@ mod tests {
     /// private spill directory, unless the operator says otherwise.
     #[test]
     fn unconfigured_burrmill_opens_at_todays_walls() {
+        let _env = crate::analytics_budget::tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = crate::analytics_budget::from_env();
         assert_eq!((cfg.memory_limit_mb, cfg.threads), (512, 2));
         let spill = crate::engine_duck::new_spill_dir().unwrap();
         let budget = super::budget(&cfg, &spill.0);
         assert_eq!(budget.memory_bytes, 512 << 20);
         assert_eq!(budget.threads, 2);
-        assert_eq!(budget.spill, Some((spill.0.clone(), 100 << 30)));
+        assert_eq!(budget.spill, Some((spill.0.clone(), 2 << 30)));
         assert!(super::BurrmillSession::new().is_ok());
     }
 
@@ -511,7 +561,7 @@ mod tests {
             "SELECT who, sum(amount_dec) AS total, max(block_number) AS last FROM t GROUP BY who ORDER BY who",
             "SELECT block_number, amount_overflow FROM t WHERE block_number > 4 ORDER BY 1",
         ] {
-            let (rows, truncated) = session.collect(sql, Some(1000)).unwrap();
+            let Collected { rows, truncated, .. } = session.collect(sql, Some(1000)).unwrap();
             assert!(!rows.is_empty(), "{sql}");
             assert!(!truncated);
         }
@@ -648,7 +698,7 @@ type Swap @entity { id: ID! pool: Pool! }
                 "{}\t{}\t{}",
                 if after > before { "DIFF" } else { "same" },
                 match &served {
-                    Ok((rows, _)) => format!("{} rows", rows.len()),
+                    Ok(c) => format!("{} rows", c.rows.len()),
                     Err(e) => format!("primary refused: {e:?}"),
                 },
                 sql.split_whitespace().collect::<Vec<_>>().join(" ")

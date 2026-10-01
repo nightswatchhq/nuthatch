@@ -144,6 +144,7 @@ async fn main() -> Result<()> {
                         args.finality_only,
                     ),
                     args.cors,
+                    args.registry,
                 )
                 .await
             } else {
@@ -267,6 +268,7 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&a.dir),
                 a.out.as_deref().map(std::path::Path::new),
                 a.as_dir,
+                a.allow_secrets,
             ),
             cli::NestWhat::Load(a) => match a.registry.as_deref() {
                 Some(registry) => {
@@ -422,7 +424,7 @@ async fn run_sql(args: cli::SqlArgs) -> Result<()> {
                     println!("{row}");
                 }
             } else {
-                print_table(&out.rows);
+                print_table(&out);
             }
             report_caveats(&out);
             Ok(())
@@ -439,6 +441,26 @@ async fn run_sql(args: cli::SqlArgs) -> Result<()> {
 /// issue is about - the whole point is that a caller who ignores the flag still gets told. A reduced
 /// table looks identical to a small one from here, so absent the line the operator sums a column and
 /// gets a confident wrong number off their own machine.
+/// A maintained entity is folded in memory by the running node and never written to disk, so a query
+/// with no node running cannot see it (#1577). Say that, rather than leave "does not exist" standing.
+fn offline_entity_hint(dir: &std::path::Path, raw: &str) -> Option<String> {
+    let marker = "Table with name ";
+    let name = raw[raw.find(marker)? + marker.len()..]
+        .split_whitespace()
+        .next()?;
+    let declared = nuthatch::entities::load(dir).ok()?;
+    declared
+        .iter()
+        .any(|e| e.name.eq_ignore_ascii_case(name))
+        .then(|| {
+            format!(
+                "`{name}` is a maintained entity: the running node keeps it in memory and it is not \
+                 stored on disk, so it cannot be read with no node running. Start `nuthatch dev` and \
+                 run this again (`nuthatch sql` then goes through it), or GET /derived/{name}."
+            )
+        })
+}
+
 fn report_caveats(out: &analytics::QueryOutput) {
     for line in caveats(out) {
         eprintln!("{line}");
@@ -656,8 +678,9 @@ impl SqlBackend {
                         // Errors as prompts (RFC-0016 §3), same as the HTTP path: classify against the
                         // nest's schema and append a fix hint.
                         let raw = format!("{e:#}");
-                        let hint =
-                            nuthatch::analytics::enrich_query_error(dir, &raw, sql, &declared);
+                        let hint = offline_entity_hint(dir, &raw).or_else(|| {
+                            nuthatch::analytics::enrich_query_error(dir, &raw, sql, &declared)
+                        });
                         match hint {
                             Some(h) => anyhow::bail!("{raw}\n\nhint: {h}"),
                             None => anyhow::bail!("{raw}"),
@@ -725,8 +748,18 @@ impl SqlBackend {
                     .get("tip_unavailable")
                     .and_then(|t| t.as_bool())
                     .unwrap_or(false);
+                let columns = body
+                    .get("columns")
+                    .and_then(|c| c.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Ok(analytics::QueryOutput {
                     rows,
+                    columns,
                     truncated,
                     degraded_tables,
                     tip_unavailable,
@@ -764,7 +797,7 @@ async fn repl(backend: SqlBackend) -> Result<()> {
                 // A query error is printed, never fatal - the session stays open.
                 match backend.query(line).await {
                     Ok(out) => {
-                        print_table(&out.rows);
+                        print_table(&out);
                         report_caveats(&out);
                     }
                     Err(e) => eprintln!("error: {e:#}"),
@@ -819,7 +852,7 @@ async fn repl_meta(line: &str, backend: &SqlBackend) -> bool {
 async fn run_meta_query(backend: &SqlBackend, sql: &str) {
     match backend.query(sql).await {
         Ok(out) => {
-            print_table(&out.rows);
+            print_table(&out);
             // The dot-commands get the caveats too. `.tables` is the sharpest case: a table whose
             // view could not be defined is simply *absent* from the catalogue listing, which is the
             // naming-fault misread of #419 in its purest form - the warning names it.
@@ -830,19 +863,22 @@ async fn run_meta_query(backend: &SqlBackend, sql: &str) {
 }
 
 /// Render query rows as a simple aligned ASCII table.
-fn print_table(rows: &[serde_json::Value]) {
+fn print_table(out: &analytics::QueryOutput) {
     use serde_json::Value;
+    let rows = &out.rows;
     if rows.is_empty() {
         println!("(0 rows)");
         return;
     }
-    // Column order: first-seen across rows (a query result's columns are consistent row to row).
-    let mut cols: Vec<String> = Vec::new();
-    for r in rows {
-        if let Some(o) = r.as_object() {
-            for k in o.keys() {
-                if !cols.iter().any(|c| c == k) {
-                    cols.push(k.clone());
+    // Keys as a fallback only, for a node older than #1609 that sends no `columns`: they are sorted.
+    let mut cols = out.columns.clone();
+    if cols.is_empty() {
+        for r in rows {
+            if let Some(o) = r.as_object() {
+                for k in o.keys() {
+                    if !cols.iter().any(|c| c == k) {
+                        cols.push(k.clone());
+                    }
                 }
             }
         }
@@ -944,9 +980,31 @@ fn hostname_or_bail() -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_offline_query_of_an_entity_says_it_needs_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT \"to\" AS recipient, count(*) AS n FROM usdc__transfer GROUP BY \"to\"",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname = \"totals\"\nsql = \"entities/totals.sql\"\nkey = [\"recipient\"]\nmax_rows = 100\n",
+        )
+        .unwrap();
+        let raw = "failed to prepare query: Catalog Error: Table with name totals does not exist!";
+        let hint = offline_entity_hint(dir.path(), raw).expect("an entity is named");
+        assert!(hint.contains("maintained entity"), "{hint}");
+        let other = "Catalog Error: Table with name usdc__nothing does not exist!";
+        assert_eq!(offline_entity_hint(dir.path(), other), None);
+    }
+
     fn out(truncated: bool, degraded: &[&str]) -> analytics::QueryOutput {
         analytics::QueryOutput {
             rows: vec![],
+            columns: vec![],
             truncated,
             degraded_tables: degraded.iter().map(|s| s.to_string()).collect(),
             tip_unavailable: false,

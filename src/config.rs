@@ -555,7 +555,18 @@ impl Config {
         })?;
         // v2 first; fall back to migrating a v1 file.
         let cfg = match toml::from_str::<Config>(&raw) {
-            Ok(cfg) => cfg,
+            Ok(cfg) => {
+                for key in Self::unknown_keys(&raw) {
+                    let hint = Self::suggest_key(&raw, &key)
+                        .map(|k| format!(" (did you mean `{k}`?)"))
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        "{CONFIG_FILE}: `{key}` is not a key nuthatch reads, so it is ignored and \
+                         its default applies{hint} - `nuthatch check` fails on it"
+                    );
+                }
+                cfg
+            }
             Err(v2_err) => Self::from_v1(&raw).map_err(|v1_err| {
                 anyhow!("nuthatch.toml is neither v2 ({v2_err}) nor v1 ({v1_err})")
             })?,
@@ -582,6 +593,53 @@ impl Config {
         cfg.refuse_tip_finality_webhooks()?;
         refuse_feature_only_files(dir)?;
         Ok(cfg)
+    }
+
+    /// Keys in a v2 `nuthatch.toml` that no field reads, as dotted paths (`contracts.0.start_blok`).
+    /// Serde drops them, so a misspelling silently takes the default (#1582): `start_blok` backfilled
+    /// from recent history instead of the declared block. Empty when the file does not parse as v2.
+    pub fn unknown_keys(raw: &str) -> Vec<String> {
+        let mut unknown = Vec::new();
+        let parsed: Result<Config, _> =
+            serde_ignored::deserialize(toml::Deserializer::new(raw), |path| {
+                unknown.push(path.to_string())
+            });
+        if parsed.is_err() {
+            return Vec::new();
+        }
+        unknown
+    }
+
+    /// The key nuthatch reads that `path` (an entry of [`Config::unknown_keys`]) most likely meant, if
+    /// one spelling is one edit away (#1584). The parser is the oracle: each candidate is put in the
+    /// typo's place and kept only if the file then reads it, so there is no list of keys to go stale.
+    pub fn suggest_key(raw: &str, path: &str) -> Option<String> {
+        let doc: toml::Value = toml::from_str(raw).ok()?;
+        let (parent, typo) = path.rsplit_once('.').unwrap_or(("", path));
+        let mut candidates: Vec<String> = one_edit_away(typo).into_iter().collect();
+        candidates.sort();
+        candidates.into_iter().find(|candidate| {
+            let mut doc = doc.clone();
+            let Some(table) = table_at(&mut doc, parent) else {
+                return false;
+            };
+            if table.contains_key(candidate.as_str()) {
+                return false;
+            }
+            let Some(value) = table.remove(typo) else {
+                return false;
+            };
+            table.insert(candidate.clone(), value);
+            let Ok(text) = toml::to_string(&doc) else {
+                return false;
+            };
+            let at = if parent.is_empty() {
+                candidate.clone()
+            } else {
+                format!("{parent}.{candidate}")
+            };
+            toml::from_str::<Config>(&text).is_ok() && !Self::unknown_keys(&text).contains(&at)
+        })
     }
 
     /// Parse and validate a nest **without** the serving-path policy refusals.
@@ -787,9 +845,111 @@ impl Config {
     }
 }
 
+/// The table at a dotted path such as `contracts.0`, where a numeric segment indexes an array.
+fn table_at<'a>(doc: &'a mut toml::Value, path: &str) -> Option<&'a mut toml::value::Table> {
+    let mut at = doc;
+    for seg in path.split('.').filter(|s| !s.is_empty()) {
+        at = match at {
+            toml::Value::Table(t) => t.get_mut(seg)?,
+            toml::Value::Array(a) => a.get_mut(seg.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    at.as_table_mut()
+}
+
+/// Every spelling one edit from `word`: a deletion, a swap of neighbours, a replacement or an insertion,
+/// over the characters a TOML key here is written in.
+fn one_edit_away(word: &str) -> std::collections::BTreeSet<String> {
+    const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz0123456789_";
+    let w: Vec<char> = word.chars().collect();
+    let mut out = std::collections::BTreeSet::new();
+    for i in 0..w.len() {
+        out.insert(w[..i].iter().chain(&w[i + 1..]).collect());
+        if i + 1 < w.len() {
+            let mut s = w.clone();
+            s.swap(i, i + 1);
+            out.insert(s.into_iter().collect());
+        }
+    }
+    for i in 0..=w.len() {
+        for c in ALPHABET.chars() {
+            if i < w.len() {
+                let mut s = w.clone();
+                s[i] = c;
+                out.insert(s.into_iter().collect());
+            }
+            let mut s = w.clone();
+            s.insert(i, c);
+            out.insert(s.into_iter().collect());
+        }
+    }
+    out.remove(word);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1582: a misspelt key is reported, and nothing a real config says, or a parsed one writes
+    /// back, is. A false positive would make every nest warn and `check` fail.
+    #[test]
+    fn only_keys_nothing_reads_are_unknown() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut seen = 0;
+        for rel in [
+            "docs/bench/nests/usdc-120",
+            "tests/fixtures/dune_emit/nest",
+            "obib-case2",
+            "obib-case3",
+        ] {
+            let raw = std::fs::read_to_string(root.join(rel).join(CONFIG_FILE)).unwrap();
+            assert_eq!(Config::unknown_keys(&raw), Vec::<String>::new(), "{rel}");
+            let parsed: Config = toml::from_str(&raw).unwrap();
+            let written = toml::to_string(&parsed).unwrap();
+            assert_eq!(
+                Config::unknown_keys(&written),
+                Vec::<String>::new(),
+                "{rel} written back"
+            );
+            seen += 1;
+            if rel == "docs/bench/nests/usdc-120" {
+                let typo = raw.replacen("start_block", "start_blok", 1);
+                assert_ne!(typo, raw, "premise: the fixture declares start_block");
+                let unknown = Config::unknown_keys(&typo);
+                assert_eq!(unknown.len(), 1, "{unknown:?}");
+                assert!(unknown[0].ends_with("start_blok"), "{unknown:?}");
+                // #1584: the parser, asked, names the key the typo meant.
+                assert_eq!(
+                    Config::suggest_key(&typo, &unknown[0]).as_deref(),
+                    Some("start_block")
+                );
+                let swapped = raw.replacen("block_timestamps", "block_timstamps", 1);
+                assert_ne!(
+                    swapped, raw,
+                    "premise: the fixture declares block_timestamps"
+                );
+                let unknown = Config::unknown_keys(&swapped);
+                assert!(
+                    unknown.iter().any(|k| k.ends_with("block_timstamps")),
+                    "{unknown:?}"
+                );
+                let k = unknown
+                    .iter()
+                    .find(|k| k.ends_with("block_timstamps"))
+                    .unwrap();
+                assert_eq!(
+                    Config::suggest_key(&swapped, k).as_deref(),
+                    Some("block_timestamps")
+                );
+                let nonsense = raw.replacen("start_block", "zzzzzz", 1);
+                let unknown = Config::unknown_keys(&nonsense);
+                assert_eq!(Config::suggest_key(&nonsense, &unknown[0]), None);
+            }
+        }
+        assert_eq!(seen, 4);
+    }
 
     #[test]
     fn migrates_a_v1_file() {

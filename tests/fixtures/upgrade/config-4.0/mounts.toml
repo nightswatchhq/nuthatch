@@ -1,0 +1,29 @@
+[runtime]
+name = "fleet"
+default_tenant = "ops"
+max_rss_mb = 1536
+
+[[chains]]
+chain = "arbitrum-one"
+chain_id = 42161
+rpc_urls = ["https://arb1.arbitrum.io/rpc"]
+
+[[mounts]]
+tenant = "ops"
+alias = "tokens"
+nid = "2bca092694c5833d2fecec20983b307f23c3a5507402c39bab4d3fab91231576"
+sql = "open"
+
+[[mounts]]
+tenant = "acme"
+alias = "tokens"
+nid = "2bca092694c5833d2fecec20983b307f23c3a5507402c39bab4d3fab91231576"
+sql = "allowlist"
+
+[[mounts.queries]]
+name = "received_by"
+sql = "SELECT sum(value) AS total FROM usdc__transfer WHERE \"to\" = {who} AND block_number >= {from}"
+
+[mounts.queries.params]
+who = "address"
+from = "int"

@@ -102,8 +102,9 @@ async fn bring_up(
 ) -> Vec<(String, Option<String>)> {
     let mounts = MountTable::load(root).unwrap();
     let datasets = mounts.datasets(root);
-    let multi_tenant = mounts.is_multi_tenant();
-    let mounted = runtime::load_mounted(root, &datasets, multi_tenant).expect("load");
+    let default_tenant_owned = mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
+    let mounted = runtime::load_mounted(root, &datasets, default_tenant).expect("load");
 
     let health = Arc::new(RuntimeHealth::new());
     for (name, _, _) in &mounted {
@@ -364,13 +365,14 @@ async fn bring_up_live(
     tip: u64,
 ) -> runtime::RuntimeHandles {
     let mounts = MountTable::load(root).unwrap();
-    let multi_tenant = mounts.is_multi_tenant();
+    let default_tenant_owned = mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
     let datasets: Vec<_> = mounts
         .datasets(root)
         .into_iter()
         .filter(|d| only.contains(&d.canonical().alias.as_str()))
         .collect();
-    let mounted = runtime::load_mounted(root, &datasets, multi_tenant).expect("load");
+    let mounted = runtime::load_mounted(root, &datasets, default_tenant).expect("load");
 
     let health = Arc::new(RuntimeHealth::new());
     for (name, _, _) in &mounted {
@@ -418,7 +420,8 @@ async fn bring_up_live(
         health,
         roster,
         estimates: std::collections::HashMap::new(),
-        multi_tenant,
+        default_tenant: default_tenant.to_string(),
+        suspended: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: root.to_path_buf(),
             // The whole table, including the record for the nest not yet mounted - which is exactly
@@ -439,6 +442,10 @@ async fn bring_up_live(
             max_rss_mb: 2048,
             freshness: Default::default(),
             chain_freshness: Default::default(),
+            dormant: Default::default(),
+            fail_fast: false,
+            cursors: None,
+            registry: None,
         },
     };
     // The cursor has to keep running for the mount handshake to be answered at a window boundary.
@@ -670,7 +677,7 @@ async fn a_substantive_edit_does_not_adopt_on_the_mount_path() {
     let dest = MountTable::data_dir(root, &new_nid);
     let mounts = MountTable::load(root).unwrap();
     let datasets = mounts.datasets(root);
-    runtime::load_mounted(root, &datasets, mounts.is_multi_tenant()).expect("load");
+    runtime::load_mounted(root, &datasets, &mounts.tenant_default()).expect("load");
 
     assert!(
         !dest.join("nuthatch.redb").exists(),

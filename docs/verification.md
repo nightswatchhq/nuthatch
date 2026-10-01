@@ -274,16 +274,18 @@ never multiplexed across chains. Stalling one chain's RPC must not stall the oth
 **3.4 Mount and unmount without a restart**
 
 ```sh
-curl -XPOST   localhost:8288/_admin/nests -d '{"name":"another"}'
+curl -XPOST   localhost:8288/_admin/nests -H 'Content-Type: application/json' -d '{"name":"another"}'   # 202 and the job
+curl          localhost:8288/_admin/mounts/another                   # until "phase": "live"
 curl -XDELETE localhost:8288/_admin/nests/another
 ```
 
-Expect both to succeed **without co-tenants being interrupted** — check the other nests' `/ready` and
-row counts across the operation. *Proves* the live runtime: a configuration change no longer has a wider
-blast radius than a fault.
+Expect the mount to reach `live` and the unmount to succeed **without co-tenants being interrupted** —
+check the other nests' `/ready` and row counts across the operation. *Proves* the live runtime: a
+configuration change no longer has a wider blast radius than a fault.
 
-Expect a `507` if the mount would breach the cursor's RAM budget, carrying the projected and ceiling
-figures. That refusal is the feature; a budget that can be quietly exceeded is not a budget.
+Expect a mount that would breach the cursor's RAM budget to end `failed`, its reason carrying the
+projected and ceiling figures; with `?wait=true` the same refusal is a `507`. That refusal is the
+feature; a budget that can be quietly exceeded is not a budget.
 
 **3.5 Per-nest blast radius**
 
@@ -505,7 +507,7 @@ not been run on 1.x or 2.x**, so a report against the release you are holding st
 
 ```sh
 curl -XPOST localhost:8290/nests \
-  -d '{"name":"usdc","chain":"arbitrum-one","estimated_rss_mb":120}'
+  -H 'Content-Type: application/json' -d '{"name":"usdc","chain":"arbitrum-one","estimated_rss_mb":120}'
 curl -s localhost:8290/plan
 ```
 
@@ -548,7 +550,7 @@ change no cursor's ownership and no ingestion progress. *Proves* the plane split
 **5.7 Versions resolve identically fleet-wide**
 
 ```sh
-curl -XPUT localhost:8290/nests/usdc/pin -d '{"version":"1.0.0","bundle_hash":"0x…"}'
+curl -XPUT localhost:8290/nests/usdc/pin -H 'Content-Type: application/json' -d '{"version":"1.0.0","bundle_hash":"0x…"}'
 # then, against each FE node:
 curl -s localhost:8290/nests/usdc/resolve
 ```
@@ -562,7 +564,7 @@ An unpinned endpoint must report `servable: false` — an FE refusing is correct
 **5.8 Secrets stay out of bundles**
 
 ```sh
-curl -XPUT localhost:8290/nests/usdc/secrets -d '{"key":"rpc_url","value":"<canary>"}'
+curl -XPUT localhost:8290/nests/usdc/secrets -H 'Content-Type: application/json' -d '{"key":"rpc_url","value":"<canary>"}'
 curl -s localhost:8290/nests/usdc/secrets     # expect: key names only, never values
 ```
 

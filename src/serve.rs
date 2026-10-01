@@ -518,6 +518,8 @@ pub fn compose_runtime(
         })
         .collect();
     let ready_nests = Arc::new(shared.clone());
+    let metrics_nests = ready_nests.clone();
+    let metrics_health = health.clone();
     let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
         // `GET /nests` - the roster (name, chain, registry hash, table count) across mounted nests,
@@ -530,6 +532,16 @@ pub fn compose_runtime(
                 let r = roster.clone();
                 let h = roster_health.clone();
                 async move { Json(merge_roster_health(&r, &h)) }
+            }),
+        )
+        // `GET /metrics` at the root, so a runtime is scrapeable before anything is mounted and a
+        // scrape target does not depend on which mounts exist. Every mount's `/metrics` serves this too.
+        .route(
+            "/metrics",
+            get(move || {
+                let h = metrics_health.clone();
+                let n = metrics_nests.clone();
+                async move { runtime_metrics(&h, &n) }
             }),
         )
         // `GET /ready` at the runtime root - the runtime-wide readiness a supervisor polls. The per-nest
@@ -585,10 +597,13 @@ impl LiveRuntime {
     /// The router to serve: a fallback that resolves the current composition per request.
     pub fn service(&self) -> Router {
         let current = self.current.clone();
-        Router::new().fallback(move |req: axum::extract::Request| {
+        Router::new().fallback(move |mut req: axum::extract::Request| {
             let current = current.clone();
             async move {
                 use tower::ServiceExt;
+                // `nest("/usdc")` matches `/usdc` and `/usdc/x` but not `/usdc/`, which fell through
+                // to an empty 404 whatever the mount's state (#1588).
+                trim_trailing_slash(&mut req);
                 // `Router::clone` is cheap (its state is behind an `Arc`), and `oneshot` drives this
                 // request through the composed router exactly as `axum::serve` would have.
                 let router = (**current.load()).clone();
@@ -600,6 +615,26 @@ impl LiveRuntime {
                 }
             }
         })
+    }
+}
+
+fn trim_trailing_slash(req: &mut axum::extract::Request) {
+    let path = req.uri().path();
+    if path.len() <= 1 || !path.ends_with('/') {
+        return;
+    }
+    let trimmed = path.trim_end_matches('/');
+    let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
+    let rebuilt = match req.uri().query() {
+        Some(q) => format!("{trimmed}?{q}"),
+        None => trimmed.to_string(),
+    };
+    let mut parts = req.uri().clone().into_parts();
+    if let Ok(pq) = rebuilt.parse() {
+        parts.path_and_query = Some(pq);
+        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+            *req.uri_mut() = uri;
+        }
     }
 }
 
@@ -1058,6 +1093,25 @@ async fn count_request(
 }
 
 /// `GET /metrics` - Prometheus text exposition (RFC-0005 §6).
+/// The runtime root's `/metrics`: the process registry, the health series and every mount's entity series.
+fn runtime_metrics(
+    health: &crate::health::RuntimeHealth,
+    nests: &[(String, SharedNest)],
+) -> impl IntoResponse {
+    let mut body = crate::metrics::METRICS.render();
+    body.push_str(&health.render_metrics());
+    for (_, nest) in nests {
+        body.push_str(&entity_metrics(&nest.current()));
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+}
+
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     let mut body = crate::metrics::METRICS.render();
     // In a runtime, append the health series (RFC-0026 §5) so an operator can alert on "anything
@@ -1600,7 +1654,25 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     ) = seal_direct;
     let now = now_unix();
     let age = (last_poll != 0).then(|| now.saturating_sub(last_poll));
-    let lag = tip.saturating_sub(last);
+    // Before its first commit a cursor stands just below its start block, not at block 0: a nest
+    // waiting for finality to reach its start is not the whole chain behind.
+    let position = if last == 0 {
+        s.store
+            .get_meta(crate::indexer::START_BLOCK_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(0, |start| start.saturating_sub(1))
+    } else {
+        last
+    };
+    let lag = tip.saturating_sub(position);
+    // A wedge is judged against where the cursor may go: under `--finality-only` that is the finality
+    // boundary, and one waiting there for the next finalized block is caught up (#1575).
+    let ceiling = nest
+        .as_ref()
+        .map_or_else(|| METRICS.ceiling(), |m| m.ceiling());
+    let target = if ceiling == 0 { tip } else { ceiling };
     let wedged = !seal_direct_active
         && progress_stalled(
             last_progress,
@@ -1608,7 +1680,7 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
             now,
             s.freshness
                 .stall_threshold_secs(READINESS_PROGRESS_STALL_SECS),
-            lag,
+            target.saturating_sub(position),
         );
     let initial_failure = initial_poll_failed(last_poll, poll_failed);
     // #846: `seal_direct_active` used to suppress every term above with nothing put in its place, so
@@ -3469,6 +3541,14 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
         )
             .into_response();
     }
+    if let Some(cut) = e.downcast_ref::<crate::analytics::QuerySpillExceeded>() {
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::TooLarge);
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            Json(json!({ "error": cut.to_string(), "spill_cap_bytes": cut.cap_bytes })),
+        )
+            .into_response();
+    }
     let reason = if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
         || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
             .is_some()
@@ -3824,6 +3904,8 @@ fn sql_response(
         // cause (a damaged/unreadable hot store, not a bad segment) and distinct remedy, so it does
         // not belong inside `degraded_tables` - see `QueryOutput::tip_unavailable`.
         "tip_unavailable": out.tip_unavailable,
+        // The query's column order (#1609), which the row objects do not keep.
+        "columns": out.columns,
         "rows": out.rows,
         // Answered from the deterministic memo (#1186): the same rows this statement produced the
         // last time every input it reads was in this state. Never stale by construction; here so a
@@ -5367,6 +5449,80 @@ mod tests {
         assert_eq!(json["wedged"], json!(true));
     }
 
+    /// #1575: under `--finality-only` a cursor waits at the finality boundary, below the tip, for the
+    /// next finalized block, which on Arbitrum takes minutes. Level with its ceiling it is caught up;
+    /// behind it and not moving, it is still wedged.
+    #[tokio::test]
+    async fn a_finality_cursor_at_its_ceiling_is_ready_and_one_behind_it_is_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "finality-cursor";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_last_block(1_000);
+        handle.set_tip(1_100);
+        handle.set_ceiling(1_000);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now.saturating_sub(200));
+        let (code, body) = get(router.clone(), &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "waiting at finality is caught up: {json}"
+        );
+        assert_eq!(json["wedged"], json!(false));
+
+        handle.set_ceiling(1_050);
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["wedged"], json!(true));
+    }
+
+    /// #1575, found on Base: a new finality-only nest whose start block is above the finality boundary
+    /// has committed nothing, so its position is just below its start, not block 0. Waiting for
+    /// finality to reach it is not being the whole chain behind.
+    #[tokio::test]
+    async fn a_new_finality_cursor_waiting_below_its_start_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "finality-cursor-fresh";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let state = test_state(&dir.path().join(name), 4);
+        state
+            .store
+            .set_meta(crate::indexer::START_BLOCK_KEY, "1200")
+            .unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let router = compose_runtime(roster, vec![(name.to_string(), state)], health);
+
+        let now = crate::metrics::now_unix();
+        let handle = crate::metrics::METRICS.nest(name);
+        handle.set_tip(1_300);
+        handle.set_ceiling(1_000);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now.saturating_sub(200));
+        let (code, body) = get(router, &format!("/{name}/ready")).await;
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "waiting for finality to reach its start: {json}"
+        );
+        assert_eq!(json["wedged"], json!(false));
+        assert_eq!(
+            json["lag_blocks"],
+            json!(101),
+            "lag is from its position, not block 0"
+        );
+    }
+
     /// #583/#589: a cursor level with tip - caught up, doing exactly what it should - must stay ready
     /// even though `last_progress` is stale well past the threshold. `set_last_block` only stamps
     /// `last_progress` on an actual advance, so a caught-up cursor stops stamping the moment it
@@ -6050,6 +6206,24 @@ mod tests {
                 direct, dispatched,
                 "{path} must be identical through the dispatcher; got {direct:?} vs {dispatched:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_is_trimmed_and_the_query_kept() {
+        for (from, to) in [
+            ("/usdc/", "/usdc"),
+            ("/usdc/sql/?q=SELECT%201", "/usdc/sql?q=SELECT%201"),
+            ("/acme/usdc//", "/acme/usdc"),
+            ("/", "/"),
+            ("/usdc", "/usdc"),
+        ] {
+            let mut req = axum::http::Request::builder()
+                .uri(from)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            trim_trailing_slash(&mut req);
+            assert_eq!(req.uri().to_string(), to, "{from}");
         }
     }
 
@@ -7046,6 +7220,22 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #1609: the row objects cannot carry the projection order, so the response names it.
+    #[tokio::test]
+    async fn sql_response_names_its_columns_in_the_querys_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let (status, body) = get(
+            router(SharedNest::new(state)),
+            "/sql?q=SELECT%201%20AS%20z,%202%20AS%20a,%203%20AS%20m",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["columns"], json!(["z", "a", "m"]), "{body}");
+        assert_eq!(body["rows"], json!([{"z": 1, "a": 2, "m": 3}]), "{body}");
     }
 
     /// A typed-rows QoS nest held 850,879 rows hot behind outstanding documents, under the two-million

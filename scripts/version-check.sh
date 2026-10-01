@@ -45,6 +45,16 @@ else
   echo "Cargo.toml: STALE ($have, expected $WANT)"; fail=$((fail + 1))
 fi
 
+# SECURITY.md said "currently the 0.1.x line" through twelve 3.x releases (#1541). The section names
+# no version at all now, so any number that appears in it is a regression.
+echo
+if sed -n '/^## Supported versions/,/^## /p' SECURITY.md | grep -qE '\b[0-9]+\.[0-9x]+(\.[0-9x]+)?\b'; then
+  echo "SECURITY.md supported versions: STALE (names a version; say \"the latest release\" instead)"
+  fail=$((fail + 1))
+else
+  echo "SECURITY.md supported versions: OK"
+fi
+
 # 3. Everything else, reported but never judged. `docs/rfcs/` and the progress log are dated writing
 #    and *should* keep the version they were written about; so should a security note naming the
 #    release that fixed something. Listing them without a verdict is deliberate - a checker that

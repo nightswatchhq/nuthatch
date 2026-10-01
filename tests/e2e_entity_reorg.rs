@@ -371,6 +371,83 @@ async fn seal_direct_refuses_a_nest_that_declares_an_entity() {
     );
 }
 
+/// #1537: a live mount builds through `build_and_prepare_nest`, which used to skip the refusal
+/// `spawn_nest` makes and then serve the entity empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_mount_refuses_seal_direct_with_an_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    declare_entity(dir.path());
+    let source: Arc<dyn nuthatch::source::Source> = tape;
+
+    let err = indexer::build_and_prepare_nest(
+        &source,
+        nuthatch::runtime::PreparedDataset::without_nid(dir.path().to_path_buf()),
+        &cfg,
+        None,
+        true,
+        1,
+        Some(2),
+        false,
+        None,
+        None,
+        nuthatch::serve::new_sql_gate(),
+    )
+    .await
+    .err()
+    .expect("a live mount must refuse seal-direct plus an entity");
+
+    let err = format!("{err:#}");
+    assert!(err.contains("--seal-direct cannot be combined"), "{err}");
+    assert!(
+        err.contains("`received`"),
+        "the refusal must name the entity: {err}"
+    );
+}
+
+/// #1545: a first mount onto a chain starts its cursor through `spawn_runtime`, so that path must
+/// refuse seal-direct with an entity too, and let go of the store it opened to find out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_started_by_a_mount_refuses_seal_direct_with_an_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    declare_entity(dir.path());
+
+    let err = indexer::spawn_runtime(
+        tape,
+        vec![("usdc".to_string(), dir.path().to_path_buf(), cfg)],
+        None,
+        true,
+        1,
+        Some(2),
+        false,
+        None,
+        Arc::new(nuthatch::health::RuntimeHealth::new()),
+        false,
+    )
+    .await
+    .err()
+    .expect("a cursor started for a mount must refuse seal-direct plus an entity");
+    assert!(
+        format!("{err:#}").contains("--seal-direct cannot be combined"),
+        "{err:#}"
+    );
+    nuthatch::store::Store::open(&dir.path().join(nuthatch::config::DB_FILE))
+        .expect("the refused nest's store must be released");
+}
+
 /// The same nest without `--seal-direct` starts and folds - so the refusal above is about the
 /// combination and not about entities being unable to start at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1700,4 +1777,154 @@ max_rows = 10000
     );
     assert!(two.iter().any(|(k, _)| k == "USDCe"), "{two:?}");
     shutdown_and_settle(rt).await;
+}
+
+/// From the 3.13.1 hardening pass: every maintained cell reached `/sql` as text, so a `COUNT(*)`
+/// column was VARCHAR, `sum(n)` would not bind and `max(n)` compared strings ("5" over "29").
+const COUNTS: &str = r#"[[entities]]
+name = "counts"
+query = "SELECT t.to, COUNT(*) AS n, MAX(CASE WHEN t.to = 'never' THEN 1 END) AS nothing FROM usdc__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = 10000
+
+# Astra's review of #1583: a relation carrying block_number is still a relation, and a text
+# column named like an event counter keeps its text.
+[[entities]]
+name = "by_block"
+query = "SELECT t.block_number, COUNT(*) AS n FROM usdc__transfer t GROUP BY t.block_number"
+key = ["block_number"]
+max_rows = 10000
+
+[[entities]]
+name = "named_like_counters"
+query = "SELECT t.to AS log_index, COUNT(*) AS n FROM usdc__transfer t GROUP BY t.to"
+key = ["log_index"]
+max_rows = 10000
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_maintained_count_is_numeric_in_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for block in 1..=CHAIN_LEN {
+        tape.insert_block(block, canonical_block(block));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_declared(dir.path(), tape, CHAIN_LEN, COUNTS).await;
+    for e in rt.state.entities.iter() {
+        e.flush();
+    }
+    let one = |sql: &'static str| {
+        let rt = &rt;
+        async move {
+            let (status, body) = get_json(rt, &format!("/sql?q={}", urlencoding_lite(sql))).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{sql} -> {body}");
+            body["rows"][0].clone()
+        }
+    };
+    assert_eq!(
+        one("SELECT typeof(n) AS t FROM counts LIMIT 1").await["t"],
+        "HUGEINT"
+    );
+    assert_eq!(
+        one("SELECT count(*) AS c FROM counts WHERE nothing IS NULL").await["c"],
+        one("SELECT count(*) AS c FROM counts").await["c"],
+        "a NULL cell must be NULL, not the text \"NULL\""
+    );
+    let summed = one("SELECT sum(n) AS s FROM counts").await["s"].to_string();
+    let raw = one("SELECT count(*) AS c FROM usdc__transfer").await["c"].to_string();
+    assert_eq!(summed.trim_matches('"'), raw.trim_matches('"'));
+    assert_eq!(
+        one("SELECT any_value(typeof(n)) AS t FROM by_block").await["t"],
+        "HUGEINT"
+    );
+    let named = one("SELECT log_index FROM named_like_counters LIMIT 1").await["log_index"].clone();
+    assert!(
+        named.as_str().is_some_and(|a| a.starts_with("0x")),
+        "a text column named log_index lost its text: {named}"
+    );
+    // A running nest keeps the declarations it started with: a half-edited file on disk must not turn
+    // its relations back into text (astra's re-review).
+    std::fs::write(dir.path().join("entities.toml"), "[[entities\nnot toml").unwrap();
+    assert_eq!(
+        one("SELECT typeof(n) AS t FROM counts ORDER BY n LIMIT 1").await["t"],
+        "HUGEINT"
+    );
+    shutdown_and_settle(rt).await;
+}
+
+/// Astra's third review of #1583: the declarations a nest started from type its relations, even when
+/// `entities.toml` is broken before the first query ever reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_broken_before_the_first_query_keeps_the_started_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for block in 1..=CHAIN_LEN {
+        tape.insert_block(block, canonical_block(block));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_declared(dir.path(), tape, CHAIN_LEN, COUNTS).await;
+    for e in rt.state.entities.iter() {
+        e.flush();
+    }
+    std::fs::write(dir.path().join("entities.toml"), "[[entities\nnot toml").unwrap();
+    let sql = "SELECT typeof(n) AS t FROM counts LIMIT 1";
+    let (status, body) = get_json(&rt, &format!("/sql?q={}", urlencoding_lite(sql))).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["t"], "HUGEINT", "{body}");
+    shutdown_and_settle(rt).await;
+}
+
+/// The same quarantine when the fault lands on the **last** window and no block follows. An entity
+/// records a failed step on its own thread, after the window that fed it has been checked, so on a
+/// quiet chain the nest reported healthy until another block arrived. Found on a stationary fork:
+/// `/ready` said faulted while `/nests` and the health gauge said indexing, for as long as the chain
+/// stayed still.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entity_that_faults_on_the_last_block_is_quarantined_without_another() {
+    use nuthatch::health::RuntimeHealth;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let cfg = scaffold_nest(dir.path(), "lastfault", USDC);
+    // One transfer a block: the bound admits every input but the last block's.
+    entity_fixture::write(
+        dir.path(),
+        &format!(
+            r#"[[entities]]
+name = "received"
+query = "SELECT t.to, SUM(t.value) FROM lastfault__transfer t GROUP BY t.to"
+key = ["to"]
+max_rows = {}
+"#,
+            CHAIN_LEN - 1
+        ),
+    )
+    .unwrap();
+    let health = Arc::new(RuntimeHealth::new());
+    health.register("lastfault", &cfg.nest.chain);
+    let _cursor = indexer::spawn_runtime(
+        tape,
+        vec![("lastfault".to_string(), dir.path().to_path_buf(), cfg)],
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health.clone(),
+        false,
+    )
+    .await
+    .expect("spawn_runtime");
+
+    let quarantined = wait_until(POLL_TIMEOUT, || health.status("lastfault").is_some()).await;
+    assert!(
+        quarantined,
+        "a nest whose entity faulted on the last block must be quarantined without another block"
+    );
 }

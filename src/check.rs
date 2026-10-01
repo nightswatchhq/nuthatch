@@ -26,6 +26,26 @@ pub fn check(args: CheckArgs) -> Result<()> {
         return check_folds(&dir, args.from_genesis);
     }
 
+    // A misspelt key is dropped and its default used, silently (#1582); this is where an author learns.
+    if let Ok(raw) = std::fs::read_to_string(dir.join(crate::config::CONFIG_FILE)) {
+        let unknown = crate::config::Config::unknown_keys(&raw);
+        if !unknown.is_empty() {
+            let named: Vec<String> = unknown
+                .iter()
+                .map(|k| match crate::config::Config::suggest_key(&raw, k) {
+                    Some(s) => format!("{k} (did you mean `{s}`?)"),
+                    None => k.clone(),
+                })
+                .collect();
+            bail!(
+                "{} has key(s) nuthatch does not read, so their defaults apply instead: {}. Check \
+                 the spelling against the config reference.",
+                crate::config::CONFIG_FILE,
+                named.join(", ")
+            );
+        }
+    }
+
     // Grafting (RFC-0033) is reported **before** the parity checks, and before the no-checks bail: a
     // nest with no `checks/*.sql` is the common case, and its author still deserves to know which of
     // their views can never be reused. Reporting it after the bail made this dead code for most
@@ -344,7 +364,26 @@ mod tests {
             "[[entities]]\nname = \"constant\"\nsql = \"entities/constant.sql\"\nkey = [\"id\"]\nmax_rows = 1\n",
         )
         .unwrap();
-        std::fs::write(dir.path().join("entities/constant.sql"), "SELECT 1 AS id").unwrap();
+        // A shape `dev` would start: a real table, and SQL the lowerer accepts (#1590).
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/t.json"),
+            r#"[{"type":"event","name":"Seen","anonymous":false,"inputs":[
+                {"name":"who","type":"address","indexed":true}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("nuthatch.toml"),
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x00000000000000000000000000000000000000aa\"\n\
+             abi = \"abis/t.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/constant.sql"),
+            "SELECT who AS id, count(*) AS n FROM t__seen GROUP BY who",
+        )
+        .unwrap();
 
         let result = check(CheckArgs {
             name: None,

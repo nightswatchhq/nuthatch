@@ -247,6 +247,8 @@ rpc_urls = ["https://…"]
 max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048)
 default_tenant = "acme"       # optional; the tenant a mount belongs to when it does not say
                               # (default "default"). Opaque - nuthatch refcounts it, nothing more.
+suspended = ["usdc"]          # runtime state: mounts suspended over the admin API. Kept on disk,
+                              # neither indexed nor served (503) until `POST /_admin/resume/<name>`.
 
 [[mounts]]                    # what is mounted; `nests = [...]` is gone
 alias = "usdc"
@@ -487,9 +489,11 @@ alias = "usdc"        # the same alias is fine - it is unique WITHIN a tenant
 nid = "9f2c…"         # same nest, one dataset, one backfill
 ```
 
-**Routes carry the tenant only when there is more than one.** One tenant → `/usdc/…`, exactly as
-today. Two or more → `/acme/usdc/…` and `/globex/usdc/…`. Nobody running a single-tenant runtime ever
-types the word, and their URLs never move.
+**Routes carry the tenant unless it is the default one.** A mount of the default tenant (`default`, or
+`[runtime] default_tenant`) serves at `/usdc/…`; any other tenant's at `/acme/usdc/…`. Each mount's
+route depends on its own tenant alone (3.13.1), so adding or removing another tenant never moves it,
+before or after a restart. A runtime whose mounts all belong to the default tenant never shows the
+word in a URL.
 
 Both `tenant` and `alias` are path segments, so both are restricted to letters, digits, `_` and `-`.
 Opaque means nuthatch does not interpret it, not that it may contain `..`.

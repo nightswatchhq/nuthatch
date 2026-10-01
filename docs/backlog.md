@@ -73,6 +73,10 @@ gh issue list --label verification                            # claims owing a m
 Sorting by priority beats filtering by `parked`: an issue is actionable when it has a `p*` label.
 `grep -v parked` used to be the recommendation here only because priorities did not exist yet.
 
+The issues carrying `parked` on 2026-09-28 were closed that day. The decisions are in
+[parked-closed.md](parked-closed.md). An open `parked` issue after that date is a new deferral, and
+the label still means what the table above says.
+
 ## Standing decisions - do not re-raise these as blockers
 
 These are settled. They are recorded here rather than in an issue because the answer is "no, and here

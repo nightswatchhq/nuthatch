@@ -179,6 +179,14 @@ pub async fn init(args: InitArgs) -> Result<()> {
     println!("next:  nuthatch dev{}", dir_hint(&args.dir));
     println!("       nuthatch mcp   (expose this index to a coding agent over MCP)");
     print_undetected_start_blocks(&undetected);
+    if let Some(note) = chains::keyless_caveat(
+        &chain.name,
+        &config.nest.rpc_urls,
+        config.nest.block_timestamps,
+    ) {
+        println!();
+        println!("note:  {note}");
+    }
     Ok(())
 }
 

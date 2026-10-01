@@ -248,9 +248,10 @@ async fn bring_up_mounted_runtime(
 
     let mounts = MountTable::load(root).unwrap();
     let datasets = mounts.datasets(root);
-    let multi_tenant = mounts.is_multi_tenant();
+    let default_tenant_owned = mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
     assert!(
-        !multi_tenant,
+        !mounts.is_multi_tenant(),
         "a single mount must not become multi-tenant - route_key would gain a tenant segment"
     );
 
@@ -271,9 +272,9 @@ async fn bring_up_mounted_runtime(
 
     let health = Arc::new(RuntimeHealth::new());
     for ds in &datasets {
-        health.register(&ds.canonical().route_key(multi_tenant), "arbitrum-one");
+        health.register(&ds.canonical().route_key(default_tenant), "arbitrum-one");
     }
-    let mounted = runtime::load_mounted(root, &datasets, multi_tenant).expect("load_mounted");
+    let mounted = runtime::load_mounted(root, &datasets, default_tenant).expect("load_mounted");
     let cursor = indexer::spawn_runtime(
         tape.clone(),
         mounted,
@@ -304,7 +305,7 @@ async fn bring_up_mounted_runtime(
         cursor.states,
         &health,
         &mut estimates,
-        multi_tenant,
+        default_tenant,
     );
 
     let nid = datasets[0]
@@ -357,7 +358,78 @@ async fn a_mounted_runtime_resolves_the_alias_prefix_and_the_query_succeeds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_solo_runtime_stays_unprefixed() {
     let root = tempfile::tempdir().unwrap();
-    let cfg = scaffold_nest(root.path(), "usdc", USDC);
+    let addr = bring_up_solo_runtime(root.path()).await;
+
+    let (status, output) = run_sql(root.path(), &format!("http://{addr}"), "SELECT 1 AS n").await;
+
+    assert!(
+        status.success(),
+        "a solo runtime serves /sql at the root and must stay unprefixed, got:\n{output}"
+    );
+    assert!(
+        output.contains('n') && output.contains('1'),
+        "and the answer must be the query's, got:\n{output}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Column order (issue #1609)
+// ---------------------------------------------------------------------------
+
+const ORDERED: &str = "SELECT 1 AS z, 2 AS a, 3 AS m";
+
+/// The table's header and first row, as cells.
+fn table_head(output: &str) -> (Vec<String>, Vec<String>) {
+    let cells = |line: &str| line.split('|').map(|c| c.trim().to_string()).collect();
+    let mut lines = output.lines();
+    let header = cells(lines.next().unwrap_or_default());
+    let row = cells(lines.nth(1).unwrap_or_default());
+    (header, row)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_answer_prints_the_querys_column_order() {
+    let instance = serving_instance().await;
+    let nest = tempfile::tempdir().unwrap();
+    drop(nuthatch::store::Store::open(&nest.path().join("nuthatch.redb")).unwrap());
+
+    let (status, output) = run_sql(nest.path(), &instance.url, ORDERED).await;
+
+    assert!(status.success(), "{output}");
+    assert_eq!(instance.hits.load(Ordering::SeqCst), 0, "{output}");
+    assert_eq!(
+        table_head(&output),
+        (
+            vec!["z".into(), "a".into(), "m".into()],
+            vec!["1".into(), "2".into(), "3".into()]
+        ),
+        "{output}"
+    );
+}
+
+/// Through the real router, so the order has to cross the `/sql` response to survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_over_http_prints_the_querys_column_order() {
+    let root = tempfile::tempdir().unwrap();
+    let addr = bring_up_solo_runtime(root.path()).await;
+
+    let (status, output) = run_sql(root.path(), &format!("http://{addr}"), ORDERED).await;
+
+    assert!(status.success(), "{output}");
+    assert_eq!(
+        table_head(&output),
+        (
+            vec!["z".into(), "a".into(), "m".into()],
+            vec!["1".into(), "2".into(), "3".into()]
+        ),
+        "{output}"
+    );
+}
+
+/// A solo (`nuthatch.toml`) nest indexed to block 1 and served by the real router, which holds its
+/// store open so the CLI is forced onto the HTTP path.
+async fn bring_up_solo_runtime(root: &Path) -> std::net::SocketAddr {
+    let cfg = scaffold_nest(root, "usdc", USDC);
 
     let tape = Arc::new(TapeSource::new());
     let a1 = account(1);
@@ -376,7 +448,7 @@ async fn a_solo_runtime_stays_unprefixed() {
 
     let rt = indexer::spawn_nest(
         tape.clone(),
-        root.path().to_path_buf(),
+        root.to_path_buf(),
         cfg,
         None,
         false,
@@ -401,15 +473,5 @@ async fn a_solo_runtime_stays_unprefixed() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-
-    let (status, output) = run_sql(root.path(), &format!("http://{addr}"), "SELECT 1 AS n").await;
-
-    assert!(
-        status.success(),
-        "a solo runtime serves /sql at the root and must stay unprefixed, got:\n{output}"
-    );
-    assert!(
-        output.contains('n') && output.contains('1'),
-        "and the answer must be the query's, got:\n{output}"
-    );
+    addr
 }

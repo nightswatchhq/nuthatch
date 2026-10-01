@@ -6,9 +6,9 @@
 //! names the engine.
 
 use crate::engine::{
-    value_bytes, Died, Engine, FactWindow, Interrupt, Session, SQL_MAX_RESULT_BYTES,
+    value_bytes, Collected, Died, Engine, FactWindow, Interrupt, Session, SQL_MAX_RESULT_BYTES,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use duckdb::arrow::datatypes::DataType;
 use duckdb::types::{Value as DuckValue, ValueRef};
 use duckdb::{Config, Connection};
@@ -23,24 +23,26 @@ pub(crate) struct DuckEngine;
 impl Engine for DuckEngine {
     fn open(&self, dir: &Path) -> Result<Box<dyn Session>> {
         let (conn, spill) = open_locked_duckdb(dir)?;
+        let cap = crate::analytics_budget::spill_cap_bytes(&crate::analytics_budget::from_env());
         Ok(Box::new(DuckSession {
             conn,
-            _spill: Some(spill),
+            spill: Some((spill, cap)),
         }))
     }
 
     fn open_bare(&self) -> Result<Box<dyn Session>> {
         let conn = Connection::open_in_memory()?;
         register_extensions(&conn)?;
-        Ok(Box::new(DuckSession { conn, _spill: None }))
+        Ok(Box::new(DuckSession { conn, spill: None }))
     }
 }
 
 pub(crate) struct DuckSession {
     conn: Connection,
-    /// This instance's private spill directory, removed when the session is dropped (#1165). Held
-    /// here so its lifetime is exactly the connection's. A bare session has none.
-    _spill: Option<SpillDir>,
+    /// This instance's private spill directory and its cap in bytes. The directory is removed when
+    /// the session is dropped (#1165), so its lifetime is exactly the connection's. A bare session
+    /// has none.
+    spill: Option<(SpillDir, u64)>,
 }
 
 impl Interrupt for duckdb::InterruptHandle {
@@ -53,7 +55,7 @@ impl Session for DuckSession {
     fn execute(&self, sql: &str) -> Result<()> {
         Session::execute(&self.conn, sql)
     }
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
         Session::collect(&self.conn, sql, cap)
     }
     fn for_each_row(&self, sql: &str, f: &mut dyn FnMut(&[Value]) -> Result<()>) -> Result<()> {
@@ -89,11 +91,25 @@ impl Session for DuckSession {
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
         Session::interrupt_handle(&self.conn)
     }
+    fn spill_limit(&self) -> Option<(PathBuf, u64)> {
+        self.spill.as_ref().map(|(dir, cap)| (dir.0.clone(), *cap))
+    }
     fn cold_scan_operators(&self, sql: &str) -> Result<u64> {
         self.conn.cold_scan_operators(sql)
     }
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
         self.conn.load_hot(table, rows)
+    }
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        self.conn.drop_relation(name)
+    }
+    fn load_relation(
+        &self,
+        table: &str,
+        cols: &[(String, &'static str)],
+        rows: &[&Value],
+    ) -> Result<()> {
+        self.conn.load_relation(table, cols, rows)
     }
     fn bind_facts(
         &self,
@@ -126,7 +142,7 @@ impl Session for Connection {
         Ok(self.execute_batch(sql)?)
     }
 
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
         collect(self, sql, cap)
     }
 
@@ -231,10 +247,10 @@ impl Session for Connection {
                 "QUALIFIED_SCHEMA" => surveys = true,
                 // A DuckDB *replacement scan* (`FROM '/x.parquet'`) parses as a BASE_TABLE whose
                 // name is the path, so the AST alone cannot tell it from a real table - the name has
-                // to be checked.
+                // to be checked. A path needs `/`, `.` or `:`; a non-ASCII name (`abéé`) needs none.
                 "BASE_TABLE"
                     if name.is_empty()
-                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                        || !name.chars().all(|c| c.is_alphanumeric() || c == '_') =>
                 {
                     bad = Some(format!(
                         "`{name}` is not a table name - a quoted path in table position reads a file"
@@ -281,8 +297,28 @@ impl Session for Connection {
         physical_parquet_scans(&plan)
     }
 
+    fn drop_relation(&self, name: &str) -> Result<()> {
+        self.execute_batch(&format!(
+            "DROP VIEW IF EXISTS \"{}\"",
+            name.replace('"', "\"\"")
+        ))?;
+        Ok(())
+    }
+
+    fn load_relation(
+        &self,
+        table: &str,
+        cols: &[(String, &'static str)],
+        rows: &[&Value],
+    ) -> Result<()> {
+        if cols.is_empty() {
+            return load_hot_temp(self, &hot_table(table), rows, true);
+        }
+        load_declared_relation(self, &hot_table(table), cols, rows)
+    }
+
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
-        load_hot_temp(self, &hot_table(table), rows)
+        load_hot_temp(self, &hot_table(table), rows, false)
     }
 
     fn bind_facts(
@@ -485,7 +521,38 @@ pub(crate) static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 fn spill_parent() -> PathBuf {
     crate::analytics_budget::from_env()
         .temp_directory
-        .unwrap_or_else(std::env::temp_dir)
+        .unwrap_or_else(default_spill_parent)
+}
+
+/// Where spill goes unless `analytics.temp_directory` says. Not the process temp dir on Linux: that is
+/// often a tmpfs, where spill is RAM the per-cursor budget does not count (Jules on #1583). The user's
+/// cache directory is on disk; the temp dir remains the fallback where there is no home.
+fn default_spill_parent() -> PathBuf {
+    spill_parent_for(
+        cfg!(target_os = "linux"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn spill_parent_for(
+    linux: bool,
+    xdg_cache: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if linux {
+        let cache = xdg_cache
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                home.filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".cache"))
+            });
+        if let Some(cache) = cache {
+            return cache.join("nuthatch");
+        }
+    }
+    std::env::temp_dir()
 }
 
 /// A directory no other DuckDB instance in this process (or any other) will write to.
@@ -501,11 +568,11 @@ fn spill_parent() -> PathBuf {
 pub(crate) fn new_spill_dir() -> Result<SpillDir> {
     static SWEPT: std::sync::Once = std::sync::Once::new();
     SWEPT.call_once(|| {
+        // The temp dir too: it was the default parent before 3.13.2, and may hold dead ones.
         sweep_dead_spill_dirs(&std::env::temp_dir());
-        if let Some(ref p) = crate::analytics_budget::from_env().temp_directory {
-            if *p != std::env::temp_dir() {
-                sweep_dead_spill_dirs(p);
-            }
+        let parent = spill_parent();
+        if parent != std::env::temp_dir() {
+            sweep_dead_spill_dirs(&parent);
         }
     });
     let parent = spill_parent();
@@ -571,11 +638,11 @@ fn open_locked_duckdb(dir: &Path) -> Result<(Connection, SpillDir)> {
         // shared default - and before `lock_configuration`, which freezes it (#1165).
         .with("temp_directory", spill.0.display().to_string())
         .context("duckdb temp_directory")?;
-    if let Some(ref size) = resources.max_temp_size {
-        config = config
-            .with("max_temp_directory_size", size)
-            .context("duckdb max_temp_directory_size")?;
-    }
+    // DuckDB's own limit, where it holds; the `/sql` guard enforces the same cap where it does not.
+    let cap_mb = crate::analytics_budget::spill_cap_bytes(&resources) / (1024 * 1024);
+    config = config
+        .with("max_temp_directory_size", format!("{cap_mb}MB"))
+        .context("duckdb max_temp_directory_size")?;
     let conn = Connection::open_in_memory_with_flags(config).context("open DuckDB")?;
     register_extensions(&conn)?;
     // Every build (#1152, then #1165). The bundled DuckDB's `D_ASSERT(min_val <= input)` in compressed
@@ -672,7 +739,7 @@ pub(crate) fn physical_parquet_scans(plan: &Value) -> Result<u64> {
 /// i.e. more than `n` rows were available); the caller then truncates back to `n`. `cap = None`
 /// materialises every row. Row materialisation is Rust-side and escapes DuckDB's own memory limit,
 /// so the cap is what actually bounds a `SELECT *` result buffer.
-fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
     let mut stmt = conn
         .prepare(sql)
         .context("failed to prepare query")
@@ -703,7 +770,7 @@ fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Valu
 }
 
 /// Materialise an executed statement's rows as JSON, under the caps `collect` documents.
-fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<Collected, Died> {
     // Column metadata is only materialised once the statement has executed - read it off the
     // executed result, not the prepared statement.
     let column_names: Vec<String> = rows
@@ -721,6 +788,7 @@ fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<(Vec<Value>, 
     let byte_cap = cap.map(|_| SQL_MAX_RESULT_BYTES);
     let mut out = Vec::new();
     let mut bytes = 0usize;
+    let mut truncated = false;
     while let Some(row) = rows
         .next()
         .context("row read failed")
@@ -735,14 +803,16 @@ fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<(Vec<Value>, 
             obj.insert(name.clone(), v);
         }
         out.push(Value::Object(obj));
-        if hard.is_some_and(|h| out.len() >= h) {
-            return Ok((out, true));
-        }
-        if byte_cap.is_some_and(|max| bytes >= max) {
-            return Ok((out, true));
+        if hard.is_some_and(|h| out.len() >= h) || byte_cap.is_some_and(|max| bytes >= max) {
+            truncated = true;
+            break;
         }
     }
-    Ok((out, false))
+    Ok(Collected {
+        rows: out,
+        columns: column_names,
+        truncated,
+    })
 }
 
 /// `duckdb-rs` currently materialises a scaled `DECIMAL(38, s)` through
@@ -798,7 +868,11 @@ fn quote_identifier(name: &str) -> String {
 /// exactly how `seal::rows_to_batch` derives the Parquet schema - so no `schema.json` is required.
 /// Value marshalling mirrors seal exactly: counter columns are `u64` (0 if absent), every other column
 /// is the JSON string as-is, or the JSON value stringified, or NULL when absent/null.
-fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value]) -> Result<()> {
+///
+/// `typed` is a maintained relation's load: a column whose values are all JSON integers is `HUGEINT`
+/// (the cell is an `i128`) and one whose values are all booleans is `BOOLEAN`, so `sum(n)` over a
+/// `count(*)` works. Event tables keep their text columns, which must match the sealed Parquet.
+fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value], typed: bool) -> Result<()> {
     let mut columns: BTreeSet<String> = BTreeSet::new();
     for r in rows {
         if let Some(obj) = r.as_object() {
@@ -809,9 +883,20 @@ fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value]) -> Result<()> {
     if columns.is_empty() {
         bail!("hot rows have no columns");
     }
+    let types: Vec<&'static str> = columns
+        .iter()
+        .map(|c| {
+            if typed {
+                relation_col_type(rows, c)
+            } else {
+                crate::analytics::hot_col_type(c)
+            }
+        })
+        .collect();
     let coldefs: Vec<String> = columns
         .iter()
-        .map(|c| format!("\"{c}\" {}", crate::analytics::hot_col_type(c)))
+        .zip(&types)
+        .map(|(c, t)| format!("\"{c}\" {t}"))
         .collect();
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS \"{name}\"; CREATE TEMP TABLE \"{name}\" ({})",
@@ -821,13 +906,97 @@ fn load_hot_temp(conn: &Connection, name: &str, rows: &[&Value]) -> Result<()> {
     for row in rows {
         let vals: Vec<DuckValue> = columns
             .iter()
-            .map(|c| json_to_duck(row.get(c), c))
+            .zip(&types)
+            .map(|(c, t)| match (*t, row.get(c)) {
+                (_, None | Some(Value::Null)) if typed => DuckValue::Null,
+                ("HUGEINT", Some(v)) => v
+                    .to_string()
+                    .parse::<i128>()
+                    .map_or(DuckValue::Null, DuckValue::HugeInt),
+                ("BOOLEAN", Some(v)) => v.as_bool().map_or(DuckValue::Null, DuckValue::Boolean),
+                // Not the event converter: it types by column name, and would read a relation's text
+                // `log_index` as a counter.
+                (_, Some(Value::String(s))) if typed => DuckValue::Text(s.clone()),
+                (_, Some(v)) if typed => DuckValue::Text(v.to_string()),
+                _ => json_to_duck(row.get(c), c),
+            })
             .collect();
         let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
         app.append_row(refs.as_slice())?;
     }
     app.flush()?;
     Ok(())
+}
+
+/// A maintained relation with the columns and types its plan declares (#1598): it exists with no
+/// rows, and a column keeps its type whatever its values, where typing by cells turned a sum that
+/// outgrew a JSON number into text.
+fn load_declared_relation(
+    conn: &Connection,
+    name: &str,
+    cols: &[(String, &'static str)],
+    rows: &[&Value],
+) -> Result<()> {
+    // Every row is converted before the table is touched, so a row that does not match leaves no
+    // empty or partial table behind.
+    let mut converted: Vec<Vec<DuckValue>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let vals: Vec<DuckValue> = cols
+            .iter()
+            .map(|(c, t)| match (*t, row.get(c)) {
+                (_, None | Some(Value::Null)) => Ok(DuckValue::Null),
+                ("HUGEINT", Some(v)) => {
+                    let text = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    text.parse::<i128>()
+                        .map(DuckValue::HugeInt)
+                        .map_err(|_| anyhow!("{c} = {text} is not the integer its plan declares"))
+                }
+                ("BOOLEAN", Some(v)) => v
+                    .as_bool()
+                    .map(DuckValue::Boolean)
+                    .ok_or_else(|| anyhow!("{c} = {v} is not the boolean its plan declares")),
+                (_, Some(Value::String(s))) => Ok(DuckValue::Text(s.clone())),
+                (_, Some(v)) => Ok(DuckValue::Text(v.to_string())),
+            })
+            .collect::<Result<_>>()?;
+        converted.push(vals);
+    }
+    let coldefs: Vec<String> = cols.iter().map(|(c, t)| format!("\"{c}\" {t}")).collect();
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS \"{name}\"; CREATE TEMP TABLE \"{name}\" ({})",
+        coldefs.join(", ")
+    ))?;
+    let mut app = conn.appender(name)?;
+    for vals in &converted {
+        let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+        app.append_row(refs.as_slice())?;
+    }
+    app.flush()?;
+    Ok(())
+}
+
+/// A maintained relation's column type, from its non-null cells.
+fn relation_col_type(rows: &[&Value], col: &str) -> &'static str {
+    let cells: Vec<&Value> = rows
+        .iter()
+        .filter_map(|r| r.get(col))
+        .filter(|v| !v.is_null())
+        .collect();
+    if cells.is_empty() {
+        "VARCHAR"
+    } else if cells
+        .iter()
+        .all(|v| v.is_number() && v.to_string().parse::<i128>().is_ok())
+    {
+        "HUGEINT"
+    } else if cells.iter().all(|v| v.is_boolean()) {
+        "BOOLEAN"
+    } else {
+        "VARCHAR"
+    }
 }
 
 /// One JSON cell → a DuckDB value, mirroring `seal::rows_to_batch`'s marshalling for a matching schema.
@@ -948,8 +1117,45 @@ mod tests {
     /// An unconfigured process still opens DuckDB at today's 512 MB / 2 threads. Raising the permit
     /// count no longer silently shrinks the per-connection ceiling: that product is the startup
     /// validator's job (RFC-0047 C4).
+    /// Jules on #1583: on Linux the temp dir is often a tmpfs, where spill is RAM outside the budget.
+    #[test]
+    fn spill_defaults_to_the_cache_dir_on_linux_and_the_temp_dir_without_a_home() {
+        let s = |x: &str| Some(std::ffi::OsString::from(x));
+        assert_eq!(
+            spill_parent_for(true, s("/x"), s("/h")),
+            PathBuf::from("/x/nuthatch")
+        );
+        assert_eq!(
+            spill_parent_for(true, None, s("/h")),
+            PathBuf::from("/h/.cache/nuthatch")
+        );
+        assert_eq!(spill_parent_for(true, s(""), None), std::env::temp_dir());
+        assert_eq!(
+            spill_parent_for(false, s("/x"), s("/h")),
+            std::env::temp_dir()
+        );
+    }
+
+    #[test]
+    fn the_security_walk_takes_a_non_ascii_name_and_still_refuses_a_path() {
+        let d = tempfile::tempdir().unwrap();
+        let (conn, _spill) = open_locked_duckdb(d.path()).unwrap();
+        let cte = "WITH abéé AS (SELECT 1 AS x) SELECT x FROM abéé";
+        assert!(matches!(Session::reach(&conn, cte), Some(Ok(_))), "{cte}");
+        for q in [
+            "SELECT * FROM '/x.parquet'",
+            "SELECT * FROM 'dé/x.csv'",
+            "SELECT * FROM 'é.json'",
+        ] {
+            assert!(matches!(Session::reach(&conn, q), Some(Err(_))), "{q}");
+        }
+    }
+
     #[test]
     fn unconfigured_duckdb_still_opens_at_todays_walls() {
+        let _env = crate::analytics_budget::tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let resources = crate::analytics_budget::from_env();
         assert_eq!(resources.memory_limit_mb, 512);
         assert_eq!(resources.threads, 2);

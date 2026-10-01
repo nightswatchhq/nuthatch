@@ -83,6 +83,7 @@ pub mod mcp;
 pub mod metadata;
 pub mod metrics;
 pub mod migrate;
+pub mod mount_jobs;
 pub mod offchain;
 pub mod pack;
 /// The Postgres hot store (RFC-0022 slice 2). Feature-gated so the default build stays a single

@@ -10,7 +10,7 @@
 //! The binary stays single-file: DuckDB is statically bundled. Memory is capped so an analytical
 //! query can't blow the embedded-mode RAM budget.
 
-use crate::engine::{Died, Engine, Interrupt, Session};
+use crate::engine::{Collected, Died, Engine, Interrupt, Session};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 #[cfg(test)]
@@ -257,6 +257,55 @@ impl std::fmt::Display for QueryBudgetExceeded {
 
 impl std::error::Error for QueryBudgetExceeded {}
 
+/// A query the guard stopped for spilling more than its connection's cap to disk (or to a tmpfs,
+/// which is RAM). Its own type so `/sql` answers 507 with the cap, rather than the timeout's 504.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuerySpillExceeded {
+    pub cap_bytes: u64,
+}
+
+impl std::fmt::Display for QuerySpillExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "query spilled more than {} MB to temporary storage on the read-only SQL surface; \
+             narrow it, or raise analytics.max_temp_size",
+            self.cap_bytes / (1024 * 1024)
+        )
+    }
+}
+
+impl std::error::Error for QuerySpillExceeded {}
+
+/// How often the `/sql` watchdog measures a running query's spill directory.
+const SPILL_POLL: Duration = Duration::from_millis(250);
+
+/// The error for a query the watchdog interrupted: the spill cap when that was what it hit, else the
+/// deadline.
+fn stopped(guard: Option<QueryGuard>, spilled: &AtomicU64) -> anyhow::Error {
+    match spilled.load(Ordering::SeqCst) {
+        0 => QueryBudgetExceeded {
+            secs: guard.map(|g| g.timeout.as_secs()).unwrap_or(0),
+        }
+        .into(),
+        cap_bytes => QuerySpillExceeded { cap_bytes }.into(),
+    }
+}
+
+/// Bytes allocated under a spill directory, counted by blocks so a sparse file is not overcounted.
+fn spilled_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.blocks().saturating_mul(512))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
 /// interrupting the running DuckDB query) and a cap on materialised rows. Trusted internal callers
 /// (`net_balances`, `get_row`) run *unguarded* - their SQL is registry-built, never user text, and
@@ -306,6 +355,9 @@ pub struct QueryGuard {
 #[derive(Debug, Default, Clone)]
 pub struct QueryOutput {
     pub rows: Vec<Value>,
+    /// The statement's columns in its projection order (#1609). Each row is a `serde_json::Map`,
+    /// which sorts its keys, so this is the only place that order survives.
+    pub columns: Vec<String>,
     pub truncated: bool,
     pub degraded_tables: std::collections::BTreeSet<String>,
     pub tip_unavailable: bool,
@@ -563,7 +615,15 @@ pub fn degraded_tables(
 /// Run a read-only query to completion. Only SELECT/WITH statements are accepted - this is a query
 /// surface, not a mutation surface. Unguarded: for trusted, registry-built SQL that must finish.
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
+    #[cfg(test)]
+    QUERIES.with(|n| n.set(n.get() + 1));
     Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[], None, None)?.rows)
+}
+
+// How many trusted queries this thread has run, so a test can hold a point read to its count (#1574).
+#[cfg(test)]
+thread_local! {
+    static QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Run a trusted read-only query over **only the segments finalized at/below `sealed_through`** (the
@@ -906,7 +966,7 @@ fn run(
     };
     if vanished {
         if let Some(secs) = timed_out(guard, deadline) {
-            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+            return Err(QueryBudgetExceeded { secs }.into());
         }
         tracing::info!(
             "a segment the plan named was gone by execution - a seal replaced it under the query \
@@ -974,12 +1034,12 @@ fn run(
     // skipping the sweep and returning `e`, which (for a guard-bound caller) could otherwise read as
     // an ordinary query error rather than the timeout it actually is.
     if let Some(secs) = timed_out(guard, deadline) {
-        bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+        return Err(QueryBudgetExceeded { secs }.into());
     }
     let corrupt = crate::seal::segments_failing_verification(dir, &tables, deadline);
     if corrupt.is_empty() {
         if let Some(secs) = timed_out(guard, deadline) {
-            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+            return Err(QueryBudgetExceeded { secs }.into());
         }
         return Err(e);
     }
@@ -1097,7 +1157,7 @@ fn attempt(
     }
     let mut slot = slot.expect("just inserted");
     slot.last_used = DUCK_USE.fetch_add(1, Ordering::Relaxed);
-    let (referenced, offchain, degraded_tables, interrupted, outcome, cap, scan) = {
+    let (referenced, offchain, degraded_tables, interrupted, spilled, outcome, cap, scan) = {
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
         let walked = reject_unknown_table_refs(session, sql)?;
@@ -1175,17 +1235,36 @@ fn attempt(
         // (#476) - `run` computes `deadline` once and threads it through both calls. A deadline already in
         // the past (the sweep between attempts ran long) makes `recv_timeout` fire immediately.
         let interrupted = Arc::new(AtomicBool::new(false));
+        // The cap, set before `interrupted`, when it was the spill and not the deadline that stopped it.
+        let spilled = Arc::new(AtomicU64::new(0));
         let watchdog = guard.zip(deadline).map(|(_, d)| {
             let handle = session.interrupt_handle();
-            let flag = interrupted.clone();
+            let spill = session.spill_limit();
+            let (flag, over) = (interrupted.clone(), spilled.clone());
             let (tx, rx) = mpsc::channel::<()>();
-            let join = std::thread::spawn(move || {
+            let join = std::thread::spawn(move || loop {
                 let remaining = d.saturating_duration_since(Instant::now());
+                let tick = match spill {
+                    Some(_) => remaining.min(SPILL_POLL),
+                    None => remaining,
+                };
                 // Only a genuine timeout interrupts; a value (normal completion) or a dropped sender
                 // (panic) leaves the query alone.
-                if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(remaining) {
+                if !matches!(rx.recv_timeout(tick), Err(mpsc::RecvTimeoutError::Timeout)) {
+                    break;
+                }
+                if let Some((dir, cap)) = &spill {
+                    if spilled_bytes(dir) > *cap {
+                        over.store(*cap, Ordering::SeqCst);
+                        flag.store(true, Ordering::SeqCst);
+                        handle.interrupt();
+                        break;
+                    }
+                }
+                if Instant::now() >= d {
                     flag.store(true, Ordering::SeqCst);
                     handle.interrupt();
+                    break;
                 }
             });
             (tx, join)
@@ -1235,6 +1314,7 @@ fn attempt(
             offchain,
             degraded_tables,
             interrupted,
+            spilled,
             outcome,
             cap,
             scan,
@@ -1248,8 +1328,7 @@ fn attempt(
 
     let scan = match scan {
         Some(Err(_)) if interrupted.load(Ordering::SeqCst) => {
-            let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-            bail!("query exceeded the {secs}s time budget on the read-only SQL surface");
+            return Err(stopped(guard, &spilled));
         }
         Some(Err(e)) => return Err(e),
         Some(Ok(bound)) => Some(bound),
@@ -1264,7 +1343,11 @@ fn attempt(
             ..Default::default()
         }));
     };
-    let (mut rows, over_cap) = match outcome {
+    let Collected {
+        mut rows,
+        columns,
+        truncated: over_cap,
+    } = match outcome {
         Ok(v) => v,
         // #529: the watchdog's `interrupt()` cancels whatever DuckDB phase is currently running, not
         // just an in-flight execute - a query that gets no further than `conn.prepare` before the
@@ -1276,15 +1359,13 @@ fn attempt(
         // internal DuckDB error string - the same class of bug this guard exists to prevent.
         Err(Died::Binding(e)) => {
             if interrupted.load(Ordering::SeqCst) {
-                let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-                return Err(QueryBudgetExceeded { secs }.into());
+                return Err(stopped(guard, &spilled));
             }
             return Err(e);
         }
         Err(Died::Executing(e)) => {
             if interrupted.load(Ordering::SeqCst) {
-                let secs = guard.map(|g| g.timeout.as_secs()).unwrap_or(0);
-                return Err(QueryBudgetExceeded { secs }.into());
+                return Err(stopped(guard, &spilled));
             }
             // Handed back rather than returned: the caller decides whether a corrupt segment explains
             // it and is worth one reduced retry (#433). The tables ride along because they come from
@@ -1306,6 +1387,7 @@ fn attempt(
     };
     Ok(Attempt::Ok(QueryOutput {
         rows,
+        columns,
         truncated,
         degraded_tables,
         tip_unavailable: false,
@@ -1443,8 +1525,11 @@ fn strip_all_sql_comments(sql: &str) -> String {
             i += 2;
             out.push(' ');
         } else {
-            out.push(b[i] as char);
-            i += 1;
+            // Whole characters: a byte pushed as a char turns `é` into two, and every byte offset the
+            // checks downstream take stops lining up with the text.
+            let c = sql[i..].chars().next().expect("i is on a char boundary");
+            out.push(c);
+            i += c.len_utf8();
         }
     }
     out
@@ -1486,11 +1571,9 @@ fn reject_with_prefixed_dml(sql: &str) -> Result<()> {
 /// True when `s` opens with `kw` as a whole SQL word (case-insensitive, not `without` for `with`).
 fn sql_keyword_at(s: &str, kw: &str) -> bool {
     let s = s.trim_start();
-    if s.len() < kw.len() {
-        return false;
-    }
-    if !s[..kw.len()].eq_ignore_ascii_case(kw) {
-        return false;
+    match s.get(..kw.len()) {
+        Some(head) if head.eq_ignore_ascii_case(kw) => {}
+        _ => return false,
     }
     match s[kw.len()..].chars().next() {
         None => true,
@@ -1499,7 +1582,8 @@ fn sql_keyword_at(s: &str, kw: &str) -> bool {
 }
 
 fn sql_ident_cont(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    // DuckDB takes unquoted non-ASCII identifiers (`abéé`), so this must too.
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Consume `WITH [RECURSIVE] name AS [(…)] [, name AS (…)]*` and return the remainder.
@@ -2373,15 +2457,32 @@ fn define_children_views(session: &dyn Session, dir: &Path) {
 /// store has already pruned it. Integers are interpolated (not user text), so no injection surface.
 pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> {
     let manifest = crate::seal::load_manifest(dir)?;
-    for table in manifest.tables.keys() {
-        let sql = format!(
-            "SELECT * FROM \"{table}\" WHERE block_number = {block} AND log_index = {log_index} LIMIT 1"
-        );
-        if let Some(row) = query(dir, &sql)?.into_iter().next() {
-            return Ok(Some(row));
-        }
+    // The id names no table. Asking each in turn cost a query per table (#1574), so one probe finds
+    // the table and the row is then read from it alone, in the shape a single-table query gives.
+    let probe = manifest
+        .tables
+        .keys()
+        .map(|t| {
+            format!(
+                "SELECT '{}' AS t FROM \"{t}\" WHERE block_number = {block} AND log_index = {log_index}",
+                t.replace('\'', "''")
+            )
+        })
+        .collect::<Vec<_>>();
+    if probe.is_empty() {
+        return Ok(None);
     }
-    Ok(None)
+    let found = query(
+        dir,
+        &format!("{} ORDER BY t LIMIT 1", probe.join(" UNION ALL ")),
+    )?;
+    let Some(table) = found.first().and_then(|r| r["t"].as_str()) else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "SELECT * FROM \"{table}\" WHERE block_number = {block} AND log_index = {log_index} LIMIT 1"
+    );
+    Ok(query(dir, &sql)?.into_iter().next())
 }
 
 /// Expose each table's sealed segments as a read-only DuckDB view named after the table. Tables with
@@ -2573,6 +2674,15 @@ fn define_views_bound(
     if let Some(wanted) = wanted {
         tables.retain(|t| wanted.contains(&t.to_ascii_lowercase()));
     }
+    // The maintained relations, by the declaration that makes them so: their rows are typed from their
+    // own cells rather than loaded as event text (#1572).
+    let relations = declared_relations(dir);
+    // A pooled connection keeps the views an earlier request defined. An entity that has since
+    // faulted is left out of `hot`, and one whose rows fail to load is not rebound, so without this
+    // either would still answer from its old relation. Each is rebuilt below only if it loads.
+    for r in &relations {
+        let _ = session.drop_relation(r);
+    }
 
     for table in &tables {
         let cols = cols_of(table);
@@ -2681,8 +2791,20 @@ fn define_views_bound(
         // The hot tip: load this table's unsealed rows into a temp table, then union it in. Columns are
         // derived from the rows themselves (like the sealed Parquet, `seal::rows_to_batch`), so this
         // works with or without a `schema.json`. The `*_dec` derived columns still come from the schema.
-        let hot_loaded = !hot_rows.is_empty()
-            && match session.load_hot(table, &hot_rows) {
+        let relation = relations.contains(&table.to_ascii_lowercase());
+        // A relation with declared types exists empty: an entity with no rows yet is a table of none,
+        // not a missing one (#1598).
+        let declared_relation = if relation {
+            relation_types(dir, table)
+        } else {
+            Vec::new()
+        };
+        let hot_loaded = (!hot_rows.is_empty() || !declared_relation.is_empty())
+            && match if relation {
+                session.load_relation(table, &declared_relation, &hot_rows)
+            } else {
+                session.load_hot(table, &hot_rows)
+            } {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
@@ -2766,6 +2888,97 @@ fn table_scan(files: &[(PathBuf, u64)]) -> TableScan {
 
 /// The DuckDB column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
 /// columns are `UBIGINT`, everything else is stored as canonical text (`VARCHAR`).
+type HeldRelations = Mutex<std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>>;
+
+fn held_relations() -> &'static HeldRelations {
+    static HELD: OnceLock<HeldRelations> = OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// Record the entities a successful read of `dir/entities.toml` declared. Called by
+/// [`crate::entities::load`], so the read a nest starts from is the one its queries type by.
+pub(crate) fn hold_relations(dir: &Path, decls: &[crate::entities::EntityDecl]) {
+    let names = decls.iter().map(|e| e.name.to_ascii_lowercase()).collect();
+    held_relations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf(), names);
+}
+
+type HeldRelationTypes =
+    Mutex<std::collections::HashMap<(PathBuf, String), Vec<(String, &'static str)>>>;
+
+fn held_relation_types() -> &'static HeldRelationTypes {
+    static HELD: OnceLock<HeldRelationTypes> = OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// Record an entity's output columns with the types its plan gives them (#1598), so its relation
+/// exists before it holds a row and keeps one type whatever its values. A column whose type the plan
+/// cannot fix, a `CASE` over mixed branches for one, is text.
+pub(crate) fn hold_relation_types(
+    dir: &Path,
+    name: &str,
+    columns: &[String],
+    types: &[Option<crate::entity_expr::Type>],
+) {
+    use crate::entity_expr::Type;
+    let cols = columns
+        .iter()
+        .zip(types)
+        .map(|(c, t)| {
+            let ty = match t {
+                Some(Type::Int) => "HUGEINT",
+                Some(Type::Bool) => "BOOLEAN",
+                Some(Type::Str) | None => "VARCHAR",
+            };
+            (c.clone(), ty)
+        })
+        .collect();
+    held_relation_types()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((dir.to_path_buf(), name.to_ascii_lowercase()), cols);
+}
+
+/// The declared columns of `dir`'s relation `name`, or none when it was never started here.
+fn relation_types(dir: &Path, name: &str) -> Vec<(String, &'static str)> {
+    held_relation_types()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dir.to_path_buf(), name.to_ascii_lowercase()))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The entity names `entities.toml` declares in `dir`, lowercased, as last read successfully. A running
+/// nest's declarations cannot change without a restart (they are part of its content address), and its
+/// start read them, so a file an operator leaves half-edited does not turn its relations into text.
+fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
+    if let Some(names) = held_relations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(dir)
+    {
+        return names.clone();
+    }
+    match crate::entities::load(dir) {
+        Ok(decls) => decls
+            .into_iter()
+            .map(|e| e.name.to_ascii_lowercase())
+            .collect(),
+        // Never read successfully in this process, so no entity circuit is running from it: nothing
+        // here is a maintained relation to mistype.
+        Err(e) => {
+            tracing::warn!(
+                "{} could not be read: {e:#}",
+                dir.join("entities.toml").display()
+            );
+            Default::default()
+        }
+    }
+}
+
 pub(crate) fn hot_col_type(name: &str) -> &'static str {
     if matches!(
         name,
@@ -3218,7 +3431,12 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
     };
     // Base surface the views bind against. `u64::MAX` includes every sealed segment (or, on a fresh
     // nest, yields the empty typed views) so a view referencing `usdc__transfer` resolves.
-    let empty_hot = HotRows::new();
+    // Each entity that binds is an empty relation of its declared types, so a view over it checks
+    // exactly when `dev` would serve it (#1599).
+    let empty_hot: HotRows = crate::entities::hold_declared_relations(dir)
+        .into_iter()
+        .map(|name| (name, Vec::new()))
+        .collect();
     let _ = define_views(
         &*session,
         dir,
@@ -3687,7 +3905,7 @@ impl FoldEvaluator {
     }
 
     pub(crate) fn rows(&self, sql: &str) -> Result<Vec<Value>> {
-        Ok(self.session.collect(sql, None)?.0)
+        Ok(self.session.collect(sql, None)?.rows)
     }
 }
 
@@ -3769,6 +3987,78 @@ mod tests {
     };
     use duckdb::Connection;
 
+    /// #1598: an entity's relation takes the types its plan declares. It exists with no rows, and a
+    /// sum past what a JSON number holds stays an integer rather than becoming text.
+    #[test]
+    fn an_entity_relation_keeps_its_declared_types_empty_or_large() {
+        use crate::entity_expr::Type;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['k']\nmax_rows=10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT k, sum(v) AS n FROM t GROUP BY k",
+        )
+        .unwrap();
+        crate::entities::load(dir.path()).unwrap();
+        super::hold_relation_types(
+            dir.path(),
+            "totals",
+            &["k".into(), "n".into()],
+            &[Some(Type::Str), Some(Type::Int)],
+        );
+        let guard = || super::QueryGuard {
+            timeout: std::time::Duration::from_secs(10),
+            max_rows: 10,
+        };
+        let run = |rows: Vec<serde_json::Value>, sql: &str| {
+            let hot: super::HotRows = [("totals".to_string(), rows)].into_iter().collect();
+            super::query_hot_cold(dir.path(), sql, guard(), &hot, u64::MAX, &[])
+        };
+
+        let empty = run(Vec::new(), "SELECT count(*) AS c, sum(n) AS s FROM totals").unwrap();
+        assert_eq!(empty.rows[0]["c"], serde_json::json!(0), "{:?}", empty.rows);
+
+        // What `sql_cell` renders for an i128 beyond a JSON number: a string.
+        let big = serde_json::json!({"k": "a", "n": "1000000000000000000000000000000"});
+        let out = run(vec![big], "SELECT n + 1 AS m FROM totals").unwrap();
+        assert_eq!(
+            out.rows[0]["m"].to_string().trim_matches('"'),
+            "1000000000000000000000000000001",
+            "{:?}",
+            out.rows
+        );
+
+        // The cached session keeps the view the queries above defined. An entity that has since
+        // faulted is left out of `hot`, and must not answer from that view; nor may one whose rows
+        // do not match their declared types.
+        let hot: super::HotRows = Default::default();
+        let gone = super::query_hot_cold(
+            dir.path(),
+            "SELECT count(*) AS faulted FROM totals",
+            guard(),
+            &hot,
+            u64::MAX,
+            &[],
+        );
+        assert!(
+            gone.is_err(),
+            "a faulted entity answered: {:?}",
+            gone.map(|o| o.rows)
+        );
+        let bad = serde_json::json!({"k": "a", "n": "not an integer"});
+        let mistyped = run(vec![bad], "SELECT count(*) AS mistyped FROM totals");
+        assert!(
+            mistyped.is_err(),
+            "a mistyped load answered: {:?}",
+            mistyped.map(|o| o.rows)
+        );
+    }
+
     #[test]
     fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
         crate::engine::each_engine(
@@ -3791,10 +4081,11 @@ mod tests {
         .unwrap();
         // Each statement here selects one column: the ids, in the statement's own order.
         let ids = |sql: &str| -> Vec<String> {
-            let (rows, _) = conn
+            let rows = conn
                 .collect(sql, None)
                 .map_err(|e| anyhow::anyhow!("{e:?}"))
-                .unwrap();
+                .unwrap()
+                .rows;
             rows.iter()
                 .map(|r| {
                     r.as_object()
@@ -4335,6 +4626,7 @@ template="pool"
             r#"{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"5","block_number":10,"tx_hash":"0xt","log_index":0}"#.to_string(),
             r#"{"table":"usdc__transfer","from":"0xa","to":"0xc","value":"7","block_number":10,"tx_hash":"0xt","log_index":1}"#.to_string(),
             r#"{"table":"usdc__approval","owner":"0xa","spender":"0xd","value":"9","block_number":10,"tx_hash":"0xt","log_index":2}"#.to_string(),
+            r#"{"table":"usdc__zmint","to":"0xe","value":"3","block_number":10,"tx_hash":"0xt","log_index":3}"#.to_string(),
         ];
         crate::seal::seal_range(dir.path(), &entities, 10, 10).unwrap();
 
@@ -4349,6 +4641,21 @@ template="pool"
         assert_eq!(one["to"], Value::from("0xc"));
         let appr = get_row(dir.path(), 10, 2).unwrap().unwrap();
         assert_eq!(appr["spender"], Value::from("0xd"));
+
+        // #1574: one probe then one read, whichever table holds the row, not a query per table. The
+        // row is in the last of three tables, so asking each in turn would take three.
+        let queries = |f: &dyn Fn()| {
+            let before = QUERIES.with(|n| n.get());
+            f();
+            QUERIES.with(|n| n.get()) - before
+        };
+        let n = queries(&|| {
+            let last = get_row(dir.path(), 10, 3).unwrap().unwrap();
+            assert_eq!(last["to"], Value::from("0xe"));
+        });
+        assert_eq!(n, 2, "a point read in the last table");
+        let n = queries(&|| assert_eq!(get_row(dir.path(), 10, 4).unwrap(), None));
+        assert_eq!(n, 1, "a miss is the probe alone");
     }
 
     fn sealed_bytes(dir: &Path, table: &str) -> u64 {
@@ -6102,6 +6409,9 @@ template="pool"
             "WITH t AS NOT MATERIALIZED (SELECT 1 AS x) SELECT x FROM t",
             // INSERT is data, not a statement, when it lives in a string inside the CTE.
             "WITH t AS (SELECT 'INSERT' AS s) SELECT s FROM t",
+            // Non-ASCII after a keyword once sliced a character in half and answered 500.
+            "WITH abéé AS (SELECT 1 AS x) SELECT x FROM abéé",
+            "/* é */ WITH t AS (SELECT 'é' AS s) SELECT s FROM t",
             "SELECT 1",
         ] {
             assert!(
@@ -6119,6 +6429,8 @@ template="pool"
             "WITH t AS (SELECT 1 AS x) CREATE TABLE x AS SELECT 1",
             // Comments must not smuggle DML past the CTE list.
             "WITH t AS (SELECT 1 AS x) /* hi */ INSERT INTO t SELECT 1",
+            "WITH t AS (SELECT 1 AS x) /* é */ INSERT INTO t SELECT 1",
+            "WITH x AS (SELECT 1) aéé",
         ] {
             let err = reject_with_prefixed_dml(bad)
                 .expect_err(&format!("must be refused: {bad}"))
@@ -6518,6 +6830,19 @@ template="pool"
             },
         )
         .expect("a reduced table must still answer")
+    }
+
+    /// #1609: the projection order reaches the caller, including on an answer with no rows.
+    #[test]
+    fn a_result_names_its_columns_in_the_querys_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = cold(dir.path(), "SELECT 1 AS z, 2 AS a, 3 AS m");
+        assert_eq!(out.columns, ["z", "a", "m"]);
+        assert_eq!(out.rows, vec![serde_json::json!({"z": 1, "a": 2, "m": 3})]);
+
+        let empty = cold(dir.path(), "SELECT 1 AS z, 2 AS a WHERE false");
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.columns, ["z", "a"]);
     }
 
     /// **Issue #435, the control.** A nest whose segments are all intact must report **no**
@@ -7087,6 +7412,43 @@ template="pool"
     /// finish line to race across; one is already over before the sweep starts, the other has ample
     /// room regardless of load.
     #[test]
+    fn a_query_spilling_past_its_cap_is_stopped_by_the_guard() {
+        // DuckDB reports this cap and spills past it anyway: 1.3 GB in ten seconds on this query.
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(60),
+            max_rows: 10,
+        };
+        let started = Instant::now();
+        let result = {
+            let _env = crate::analytics_budget::tests::env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE, "64MB");
+            let r = query_hot_cold(
+                dir.path(),
+                "SELECT sum(i * j) FROM range(1000000000) a(i), range(1000000000) b(j)",
+                guard,
+                &HotRows::new(),
+                0,
+                &[],
+            );
+            std::env::remove_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE);
+            r
+        };
+        let err = result.expect_err("the cross join must not run to completion");
+        let cut = err
+            .downcast_ref::<QuerySpillExceeded>()
+            .unwrap_or_else(|| panic!("stopped for the wrong reason: {err:#}"));
+        assert_eq!(cut.cap_bytes, 64 * 1024 * 1024);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "stopped by the deadline, not the spill: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn the_sweep_is_bound_by_the_query_s_own_deadline_not_a_fresh_one() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -7635,14 +7997,15 @@ template="pool"
             )
             .unwrap();
             define_nest_views(&*conn, dir.path(), None);
-            let (rows, _) = conn
+            let rows = conn
                 .collect(
                     "SELECT minted_value, minted_pool, withdrawn_value, withdrawn_recipient \
                      FROM gns_network",
                     None,
                 )
                 .map_err(|e| anyhow::anyhow!("{e:?}"))
-                .expect("the populated half of the join must resolve, not merely avoid erroring");
+                .expect("the populated half of the join must resolve, not merely avoid erroring")
+                .rows;
             assert_eq!(rows.len(), 1);
             let row = &rows[0];
             assert_eq!(
@@ -7781,13 +8144,14 @@ events = ["Minted", "Withdrawn"]
         )
         .unwrap();
         define_nest_views(conn, dir.path(), None);
-        let (rows, _) = conn
+        let rows = conn
             .collect(
                 "SELECT minted_pool, minted_value, withdrawn_recipient, withdrawn_value FROM tok_network",
                 None,
             )
             .map_err(|e| anyhow::anyhow!("{e:?}"))
-            .expect("real constructor chain: the view must resolve, not just the hand-built one");
+            .expect("real constructor chain: the view must resolve, not just the hand-built one")
+            .rows;
         let row = &rows[0];
         assert_eq!(row["minted_pool"], "0xpool");
         assert_eq!(row["minted_value"], "42");

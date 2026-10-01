@@ -454,10 +454,17 @@ fn format_sql_result(raw: &str) -> String {
     if rows.is_empty() {
         out.push_str("(0 rows)\n");
     } else {
-        let cols: Vec<String> = rows[0]
-            .as_object()
-            .map(|o| o.keys().cloned().collect())
-            .unwrap_or_default();
+        // A node older than #1609 sends no `columns`; its rows' keys come back sorted.
+        let cols: Vec<String> = match v.get("columns").and_then(Value::as_array) {
+            Some(named) if !named.is_empty() => named
+                .iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect(),
+            _ => rows[0]
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default(),
+        };
         let mut w: Vec<usize> = cols.iter().map(String::len).collect();
         for r in &rows {
             if let Some(o) = r.as_object() {
@@ -544,7 +551,13 @@ async fn fetch(req: reqwest::RequestBuilder, url: &str) -> Result<String> {
     let resp = req.send().await.map_err(|e| {
         anyhow!("cannot reach nuthatch at {url} - is `nuthatch dev` running? ({e})")
     })?;
-    Ok(resp.text().await?)
+    let status = resp.status();
+    let body = resp.text().await?;
+    // A 404 or a refused query is a failed tool call, with the body as the agent's explanation.
+    if !status.is_success() {
+        bail!("HTTP {}: {body}", status.as_u16());
+    }
+    Ok(body)
 }
 
 fn ok(id: Value, result: Value) -> Value {
@@ -778,6 +791,18 @@ mod tests {
         assert!(out.len() < raw.len(), "compact must beat verbose JSON");
     }
 
+    /// #1609: the table follows the response's `columns`, not the parsed rows' sorted keys.
+    #[test]
+    fn sql_result_table_keeps_the_querys_column_order() {
+        let raw =
+            r#"{"count":1,"truncated":false,"columns":["z","a","m"],"rows":[{"z":1,"a":2,"m":3}]}"#;
+        let out = format_sql_result(raw);
+        let header: Vec<&str> = out.lines().next().unwrap().split_whitespace().collect();
+        assert_eq!(header, ["z", "a", "m"], "{out}");
+        let row: Vec<&str> = out.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(row, ["1", "2", "3"], "{out}");
+    }
+
     #[test]
     fn sql_truncation_is_guidance_not_silence() {
         let raw = r#"{"count":200,"truncated":true,"rows":[{"n":1}],"provenance":{"as_of":9,"sealed_through":9,"source":"hot+sealed","registry_hash":"0xabcd1234"}}"#;
@@ -897,7 +922,15 @@ mod tests {
             .route(
                 "/entity/{id}",
                 get(|Path(id): Path<String>| async move {
-                    Json(json!({"id": id, "table": "usdc__transfer"}))
+                    use axum::response::IntoResponse;
+                    if id == "000000000000-000000" {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            Json(json!({"error": "not found", "id": id})),
+                        )
+                            .into_response();
+                    }
+                    Json(json!({"id": id, "table": "usdc__transfer"})).into_response()
                 }),
             )
             .route(
@@ -1014,6 +1047,15 @@ mod tests {
             tool_text(&entity).contains("000000000042-000001"),
             "{entity}"
         );
+        let missing = call(
+            &client,
+            &base,
+            "entity",
+            json!({ "id": "000000000000-000000" }),
+        )
+        .await;
+        assert_eq!(missing["result"]["isError"], true, "{missing}");
+        assert!(tool_text(&missing).contains("not found"), "{missing}");
 
         let balance = call(&client, &base, "balance", json!({ "address": "0xabc" })).await;
         assert!(tool_text(&balance).contains("0xabc"), "{balance}");

@@ -109,6 +109,9 @@ const MAINNET: Chain = Chain {
         //   eth-pokt.nodies.app   archive YES, topic0-only YES
         //   eth.drpc.org          archive YES, topic0-only YES (batch-of-5 500s; the timestamp
         //                         fetcher already splits down to the cap)
+        // 2026-10-01 (#1607): eth.drpc.org no longer keeps history. Every getLogs below its pruning
+        // horizon is HTTP 400 "Unknown state. First available state is 1"; the tip still serves.
+        // eth-pokt.nodies.app keeps history but caps getLogs at 50 blocks.
         // `eth.api.onfinality.io/public` dropped: the 23rd's doctor probe did not complete (empty
         // hang). A spare that stalls the run is not failover. It answered the same probes on the
         // 24th; it stays off the list until it survives a doctor run, not a one-shot getLogs.
@@ -478,6 +481,43 @@ pub fn lookup(name: &str) -> Option<&'static Chain> {
     }
 }
 
+/// What an operator should know before indexing `chain` through the endpoints actually in use, when
+/// it matters (#1570): only when timestamps are being fetched, and only for `arb1.arbitrum.io` itself.
+///
+/// `arb1` sends `blockTimestamp: 0x0` on every log, so every block's timestamp costs a header, and it
+/// takes header batches of about ten at most. The header batch width is the narrowest any endpoint in
+/// the pool takes, so while `arb1` is in the pool it bounds the rest: the note says so, and says to
+/// replace it rather than add to it.
+pub fn keyless_caveat(chain: &str, rpc_urls: &[String], timestamps: bool) -> Option<&'static str> {
+    let arbitrum = lookup(chain).is_some_and(|c| c.chain_id == 42161);
+    let arb1 = rpc_urls.iter().any(|u| host_is(u, ARB1));
+    (timestamps && arbitrum && arb1).then_some(
+        "arb1.arbitrum.io sends no timestamp on its logs, so each block's comes from a header, and it \
+         takes header batches of about ten. While it is anywhere in the pool, primary or fallback, \
+         every header batch goes out at ten, keyed endpoints included: a backfill here runs at a few \
+         times chain speed, and a long one may be refused. For history, use a keyed Arbitrum RPC in \
+         place of arb1 (in rpc_urls, or --rpc <url>).",
+    )
+}
+
+/// Arbitrum's own keyless RPC, which the registry ships first for `arbitrum-one`.
+const ARB1: &str = "arb1.arbitrum.io";
+
+fn host_is(url: &str, host: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| u.host_str() == Some(host))
+}
+
+/// The most block headers an endpoint in `rpc_urls` answers in one batch, where a known keyless one
+/// answers fewer than nuthatch would send (#1570).
+///
+/// `arb1.arbitrum.io` answers ten and refuses fifty, and refuses them with a 429 that no response can
+/// tell from a throttle. Inferring the limit from refusals (or probing for it) therefore mistakes a
+/// throttle for a size limit and spends quota doing it, so the fact is recorded here, beside the
+/// endpoint itself, as the registry records the rest of what it knows about the endpoints it ships.
+pub fn header_batch_cap(rpc_urls: &[String]) -> Option<usize> {
+    rpc_urls.iter().any(|u| host_is(u, ARB1)).then_some(10)
+}
+
 /// Policy for a chain with no registry entry: the same "assume L1, wait for real depth, and a
 /// narrow `eth_getLogs` window" default the indexer already falls back to for a nest whose
 /// `chain` field names nothing in this file. `init`/`add` hand a custom chain the identical
@@ -590,6 +630,29 @@ pub fn all() -> &'static [&'static Chain] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1570: the caveat is for Arbitrum through `arb1`, under any name the chain goes by, and not
+    /// for a nest that brought its own endpoint or another chain.
+    #[test]
+    fn the_keyless_arbitrum_caveat_names_only_the_case_it_is_about() {
+        let arb1 = vec!["https://arb1.arbitrum.io/rpc".to_string()];
+        let keyed = vec!["https://arb-mainnet.g.alchemy.com/v2/k".to_string()];
+        assert!(keyless_caveat("arbitrum-one", &arb1, true).is_some());
+        assert!(keyless_caveat("arbitrum", &arb1, true).is_some());
+        assert!(keyless_caveat("arbitrum-one", &keyed, true).is_none());
+        assert!(keyless_caveat("base", &arb1, true).is_none());
+        assert_eq!(header_batch_cap(&arb1), Some(10));
+        assert_eq!(header_batch_cap(&keyed), None);
+        assert!(
+            keyless_caveat("arbitrum-one", &arb1, false).is_none(),
+            "no timestamps, no headers"
+        );
+        let lookalike = vec!["https://proxy.example/arb1.arbitrum.io/rpc".to_string()];
+        assert!(
+            keyless_caveat("arbitrum-one", &lookalike, true).is_none(),
+            "the host, not a substring"
+        );
+    }
 
     #[test]
     fn arbitrum_is_registered_with_l2_finality() {

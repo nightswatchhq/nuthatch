@@ -245,7 +245,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         .with_context(|| format!("build the decode registry for {}", nest.display()))?
         .schema();
 
-    let (entities, mut skipped_fields) =
+    let (entities, mut skipped_fields, totals_views) =
         write_entities(nest, &report, &mappings, &config, &schema)?;
     // Where each field landed, so the view path reports "materialised as an entity" rather than
     // "not in this view" - RFC-0044 §6 requires the artefacts to say which of the two it was.
@@ -253,8 +253,21 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         .iter()
         .flat_map(|e| e.fields.iter().map(|f| (e.entity.clone(), f.clone())))
         .collect();
-    let (views, view_skipped, entities_without_views) =
-        write_exact_views(nest, &report, &mappings, &config, &schema, &materialised)?;
+    // A multi-arm total is a view rather than an entity (#1595), but it is still a total and must stay
+    // out of the latest-value view just the same.
+    let totalled: BTreeSet<(String, String)> = materialised
+        .iter()
+        .cloned()
+        .chain(
+            totals_views
+                .iter()
+                .flat_map(|v| v.exact_fields.iter().map(|f| (v.entity.clone(), f.clone()))),
+        )
+        .collect();
+    let (mut views, view_skipped, entities_without_views) =
+        write_exact_views(nest, &report, &mappings, &config, &schema, &totalled)?;
+    // Answered fields, so they count in coverage and get projection checks like any view.
+    views.extend(totals_views);
     skipped_fields.extend(view_skipped);
     write_checks(nest, &views)?;
 
@@ -476,7 +489,7 @@ fn write_entities(
     mappings: &crate::port_report::Mappings,
     config: &Config,
     schema: &[nuthatch_decode::registry::TableSchema],
-) -> Result<(Vec<EmittedEntity>, Vec<SkippedField>)> {
+) -> Result<(Vec<EmittedEntity>, Vec<SkippedField>, Vec<EmittedView>)> {
     let mut exact_by_entity: BTreeMap<String, Vec<&crate::port_report::FieldRow>> = BTreeMap::new();
     for f in &report.fields {
         if f.class == Class::Exact && f.entity != "_Schema_" {
@@ -485,6 +498,7 @@ fn write_entities(
     }
 
     let mut emitted: Vec<EmittedEntity> = Vec::new();
+    let mut totals_views: Vec<EmittedView> = Vec::new();
     let mut skipped: Vec<SkippedField> = Vec::new();
     for (entity, fields) in &exact_by_entity {
         let accumulated = map_accumulating_fields(entity, fields, mappings, config, schema);
@@ -562,14 +576,13 @@ fn write_entities(
         if fields.is_empty() {
             continue;
         }
+        arms.retain(|_, list| list.iter().any(|a| fields.contains(&a.field)));
 
-        let name = to_alias(entity);
-        let mut sql = String::new();
-        sql.push_str(&format!(
-            "-- Running totals of `{entity}`, maintained incrementally (RFC-0041).\n"
-        ));
-        sql.push_str(
-            "-- A subgraph accumulates these one event at a time; the decoded table holds the\n             -- deltas, so the total is their sum and never the latest value. The exact fields that\n             -- *are* latest-value live in views/, and README.md says which field went where.\n",
+        let mut header = format!(
+            "-- Running totals of `{entity}`, maintained incrementally (RFC-0041).\n\
+             -- A subgraph accumulates these one event at a time; the decoded table holds the\n\
+             -- deltas, so the total is their sum and never the latest value. The exact fields that\n\
+             -- *are* latest-value live in views/, and README.md says which field went where.\n"
         );
         for ((table, key), list) in &arms {
             for a in list.iter().filter(|a| fields.contains(&a.field)) {
@@ -579,7 +592,7 @@ fn write_entities(
                     (AccumulationSource::Rows, false) => "counts rows".to_string(),
                     (AccumulationSource::Rows, true) => "counts rows, negated".to_string(),
                 };
-                sql.push_str(&format!(
+                header.push_str(&format!(
                     "-- `{entity}.{}` {how} of `{table}` keyed by {key}: {}\n",
                     a.field,
                     a.citation.display()
@@ -587,18 +600,64 @@ fn write_entities(
             }
         }
 
-        // **The cast is checked, and its failure is reported rather than swallowed.** Every event
-        // param is sealed as exact decimal *text* (RFC-0047 §1), so `sum("col")` does not even
-        // type-check - `sum(VARCHAR)` has no candidate. `TRY_CAST` to `DECIMAL(38,0)` is the
-        // conversion RFC-0047 §2 C1 names, but on its own it yields NULL past 38 digits and `sum`
-        // skips NULLs, which would drop a real uint256 out of a total in silence. C1's rule is
-        // explicit that no conversion out of the exact text may narrow silently, so each total
-        // carries an `_overflow` companion that is 1 when any contributing row could not be
-        // represented. `max` is one of the six aggregates v1 maintains, so the flag costs nothing
-        // the total does not already cost.
+        // **One entity per arm, and a view that adds them up** (#1590). The circuit that maintains an
+        // entity reads one table, or two under an inner join, so the `UNION ALL` of arms this used to
+        // emit was refused when `dev` started it; only `check`'s own validator ever accepted it. Each
+        // arm is now its own entity, and when there is more than one a view of the same totals name
+        // sums them by id. The totals are named `<entity>_totals` because the latest-value view
+        // already answers as `<entity>`.
         //
-        // A row count casts nothing and cannot narrow, so a field sourced only from row counts carries
-        // no flag - a column that is always 0 would read as evidence that something could overflow.
+        // The circuit reads a decoded integer as a checked 128-bit integer and faults the entity on a
+        // value it cannot hold, so the checked cast and `_overflow` flag the DuckDB form needed are
+        // gone: nothing narrows silently.
+        // **An entity when one table feeds the total, a view when several do** (#1595). The circuit
+        // that maintains an entity reads one table, or two under an inner join, so the `UNION ALL` of
+        // arms this used to emit as an entity was refused when `dev` started it; only `check`'s own
+        // validator ever accepted it. RFC-0041's rule for SQL the circuit cannot maintain is that it
+        // stays a view, so a multi-arm total is now exactly that: the same union, summed when it is
+        // read. Either way it answers as `<entity>_totals`, because the latest-value view already
+        // answers as `<entity>`.
+        let totals = format!("{}_totals", to_alias(entity));
+        if arms.len() == 1 {
+            // The circuit reads a decoded integer as a checked 128-bit integer and faults the entity on
+            // a value it cannot hold, so the checked cast and `_overflow` flag the view needs are not
+            // needed here: nothing narrows silently.
+            let ((table, key), list) = arms.iter().next().expect("one arm");
+            let mut cols = vec![format!("  {key} AS \"id\"")];
+            for f in &fields {
+                let Some(a) = list.iter().find(|a| &a.field == f) else {
+                    continue;
+                };
+                let term = match (&a.source, a.negated) {
+                    (AccumulationSource::Column(c), false) => format!("sum(\"{c}\")"),
+                    (AccumulationSource::Column(c), true) => format!("sum(0 - \"{c}\")"),
+                    (AccumulationSource::Rows, false) => "count(*)".to_string(),
+                    (AccumulationSource::Rows, true) => "sum(-1)".to_string(),
+                };
+                cols.push(format!("  {term} AS \"{f}\""));
+            }
+            let mut sql = header.clone();
+            sql.push_str(&format!(
+                "SELECT\n{}\nFROM \"{table}\"\nGROUP BY {key}\n",
+                cols.join(",\n")
+            ));
+            emitted.push(EmittedEntity {
+                entity: entity.clone(),
+                name: totals.clone(),
+                file: format!("entities/{totals}.sql"),
+                sql,
+                fields: fields.clone(),
+            });
+            continue;
+        }
+
+        let mut sql = header.clone();
+        sql.push_str(&format!(
+            "-- {} tables contribute, and an incremental entity reads one, so this total is a view,\n\
+             -- summed when it is read (RFC-0041).\n\
+             CREATE VIEW \"{totals}\" AS\n",
+            arms.len()
+        ));
         let needs_overflow: BTreeSet<String> = arms
             .values()
             .flatten()
@@ -667,14 +726,25 @@ fn write_entities(
             outer.join(",\n"),
             inner.join("\n  UNION ALL\n")
         ));
-
-        emitted.push(EmittedEntity {
+        sql.push_str(";\n");
+        totals_views.push(EmittedView {
             entity: entity.clone(),
-            name: name.clone(),
-            file: format!("entities/{name}.sql"),
+            file: format!("30-{totals}.sql"),
             sql,
-            fields: fields.clone(),
+            exact_fields: fields.clone(),
         });
+    }
+
+    // The views that sum a multi-arm entity's totals carry the entities' header, so a previous run's
+    // are recognised and replaced like the entities themselves.
+    let views = nest.join("views");
+    remove_generated_sql(&views)?;
+    if !totals_views.is_empty() {
+        std::fs::create_dir_all(&views).with_context(|| format!("create {}", views.display()))?;
+        for v in &totals_views {
+            std::fs::write(views.join(&v.file), &v.sql)
+                .with_context(|| format!("write views/{}", v.file))?;
+        }
     }
 
     let dir = nest.join("entities");
@@ -688,11 +758,11 @@ fn write_entities(
         } else {
             write_operator_entity_declarations(nest, &operator_declarations)?;
         }
-        return Ok((emitted, skipped));
+        return Ok((emitted, skipped, totals_views));
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut toml = String::from(
-        "# Authored incremental entities emitted by `port-emit` (RFC-0041, RFC-0044 S5).\n         #\n         # `max_rows` is an admission and runtime bound, not documentation: crossing it faults the\n         # nest loudly. The value below is a starting point, not a measurement. Set it from the\n         # cardinality this relation actually reaches on your chain before running unattended.\n",
+        "# Authored incremental entities emitted by `port-emit` (RFC-0041, RFC-0044 S5).\n         #\n         # `max_rows` is an admission and runtime bound, not documentation: crossing it faults the\n         # nest loudly. It bounds the input rows the circuit retains, summed across its inputs, which\n         # for a running total is every event it has summed, not the number of ids. The value below\n         # is a starting point, not a measurement: set it from your chain before running unattended.\n",
     );
     for e in &emitted {
         std::fs::write(nest.join(&e.file), &e.sql).with_context(|| format!("write {}", e.file))?;
@@ -711,7 +781,7 @@ fn write_entities(
         toml.push_str(&toml::to_string(&toml::Value::Table(root))?);
     }
     std::fs::write(nest.join(crate::entities::ENTITY_FILE), toml).context("write entities.toml")?;
-    Ok((emitted, skipped))
+    Ok((emitted, skipped, totals_views))
 }
 
 fn load_operator_entity_declarations(
@@ -773,6 +843,16 @@ fn write_operator_entity_declarations(
 /// by its operator, so `port-emit` must not treat the whole directory as disposable merely because
 /// it no longer emits a running total.
 fn remove_generated_entities(dir: &Path) -> Result<()> {
+    remove_generated_sql(dir)?;
+    if std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none()) {
+        std::fs::remove_dir(dir).with_context(|| format!("remove {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Remove the `.sql` files in `dir` that carry the running-totals header this emitter writes, leaving
+/// an operator's own files alone.
+fn remove_generated_sql(dir: &Path) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -790,13 +870,6 @@ fn remove_generated_entities(dir: &Path) -> Result<()> {
         if sql.starts_with("-- Running totals of `") {
             std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         }
-    }
-    if std::fs::read_dir(dir)
-        .with_context(|| format!("read {}", dir.display()))?
-        .next()
-        .is_none()
-    {
-        std::fs::remove_dir(dir).with_context(|| format!("remove {}", dir.display()))?;
     }
     Ok(())
 }
@@ -1003,7 +1076,7 @@ fn view_for_entity(
         // total, which is the wrong number rather than a missing one.
         if materialised.contains(&(f.entity.clone(), f.field.clone())) {
             comments.push(format!(
-                "-- `{}.{}` exact, maintained incrementally in entities/{}.sql, not here: {}",
+                "-- `{}.{}` exact, a running total answered by `{}_totals`, not here: {}",
                 f.entity,
                 f.field,
                 to_alias(&f.entity),
@@ -1538,11 +1611,15 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
     let mut labels: Vec<(String, String, Vec<String>)> = views
         .iter()
         .map(|v| {
-            (
-                v.entity.clone(),
-                to_alias(&v.entity),
-                v.exact_fields.clone(),
-            )
+            // The relation the file creates: `20-pool.sql` is `pool`, and a multi-arm total's
+            // `30-pool_totals.sql` is `pool_totals`.
+            let relation = v
+                .file
+                .split_once('-')
+                .map_or(v.file.as_str(), |(_, rest)| rest)
+                .trim_end_matches(".sql")
+                .to_string();
+            (v.entity.clone(), relation, v.exact_fields.clone())
         })
         .collect();
     labels.sort();
@@ -1655,10 +1732,11 @@ mod tests {
             }
         };
         let answer = || -> Vec<(String, bool)> {
-            let (rows, _) = conn
+            let rows = conn
                 .collect(sql.trim_end().trim_end_matches(';'), None)
                 .map_err(|e| anyhow::anyhow!("{e:?}"))
-                .unwrap();
+                .unwrap()
+                .rows;
             rows.iter()
                 .map(|r| (r["view"].as_str().unwrap().to_string(), r["binds"] == true))
                 .collect()
@@ -1741,10 +1819,11 @@ mod tests {
         );
 
         let read = || -> (Option<String>, Option<String>) {
-            let (rows, _) = conn
+            let rows = conn
                 .collect(sql.trim_end().trim_end_matches(';'), None)
                 .map_err(|e| anyhow::anyhow!("{e:?}"))
-                .unwrap();
+                .unwrap()
+                .rows;
             assert_eq!(rows.len(), 1, "one id, one row: {rows:?}");
             let text = |v: &serde_json::Value| v.as_str().map(str::to_string);
             (text(&rows[0]["name"]), text(&rows[0]["symbol"]))

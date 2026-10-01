@@ -79,10 +79,16 @@ fn decode_call_batch(response: &Value, expected: usize) -> Result<Vec<Option<Str
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let code = error.get("code").and_then(Value::as_i64);
-            let explicit_revert = matches!(code, Some(3 | -32000 | -32015))
-                && (message == "execution reverted"
-                    || message.starts_with("execution reverted:")
-                    || message.starts_with("vm execution error: revert"));
+            // GraphOps wraps the upstream's revert as `-32603 "gave up retrying on upstream-level
+            // after 1.9s: 3: execution reverted"`; the embedded `3:` keeps it as explicit as a bare one.
+            let wrapped_revert = code == Some(-32603)
+                && (message.ends_with(": 3: execution reverted")
+                    || message.contains(": 3: execution reverted:"));
+            let explicit_revert = wrapped_revert
+                || matches!(code, Some(3 | -32000 | -32015))
+                    && (message == "execution reverted"
+                        || message.starts_with("execution reverted:")
+                        || message.starts_with("vm execution error: revert"));
             if !explicit_revert {
                 return Err(ClassifiedError {
                     class: classify_rpc_error(error),
@@ -183,6 +189,9 @@ pub(crate) enum FailureClass {
     RateLimited { retry_after: Option<Duration> },
     /// The request is fine, this endpoint is having a moment. Fail over, retry at the same width.
     Transient,
+    /// This endpoint keeps no blocks this old (#1607). Not about width, so never narrowed, and not
+    /// about its health at the tip, which it may serve perfectly well.
+    HistoryUnavailable,
     /// This endpoint will not serve us until something changes outside the process. Long cooldown,
     /// and say so loudly.
     Terminal,
@@ -233,6 +242,49 @@ fn escalate_pool_wide_rate_limit(
         });
     }
     err
+}
+
+/// One call's failures across the pool, with refusals for want of history kept apart (#1607).
+///
+/// Such a refusal says nothing about the request or our pacing, so it must not stand in for another
+/// endpoint's answer: as the last error it hid a throttle and a cap, and the window never moved. It
+/// is named, with the remedy, and is the verdict only when every endpoint gave it.
+#[derive(Default)]
+struct PoolFailures {
+    other: Option<anyhow::Error>,
+    pruned: Vec<String>,
+    last_pruned: Option<anyhow::Error>,
+}
+
+impl PoolFailures {
+    fn push(&mut self, url: &str, e: anyhow::Error) {
+        if matches!(class_of(&e), Some(FailureClass::HistoryUnavailable)) {
+            self.pruned.push(redact_url(url));
+            self.last_pruned = Some(e);
+        } else {
+            self.other = Some(e);
+        }
+    }
+
+    fn verdict(self, attempts: usize, rate_limited: usize) -> anyhow::Error {
+        let remedy = "supply an archive-capable RPC with `--rpc` or `rpc_urls`";
+        let pruned = self.pruned.join(", ");
+        match (self.other, self.last_pruned) {
+            (None, Some(e)) => anyhow::Error::new(ClassifiedError {
+                class: FailureClass::HistoryUnavailable,
+                detail: format!(
+                    "no configured RPC endpoint keeps blocks this old ({pruned}); {remedy}. \
+                     Last answer: {e:#}"
+                ),
+            }),
+            (None, None) => anyhow!("all RPC endpoints failed"),
+            (Some(e), None) => escalate_pool_wide_rate_limit(e, attempts, rate_limited),
+            (Some(e), Some(_)) => e.context(format!(
+                "{pruned} keeps no blocks this old, so the rest of the pool must serve them; if \
+                 this persists, {remedy}"
+            )),
+        }
+    }
 }
 
 /// Did this failure's "narrowable" verdict come only from a **pool-wide 429**?
@@ -330,7 +382,9 @@ fn batch_is_narrowable(err: &anyhow::Error) -> bool {
         // Auth and rate limits are positive findings about something other than size: splitting an
         // unauthorised request into two unauthorised requests helps nobody, and splitting under a rate
         // limit doubles the request count in exactly the wrong direction.
-        Some(FailureClass::Terminal) | Some(FailureClass::RateLimited { .. }) => false,
+        Some(FailureClass::Terminal)
+        | Some(FailureClass::RateLimited { .. })
+        | Some(FailureClass::HistoryUnavailable) => false,
         _ => true,
     }
 }
@@ -347,6 +401,7 @@ fn class_label(class: Option<&FailureClass>) -> &'static str {
         Some(FailureClass::RateLimited { .. }) => "RateLimited",
         Some(FailureClass::Transient) => "Transient",
         Some(FailureClass::Terminal) => "Terminal",
+        Some(FailureClass::HistoryUnavailable) => "HistoryUnavailable",
         None => "unclassified",
     }
 }
@@ -397,6 +452,8 @@ pub(crate) fn looks_like_cap(body: &str) -> bool {
         // Monad public endpoints, 2026-09-03 (RFC-0051): Ankr and QuickNode respectively.
         "exceeds size limit",
         "is limited to a",
+        // GraphOps, 2026-09-29.
+        "exceeded max allowed range",
     ];
     CAP.iter().any(|m| s.contains(m))
 }
@@ -466,6 +523,8 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         // fallback's cap list and not here, so the JSON-RPC classifier called it `Transient` and
         // the same width went round again - found by the test that pins it, before a backfill did.
         "logs matched by query",
+        // GraphOps, 2026-09-29: `-32012 "getLogs request exceeded max allowed range"` over 25,000.
+        "exceeded max allowed range",
     ];
     const TERMINAL: &[&str] = &[
         "must be authenticated",
@@ -507,6 +566,11 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         return FailureClass::RateLimited {
             retry_after: retry_hint_of(err),
         };
+    }
+    // eth.drpc.org, 2026-10-01 (#1607): HTTP 400, code 27, for every block below its pruning horizon.
+    const HISTORY: &[&str] = &["first available state"];
+    if HISTORY.iter().any(|p| msg.contains(p)) {
+        return FailureClass::HistoryUnavailable;
     }
     if NARROWABLE.iter().any(|p| msg.contains(p)) {
         return FailureClass::Narrowable {
@@ -693,6 +757,9 @@ pub struct RpcClient {
     /// re-execution determinism. The RFC proposes the cache without noting this; the invalidation hook
     /// is the condition that makes it safe, not an optimisation on top.
     timestamps: std::sync::Mutex<HashMap<u64, u64>>,
+    /// Headers per batch: [`MAX_TIMESTAMP_BATCH`], or less where a known endpoint in the pool takes
+    /// less ([`crate::chains::header_batch_cap`], #1570).
+    header_width: usize,
 }
 
 impl RpcClient {
@@ -705,6 +772,8 @@ impl RpcClient {
             .build()
             .context("failed to build HTTP client")?;
         let n = urls.len();
+        let header_width = crate::chains::header_batch_cap(&urls)
+            .map_or(MAX_TIMESTAMP_BATCH, |cap| cap.clamp(1, MAX_TIMESTAMP_BATCH));
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         let heads = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
@@ -716,6 +785,7 @@ impl RpcClient {
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
+            header_width,
         })
     }
 
@@ -849,7 +919,7 @@ impl RpcClient {
         params: Value,
         need: Option<u64>,
     ) -> Result<(Value, usize)> {
-        let mut last_err = anyhow!("all RPC endpoints failed");
+        let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
         for j in self.endpoint_order_holding(need) {
@@ -881,21 +951,17 @@ impl RpcClient {
                         rate_limited += 1;
                     }
                     self.record_failure(j, method, &e);
-                    last_err = e;
+                    failures.push(url, e);
                 }
             }
         }
-        Err(escalate_pool_wide_rate_limit(
-            last_err,
-            attempts,
-            rate_limited,
-        ))
+        Err(failures.verdict(attempts, rate_limited))
     }
 
     /// POST a raw JSON-RPC body (single object or a batch array) with the same health-ordered failover
     /// as `call`, returning the parsed response. Used for batch requests `call` can't express.
     async fn post_with_failover(&self, body: &Value) -> Result<Value> {
-        let mut last_err = anyhow!("all RPC endpoints failed");
+        let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
         for j in self.endpoint_order() {
@@ -945,15 +1011,11 @@ impl RpcClient {
                         rate_limited += 1;
                     }
                     self.record_failure(j, "batch", &e);
-                    last_err = e;
+                    failures.push(url, e);
                 }
             }
         }
-        Err(escalate_pool_wide_rate_limit(
-            last_err,
-            attempts,
-            rate_limited,
-        ))
+        Err(failures.verdict(attempts, rate_limited))
     }
 
     /// POST `body` and parse the response, attaching a [`FailureClass`] to any failure (RFC-0028 §3).
@@ -1381,7 +1443,7 @@ impl RpcClient {
         // Futures built eagerly rather than mapped inside the stream: the borrow of each chunk has to
         // outlive the stream, and a closure producing them cannot express that.
         let futures: Vec<_> = blocks
-            .chunks(MAX_TIMESTAMP_BATCH)
+            .chunks(self.header_width)
             .map(|c| self.fetch_timestamp_batch(c, false, true))
             .collect();
         let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -1487,7 +1549,7 @@ impl RpcClient {
         for round in 0..ROUNDS {
             use futures::stream::StreamExt;
             let futures: Vec<_> = missing
-                .chunks(MAX_TIMESTAMP_BATCH)
+                .chunks(self.header_width)
                 .map(|c| self.fetch_timestamp_batch(c, full, true))
                 .collect();
             let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -1849,7 +1911,8 @@ impl RpcClient {
             .filter_map(|l| {
                 let block = parse_hex_u64(l.get("blockNumber")?.as_str()?).ok()?;
                 let ts = parse_hex_u64(l.get("blockTimestamp")?.as_str()?).ok()?;
-                Some((block, ts))
+                // arb1.arbitrum.io sends `0x0` on every log: absent, not the epoch.
+                (ts != 0).then_some((block, ts))
             })
             .collect();
         if found.is_empty() {
@@ -1906,17 +1969,18 @@ fn now_millis() -> u64 {
 }
 
 /// Reduce an RPC URL to `scheme://host[:port]` for logging - provider endpoints routinely carry the API
-/// key in the path (`.../v3/<KEY>`) or query string, and the failure log fires on exactly the outages an
-/// operator debugs with `RUST_LOG=debug`. Log *where* it failed, never the key. Returns a slice of the
-/// original (the `scheme://host` prefix), so it is zero-alloc.
-pub(crate) fn redact_url(url: &str) -> &str {
-    match url.split_once("://") {
-        // Truncate at the first '/' or '?' after the scheme, i.e. keep scheme://host[:port] only.
-        Some((scheme, rest)) => {
-            let host_len = rest.find(['/', '?']).unwrap_or(rest.len());
-            &url[..scheme.len() + 3 + host_len]
-        }
-        None => url.split(['/', '?']).next().unwrap_or(url),
+/// key in the path (`.../v3/<KEY>`), the query string or the userinfo (`user:pass@`), and the failure
+/// log fires on exactly the outages an operator debugs with `RUST_LOG=debug`. Log *where* it failed,
+/// never the key. Rebuilt from the parsed URL rather than sliced, because userinfo sits inside the
+/// prefix a slice would keep (#1589).
+pub(crate) fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
+            (Some(host), None) => format!("{}://{host}", u.scheme()),
+            (None, _) => format!("{}:<no host>", u.scheme()),
+        },
+        Err(_) => "<unparseable url>".to_string(),
     }
 }
 
@@ -2073,6 +2137,18 @@ mod tests {
             .unwrap(),
             vec![Some("0x0012".into()), None]
         );
+        // GraphOps, measured 2026-09-29: the upstream's code-3 revert, wrapped by its proxy.
+        assert_eq!(
+            super::decode_call_batch(
+                &json!([
+                    {"id":0,"error":{"code":-32603,"message":"gave up retrying on upstream-level after 1.89064678s: 3: execution reverted"}},
+                    {"id":1,"error":{"code":-32603,"message":"gave up retrying on upstream-level after 2s: 3: execution reverted: missing getter"}}
+                ]),
+                2
+            )
+            .unwrap(),
+            vec![None, None]
+        );
         for response in [
             json!([]),
             json!({"result":"0x"}),
@@ -2083,6 +2159,8 @@ mod tests {
             json!([{"id":0,"result":"0x1"}]),
             json!([{"id":0,"error":{"code":-32000,"message":"missing trie node"}}]),
             json!([{"id":0,"error":{"code":-32602,"message":"invalid block selector"}}]),
+            json!([{"id":0,"error":{"code":-32603,"message":"gave up retrying on upstream-level after 2s: -32000: header not found"}}]),
+            json!([{"id":0,"error":{"code":-32603,"message":"execution reverted"}}]),
             json!([{"id":0,"error":{"code":429,"message":"rate limit exceeded"}}]),
             json!([{"id":0,"result":"0x","error":{"code":3,"message":"execution reverted"}}]),
         ] {
@@ -2329,6 +2407,22 @@ mod tests {
         }
     }
 
+    /// GraphOps' Arbitrum endpoint caps `eth_getLogs` at 25,000 blocks, measured 2026-09-29 with a
+    /// 100,000-block ask. The cap itself is only in `data.details`, so the chunker has to halve to it.
+    #[test]
+    fn graphops_endpoint_cap_shape_is_narrowable() {
+        let body = r#"{"code":-32012,"message":"getLogs request exceeded max allowed range","data":{"code":"ErrGetLogsExceededMaxAllowedRange","details":{"maxAllowedRange":25000,"requestRange":100001}}}"#;
+        let err: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            matches!(
+                super::classify_rpc_error(&err),
+                super::FailureClass::Narrowable { .. }
+            ),
+            "{body} must be narrowable, not transient"
+        );
+        assert!(super::looks_like_cap(body));
+    }
+
     /// **The guard that makes the timestamp cache sound at all** (RFC-0029 §6d).
     ///
     /// A block *number* is not a block identity. After a reorg the block at a given height is a
@@ -2385,6 +2479,107 @@ mod tests {
         );
     }
 
+    /// #1570: a pool holding `arb1.arbitrum.io`, as primary or fallback, sends header batches of ten,
+    /// which it takes; anything else keeps the full width.
+    #[test]
+    fn a_pool_with_arb1_sends_header_batches_it_takes() {
+        let arb1 = "https://arb1.arbitrum.io/rpc".to_string();
+        let keyed = "https://arb-mainnet.g.alchemy.com/v2/k".to_string();
+        assert_eq!(RpcClient::new(vec![arb1.clone()]).unwrap().header_width, 10);
+        assert_eq!(
+            RpcClient::with_fallbacks(vec![keyed.clone()], vec![arb1])
+                .unwrap()
+                .header_width,
+            10
+        );
+        assert_eq!(
+            RpcClient::new(vec![keyed]).unwrap().header_width,
+            super::MAX_TIMESTAMP_BATCH
+        );
+    }
+
+    /// And sent at that width, an endpoint shaped like `arb1` (429 above ten headers, 403 above a
+    /// hundred) answers every one; a throttle is still not narrowed, so it costs one refusal per
+    /// attempt rather than a cascade (#1297).
+    #[tokio::test]
+    async fn header_batches_go_out_at_the_capped_width() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+
+        async fn serve(throttle_all: bool) -> (String, Arc<Mutex<Vec<usize>>>) {
+            let seen: Arc<Mutex<Vec<usize>>> = Arc::default();
+            let log = seen.clone();
+            let app = Router::new().route(
+                "/",
+                post(move |Json(req): Json<Value>| {
+                    let log = log.clone();
+                    async move {
+                        let items = match &req {
+                            Value::Array(items) => items.clone(),
+                            item => vec![item.clone()],
+                        };
+                        log.lock().unwrap().push(items.len());
+                        if throttle_all || items.len() > 10 {
+                            let code = if items.len() > 100 && !throttle_all {
+                                StatusCode::FORBIDDEN
+                            } else {
+                                StatusCode::TOO_MANY_REQUESTS
+                            };
+                            return (code, "{\"error\":\"refused\"}").into_response();
+                        }
+                        let answer = |item: &Value| {
+                            let b = u64::from_str_radix(
+                                item["params"][0].as_str().unwrap().trim_start_matches("0x"),
+                                16,
+                            )
+                            .unwrap();
+                            json!({"jsonrpc":"2.0","id":item["id"],
+                                   "result":{"number":format!("0x{b:x}"),"timestamp":format!("0x{:x}", b * 10)}})
+                        };
+                        Json(Value::Array(items.iter().map(answer).collect())).into_response()
+                    }
+                }),
+            );
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+            (format!("http://{addr}"), seen)
+        }
+
+        let (url, seen) = serve(false).await;
+        let mut c = RpcClient::new(vec![url]).unwrap();
+        c.header_width = 10;
+        let blocks: Vec<u64> = (1_000..1_300).collect();
+        let got = c
+            .block_timestamps(&blocks)
+            .await
+            .expect("batches the endpoint takes");
+        assert!(blocks.iter().all(|b| got[b] == b * 10));
+        let sent = seen.lock().unwrap().clone();
+        assert!(sent.iter().all(|&n| n <= 10), "{sent:?}");
+        // The header and block-body path chunks separately, and at the same width (astra on #1586).
+        seen.lock().unwrap().clear();
+        let more: Vec<u64> = (2_000..2_300).collect();
+        let headers = c
+            .block_headers(&more)
+            .await
+            .expect("headers at the capped width");
+        assert_eq!(headers.len(), 300);
+        let sent = seen.lock().unwrap().clone();
+        assert!(sent.iter().all(|&n| n <= 10), "{sent:?}");
+
+        let (url, seen) = serve(true).await;
+        let mut c = RpcClient::new(vec![url]).unwrap();
+        c.header_width = 10;
+        assert!(c.block_timestamps(&[1, 2, 3, 4]).await.is_err());
+        let sent = seen.lock().unwrap().clone();
+        assert!(
+            sent.iter().all(|&n| n == 4),
+            "a throttle was narrowed: {sent:?}"
+        );
+    }
+
     #[tokio::test]
     async fn timestamps_carried_on_logs_cost_no_header_calls() {
         use axum::{routing::post, Json, Router};
@@ -2410,6 +2605,7 @@ mod tests {
             log(11, Some(1_012), false),
             log(12, None, false),
             log(13, Some(9_999), true),
+            log(14, Some(0), false),
         ]);
         let app = Router::new().route(
             "/",
@@ -2434,7 +2630,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
 
         let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
-        c.get_logs(&[], &["0x01".into()], 10, 13).await.unwrap();
+        c.get_logs(&[], &["0x01".into()], 10, 14).await.unwrap();
         let got = c.block_timestamps(&[10, 11]).await.unwrap();
         assert_eq!(got, HashMap::from([(10, 1_000), (11, 1_012)]));
         assert_eq!(
@@ -2443,11 +2639,11 @@ mod tests {
             "the logs already said when"
         );
 
-        // A log without the field, and a removed one, still go to the header.
-        let got = c.block_timestamps(&[12, 13]).await.unwrap();
+        // A log without the field, a removed one, and one saying 0x0 still go to the header.
+        let got = c.block_timestamps(&[12, 13, 14]).await.unwrap();
         server.abort();
-        assert_eq!(got, HashMap::from([(12, 7), (13, 7)]));
-        assert_eq!(HEADERS.load(Ordering::SeqCst), 2);
+        assert_eq!(got, HashMap::from([(12, 7), (13, 7), (14, 7)]));
+        assert_eq!(HEADERS.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -2935,6 +3131,16 @@ mod tests {
         );
         assert_eq!(redact_url("http://localhost:8545"), "http://localhost:8545");
         assert_eq!(redact_url("https://host:8545/"), "https://host:8545");
+        // Userinfo sits before the host, so a prefix kept it (#1589).
+        assert_eq!(
+            redact_url("https://alice:SECRET@rpc.example.com/path"),
+            "https://rpc.example.com"
+        );
+        assert_eq!(
+            redact_url("https://tok@rpc.example.com:8545"),
+            "https://rpc.example.com:8545"
+        );
+        assert!(!redact_url("not a url with SECRET").contains("SECRET"));
     }
 
     /// **RFC-0029 §6g.** A body-read *timeout* must narrow; a body *syntax* error must not.
@@ -3789,6 +3995,140 @@ mod rfc0036_tests {
             !batch_is_narrowable(&err),
             "splitting under a rate limit doubles the request count in the wrong direction"
         );
+    }
+
+    /// eth.drpc.org's answer to any getLogs below its pruning horizon, measured 2026-10-01 (#1607).
+    const DRPC_PRUNED: &str = r#"{"id":1,"jsonrpc":"2.0","error":{"message":"Unknown state. First available state is 1","code":27}}"#;
+    /// eth-pokt.nodies.app's throttle as #761 recorded it; #1607's log elides the message's tail.
+    const NODIES_THROTTLED: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Rate limit exceeded on Nodies public endpoints. For higher limits, create a free account"}}"#;
+    /// eth-pokt.nodies.app's answer to an 80-block getLogs, measured 2026-10-01.
+    const NODIES_CAPPED: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Block range too large: maximum allowed is 50 blocks on your current plan. Upgrade your subscription at https://nodies.app/pricing for larger ranges."}}"#;
+
+    /// An endpoint answering every request with `status` and `body`, counting the requests.
+    async fn answering(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<AtomicU64>,
+    ) {
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicU64::new(0));
+        let app = Router::new()
+            .route(
+                "/",
+                post(move |State(hits): State<Arc<AtomicU64>>| async move {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }),
+            )
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle, hits)
+    }
+
+    /// #1607: the README demo's pool, one endpoint pruned and the other throttled. Every attempt
+    /// reached both, yet the error carried only whichever was tried last, so the log repeated a 429
+    /// and nothing said the other endpoint could never serve the range. The throttle must stay the
+    /// verdict, so the caller still retries it, and the pruned endpoint and the remedy must be named.
+    #[tokio::test]
+    async fn a_pruned_endpoint_beside_a_throttled_one_is_named_with_the_remedy() {
+        let (pruned, hp, pruned_hits) = answering(400, DRPC_PRUNED).await;
+        let (throttled, ht, throttled_hits) = answering(429, NODIES_THROTTLED).await;
+        for urls in [
+            vec![pruned.clone(), throttled.clone()],
+            vec![throttled.clone(), pruned.clone()],
+        ] {
+            let c = RpcClient::new(urls).unwrap();
+            for _ in 0..3 {
+                let err = c
+                    .get_logs(&["0xa0b8".into()], &[], 6_082_525, 6_082_604)
+                    .await
+                    .unwrap_err();
+                let text = format!("{err:#}");
+                assert!(
+                    matches!(class_of(&err), Some(FailureClass::RateLimited { .. })),
+                    "the throttle is the only thing waiting can fix: {text}"
+                );
+                assert!(
+                    text.contains(&redact_url(&pruned)),
+                    "the pruned endpoint is not named: {text}"
+                );
+                assert!(
+                    text.contains("--rpc") && text.contains("rpc_urls"),
+                    "the remedy is not named: {text}"
+                );
+            }
+        }
+        assert!(pruned_hits.load(Ordering::Relaxed) >= 6);
+        assert!(throttled_hits.load(Ordering::Relaxed) >= 6);
+        hp.abort();
+        ht.abort();
+    }
+
+    /// The same masking with today's Nodies answer: its cap is the one narrowing can satisfy, and
+    /// when the pruned endpoint was tried last its 400 replaced the cap, so the window never shrank.
+    #[tokio::test]
+    async fn a_pruned_endpoint_does_not_hide_another_endpoints_cap() {
+        let (pruned, hp, _) = answering(400, DRPC_PRUNED).await;
+        let (capped, hc, _) = answering(200, NODIES_CAPPED).await;
+        for urls in [
+            vec![pruned.clone(), capped.clone()],
+            vec![capped.clone(), pruned.clone()],
+        ] {
+            let c = RpcClient::new(urls).unwrap();
+            for _ in 0..3 {
+                let err = c
+                    .get_logs(&["0xa0b8".into()], &[], 6_082_525, 6_082_604)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    crate::chunker::is_result_too_large(&err),
+                    "the cap was lost: {err:#}"
+                );
+            }
+        }
+        hp.abort();
+        hc.abort();
+    }
+
+    /// When every endpoint is pruned no retry can help, so the verdict says so, names them all, and
+    /// is never mistaken for a cap.
+    #[tokio::test]
+    async fn a_pool_of_pruned_endpoints_has_no_history_to_offer() {
+        let (a, ha, _) = answering(400, DRPC_PRUNED).await;
+        let (b, hb, _) = answering(200, DRPC_PRUNED).await;
+        let c = RpcClient::new(vec![a.clone(), b.clone()]).unwrap();
+        let err = c
+            .get_logs(&["0xa0b8".into()], &[], 6_082_525, 6_082_604)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert_eq!(
+            class_of(&err),
+            Some(FailureClass::HistoryUnavailable),
+            "{text}"
+        );
+        assert!(!crate::chunker::is_result_too_large(&err), "{text}");
+        for url in [&a, &b] {
+            assert!(text.contains(&redact_url(url)), "{text}");
+        }
+        assert!(
+            text.contains("--rpc") && text.contains("Unknown state"),
+            "{text}"
+        );
+        ha.abort();
+        hb.abort();
     }
 
     /// A genuine size refusal must still narrow - the fix above must not swallow the case the

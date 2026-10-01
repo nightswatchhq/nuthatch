@@ -630,12 +630,18 @@ pub struct NestBundleArgs {
     /// bundle's contents).
     #[arg(long)]
     pub as_dir: bool,
+
+    /// Bundle even though `nuthatch.toml` holds credentials (a keyed RPC URL, a webhook secret).
+    /// The bundle carries the file verbatim, so they are published with it.
+    #[arg(long)]
+    pub allow_secrets: bool,
 }
 
 #[derive(Args)]
 pub struct NestLoadArgs {
     /// The bundle to load: a `.bundle` file, an `http(s)://` URL to one, or an unpacked bundle
-    /// directory - or, with `--registry`, a `name[@version]` reference (no `@version` → `latest`).
+    /// directory - or, with `--registry`, a `name[@version]` reference (no `@version` → `latest`), or a
+    /// NID as `nuthatch nest nid` prints it, whose bundle must compute to that NID.
     pub bundle: String,
 
     /// Target directory to install the nest into (default: the nest's name).
@@ -1518,6 +1524,11 @@ pub struct DevArgs {
     /// to be set AND each request to present it as `?token=…` (or it self-disables with a log line).
     #[arg(long)]
     pub no_admin: bool,
+
+    /// A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when
+    /// this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`.
+    #[arg(long)]
+    pub registry: Option<String>,
 }
 
 #[derive(Args)]
