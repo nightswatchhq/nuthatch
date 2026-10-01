@@ -562,7 +562,15 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
     // `-32005` is the de-facto "limit exceeded" code (Infura, Chainstack and others); `429` is
     // Alchemy putting the HTTP status in the body.
     let code = err.get("code").and_then(Value::as_i64);
-    if matches!(code, Some(429) | Some(-32005)) || RATE_LIMITED.iter().any(|p| msg.contains(p)) {
+    // The code alone decides only when the message names no size cap: Infura-style endpoints put
+    // `-32005` on "query returned more than 10000 results" too. "limit exceeded" is left out because
+    // a throttle says it as well.
+    let names_a_cap = NARROWABLE
+        .iter()
+        .any(|p| *p != "limit exceeded" && msg.contains(p));
+    if RATE_LIMITED.iter().any(|p| msg.contains(p))
+        || (matches!(code, Some(429) | Some(-32005)) && !names_a_cap)
+    {
         return FailureClass::RateLimited {
             retry_after: retry_hint_of(err),
         };
@@ -3738,6 +3746,31 @@ mod tests {
 #[cfg(test)]
 mod rfc0036_tests {
     use super::*;
+
+    /// `-32005` is also what Infura-style endpoints put on a result-count cap. Read as a throttle it
+    /// was retried at the same width for good: rpc.mevblocker.io, 2026-10-01, body verbatim.
+    #[test]
+    fn a_result_cap_under_the_rate_limit_code_narrows_to_the_range_it_names() {
+        let mevblocker = serde_json::json!({
+            "code": -32005,
+            "data": {"from": "0x121FF8B", "limit": 10000, "to": "0x12206F0"},
+            "message": "query returned more than 10000 results. Try with this block range [0x121FF8B, 0x12206F0]."
+        });
+        let class = classify_rpc_error(&mevblocker);
+        let FailureClass::Narrowable { suggested, .. } = class else {
+            panic!("a result cap must classify as Narrowable, got {class:?}");
+        };
+        assert_eq!(suggested, Some((0x121FF8B, 0x12206F0)));
+
+        // The bare code, and the code beside the one size phrase a throttle also uses, stay throttles.
+        for msg in ["limit exceeded", "daily request count exceeded"] {
+            let bare = serde_json::json!({"code": -32005, "message": msg});
+            assert!(
+                matches!(classify_rpc_error(&bare), FailureClass::RateLimited { .. }),
+                "{msg}"
+            );
+        }
+    }
 
     /// A provider that says **when** to come back is honoured instead of guessed at (#361).
     ///
