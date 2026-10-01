@@ -1095,13 +1095,8 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
 async fn a_segment_scribbled_over_under_a_running_node_reduces_the_table_over_http() {
     a_corrupted_segment_reduces_the_table_over_http(|path| {
         std::fs::write(path, b"this is not a parquet file").unwrap();
-        let conn = duckdb::Connection::open_in_memory().unwrap();
         assert!(
-            conn.prepare(&format!(
-                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-                path.display()
-            ))
-            .is_err(),
+            !common::footer_reads(path),
             "this is #419's case: the wrecked file must NOT bind, or it is #433's wearing this name"
         );
     })
@@ -1124,13 +1119,8 @@ async fn a_page_corrupt_segment_under_a_running_node_reduces_the_table_over_http
         assert!(end > 4, "the fixture needs a data region to corrupt");
         bytes[4..end].fill(0xFF);
         std::fs::write(path, &bytes).unwrap();
-        let conn = duckdb::Connection::open_in_memory().unwrap();
         assert!(
-            conn.prepare(&format!(
-                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-                path.display()
-            ))
-            .is_ok(),
+            common::footer_reads(path),
             "the fixture must still BIND, or this is #419's case wearing #433's name"
         );
     })

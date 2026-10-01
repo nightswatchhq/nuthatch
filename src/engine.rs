@@ -141,6 +141,41 @@ pub(crate) trait Session: Send {
         None
     }
 
+    /// `SELECT * FROM table ORDER BY ALL` written to `path` as one Parquet file (a fold checkpoint).
+    fn write_parquet(&self, table: &str, path: &Path) -> Result<()> {
+        self.execute(&format!(
+            "COPY (SELECT * FROM \"{table}\" ORDER BY ALL) TO '{}' (FORMAT parquet)",
+            path.display().to_string().replace('\'', "''")
+        ))
+    }
+
+    /// `table` replaced by the Parquet file at `path`, read through `select` (its columns cast).
+    fn load_parquet(&self, table: &str, select: &str, path: &Path) -> Result<()> {
+        self.execute(&format!(
+            "CREATE OR REPLACE TABLE \"{table}\" AS SELECT {select} FROM read_parquet('{}')",
+            path.display().to_string().replace('\'', "''")
+        ))
+    }
+
+    /// The statement as this engine keys it for reuse (RFC-0033 §3); `None` keys it by its raw text.
+    fn canonical_plan(&self, sql: &str) -> Option<String> {
+        crate::graft::canonical_from_ast(self.serialize_sql(sql).ok()?)
+    }
+
+    /// This engine and its version, written into reuse keys (RFC-0033 §2.2).
+    fn engine_version(&self) -> String {
+        self.one_value("SELECT version()")
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "duckdb-unknown".to_string())
+    }
+
+    /// The physical tables a statement reads (names a `WITH` binds in scope excluded) and the table
+    /// functions it calls, lowercased; `None` when the statement will not parse.
+    fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+        crate::analytics::table_refs_from_ast(&self.serialize_sql(sql).ok()?)
+    }
+
     /// A handle another thread can use to cancel whatever this session is running.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
 
@@ -208,4 +243,37 @@ pub(crate) trait Session: Send {
 
     /// Define the `labels` view over the `*.json` snapshots in `labels_dir`.
     fn bind_labels(&self, labels_dir: &Path) -> Result<()>;
+}
+
+/// A bare session on every engine this build carries: DuckDB, and Burrmill where it is built in.
+#[cfg(test)]
+pub(crate) fn test_sessions() -> Vec<Box<dyn Session>> {
+    #[allow(unused_mut)]
+    let mut sessions: Vec<Box<dyn Session>> = vec![crate::engine_duck::in_memory()];
+    #[cfg(feature = "shadow-burrmill")]
+    sessions.push(crate::engine_burrmill::BurrmillEngine.open_bare().unwrap());
+    sessions
+}
+
+/// As `each_engine`, for a body that needs more than one session of the same engine.
+#[cfg(test)]
+pub(crate) fn each_engine_fresh(body: impl Fn(&dyn Fn() -> Box<dyn Session>)) {
+    let duck = || crate::engine_duck::in_memory();
+    eprintln!("on duckdb");
+    body(&duck);
+    #[cfg(feature = "shadow-burrmill")]
+    {
+        let burrmill = || crate::engine_burrmill::BurrmillEngine.open_bare().unwrap();
+        eprintln!("on burrmill");
+        body(&burrmill);
+    }
+}
+
+/// Run a test body once on each engine, from its own setup, naming the engine for a failure.
+#[cfg(test)]
+pub(crate) fn each_engine(body: impl Fn(&dyn Session)) {
+    for session in test_sessions() {
+        eprintln!("on {}", session.engine_version());
+        body(session.as_ref());
+    }
 }

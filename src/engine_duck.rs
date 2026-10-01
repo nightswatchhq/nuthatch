@@ -1104,6 +1104,12 @@ fn value_to_json(v: ValueRef<'_>) -> Value {
     }
 }
 
+/// A bare in-memory DuckDB session, for a test that runs the same body on each engine.
+#[cfg(test)]
+pub(crate) fn in_memory() -> Box<dyn Session> {
+    Box::new(duckdb::Connection::open_in_memory().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

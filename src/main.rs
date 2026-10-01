@@ -103,13 +103,19 @@ async fn main() -> Result<()> {
         // they know which they want. A `mounts.toml` means a multi-nest runtime, a `nuthatch.toml`
         // means one nest, and the pre-2.0 `mounts dev` split is gone.
         cli::Command::Dev(args) => {
-            #[cfg(feature = "shadow-burrmill")]
-            {
-                nuthatch::engine_burrmill::enable_shadow()?;
-                tracing::warn!(
+            let engine = nuthatch::analytics::choose_engine(
+                std::env::var(nuthatch::analytics::ENV_ENGINE).ok().as_deref(),
+            )?;
+            nuthatch::analytics::install_engine(engine)?;
+            match engine {
+                nuthatch::analytics::EngineChoice::DuckDb => {}
+                nuthatch::analytics::EngineChoice::Shadow => tracing::warn!(
                     "shadow-burrmill: every statement also runs on Burrmill; differences go to the \
                      `shadow` log target, DuckDB's answer is served"
-                );
+                ),
+                nuthatch::analytics::EngineChoice::Burrmill => {
+                    tracing::warn!("Burrmill serves every statement; DuckDB is not consulted")
+                }
             }
             let dir = std::path::PathBuf::from(&args.dir);
             if dir.join(nuthatch::runtime::MOUNTS_FILE).exists()

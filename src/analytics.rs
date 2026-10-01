@@ -20,10 +20,85 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The engine every query runs on. One implementation until phase 2b puts a shadow beside it.
-fn engine() -> &'static dyn Engine {
+/// The engine every query runs on: the one [`install_engine`] chose, else DuckDB.
+pub(crate) fn engine() -> &'static dyn Engine {
     static ENGINE: crate::engine_duck::DuckEngine = crate::engine_duck::DuckEngine;
+    #[cfg(all(test, feature = "shadow-burrmill"))]
+    if let Some(e) = TEST_ENGINE.with(std::cell::Cell::get) {
+        return e;
+    }
+    #[cfg(all(test, feature = "shadow-burrmill"))]
+    if let Some(e) = TEST_PRIMARY.get() {
+        return *e;
+    }
+    if let Some(e) = PRIMARY.get() {
+        return *e;
+    }
     crate::engine_shadow::installed().unwrap_or(&ENGINE)
+}
+
+static PRIMARY: OnceLock<&'static dyn Engine> = OnceLock::new();
+
+/// The operator's switch between engines, read from this variable at startup.
+pub const ENV_ENGINE: &str = "NUTHATCH_ENGINE";
+
+/// Which engine serves: DuckDB, Burrmill alone, or DuckDB with Burrmill beside it in shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineChoice {
+    DuckDb,
+    Burrmill,
+    Shadow,
+}
+
+/// [`ENV_ENGINE`]'s value as a choice. Unset, a build carrying Burrmill shadows as it always has;
+/// asking a build without Burrmill for it is refused rather than served by DuckDB.
+pub fn choose_engine(value: Option<&str>) -> Result<EngineChoice> {
+    choose(value, cfg!(feature = "shadow-burrmill"))
+}
+
+fn choose(value: Option<&str>, built_with_burrmill: bool) -> Result<EngineChoice> {
+    let choice = match value.map(str::trim) {
+        None | Some("") if built_with_burrmill => return Ok(EngineChoice::Shadow),
+        None | Some("") => return Ok(EngineChoice::DuckDb),
+        Some("duckdb") => EngineChoice::DuckDb,
+        Some("burrmill") => EngineChoice::Burrmill,
+        Some("shadow") => EngineChoice::Shadow,
+        Some(other) => bail!("{ENV_ENGINE}={other}: expected duckdb, burrmill or shadow"),
+    };
+    if choice != EngineChoice::DuckDb && !built_with_burrmill {
+        bail!("{ENV_ENGINE} asks for {choice:?}, and this build has no Burrmill (feature `shadow-burrmill`)");
+    }
+    Ok(choice)
+}
+
+/// Install `choice` for the process. Once, before the first query.
+pub fn install_engine(choice: EngineChoice) -> Result<()> {
+    match choice {
+        EngineChoice::DuckDb => Ok(()),
+        #[cfg(feature = "shadow-burrmill")]
+        EngineChoice::Shadow => crate::engine_burrmill::enable_shadow(),
+        #[cfg(feature = "shadow-burrmill")]
+        EngineChoice::Burrmill => {
+            static BURRMILL: crate::engine_burrmill::BurrmillEngine =
+                crate::engine_burrmill::BurrmillEngine;
+            PRIMARY
+                .set(&BURRMILL)
+                .map_err(|_| anyhow::anyhow!("an engine is already installed"))
+        }
+        #[cfg(not(feature = "shadow-burrmill"))]
+        other => bail!("{other:?} needs a build with the `shadow-burrmill` feature"),
+    }
+}
+
+// The whole process on another engine, for a test whose queries run on threads it does not own.
+#[cfg(all(test, feature = "shadow-burrmill"))]
+pub(crate) static TEST_PRIMARY: OnceLock<&'static dyn Engine> = OnceLock::new();
+
+// A test running this thread's work on another engine, so one body checks both.
+#[cfg(all(test, feature = "shadow-burrmill"))]
+thread_local! {
+    pub(crate) static TEST_ENGINE: std::cell::Cell<Option<&'static dyn Engine>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// A session bounded and locked to `dir`, counted so a test can see the cache reuse one.
@@ -1888,21 +1963,33 @@ fn table_refs_in(
     sql: &str,
     wanted_kind: &str,
 ) -> Option<std::collections::BTreeSet<String>> {
-    let v = session.serialize_sql(sql).ok()?;
+    let (tables, functions) = session.table_refs(sql)?;
+    Some(if wanted_kind == "BASE_TABLE" {
+        tables
+    } else {
+        functions
+    })
+}
+
+/// `Session::table_refs` over DuckDB's `json_serialize_sql` AST.
+pub(crate) fn table_refs_from_ast(
+    v: &Value,
+) -> Option<(
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+)> {
     if v.get("error").and_then(Value::as_bool) == Some(true) {
         return None;
     }
-    let mut out = std::collections::BTreeSet::new();
-    if wanted_kind == "BASE_TABLE" {
-        walk_base_table_refs(&v, &Default::default(), &mut out);
-        return Some(out);
-    }
-    walk_table_refs(&v, &mut |kind, name| {
-        if kind == wanted_kind {
-            out.insert(name.to_ascii_lowercase());
+    let mut tables = std::collections::BTreeSet::new();
+    walk_base_table_refs(v, &Default::default(), &mut tables);
+    let mut functions = std::collections::BTreeSet::new();
+    walk_table_refs(v, &mut |kind, name| {
+        if kind == "TABLE_FUNCTION" {
+            functions.insert(name.to_ascii_lowercase());
         }
     });
-    Some(out)
+    Some((tables, functions))
 }
 
 /// Dependency discovery respects lexical CTE scope. The security walk below deliberately remains
@@ -2093,7 +2180,7 @@ pub(crate) fn reject_replacement_scan(sql: &str) -> Result<()> {
 /// whose net is exactly zero are omitted (matching the view's drop-at-zero behaviour). `table` and
 /// the column names come from the registry (`{alias}__transfer`; from/to/value column names vary by
 /// token - USDC from/to/value, WETH src/dst/wad), never user text, so there is no injection surface.
-/// Transfers in `table` whose value does not fit `i128`, and which [`net_balances`] therefore
+/// Transfers in `table` whose value has more than 38 digits, and which [`net_balances`] therefore
 /// dropped (COR-8, #814).
 ///
 /// A separate query rather than a column on the fold: the fold groups by address and sums, so a
@@ -2103,20 +2190,91 @@ pub(crate) fn reject_replacement_scan(sql: &str) -> Result<()> {
 /// `TRY_CAST` is the same expression the fold uses, deliberately: a second spelling of "does not fit"
 /// could disagree with the one doing the dropping, and then the count would describe a different set
 /// of rows than the ones actually missing.
-pub fn over_i128_transfers(
+pub fn oversized_transfers(
     dir: &Path,
     table: &str,
     value_col: &str,
     sealed_through: u64,
 ) -> Result<u64> {
-    let sql = format!(
-        "SELECT COUNT(*)::VARCHAR AS n FROM \"{table}\"          WHERE \"{value_col}\" IS NOT NULL AND TRY_CAST(\"{value_col}\" AS HUGEINT) IS NULL"
-    );
-    Ok(query_cold(dir, &sql, sealed_through)?
-        .first()
-        .and_then(|r| r["n"].as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0))
+    Ok(
+        query_cold(dir, &oversized_sql(table, value_col), sealed_through)?
+            .first()
+            .and_then(|r| r["n"].as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+fn oversized_sql(table: &str, value_col: &str) -> String {
+    format!(
+        "SELECT COUNT(*)::VARCHAR AS n FROM \"{table}\"          WHERE \"{value_col}\" IS NOT NULL AND TRY_CAST(\"{value_col}\" AS DECIMAL(38,0)) IS NULL"
+    )
+}
+
+/// `expr` as `ty` when it has at most 38 digits, else NULL: the nest's `DECIMAL(38,0)` line (COR-8),
+/// spelled so the drop is visible to an engine that refuses to sum a `TRY_CAST` (Burrmill's checked
+/// rule). [`crate::views::transfer_value`] draws the same line for the live views.
+pub(crate) fn exact_or_null(expr: &str, ty: &str) -> String {
+    format!("CASE WHEN TRY_CAST({expr} AS DECIMAL(38,0)) IS NOT NULL THEN CAST({expr} AS {ty}) END")
+}
+
+fn net_balances_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
+    // `to` receives (+value), `from` sends (−value); a value past 38 digits is NULL (skipped),
+    // mirroring the live views' `transfer_value`.
+    let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
+           SELECT \"{to_col}\" AS addr, {d} AS d FROM \"{table}\" \
+           UNION ALL \
+           SELECT \"{from_col}\" AS addr, -{d} AS d FROM \"{table}\"\
+         ) GROUP BY addr HAVING SUM(d) <> 0"
+    )
+}
+
+fn cold_exposure_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
+    // Outbound: the sender has exposure to the labels of a labeled recipient. Inbound: the recipient
+    // has exposure from the labels of a labeled sender. COUNT/SUM per (address, label, direction).
+    let d = exact_or_null(&format!("t.\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT addr, label, dir, SUM(d)::VARCHAR AS amount, COUNT(*) AS cnt FROM (\
+           SELECT lower(t.\"{from_col}\") AS addr, l.label AS label, 'out' AS dir, \
+                  {d} AS d \
+           FROM \"{table}\" t JOIN labels l ON lower(t.\"{to_col}\") = l.address \
+           UNION ALL \
+           SELECT lower(t.\"{to_col}\") AS addr, l.label, 'in', \
+                  {d} AS d \
+           FROM \"{table}\" t JOIN labels l ON lower(t.\"{from_col}\") = l.address\
+         ) WHERE d IS NOT NULL GROUP BY addr, label, dir"
+    )
+}
+
+fn cold_velocity_sql(table: &str, from_col: &str, value_col: &str, window: u64) -> String {
+    let w = window.max(1);
+    // window_start = (block // W) * W; sum outbound volume + count per (sender, window). A value
+    // past 38 digits leaves the count too, as the hot replay never feeds that transfer at all.
+    let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
+                SUM({d})::VARCHAR AS vol, COUNT(*) AS cnt \
+         FROM \"{table}\" WHERE {d} IS NOT NULL GROUP BY addr, ws"
+    )
+}
+
+/// The four restart folds' SQL over one transfer table, for testing them on another engine.
+#[cfg(all(test, feature = "shadow-burrmill"))]
+pub(crate) fn generated_fold_sql(
+    table: &str,
+    from_col: &str,
+    to_col: &str,
+    value_col: &str,
+    window: u64,
+) -> [String; 4] {
+    [
+        oversized_sql(table, value_col),
+        net_balances_sql(table, from_col, to_col, value_col),
+        cold_exposure_sql(table, from_col, to_col, value_col),
+        cold_velocity_sql(table, from_col, value_col, window),
+    ]
 }
 
 pub fn net_balances(
@@ -2127,17 +2285,12 @@ pub fn net_balances(
     value_col: &str,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128)>> {
-    // `to` receives (+value), `from` sends (−value); TRY_CAST yields NULL (skipped) for the rare
-    // value that overflows i128, mirroring the caller's i128 parse-or-skip.
-    let sql = format!(
-        "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
-           SELECT \"{to_col}\" AS addr, TRY_CAST(\"{value_col}\" AS HUGEINT) AS d FROM \"{table}\" \
-           UNION ALL \
-           SELECT \"{from_col}\" AS addr, -TRY_CAST(\"{value_col}\" AS HUGEINT) AS d FROM \"{table}\"\
-         ) GROUP BY addr HAVING SUM(d) <> 0"
-    );
     let mut out = Vec::new();
-    for r in query_cold(dir, &sql, sealed_through)? {
+    for r in query_cold(
+        dir,
+        &net_balances_sql(table, from_col, to_col, value_col),
+        sealed_through,
+    )? {
         if let (Some(addr), Some(net)) = (r["addr"].as_str(), r["net"].as_str()) {
             if let Ok(n) = net.parse::<i128>() {
                 out.push((addr.to_string(), n));
@@ -2161,21 +2314,12 @@ pub fn cold_exposure(
     value_col: &str,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128, i128)>> {
-    // Outbound: the sender has exposure to the labels of a labeled recipient. Inbound: the recipient
-    // has exposure from the labels of a labeled sender. COUNT/SUM per (address, label, direction).
-    let sql = format!(
-        "SELECT addr, label, dir, SUM(d)::VARCHAR AS amount, COUNT(*) AS cnt FROM (\
-           SELECT lower(t.\"{from_col}\") AS addr, l.label AS label, 'out' AS dir, \
-                  TRY_CAST(t.\"{value_col}\" AS HUGEINT) AS d \
-           FROM \"{table}\" t JOIN labels l ON lower(t.\"{to_col}\") = l.address \
-           UNION ALL \
-           SELECT lower(t.\"{to_col}\") AS addr, l.label, 'in', \
-                  TRY_CAST(t.\"{value_col}\" AS HUGEINT) AS d \
-           FROM \"{table}\" t JOIN labels l ON lower(t.\"{from_col}\") = l.address\
-         ) GROUP BY addr, label, dir"
-    );
     let mut out = Vec::new();
-    for r in query_cold(dir, &sql, sealed_through)? {
+    for r in query_cold(
+        dir,
+        &cold_exposure_sql(table, from_col, to_col, value_col),
+        sealed_through,
+    )? {
         let (Some(addr), Some(label), Some(dir_s), Some(cnt)) = (
             r["addr"].as_str(),
             r["label"].as_str(),
@@ -2206,15 +2350,12 @@ pub fn cold_velocity(
     window: u64,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128, i128)>> {
-    let w = window.max(1);
-    // window_start = (block // W) * W; sum outbound volume + count per (sender, window).
-    let sql = format!(
-        "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
-                SUM(TRY_CAST(\"{value_col}\" AS HUGEINT))::VARCHAR AS vol, COUNT(*) AS cnt \
-         FROM \"{table}\" GROUP BY addr, ws"
-    );
     let mut out = Vec::new();
-    for r in query_cold(dir, &sql, sealed_through)? {
+    for r in query_cold(
+        dir,
+        &cold_velocity_sql(table, from_col, value_col, window),
+        sealed_through,
+    )? {
         let (Some(addr), Some(ws), Some(cnt)) =
             (r["addr"].as_str(), r["ws"].as_u64(), r["cnt"].as_i64())
         else {
@@ -3453,25 +3594,7 @@ impl FoldBinder {
 
     /// The statement's top-level node type, or the parser's error.
     pub(crate) fn statement_kinds(&self, sql: &str) -> Result<Vec<String>> {
-        let ast = self.session.serialize_sql(sql)?;
-        if ast.get("error").and_then(Value::as_bool) == Some(true) {
-            bail!(
-                "does not parse: {}",
-                ast.get("error_message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-            );
-        }
-        Ok(ast
-            .pointer("/statements")
-            .and_then(Value::as_array)
-            .map(|s| {
-                s.iter()
-                    .filter_map(|st| st.pointer("/node/type").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default())
+        fold_statement_kinds(sql)
     }
 
     pub(crate) fn base_tables(&self, sql: &str) -> Option<std::collections::BTreeSet<String>> {
@@ -3487,7 +3610,7 @@ impl FoldBinder {
     }
 
     pub(crate) fn refusals(&self, sql: &str) -> Vec<crate::graft::Refusal> {
-        crate::graft::static_refusals(&self.parser.canonical_plan(sql))
+        crate::graft::refusals_in_sql(sql)
     }
 
     /// The canonical plan, so formatting alone never changes a fold's identity.
@@ -3520,68 +3643,132 @@ impl FoldBinder {
         sql: &str,
         facts: &std::collections::BTreeSet<String>,
     ) -> Vec<String> {
-        let Ok(ast) = self.session.serialize_sql(sql) else {
-            return Vec::new();
-        };
-        let mut out: Vec<String> = Vec::new();
-        let mut note = |s: String| {
-            if !out.contains(&s) {
-                out.push(s);
-            }
-        };
-        walk_ast(&ast, &mut |map| {
-            let class = map.get("class").and_then(Value::as_str);
-            let kind = map.get("type").and_then(Value::as_str);
-            if class == Some("WINDOW") {
-                let f = map
-                    .get("function_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
-                note(format!("a window function (`{f}() OVER`)"));
-            }
-            if kind == Some("RECURSIVE_CTE_NODE") {
-                let name = map.get("cte_name").and_then(Value::as_str).unwrap_or("?");
-                note(format!("a recursive CTE (`{name}`)"));
-            }
-            if class == Some("SUBQUERY") {
-                let how = match map.get("subquery_type").and_then(Value::as_str) {
-                    Some("EXISTS") => "an EXISTS subquery",
-                    Some("NOT_EXISTS") => "a NOT EXISTS subquery",
-                    Some("SCALAR") => "a scalar subquery",
-                    _ => "a subquery",
-                };
-                let mut over = std::collections::BTreeSet::new();
-                if let Some(inner) = map.get("subquery") {
-                    walk_ast(inner, &mut |m| {
-                        if m.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
-                            if let Some(t) = m.get("table_name").and_then(Value::as_str) {
-                                let t = t.to_ascii_lowercase();
-                                if facts.contains(&t) {
-                                    over.insert(t);
-                                }
-                            }
-                        }
-                    });
-                }
-                for t in over {
-                    note(format!("{how} over `{t}`"));
-                }
-            }
-        });
-        out
+        fold_lookbacks(sql, facts)
     }
 }
 
 #[cfg(feature = "folds")]
-fn walk_ast(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
-    match v {
-        Value::Object(map) => {
-            f(map);
-            map.values().for_each(|c| walk_ast(c, f));
+fn parse_duck(sql: &str) -> Result<Vec<sqlparser::ast::Statement>> {
+    sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, sql)
+        .map_err(|e| anyhow::anyhow!("does not parse: {e}"))
+}
+
+#[cfg(feature = "folds")]
+fn fold_statement_kinds(sql: &str) -> Result<Vec<String>> {
+    use sqlparser::ast::{SetExpr, Statement};
+    fn kind(body: &SetExpr) -> &'static str {
+        match body {
+            SetExpr::Select(_) | SetExpr::Values(_) => "SELECT_NODE",
+            SetExpr::SetOperation { .. } => "SET_OPERATION_NODE",
+            SetExpr::Query(q) => kind(&q.body),
+            _ => "OTHER",
         }
-        Value::Array(items) => items.iter().for_each(|c| walk_ast(c, f)),
-        _ => {}
     }
+    parse_duck(sql)?
+        .iter()
+        .map(|st| match st {
+            Statement::Query(q) => Ok(kind(&q.body).to_string()),
+            _ => bail!("does not parse: only SELECT statements can be folds"),
+        })
+        .collect()
+}
+
+#[cfg(feature = "folds")]
+fn fold_lookbacks(sql: &str, facts: &std::collections::BTreeSet<String>) -> Vec<String> {
+    use sqlparser::ast::{Expr, Query, SetExpr, TableFactor, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    fn tables_over(q: &Query, facts: &std::collections::BTreeSet<String>) -> Vec<String> {
+        struct Tables<'a>(
+            &'a std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+        );
+        impl Visitor for Tables<'_> {
+            type Break = ();
+            fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+                if let TableFactor::Table {
+                    name, args: None, ..
+                } = t
+                {
+                    let n = name
+                        .0
+                        .last()
+                        .map(|p| p.to_string().trim_matches('"').to_ascii_lowercase());
+                    if let Some(n) = n.filter(|n| self.0.contains(n)) {
+                        self.1.insert(n);
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        let mut t = Tables(facts, Default::default());
+        let _ = q.visit(&mut t);
+        t.1.into_iter().collect()
+    }
+
+    struct Look<'a> {
+        facts: &'a std::collections::BTreeSet<String>,
+        out: Vec<String>,
+    }
+    impl Look<'_> {
+        fn note(&mut self, s: String) {
+            if !self.out.contains(&s) {
+                self.out.push(s);
+            }
+        }
+    }
+    impl Visitor for Look<'_> {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if let Some(with) = q.with.as_ref().filter(|w| w.recursive) {
+                for c in &with.cte_tables {
+                    if matches!(*c.query.body, SetExpr::SetOperation { .. }) {
+                        self.note(format!("a recursive CTE (`{}`)", c.alias.name.value));
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            let (how, q) = match e {
+                Expr::Function(f) if f.over.is_some() => {
+                    let name = f.name.0.last().map(|p| p.to_string()).unwrap_or_default();
+                    self.note(format!(
+                        "a window function (`{}() OVER`)",
+                        name.to_ascii_lowercase()
+                    ));
+                    return ControlFlow::Continue(());
+                }
+                Expr::Exists {
+                    subquery,
+                    negated: false,
+                } => ("an EXISTS subquery", subquery),
+                Expr::Exists {
+                    subquery,
+                    negated: true,
+                } => ("a NOT EXISTS subquery", subquery),
+                Expr::Subquery(q) => ("a scalar subquery", q),
+                Expr::InSubquery { subquery, .. } => ("a subquery", subquery),
+                _ => return ControlFlow::Continue(()),
+            };
+            for t in tables_over(q, self.facts) {
+                self.note(format!("{how} over `{t}`"));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let Ok(stmts) = parse_duck(sql) else {
+        return Vec::new();
+    };
+    let mut look = Look {
+        facts,
+        out: Vec::new(),
+    };
+    for st in &stmts {
+        let _ = st.visit(&mut look);
+    }
+    look.out
 }
 
 /// RFC-0059: evaluates folds one window at a time on a connection of its own. Inside it a fact name
@@ -3676,6 +3863,14 @@ impl FoldEvaluator {
 
     pub(crate) fn execute(&self, sql: &str) -> Result<()> {
         self.session.execute(sql)
+    }
+
+    pub(crate) fn write_parquet(&self, table: &str, path: &Path) -> Result<()> {
+        self.session.write_parquet(table, path)
+    }
+
+    pub(crate) fn load_parquet(&self, table: &str, select: &str, path: &Path) -> Result<()> {
+        self.session.load_parquet(table, select, path)
     }
 
     pub(crate) fn count(&self, relation: &str) -> Result<u64> {
@@ -3867,28 +4062,51 @@ mod tests {
 
     #[test]
     fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE token(id VARCHAR, symbol VARCHAR);\
-             INSERT INTO token VALUES ('yes', 'WETH'), ('yes', 'WETH'),\
-                 ('no', 'OTHER'), (NULL, 'WETH');\
-             CREATE TABLE pool(id VARCHAR, token0 VARCHAR);\
-             INSERT INTO pool VALUES ('a', 'yes'), ('b', 'no'), ('c', 'missing'), ('d', NULL);",
+        crate::engine::each_engine(
+            relation_membership_preserves_existence_with_nulls_and_duplicates_on,
+        );
+    }
+
+    fn relation_membership_preserves_existence_with_nulls_and_duplicates_on(
+        conn: &dyn crate::engine::Session,
+    ) {
+        conn.execute(
+            "CREATE TABLE token AS SELECT CAST(a AS VARCHAR) AS id, CAST(b AS VARCHAR) AS symbol \
+             FROM (VALUES ('yes', 'WETH'), ('yes', 'WETH'), ('no', 'OTHER'), (NULL, 'WETH')) v(a, b)",
         )
         .unwrap();
+        conn.execute(
+            "CREATE TABLE pool AS SELECT CAST(a AS VARCHAR) AS id, CAST(b AS VARCHAR) AS token0 \
+             FROM (VALUES ('a', 'yes'), ('b', 'no'), ('c', 'missing'), ('d', NULL)) v(a, b)",
+        )
+        .unwrap();
+        // Each statement here selects one column: the ids, in the statement's own order.
+        let ids = |sql: &str| -> Vec<String> {
+            let rows = conn
+                .collect(sql, None)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
+                .unwrap()
+                .rows;
+            rows.iter()
+                .map(|r| {
+                    r.as_object()
+                        .unwrap()
+                        .values()
+                        .next()
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
         let schema = crate::graph_schema::parse("type Pool @entity { id: ID! token0: Token! } type Token @entity { id: ID! symbol: String! }").unwrap();
         let roots = crate::graph_query::parse(
             r#"{ pools(where: { token0_: { symbol: "WETH" } }) { id } }"#,
         )
         .unwrap();
         let compiled = crate::graph_query::compile(&schema, &roots[0]).unwrap();
-        let mut stmt = conn.prepare(&compiled.sql).unwrap();
-        let actual: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(actual, ["a"]);
+        assert_eq!(ids(&compiled.sql), ["a"]);
         // SQL NULL must be false just as EXISTS is, even when the child set contains NULL.
         let predicate = compiled
             .sql
@@ -3899,13 +4117,7 @@ mod tests {
             .unwrap()
             .0;
         let sql = format!("SELECT b.id FROM pool b WHERE NOT ({predicate}) ORDER BY b.id");
-        let mut stmt = conn.prepare(&sql).unwrap();
-        let rejected: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(rejected, ["b", "c", "d"]);
+        assert_eq!(ids(&sql), ["b", "c", "d"]);
     }
 
     use super::*;
@@ -3962,13 +4174,14 @@ mod tests {
 
     #[test]
     fn dependency_closure_reaches_sources_beyond_eight_views() {
+        crate::engine::each_engine(dependency_closure_reaches_sources_beyond_eight_views_on);
+    }
+
+    fn dependency_closure_reaches_sources_beyond_eight_views_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE source_facts (amount INTEGER); INSERT INTO source_facts VALUES (7)",
-        )
-        .unwrap();
+        conn.execute("CREATE TABLE source_facts AS SELECT 7 AS amount")
+            .unwrap();
         for i in 0..12 {
             let source = if i == 0 {
                 "source_facts".to_string()
@@ -3977,7 +4190,7 @@ mod tests {
             };
             let sql = format!("CREATE VIEW layer_{i} AS SELECT amount FROM {source};");
             std::fs::write(dir.path().join(format!("views/{i:02}.sql")), &sql).unwrap();
-            conn.execute_batch(&sql).unwrap();
+            conn.execute(&sql).unwrap();
         }
         let named = ["layer_11".to_string()].into_iter().collect();
         let expected: std::collections::BTreeSet<_> = (0..12)
@@ -3985,22 +4198,30 @@ mod tests {
             .chain(std::iter::once("source_facts".to_string()))
             .collect();
         assert_eq!(
-            reachable_tables(&conn, dir.path(), &named).unwrap(),
+            reachable_tables(conn, dir.path(), &named).unwrap(),
             expected
         );
-        assert_eq!(expand_through_views(&conn, &named), expected);
+        assert_eq!(expand_through_views(conn, &named), expected);
         // Even invalid, cyclic authored definitions must terminate during discovery.
         std::fs::write(dir.path().join("views/12.sql"),
             "CREATE VIEW cycle_a AS SELECT * FROM cycle_b; CREATE VIEW cycle_b AS SELECT * FROM cycle_a;").unwrap();
         let cycle = ["cycle_a".to_string(), "cycle_b".to_string()]
             .into_iter()
             .collect();
-        assert_eq!(reachable_tables(&conn, dir.path(), &cycle).unwrap(), cycle);
+        assert_eq!(reachable_tables(conn, dir.path(), &cycle).unwrap(), cycle);
     }
     /// RFC-0059: a two-sided window exposes only `(after, through]`, across sealed and hot, and names
     /// only the segments that overlap it. The count alone cannot tell pruning from the predicate.
     #[test]
     fn a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments() {
+        crate::engine::each_engine(
+            a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments_on,
+        );
+    }
+
+    fn a_fact_window_exposes_only_its_range_and_names_only_overlapping_segments_on(
+        conn: &dyn Session,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("schema.json"),
@@ -4022,9 +4243,8 @@ mod tests {
                 .collect(),
         );
         let count = |after: Option<u64>, through: Option<u64>| {
-            let conn = Connection::open_in_memory().unwrap();
             let defined = define_views_bound(
-                &conn,
+                conn,
                 dir.path(),
                 &hot,
                 30,
@@ -4035,11 +4255,20 @@ mod tests {
                 false,
             )
             .unwrap();
-            let n: u64 = conn
-                .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            let n = conn
+                .one_value("SELECT count(*) FROM t")
+                .unwrap()
+                .as_u64()
                 .unwrap();
-            let hot_loaded: u64 = conn
-                .query_row("SELECT count(*) FROM \"__hot_t\"", [], |r| r.get(0))
+            // Where each engine keeps the hot rows it was handed.
+            let hot = match conn.engine_version().starts_with("burrmill") {
+                true => "t__hot",
+                false => "__hot_t",
+            };
+            let hot_loaded = conn
+                .one_value(&format!("SELECT count(*) FROM \"{hot}\""))
+                .ok()
+                .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             (n, defined.tables["t"].segments, hot_loaded)
         };
@@ -4326,6 +4555,23 @@ template="pool"
         );
     }
 
+    /// The operator's switch: unset keeps what each build did before it, a build without Burrmill
+    /// refuses to pretend, and a typo is an error rather than a quiet default.
+    #[test]
+    fn the_engine_switch_reads_as_written() {
+        use EngineChoice::*;
+        assert_eq!(choose(None, true).unwrap(), Shadow);
+        assert_eq!(choose(Some(""), true).unwrap(), Shadow);
+        assert_eq!(choose(None, false).unwrap(), DuckDb);
+        assert_eq!(choose(Some("burrmill"), true).unwrap(), Burrmill);
+        assert_eq!(choose(Some(" duckdb "), true).unwrap(), DuckDb);
+        assert_eq!(choose(Some("shadow"), true).unwrap(), Shadow);
+        assert_eq!(choose(Some("duckdb"), false).unwrap(), DuckDb);
+        assert!(choose(Some("burrmill"), false).is_err());
+        assert!(choose(Some("shadow"), false).is_err());
+        assert!(choose(Some("burmill"), true).is_err());
+    }
+
     /// A runaway query is interrupted by the watchdog and surfaced as a timeout, not left to hang.
     #[test]
     fn guarded_query_times_out_on_a_runaway() {
@@ -4342,6 +4588,36 @@ template="pool"
             format!("{err:#}").contains("time budget"),
             "expected a timeout error, got: {err:#}"
         );
+    }
+
+    /// The cutover build has no DuckDB in front: the same watchdog must stop Burrmill, both in a
+    /// recursion that emits no batch until it ends and in a join that reads no Parquet.
+    #[cfg(feature = "shadow-burrmill")]
+    #[test]
+    fn guarded_query_times_out_on_a_runaway_on_burrmill() {
+        static E: crate::engine_burrmill::BurrmillEngine = crate::engine_burrmill::BurrmillEngine;
+        TEST_ENGINE.with(|c| c.set(Some(&E)));
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_millis(250),
+            max_rows: 1000,
+        };
+        for runaway in [
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000000000) SELECT count(*) FROM t",
+            "SELECT count(*) FROM range(1000000) a, range(1000000) b WHERE a.range + b.range = -1",
+        ] {
+            let started = Instant::now();
+            let err = query_guarded(dir.path(), runaway, guard).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("time budget"),
+                "expected a timeout error, got: {err:#}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{runaway}: stopped after {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]
@@ -4545,7 +4821,11 @@ template="pool"
         let correlated = r#"SELECT * FROM "t__transfer" a WHERE a.log_index =
             (SELECT max(b.log_index) FROM "t__big" b WHERE b.log_index < a.log_index)"#;
         match refusal(named(dir.path(), correlated, u64::MAX, 0, false, None)) {
-            AdmissionRefusal::Unboundable(why) => assert!(why.contains("DELIM"), "{why}"),
+            // Each engine names the operator that rescans: DuckDB's delim join, Burrmill's nested loop.
+            AdmissionRefusal::Unboundable(why) => assert!(
+                why.contains("DELIM") || why.contains("NestedLoopJoinExec"),
+                "{why}"
+            ),
             other => panic!("{other}"),
         }
     }
@@ -5345,10 +5625,11 @@ template="pool"
         assert_eq!(rows[1]["value_dec"], Value::Null);
         assert_eq!(rows[1]["value_overflow"], Value::from(true));
 
-        // And SUM(value_dec) works over the fitting rows without a manual cast.
+        // And summing the rows that fit says so: over every row, a value that did not fit refuses
+        // on Burrmill rather than being left out of the total (Chief, 2026-09-29).
         let s = query(
             dir.path(),
-            r#"SELECT SUM(value_dec)::VARCHAR AS s FROM "t__transfer""#,
+            r#"SELECT (SUM(value_dec) FILTER (WHERE NOT value_overflow))::VARCHAR AS s FROM "t__transfer""#,
         )
         .unwrap();
         assert_eq!(s[0]["s"], Value::from(fits));
@@ -6194,21 +6475,21 @@ template="pool"
         assert!(!exfil.exists(), "a WITH-prefixed COPY wrote a file");
     }
 
-    /// Issue #150: a value larger than `i128` must be dropped **identically** by the cold fold and the
-    /// hot replay, or a warm restart would silently change balances.
+    /// Issue #150: a value of more than 38 digits must be dropped **identically** by the cold fold and
+    /// the hot replay, or a warm restart would silently change balances.
     ///
-    /// The two paths reject it by different mechanisms - the cold fold via `TRY_CAST(… AS HUGEINT)`
-    /// yielding NULL, the hot replay via `str::parse::<i128>()` returning `Err` - so their agreement is
-    /// a coincidence of intent, not of code, and worth pinning. Both must drop the *whole transfer*:
+    /// The two paths reject it in two languages - the cold fold via `TRY_CAST(… AS DECIMAL(38,0))`
+    /// yielding NULL, the hot replay via `views::transfer_value` - so their agreement is worth
+    /// pinning. Both must drop the *whole transfer*:
     /// dropping only one leg would invent value out of nowhere, leaving the sender debited and the
     /// recipient uncredited (or worse).
     #[test]
-    fn an_over_i128_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay() {
-        // 2^127 - one past i128::MAX, the smallest value that must be refused.
-        const TOO_BIG: &str = "170141183460469231731687303715884105728";
+    fn an_oversized_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay() {
+        // 10^38, the smallest value that must be refused; it fits i128, the old line.
+        const TOO_BIG: &str = "100000000000000000000000000000000000000";
         assert!(
-            TOO_BIG.parse::<i128>().is_err(),
-            "fixture must overflow i128"
+            crate::views::transfer_value(TOO_BIG).is_none(),
+            "fixture must be refused by the hot replay"
         );
 
         let row = |from: &str, to: &str, value: &str, block: u64, li: u64| {
@@ -6250,7 +6531,7 @@ template="pool"
         assert_eq!(
             fold(mixed.path()),
             fold(reference.path()),
-            "the cold fold must drop an over-i128 transfer exactly as the hot replay's parse-or-skip does"
+            "the cold fold must drop an oversized transfer exactly as the hot replay does"
         );
 
         // Concretely: only the ordinary transfer survives, and both its legs are present.
@@ -6266,6 +6547,44 @@ template="pool"
         assert!(
             !got.iter().any(|(a, _)| a == "0xwhale"),
             "the sender of a dropped transfer must not be debited: {got:?}"
+        );
+
+        // Exposure and velocity count transfers as well as summing them, and the hot replay counts
+        // a dropped transfer nowhere. Labels take real addresses, so these are their own nests.
+        const MIXER: &str = "0x1111111111111111111111111111111111111111";
+        const SENDER: &str = "0x00000000000000000000000000000000000000aa";
+        let labeled = |rows: &[String]| {
+            let dir = tempfile::tempdir().unwrap();
+            let labels = dir.path().join("l.csv");
+            std::fs::write(&labels, format!("{MIXER},mixer\n")).unwrap();
+            crate::labels::import(dir.path(), &labels).unwrap();
+            crate::seal::seal_range(dir.path(), rows, 1, 6).unwrap();
+            dir
+        };
+        let mixed = labeled(&[
+            row(SENDER, MIXER, "100", 1, 0),
+            row(SENDER, MIXER, TOO_BIG, 2, 0),
+        ]);
+        let reference = labeled(&[row(SENDER, MIXER, "100", 1, 0)]);
+        let sorted = |mut v: Vec<(String, i128, i128)>| {
+            v.sort();
+            v
+        };
+        let exposure = |dir: &std::path::Path| {
+            sorted(cold_exposure(dir, "t__transfer", "from", "to", "value", 6).unwrap())
+        };
+        let velocity = |dir: &std::path::Path| {
+            sorted(cold_velocity(dir, "t__transfer", "from", "value", 10, 6).unwrap())
+        };
+        assert_eq!(exposure(mixed.path()), exposure(reference.path()));
+        assert_eq!(
+            exposure(mixed.path()),
+            [(format!("{SENDER}\u{1f}mixer\u{1f}out"), 100, 1)]
+        );
+        assert_eq!(velocity(mixed.path()), velocity(reference.path()));
+        assert_eq!(
+            velocity(mixed.path()),
+            [(format!("{SENDER}\u{1f}0"), 100, 1)]
         );
     }
 
@@ -6493,13 +6812,8 @@ template="pool"
 
         // **The fixture is the condition it claims to be.** #430's probe still says this file is fine,
         // so nothing in the footer-corrupt path can be what makes the assertions below pass.
-        let conn = Connection::open_in_memory().unwrap();
-        let probe = format!(
-            "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-            path.display()
-        );
         assert!(
-            conn.prepare(&probe).is_ok(),
+            crate::seal::footer_reads(&path),
             "this test is about a segment that BINDS and then will not read - if it no longer binds \
              it is #430's case and this test has stopped testing #433"
         );
@@ -6656,13 +6970,8 @@ template="pool"
         );
         // The fixture is the condition it claims to be: #430's probe still passes this file, so the
         // footer-corrupt path cannot be what sets the flag below.
-        let conn = Connection::open_in_memory().unwrap();
         assert!(
-            conn.prepare(&format!(
-                "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-                path.display()
-            ))
-            .is_ok(),
+            crate::seal::footer_reads(&path),
             "if it no longer binds this is #430's case and the test has stopped testing #433's"
         );
 
@@ -6841,13 +7150,18 @@ template="pool"
     /// depend on - and the caveat therefore must not name - a segment-level cause.
     #[test]
     fn an_undefinable_view_degrades_with_every_segment_intact() {
+        crate::engine::each_engine(an_undefinable_view_degrades_with_every_segment_intact_on);
+    }
+
+    fn an_undefinable_view_degrades_with_every_segment_intact_on(
+        conn: &dyn crate::engine::Session,
+    ) {
         let dir = two_table_nest();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(r#"CREATE TABLE "t__transfer" (x INTEGER)"#)
+        conn.execute(r#"CREATE TABLE "t__transfer" AS SELECT CAST(1 AS INTEGER) AS x"#)
             .unwrap();
 
         let degraded = define_views(
-            &conn,
+            conn,
             dir.path(),
             &HotRows::new(),
             u64::MAX,
@@ -6874,14 +7188,8 @@ template="pool"
         let manifest = crate::seal::load_manifest(dir.path()).unwrap();
         for seg in &manifest.tables["t__transfer"] {
             let path = crate::seal::segment_path(dir.path(), &seg.file, &seg.hash);
-            let probe = Connection::open_in_memory().unwrap();
             assert!(
-                probe
-                    .prepare(&format!(
-                        "SELECT 1 FROM read_parquet(['{}'], union_by_name=true) LIMIT 0",
-                        path.display()
-                    ))
-                    .is_ok(),
+                crate::seal::footer_reads(&path),
                 "every segment must still bind on its own for this to be the undefinable-view arm"
             );
         }
@@ -6901,6 +7209,10 @@ template="pool"
     /// this sprint is about, in my own new fixture.
     #[test]
     fn collect_separates_a_bind_failure_from_a_read_failure() {
+        crate::engine::each_engine(collect_separates_a_bind_failure_from_a_read_failure_on);
+    }
+
+    fn collect_separates_a_bind_failure_from_a_read_failure_on(conn: &dyn crate::engine::Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("schema.json"),
@@ -6921,10 +7233,9 @@ template="pool"
         let path = crate::seal::segment_path(dir.path(), &seg.file, &seg.hash);
         corrupt_pages_leaving_the_footer_intact(&path);
 
-        let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &empty,
             u64::MAX,
@@ -7418,6 +7729,10 @@ template="pool"
     /// quietly.
     #[test]
     fn an_authored_view_resolves_on_a_cold_nest_with_no_rows() {
+        crate::engine::each_engine(an_authored_view_resolves_on_a_cold_nest_with_no_rows_on);
+    }
+
+    fn an_authored_view_resolves_on_a_cold_nest_with_no_rows_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -7434,10 +7749,9 @@ template="pool"
         )
         .unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &empty,
             u64::MAX,
@@ -7446,17 +7760,19 @@ template="pool"
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path(), None);
+        define_nest_views(conn, dir.path(), None);
 
         // The base table exists as an empty typed view…
         let n: i64 = conn
-            .query_row("SELECT count(*) FROM tok__transfer", [], |r| r.get(0))
+            .one_value("SELECT count(*) FROM tok__transfer")
+            .map(|v| v.as_i64().expect("an integer count"))
             .expect("a declared table with no rows must still resolve");
         assert_eq!(n, 0);
 
         // …and so does the authored view built on it, including the derived `_dec` column.
         let n: i64 = conn
-            .query_row("SELECT count(*) FROM big_transfers", [], |r| r.get(0))
+            .one_value("SELECT count(*) FROM big_transfers")
+            .map(|v| v.as_i64().expect("an integer count"))
             .expect("an authored view on an empty table must resolve to zero rows, not fail");
         assert_eq!(n, 0);
     }
@@ -7469,6 +7785,10 @@ template="pool"
     /// mechanism is missing passes for the wrong reason.
     #[test]
     fn a_view_the_statement_cannot_reach_is_not_redefined() {
+        crate::engine::each_engine(a_view_the_statement_cannot_reach_is_not_redefined_on);
+    }
+
+    fn a_view_the_statement_cannot_reach_is_not_redefined_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -7489,9 +7809,8 @@ template="pool"
         )
         .unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &HotRows::new(),
             u64::MAX,
@@ -7504,21 +7823,21 @@ template="pool"
             ["a".to_string(), "tok__transfer".to_string()]
                 .into_iter()
                 .collect();
-        define_nest_views(&conn, dir.path(), Some(&wanted));
+        define_nest_views(conn, dir.path(), Some(&wanted));
         assert!(
-            conn.prepare("SELECT * FROM a").is_ok(),
+            conn.has_relation("a"),
             "the view the statement reaches is defined"
         );
         assert!(
-            conn.prepare("SELECT * FROM b").is_err(),
+            !conn.has_relation("b"),
             "a view the statement cannot reach must not be bound - that bind, over every segment \
              behind every table it touches, was the fixed cost under every request"
         );
 
         // The positive control: `None` still defines everything, as the warm-restart callers rely on.
-        define_nest_views(&conn, dir.path(), None);
+        define_nest_views(conn, dir.path(), None);
         assert!(
-            conn.prepare("SELECT * FROM b").is_ok(),
+            conn.has_relation("b"),
             "with no reachability set every authored view is defined"
         );
     }
@@ -7568,6 +7887,14 @@ template="pool"
     /// `refresh_stale_artifacts` regenerates a missing schema before anything reads it.
     #[test]
     fn without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it() {
+        crate::engine::each_engine(
+            without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it_on,
+        );
+    }
+
+    fn without_a_schema_the_view_cannot_resolve_which_is_why_we_regenerate_it_on(
+        conn: &dyn Session,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -7576,10 +7903,9 @@ template="pool"
         )
         .unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &empty,
             u64::MAX,
@@ -7588,11 +7914,10 @@ template="pool"
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path(), None);
+        define_nest_views(conn, dir.path(), None);
 
         assert!(
-            conn.query_row("SELECT count(*) FROM big_transfers", [], |r| r
-                .get::<_, i64>(0))
+            conn.one_value("SELECT count(*) FROM big_transfers")
                 .is_err(),
             "with no schema.json there is no typed empty view, so the authored view cannot resolve - \
              this is the failure `refresh_stale_artifacts` prevents by regenerating the schema"
@@ -7611,6 +7936,14 @@ template="pool"
     /// doesn't depend on `schema.json` being fresh.
     #[test]
     fn a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied(
+    ) {
+        crate::engine::each_engine_fresh(
+            a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied_on,
+        );
+    }
+
+    fn a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied_on(
+        open: &dyn Fn() -> Box<dyn crate::engine::Session>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
@@ -7681,9 +8014,9 @@ template="pool"
         // It gets no view at all, and the single `CREATE VIEW gns_network` statement - which touches
         // both tables - fails to bind. Pinning the bug this issue reports, not just the fix.
         {
-            let conn = Connection::open_in_memory().unwrap();
+            let conn = open();
             define_views(
-                &conn,
+                &*conn,
                 dir.path(),
                 &hot,
                 u64::MAX,
@@ -7692,10 +8025,9 @@ template="pool"
                 None,
             )
             .unwrap();
-            define_nest_views(&conn, dir.path(), None);
+            define_nest_views(&*conn, dir.path(), None);
             assert!(
-                conn.query_row("SELECT count(*) FROM gns_network", [], |r| r
-                    .get::<_, i64>(0))
+                conn.collect("SELECT count(*) FROM gns_network", None)
                     .is_err(),
                 "pin the bug: one never-fired table takes the whole view down, all four fields"
             );
@@ -7705,9 +8037,9 @@ template="pool"
         // `schema.json` doesn't, so it gets an empty typed view and the join resolves - the fired
         // table's real data intact, the never-fired table's side NULL rather than absent.
         {
-            let conn = Connection::open_in_memory().unwrap();
+            let conn = open();
             define_views(
-                &conn,
+                &*conn,
                 dir.path(),
                 &hot,
                 u64::MAX,
@@ -7716,29 +8048,29 @@ template="pool"
                 None,
             )
             .unwrap();
-            define_nest_views(&conn, dir.path(), None);
-            let row = conn
-                .query_row(
+            define_nest_views(&*conn, dir.path(), None);
+            let rows = conn
+                .collect(
                     "SELECT minted_value, minted_pool, withdrawn_value, withdrawn_recipient \
                      FROM gns_network",
-                    [],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                        ))
-                    },
+                    None,
                 )
-                .expect("the populated half of the join must resolve, not merely avoid erroring");
-            assert_eq!(row.0, "500", "the fired table's real data survives the fix");
-            assert_eq!(row.1, "0xpool");
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
+                .expect("the populated half of the join must resolve, not merely avoid erroring")
+                .rows;
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
             assert_eq!(
-                row.2, None,
+                row["minted_value"], "500",
+                "the fired table's real data survives the fix"
+            );
+            assert_eq!(row["minted_pool"], "0xpool");
+            assert_eq!(
+                row["withdrawn_value"],
+                serde_json::Value::Null,
                 "the never-fired table degrades to NULL on its side, not an error"
             );
-            assert_eq!(row.3, None);
+            assert_eq!(row["withdrawn_recipient"], serde_json::Value::Null);
         }
     }
 
@@ -7754,6 +8086,12 @@ template="pool"
     /// commit that added the event without regenerating.
     #[test]
     fn the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it() {
+        crate::engine::each_engine(
+            the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it_on,
+        );
+    }
+
+    fn the_real_constructor_chain_reproduces_663_and_the_fix_resolves_it_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("abis")).unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
@@ -7847,9 +8185,8 @@ events = ["Minted", "Withdrawn"]
 
         // Before the fix this view fails to bind at all (pinned with a hand-built fixture above);
         // here, with everything built through the real chain, it must resolve.
-        let conn = Connection::open_in_memory().unwrap();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &hot,
             u64::MAX,
@@ -7858,25 +8195,20 @@ events = ["Minted", "Withdrawn"]
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path(), None);
-        let row = conn
-            .query_row(
+        define_nest_views(conn, dir.path(), None);
+        let rows = conn
+            .collect(
                 "SELECT minted_pool, minted_value, withdrawn_recipient, withdrawn_value FROM tok_network",
-                [],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                    ))
-                },
+                None,
             )
-            .expect("real constructor chain: the view must resolve, not just the hand-built one");
-        assert_eq!(row.0, "0xpool");
-        assert_eq!(row.1, "42");
-        assert_eq!(row.2, None);
-        assert_eq!(row.3, None);
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
+            .expect("real constructor chain: the view must resolve, not just the hand-built one")
+            .rows;
+        let row = &rows[0];
+        assert_eq!(row["minted_pool"], "0xpool");
+        assert_eq!(row["minted_value"], "42");
+        assert_eq!(row["withdrawn_recipient"], Value::Null);
+        assert_eq!(row["withdrawn_value"], Value::Null);
     }
 
     /// #729's counterpart to the #663 test above: the table itself is never missing, only its *column
@@ -8059,6 +8391,10 @@ events = ["Transfer"]
     /// granularity.
     #[test]
     fn one_premature_view_does_not_kill_the_others_in_its_file() {
+        crate::engine::each_engine(one_premature_view_does_not_kill_the_others_in_its_file_on);
+    }
+
+    fn one_premature_view_does_not_kill_the_others_in_its_file_on(conn: &dyn Session) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -8077,10 +8413,9 @@ events = ["Transfer"]
         )
         .unwrap();
 
-        let conn = Connection::open_in_memory().unwrap();
         let empty = HotRows::new();
         define_views(
-            &conn,
+            conn,
             dir.path(),
             &empty,
             u64::MAX,
@@ -8089,17 +8424,16 @@ events = ["Transfer"]
             None,
         )
         .unwrap();
-        define_nest_views(&conn, dir.path(), None);
+        define_nest_views(conn, dir.path(), None);
 
         for v in ["ok_one", "ok_two"] {
-            conn.query_row(&format!("SELECT count(*) FROM {v}"), [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap_or_else(|e| panic!("{v} must exist despite a sibling statement failing: {e}"));
+            conn.one_value(&format!("SELECT count(*) FROM {v}"))
+                .unwrap_or_else(|e| {
+                    panic!("{v} must exist despite a sibling statement failing: {e}")
+                });
         }
         assert!(
-            conn.query_row("SELECT count(*) FROM premature", [], |r| r.get::<_, i64>(0))
-                .is_err(),
+            conn.one_value("SELECT count(*) FROM premature").is_err(),
             "the genuinely-unresolvable view is still absent, which is correct"
         );
     }
@@ -8225,22 +8559,25 @@ events = ["Transfer"]
     /// allowlist is carrying weight of its own rather than shadowing the older control.
     #[test]
     fn the_allowlist_refuses_functions_the_denylist_never_heard_of() {
-        let conn = Connection::open_in_memory().unwrap();
-        for q in [
-            // Not in FORBIDDEN_FNS - inert today only because the extension is not bundled.
-            "SELECT * FROM read_xlsx('/etc/passwd')",
-            "SELECT * FROM st_read('/etc/passwd')",
-            "SELECT * FROM iceberg_scan('/tmp')",
-            "SELECT * FROM postgres_scan('host=x','public','t')",
-            // A plausible future name nobody has listed anywhere.
-            "SELECT * FROM read_totally_new_format('/etc/passwd')",
-            // And the ones it does list, by every spelling.
-            "SELECT * FROM read_csv('/etc/passwd')",
-            r#"SELECT * FROM "read_csv"('/etc/passwd')"#,
-        ] {
+        for (conn, q) in crate::engine::test_sessions().iter().flat_map(|c| {
+            [
+                // Not in FORBIDDEN_FNS - inert today only because the extension is not bundled.
+                "SELECT * FROM read_xlsx('/etc/passwd')",
+                "SELECT * FROM st_read('/etc/passwd')",
+                "SELECT * FROM iceberg_scan('/tmp')",
+                "SELECT * FROM postgres_scan('host=x','public','t')",
+                // A plausible future name nobody has listed anywhere.
+                "SELECT * FROM read_totally_new_format('/etc/passwd')",
+                // And the ones it does list, by every spelling.
+                "SELECT * FROM read_csv('/etc/passwd')",
+                r#"SELECT * FROM "read_csv"('/etc/passwd')"#,
+            ]
+            .map(|q| (c, q))
+        }) {
             assert!(
-                reject_unknown_table_refs(&conn, q).is_err(),
-                "the allowlist must refuse: {q}"
+                reject_unknown_table_refs(conn.as_ref(), q).is_err(),
+                "the allowlist must refuse on {}: {q}",
+                conn.engine_version()
             );
         }
     }
@@ -8249,15 +8586,18 @@ events = ["Transfer"]
     /// distinguish it from a real table, so the name has to be checked.
     #[test]
     fn a_path_in_table_position_is_not_a_table_name() {
-        let conn = Connection::open_in_memory().unwrap();
-        for q in [
-            "SELECT * FROM '/etc/passwd'",
-            "SELECT * FROM '/x.parquet'",
-            "SELECT * FROM 'https://evil.example/x.parquet'",
-        ] {
+        for (conn, q) in crate::engine::test_sessions().iter().flat_map(|c| {
+            [
+                "SELECT * FROM '/etc/passwd'",
+                "SELECT * FROM '/x.parquet'",
+                "SELECT * FROM 'https://evil.example/x.parquet'",
+            ]
+            .map(|q| (c, q))
+        }) {
             assert!(
-                reject_unknown_table_refs(&conn, q).is_err(),
-                "a path in table position must be refused: {q}"
+                reject_unknown_table_refs(conn.as_ref(), q).is_err(),
+                "a path in table position must be refused on {}: {q}",
+                conn.engine_version()
             );
         }
     }
@@ -8266,22 +8606,25 @@ events = ["Transfer"]
     /// which is a broken dashboard rather than a breach, but still a bug.
     #[test]
     fn ordinary_analytical_sql_still_passes_the_allowlist() {
-        let conn = Connection::open_in_memory().unwrap();
-        for q in [
-            "SELECT * FROM usdc__transfer",
-            r#"SELECT "from", "to", value_dec FROM usdc__transfer WHERE value_dec > 100"#,
-            "WITH t AS (SELECT * FROM usdc__transfer) SELECT count(*) FROM t",
-            "SELECT a.block_number FROM usdc__transfer a JOIN weth__transfer b USING (tx_hash)",
-            // Row-generating functions analytics legitimately uses.
-            "SELECT * FROM generate_series(1, 10)",
-            "SELECT * FROM range(10)",
-            // Inline VALUES references no table at all.
-            "SELECT * FROM (VALUES (1),(2)) t(x)",
-            "SELECT count(*) FROM usdc__transfer GROUP BY \"from\" ORDER BY 1 DESC LIMIT 5",
-        ] {
+        for (conn, q) in crate::engine::test_sessions().iter().flat_map(|c| {
+            [
+                "SELECT * FROM usdc__transfer",
+                r#"SELECT "from", "to", value_dec FROM usdc__transfer WHERE value_dec > 100"#,
+                "WITH t AS (SELECT * FROM usdc__transfer) SELECT count(*) FROM t",
+                "SELECT a.block_number FROM usdc__transfer a JOIN weth__transfer b USING (tx_hash)",
+                // Row-generating functions analytics legitimately uses.
+                "SELECT * FROM generate_series(1, 10)",
+                "SELECT * FROM range(10)",
+                // Inline VALUES references no table at all.
+                "SELECT * FROM (VALUES (1),(2)) t(x)",
+                "SELECT count(*) FROM usdc__transfer GROUP BY \"from\" ORDER BY 1 DESC LIMIT 5",
+            ]
+            .map(|q| (c, q))
+        }) {
             assert!(
-                reject_unknown_table_refs(&conn, q).is_ok(),
-                "legitimate query must be allowed: {q}"
+                reject_unknown_table_refs(conn.as_ref(), q).is_ok(),
+                "legitimate query must be allowed on {}: {q}",
+                conn.engine_version()
             );
         }
     }
@@ -8591,5 +8934,154 @@ mod cross_nest_s0 {
                 ("b".into(), "t".into())
             ]
         );
+    }
+}
+
+/// The fold binder's parser role as it was on DuckDB's `json_serialize_sql`, kept to test the port.
+#[cfg(all(test, feature = "folds"))]
+mod fold_parser_oracle {
+    use super::*;
+
+    /// The statement's top-level node type, or the parser's error.
+    pub(super) fn statement_kinds(session: &dyn Session, sql: &str) -> Result<Vec<String>> {
+        let ast = session.serialize_sql(sql)?;
+        if ast.get("error").and_then(Value::as_bool) == Some(true) {
+            bail!(
+                "does not parse: {}",
+                ast.get("error_message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+        Ok(ast
+            .pointer("/statements")
+            .and_then(Value::as_array)
+            .map(|s| {
+                s.iter()
+                    .filter_map(|st| st.pointer("/node/type").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The constructs in a statement that read across rows or reach back for earlier ones: a window
+    /// function, a recursive CTE, or a subquery over one of `facts`. Inside a fold each of them
+    /// answers over the window alone (RFC-0059 §3), which is what #1504 asks to warn about. Each is
+    /// described once. Empty when the statement does not parse: the fold loader has refused that
+    /// already.
+    pub(super) fn lookbacks(
+        session: &dyn Session,
+        sql: &str,
+        facts: &std::collections::BTreeSet<String>,
+    ) -> Vec<String> {
+        let Ok(ast) = session.serialize_sql(sql) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut note = |s: String| {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        };
+        walk_ast(&ast, &mut |map| {
+            let class = map.get("class").and_then(Value::as_str);
+            let kind = map.get("type").and_then(Value::as_str);
+            if class == Some("WINDOW") {
+                let f = map
+                    .get("function_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                note(format!("a window function (`{f}() OVER`)"));
+            }
+            if kind == Some("RECURSIVE_CTE_NODE") {
+                let name = map.get("cte_name").and_then(Value::as_str).unwrap_or("?");
+                note(format!("a recursive CTE (`{name}`)"));
+            }
+            if class == Some("SUBQUERY") {
+                let how = match map.get("subquery_type").and_then(Value::as_str) {
+                    Some("EXISTS") => "an EXISTS subquery",
+                    Some("NOT_EXISTS") => "a NOT EXISTS subquery",
+                    Some("SCALAR") => "a scalar subquery",
+                    _ => "a subquery",
+                };
+                let mut over = std::collections::BTreeSet::new();
+                if let Some(inner) = map.get("subquery") {
+                    walk_ast(inner, &mut |m| {
+                        if m.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
+                            if let Some(t) = m.get("table_name").and_then(Value::as_str) {
+                                let t = t.to_ascii_lowercase();
+                                if facts.contains(&t) {
+                                    over.insert(t);
+                                }
+                            }
+                        }
+                    });
+                }
+                for t in over {
+                    note(format!("{how} over `{t}`"));
+                }
+            }
+        });
+        out
+    }
+
+    fn walk_ast(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
+        match v {
+            Value::Object(map) => {
+                f(map);
+                map.values().for_each(|c| walk_ast(c, f));
+            }
+            Value::Array(items) => items.iter().for_each(|c| walk_ast(c, f)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_sqlparser_port_finds_what_duckdb_found() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let facts: std::collections::BTreeSet<String> = ["t", "h", "transfer"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cases = [
+            "SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY block_number) AS rn FROM t",
+            "WITH RECURSIVE chain AS (SELECT k, v, block_number FROM t UNION ALL SELECT k, v, block_number + 1 FROM chain WHERE block_number < 0) SELECT k, v FROM chain",
+            "WITH RECURSIVE c AS (SELECT 1 AS n) SELECT * FROM c",
+            "WITH c AS (SELECT k FROM t UNION ALL SELECT k FROM h) SELECT * FROM c",
+            "SELECT a.k, a.v FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.k = a.k AND b.block_number < a.block_number)",
+            "SELECT a.k FROM t a WHERE NOT EXISTS (SELECT 1 FROM h b WHERE b.k = a.k)",
+            "SELECT a.k, (SELECT min(b.block_number) FROM t b WHERE b.k = a.k) AS first_seen FROM t a",
+            "SELECT k FROM t WHERE k IN (SELECT k FROM transfer)",
+            "SELECT k FROM t WHERE k IN (SELECT k FROM other)",
+            "SELECT sum(v) OVER (ORDER BY block_number), lag(v) OVER w FROM t WINDOW w AS (ORDER BY k)",
+            "SELECT * FROM (SELECT k FROM t) s",
+            "SELECT CAST(count(*) AS UBIGINT) AS n FROM t",
+            "SELECT 1 AS n UNION ALL SELECT 2",
+            "(SELECT 1 AS n)",
+            "VALUES (1), (2)",
+            "SELECT 1 AS n; SELECT 2 AS n",
+            "INSERT INTO t VALUES (1)",
+            "SELEC 1",
+        ];
+        for sql in cases {
+            let old_k = statement_kinds(&conn, sql).map_err(|_| ());
+            let new_k = super::fold_statement_kinds(sql).map_err(|_| ());
+            let accepted = |k: &std::result::Result<Vec<String>, ()>| matches!(k, Ok(v) if matches!(v.as_slice(), [x] if x == "SELECT_NODE" || x == "SET_OPERATION_NODE"));
+            assert_eq!(
+                accepted(&old_k),
+                accepted(&new_k),
+                "kinds, {sql}: {old_k:?} / {new_k:?}"
+            );
+            let mut old_l = lookbacks(&conn, sql, &facts);
+            // DuckDB serialises `NOT EXISTS` as `NOT (EXISTS …)`, so the old walk named it an EXISTS.
+            let mut new_l: Vec<String> = super::fold_lookbacks(sql, &facts)
+                .into_iter()
+                .map(|w| w.replace("a NOT EXISTS subquery", "an EXISTS subquery"))
+                .collect();
+            old_l.sort();
+            new_l.sort();
+            assert_eq!(old_l, new_l, "lookbacks, {sql}");
+        }
     }
 }

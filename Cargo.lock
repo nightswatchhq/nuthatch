@@ -1575,7 +1575,7 @@ dependencies = [
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nightswatchhq/burrmill?rev=5398e3fdad1e66c68c8f853ef5a224ef2c65544d#5398e3fdad1e66c68c8f853ef5a224ef2c65544d"
+source = "git+https://github.com/nightswatchhq/burrmill?rev=f4d2661bccb462af5860b6114046deb1824c9709#f4d2661bccb462af5860b6114046deb1824c9709"
 dependencies = [
  "arrow 59.3.0",
  "arrow-schema 59.3.0",
@@ -5084,6 +5084,7 @@ dependencies = [
  "serde_ignored",
  "serde_json",
  "sha2 0.10.9",
+ "sqlparser",
  "tar",
  "tempfile",
  "tokio",

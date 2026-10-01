@@ -62,11 +62,12 @@ pub fn reserves_select(alias: &str) -> String {
 /// `holder_count`.
 fn net_balance_subquery(alias: &str) -> String {
     let t = format!("{alias}__transfer");
+    let d = crate::analytics::exact_or_null("\"value\"", "HUGEINT");
     format!(
         "SELECT addr, SUM(d) AS balance FROM (\
-           SELECT lower(\"to\") AS addr, TRY_CAST(\"value\" AS HUGEINT) AS d FROM \"{t}\" \
+           SELECT lower(\"to\") AS addr, {d} AS d FROM \"{t}\" \
            UNION ALL \
-           SELECT lower(\"from\") AS addr, -TRY_CAST(\"value\" AS HUGEINT) AS d FROM \"{t}\"\
+           SELECT lower(\"from\") AS addr, -{d} AS d FROM \"{t}\"\
          ) GROUP BY addr"
     )
 }
@@ -91,12 +92,13 @@ pub fn holder_count_select(alias: &str) -> String {
 /// Σ(value where `from` = 0x0) − Σ(value where `to` = 0x0). Exposed so it can be queried directly (and
 /// tested) as well as wrapped in a `CREATE VIEW`.
 pub fn total_supply_select(alias: &str) -> String {
+    let d = crate::analytics::exact_or_null("\"value\"", "HUGEINT");
     format!(
         "SELECT \
            COALESCE(SUM(CASE WHEN lower(\"from\") = '{ZERO_ADDRESS}' \
-             THEN TRY_CAST(\"value\" AS HUGEINT) ELSE 0 END), 0) \
+             THEN {d} ELSE 0 END), 0) \
          - COALESCE(SUM(CASE WHEN lower(\"to\") = '{ZERO_ADDRESS}' \
-             THEN TRY_CAST(\"value\" AS HUGEINT) ELSE 0 END), 0) \
+             THEN {d} ELSE 0 END), 0) \
          AS total_supply FROM \"{alias}__transfer\""
     )
 }

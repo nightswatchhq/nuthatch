@@ -62,11 +62,7 @@ const KNOWN: &[&str] = &[
     "analytics.rs", // tests only, as oracles; the policy code went engine-neutral in phase 2a
     "engine_duck.rs", // the `engine::Session` implementation: what analytics.rs used to hold
     "analytics_scalars.rs", // bounded pure Arrow scalar conversions, registered by analytics
-    "entities.rs",  // the admissible function vocabulary, from duckdb_functions()
-    "entity_lower.rs", // AST for lowering authored SQL to a circuit
     "graft.rs",     // canonical plan, engine version, determinism gate
-    "seal.rs",      // segment-binding oracle (test-only)
-    "port_emit.rs", // emitted-check oracle (test-only)
     "authored_entity_spike.rs", // RFC-0041 spike, reachable via `nuthatch bench`
     "dune_views.rs", // AST of authored views, for RFC-0055 S3's translation
 ];
@@ -82,10 +78,7 @@ const KNOWN: &[&str] = &[
 const INTERNAL_EXPOSURE: &[(&str, &str)] = &[
     ("analytics_scalars.rs", "register"),
     ("graft.rs", "canonical_plan"),
-    ("graft.rs", "engine_version"),
     ("graft.rs", "parser_connection"),
-    ("graft.rs", "build"),
-    ("graft.rs", "determinism_gate"),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -499,8 +492,8 @@ fn internal_duckdb_exposure_is_pinned_and_may_only_shrink() {
     );
     assert_eq!(
         found.len(),
-        6,
-        "the internal-exposure count changed: five graft parser/canonicalisation sites and one \
+        3,
+        "the internal-exposure count changed: two graft parser/canonicalisation sites and one \
          pure analytical-scalar registration site. Found: {found:#?}"
     );
 }

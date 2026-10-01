@@ -1,6 +1,6 @@
-//! Burrmill behind [`crate::engine`], the second engine of shadow mode (RFC-0044 Amendment 2,
-//! phase 2b). Compiled only with the `shadow-burrmill` feature, and installed by
-//! [`enable_shadow`]; a release build never names it.
+//! Burrmill behind [`crate::engine`]: the second engine of shadow mode (RFC-0044 Amendment 2,
+//! phase 2b), or the only one when `NUTHATCH_ENGINE=burrmill` (phase 3a). Compiled only with the
+//! `shadow-burrmill` feature; chosen by [`crate::analytics::install_engine`].
 //!
 //! A session is one `burrmill::Engine` opened empty, with the tables the policy code binds registered
 //! as it binds them: the same segment list, the same hot rows, the same declared columns and window
@@ -29,24 +29,32 @@ impl Engine for BurrmillEngine {
 
 /// Put Burrmill beside DuckDB on every nest this process serves. Once per process.
 /// Records go to the log, and also as JSON lines to the file `NUTHATCH_SHADOW_LOG` names, when it
-/// names one.
+/// names one; so do the running counts of every statement shadowed.
 pub fn enable_shadow() -> Result<()> {
     use crate::engine_shadow::{both_sinks, file_sink, log_sink};
     let sink = match std::env::var_os("NUTHATCH_SHADOW_LOG") {
         Some(path) => both_sinks(log_sink(), file_sink(Path::new(&path))?),
         None => log_sink(),
     };
-    crate::engine_shadow::install(crate::engine_shadow::ShadowEngine::new(
+    let engine = crate::engine_shadow::ShadowEngine::new(
         Box::new(crate::engine_duck::DuckEngine),
         Box::new(BurrmillEngine),
         sink,
-    ))
+    );
+    crate::engine_shadow::install(match std::env::var_os("NUTHATCH_SHADOW_LOG") {
+        Some(path) => engine.with_tally_in(Path::new(&path))?,
+        None => engine,
+    })
 }
 
 pub(crate) struct BurrmillSession {
     engine: Mutex<burrmill::Engine>,
     /// Hot rows staged by `load_hot`, bound by the next `bind_facts` for that table.
     hot: Mutex<HashMap<String, Vec<Value>>>,
+    /// Held for the session's life, as DuckDB's is; removed on drop and swept by pid after a crash.
+    _spill: crate::engine_duck::SpillDir,
+    /// Each view's `CREATE VIEW` text as defined, for the integrity sweep's walk through views.
+    views: Mutex<std::collections::BTreeMap<String, String>>,
     /// The declared columns of each maintained relation `load_relation` staged, so one with no rows
     /// still binds (#1598). Burrmill types columns by name, so these carry names only.
     relations: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -54,20 +62,35 @@ pub(crate) struct BurrmillSession {
 
 impl BurrmillSession {
     fn new() -> Result<Self> {
+        let spill = crate::engine_duck::new_spill_dir()?;
+        let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
+        #[allow(unused_mut)]
+        let mut engine = burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?;
+        #[cfg(feature = "graph")]
+        crate::analytics_scalars::register_burrmill(&mut engine);
         Ok(Self {
-            engine: Mutex::new(
-                burrmill::Engine::open_empty_within(
-                    (crate::analytics_budget::from_env().memory_limit_mb as usize) << 20,
-                )
-                .map_err(engine_err)?,
-            ),
+            engine: Mutex::new(engine),
             hot: Mutex::new(HashMap::new()),
+            _spill: spill,
+            views: Mutex::new(std::collections::BTreeMap::new()),
             relations: Mutex::new(HashMap::new()),
         })
     }
 
     fn engine(&self) -> std::sync::MutexGuard<'_, burrmill::Engine> {
         self.engine.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// The walls `analytics_budget` sets for DuckDB, as Burrmill's budget.
+fn budget(cfg: &crate::analytics_budget::AnalyticsConfig, spill: &Path) -> burrmill::Budget {
+    burrmill::Budget {
+        memory_bytes: (cfg.memory_limit_mb as usize) << 20,
+        threads: cfg.threads.max(1) as usize,
+        spill: Some((
+            spill.to_path_buf(),
+            crate::analytics_budget::spill_cap_bytes(cfg) as _,
+        )),
     }
 }
 
@@ -79,7 +102,7 @@ fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
 fn died(e: burrmill::BurrmillError) -> Died {
     use burrmill::BurrmillError::*;
     match e {
-        NotAllowed(_) | Parse(_) | NoSegments(_) => Died::Binding(engine_err(e)),
+        NotAllowed(_) | Parse(_) | Plan(_) | NoSegments(_) => Died::Binding(engine_err(e)),
         _ => Died::Executing(engine_err(e)),
     }
 }
@@ -108,17 +131,70 @@ impl Interrupt for Cancel {
 
 impl Session for BurrmillSession {
     fn execute(&self, sql: &str) -> Result<()> {
-        // The statements the policy code runs for effect are all view definitions; anything else
-        // (a transaction boundary on the folds path) has no Burrmill meaning and says so.
-        let (Some(name), Some(body)) = (
+        use sqlparser::ast::{ObjectType, Statement};
+        if let (Some(name), Some(body)) = (
             crate::analytics::view_name(sql),
             crate::analytics::view_body(sql),
-        ) else {
-            return Err(anyhow!(
-                "not a view definition, and Burrmill runs nothing else for effect"
-            ));
-        };
-        self.engine().register_view(&name, body).map_err(engine_err)
+        ) {
+            self.engine()
+                .register_view(&name, body)
+                .map_err(engine_err)?;
+            self.views
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(name, sql.to_string());
+            return Ok(());
+        }
+        // The folds path's statements for effect, and nothing else: a statement is still read-only.
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, sql)?;
+        // In order, as DuckDB runs a batch: each takes effect before the next, none is atomic.
+        let mut engine = self.engine();
+        for stmt in &stmts {
+            match stmt {
+                Statement::CreateTable(ct) if ct.query.is_some() => {
+                    let name = ct.name.to_string().trim_matches('"').to_string();
+                    let query = ct.query.as_ref().expect("checked").to_string();
+                    engine.create_table_as(&name, &query).map_err(engine_err)?;
+                }
+                Statement::Drop {
+                    object_type: ObjectType::View | ObjectType::Table,
+                    names,
+                    ..
+                } => {
+                    for n in names {
+                        let n = n.to_string().trim_matches('"').to_string();
+                        engine.drop_relation(&n);
+                        self.views
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&n);
+                    }
+                }
+                Statement::StartTransaction { .. } => engine.begin().map_err(engine_err)?,
+                Statement::Commit { .. } => engine.commit().map_err(engine_err)?,
+                Statement::Rollback { .. } => engine.rollback().map_err(engine_err)?,
+                _ => return Err(anyhow!("Burrmill runs no `{stmt}` for effect")),
+            }
+        }
+        Ok(())
+    }
+
+    fn write_parquet(&self, table: &str, path: &Path) -> Result<()> {
+        self.engine()
+            .write_parquet(&format!("SELECT * FROM \"{table}\" ORDER BY ALL"), path)
+            .map_err(engine_err)?;
+        Ok(())
+    }
+
+    fn load_parquet(&self, table: &str, select: &str, path: &Path) -> Result<()> {
+        const LOADING: &str = "__checkpoint_load";
+        let mut engine = self.engine();
+        engine.load_parquet(LOADING, path).map_err(engine_err)?;
+        let made = engine.create_table_as(table, &format!("SELECT {select} FROM \"{LOADING}\""));
+        engine.drop_relation(LOADING);
+        made.map_err(engine_err)?;
+        Ok(())
     }
 
     fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
@@ -209,47 +285,26 @@ impl Session for BurrmillSession {
             .ok_or_else(|| anyhow!("no rows"))
     }
 
-    fn query_arrow(&self, _sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
-        // Burrmill's arrow is not nuthatch's arrow; the fold snapshot path stays on the primary.
-        Err(anyhow!("query_arrow is not available on the shadow engine"))
+    /// Through Arrow IPC, because Burrmill's arrow is not nuthatch's.
+    fn query_arrow(&self, sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+        let ipc = self.engine().sql_ipc(sql).map_err(engine_err)?;
+        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)?;
+        Ok(reader.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// From the plan, as DuckDB's prepare gives them: a result with no rows has no batch to read.
     fn column_names(&self, sql: &str) -> Result<Vec<String>> {
-        let engine = self.engine();
-        let mut names = Vec::new();
-        engine
-            .sql_for_each(sql, |batch| {
-                if names.is_empty() {
-                    names = batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().clone())
-                        .collect();
-                }
-                Ok(())
-            })
-            .map_err(engine_err)?;
-        Ok(names)
+        Ok(self
+            .engine()
+            .describe(sql)
+            .map_err(engine_err)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
 
     fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
-        let engine = self.engine();
-        let mut out = Vec::new();
-        engine
-            .sql_for_each(sql, |batch| {
-                if out.is_empty() {
-                    out = batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| (f.name().clone(), f.data_type().to_string()))
-                        .collect();
-                }
-                Ok(())
-            })
-            .map_err(engine_err)?;
-        Ok(out)
+        self.engine().describe(sql).map_err(engine_err)
     }
 
     fn has_relation(&self, name: &str) -> bool {
@@ -266,7 +321,23 @@ impl Session for BurrmillSession {
     }
 
     fn view_definitions(&self) -> Option<Vec<(String, String)>> {
-        None
+        let views = self.views.lock().unwrap_or_else(|p| p.into_inner());
+        Some(views.iter().map(|(n, s)| (n.clone(), s.clone())).collect())
+    }
+
+    fn canonical_plan(&self, sql: &str) -> Option<String> {
+        burrmill::inspect::canonical(sql)
+    }
+
+    fn engine_version(&self) -> String {
+        burrmill::ENGINE.to_string()
+    }
+
+    fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+        Some((
+            burrmill::inspect::base_tables(sql)?,
+            burrmill::inspect::refs(sql)?.functions,
+        ))
     }
 
     fn serialize_sql(&self, _sql: &str) -> Result<Value> {
@@ -287,10 +358,10 @@ impl Session for BurrmillSession {
         Arc::new(Cancel(self.engine().cancel_token()))
     }
 
-    fn cold_scan_operators(&self, _sql: &str) -> Result<u64> {
-        Err(crate::analytics::unboundable(
-            "the admission bound is planned on DuckDB",
-        ))
+    fn cold_scan_operators(&self, sql: &str) -> Result<u64> {
+        self.engine()
+            .parquet_scans(sql)
+            .map_err(|e| crate::analytics::unboundable(e.to_string()))
     }
 
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
@@ -419,6 +490,34 @@ impl Session for BurrmillSession {
 
 #[cfg(test)]
 mod tests {
+    /// `unconfigured_duckdb_still_opens_at_todays_walls`, for Burrmill: the same memory, threads and
+    /// private spill directory, unless the operator says otherwise.
+    #[test]
+    fn unconfigured_burrmill_opens_at_todays_walls() {
+        let _env = crate::analytics_budget::tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = crate::analytics_budget::from_env();
+        assert_eq!((cfg.memory_limit_mb, cfg.threads), (512, 2));
+        let spill = crate::engine_duck::new_spill_dir().unwrap();
+        let budget = super::budget(&cfg, &spill.0);
+        assert_eq!(budget.memory_bytes, 512 << 20);
+        assert_eq!(budget.threads, 2);
+        assert_eq!(budget.spill, Some((spill.0.clone(), 2 << 30)));
+        assert!(super::BurrmillSession::new().is_ok());
+    }
+
+    #[test]
+    fn burrmill_keys_derivations_by_its_own_parse_and_build() {
+        use crate::engine::Session;
+        let s = super::BurrmillSession::new().unwrap();
+        let a = s.canonical_plan("SELECT a.x FROM t a -- c\nWHERE a.y > 1");
+        assert!(a.is_some());
+        assert_eq!(a, s.canonical_plan("select b.x from t b where b.y > 1"));
+        assert_ne!(a, s.canonical_plan("SELECT a.x FROM u a WHERE a.y > 1"));
+        assert!(s.engine_version().starts_with("burrmill "));
+    }
+
     use super::*;
     use crate::engine_shadow::{Difference, ShadowEngine};
     use serde_json::json;
@@ -472,6 +571,151 @@ mod tests {
         }
         let seen = seen.lock().unwrap();
         assert!(seen.is_empty(), "{seen:#?}");
+    }
+
+    /// The SQL nuthatch writes itself, rather than the SQL a user or an authored view writes: the
+    /// restart folds, the recipes, a webhook predicate and GraphQL's lowering, each on both engines.
+    #[test]
+    fn duckdb_and_burrmill_agree_on_the_sql_nuthatch_generates() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        let zero = crate::recipes::ZERO_ADDRESS;
+        let transfers = [
+            (zero, "0xaa", "1000"),
+            (zero, "0xbb", "250"),
+            ("0xaa", "0xbb", "400"),
+            ("0xbb", "0xcc", "650"),
+            ("0xcc", zero, "50"),
+            // Past 38 digits: the folds drop it and `oversized_transfers` counts it.
+            (
+                "0xaa",
+                "0xcc",
+                "1606938044258990275541962092341162602522202993782792835301376",
+            ),
+            // Fits i128 but not 38 digits, where Burrmill's HUGEINT ends: dropped by both.
+            ("0xbb", "0xaa", "150000000000000000000000000000000000000"),
+        ];
+        for (i, (from, to, value)) in transfers.iter().enumerate() {
+            let b = i as u64 + 1;
+            let rows = [
+                json!({"table": "tok__transfer", "block_number": b, "log_index": 0, "from": from, "to": to, "value": value}).to_string(),
+                json!({"table": "tok__sync", "block_number": b, "log_index": 1, "address": if b.is_multiple_of(2) { "0xp1" } else { "0xp2" }, "reserve0": (b * 10).to_string(), "reserve1": (b * 7).to_string()}).to_string(),
+            ];
+            crate::seal::seal_range(dir.path(), &rows, b, b).unwrap();
+        }
+        let labels = dir.path().join("labels");
+        std::fs::create_dir_all(&labels).unwrap();
+        std::fs::write(
+            labels.join("l.json"),
+            r#"[{"address":"0xBB","label":"exchange"},{"address":"0xcc","label":"mixer"}]"#,
+        )
+        .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<Difference>::new()));
+        let s = seen.clone();
+        let engine = ShadowEngine::new(
+            Box::new(crate::engine_duck::DuckEngine),
+            Box::new(BurrmillEngine),
+            Arc::new(move |d: &Difference| s.lock().unwrap().push(d.clone())),
+        );
+        let session = engine.open(dir.path()).unwrap();
+        let manifest = crate::seal::load_manifest_with_hash(dir.path()).unwrap().0;
+        let sealed = |t: &str| -> Vec<PathBuf> {
+            manifest.tables[t]
+                .iter()
+                .map(|s| crate::seal::segment_path(dir.path(), &s.file, &s.hash))
+                .collect()
+        };
+        let col = |n: &str, t: &str| (n.to_string(), t.to_string());
+        let transfer_cols = [
+            col("block_number", "u64"),
+            col("log_index", "u64"),
+            col("from", "address"),
+            col("to", "address"),
+            col("value", "word32"),
+        ];
+        let sync_cols = [
+            col("block_number", "u64"),
+            col("log_index", "u64"),
+            col("address", "address"),
+            col("reserve0", "word32"),
+            col("reserve1", "word32"),
+        ];
+        for (t, cols) in [("tok__transfer", &transfer_cols), ("tok__sync", &sync_cols)] {
+            assert!(session
+                .bind_facts(t, cols, &sealed(t), false, FactWindow::default())
+                .unwrap());
+        }
+        session.bind_labels(&labels).unwrap();
+
+        let graph = crate::graph_schema::parse(
+            r#"
+type Pool @entity { id: ID! liquidity: BigInt! token0: Token! swaps: [Swap!]! @derivedFrom(field: "pool") }
+type Token @entity { id: ID! symbol: String! }
+type Swap @entity { id: ID! pool: Pool! }
+"#,
+        )
+        .unwrap();
+        let view = crate::subgraph_import::to_alias;
+        for ddl in [
+            format!("CREATE VIEW \"{}\" AS SELECT * FROM (VALUES ('p1', '5', 't1'), ('p2', '170141183460469231731687303715884105728', 't2'), ('p3', '12', 't1')) v(id, liquidity, token0)", view("Pool")),
+            format!("CREATE VIEW \"{}\" AS SELECT * FROM (VALUES ('t1', 'AAA'), ('t2', 'BBB')) v(id, symbol)", view("Token")),
+            format!("CREATE VIEW \"{}\" AS SELECT * FROM (VALUES ('s1', 'p1'), ('s2', 'p1'), ('s3', 'p3')) v(id, pool)", view("Swap")),
+        ] {
+            session.execute(&ddl).unwrap();
+        }
+        let mut statements: Vec<String> = [
+            crate::recipes::total_supply_select("tok"),
+            crate::recipes::balances_select("tok"),
+            crate::recipes::holder_count_select("tok"),
+            crate::recipes::reserves_select("tok"),
+            "SELECT * FROM \"tok__transfer\" WHERE block_number > 0 AND block_number <= 6 \
+             AND (CAST(value AS HUGEINT) >= 100) ORDER BY block_number, log_index"
+                .to_string(),
+        ]
+        .into_iter()
+        .chain(crate::analytics::generated_fold_sql(
+            "tok__transfer",
+            "from",
+            "to",
+            "value",
+            3,
+        ))
+        .collect();
+        for q in [
+            "{ pools { id liquidity } }",
+            "{ pools(orderBy: liquidity, orderDirection: desc) { id } }",
+            "{ pools(where: { liquidity_gt: \"6\" }) { id } }",
+            "{ pools { id token0 { symbol } } }",
+            "{ pools { id swaps { id } } }",
+            "{ swaps { id pool { id liquidity } } }",
+        ] {
+            let root = crate::graph_query::parse(q).unwrap().remove(0);
+            statements.push(crate::graph_query::compile(&graph, &root).unwrap().sql);
+        }
+
+        for sql in &statements {
+            let before = seen.lock().unwrap().len();
+            let served = session.collect(sql, Some(1000));
+            let after = seen.lock().unwrap().len();
+            eprintln!(
+                "{}\t{}\t{}",
+                if after > before { "DIFF" } else { "same" },
+                match &served {
+                    Ok(c) => format!("{} rows", c.rows.len()),
+                    Err(e) => format!("primary refused: {e:?}"),
+                },
+                sql.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+        }
+        let seen = seen.lock().unwrap();
+        for d in seen.iter() {
+            eprintln!(
+                "{:?}\n  primary={}\n  secondary={}",
+                d.kind, d.primary, d.secondary
+            );
+        }
+        assert!(seen.is_empty(), "{} differences", seen.len());
     }
 
     /// Shadow mode over a real nest, through the production path: the shadow is installed, every

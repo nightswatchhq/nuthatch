@@ -47,8 +47,9 @@ SELECT count(*) AS transfers, CAST(sum(value_dec) AS VARCHAR) AS total,
 FROM usdc__transfer;
 
 CREATE VIEW wide_values AS
-SELECT value_overflow AS overflowed, count(*) AS n, sum(value_dec) AS total_dec,
-       count(value_dec) AS with_dec
+SELECT value_overflow AS overflowed, count(*) AS n,
+       sum(CASE WHEN NOT value_overflow THEN value_dec END) AS total_dec,
+       count(CASE WHEN NOT value_overflow THEN value_dec END) AS with_dec
 FROM usdc__wide
 GROUP BY value_overflow;
 
@@ -497,8 +498,10 @@ fn translated_views(nest: &Path) -> serde_json::Map<String, serde_json::Value> {
     );
     assert_eq!(refused[0].0, "mean_value");
     assert!(refused[0].1.contains("`avg`"), "{}", refused[0].1);
+    let mut names = out.keys().map(String::as_str).collect::<Vec<_>>();
+    names.sort_unstable();
     assert_eq!(
-        out.keys().map(String::as_str).collect::<Vec<_>>(),
+        names,
         [
             "drift_summary",
             "sender_kinds",

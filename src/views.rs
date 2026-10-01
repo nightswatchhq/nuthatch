@@ -9,13 +9,15 @@
 //! or high-decimal tokens would under-count. i128 (max ~1.7e38) comfortably holds any real token's
 //! total supply in base units.
 //!
-//! **Values exceeding i128 are skipped entirely** - the whole transfer, both legs - rather than
-//! saturated or truncated (audit L4, reviewed and accepted). No real token reaches 1.7e38 base units,
-//! so in practice this only fires on a deliberately absurd value; silently admitting a wrong number
-//! would be worse than omitting a fictional one, and crediting one leg while dropping the other would
-//! invent value. Both the hot replay (`parse::<i128>` → skip) and the cold fold
-//! (`TRY_CAST(… AS HUGEINT)` → NULL) drop it, so a restart cannot change the answer - pinned by
-//! `analytics::tests::an_over_i128_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay`.
+//! **Values of more than 38 digits are skipped entirely** - the whole transfer, both legs - rather
+//! than saturated or truncated (audit L4, reviewed and accepted). No real token reaches 1e38 base
+//! units, so in practice this only fires on a deliberately absurd value; silently admitting a wrong
+//! number would be worse than omitting a fictional one, and crediting one leg while dropping the
+//! other would invent value. The line is the nest's own `_dec` line, `DECIMAL(38,0)`, and both the
+//! hot replay ([`transfer_value`]) and the cold fold (`TRY_CAST(… AS DECIMAL(38,0))`) draw it, so a
+//! restart cannot change the answer - pinned by
+//! `analytics::tests::an_oversized_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay`.
+//! Until 3.13 the line was `i128`, which Burrmill's HUGEINT (`DECIMAL(38,0)`) cannot hold.
 //!
 //! The view is in-memory but not ephemeral: `rebuild` reconstructs it from stored facts on a warm
 //! restart (see `indexer::rebuild_balances`), so balances survive a process bounce.
@@ -33,6 +35,15 @@ use std::sync::{Arc, RwLock};
 type Delta = Tup2<String, i128>;
 /// A batch of weighted deltas. Weight is the DBSP Z-set weight (i64): +1 insert, −1 retract.
 pub type WeightedBatch = Vec<Tup2<Delta, i64>>;
+
+/// A transfer value as the balance, exposure and velocity views take it: at most 38 digits, the
+/// nest's `DECIMAL(38,0)` line, else `None` and the transfer is dropped (COR-8, #814). The cold folds
+/// draw the same line in SQL (`analytics::exact_or_null`).
+pub fn transfer_value(text: &str) -> Option<i128> {
+    text.parse::<i128>()
+        .ok()
+        .filter(|v| v.unsigned_abs() < 10u128.pow(38))
+}
 
 /// The two deltas a single transfer contributes: +value to `to`, −value to `from`.
 pub fn transfer_deltas(from: &str, to: &str, value: i128, weight: i64) -> WeightedBatch {
@@ -138,12 +149,13 @@ pub struct BalanceView {
     /// surface a dead derived-view thread and fail loudly, instead of silently serving frozen balances
     /// as if healthy (a dead task must surface, never be served over).
     healthy: Arc<AtomicBool>,
-    /// Transfers whose value does not fit `i128` and were therefore **dropped from these balances**
-    /// (COR-8, #814).
+    /// Transfers whose value has more than 38 digits and were therefore **dropped from these
+    /// balances** (COR-8, #814). Served as `dropped_over_i128`, the name from when the line was
+    /// `i128`, kept because callers read it.
     ///
-    /// The drop itself is correct and stays: `TRY_CAST(... AS HUGEINT)` yields NULL on the cold fold
-    /// and `str::parse::<i128>()` errors on the hot replay, and **both legs go**, because dropping
-    /// only one would invent value - a sender debited with nobody credited.
+    /// The drop itself is correct and stays: [`transfer_value`] refuses it on the hot replay and
+    /// `TRY_CAST(... AS DECIMAL(38,0))` yields NULL on the cold fold, and **both legs go**, because
+    /// dropping only one would invent value - a sender debited with nobody credited.
     ///
     /// What was wrong is that it was **silent**. A balance missing a transfer was served exactly
     /// like a complete one, so a caller could not tell the two apart. Counting it is the whole fix:
@@ -246,7 +258,7 @@ impl BalanceView {
         self.balances.read().map(|m| m.len()).unwrap_or(0)
     }
 
-    /// Record `n` transfers dropped for exceeding `i128` (COR-8, #814).
+    /// Record `n` transfers dropped for exceeding 38 digits (COR-8, #814).
     pub fn note_over_i128(&self, n: u64) {
         if n > 0 {
             self.over_i128.fetch_add(n, Ordering::Relaxed);
@@ -264,6 +276,22 @@ impl BalanceView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_transfer_value_is_taken_up_to_38_digits() {
+        let max = "99999999999999999999999999999999999999";
+        assert_eq!(transfer_value(max), Some(10i128.pow(38) - 1));
+        assert_eq!(
+            transfer_value("100000000000000000000000000000000000000"),
+            None
+        );
+        assert_eq!(
+            transfer_value("170141183460469231731687303715884105727"),
+            None
+        );
+        assert_eq!(transfer_value("0"), Some(0));
+        assert_eq!(transfer_value("x"), None);
+    }
 
     #[test]
     fn seeding_matches_replay() {

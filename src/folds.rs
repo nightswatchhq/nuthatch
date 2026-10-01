@@ -656,11 +656,7 @@ impl Stepper<'_> {
             std::fs::create_dir_all(&cdir)?;
             let path = cdir.join(format!("{at}.parquet"));
             let tmp = cdir.join(format!("{at}.parquet.tmp"));
-            self.eval.execute(&format!(
-                "COPY (SELECT * FROM \"{}\" ORDER BY ALL) TO '{}' (FORMAT parquet)",
-                f.name,
-                tmp.display().to_string().replace('\'', "''")
-            ))?;
+            self.eval.write_parquet(&f.name, &tmp)?;
             std::fs::File::open(&tmp)?.sync_all()?;
             std::fs::rename(&tmp, &path)?;
             // The Parquet file is in place before the log names it; an unlisted file is never read.
@@ -699,12 +695,7 @@ impl Stepper<'_> {
                 .iter()
                 .map(|(c, t)| format!("CAST(\"{c}\" AS {t}) AS \"{c}\""))
                 .collect();
-            self.eval.execute(&format!(
-                "CREATE OR REPLACE TABLE \"{}\" AS SELECT {} FROM read_parquet('{}')",
-                f.name,
-                cols.join(", "),
-                path.display().to_string().replace('\'', "''")
-            ))?;
+            self.eval.load_parquet(&f.name, &cols.join(", "), &path)?;
             let (rows, digest) = self.eval.digest(&carry_select(f))?;
             if rows != entry.rows || digest != entry.row_digest {
                 bail!(
@@ -2121,6 +2112,14 @@ fn declared_carry(
             .with_context(|| format!("{at}: carry column `{col}` has an unknown type `{ty}`"))?
             .remove(0)
             .1;
+        // An engine may carry a 128-bit integer as DECIMAL(38,0), which would pass below.
+        let declared = ty.trim().to_ascii_uppercase();
+        let canonical = if ["HUGEINT", "INT128", "UHUGEINT", "UINT128"].contains(&declared.as_str())
+        {
+            declared
+        } else {
+            canonical
+        };
         let allowed = CARRY_TYPES.contains(&canonical.as_str())
             || canonical
                 .strip_prefix("DECIMAL(")
@@ -2162,8 +2161,37 @@ fn schema_mismatch(carry: &[(String, String)], output: &[(String, String)]) -> S
     format!("output is not its carry: {}", parts.join("; "))
 }
 
+/// The same bodies with Burrmill as the engine: stepping, checkpoints, resume, snapshots. Invoked
+/// inside each test module, whose tests are private to it.
+#[cfg(all(test, feature = "shadow-burrmill"))]
+macro_rules! on_burrmill {
+    ($($t:ident),* $(,)?) => {
+        mod on_burrmill {
+            $(
+                #[test]
+                fn $t() {
+                    static E: crate::engine_burrmill::BurrmillEngine =
+                        crate::engine_burrmill::BurrmillEngine;
+                    crate::analytics::TEST_ENGINE.with(|c| c.set(Some(&E)));
+                    super::$t();
+                }
+            )*
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        a_valid_set_loads_in_name_order_with_its_dependencies,
+        a_volatile_fold_is_refused_and_so_is_one_over_a_volatile_view,
+        a_view_that_looks_back_into_history_is_warned_by_name_and_construct,
+        an_output_that_is_not_its_carry_is_refused_by_what_differs,
+        a_carry_type_a_checkpoint_cannot_hold_exactly_is_refused,
+        names_order_and_declarations_are_checked,
+    );
+
     use super::*;
 
     pub(super) const SCHEMA: &str = r#"{"tables":[{"table":"t","columns":[{"name":"block_number","storage":"u64"},{"name":"k","storage":"varchar"},{"name":"v","storage":"varchar"}]}]}"#;
@@ -2432,6 +2460,15 @@ mod stepping_support {
 
 #[cfg(test)]
 mod stepping {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        a_fold_sees_its_window_and_its_carry_holds_the_rest,
+        a_keyed_fold_passes_untouched_keys_through,
+        a_refused_step_changes_nothing_and_a_retry_does_not_double_count,
+        a_refused_first_step_leaves_the_views_a_retry_needs,
+        a_fold_over_its_max_rows_is_refused,
+    );
+
     use super::stepping_support::*;
     use super::*;
 
@@ -2583,6 +2620,9 @@ mod stepping {
 
 #[cfg(test)]
 mod short_windows {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(a_window_missing_sealed_data_is_refused,);
+
     use super::stepping_support::*;
     use super::*;
 
@@ -2613,6 +2653,18 @@ mod short_windows {
 
 #[cfg(test)]
 mod checkpoints {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        a_read_from_checkpoints_equals_one_window_from_genesis,
+        partitions_agree_at_the_first_event_after_every_cut,
+        a_checkpoint_that_no_longer_matches_its_digest_is_refused,
+        a_checkpoint_file_the_log_does_not_name_is_never_read,
+        checkpoints_chain_and_record_what_each_window_read,
+        a_writer_killed_mid_checkpoint_is_repaired_by_the_next_build,
+        a_link_that_does_not_chain_is_cut_away_with_everything_after_it,
+        a_fold_hash_ignores_formatting_and_follows_meaning,
+    );
+
     use super::stepping_support::*;
     use super::*;
 
@@ -2819,6 +2871,12 @@ mod checkpoints {
 
 #[cfg(test)]
 mod checkpoints_are_used {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        a_read_past_a_checkpoint_does_not_need_the_history_before_it,
+        a_checkpoint_id_covers_the_whole_history_not_the_last_window,
+    );
+
     use super::stepping_support::*;
     use super::*;
 
@@ -2889,6 +2947,9 @@ mod checkpoints_are_used {
 
 #[cfg(test)]
 mod cli {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(fold_build_then_read_over_a_real_store,);
+
     use super::stepping_support::*;
     use super::*;
     use crate::cli::FoldCommand;
@@ -2938,6 +2999,12 @@ mod cli {
 
 #[cfg(test)]
 mod bench_and_probe {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        a_probe_answers_at_the_head_and_changes_nothing,
+        the_bench_times_every_hot_head_from_the_checkpoint,
+    );
+
     use super::stepping_support::*;
     use super::*;
 
@@ -2993,6 +3060,13 @@ mod bench_and_probe {
 
 #[cfg(test)]
 mod provenance {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        a_checkpoint_that_claims_another_predecessor_is_refused,
+        a_checkpoint_whose_id_does_not_recompute_is_refused,
+        a_provisional_segment_folded_into_a_wider_one_leaves_the_checkpoints_valid,
+    );
+
     use super::stepping_support::*;
     use super::*;
 
@@ -3101,6 +3175,13 @@ mod provenance {
 
 #[cfg(test)]
 mod verification {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        check_folds_recomputes_the_last_window_and_names_what_differs,
+        check_folds_from_genesis_walks_every_window,
+        check_folds_names_a_link_that_does_not_chain,
+    );
+
     use super::stepping_support::*;
     use super::*;
 
@@ -3207,6 +3288,9 @@ mod verification {
 
 #[cfg(test)]
 mod streamed_digest {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(the_streamed_digest_equals_the_materialised_one,);
+
     use super::stepping_support::*;
     use super::*;
 
@@ -3235,6 +3319,9 @@ mod streamed_digest {
 
 #[cfg(test)]
 mod name_case {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(a_fold_name_is_lowercase_and_clashes_ignore_case,);
+
     use super::*;
 
     /// Relation names compare lowercased, and a fold name can only be lowercase, so a case variant
@@ -3267,6 +3354,14 @@ mod name_case {
 
 #[cfg(test)]
 mod writer {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        a_nest_without_folds_has_no_writer,
+        the_writer_checkpoints_each_advance_and_matches_a_build,
+        a_restarted_writer_continues_from_its_checkpoints,
+        a_writer_that_fails_says_so_and_stops,
+    );
+
     use super::stepping_support::*;
     use super::*;
 
@@ -3431,6 +3526,9 @@ mod writer {
 
 #[cfg(test)]
 mod identity {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(a_fold_hash_does_not_depend_on_whether_anything_has_sealed,);
+
     use super::stepping_support::*;
     use super::*;
     use serde_json::json;
@@ -3469,6 +3567,15 @@ mod identity {
 
 #[cfg(test)]
 mod retention {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        the_keep_rule_takes_the_recent_and_the_first_of_each_span,
+        retention_bounds_the_files_and_every_read_stays_exact,
+        a_read_into_history_past_the_horizon_is_refused_by_name,
+        resuming_at_a_removed_checkpoint_says_so,
+        a_retention_that_would_break_check_folds_is_refused,
+    );
+
     use super::stepping_support::*;
     use super::*;
     use serde_json::json;
@@ -3614,6 +3721,20 @@ mod retention {
 
 #[cfg(test)]
 mod head_snapshots {
+    #[cfg(feature = "shadow-burrmill")]
+    on_burrmill!(
+        concurrent_readers_at_one_head_cause_one_evaluation,
+        a_snapshot_equals_the_on_demand_read_at_its_block,
+        a_keyed_snapshot_holds_its_touched_keys_over_a_shared_checkpoint,
+        a_pinned_read_to_a_retained_hash_is_the_head_response,
+        an_orphaned_hash_is_refused,
+        retained_snapshots_stay_within_the_declared_bound,
+        an_expired_snapshot_still_answers_the_readers_that_waited_for_it,
+        the_snapshot_bench_reads_every_hot_head_once,
+        an_evicted_snapshot_is_freed,
+        an_empty_snapshot_bound_is_refused_at_load,
+    );
+
     use super::stepping_support::*;
     use super::*;
 

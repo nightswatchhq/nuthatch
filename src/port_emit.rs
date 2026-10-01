@@ -673,10 +673,14 @@ fn write_entities(
                     Some(a) => match &a.source {
                         AccumulationSource::Column(column) => {
                             let cast = format!("TRY_CAST(\"{column}\" AS DECIMAL(38,0))");
+                            let value = crate::analytics::exact_or_null(
+                                &format!("\"{column}\""),
+                                "DECIMAL(38,0)",
+                            );
                             let term = if a.negated {
-                                format!("-{cast}")
+                                format!("-{value}")
                             } else {
-                                cast.clone()
+                                value
                             };
                             cols.push(format!("    {term} AS \"{f}\""));
                             if needs_overflow.contains(f) {
@@ -1688,6 +1692,12 @@ mod tests {
     /// thing either way. Run against real DuckDB, empty and populated.
     #[test]
     fn the_emitted_check_answers_the_same_on_a_populated_nest() {
+        crate::engine::each_engine(the_emitted_check_answers_the_same_on_a_populated_nest_on);
+    }
+
+    fn the_emitted_check_answers_the_same_on_a_populated_nest_on(
+        conn: &dyn crate::engine::Session,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let views = [view("Token"), view("Pool")];
         write_checks(dir.path(), &views).unwrap();
@@ -1706,39 +1716,43 @@ mod tests {
             "the fixture must be the constant answer, not a row count: {expected}"
         );
 
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        for alias in ["token", "pool"] {
-            conn.execute_batch(&format!(
-                "CREATE TABLE {alias}_rows (id VARCHAR); \
-                 CREATE VIEW \"{alias}\" AS SELECT * FROM {alias}_rows;"
-            ))
-            .unwrap();
-        }
-
-        let answer = |conn: &duckdb::Connection| -> Vec<(String, bool)> {
-            let mut stmt = conn.prepare(sql.trim_end().trim_end_matches(';')).unwrap();
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
+        // Each table and its view, redefined together: a Burrmill view keeps the table it was
+        // defined over, where DuckDB's reads whatever holds the name now.
+        let nest = |token: &str, pool: &str| {
+            for (alias, ids) in [("token", token), ("pool", pool)] {
+                conn.execute(&format!(
+                    "CREATE OR REPLACE TABLE {alias}_rows AS SELECT CAST(id AS VARCHAR) AS id \
+                     FROM (VALUES {ids}) v(id) WHERE id IS NOT NULL"
+                ))
                 .unwrap();
-            rows
+                conn.execute(&format!(
+                    "CREATE OR REPLACE VIEW \"{alias}\" AS SELECT * FROM {alias}_rows"
+                ))
+                .unwrap();
+            }
+        };
+        let answer = || -> Vec<(String, bool)> {
+            let rows = conn
+                .collect(sql.trim_end().trim_end_matches(';'), None)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
+                .unwrap()
+                .rows;
+            rows.iter()
+                .map(|r| (r["view"].as_str().unwrap().to_string(), r["binds"] == true))
+                .collect()
         };
 
-        let empty = answer(&conn);
+        nest("(NULL)", "(NULL)");
+        let empty = answer();
         assert_eq!(
             empty,
             vec![("Pool".to_string(), true), ("Token".to_string(), true)],
             "the check must bind on an empty nest"
         );
 
-        conn.execute_batch(
-            "INSERT INTO token_rows VALUES ('0xaa'), ('0xbb'); \
-             INSERT INTO pool_rows VALUES ('0xcc');",
-        )
-        .unwrap();
+        nest("('0xaa'), ('0xbb')", "('0xcc')");
         assert_eq!(
-            answer(&conn),
+            answer(),
             empty,
             "the check must give the same answer once the nest holds data"
         );
@@ -1747,12 +1761,16 @@ mod tests {
     /// A view the nest does not have must still fail the check - the point of it binding.
     #[test]
     fn the_emitted_check_fails_when_a_view_is_missing() {
+        crate::engine::each_engine(|conn| the_emitted_check_fails_when_a_view_is_missing_on(conn));
+    }
+
+    fn the_emitted_check_fails_when_a_view_is_missing_on(conn: &dyn crate::engine::Session) {
         let dir = tempfile::tempdir().unwrap();
         write_checks(dir.path(), &[view("Token")]).unwrap();
         let sql = std::fs::read_to_string(dir.path().join("checks/port_views.sql")).unwrap();
-        let conn = duckdb::Connection::open_in_memory().unwrap();
         assert!(
-            conn.prepare(sql.trim_end().trim_end_matches(';')).is_err(),
+            conn.collect(sql.trim_end().trim_end_matches(';'), None)
+                .is_err(),
             "a check that binds nothing is not a check:\n{sql}"
         );
     }
@@ -1763,6 +1781,14 @@ mod tests {
     /// real DuckDB, because the whole claim is about what the SQL returns.
     #[test]
     fn a_later_explicit_null_clears_the_field_and_a_missing_column_does_not() {
+        crate::engine::each_engine(
+            a_later_explicit_null_clears_the_field_and_a_missing_column_does_not_on,
+        );
+    }
+
+    fn a_later_explicit_null_clears_the_field_and_a_missing_column_does_not_on(
+        conn: &dyn crate::engine::Session,
+    ) {
         let mut selects = BTreeMap::new();
         put(&mut selects, "id", "factory__pool_created", "token0");
         put(&mut selects, "id", "factory__token_updated", "token");
@@ -1770,34 +1796,40 @@ mod tests {
         put(&mut selects, "name", "factory__token_updated", "name");
         let sql = exact_select_sql(&selects, &BTreeMap::new());
 
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE factory__pool_created (token0 VARCHAR, sym VARCHAR, \
-               block_number BIGINT, log_index BIGINT);
-             CREATE TABLE factory__token_updated (token VARCHAR, name VARCHAR, \
-               block_number BIGINT, log_index BIGINT);
-             INSERT INTO factory__pool_created VALUES ('0xaa', 'AAA', 1, 0);
-             INSERT INTO factory__token_updated VALUES ('0xaa', 'old name', 2, 0);",
-        )
-        .unwrap();
+        // One row per event, all of a table's rows at once: (key, field, block_number, log_index).
+        let events = |table: &str, key: &str, field: &str, rows: &str| {
+            conn.execute(&format!(
+                "CREATE OR REPLACE TABLE {table} AS SELECT CAST(a AS VARCHAR) AS {key}, \
+                 CAST(b AS VARCHAR) AS {field}, CAST(c AS BIGINT) AS block_number, \
+                 CAST(d AS BIGINT) AS log_index FROM (VALUES {rows}) v(a, b, c, d)"
+            ))
+            .unwrap();
+        };
+        events(
+            "factory__pool_created",
+            "token0",
+            "sym",
+            "('0xaa', 'AAA', 1, 0)",
+        );
+        events(
+            "factory__token_updated",
+            "token",
+            "name",
+            "('0xaa', 'old name', 2, 0)",
+        );
 
-        let read = |conn: &duckdb::Connection| -> (Option<String>, Option<String>) {
-            let mut stmt = conn.prepare(sql.trim_end().trim_end_matches(';')).unwrap();
-            let rows: Vec<(Option<String>, Option<String>)> = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, Option<String>>("name")?,
-                        r.get::<_, Option<String>>("symbol")?,
-                    ))
-                })
+        let read = || -> (Option<String>, Option<String>) {
+            let rows = conn
+                .collect(sql.trim_end().trim_end_matches(';'), None)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
                 .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+                .rows;
             assert_eq!(rows.len(), 1, "one id, one row: {rows:?}");
-            rows[0].clone()
+            let text = |v: &serde_json::Value| v.as_str().map(str::to_string);
+            (text(&rows[0]["name"]), text(&rows[0]["symbol"]))
         };
 
-        let (name, symbol) = read(&conn);
+        let (name, symbol) = read();
         assert_eq!(name.as_deref(), Some("old name"));
         assert_eq!(
             symbol.as_deref(),
@@ -1806,9 +1838,13 @@ mod tests {
         );
 
         // A later event clears the field. This is the one the old filter could not see.
-        conn.execute_batch("INSERT INTO factory__token_updated VALUES ('0xaa', NULL, 3, 0);")
-            .unwrap();
-        let (name, symbol) = read(&conn);
+        events(
+            "factory__token_updated",
+            "token",
+            "name",
+            "('0xaa', 'old name', 2, 0), ('0xaa', NULL, 3, 0)",
+        );
+        let (name, symbol) = read();
         assert_eq!(
             name, None,
             "an explicit NULL at a later block clears the field; it returned {name:?}"

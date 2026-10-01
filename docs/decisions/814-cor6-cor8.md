@@ -100,3 +100,14 @@ fault that is not there.
 
 Both of the above. And in COR-6's case, the reorg question is unmeasured - if the board picks
 anything other than refusal, a rollback test over a colliding schema comes first.
+
+## Addendum, 2026-09-29: the line moves from `i128` to 38 digits
+
+A transfer is now dropped when its value has more than 38 digits, not when it exceeds `i128`. The
+line is the nest's own: the `_dec` and `_overflow` columns already stopped at `DECIMAL(38,0)`, while
+the balance, exposure and velocity views stopped at `i128`, so a value in `[10^38, 2^127)` was an
+overflow in one column and a balance in the view beside it. Burrmill's HUGEINT is `DECIMAL(38,0)`
+and cannot hold that band, so the old line could not survive the engine change either. The live
+views draw it in `views::transfer_value`, the cold folds in `analytics::exact_or_null`; the test
+above is now `an_oversized_value_is_dropped_identically_by_the_cold_fold_and_the_hot_replay`.
+`dropped_over_i128` keeps its name on `/balances` because callers read it.

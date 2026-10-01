@@ -126,16 +126,20 @@ Three sites have been added since: `port_emit.rs` (test-only, 2026-09-08), `dune
 (production, 2026-09-15), and `analytics_scalars.rs` (production, 2026-09-17).
 The table now lists nine; the six in the heading is what slice 0 found,
 kept because that is the number the rest of this document reasons about.
+Two have since left: `entities.rs` and `entity_lower.rs` parse with sqlparser's DuckDB dialect
+(2026-09-28), keeping the DuckDB-JSON versions only as `#[cfg(test)]` differential oracles.
+Two more left on 2026-09-30, both test-only: `seal.rs`, whose segment-binding probe now reads the
+footer with the parquet crate, and `port_emit.rs`, whose checks run on each engine through `Session`.
 
 | site | role | classification | notes |
 | --- | --- | --- | --- |
 | `analytics.rs` | general SQL, views, hot+cold federation | production | 53 connection ops, the obvious one |
 | `analytics_scalars.rs` | pure bounded scalar conversions and exact arithmetic | production | registers on the existing analytical connection; one crate-internal `&Connection` signature, no additional connection or I/O |
-| `entities.rs` | aggregate **classification** from `duckdb_functions()` | **production, public contract** | its own comment: "the same catalogue the binder uses". Narrower than first written - see correction |
-| `entity_lower.rs` | AST for lowering authored SQL to a DBSP circuit | production | RFC-0041 parser role |
+| `entities.rs` | aggregate **classification** from `duckdb_functions()` | **production, public contract** | its own comment: "the same catalogue the binder uses". Narrower than first written - see correction. **Gone 2026-09-28:** the catalogue is a frozen list, checked against `duckdb_functions()` in tests |
+| `entity_lower.rs` | AST for lowering authored SQL to a DBSP circuit | production | RFC-0041 parser role. **Gone 2026-09-28:** sqlparser, differential-tested against the old lowering |
 | `graft.rs` | engine string in the derivation reuse key (`engine: "duckdb-v1.4.0"`) | **latent** - see correction below | **not** production: nothing calls it and nothing is written to disk |
-| `seal.rs` | segment-binding oracle | test-only | one in-memory connection in a fixture |
-| `port_emit.rs` | emitted-check oracle | test-only | added 2026-09-08 (#1211). Two in-memory connections in `#[cfg(test)]`, proving the generated `checks/port_views.sql` binds and answers the same on an empty and a populated nest. Nothing in the authoring path reaches the engine |
+| `seal.rs` | segment-binding oracle | test-only | one in-memory connection in a fixture. **Gone 2026-09-30:** the parquet crate reads the footer |
+| `port_emit.rs` | emitted-check oracle | test-only | added 2026-09-08 (#1211). Two in-memory connections in `#[cfg(test)]`, proving the generated `checks/port_views.sql` binds and answers the same on an empty and a populated nest. Nothing in the authoring path reaches the engine. **Gone 2026-09-30:** the checks run on each engine through `Session` |
 | `dune_views.rs` | AST of authored views, for exact DuneSQL translation | production | added 2026-09-15 (#1359, RFC-0055 S3). One in-memory connection per `nuthatch emit dune` run, used only for `json_serialize_sql`. The parser is the role, not a convenience: a translation is exact when it means what DuckDB means by the view, so a replacement engine would need its own AST, and views would be written in its dialect |
 | `authored_entity_spike.rs` | RFC-0041 slice-zero spike | **production, measurement-only** | `pub mod` in `lib.rs`, reachable via `nuthatch bench`. A naive read files this as test-only; it ships |
 

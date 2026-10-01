@@ -28,6 +28,7 @@
 //! **A parse failure falls back to the raw text.** That can only cost a match, never invent one.
 
 use anyhow::{Context, Result};
+#[cfg(test)]
 use duckdb::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -128,6 +129,7 @@ impl CanonicalPlan {
 /// Everything else in §3's unsafe list stays significant, and needs no work to stay so: the AST is
 /// already type-aware (`5/2` carries `INTEGER` where `5/2.0` carries `DECIMAL`), already ordered, and
 /// already distinguishes `DISTINCT`.
+#[cfg(test)]
 pub(crate) fn canonical_plan(conn: &Connection, sql: &str) -> CanonicalPlan {
     let literal = format!("'{}'", sql.replace('\'', "''"));
     let Ok(raw) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
@@ -135,21 +137,27 @@ pub(crate) fn canonical_plan(conn: &Connection, sql: &str) -> CanonicalPlan {
     }) else {
         return CanonicalPlan::RawText(sql.trim().to_string());
     };
-    let Ok(mut ast) = serde_json::from_str::<Value>(&raw) else {
-        return CanonicalPlan::RawText(sql.trim().to_string());
-    };
+    match serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(canonical_from_ast)
+    {
+        Some(ast) => CanonicalPlan::Ast(ast),
+        None => CanonicalPlan::RawText(sql.trim().to_string()),
+    }
+}
+
+/// [`canonical_plan`]'s normalisation over an AST already serialised by DuckDB.
+pub(crate) fn canonical_from_ast(mut ast: Value) -> Option<String> {
     // DuckDB reports a parse failure in-band rather than as an error.
     if ast.get("error").and_then(Value::as_bool) != Some(false) {
-        return CanonicalPlan::RawText(sql.trim().to_string());
+        return None;
     }
-
     strip_positional(&mut ast);
     let aliases = collect_aliases(&ast);
     rename_aliases(&mut ast, &aliases);
-
     // `serde_json` preserves object key order as parsed, and DuckDB emits it deterministically for a
     // given version - which is the version already in the key.
-    CanonicalPlan::Ast(ast.to_string())
+    Some(ast.to_string())
 }
 
 /// Remove source-position fields everywhere in the tree.
@@ -253,18 +261,6 @@ pub(crate) fn walk_mut(v: &mut Value, f: &mut impl FnMut(&mut serde_json::Map<St
     }
 }
 
-/// The engine that will evaluate a derivation, and its version (RFC-0033 §2.2).
-///
-/// Not bookkeeping - a correctness requirement. **DuckDB changed CTE semantics at 1.4**, making them
-/// materialized by default where they had been inlined; PostgreSQL flipped the same switch the other
-/// way at 12. Same SQL, different version, different evaluation and potentially different results. A
-/// key without this is unsound across our *own* upgrades, which is the worst place to be unsound
-/// because it is discovered in production rather than in CI.
-pub(crate) fn engine_version(conn: &Connection) -> String {
-    conn.query_row("SELECT version()", [], |r| r.get::<_, String>(0))
-        .unwrap_or_else(|_| "duckdb-unknown".to_string())
-}
-
 /// Everything a derivation's identity depends on. Assembled explicitly so a reader can see the whole
 /// key in one place rather than inferring it from a hash function.
 #[derive(Debug, Clone)]
@@ -353,7 +349,7 @@ impl GraftReport {
 /// author, it simply cannot be cached, and refusing to start over it would be a regression for nests
 /// that work today. A cycle is different - it is malformed, and RFC-0033 §6 makes it a refusal.
 pub fn report(nest_dir: &std::path::Path) -> GraftReport {
-    let Ok(conn) = parser_connection() else {
+    let Ok(parser) = Parser::new() else {
         return GraftReport {
             never_graftable: Vec::new(),
             uncanonical: Vec::new(),
@@ -364,12 +360,12 @@ pub fn report(nest_dir: &std::path::Path) -> GraftReport {
         .into_iter()
         .map(|v| (v.file, v.sql))
         .collect();
-    let dag = Dag::build(&conn, &files);
+    let dag = Dag::build(&parser, &files);
 
     let mut never_graftable = Vec::new();
     let mut uncanonical = Vec::new();
     for node in &dag.nodes {
-        for r in static_refusals(&node.plan) {
+        for r in refusals_in_sql(&node.body) {
             never_graftable.push((node.name.clone(), r.to_string()));
         }
         if !node.plan.is_canonical() {
@@ -386,6 +382,7 @@ pub fn report(nest_dir: &std::path::Path) -> GraftReport {
 /// Open a connection suitable for canonicalisation. No data is attached: parsing needs no catalogue.
 ///
 /// **Prefer [`Parser`].** This stays `pub(crate)` so the engine type does not leave the module (#944).
+#[cfg(test)]
 pub(crate) fn parser_connection() -> Result<Connection> {
     Connection::open_in_memory().context("opening DuckDB to canonicalise a derivation")
 }
@@ -402,24 +399,34 @@ pub(crate) fn parser_connection() -> Result<Connection> {
 /// own merits - a public function returning a third-party connection type is wrong whether or not the
 /// third party ever changes.
 pub struct Parser {
-    conn: Connection,
+    session: Box<dyn crate::engine::Session>,
 }
 
 impl Parser {
+    /// Keys as the engine that evaluates derivations keys them, so a change of engine changes every key.
     pub fn new() -> Result<Self> {
         Ok(Self {
-            conn: parser_connection()?,
+            session: crate::analytics::engine().open_bare()?,
         })
     }
 
     /// See [`canonical_plan`].
     pub fn canonical_plan(&self, sql: &str) -> CanonicalPlan {
-        canonical_plan(&self.conn, sql)
+        match self.session.canonical_plan(sql) {
+            Some(ast) => CanonicalPlan::Ast(ast),
+            None => CanonicalPlan::RawText(sql.trim().to_string()),
+        }
     }
 
-    /// See [`engine_version`]. This is the value written into grafting identity.
+    /// The engine that will evaluate a derivation, and its version (RFC-0033 §2.2).
+    ///
+    /// Not bookkeeping - a correctness requirement. **DuckDB changed CTE semantics at 1.4**, making them
+    /// materialized by default where they had been inlined; PostgreSQL flipped the same switch the other
+    /// way at 12. Same SQL, different version, different evaluation and potentially different results. A
+    /// key without this is unsound across our *own* upgrades, which is the worst place to be unsound
+    /// because it is discovered in production rather than in CI.
     pub fn engine_version(&self) -> String {
-        engine_version(&self.conn)
+        self.session.engine_version()
     }
 }
 
@@ -660,7 +667,7 @@ mod tests {
             .iter()
             .map(|(f, s)| (f.to_string(), s.to_string()))
             .collect();
-        Dag::build(&parser_connection().unwrap(), &owned)
+        Dag::build(&Parser::new().unwrap(), &owned)
     }
 
     fn any_source(name: &str) -> Option<SourceIdentity> {
@@ -905,6 +912,60 @@ mod tests {
     /// RFC-0033 §4. Each of these **must** be refused - Trino #22533 is what happens otherwise: a
     /// materialized view over `CURRENT_TIMESTAMP` served a frozen timestamp forever.
     #[test]
+    fn table_refs_from_sqlparser_match_the_duckdb_walk() {
+        for sql in [
+            "SELECT * FROM Transfer t JOIN label l ON t.a = l.a",
+            "WITH c AS (SELECT * FROM mint) SELECT * FROM c, burn WHERE x IN (SELECT y FROM Burn)",
+            "SELECT count(*) FROM usdc__transfer",
+            "SELECT * FROM \"Quoted\" q, main.t",
+            "SELECT i FROM range(5) t(i)",
+            "SELECT * FROM (SELECT * FROM a UNION ALL SELECT * FROM b) s",
+            "this is not sql at all",
+        ] {
+            let duck = match plan(sql) {
+                CanonicalPlan::Ast(json) => table_refs(&serde_json::from_str(&json).unwrap()),
+                CanonicalPlan::RawText(_) => Vec::new(),
+            };
+            assert_eq!(duck, table_refs_in_sql(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn refusals_from_sqlparser_match_the_duckdb_walk() {
+        for sql in [
+            "SELECT now()",
+            "SELECT current_timestamp",
+            "SELECT CURRENT_DATE",
+            "SELECT random()",
+            "SELECT uuid()",
+            "SELECT version()",
+            "SELECT getenv('HOME')",
+            "SELECT x FROM t WHERE ts > NOW()",
+            "SELECT date_trunc('day', now())",
+            "SELECT x FROM t LIMIT 10",
+            "SELECT x FROM t ORDER BY x LIMIT 10",
+            "SELECT count(*) FROM usdc__transfer",
+            "SELECT a.k FROM t AS a JOIN u ON a.k = u.k WHERE a.v > 100",
+            "WITH r AS (SELECT k FROM t) SELECT count(*) FROM r",
+            "SELECT x FROM t ORDER BY x",
+            "SELECT t.current_date FROM t",
+            "SELECT i FROM range(50) t(i) ORDER BY i",
+            "SELECT random() AS r FROM range(200)",
+            "SELECT x FROM (SELECT x FROM t LIMIT 5) s ORDER BY x",
+            "SELECT x FROM t UNION ALL SELECT x FROM u LIMIT 3",
+            "SELECT CAST(count(*) AS UBIGINT) AS n FROM t WHERE now() IS NOT NULL",
+            "SELECT k FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY b DESC) = 1",
+            "this is not sql at all",
+        ] {
+            let mut duck = static_refusals(&plan(sql));
+            let mut ours = refusals_in_sql(sql);
+            duck.sort_by_key(|r| r.to_string());
+            ours.sort_by_key(|r| r.to_string());
+            assert_eq!(duck, ours, "{sql}");
+        }
+    }
+
+    #[test]
     fn volatile_functions_are_refused_by_name() {
         for (sql, func) in [
             ("SELECT now()", "now"),
@@ -1040,6 +1101,8 @@ pub struct Node {
     pub inputs: Vec<String>,
     /// Every table name it reads that is not an authored derivation - the decoded tables it sits on.
     pub sources: Vec<String>,
+    /// Its `SELECT` body as authored, which the static refusals read.
+    pub body: String,
 }
 
 /// Split `CREATE [OR REPLACE] [TEMP|TEMPORARY] VIEW <name> [(cols)] AS <select>`.
@@ -1141,6 +1204,41 @@ pub fn table_refs(ast: &Value) -> Vec<String> {
     out
 }
 
+/// [`table_refs`] from the SQL text by sqlparser's parse: every table name read, as written, CTE names
+/// included. Empty for SQL that will not parse, as a view that fails to parse contributes no edges.
+pub fn table_refs_in_sql(sql: &str) -> Vec<String> {
+    use sqlparser::ast::{TableFactor, Visit, Visitor};
+    use std::ops::ControlFlow;
+    struct Refs(Vec<String>);
+    impl Visitor for Refs {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table {
+                name, args: None, ..
+            } = t
+            {
+                if let Some(sqlparser::ast::ObjectNamePart::Identifier(i)) = name.0.last() {
+                    if !self.0.contains(&i.value) {
+                        self.0.push(i.value.clone());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let Ok(stmts) =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, sql)
+    else {
+        return Vec::new();
+    };
+    let mut r = Refs(Vec::new());
+    for st in &stmts {
+        let _ = st.visit(&mut r);
+    }
+    r.0.sort();
+    r.0
+}
+
 /// A cycle among derivations, named so an operator can act on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cycle(pub Vec<String>);
@@ -1161,7 +1259,7 @@ impl Dag {
     /// Build the graph from a nest's `views/*.sql`.
     ///
     /// Statements that are not `CREATE VIEW` are ignored rather than guessed at.
-    pub(crate) fn build(conn: &Connection, files: &[(String, String)]) -> Dag {
+    pub(crate) fn build(parser: &Parser, files: &[(String, String)]) -> Dag {
         let mut raw: Vec<(String, String, String)> = Vec::new(); // (name, file, select body)
         for (file, sql) in files {
             for stmt in crate::analytics::split_sql_statements(sql) {
@@ -1175,15 +1273,9 @@ impl Dag {
         let nodes = raw
             .into_iter()
             .map(|(name, file, body)| {
-                let plan = canonical_plan(conn, &body);
-                // Edges come from the *canonicalised* AST, so a view that fails to parse contributes
-                // no edges - it becomes a leaf rather than a wrong shape.
-                let refs = match &plan {
-                    CanonicalPlan::Ast(json) => serde_json::from_str::<Value>(json)
-                        .map(|v| table_refs(&v))
-                        .unwrap_or_default(),
-                    CanonicalPlan::RawText(_) => Vec::new(),
-                };
+                let plan = parser.canonical_plan(&body);
+                // A view that fails to parse contributes no edges: a leaf rather than a wrong shape.
+                let refs = table_refs_in_sql(&body);
                 let (inputs, sources): (Vec<_>, Vec<_>) = refs
                     .into_iter()
                     .partition(|r| defined.contains(r) && r != &name);
@@ -1193,6 +1285,7 @@ impl Dag {
                     plan,
                     inputs,
                     sources,
+                    body,
                 }
             })
             .collect();
@@ -1365,7 +1458,7 @@ impl std::fmt::Display for Refusal {
 /// with the determinism gate (§10) as the empirical backstop. An allowlist over DuckDB's several
 /// hundred scalar functions would be wrong on day one and wrong differently after every upgrade;
 /// this list plus a gate that actually runs the query twice is the honest combination.
-const VOLATILE_FUNCTIONS: &[&str] = &[
+pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "now",
     "current_timestamp",
     "get_current_timestamp",
@@ -1394,6 +1487,69 @@ const VOLATILE_FUNCTIONS: &[&str] = &[
     "nextval",
     "currval",
 ];
+
+/// [`static_refusals`] from the SQL text by sqlparser's parse, so the refusal does not depend on
+/// which engine keyed the plan. Nothing for SQL that will not parse.
+pub fn refusals_in_sql(sql: &str) -> Vec<Refusal> {
+    use sqlparser::ast::{Expr, Query, SetExpr, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    struct Find(Vec<Refusal>);
+    impl Find {
+        fn add(&mut self, r: Refusal) {
+            if !self.0.contains(&r) {
+                self.0.push(r);
+            }
+        }
+        fn volatile(&mut self, name: &str) {
+            let lower = name.to_ascii_lowercase();
+            if VOLATILE_FUNCTIONS.contains(&lower.as_str()) {
+                self.add(Refusal::Volatile { function: lower });
+            }
+        }
+    }
+    impl Visitor for Find {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if matches!(*q.body, SetExpr::Select(_))
+                && q.limit_clause.is_some()
+                && q.order_by.is_none()
+            {
+                self.add(Refusal::ImplicitRowOrder);
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            match e {
+                // `t.current_date` reads as a call with no argument list, where DuckDB sees a column
+                // of `t`: a keyword counts only unqualified, as the COLUMN_REF rule below has it.
+                Expr::Function(f)
+                    if !matches!(f.args, sqlparser::ast::FunctionArguments::None)
+                        || f.name.0.len() == 1 =>
+                {
+                    if let Some(p) = f.name.0.last() {
+                        self.volatile(&p.to_string());
+                    }
+                }
+                // A bare keyword (`SELECT current_timestamp`) is not a call; see below.
+                Expr::Identifier(i) => self.volatile(&i.value),
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let Ok(stmts) =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, sql)
+    else {
+        return Vec::new();
+    };
+    let mut find = Find(Vec::new());
+    for st in &stmts {
+        let _ = st.visit(&mut find);
+    }
+    find.0
+}
 
 /// Static refusals provable from the parse alone (RFC-0033 §4).
 ///
@@ -1513,26 +1669,21 @@ pub fn static_refusals(plan: &CanonicalPlan) -> Vec<Refusal> {
 /// backstop. A version that is genuinely stronger would have to perturb the input order between runs.
 /// Recorded here rather than in a comment on the issue, because the next reader meets the claim here.
 #[allow(dead_code)]
-pub(crate) fn determinism_gate(conn: &Connection, sql: &str) -> Result<()> {
+pub(crate) fn determinism_gate(session: &dyn crate::engine::Session, sql: &str) -> Result<()> {
     let digest = |attempt: usize| -> Result<String> {
-        let mut stmt = conn
-            .prepare(sql)
-            .with_context(|| format!("preparing the derivation for determinism run {attempt}"))?;
-        let mut rows = stmt
-            .query([])
-            .with_context(|| format!("running the derivation for determinism run {attempt}"))?;
         let mut h = Sha256::new();
         // Row *and* column order are part of the answer: a derivation that returns the same bag in a
         // different order is not the same derivation for anything downstream that reads positionally.
-        while let Some(row) = rows.next()? {
-            let mut col = 0usize;
-            while let Ok(v) = row.get::<_, duckdb::types::Value>(col) {
-                h.update(format!("{v:?}").as_bytes());
-                h.update(b"\x1f");
-                col += 1;
-            }
-            h.update(b"\x1e");
-        }
+        session
+            .for_each_row(sql, &mut |cells| {
+                for v in cells {
+                    h.update(v.to_string().as_bytes());
+                    h.update(b"\x1f");
+                }
+                h.update(b"\x1e");
+                Ok(())
+            })
+            .with_context(|| format!("running the derivation for determinism run {attempt}"))?;
         Ok(hex::encode(h.finalize()))
     };
 
