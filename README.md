@@ -9,14 +9,17 @@
 ```sh
 curl -fsSL https://nuthatch-indexer.com/install.sh | sh                  # macOS Apple Silicon, Linux x86_64
 nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC; the chain is detected
-nuthatch dev                                                            # reads its history, then keeps up
+nuthatch dev --backfill 300                                             # the last 300 blocks, then keeps up
 nuthatch sql "SELECT count(*) FROM usdc__transfer"                      # in a second terminal
 ```
 
 The Linux binary needs glibc 2.34 or newer to run (it is built on 2.35). No Intel Mac binary is
 published: there, and on other platforms, build from source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
 `init` creates a **nest**: a directory holding the contract's ABI, its config and, once `dev` runs,
-its indexed data.
+its indexed data. `--backfill 300` starts 300 blocks behind the tip, about an hour of mainnet, so there
+are rows to query within seconds on the bundled public endpoints. Without it, `dev` backfills from the
+contract's deployment block: for USDC that is 20 million blocks, which the public endpoints will not
+serve in any useful time and which wants your own archive-capable RPC (`--rpc`).
 
 | | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
 |---|---|---|---|---|---|

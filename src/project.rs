@@ -177,6 +177,14 @@ pub async fn init(args: InitArgs) -> Result<()> {
     println!("    .claude/skills/nuthatch/   Claude Code skill (offline, no phone-home)");
     println!();
     println!("next:  nuthatch dev{}", dir_hint(&args.dir));
+    if let Some(hint) = recent_history_hint(
+        config.contracts.iter().filter_map(|c| c.start_block).min(),
+        tip,
+        chain.log_window,
+        &args.dir,
+    ) {
+        println!("{hint}");
+    }
     println!("       nuthatch mcp   (expose this index to a coding agent over MCP)");
     print_undetected_start_blocks(&undetected);
     if let Some(note) = chains::keyless_caveat(
@@ -1898,6 +1906,23 @@ fn scaffold_ai_surface(
     Ok(())
 }
 
+/// The line under `next:  nuthatch dev` when that command would backfill a long history (#1607): the
+/// same command over the last fifteen windows, which a public endpoint serves in seconds.
+fn recent_history_hint(
+    start: Option<u64>,
+    tip: Option<u64>,
+    window: u64,
+    dir: &str,
+) -> Option<String> {
+    let span = crate::indexer::long_backfill(start?, tip?, window)?;
+    let recent = window.saturating_mul(15);
+    Some(format!(
+        "       nuthatch dev{} --backfill {recent}   (the last {recent} blocks only; without it, dev \
+         backfills {span} blocks from deployment)",
+        dir_hint(dir)
+    ))
+}
+
 fn dir_hint(dir: &str) -> String {
     if dir == "." {
         String::new()
@@ -2123,6 +2148,24 @@ mod tests {
             "-- author's edit",
             "existing views/ is never clobbered"
         );
+    }
+
+    /// #1607: the README demo, USDC from deployment, is offered its last 300 blocks; a nest with a
+    /// short history or no detected start is offered nothing.
+    #[test]
+    fn init_offers_recent_history_only_beside_a_long_backfill() {
+        let hint = recent_history_hint(Some(6_082_465), Some(26_096_175), 20, "usdc").unwrap();
+        assert!(
+            hint.contains("nuthatch dev --dir usdc --backfill 300 "),
+            "{hint}"
+        );
+        assert!(hint.contains("20013710 blocks from deployment"), "{hint}");
+        assert_eq!(
+            recent_history_hint(Some(26_090_000), Some(26_096_175), 20, "."),
+            None
+        );
+        assert_eq!(recent_history_hint(None, Some(26_096_175), 20, "."), None);
+        assert_eq!(recent_history_hint(Some(6_082_465), None, 20, "."), None);
     }
 
     #[test]
