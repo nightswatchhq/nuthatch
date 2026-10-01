@@ -58,7 +58,7 @@ probe() {  # probe <chain> <busy-contract> <url>
 }
 # Contracts chosen for being busy on each chain. URLs are the shipped defaults in
 # `src/chains.rs` - probing a host we already dropped is not a test of the product (#716).
-for u in https://eth-pokt.nodies.app https://eth.drpc.org; do
+for u in https://mainnet.gateway.tenderly.co https://rpc.mevblocker.io; do
   probe mainnet 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 "$u"
 done
 for u in https://arb1.arbitrum.io/rpc https://arb-pokt.nodies.app; do
