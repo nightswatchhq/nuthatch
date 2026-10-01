@@ -10,6 +10,14 @@ missing notes file is a build failure, not a warning.
 
 No em dashes - spaced hyphen, matching the rest of the project's public-facing prose.
 
+## Patch releases on 4.x
+
+A 4.x patch only fixes, and `main` carries the next minor's features, so a patch is not cut from
+`main`. It is cut from `release/<major>.<minor>` (`release/4.0`, created at the `v4.0.0` tag): the
+fix lands on `main` first, is cherry-picked onto the release branch with the version bump and its
+notes, and the tag goes on that branch's merge commit. The notes file is then copied to `main` so the
+record is in one place. 4.0.1 was the first.
+
 ## Pre-releases
 
 A tag carrying a semver pre-release identifier - the `-` in `v3.0.0-alpha.1` - is published as a
