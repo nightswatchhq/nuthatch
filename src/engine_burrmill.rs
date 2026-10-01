@@ -793,10 +793,17 @@ type Swap @entity { id: ID! pool: Pool! }
             .filter_map(|stmt| crate::analytics::view_name(&stmt))
             .collect();
         views.sort();
+        // `NUTHATCH_SHADOW_VIEWS=off` replays the statements alone, under the production guard: a
+        // nest whose views are too large to read whole (QoS, 74 million rows) is asked what its
+        // dashboard asks, and judged on the 30 s it is given.
+        let statements_only = std::env::var("NUTHATCH_SHADOW_VIEWS").as_deref() == Ok("off");
         let guard = crate::analytics::QueryGuard {
-            timeout: std::time::Duration::from_secs(600),
+            timeout: std::time::Duration::from_secs(if statements_only { 30 } else { 600 }),
             max_rows: 10_000_000,
         };
+        if statements_only {
+            views.clear();
+        }
         for view in &views {
             let before = seen.lock().unwrap().len();
             let started = std::time::Instant::now();
