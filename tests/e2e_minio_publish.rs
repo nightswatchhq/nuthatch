@@ -11,17 +11,13 @@
 //!      the same query over the local sealed segment;
 //!   3. a second `sync` puts nothing but `publish.json`.
 //!
-//! ## Why not DuckDB httpfs
+//! ## How the object is read back
 //!
-//! `httpfs` is not statically linked into this binary's bundled DuckDB, and RFC-0045 holds that it
-//! must not be: loading it would mean fetching an extension at runtime (the exact phone-home
-//! `tests/duckdb_extensions_are_static.rs` guards against) and would put an SSRF surface behind
-//! every `/sql` query. So table 2's check does not point DuckDB at `s3://` directly - it fetches
-//! each table's object from the bucket with the same `object_store` S3 client `ObjMirror` uses
-//! (independent of `publish::verify`'s own re-download below), writes it to a local temp file, and
-//! hands *that* to nuthatch's ordinary bundled DuckDB via `read_parquet`. That still proves the
-//! object landed in the bucket intact and that DuckDB parses it identically to the local copy,
-//! without asking the shipped binary for a capability the RFC forbids it.
+//! The engine reads nothing over the network, and RFC-0045 holds that it must not: that would put
+//! an SSRF surface behind every `/sql` query. So check 2 fetches each table's object from the bucket
+//! with the same `object_store` S3 client `ObjMirror` uses (independent of `publish::verify`'s own
+//! re-download below), writes it to a local temp file, and reads *that* with the Parquet reader.
+//! That still proves the object landed in the bucket intact and parses as the local copy does.
 //!
 //! ## Running it
 //!
@@ -136,17 +132,31 @@ fn two_table_nest() -> tempfile::TempDir {
     dir
 }
 
-/// `count(*)` and `sum(value)` for a local Parquet file via nuthatch's own bundled DuckDB - no
-/// extensions, no network. `value` is stored as text (every non-block/log/seq column is, per
-/// `seal::rows_to_batch`), hence the cast.
+/// `count(*)` and `sum(value)` for a local Parquet file. `value` is stored as text (every
+/// non-block/log/seq column is, per `seal::rows_to_batch`), hence the parse.
 fn count_and_sum(path: &Path) -> (i64, i64) {
-    let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
-    conn.prepare(&format!(
-        "SELECT count(*), sum(TRY_CAST(value AS BIGINT)) FROM read_parquet('{}')",
-        path.display()
-    ))
-    .and_then(|mut s| s.query_row([], |r| Ok((r.get(0)?, r.get(1)?))))
-    .expect("count/sum over a sealed segment")
+    use arrow::array::Array;
+    let file = std::fs::File::open(path).expect("open the segment");
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|b| b.build())
+        .expect("read a sealed segment");
+    let (mut count, mut sum) = (0i64, 0i64);
+    for batch in reader {
+        let batch = batch.expect("a batch of the segment");
+        count += batch.num_rows() as i64;
+        let value = batch.column_by_name("value").expect("a value column");
+        let value = arrow::compute::cast(value, &arrow::datatypes::DataType::Utf8).unwrap();
+        let value = value
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        sum += value
+            .iter()
+            .flatten()
+            .filter_map(|v| v.parse::<i64>().ok())
+            .sum::<i64>();
+    }
+    (count, sum)
 }
 
 /// Fetch one object's raw bytes from the bucket with a fresh `object_store` S3 client, built the
@@ -229,7 +239,7 @@ async fn sync_and_verify_against_a_real_s3_compatible_store() {
         "remote manifest.json must be byte-identical to the local sealed catalogue"
     );
 
-    // Criterion 2: per table, DuckDB's count(*)/sum(value) over the bucket's copy must match the
+    // Criterion 2: per table, count(*)/sum(value) over the bucket's copy must match the
     // same query over the local sealed segment.
     for (table, segs) in &local_manifest.tables {
         let seg = &segs[0];

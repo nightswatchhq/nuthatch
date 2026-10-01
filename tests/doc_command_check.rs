@@ -39,6 +39,84 @@ fn repo_root() -> PathBuf {
 /// no longer needs to exist as a separate check - a stale entry is just the actual-count-0 case).
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
+        "docs/rfcs/0055-the-dune-view-emitter.md",
+        "emit",
+        3,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
+        "docs/rfcs/0055-the-dune-view-emitter.md",
+        "--source",
+        1,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
+        "docs/rfcs/0056-the-dune-row-insert-sidecar.md",
+        "--source",
+        1,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
+        "docs/rfcs/0042-slice0-bom.md",
+        "emit",
+        1,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
+        "docs/rfcs/README.md",
+        "emit",
+        2,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
+        "docs/bench/rfc-0041-slice-zero.md",
+        "authored-entity",
+        3,
+        "`nuthatch bench authored-entity` measured the RFC-0041 spike, which left with DuckDB in 4.1; this is the dated record of that measurement",
+    ),
+    (
+        "docs/bench/rfc-0041-slice-zero.md",
+        "--batch-rows",
+        1,
+        "`nuthatch bench authored-entity` measured the RFC-0041 spike, which left with DuckDB in 4.1; this is the dated record of that measurement",
+    ),
+    (
+        "docs/bench/rfc-0041-slice-zero.md",
+        "--max-rows",
+        3,
+        "`nuthatch bench authored-entity` measured the RFC-0041 spike, which left with DuckDB in 4.1; this is the dated record of that measurement",
+    ),
+    (
+        "docs/bench/rfc-0041-slice-zero.md",
+        "--segments",
+        2,
+        "`nuthatch bench authored-entity` measured the RFC-0041 spike, which left with DuckDB in 4.1; this is the dated record of that measurement",
+    ),
+    (
+        "docs/releases/v3.7.0.md",
+        "emit",
+        3,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
+        "docs/releases/v3.7.0.md",
+        "--source",
+        1,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
+        "docs/releases/v3.8.3.md",
+        "emit",
+        2,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
+        "docs/rfcs/0056-the-dune-row-insert-sidecar.md",
+        "emit",
+        7,
+        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
+    ),
+    (
         "docs/rfcs/0052-the-mirrored-nest.md",
         "--from-mirror",
         1,

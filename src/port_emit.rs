@@ -1692,7 +1692,7 @@ mod tests {
     /// thing either way. Run against real DuckDB, empty and populated.
     #[test]
     fn the_emitted_check_answers_the_same_on_a_populated_nest() {
-        crate::engine::each_engine(the_emitted_check_answers_the_same_on_a_populated_nest_on);
+        crate::engine::on_bare(the_emitted_check_answers_the_same_on_a_populated_nest_on);
     }
 
     fn the_emitted_check_answers_the_same_on_a_populated_nest_on(
@@ -1761,7 +1761,7 @@ mod tests {
     /// A view the nest does not have must still fail the check - the point of it binding.
     #[test]
     fn the_emitted_check_fails_when_a_view_is_missing() {
-        crate::engine::each_engine(|conn| the_emitted_check_fails_when_a_view_is_missing_on(conn));
+        crate::engine::on_bare(|conn| the_emitted_check_fails_when_a_view_is_missing_on(conn));
     }
 
     fn the_emitted_check_fails_when_a_view_is_missing_on(conn: &dyn crate::engine::Session) {
@@ -1781,7 +1781,7 @@ mod tests {
     /// real DuckDB, because the whole claim is about what the SQL returns.
     #[test]
     fn a_later_explicit_null_clears_the_field_and_a_missing_column_does_not() {
-        crate::engine::each_engine(
+        crate::engine::on_bare(
             a_later_explicit_null_clears_the_field_and_a_missing_column_does_not_on,
         );
     }

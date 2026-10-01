@@ -113,8 +113,6 @@ pub enum Command {
     Offchain(OffchainArgs),
     /// Mirror sealed segments to an object-store prefix (RFC-0052).
     Publish(PublishArgs),
-    /// Write another engine's SQL over a nest's tables, offline and deterministically (RFC-0055).
-    Emit(EmitArgs),
     /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
     Nest(NestArgs),
     /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
@@ -459,31 +457,6 @@ pub struct PublishVerifyArgs {
     /// For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use --deep otherwise.
     #[arg(long)]
     pub etag_md5: bool,
-}
-
-#[derive(Args)]
-pub struct EmitArgs {
-    #[command(subcommand)]
-    pub what: EmitWhat,
-}
-
-#[derive(Subcommand)]
-pub enum EmitWhat {
-    /// One DuneSQL query per event table, casting each column to its DuneSQL type (RFC-0055 S1).
-    Dune(EmitDuneArgs),
-}
-
-#[derive(Args)]
-pub struct EmitDuneArgs {
-    /// Nest directory. Read only.
-    #[arg(long, default_value = ".")]
-    pub dir: String,
-    /// Directory the `.sql` files and `README.md` are written to.
-    #[arg(long)]
-    pub out: String,
-    /// The Dune namespace the rows were uploaded into; queries read `dune.<source>.<table>`.
-    #[arg(long)]
-    pub source: String,
 }
 
 #[derive(Args)]
@@ -864,39 +837,6 @@ pub enum BenchWhat {
     /// (query latency + peak RSS). The regression guard for the perf refactors - run offline against
     /// an already-indexed nest.
     Query(QueryBenchArgs),
-    /// Measure the RFC-0041 embedded authored-entity spike over a sealed Horizon fixture.
-    AuthoredEntity(AuthoredEntityBenchArgs),
-}
-
-#[derive(Args)]
-pub struct AuthoredEntityBenchArgs {
-    /// Directory holding the captured, manifest-bound Horizon `segments/` files.
-    #[arg(long, required_unless_present = "replay")]
-    pub segments: Option<String>,
-
-    /// The entity's declared live-input admission bound. The run fails before DBSP receives more.
-    #[arg(long, default_value_t = 1_000)]
-    pub max_rows: usize,
-
-    /// Rows per recorded entity-input batch. The tape contains the normalised weighted inputs, not
-    /// synthetic RPC responses, and replay applies them through the same DBSP boundary offline.
-    #[arg(long, default_value_t = 256)]
-    pub batch_rows: usize,
-
-    /// Normalise the sealed fixture once and write its content-addressed entity-input tape here.
-    /// The command then measures a replay of that tape, so the published timing excludes DuckDB's
-    /// one-off raw-history scan.
-    #[arg(long, conflicts_with = "replay")]
-    pub record: Option<String>,
-
-    /// Replay a recorded entity-input tape. This takes no fixture or RPC path and cannot contact a
-    /// network endpoint.
-    #[arg(long, conflicts_with_all = ["record", "segments"])]
-    pub replay: Option<String>,
-
-    /// Write the measurement JSON here as well as printing it.
-    #[arg(long)]
-    pub out: Option<String>,
 }
 
 #[derive(Args)]

@@ -140,7 +140,7 @@ The order a reader who wants block order must impose, and the one `read_table_ro
 Content address breaks ties inside a range, so a re-seal cannot reorder rows. Within one file,
 rows are in ingest order for that seal.
 
-nuthatch's DuckDB views union the files in **catalogue order** and do not sort. `ORDER BY
+nuthatch's views union the files in **catalogue order** and do not sort. `ORDER BY
 block_number, log_index` if you need a sequence; do not assume the scan comes back in chain
 order.
 
@@ -185,7 +185,7 @@ The gate is `sealed_parquet_writes_uint64_counters_and_utf8_uint256_without_dec_
 ## `c_dec` and `c_overflow` are not in the file
 
 nuthatch's SQL surface derives two view columns for each big-integer column `c` (schema storage
-`word16` or `word32`) at DuckDB view definition, in `src/analytics.rs`:
+`word16` or `word32`) at view definition, by the engine:
 
 ```sql
 TRY_CAST("c" AS DECIMAL(38,0)) AS "c_dec",
@@ -193,8 +193,10 @@ TRY_CAST("c" AS DECIMAL(38,0)) AS "c_dec",
 ```
 
 `c_dec` is the value as `DECIMAL(38,0)` when it fits, else NULL. `c_overflow` is true when the
-exact text is present and that cast is NULL. `SUM(c_dec)` works over the values that fit;
-`SUM(c)` is the footgun (it concatenates text, or fails, depending on the engine). Values with
+exact text is present and that cast is NULL. On nuthatch's own `/sql`, `SUM`, `MIN` or `MAX` of
+`c_dec` is refused when a value under it did not fit, rather than answered from the ones that
+did; an external reader that re-derives the column gets the sum of what fits unless it checks
+`c_overflow`. `SUM(c)` is the footgun (it concatenates text, or fails, depending on the engine). Values with
 more than 38 digits (a Uniswap `sqrtPriceX96` can) stay exact in `c` and flag on `c_overflow`.
 
 These columns are **never written to Parquet**. An external reader of the raw files does not
@@ -211,7 +213,7 @@ The conversion, per engine:
 | engine | conversion | exact over |
 | --- | --- | --- |
 | DuckDB | `TRY_CAST(c AS DECIMAL(38,0))`, NULL past 38 digits | values up to 38 digits |
-| DuneSQL | `cast(c as uint256)`, or `int256` for a signed column, as `nuthatch emit dune` writes it | every 256-bit value |
+| DuneSQL | `cast(c as uint256)`, or `int256` for a signed column | every 256-bit value |
 
 Another engine is listed here once its recipe has been run, not before (RFC-0052 S5).
 

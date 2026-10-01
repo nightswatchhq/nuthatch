@@ -536,7 +536,7 @@ fn production_walk_covers_crate_src_beyond_the_root_and_decode() {
                 .replace('\\', "/")
         })
         .collect();
-    let extra = ["tools/pqmeta/src", "tools/df-gate/src"];
+    let extra = ["tools/pqmeta/src"];
     let present: Vec<&str> = extra
         .into_iter()
         .filter(|p| root.join(p).is_dir())

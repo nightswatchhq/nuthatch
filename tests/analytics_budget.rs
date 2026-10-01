@@ -159,15 +159,15 @@ fn custom_temp_directory_still_gets_private_instance_dirs() {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("nuthatch-duckdb-"))
+        .filter(|n| n.starts_with("nuthatch-spill-"))
         .collect();
     assert!(
         !kids.is_empty(),
-        "DuckDB spill must land under the operator parent as nuthatch-duckdb-{{pid}}-{{seq}}, got {kids:?}"
+        "spill must land under the operator parent as nuthatch-spill-{{pid}}-{{seq}}, got {kids:?}"
     );
     assert!(
         kids.iter()
-            .all(|n| n.starts_with(&format!("nuthatch-duckdb-{}-", std::process::id()))),
+            .all(|n| n.starts_with(&format!("nuthatch-spill-{}-", std::process::id()))),
         "must not regress #1165: {kids:?}"
     );
 }

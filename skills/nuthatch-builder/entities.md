@@ -59,7 +59,7 @@ and `dev` read that file. Inline SQL is refused; move existing inline queries in
 An entity's `SELECT` is compiled, not merely run, so the subset is small and checked at load:
 
 - **Aggregates: `sum`, `min`, `max`, `avg`, `count`, `count(*)`.** Nothing else. This is an
-  allowlist, not a refusal list, and deliberately so - DuckDB knows 88 aggregate names and grows the
+  allowlist, not a refusal list, and deliberately so - a SQL engine knows dozens of aggregate names and grows the
   set, so anything not proven incrementally maintainable is refused rather than silently admitted.
 - One `GROUP BY`, projection, filtering, exact arithmetic, and an equijoin between two tables.
 - Column names bind against the nest's ABI at load. An entity naming a column the contract does not
@@ -140,7 +140,7 @@ the other is simply empty.
 
 ## Reading one
 
-- `GET /derived/{entity}/{key}` - a keyed point read. A map lookup; it does not touch DuckDB.
+- `GET /derived/{entity}/{key}` - a keyed point read. A map lookup; it does not touch the SQL engine.
 - `GET /derived/{entity}` - the first page, with provenance.
 - `` `SELECT … FROM {entity}` `` on `/sql` - queryable by name, under the column names you wrote,
   joinable against decoded tables like any other relation.

@@ -1,30 +1,10 @@
 //! Pure, bounded conversions for event-shaped SQL. Decimal arithmetic must not pass through
 //! DOUBLE, and a digest-to-CID conversion must not fetch content or hash the digest again.
 use anyhow::{bail, Context, Result};
-use duckdb::{
-    arrow::{
-        array::{Array, RecordBatch, StringArray},
-        datatypes::DataType,
-    },
-    vscalar::arrow::{ArrowFunctionSignature, VArrowScalar},
-    Connection,
-};
 use num_bigint::BigUint;
 use std::sync::Arc;
 
-pub(crate) fn register(connection: &Connection) -> Result<()> {
-    connection.register_scalar_function::<Scalar<1>>("nuthatch_uint256")?;
-    connection.register_scalar_function::<Scalar<2>>("nuthatch_mul_div")?;
-    connection.register_scalar_function::<Scalar<3>>("nuthatch_cid_v0")?;
-    connection.register_scalar_function::<Scalar<4>>("nuthatch_base58_uint256")?;
-    connection.register_scalar_function::<Scalar<5>>("nuthatch_uint256_word")?;
-    connection.register_scalar_function::<Scalar<6>>("nuthatch_keccak256")?;
-    connection.register_scalar_function::<Scalar<7>>("nuthatch_abi_tuple")?;
-    Ok(())
-}
-
 /// Name, `evaluate` kind and arity of each function `register` defines.
-#[cfg(feature = "shadow-burrmill")]
 const FUNCTIONS: [(&str, u8, usize); 7] = [
     ("nuthatch_uint256", 1, 1),
     ("nuthatch_mul_div", 2, 3),
@@ -35,9 +15,8 @@ const FUNCTIONS: [(&str, u8, usize); 7] = [
     ("nuthatch_abi_tuple", 7, 2),
 ];
 
-/// The same functions on Burrmill, over the same `evaluate`.
-#[cfg(feature = "shadow-burrmill")]
-pub(crate) fn register_burrmill(engine: &mut burrmill::Engine) {
+/// A NULL argument answers NULL without reaching `evaluate`.
+pub(crate) fn register(engine: &mut burrmill::Engine) {
     for (name, kind, arity) in FUNCTIONS {
         engine.register_text_function(
             name,
@@ -159,117 +138,25 @@ fn evaluate(kind: u8, values: &[&str]) -> Result<String> {
     }
 }
 
-struct Scalar<const KIND: u8>;
-impl<const KIND: u8> VArrowScalar for Scalar<KIND> {
-    type State = ();
-
-    fn invoke(
-        _: &(),
-        input: RecordBatch,
-    ) -> std::result::Result<Arc<dyn Array>, Box<dyn std::error::Error>> {
-        let columns = input
-            .columns()
-            .iter()
-            .map(|c| {
-                c.as_any()
-                    .downcast_ref::<StringArray>()
-                    .context("expected VARCHAR vector")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut output = Vec::with_capacity(input.num_rows());
-        for row in 0..input.num_rows() {
-            if columns.iter().any(|c| c.is_null(row)) {
-                output.push(None);
-                continue;
-            }
-            let values = columns.iter().map(|c| c.value(row)).collect::<Vec<_>>();
-            output.push(Some(evaluate(KIND, &values)?));
-        }
-        Ok(Arc::new(StringArray::from(output)))
-    }
-
-    fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![
-                DataType::Utf8;
-                match KIND {
-                    2 => 3,
-                    7 => 2,
-                    _ => 1,
-                }
-            ],
-            DataType::Utf8,
-        )]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "shadow-burrmill")]
-    #[test]
-    fn burrmill_answers_every_function_as_duckdb_does() {
-        let conn = Connection::open_in_memory().unwrap();
-        register(&conn).unwrap();
+    fn engine() -> burrmill::Engine {
         let mut engine = burrmill::Engine::open_empty().unwrap();
-        register_burrmill(&mut engine);
-        let word = format!("0x{:064x}", 16_083_151u64);
-        let tuple = "0x0000000000000000000000000000000000000000000000000000000000000001";
-        let cases = [
-            format!("nuthatch_uint256('{word}')"),
-            "nuthatch_uint256('0x')".to_string(),
-            "nuthatch_mul_div('10', '3', '4')".to_string(),
-            "nuthatch_mul_div('10', '3', '0')".to_string(),
-            format!("nuthatch_cid_v0('{word}')"),
-            "nuthatch_base58_uint256('16083151')".to_string(),
-            "nuthatch_uint256_word('16083151')".to_string(),
-            "nuthatch_keccak256('0x')".to_string(),
-            format!("nuthatch_abi_tuple('bool', '{tuple}')"),
-            "nuthatch_abi_tuple('int8', '0x')".to_string(),
-            "nuthatch_uint256(NULL)".to_string(),
-        ];
-        for call in cases {
-            let sql = format!("SELECT {call} AS v");
-            let duck: std::result::Result<Option<String>, _> =
-                conn.query_row(&sql, [], |r| r.get(0));
-            let burr = engine.sql(&sql).map(|b| {
-                let rows = burrmill::df::encode::rows(&b[0]).unwrap();
-                rows[0]["v"].as_str().map(str::to_string)
-            });
-            match (duck, burr) {
-                (Ok(d), Ok(b)) => assert_eq!(d, b, "{call}"),
-                (Err(_), Err(_)) => {}
-                (d, b) => panic!("{call}: duckdb {d:?}, burrmill {b:?}"),
-            }
-        }
+        register(&mut engine);
+        engine
+    }
+
+    fn one(engine: &burrmill::Engine, sql: &str) -> std::result::Result<Option<String>, String> {
+        let batches = engine.sql(sql).map_err(|e| e.to_string())?;
+        let rows = burrmill::df::encode::rows(&batches[0]).map_err(|e| e.to_string())?;
+        Ok(rows[0]["v"].as_str().map(str::to_string))
     }
 
     #[test]
     fn a_case_guard_does_not_decode_an_empty_predeployment_word() {
-        let conn = Connection::open_in_memory().unwrap();
-        register(&conn).unwrap();
-        let word = format!("0x{:064x}", 16_083_151);
-        let mut statement = conn
-            .prepare(
-                "SELECT DISTINCT CASE WHEN reverted OR result = '0x' THEN 0 \
-             ELSE CAST(nuthatch_uint256(result) AS INTEGER) END AS value \
-             FROM (VALUES ('0x', false), (?1, false)) t(result, reverted) ORDER BY value",
-            )
-            .unwrap();
-        let values = statement
-            .query_map([word], |row| row.get::<_, i32>(0))
-            .unwrap()
-            .collect::<duckdb::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(values, vec![0, 16_083_151]);
-    }
-
-    #[cfg(feature = "shadow-burrmill")]
-    #[test]
-    fn a_case_guard_does_not_decode_an_empty_predeployment_word_on_burrmill() {
-        let mut engine = burrmill::Engine::open_empty().unwrap();
-        register_burrmill(&mut engine);
+        let engine = engine();
         let word = format!("0x{:064x}", 16_083_151);
         let sql = format!(
             "SELECT DISTINCT CASE WHEN reverted OR result = '0x' THEN 0 \
@@ -287,58 +174,47 @@ mod tests {
 
     #[test]
     fn sql_scalars_preserve_full_width_and_nulls_and_refuse_bad_inputs() {
-        let conn = Connection::open_in_memory().unwrap();
-        register(&conn).unwrap();
+        let engine = engine();
         let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
-        let value: String = conn
-            .query_row("SELECT nuthatch_mul_div(?1, ?1, ?1)", [max], |r| r.get(0))
-            .unwrap();
-        assert_eq!(value, max);
-        let value: String = conn
-            .query_row(
-                "SELECT nuthatch_uint256(?1)",
-                [format!("0x{}", "f".repeat(64))],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(value, max);
-        let value: String = conn
-            .query_row("SELECT nuthatch_mul_div('11','3','2')", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(value, "16");
-        let value: Option<String> = conn
-            .query_row("SELECT nuthatch_mul_div(NULL,'3','2')", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(value, None);
-        let value: String = conn
-            .query_row(
-                "SELECT nuthatch_cid_v0(?1)",
-                [format!("0x{}", "00".repeat(32))],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(value, "QmNLei78zWmzUdbeRB3CiUfAizWUrbeeZh5K1rhAQKCh51");
-        for sql in [
-            "SELECT nuthatch_uint256('0x01')",
-            "SELECT nuthatch_cid_v0('0x00')",
-            "SELECT nuthatch_mul_div('1','2','0')",
-            "SELECT nuthatch_mul_div('-1','2','3')",
+        let value = |call: String| one(&engine, &format!("SELECT {call} AS v")).unwrap();
+        assert_eq!(
+            value(format!("nuthatch_mul_div('{max}', '{max}', '{max}')")).as_deref(),
+            Some(max)
+        );
+        assert_eq!(
+            value(format!("nuthatch_uint256('0x{}')", "f".repeat(64))).as_deref(),
+            Some(max)
+        );
+        assert_eq!(
+            value("nuthatch_mul_div('11','3','2')".into()).as_deref(),
+            Some("16")
+        );
+        assert_eq!(value("nuthatch_mul_div(NULL,'3','2')".into()), None);
+        assert_eq!(
+            value(format!("nuthatch_cid_v0('0x{}')", "00".repeat(32))).as_deref(),
+            Some("QmNLei78zWmzUdbeRB3CiUfAizWUrbeeZh5K1rhAQKCh51")
+        );
+        for call in [
+            "nuthatch_uint256('0x01')",
+            "nuthatch_cid_v0('0x00')",
+            "nuthatch_mul_div('1','2','0')",
+            "nuthatch_mul_div('-1','2','3')",
+            "nuthatch_abi_tuple('int8', '0x')",
         ] {
             assert!(
-                conn.query_row::<String, _, _>(sql, [], |r| r.get(0))
-                    .is_err(),
-                "{sql}"
+                one(&engine, &format!("SELECT {call} AS v")).is_err(),
+                "{call}"
             );
         }
         assert!(decimal(&"9".repeat(161)).is_err());
-        let value: String = conn
-            .query_row("SELECT nuthatch_base58_uint256('256')", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(value, "5R");
-        let value: String = conn
-            .query_row("SELECT nuthatch_base58_uint256('0')", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(value, "1");
+        assert_eq!(
+            value("nuthatch_base58_uint256('256')".into()).as_deref(),
+            Some("5R")
+        );
+        assert_eq!(
+            value("nuthatch_base58_uint256('0')".into()).as_deref(),
+            Some("1")
+        );
         assert!(evaluate(4, &[&"9".repeat(79)]).is_err());
         assert_eq!(evaluate(5, &["256"]).unwrap(), format!("0x{:064x}", 256));
         assert_eq!(
@@ -362,17 +238,19 @@ mod tests {
                 "0x0000000000000000000000000000000000000000"
             ])
         );
-        let invalid: Option<String> = conn
-            .query_row(
-                "SELECT TRY(nuthatch_abi_tuple('string,string,address', '0x'))",
-                [],
-                |r| r.get(0),
+        assert_eq!(
+            value("TRY(nuthatch_abi_tuple('string,string,address', '0x'))".into()),
+            None
+        );
+        // More than one batch, including NULLs.
+        let count = engine
+            .sql(
+                "SELECT count(*) AS n FROM (SELECT nuthatch_mul_div(CASE WHEN i % 2 = 0 THEN NULL \
+                 ELSE CAST(i AS VARCHAR) END, '3', '3') AS v, i FROM range(10000) t(i)) \
+                 WHERE v = CAST(i AS VARCHAR)",
             )
             .unwrap();
-        assert!(invalid.is_none());
-        // More than one DuckDB chunk, including NULLs: do not assume a single vector or
-        // reuse a previous invocation's result buffer.
-        let count: u64 = conn.query_row("SELECT count(*) FROM (SELECT nuthatch_mul_div(CASE WHEN i % 2 = 0 THEN NULL ELSE CAST(i AS VARCHAR) END, '3', '3') AS v, i FROM range(10000) t(i)) WHERE v = CAST(i AS VARCHAR)", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 5000);
+        let rows = burrmill::df::encode::rows(&count[0]).unwrap();
+        assert_eq!(rows[0]["n"].as_u64(), Some(5000));
     }
 }

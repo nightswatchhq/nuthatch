@@ -103,24 +103,9 @@ async fn main() -> Result<()> {
         // they know which they want. A `mounts.toml` means a multi-nest runtime, a `nuthatch.toml`
         // means one nest, and the pre-2.0 `mounts dev` split is gone.
         cli::Command::Dev(args) => {
-            let engine = nuthatch::analytics::choose_engine(
+            nuthatch::analytics::check_engine_choice(
                 std::env::var(nuthatch::analytics::ENV_ENGINE).ok().as_deref(),
             )?;
-            nuthatch::analytics::install_engine(engine)?;
-            match engine {
-                nuthatch::analytics::EngineChoice::DuckDb => {}
-                nuthatch::analytics::EngineChoice::Shadow => tracing::warn!(
-                    "shadow-burrmill: every statement also runs on Burrmill; differences go to the \
-                     `shadow` log target, DuckDB's answer is served"
-                ),
-                nuthatch::analytics::EngineChoice::Burrmill => {
-                    tracing::warn!("Burrmill serves every statement; DuckDB is not consulted")
-                }
-                nuthatch::analytics::EngineChoice::Checked => tracing::warn!(
-                    "Burrmill serves every statement; DuckDB also runs each one, and differences \
-                     go to the `shadow` log target"
-                ),
-            }
             let dir = std::path::PathBuf::from(&args.dir);
             if dir.join(nuthatch::runtime::MOUNTS_FILE).exists()
                 || dir.join(nuthatch::runtime::LEGACY_ROOST_FILE).exists()
@@ -230,9 +215,6 @@ async fn main() -> Result<()> {
                 publish::run_status(std::path::Path::new(&a.dir), &a.target).await
             }
         },
-        cli::Command::Emit(args) => match args.what {
-            cli::EmitWhat::Dune(a) => nuthatch::dune_emit::run(a),
-        },
         cli::Command::Mcp(args) => {
             if args.print_config {
                 mcp::print_client_config(&args.url);
@@ -257,9 +239,6 @@ async fn main() -> Result<()> {
         cli::Command::Bench(args) => match args.what {
             cli::BenchWhat::Backfill(a) => bench::backfill(a).await,
             cli::BenchWhat::Query(a) => bench::query(a),
-            cli::BenchWhat::AuthoredEntity(a) => {
-                tokio::task::spawn_blocking(move || bench::authored_entity(a)).await?
-            }
         },
         cli::Command::Doctor(args) => doctor::run(args).await,
         cli::Command::Labels(args) => run_labels(args),

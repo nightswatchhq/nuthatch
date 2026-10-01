@@ -47,17 +47,6 @@ Summarise the hits and flags in a block range (markdown or `--json`)
 Benchmark the indexing pipeline (measure first, optimise second - RFC-0004)
 
 
-## `nuthatch bench authored-entity`
-
-Measure the RFC-0041 embedded authored-entity spike over a sealed Horizon fixture
-
-- `--segments <SEGMENTS>` - Directory holding the captured, manifest-bound Horizon `segments/` files
-- `--max-rows <MAX_ROWS>` - The entity's declared live-input admission bound. The run fails before DBSP receives more
-- `--batch-rows <BATCH_ROWS>` - Rows per recorded entity-input batch. The tape contains the normalised weighted inputs, not synthetic RPC responses, and replay applies them through the same DBSP boundary offline
-- `--record <RECORD>` - Normalise the sealed fixture once and write its content-addressed entity-input tape here. The command then measures a replay of that tape, so the published timing excludes DuckDB's one-off raw-history scan
-- `--replay <REPLAY>` - Replay a recorded entity-input tape. This takes no fixture or RPC path and cannot contact a network endpoint
-- `--out <OUT>` - Write the measurement JSON here as well as printing it
-
 ## `nuthatch bench backfill`
 
 Measure backfill throughput (events/sec, wall-clock, peak RSS) over a pinned block range
@@ -143,19 +132,6 @@ Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width,
 - `--catalogue` - Check the segment catalogue in `--dir`: every entry's file exists and hashes. Does not quarantine (that is startup). Exit 1 if anything disagrees. With `--json` and no `--rpc`, stdout is the catalogue check only, so the live-endpoints gate is unchanged
 - `--publish <PUBLISH>` - Check the mirror of the nest in `--dir` at this target, as `publish verify` does without `--deep`. Exit 1 if an object is missing, differs, or cannot be content-checked
 - `--publish-etag-md5` - For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use `publish verify --deep` otherwise
-
-## `nuthatch emit`
-
-Write another engine's SQL over a nest's tables, offline and deterministically (RFC-0055)
-
-
-## `nuthatch emit dune`
-
-One DuneSQL query per event table, casting each column to its DuneSQL type (RFC-0055 S1)
-
-- `--dir <DIR>` - Nest directory. Read only
-- `--out <OUT>` - Directory the `.sql` files and `README.md` are written to
-- `--source <SOURCE>` - The Dune namespace the rows were uploaded into; queries read `dune.<source>.<table>`
 
 ## `nuthatch init`
 

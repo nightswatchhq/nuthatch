@@ -67,7 +67,7 @@ RestartSec=5
 # Remote admin is OFF as written: the bind above is localhost, so the admin UI needs no token.
 # To enable it you must change the bind AND choose a token — generate one, never paste a literal:
 #   Environment=NUTHATCH_ADMIN_TOKEN=<openssl rand -hex 32>
-# Keep it inside the footprint budget; the box needs headroom for DuckDB queries.
+# Keep it inside the footprint budget; the box needs headroom for analytical queries.
 MemoryMax=2G
 
 [Install]
@@ -293,7 +293,7 @@ Nests live in their own repositories rather than in-tree; see the
 
 > **Scaled mode exists** (RFC-0022): a Postgres hot store, a writer pool taking one lease per cursor,
 > a query-FE tier, and a control plane holding desired state - see *Scaled mode* below. DataFusion
-> federation (RFC-0013) is a separate question and remains DuckDB today.
+> federation (RFC-0013) is a separate question and remains unbuilt.
 >
 > It is newer and less exercised than embedded mode, which runs in production. If one process per box
 > is enough for you, that remains the recommended shape.
@@ -317,12 +317,12 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 
 | Key | Env | Default | What it is |
 |---|---|---|---|
-| `analytics.memory_limit` | `NUTHATCH_ANALYTICS_MEMORY_LIMIT` | 512MB | DuckDB `max_memory` per connection |
-| `analytics.threads` | `NUTHATCH_ANALYTICS_THREADS` | 2 (ceiling 16) | DuckDB worker threads. Above 16 is refused; not a term in the RAM equation |
-| `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | Linux: `$XDG_CACHE_HOME/nuthatch` or `~/.cache/nuthatch`; elsewhere the process temp dir | parent of per-instance spill dirs (`nuthatch-duckdb-{pid}-{seq}`; do not point two processes at one directory). Not `/tmp` on Linux by default, because that is often a tmpfs, where spill is RAM outside the per-cursor budget; do not point this at one |
-| `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | 2GB | spill per analytics connection. A `/sql` query that spills past it is stopped and answered `507`; the guard measures the spill itself, because DuckDB does not enforce its own limit on every spill. On disk it does not buy room in the equation above; on a tmpfs it is RAM |
-| `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest, and **raise-only**: 1024 is the remainder of today's 2 GiB split after 2 × 512 MB DuckDB, **not** a measured ingest RSS high-water (RFC-0047 §6). A lower value is refused at startup, because nothing caps ingest at this figure - writing a smaller number would not shrink ingest, only hand DuckDB headroom against a reservation no code enforces |
-| Burrmill's limit | `NUTHATCH_BURRMILL_MEMORY_LIMIT` | `analytics.memory_limit` | in a `shadow-burrmill` build, the bound on each Burrmill session. Its hash joins and final aggregates cannot spill, so a nest DuckDB answers in 512 MB may need more of Burrmill. Each engine counts in the split at its own bound |
+| `analytics.memory_limit` | `NUTHATCH_ANALYTICS_MEMORY_LIMIT` | 512MB | memory per analytics session. A statement that needs more is refused, not slowed: hash joins and final aggregates do not spill |
+| `analytics.threads` | `NUTHATCH_ANALYTICS_THREADS` | 2 (ceiling 16) | worker threads per session. Above 16 is refused; not a term in the RAM equation |
+| `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | Linux: `$XDG_CACHE_HOME/nuthatch` or `~/.cache/nuthatch`; elsewhere the process temp dir | parent of per-session spill dirs (`nuthatch-spill-{pid}-{seq}`; do not point two processes at one directory). Not `/tmp` on Linux by default, because that is often a tmpfs, where spill is RAM outside the per-cursor budget; do not point this at one |
+| `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | 2GB | spill per analytics session. A `/sql` query that spills past it is stopped and answered `507`. On disk it does not buy room in the equation above; on a tmpfs it is RAM |
+| `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest, and **raise-only**: 1024 is the remainder of today's 2 GiB split after 2 × 512 MB of analytics, **not** a measured ingest RSS high-water (RFC-0047 §6). A lower value is refused at startup, because nothing caps ingest at this figure - writing a smaller number would not shrink ingest, only hand analytics headroom against a reservation no code enforces |
+| the engine's limit | `NUTHATCH_BURRMILL_MEMORY_LIMIT` | `analytics.memory_limit` | takes the place of `analytics.memory_limit` where set, and is what a permit counts at in the split. Kept from the releases that carried two engines |
 | the wall | `NUTHATCH_MAX_RSS` | 2048MB | the ceiling the split is held to, for a process given more than 2 GiB. **Raise-only**, and a statement by the operator, not a measurement: the footprint job measures the default and nothing above it |
 | `runtime_headroom` | (not settable) | 0 | unmeasured. Named in the inequality so the term is visible; counted as zero until someone measures it on the box that enforces the budget |
 
@@ -333,7 +333,7 @@ four permits at 512 MB each plus the derived ingest floor is 3072 MB.
 
 `ingestion_reservation` may be raised and not lowered, which is what makes the inequality worth
 having. The consequence is the property to hold onto: **no configuration this gate accepts gives
-DuckDB more RAM than the shipped default that the footprint CI job measures**, unless the operator
+analytics more RAM than the shipped default that the footprint CI job measures**, unless the operator
 has raised the wall with `NUTHATCH_MAX_RSS` and so said the process has it. The gate is
 arithmetic over the walls, not an enforcement of ingest RSS; ingest, DBSP, redb and result
 materialisation are still bounded by the `max_rss_mb` wall and the footprint job, not by this sum.
@@ -804,10 +804,10 @@ job:
 | Guard | Default | What it bounds |
 |---|---|---|
 | statement timeout | 30 s | a runaway (e.g. cartesian) query is interrupted mid-flight |
-| max result rows | 50,000 | the Rust-side result buffer, outside DuckDB's own memory limit |
+| max result rows | 50,000 | the Rust-side result buffer, outside the engine's own memory limit |
 | max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
 | max queued queries | 256 per nest | the bound that makes the wait above safe: it caps how *many* requests may be parked waiting, where the 250 ms caps how *long* each one waits. Without it a burst parks arrival-rate × 250 ms requests before any time out. Past the cap a request is refused immediately, as every over-limit request was before the wait existed. A parked request holds only its query string (≤ 16 KiB), so the worst case is roughly 4 MB per nest |
-| DuckDB memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Product of memory with the permit count is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
+| engine memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Product of memory with the permit count is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially |
 | declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |
@@ -1395,14 +1395,14 @@ unit file, a scrape config or a dashboard gets longer.
 Stated because a platform team will ask, and because a vague promise is worse than a narrow one.
 
 - **Downgrades**, above. Upgrade only.
-- **Off-by-default cargo features: `graph`, `folds`, `counter`, `exex` and `shadow-burrmill`.**
+- **Off-by-default cargo features: `graph`, `folds`, `counter` and `exex`.**
   None is in the published binaries or images, and all are experimental: their config keys, routes,
   on-disk state and behaviour may change or go in any 4.x release. A build that enables one is not
   covered by any line above for what that feature adds. (`graph` is RFC-0053's partial read surface
   and RFC-0060's parked endpoint; `folds` is RFC-0059, parked; `counter` is x402.)
 - **The SQL dialect itself.** The tables and columns are nuthatch's and are covered; the functions and
-  planner behind `/sql` are DuckDB's. A DuckDB upgrade that changes a function's behaviour ships in a
-  minor, and its notes say so. The resource guards (timeout, row cap, spill cap) may tighten in a
+  planner behind `/sql` are the engine's: Burrmill, on DataFusion, since 4.1, and DuckDB before it. An
+  engine change that alters a function's behaviour ships in a minor, and its notes say so. The resource guards (timeout, row cap, spill cap) may tighten in a
   patch when that is the security fix.
 - **Segment identity across `arrow-rs` releases.** Byte-identical segments are a correctness
   boundary, not an API, and the boundary belongs to a dependency we do not control: a segment's hash
@@ -1557,7 +1557,7 @@ Stated plainly, because finding them yourself in production would be worse.
   machines (runbook level 5). It has not run a production workload for anyone, and until 0.9.3 the
   writer pool did not index at all (#250) - a defect a suite of ten passing checks did not catch,
   because every one of them tested the control plane rather than the data. Weigh it accordingly.
-  DataFusion federation (RFC-0013) is separate and still unbuilt; both modes use DuckDB.
+  DataFusion federation (RFC-0013) is separate and still unbuilt; both modes use the embedded engine.
 - **No ExEx or trace/state extraction.** Colocated-reth ingestion (RFC-0003) and firehose-class
   extraction (RFC-0014) are gated on a synced node - an infrastructure decision, not a coding one.
 

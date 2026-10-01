@@ -12,39 +12,23 @@
 //! discovered by a user. Every choice here is shaped by that asymmetry, which is why the matcher is
 //! strictly syntactic and why anything uncertain hashes as *different*.
 //!
-//! ## Why DuckDB's own parser
+//! ## Why the engine's own parse
 //!
-//! Canonicalisation runs over `json_serialize_sql` - the AST of the engine that will actually execute
-//! the query. A second parser could disagree with DuckDB about what a statement means, and a
-//! disagreement in the permissive direction is a false match. Using the engine's own parse makes that
-//! class of error unreachable rather than unlikely.
-//!
-//! It also satisfies §2.2 structurally: the serialized AST *is* version-shaped, so a DuckDB release
-//! that changes how a statement parses changes the key by construction, rather than by us remembering
-//! to bump something. The explicit engine version stays in the key as well, for the changes that
-//! alter *evaluation* without altering the parse (DuckDB 1.4's CTE materialisation switch is exactly
-//! that).
+//! Canonicalisation runs over the AST the engine plans from (`Session::canonical_plan`). A second
+//! parser could disagree with the engine about what a statement means, and a disagreement in the
+//! permissive direction is a false match. Using the engine's own parse makes that class of error
+//! unreachable rather than unlikely. The engine and its version are in the key as well, for the
+//! changes that alter *evaluation* without altering the parse.
 //!
 //! **A parse failure falls back to the raw text.** That can only cost a match, never invent one.
 
 use anyhow::{Context, Result};
-#[cfg(test)]
-use duckdb::Connection;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Bump to invalidate every key globally (RFC-0033 §8). Changing *what goes into* a key is a
 /// migration, not a patch: entries computed under an older meaning must never be matched against
 /// entries computed under a newer one.
 pub const CACHE_FORMAT_VERSION: u32 = 1;
-
-/// Fields the AST carries that describe the *source text* rather than the query.
-///
-/// `query_location` is a byte offset into the original SQL, so it is the only thing that differs
-/// between two statements that vary by whitespace, indentation or comments. Dropping it *is* §3's
-/// whitespace-and-comments normalisation - no tokenizer, no string-literal edge cases, and no risk of
-/// stripping a `--` that lives inside a string.
-const POSITIONAL_FIELDS: &[&str] = &["query_location"];
 
 /// What a nest's SQL reads, bound to identity rather than to a name (RFC-0033 §2.1).
 ///
@@ -114,150 +98,6 @@ impl CanonicalPlan {
     /// that rather than wonder why nothing matches.
     pub fn is_canonical(&self) -> bool {
         matches!(self, CanonicalPlan::Ast(_))
-    }
-}
-
-/// Canonicalise `sql` for the reuse key (RFC-0033 §3).
-///
-/// Applies exactly two normalisations, both provably safe:
-///
-/// 1. **Whitespace and comments** - by dropping `query_location`, which is the only field they touch.
-/// 2. **Alias α-renaming** - table aliases are rewritten to positional names, and references through
-///    them are rewritten to match. Only names that are *declared as aliases* are touched, so a real
-///    table name can never be renamed into collision with another.
-///
-/// Everything else in §3's unsafe list stays significant, and needs no work to stay so: the AST is
-/// already type-aware (`5/2` carries `INTEGER` where `5/2.0` carries `DECIMAL`), already ordered, and
-/// already distinguishes `DISTINCT`.
-#[cfg(test)]
-pub(crate) fn canonical_plan(conn: &Connection, sql: &str) -> CanonicalPlan {
-    let literal = format!("'{}'", sql.replace('\'', "''"));
-    let Ok(raw) = conn.query_row(&format!("SELECT json_serialize_sql({literal})"), [], |r| {
-        r.get::<_, String>(0)
-    }) else {
-        return CanonicalPlan::RawText(sql.trim().to_string());
-    };
-    match serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(canonical_from_ast)
-    {
-        Some(ast) => CanonicalPlan::Ast(ast),
-        None => CanonicalPlan::RawText(sql.trim().to_string()),
-    }
-}
-
-/// [`canonical_plan`]'s normalisation over an AST already serialised by DuckDB.
-pub(crate) fn canonical_from_ast(mut ast: Value) -> Option<String> {
-    // DuckDB reports a parse failure in-band rather than as an error.
-    if ast.get("error").and_then(Value::as_bool) != Some(false) {
-        return None;
-    }
-    strip_positional(&mut ast);
-    let aliases = collect_aliases(&ast);
-    rename_aliases(&mut ast, &aliases);
-    // `serde_json` preserves object key order as parsed, and DuckDB emits it deterministically for a
-    // given version - which is the version already in the key.
-    Some(ast.to_string())
-}
-
-/// Remove source-position fields everywhere in the tree.
-fn strip_positional(v: &mut Value) {
-    match v {
-        Value::Object(map) => {
-            for f in POSITIONAL_FIELDS {
-                map.remove(*f);
-            }
-            for (_, child) in map.iter_mut() {
-                strip_positional(child);
-            }
-        }
-        Value::Array(items) => items.iter_mut().for_each(strip_positional),
-        _ => {}
-    }
-}
-
-/// Every non-empty `alias` declared on a table reference, in traversal order.
-///
-/// **Only `alias` fields on things that are tables.** An expression alias (`SELECT x AS y`) also uses
-/// the key `alias`, but renaming one would change the *output column name*, which is observable - so
-/// this is deliberately narrow, and anything it does not recognise simply stays significant.
-fn collect_aliases(v: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    walk(v, &mut |obj| {
-        if is_table_ref(obj) {
-            if let Some(a) = obj.get("alias").and_then(Value::as_str) {
-                if !a.is_empty() && !out.iter().any(|s: &String| s == a) {
-                    out.push(a.to_string());
-                }
-            }
-        }
-    });
-    out
-}
-
-/// A node that introduces a table into scope, and can therefore carry a table alias.
-fn is_table_ref(obj: &serde_json::Map<String, Value>) -> bool {
-    matches!(
-        obj.get("type").and_then(Value::as_str),
-        Some("BASE_TABLE") | Some("SUBQUERY") | Some("TABLE_FUNCTION")
-    )
-}
-
-/// Rewrite declared table aliases to positional names, and every reference through them.
-///
-/// A `COLUMN_REF`'s `column_names` is a qualified path: `["a", "x"]` for `a.x`. The leading element is
-/// rewritten **only** when it names a declared alias - so `["t", "x"]`, where `t` is the real table,
-/// is untouched. Getting that wrong in the other direction would rename two different tables to the
-/// same thing, which is the false match this whole module exists to prevent.
-fn rename_aliases(v: &mut Value, aliases: &[String]) {
-    if aliases.is_empty() {
-        return;
-    }
-    let renamed = |name: &str| -> Option<String> {
-        aliases
-            .iter()
-            .position(|a| a == name)
-            .map(|i| format!("__a{i}"))
-    };
-    walk_mut(v, &mut |obj| {
-        let table_ref = is_table_ref(obj);
-        if table_ref {
-            if let Some(new) = obj.get("alias").and_then(Value::as_str).and_then(&renamed) {
-                obj.insert("alias".into(), Value::String(new));
-            }
-        }
-        if obj.get("type").and_then(Value::as_str) == Some("COLUMN_REF") {
-            if let Some(Value::Array(parts)) = obj.get_mut("column_names") {
-                // Only the qualifier, and only when the path is qualified at all.
-                if parts.len() > 1 {
-                    if let Some(new) = parts[0].as_str().and_then(&renamed) {
-                        parts[0] = Value::String(new);
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn walk(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
-    match v {
-        Value::Object(map) => {
-            f(map);
-            map.values().for_each(|c| walk(c, f));
-        }
-        Value::Array(items) => items.iter().for_each(|c| walk(c, f)),
-        _ => {}
-    }
-}
-
-pub(crate) fn walk_mut(v: &mut Value, f: &mut impl FnMut(&mut serde_json::Map<String, Value>)) {
-    match v {
-        Value::Object(map) => {
-            f(map);
-            map.values_mut().for_each(|c| walk_mut(c, f));
-        }
-        Value::Array(items) => items.iter_mut().for_each(|c| walk_mut(c, f)),
-        _ => {}
     }
 }
 
@@ -379,25 +219,9 @@ pub fn report(nest_dir: &std::path::Path) -> GraftReport {
     }
 }
 
-/// Open a connection suitable for canonicalisation. No data is attached: parsing needs no catalogue.
-///
-/// **Prefer [`Parser`].** This stays `pub(crate)` so the engine type does not leave the module (#944).
-#[cfg(test)]
-pub(crate) fn parser_connection() -> Result<Connection> {
-    Connection::open_in_memory().context("opening DuckDB to canonicalise a derivation")
-}
-
 /// The canonicalisation surface, **owning** its engine rather than handing one out (#944).
 ///
-/// `graft.rs` used to expose `duckdb::Connection` in six public signatures, and it is the same module
-/// that writes the engine string into grafting identity - so the module carrying the migration
-/// consequence also carried the API leak, and `engine_version(conn)` is *how* the string gets recorded.
-/// A caller had to open a connection and hand it back, which made the engine part of the contract.
-///
-/// It is not a plugin seam and does not pretend to be one: RFC-0042 slice 2 measured DataFusion at
-/// **2.6x DuckDB's latency at 20 M rows**, so nothing is being swapped. This is encapsulation on its
-/// own merits - a public function returning a third-party connection type is wrong whether or not the
-/// third party ever changes.
+/// A caller that had to open a session and hand it back would make the engine part of the contract.
 pub struct Parser {
     session: Box<dyn crate::engine::Session>,
 }
@@ -435,7 +259,7 @@ mod tests {
     use super::*;
 
     fn plan(sql: &str) -> CanonicalPlan {
-        canonical_plan(&parser_connection().unwrap(), sql)
+        Parser::new().unwrap().canonical_plan(sql)
     }
 
     fn src(table: &str, contract: &str) -> SourceIdentity {
@@ -912,60 +736,6 @@ mod tests {
     /// RFC-0033 §4. Each of these **must** be refused - Trino #22533 is what happens otherwise: a
     /// materialized view over `CURRENT_TIMESTAMP` served a frozen timestamp forever.
     #[test]
-    fn table_refs_from_sqlparser_match_the_duckdb_walk() {
-        for sql in [
-            "SELECT * FROM Transfer t JOIN label l ON t.a = l.a",
-            "WITH c AS (SELECT * FROM mint) SELECT * FROM c, burn WHERE x IN (SELECT y FROM Burn)",
-            "SELECT count(*) FROM usdc__transfer",
-            "SELECT * FROM \"Quoted\" q, main.t",
-            "SELECT i FROM range(5) t(i)",
-            "SELECT * FROM (SELECT * FROM a UNION ALL SELECT * FROM b) s",
-            "this is not sql at all",
-        ] {
-            let duck = match plan(sql) {
-                CanonicalPlan::Ast(json) => table_refs(&serde_json::from_str(&json).unwrap()),
-                CanonicalPlan::RawText(_) => Vec::new(),
-            };
-            assert_eq!(duck, table_refs_in_sql(sql), "{sql}");
-        }
-    }
-
-    #[test]
-    fn refusals_from_sqlparser_match_the_duckdb_walk() {
-        for sql in [
-            "SELECT now()",
-            "SELECT current_timestamp",
-            "SELECT CURRENT_DATE",
-            "SELECT random()",
-            "SELECT uuid()",
-            "SELECT version()",
-            "SELECT getenv('HOME')",
-            "SELECT x FROM t WHERE ts > NOW()",
-            "SELECT date_trunc('day', now())",
-            "SELECT x FROM t LIMIT 10",
-            "SELECT x FROM t ORDER BY x LIMIT 10",
-            "SELECT count(*) FROM usdc__transfer",
-            "SELECT a.k FROM t AS a JOIN u ON a.k = u.k WHERE a.v > 100",
-            "WITH r AS (SELECT k FROM t) SELECT count(*) FROM r",
-            "SELECT x FROM t ORDER BY x",
-            "SELECT t.current_date FROM t",
-            "SELECT i FROM range(50) t(i) ORDER BY i",
-            "SELECT random() AS r FROM range(200)",
-            "SELECT x FROM (SELECT x FROM t LIMIT 5) s ORDER BY x",
-            "SELECT x FROM t UNION ALL SELECT x FROM u LIMIT 3",
-            "SELECT CAST(count(*) AS UBIGINT) AS n FROM t WHERE now() IS NOT NULL",
-            "SELECT k FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY b DESC) = 1",
-            "this is not sql at all",
-        ] {
-            let mut duck = static_refusals(&plan(sql));
-            let mut ours = refusals_in_sql(sql);
-            duck.sort_by_key(|r| r.to_string());
-            ours.sort_by_key(|r| r.to_string());
-            assert_eq!(duck, ours, "{sql}");
-        }
-    }
-
-    #[test]
     fn volatile_functions_are_refused_by_name() {
         for (sql, func) in [
             ("SELECT now()", "now"),
@@ -982,7 +752,7 @@ mod tests {
             // Nested inside another call.
             ("SELECT date_trunc('day', now())", "now"),
         ] {
-            let refusals = static_refusals(&plan(sql));
+            let refusals = refusals_in_sql(sql);
             assert!(
                 refusals.contains(&Refusal::Volatile {
                     function: func.into()
@@ -1003,12 +773,12 @@ mod tests {
     #[test]
     fn limit_without_order_by_is_refused() {
         assert_eq!(
-            static_refusals(&plan("SELECT x FROM t LIMIT 10")),
+            refusals_in_sql("SELECT x FROM t LIMIT 10"),
             vec![Refusal::ImplicitRowOrder]
         );
         // ...and with an ordering it is fine, which is the half that proves the check discriminates
         // rather than refusing everything.
-        assert!(static_refusals(&plan("SELECT x FROM t ORDER BY x LIMIT 10")).is_empty());
+        assert!(refusals_in_sql("SELECT x FROM t ORDER BY x LIMIT 10").is_empty());
     }
 
     /// The control for the whole refusal list: ordinary derivations must **not** be refused. A check
@@ -1025,9 +795,9 @@ mod tests {
             "SELECT t.current_date FROM t",
         ] {
             assert!(
-                static_refusals(&plan(sql)).is_empty(),
+                refusals_in_sql(sql).is_empty(),
                 "{sql:?} should be graftable, got {:?}",
-                static_refusals(&plan(sql))
+                refusals_in_sql(sql)
             );
         }
     }
@@ -1035,7 +805,7 @@ mod tests {
     /// RFC-0033 §10. **What this proves is that the gate is empirical, not that it is stronger than
     /// the list** (#983).
     ///
-    /// The fixture is `random()`, which `static_refusals` already refuses **by name**. So this
+    /// The fixture is `random()`, which `refusals_in_sql` already refuses **by name**. So this
     /// demonstrates the gate catching volatility by *running the statement twice and comparing*,
     /// rather than by recognising a spelling - which is the property that would let it see something
     /// the list has not been taught. It does not demonstrate that such a thing exists.
@@ -1048,14 +818,14 @@ mod tests {
     /// is the shape the float hazard actually has.
     #[test]
     fn the_determinism_gate_catches_volatility_empirically_not_by_name() {
-        let conn = parser_connection().unwrap();
+        let conn = crate::engine::bare();
 
         // A deterministic derivation passes, twice over.
-        determinism_gate(&conn, "SELECT i FROM range(50) t(i) ORDER BY i").expect("pure");
+        determinism_gate(&*conn, "SELECT i FROM range(50) t(i) ORDER BY i").expect("pure");
 
         // `random()` is on the static list, but the gate must catch it *empirically* rather than by
         // recognising the name - that is the property that makes it a backstop.
-        let err = determinism_gate(&conn, "SELECT random() AS r FROM range(200)")
+        let err = determinism_gate(&*conn, "SELECT random() AS r FROM range(200)")
             .unwrap_err()
             .to_string();
         assert!(err.contains("not deterministic"), "{err}");
@@ -1069,7 +839,7 @@ mod tests {
     /// reporting one would be noise an author cannot act on.
     #[test]
     fn an_unparsed_plan_adds_no_refusals() {
-        assert!(static_refusals(&plan("this is not sql at all")).is_empty());
+        assert!(refusals_in_sql("this is not sql at all").is_empty());
     }
 
     /// A statement the engine cannot parse falls back to raw text - sound, just coarse.
@@ -1186,26 +956,7 @@ fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     }
 }
 
-/// Every base-table name a serialized AST reads.
-/// Base-table references from DuckDB's serialized AST. Shared with incremental-entity validation so
-/// dependency identity has one parser boundary across ordinary views and entities.
-pub fn table_refs(ast: &Value) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    walk(ast, &mut |obj| {
-        if obj.get("type").and_then(Value::as_str) == Some("BASE_TABLE") {
-            if let Some(n) = obj.get("table_name").and_then(Value::as_str) {
-                if !out.iter().any(|s| s == n) {
-                    out.push(n.to_string());
-                }
-            }
-        }
-    });
-    out.sort();
-    out
-}
-
-/// [`table_refs`] from the SQL text by sqlparser's parse: every table name read, as written, CTE names
-/// included. Empty for SQL that will not parse, as a view that fails to parse contributes no edges.
+/// Every table name the SQL reads, as written, CTE names included, from sqlparser's parse. Empty for SQL that will not parse, as a view that fails to parse contributes no edges.
 pub fn table_refs_in_sql(sql: &str) -> Vec<String> {
     use sqlparser::ast::{TableFactor, Visit, Visitor};
     use std::ops::ControlFlow;
@@ -1488,8 +1239,13 @@ pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "currval",
 ];
 
-/// [`static_refusals`] from the SQL text by sqlparser's parse, so the refusal does not depend on
-/// which engine keyed the plan. Nothing for SQL that will not parse.
+/// Static refusals provable from the parse alone (RFC-0033 §4): a volatile function, called or as
+/// a bare keyword, and a `LIMIT` with no ordering. Nothing for SQL that will not parse.
+///
+/// **What this cannot prove:** §4 also refuses float aggregation where order matters. Deciding that
+/// needs the column's type, which needs binding the view against the nest's schema. Flagging every
+/// `sum()` would make almost every useful view never-graftable, and flagging only float literals
+/// would suggest a `DOUBLE` column had been checked when it had not.
 pub fn refusals_in_sql(sql: &str) -> Vec<Refusal> {
     use sqlparser::ast::{Expr, Query, SetExpr, Visit, Visitor};
     use std::ops::ControlFlow;
@@ -1551,90 +1307,11 @@ pub fn refusals_in_sql(sql: &str) -> Vec<Refusal> {
     find.0
 }
 
-/// Static refusals provable from the parse alone (RFC-0033 §4).
-///
-/// **What this cannot prove, stated rather than left as a gap:** §4 also refuses *float aggregation
-/// where order matters*, because IEEE-754 addition is not associative, so `sum()` over a `DOUBLE`
-/// column can differ between runs that group rows differently. Deciding that needs the **column's
-/// type**, which needs binding the view against the nest's schema - not parsing it. Detecting it
-/// half-way would be worse than not at all: flagging every `sum()` makes almost every useful view
-/// never-graftable, and flagging only float *literals* would create confidence that a `DOUBLE` column
-/// had been checked when it had not.
-///
-/// [`determinism_gate`] is the backstop, and it is the stronger one: it catches float
-/// non-associativity empirically, along with every other nondeterminism this list does not name.
-pub fn static_refusals(plan: &CanonicalPlan) -> Vec<Refusal> {
-    let CanonicalPlan::Ast(json) = plan else {
-        // A derivation we could not parse is never reused anyway - its plan is raw text, so any edit
-        // at all breaks the match. No refusal to add.
-        return Vec::new();
-    };
-    let Ok(ast) = serde_json::from_str::<Value>(json) else {
-        return Vec::new();
-    };
-
-    let mut out: Vec<Refusal> = Vec::new();
-    walk(&ast, &mut |obj| {
-        if obj.get("class").and_then(Value::as_str) == Some("FUNCTION") {
-            if let Some(name) = obj.get("function_name").and_then(Value::as_str) {
-                let lower = name.to_ascii_lowercase();
-                if VOLATILE_FUNCTIONS.contains(&lower.as_str()) {
-                    let r = Refusal::Volatile { function: lower };
-                    if !out.contains(&r) {
-                        out.push(r);
-                    }
-                }
-            }
-        }
-        // **A bare volatile keyword is not a FUNCTION node.** `SELECT current_timestamp` - standard
-        // SQL, no parens - parses as a `COLUMN_REF` whose single name is the keyword, so a
-        // function-only check misses it entirely and the derivation caches a frozen timestamp
-        // forever. That *is* Trino #22533. Verified against DuckDB's AST rather than assumed.
-        //
-        // Only **unqualified** single-element references are considered: `t.current_date` is an
-        // ordinary column on table `t`. A column genuinely named `current_date` would be refused
-        // here, which is the safe direction - an over-refusal costs a recompute, and the alternative
-        // costs correctness.
-        if obj.get("type").and_then(Value::as_str) == Some("COLUMN_REF") {
-            if let Some(Value::Array(parts)) = obj.get("column_names") {
-                if parts.len() == 1 {
-                    if let Some(name) = parts[0].as_str() {
-                        let lower = name.to_ascii_lowercase();
-                        if VOLATILE_FUNCTIONS.contains(&lower.as_str()) {
-                            let r = Refusal::Volatile { function: lower };
-                            if !out.contains(&r) {
-                                out.push(r);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // A `SELECT_NODE`'s modifiers carry LIMIT and ORDER BY. A limit with no ordering leaves the
-        // engine free to return any rows it likes.
-        if obj.get("type").and_then(Value::as_str) == Some("SELECT_NODE") {
-            if let Some(Value::Array(mods)) = obj.get("modifiers") {
-                let kind = |t: &str| {
-                    mods.iter()
-                        .any(|m| m.get("type").and_then(Value::as_str) == Some(t))
-                };
-                if kind("LIMIT_MODIFIER")
-                    && !kind("ORDER_MODIFIER")
-                    && !out.contains(&Refusal::ImplicitRowOrder)
-                {
-                    out.push(Refusal::ImplicitRowOrder);
-                }
-            }
-        }
-    });
-    out
-}
-
 /// Run a derivation twice over the same range and report whether it agreed with itself (§10).
 ///
 /// The cache is only as correct as the determinism of what it caches, and this is the one check that
 /// does not depend on us having *named* the nondeterminism in advance - which is why it is the
-/// backstop for everything [`static_refusals`] cannot prove, float non-associativity included.
+/// backstop for everything [`refusals_in_sql`] cannot prove, float non-associativity included.
 ///
 /// Cheap by design: finalized ranges are exactly where re-execution is supposed to be free, so a gate
 /// that re-runs one is testing the property it relies on at the price it was promised.
@@ -1648,12 +1325,12 @@ pub fn static_refusals(plan: &CanonicalPlan) -> Vec<Refusal> {
 ///
 /// ## What it can and cannot catch, measured (#961, 2026-08-30)
 ///
-/// The claim above - "the backstop for everything [`static_refusals`] cannot prove, float
+/// The claim above - "the backstop for everything [`refusals_in_sql`] cannot prove, float
 /// non-associativity included" - **is not currently evidenced, and the float half looks unreachable by
 /// this design.** The gate re-runs the *same statement* on the *same connection*, which is
 /// deterministic almost by construction.
 ///
-/// Attempted and could not be made to diverge, where `static_refusals` returned nothing: `sum` over
+/// Attempted and could not be made to diverge, where `refusals_in_sql` returned nothing: `sum` over
 /// `DOUBLE` grouped and ungrouped, `first`, `any_value`, `string_agg`, `list`, and `SELECT ... ORDER BY`
 /// on a non-unique key - each at 1, 2, 4, 8 and 16 threads. The only divergence found was `random()`,
 /// which the static list already refuses by name.

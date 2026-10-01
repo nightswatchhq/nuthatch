@@ -37,12 +37,6 @@ mod cors_reaches_the_bind;
 mod dbsp_step_cost;
 #[path = "doc_command_check.rs"]
 mod doc_command_check;
-#[path = "duckdb_containment.rs"]
-mod duckdb_containment;
-#[path = "duckdb_extensions_are_static.rs"]
-mod duckdb_extensions_are_static;
-#[path = "dune_emit.rs"]
-mod dune_emit;
 #[path = "e2e_bare_help.rs"]
 mod e2e_bare_help;
 #[path = "e2e_crash_safety.rs"]

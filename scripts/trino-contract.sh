@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # RFC-0052 S3 (#1261): the Trino half of the contract test. `tests/e2e_trino_contract.rs` publishes
-# a nest with a drifted table to an S3 server (versitygw in CI, #1492) and writes what DuckDB reads over the local segments; this
+# a nest with a drifted table to an S3 server (versitygw in CI, #1492) and writes what the nest itself reads over the local segments; this
 # script points a running Trino (container `trino`, Hive catalog `hive`) at the published prefix and
 # fails on any difference.
 #
@@ -77,29 +77,13 @@ failed=0
 for table in $(jq -r '.tables | keys[]' "$fixture"); do
   want=$(jq -er --arg t "$table" '.tables[$t] | "\(.count)\t\(.sum)\t\(.count_sender)"' "$fixture")
   got=$(query "$table")
-  printf '%s\n  duckdb (local): %s\n  trino (prefix): %s\n' "$table" "$want" "$got"
+  printf '%s\n  nuthatch (local): %s\n  trino (prefix): %s\n' "$table" "$want" "$got"
   if [ "$got" != "$want" ]; then
-    echo "::error::$table: Trino returned [$got], local DuckDB [$want] (count, sum, count(sender))"
+    echo "::error::$table: Trino returned [$got], the nest locally [$want] (count, sum, count(sender))"
     failed=1
   fi
 done
 
-# RFC-0055 S3 (#1359): each view `emit dune` translated, pointed at this catalogue, must return the
-# rows the nest's own DuckDB view returned. A fixture that carries no views fails rather than passes.
-[ "$(jq '.views // {} | length' "$fixture")" -gt 0 ] || { echo "::error::the fixture carries no translated views"; exit 1; }
-for view in $(jq -r '.views | keys[]' "$fixture"); do
-  want=$(jq -r --arg v "$view" '.views[$v].lines[]' "$fixture")
-  if ! got=$(trino --execute "$(jq -er --arg v "$view" '.views[$v].trino_sql' "$fixture")" | LC_ALL=C sort); then
-    echo "::error::view $view: Trino refused the translated query"
-    failed=1
-    continue
-  fi
-  printf '%s\n  duckdb (nest view):\n%s\n  trino (translated):\n%s\n' "$view" "$want" "$got"
-  if [ "$got" != "$want" ]; then
-    echo "::error::view $view: Trino and the nest's own DuckDB view returned different rows"
-    failed=1
-  fi
-done
 [ "$failed" -eq 0 ] || exit 1
 
 # The drifted table has to be able to fail this test. Read by index, it must come out wrong.

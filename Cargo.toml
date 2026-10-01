@@ -24,7 +24,7 @@ exclude = ["/components", "/scratchpad", "/fuzz", "/decode", "/tools"]
 name = "nuthatch"
 path = "src/main.rs"
 
-# One integration binary avoids linking DuckDB, DBSP and the complete crate into 81 separate
+# One integration binary avoids linking Burrmill, DBSP and the complete crate into 81 separate
 # executables. These four remain isolated because they change process-global environment variables.
 [[test]]
 name = "it"
@@ -84,7 +84,7 @@ k256 = { version = "0.13", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
-# The parser role: entities, lowering and Dune read its AST, not DuckDB's `json_serialize_sql`.
+# The parser role: entities and lowering read its AST.
 sqlparser = { version = "0.62", features = ["visitor"] }
 serde_json = "1"
 csv = "1"
@@ -104,10 +104,9 @@ bytes = "1"
 # graph-node computes its own `BigDecimal` on this crate, and the prices a subgraph stores need an
 # integer wider than any fixed-width type: `sqrtPriceX96^2` reaches 2^384.
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
-duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
-# The second engine of shadow mode (RFC-0044 Amendment 2, phase 2b). Optional and off by default:
-# a release build does not carry it. Its arrow is not ours, so no batch crosses; rows cross as JSON.
-burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "17e0a2210716fe376243f65e8878bf8b07ed650b", default-features = false, features = ["datafusion"], optional = true }
+# The analytical engine (RFC-0044 Amendment 2), pinned by rev. Its arrow is not ours, so no batch
+# crosses; rows cross as JSON, and Arrow results as IPC.
+burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "17e0a2210716fe376243f65e8878bf8b07ed650b", default-features = false, features = ["datafusion"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
 # satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via
@@ -156,7 +155,7 @@ url = { version = "2", optional = true }
 # the docs advertise simply did not exist. Measured cost of enabling it: **two** lines of dependency
 # tree, because `object_store` is already compiled (via dbsp/feldera-storage) and `url` is already
 # present; the feature only adds the `aws` transport on top of a crate we were building anyway.
-default = ["object-store", "shadow-burrmill"]
+default = ["object-store"]
 # ExEx tip-ingestion source (colocated reth). Stubbed today - see docs/exex-design.md - so the
 # default build never pulls the (enormous) reth dependency.
 exex = []
@@ -172,12 +171,9 @@ postgres-store = ["dep:postgres"]
 counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
 # RFC-0060 §5.6: the Graph network facade. Off by default: a default build never shows it and
 # refuses a nest that needs it.
-graph = ["duckdb/vscalar", "duckdb/vscalar-arrow", "folds"]
+graph = ["folds"]
 # RFC-0059: checkpointed folds. Off by default, and a default build refuses a nest that ships `folds/`.
 folds = []
-# Shadow mode: Burrmill answers beside DuckDB on every statement, DuckDB is served, differences are
-# logged. Off in release builds; the shadow period runs on a build that turns it on.
-shadow-burrmill = ["dep:burrmill"]
 
 [dev-dependencies]
 proptest = "1"

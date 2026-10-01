@@ -154,7 +154,7 @@ fn is_bigint_storage(storage: &str) -> bool {
 }
 
 /// A bool storage kind - a Solidity `bool` stored as exact text `'true'`/`'false'`, not a SQL
-/// boolean. Mirrors `analytics::hot_col_type`/`rows_to_batch`, which type it the same as every other
+/// boolean. Mirrors `seal::rows_to_batch`, which types it the same as every other
 /// non-numeric Solidity value: text.
 fn is_bool_storage(storage: &str) -> bool {
     storage == "bool"

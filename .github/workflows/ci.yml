@@ -343,7 +343,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       # Clippy runs **first**, deliberately. It compiles `--all-targets` under this feature, which is a
       # superset of what the test step needs, so running it first warms the shared cache and the test
-      # step reuses it. In the other order both steps did a near-full build of duckdb, wasmtime and
+      # step reuses it. In the other order both steps did a near-full build of datafusion, wasmtime and
       # dbsp - the job's first run took ~30 minutes, most of it compiling the same crates twice.
       #
       # It also fails faster on the common breakage: a lint error surfaces before a database is
@@ -498,7 +498,7 @@ jobs:
           docker logs s3 2>&1 | tail -n 100 || true
           docker rm -f s3 || true
 
-  # RFC-0052 S3 (#1261): Trino's Hive connector over a published prefix must read what local DuckDB
+  # RFC-0052 S3 (#1261): Trino's Hive connector over a published prefix must read what the nest's own engine
   # reads, including a table whose columns drifted across seals. Not a required check.
   trino-contract:
     name: Trino contract (RFC-0052 S3)
@@ -548,7 +548,7 @@ jobs:
         run: aws configure set default.s3.addressing_style path
       - name: create the test bucket
         run: aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
-      - name: publish the drifted nest and record DuckDB's numbers
+      - name: publish the drifted nest and record the local numbers
         env:
           NUTHATCH_TRINO_FIXTURE_OUT: ${{ runner.temp }}/trino-fixture.json
         run: cargo test --locked --test it e2e_trino_contract -- --nocapture
@@ -578,7 +578,7 @@ jobs:
           echo "::error::Trino did not finish starting within 180s"
           docker logs trino || true
           exit 1
-      - name: Trino over the prefix matches local DuckDB
+      - name: Trino over the prefix matches the local numbers
         run: scripts/trino-contract.sh "$RUNNER_TEMP/trino-fixture.json"
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()

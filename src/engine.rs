@@ -1,11 +1,9 @@
-//! The analytical engine as a trait, with DuckDB behind it (`engine_duck`).
+//! The analytical engine as a trait, with Burrmill behind it (`engine_burrmill`).
 //!
-//! RFC-0044 Amendment 2, phase 2a. `analytics.rs` keeps every policy decision it had - the four
-//! read-only gates, the allowlist walk, the connection cache, the shared deadline, the integrity
-//! sweep - and asks the engine only for things any SQL engine over the sealed segments can answer:
-//! bind a fact table from its inputs, run a statement to rows, cancel one, count its cold scans.
-//! The DDL that does it, and the catalogue functions behind the catalogue questions, live with the
-//! implementation. Nothing here changes an answer; the suite is the proof.
+//! RFC-0044 Amendment 2. `analytics.rs` keeps every policy decision - the four read-only gates, the
+//! allowlist walk, the session cache, the shared deadline, the integrity sweep - and asks the engine
+//! only for what any SQL engine over the sealed segments can answer: bind a fact table from its
+//! inputs, run a statement to rows, cancel one, count its cold scans.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -18,8 +16,7 @@ pub(crate) use crate::analytics::FactWindow;
 /// The per-result Rust-side byte ceiling for the guarded `/sql` surface (64 MiB). Comfortably above
 /// any legitimate 50k-row result, far below the per-cursor RAM budget - the backstop against a
 /// wide-cell `SELECT` inflating the materialised buffer past the budget. Part of `collect`'s
-/// contract: every engine applies it whenever a row cap is given, so a shadow truncates where the
-/// primary does.
+/// contract whenever a row cap is given.
 pub(crate) const SQL_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
 /// A cheap lower-bound byte estimate of a materialised cell - dominated by string payloads, which is
@@ -38,7 +35,7 @@ pub(crate) fn value_bytes(v: &Value) -> usize {
     }
 }
 
-/// Opens sessions. One implementation today; a shadow engine is phase 2b.
+/// Opens sessions.
 pub(crate) trait Engine: Send + Sync {
     /// A session bounded and locked to `dir`: the nest's memory, thread and spill limits, file
     /// access confined to its data directories.
@@ -128,53 +125,27 @@ pub(crate) trait Session: Send {
     /// cannot be listed.
     fn view_definitions(&self) -> Option<Vec<(String, String)>>;
 
-    /// The statement's AST as the engine's parser serialises it. A statement the parser refuses
-    /// still returns `Ok`, with the refusal in-band as the parser reports it; `Err` is the
-    /// serialisation itself failing.
-    fn serialize_sql(&self, sql: &str) -> Result<Value>;
-
     /// The security walk: what the statement reaches, from the engine's own parse. `None` when the
     /// parser could not say (it fails open; the denylist is still in front), `Some(Err)` when the
     /// statement is refused with the reason, `Some(Ok((tables, surveys)))` with the base tables and
     /// CTE names lowercased and whether it asks about the catalogue.
-    fn reach(&self, _sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
-        None
-    }
+    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>>;
 
     /// `SELECT * FROM table ORDER BY ALL` written to `path` as one Parquet file (a fold checkpoint).
-    fn write_parquet(&self, table: &str, path: &Path) -> Result<()> {
-        self.execute(&format!(
-            "COPY (SELECT * FROM \"{table}\" ORDER BY ALL) TO '{}' (FORMAT parquet)",
-            path.display().to_string().replace('\'', "''")
-        ))
-    }
+    fn write_parquet(&self, table: &str, path: &Path) -> Result<()>;
 
     /// `table` replaced by the Parquet file at `path`, read through `select` (its columns cast).
-    fn load_parquet(&self, table: &str, select: &str, path: &Path) -> Result<()> {
-        self.execute(&format!(
-            "CREATE OR REPLACE TABLE \"{table}\" AS SELECT {select} FROM read_parquet('{}')",
-            path.display().to_string().replace('\'', "''")
-        ))
-    }
+    fn load_parquet(&self, table: &str, select: &str, path: &Path) -> Result<()>;
 
     /// The statement as this engine keys it for reuse (RFC-0033 §3); `None` keys it by its raw text.
-    fn canonical_plan(&self, sql: &str) -> Option<String> {
-        crate::graft::canonical_from_ast(self.serialize_sql(sql).ok()?)
-    }
+    fn canonical_plan(&self, sql: &str) -> Option<String>;
 
     /// This engine and its version, written into reuse keys (RFC-0033 §2.2).
-    fn engine_version(&self) -> String {
-        self.one_value("SELECT version()")
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "duckdb-unknown".to_string())
-    }
+    fn engine_version(&self) -> String;
 
     /// The physical tables a statement reads (names a `WITH` binds in scope excluded) and the table
     /// functions it calls, lowercased; `None` when the statement will not parse.
-    fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
-        crate::analytics::table_refs_from_ast(&self.serialize_sql(sql).ok()?)
-    }
+    fn table_refs(&self, sql: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)>;
 
     /// A handle another thread can use to cancel whatever this session is running.
     fn interrupt_handle(&self) -> Arc<dyn Interrupt>;
@@ -243,35 +214,14 @@ pub(crate) trait Session: Send {
     fn bind_labels(&self, labels_dir: &Path) -> Result<()>;
 }
 
-/// A bare session on every engine this build carries: DuckDB, and Burrmill where it is built in.
+/// A bare session, for a test.
 #[cfg(test)]
-pub(crate) fn test_sessions() -> Vec<Box<dyn Session>> {
-    #[allow(unused_mut)]
-    let mut sessions: Vec<Box<dyn Session>> = vec![crate::engine_duck::in_memory()];
-    #[cfg(feature = "shadow-burrmill")]
-    sessions.push(crate::engine_burrmill::BurrmillEngine.open_bare().unwrap());
-    sessions
+pub(crate) fn bare() -> Box<dyn Session> {
+    crate::analytics::engine().open_bare().unwrap()
 }
 
-/// As `each_engine`, for a body that needs more than one session of the same engine.
+/// Run a test body on a bare session.
 #[cfg(test)]
-pub(crate) fn each_engine_fresh(body: impl Fn(&dyn Fn() -> Box<dyn Session>)) {
-    let duck = || crate::engine_duck::in_memory();
-    eprintln!("on duckdb");
-    body(&duck);
-    #[cfg(feature = "shadow-burrmill")]
-    {
-        let burrmill = || crate::engine_burrmill::BurrmillEngine.open_bare().unwrap();
-        eprintln!("on burrmill");
-        body(&burrmill);
-    }
-}
-
-/// Run a test body once on each engine, from its own setup, naming the engine for a failure.
-#[cfg(test)]
-pub(crate) fn each_engine(body: impl Fn(&dyn Session)) {
-    for session in test_sessions() {
-        eprintln!("on {}", session.engine_version());
-        body(session.as_ref());
-    }
+pub(crate) fn on_bare(body: impl Fn(&dyn Session)) {
+    body(bare().as_ref());
 }

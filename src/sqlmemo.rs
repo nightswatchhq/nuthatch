@@ -83,7 +83,7 @@ pub fn is_deterministic(sql: &str) -> bool {
 pub struct Key([u8; 32]);
 
 /// Everything a `/sql` answer is a function of. Building one is cheap - the file stamps are the
-/// hashes `analytics::duck_inputs` already computes per request - and none of it needs a permit.
+/// hashes `analytics::cache_inputs` already computes per request - and none of it needs a permit.
 /// A stamp of every sealed segment behind `tables` (or behind every table, when the statement's
 /// reach is unknown): path, length, and modification time in nanoseconds.
 ///
