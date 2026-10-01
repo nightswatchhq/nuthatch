@@ -1,0 +1,19 @@
+[runtime]
+name = "golden"
+
+[[chains]]
+chain = "arbitrum-one"
+chain_id = 42161
+rpc_urls = []
+
+[[mounts]]
+tenant = "default"
+alias = "primary"
+nid = "2bca092694c5833d2fecec20983b307f23c3a5507402c39bab4d3fab91231576"
+sql = "open"
+
+[[mounts]]
+tenant = "acme"
+alias = "mirror"
+nid = "2bca092694c5833d2fecec20983b307f23c3a5507402c39bab4d3fab91231576"
+sql = "open"

@@ -18,6 +18,9 @@ nuthatch.toml
 !obib-case*/nuthatch.toml
 # …and the committed tape-companion nests. Same rule as OBIB: keyless, endpoint via `--rpc`.
 !docs/bench/nests/**/nuthatch.toml
+# …and the frozen upgrade fixtures, store included: they are what the 4.x promise is tested against.
+!tests/fixtures/upgrade/**/nuthatch.toml
+!tests/fixtures/upgrade/**/*.redb
 
 # guest component build dirs (the staged component .wasm at components/*.wasm IS committed)
 components/*/target
