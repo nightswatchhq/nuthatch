@@ -768,7 +768,7 @@ type Swap @entity { id: ID! pool: Pool! }
         };
         // `NUTHATCH_ENGINE=checked` replays with Burrmill served, as that switch runs a nest.
         let checked = std::env::var(crate::analytics::ENV_ENGINE).as_deref() == Ok("checked");
-        crate::engine_shadow::install(if checked {
+        let pair = if checked {
             ShadowEngine::new(
                 Box::new(BurrmillEngine),
                 Box::new(crate::engine_duck::DuckEngine),
@@ -781,6 +781,10 @@ type Swap @entity { id: ID! pool: Pool! }
                 Box::new(BurrmillEngine),
                 sink,
             )
+        };
+        crate::engine_shadow::install(match std::env::var_os("NUTHATCH_SHADOW_LOG") {
+            Some(path) => pair.with_tally_in(Path::new(&path)).unwrap(),
+            None => pair,
         })
         .unwrap();
         let mut views: Vec<String> = crate::analytics::nest_view_files(dir)
