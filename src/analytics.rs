@@ -7518,6 +7518,14 @@ template="pool"
     #[test]
     fn a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied(
     ) {
+        crate::engine::each_engine_fresh(
+            a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied_on,
+        );
+    }
+
+    fn a_view_joining_a_populated_and_a_never_fired_table_resolves_once_the_live_schema_is_supplied_on(
+        open: &dyn Fn() -> Box<dyn crate::engine::Session>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("views")).unwrap();
         std::fs::write(
@@ -7587,9 +7595,9 @@ template="pool"
         // It gets no view at all, and the single `CREATE VIEW gns_network` statement - which touches
         // both tables - fails to bind. Pinning the bug this issue reports, not just the fix.
         {
-            let conn = Connection::open_in_memory().unwrap();
+            let conn = open();
             define_views(
-                &conn,
+                &*conn,
                 dir.path(),
                 &hot,
                 u64::MAX,
@@ -7598,10 +7606,9 @@ template="pool"
                 None,
             )
             .unwrap();
-            define_nest_views(&conn, dir.path(), None);
+            define_nest_views(&*conn, dir.path(), None);
             assert!(
-                conn.query_row("SELECT count(*) FROM gns_network", [], |r| r
-                    .get::<_, i64>(0))
+                conn.collect("SELECT count(*) FROM gns_network", None)
                     .is_err(),
                 "pin the bug: one never-fired table takes the whole view down, all four fields"
             );
@@ -7611,9 +7618,9 @@ template="pool"
         // `schema.json` doesn't, so it gets an empty typed view and the join resolves - the fired
         // table's real data intact, the never-fired table's side NULL rather than absent.
         {
-            let conn = Connection::open_in_memory().unwrap();
+            let conn = open();
             define_views(
-                &conn,
+                &*conn,
                 dir.path(),
                 &hot,
                 u64::MAX,
@@ -7622,29 +7629,28 @@ template="pool"
                 None,
             )
             .unwrap();
-            define_nest_views(&conn, dir.path(), None);
-            let row = conn
-                .query_row(
+            define_nest_views(&*conn, dir.path(), None);
+            let (rows, _) = conn
+                .collect(
                     "SELECT minted_value, minted_pool, withdrawn_value, withdrawn_recipient \
                      FROM gns_network",
-                    [],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                        ))
-                    },
+                    None,
                 )
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
                 .expect("the populated half of the join must resolve, not merely avoid erroring");
-            assert_eq!(row.0, "500", "the fired table's real data survives the fix");
-            assert_eq!(row.1, "0xpool");
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
             assert_eq!(
-                row.2, None,
+                row["minted_value"], "500",
+                "the fired table's real data survives the fix"
+            );
+            assert_eq!(row["minted_pool"], "0xpool");
+            assert_eq!(
+                row["withdrawn_value"],
+                serde_json::Value::Null,
                 "the never-fired table degrades to NULL on its side, not an error"
             );
-            assert_eq!(row.3, None);
+            assert_eq!(row["withdrawn_recipient"], serde_json::Value::Null);
         }
     }
 

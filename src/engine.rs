@@ -216,6 +216,20 @@ pub(crate) fn test_sessions() -> Vec<Box<dyn Session>> {
     sessions
 }
 
+/// As `each_engine`, for a body that needs more than one session of the same engine.
+#[cfg(test)]
+pub(crate) fn each_engine_fresh(body: impl Fn(&dyn Fn() -> Box<dyn Session>)) {
+    let duck = || crate::engine_duck::in_memory();
+    eprintln!("on duckdb");
+    body(&duck);
+    #[cfg(feature = "shadow-burrmill")]
+    {
+        let burrmill = || crate::engine_burrmill::BurrmillEngine.open_bare().unwrap();
+        eprintln!("on burrmill");
+        body(&burrmill);
+    }
+}
+
 /// Run a test body once on each engine, from its own setup, naming the engine for a failure.
 #[cfg(test)]
 pub(crate) fn each_engine(body: impl Fn(&dyn Session)) {
