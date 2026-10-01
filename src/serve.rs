@@ -3904,6 +3904,8 @@ fn sql_response(
         // cause (a damaged/unreadable hot store, not a bad segment) and distinct remedy, so it does
         // not belong inside `degraded_tables` - see `QueryOutput::tip_unavailable`.
         "tip_unavailable": out.tip_unavailable,
+        // The query's column order (#1609), which the row objects do not keep.
+        "columns": out.columns,
         "rows": out.rows,
         // Answered from the deterministic memo (#1186): the same rows this statement produced the
         // last time every input it reads was in this state. Never stale by construction; here so a
@@ -7056,6 +7058,22 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #1609: the row objects cannot carry the projection order, so the response names it.
+    #[tokio::test]
+    async fn sql_response_names_its_columns_in_the_querys_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let (status, body) = get(
+            router(SharedNest::new(state)),
+            "/sql?q=SELECT%201%20AS%20z,%202%20AS%20a,%203%20AS%20m",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["columns"], json!(["z", "a", "m"]), "{body}");
+        assert_eq!(body["rows"], json!([{"z": 1, "a": 2, "m": 3}]), "{body}");
     }
 
     /// A typed-rows QoS nest held 850,879 rows hot behind outstanding documents, under the two-million

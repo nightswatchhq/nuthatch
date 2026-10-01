@@ -6,7 +6,7 @@
 //! names the engine.
 
 use crate::engine::{
-    value_bytes, Died, Engine, FactWindow, Interrupt, Session, SQL_MAX_RESULT_BYTES,
+    value_bytes, Collected, Died, Engine, FactWindow, Interrupt, Session, SQL_MAX_RESULT_BYTES,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::arrow::datatypes::DataType;
@@ -55,7 +55,7 @@ impl Session for DuckSession {
     fn execute(&self, sql: &str) -> Result<()> {
         Session::execute(&self.conn, sql)
     }
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
         Session::collect(&self.conn, sql, cap)
     }
     fn for_each_row(&self, sql: &str, f: &mut dyn FnMut(&[Value]) -> Result<()>) -> Result<()> {
@@ -142,7 +142,7 @@ impl Session for Connection {
         Ok(self.execute_batch(sql)?)
     }
 
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
         collect(self, sql, cap)
     }
 
@@ -739,7 +739,7 @@ pub(crate) fn physical_parquet_scans(plan: &Value) -> Result<u64> {
 /// i.e. more than `n` rows were available); the caller then truncates back to `n`. `cap = None`
 /// materialises every row. Row materialisation is Rust-side and escapes DuckDB's own memory limit,
 /// so the cap is what actually bounds a `SELECT *` result buffer.
-fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
     let mut stmt = conn
         .prepare(sql)
         .context("failed to prepare query")
@@ -770,7 +770,7 @@ fn collect(conn: &Connection, sql: &str, cap: Option<usize>) -> Result<(Vec<Valu
 }
 
 /// Materialise an executed statement's rows as JSON, under the caps `collect` documents.
-fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died> {
+fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<Collected, Died> {
     // Column metadata is only materialised once the statement has executed - read it off the
     // executed result, not the prepared statement.
     let column_names: Vec<String> = rows
@@ -788,6 +788,7 @@ fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<(Vec<Value>, 
     let byte_cap = cap.map(|_| SQL_MAX_RESULT_BYTES);
     let mut out = Vec::new();
     let mut bytes = 0usize;
+    let mut truncated = false;
     while let Some(row) = rows
         .next()
         .context("row read failed")
@@ -802,14 +803,16 @@ fn drain(mut rows: duckdb::Rows<'_>, cap: Option<usize>) -> Result<(Vec<Value>, 
             obj.insert(name.clone(), v);
         }
         out.push(Value::Object(obj));
-        if hard.is_some_and(|h| out.len() >= h) {
-            return Ok((out, true));
-        }
-        if byte_cap.is_some_and(|max| bytes >= max) {
-            return Ok((out, true));
+        if hard.is_some_and(|h| out.len() >= h) || byte_cap.is_some_and(|max| bytes >= max) {
+            truncated = true;
+            break;
         }
     }
-    Ok((out, false))
+    Ok(Collected {
+        rows: out,
+        columns: column_names,
+        truncated,
+    })
 }
 
 /// `duckdb-rs` currently materialises a scaled `DECIMAL(38, s)` through

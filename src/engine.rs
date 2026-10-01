@@ -76,6 +76,17 @@ impl From<Died> for anyhow::Error {
     }
 }
 
+/// A materialised result.
+#[derive(Debug)]
+pub(crate) struct Collected {
+    pub rows: Vec<Value>,
+    /// In the statement's projection order. Each row is a `serde_json::Map`, which sorts its keys,
+    /// so this is the only record of that order (#1609).
+    pub columns: Vec<String>,
+    /// More rows were available than the cap allowed.
+    pub truncated: bool,
+}
+
 /// One engine instance over one nest: a catalogue being built up and statements run against it.
 /// `Send`, because the connection cache hands a session from one request's thread to the next.
 // The methods only `folds` calls are part of the contract without it.
@@ -86,9 +97,9 @@ pub(crate) trait Session: Send {
 
     /// Prepare, execute and materialise the result as nuthatch-encoded JSON rows. With
     /// `cap = Some(n)` it stops after `n + 1` rows so the caller can report truncation precisely
-    /// (the bool is true when that extra row existed), and also caps cumulative result bytes;
+    /// (`truncated` is true when that extra row existed), and also caps cumulative result bytes;
     /// `cap = None` materialises every row.
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<(Vec<Value>, bool), Died>;
+    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died>;
 
     /// Stream a result row by row, each as its cells in column order, so a large result is never
     /// held whole.

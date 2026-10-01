@@ -418,7 +418,7 @@ async fn run_sql(args: cli::SqlArgs) -> Result<()> {
                     println!("{row}");
                 }
             } else {
-                print_table(&out.rows);
+                print_table(&out);
             }
             report_caveats(&out);
             Ok(())
@@ -742,8 +742,18 @@ impl SqlBackend {
                     .get("tip_unavailable")
                     .and_then(|t| t.as_bool())
                     .unwrap_or(false);
+                let columns = body
+                    .get("columns")
+                    .and_then(|c| c.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Ok(analytics::QueryOutput {
                     rows,
+                    columns,
                     truncated,
                     degraded_tables,
                     tip_unavailable,
@@ -781,7 +791,7 @@ async fn repl(backend: SqlBackend) -> Result<()> {
                 // A query error is printed, never fatal - the session stays open.
                 match backend.query(line).await {
                     Ok(out) => {
-                        print_table(&out.rows);
+                        print_table(&out);
                         report_caveats(&out);
                     }
                     Err(e) => eprintln!("error: {e:#}"),
@@ -836,7 +846,7 @@ async fn repl_meta(line: &str, backend: &SqlBackend) -> bool {
 async fn run_meta_query(backend: &SqlBackend, sql: &str) {
     match backend.query(sql).await {
         Ok(out) => {
-            print_table(&out.rows);
+            print_table(&out);
             // The dot-commands get the caveats too. `.tables` is the sharpest case: a table whose
             // view could not be defined is simply *absent* from the catalogue listing, which is the
             // naming-fault misread of #419 in its purest form - the warning names it.
@@ -847,19 +857,22 @@ async fn run_meta_query(backend: &SqlBackend, sql: &str) {
 }
 
 /// Render query rows as a simple aligned ASCII table.
-fn print_table(rows: &[serde_json::Value]) {
+fn print_table(out: &analytics::QueryOutput) {
     use serde_json::Value;
+    let rows = &out.rows;
     if rows.is_empty() {
         println!("(0 rows)");
         return;
     }
-    // Column order: first-seen across rows (a query result's columns are consistent row to row).
-    let mut cols: Vec<String> = Vec::new();
-    for r in rows {
-        if let Some(o) = r.as_object() {
-            for k in o.keys() {
-                if !cols.iter().any(|c| c == k) {
-                    cols.push(k.clone());
+    // Keys as a fallback only, for a node older than #1609 that sends no `columns`: they are sorted.
+    let mut cols = out.columns.clone();
+    if cols.is_empty() {
+        for r in rows {
+            if let Some(o) = r.as_object() {
+                for k in o.keys() {
+                    if !cols.iter().any(|c| c == k) {
+                        cols.push(k.clone());
+                    }
                 }
             }
         }
@@ -985,6 +998,7 @@ mod tests {
     fn out(truncated: bool, degraded: &[&str]) -> analytics::QueryOutput {
         analytics::QueryOutput {
             rows: vec![],
+            columns: vec![],
             truncated,
             degraded_tables: degraded.iter().map(|s| s.to_string()).collect(),
             tip_unavailable: false,
