@@ -19,6 +19,11 @@ pub const ENV_THREADS: &str = "NUTHATCH_ANALYTICS_THREADS";
 pub const ENV_TEMP_DIRECTORY: &str = "NUTHATCH_ANALYTICS_TEMP_DIRECTORY";
 pub const ENV_MAX_TEMP_SIZE: &str = "NUTHATCH_ANALYTICS_MAX_TEMP_SIZE";
 pub const ENV_INGESTION_RESERVATION: &str = "NUTHATCH_INGESTION_RESERVATION";
+/// Burrmill's own bound per session, in a build that carries it. Unset, `analytics.memory_limit`.
+pub const ENV_BURRMILL_MEMORY_LIMIT: &str = "NUTHATCH_BURRMILL_MEMORY_LIMIT";
+/// The cursor's RSS wall for the split below, where an operator has given the process more than the
+/// shipped 2 GiB. Raise-only: the default is what the footprint job measures.
+pub const ENV_MAX_RSS: &str = "NUTHATCH_MAX_RSS";
 
 /// Unmeasured. RFC-0047 §6 wants a high-water mark for Rust, DBSP, decode and result
 /// materialisation outside DuckDB, on the box that enforces the 2 GB budget. Counted as zero
@@ -37,6 +42,11 @@ pub struct AnalyticsConfig {
     pub max_temp_size: Option<String>,
     /// Named ingest floor, in MB. `None` → [`derived_ingestion_reservation_mb`].
     pub ingestion_reservation_mb: Option<u64>,
+    /// Burrmill's bound per session. `None` → `memory_limit_mb`. Its hash joins and final aggregates
+    /// cannot spill, so a nest whose views DuckDB answers in 512 MB may need more here.
+    pub burrmill_memory_limit_mb: Option<u64>,
+    /// The wall the split is held to. `None` → [`crate::runtime::DEFAULT_MAX_RSS_MB`].
+    pub max_rss_mb: Option<u64>,
 }
 
 impl Default for AnalyticsConfig {
@@ -47,6 +57,8 @@ impl Default for AnalyticsConfig {
             temp_directory: None,
             max_temp_size: None,
             ingestion_reservation_mb: None,
+            burrmill_memory_limit_mb: None,
+            max_rss_mb: None,
         }
     }
 }
@@ -74,6 +86,18 @@ impl AnalyticsConfig {
 /// allowed; lowering it is refused by [`validate_against`]. The consequence is the property worth
 /// stating: **no accepted split hands DuckDB more RAM than the shipped default the footprint CI
 /// job actually measures.**
+impl AnalyticsConfig {
+    pub fn burrmill_limit_mb(&self) -> u64 {
+        self.burrmill_memory_limit_mb
+            .unwrap_or(self.memory_limit_mb)
+    }
+
+    pub fn max_rss(&self) -> u64 {
+        self.max_rss_mb
+            .unwrap_or(crate::runtime::DEFAULT_MAX_RSS_MB)
+    }
+}
+
 pub fn derived_ingestion_reservation_mb() -> u64 {
     crate::runtime::DEFAULT_MAX_RSS_MB
         .saturating_sub(crate::serve::SQL_MAX_CONCURRENCY as u64 * DEFAULT_MEMORY_LIMIT_MB)
@@ -90,6 +114,8 @@ pub fn from_env() -> AnalyticsConfig {
         temp_directory: env_path(ENV_TEMP_DIRECTORY),
         max_temp_size: env_size(ENV_MAX_TEMP_SIZE),
         ingestion_reservation_mb: env_optional_memory(ENV_INGESTION_RESERVATION),
+        burrmill_memory_limit_mb: env_optional_memory(ENV_BURRMILL_MEMORY_LIMIT),
+        max_rss_mb: env_optional_memory(ENV_MAX_RSS),
     }
 }
 
@@ -100,8 +126,13 @@ pub fn from_env() -> AnalyticsConfig {
 /// exactly why the reservation may only be raised. 2 GiB is the footprint CI job / process RSS
 /// wall; this is the arithmetic that keeps a config from being allowed to breach it quietly.
 pub fn validate_cursor_budget() -> Result<()> {
-    let engines = 1 + crate::engine_shadow::installed().is_some() as u64;
-    validate_engines(&from_env(), crate::serve::sql_max_concurrency(), engines)
+    let (duckdb, burrmill) = crate::analytics::resident_engines();
+    validate_split(
+        &from_env(),
+        crate::serve::sql_max_concurrency(),
+        duckdb,
+        burrmill,
+    )
 }
 
 /// Same check against an explicit config, so a test can drive the inequality without the process
@@ -113,6 +144,18 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
 /// With the shadow installed a permit holds two sessions, each bounded by `analytics.memory_limit`,
 /// so the split counts both.
 pub fn validate_engines(cfg: &AnalyticsConfig, permits: usize, engines: u64) -> Result<()> {
+    validate_split(cfg, permits, 1, engines.saturating_sub(1))
+}
+
+/// The split with each engine at its own bound: a permit holds `duckdb` DuckDB sessions at
+/// `analytics.memory_limit` and `burrmill` Burrmill sessions at its limit.
+pub fn validate_split(
+    cfg: &AnalyticsConfig,
+    permits: usize,
+    duckdb: u64,
+    burrmill: u64,
+) -> Result<()> {
+    let engines = duckdb + burrmill;
     let permits = permits.clamp(1, crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
     if cfg.memory_limit_mb == 0 {
         bail!(
@@ -132,9 +175,21 @@ pub fn validate_engines(cfg: &AnalyticsConfig, permits: usize, engines: u64) -> 
             cfg.threads
         );
     }
-    let duck = permits
-        .saturating_mul(engines)
-        .saturating_mul(cfg.memory_limit_mb);
+    if cfg.burrmill_memory_limit_mb == Some(0) {
+        bail!("{ENV_BURRMILL_MEMORY_LIMIT} must be greater than zero");
+    }
+    let ceiling = cfg.max_rss();
+    if ceiling < crate::runtime::DEFAULT_MAX_RSS_MB {
+        bail!(
+            "{ENV_MAX_RSS} is {ceiling} MB, below the shipped {} MB. It is the wall the operator \
+             has given the process, and it may only be raised: the split is not what bounds ingest.",
+            crate::runtime::DEFAULT_MAX_RSS_MB
+        );
+    }
+    let per_permit = duckdb
+        .saturating_mul(cfg.memory_limit_mb)
+        .saturating_add(burrmill.saturating_mul(cfg.burrmill_limit_mb()));
+    let duck = permits.saturating_mul(per_permit);
     let reservation = cfg.reservation_mb();
     let floor = derived_ingestion_reservation_mb();
     if reservation < floor {
@@ -150,21 +205,23 @@ pub fn validate_engines(cfg: &AnalyticsConfig, permits: usize, engines: u64) -> 
     }
     let headroom = RUNTIME_HEADROOM_MB;
     let total = duck.saturating_add(reservation).saturating_add(headroom);
-    let ceiling = crate::runtime::DEFAULT_MAX_RSS_MB;
     if total > ceiling {
         bail!(
             "DuckDB split does not leave the named ingest floor: (sql_permits × engines × \
              analytics.memory_limit) + ingestion_reservation + runtime_headroom = ({permits} × \
              {engines} × {} MB) + {reservation} MB + {headroom} MB = {total} MB, which is above \
              {ceiling} MB. Two engines means shadow-burrmill, which runs Burrmill beside DuckDB \
-             under the same permit. \
+             under the same permit; Burrmill's sessions count at {} MB each \
+             ({ENV_BURRMILL_MEMORY_LIMIT}). {ENV_MAX_RSS} raises the wall where the process has \
+             been given more. \
              This gate refuses that split; it does not cap ingest, DBSP, redb, or result \
              materialisation. The 2 GiB cursor budget is the footprint CI job / process RSS wall, \
              not this arithmetic. Lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
              NUTHATCH_SQL_MAX_CONCURRENCY, or ingestion_reservation ({ENV_INGESTION_RESERVATION}). \
              analytics.max_temp_size is disk and does not buy RAM. A query that cannot run in its \
              budget fails; it never degrades block processing.",
-            cfg.memory_limit_mb
+            cfg.memory_limit_mb,
+            cfg.burrmill_limit_mb()
         );
     }
     Ok(())
@@ -351,6 +408,42 @@ pub(crate) mod tests {
     fn unconfigured_config_validates_at_the_shipped_permits() {
         validate_against(&AnalyticsConfig::default(), SQL_MAX_CONCURRENCY)
             .expect("today's walls must still start");
+    }
+
+    /// A nest whose views need more of Burrmill than of DuckDB: each engine counts at its own
+    /// bound, and the wall moves only when the operator says the process has more.
+    #[test]
+    fn burrmill_takes_its_own_limit_and_the_wall_only_rises() {
+        let cfg = AnalyticsConfig {
+            burrmill_memory_limit_mb: Some(2048),
+            ..AnalyticsConfig::default()
+        };
+        assert_eq!(cfg.burrmill_limit_mb(), 2048);
+        assert_eq!(AnalyticsConfig::default().burrmill_limit_mb(), 512);
+        // DuckDB checking behind Burrmill, one permit: 512 + 2,048 + 1,024.
+        let err = validate_split(&cfg, 1, 1, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("3584 MB") && err.contains(ENV_MAX_RSS),
+            "{err}"
+        );
+        let raised = AnalyticsConfig {
+            max_rss_mb: Some(4096),
+            ..cfg.clone()
+        };
+        validate_split(&raised, 1, 1, 1).expect("3,584 MB under a 4 GiB wall");
+        // Burrmill alone, two permits: 2 x 2,048 + 1,024 is over it.
+        assert!(validate_split(&raised, 2, 0, 1).is_err());
+        validate_split(&raised, 1, 0, 1).expect("one permit of Burrmill alone");
+        let lowered = AnalyticsConfig {
+            max_rss_mb: Some(1024),
+            ..AnalyticsConfig::default()
+        };
+        let err = validate_split(&lowered, 1, 1, 0).unwrap_err().to_string();
+        assert!(err.contains("may only be raised"), "{err}");
+        // Unset, nothing moved: DuckDB alone and the shadow pair as before.
+        validate_split(&AnalyticsConfig::default(), SQL_MAX_CONCURRENCY, 1, 0).unwrap();
+        assert!(validate_split(&AnalyticsConfig::default(), SQL_MAX_CONCURRENCY, 1, 1).is_err());
+        validate_split(&AnalyticsConfig::default(), 1, 1, 1).unwrap();
     }
 
     #[test]

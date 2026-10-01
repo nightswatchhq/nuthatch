@@ -322,6 +322,8 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 | `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | Linux: `$XDG_CACHE_HOME/nuthatch` or `~/.cache/nuthatch`; elsewhere the process temp dir | parent of per-instance spill dirs (`nuthatch-duckdb-{pid}-{seq}`; do not point two processes at one directory). Not `/tmp` on Linux by default, because that is often a tmpfs, where spill is RAM outside the per-cursor budget; do not point this at one |
 | `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | 2GB | spill per analytics connection. A `/sql` query that spills past it is stopped and answered `507`; the guard measures the spill itself, because DuckDB does not enforce its own limit on every spill. On disk it does not buy room in the equation above; on a tmpfs it is RAM |
 | `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest, and **raise-only**: 1024 is the remainder of today's 2 GiB split after 2 × 512 MB DuckDB, **not** a measured ingest RSS high-water (RFC-0047 §6). A lower value is refused at startup, because nothing caps ingest at this figure - writing a smaller number would not shrink ingest, only hand DuckDB headroom against a reservation no code enforces |
+| Burrmill's limit | `NUTHATCH_BURRMILL_MEMORY_LIMIT` | `analytics.memory_limit` | in a `shadow-burrmill` build, the bound on each Burrmill session. Its hash joins and final aggregates cannot spill, so a nest DuckDB answers in 512 MB may need more of Burrmill. Each engine counts in the split at its own bound |
+| the wall | `NUTHATCH_MAX_RSS` | 2048MB | the ceiling the split is held to, for a process given more than 2 GiB. **Raise-only**, and a statement by the operator, not a measurement: the footprint job measures the default and nothing above it |
 | `runtime_headroom` | (not settable) | 0 | unmeasured. Named in the inequality so the term is visible; counted as zero until someone measures it on the box that enforces the budget |
 
 Sizes accept `512`, `512MB`, `1GB`, `2GiB`. `NUTHATCH_SQL_MAX_CONCURRENCY` remains the permit
@@ -331,7 +333,8 @@ four permits at 512 MB each plus the derived ingest floor is 3072 MB.
 
 `ingestion_reservation` may be raised and not lowered, which is what makes the inequality worth
 having. The consequence is the property to hold onto: **no configuration this gate accepts gives
-DuckDB more RAM than the shipped default that the footprint CI job measures.** The gate is
+DuckDB more RAM than the shipped default that the footprint CI job measures**, unless the operator
+has raised the wall with `NUTHATCH_MAX_RSS` and so said the process has it. The gate is
 arithmetic over the walls, not an enforcement of ingest RSS; ingest, DBSP, redb and result
 materialisation are still bounded by the `max_rss_mb` wall and the footprint job, not by this sum.
 
