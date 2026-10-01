@@ -4845,11 +4845,11 @@ template="pool"
             .collect();
 
         for b in 1..=FOLDS {
-            let seen = answered.load(Ordering::SeqCst);
             crate::seal::seal_range(dir.path(), &[fold_row(b)], b, b).unwrap();
             committed.store(b + 1, Ordering::SeqCst);
-            // Each fold waits for an answer that finished after it began, so the readers race the
-            // folds on a loaded machine too, where 120 seals can outrun four readers.
+            // Each fold waits for an answer that finished after it, so every later fold begins with
+            // the readers mid-query: on a loaded machine 120 seals can otherwise outrun them.
+            let seen = answered.load(Ordering::SeqCst);
             let waiting = Instant::now();
             while answered.load(Ordering::SeqCst) == seen {
                 assert!(
