@@ -6124,12 +6124,19 @@ impl NestIngest {
                 })?;
                 let start = cold_start_block(self.start_block, backfill, tip);
                 self.store.set_meta(START_BLOCK_KEY, &start.to_string())?;
-                let src = if backfill.is_none() && self.start_block.is_some() {
+                let from_deployment = backfill.is_none() && self.start_block.is_some();
+                let src = if from_deployment {
                     " (from deployment)"
                 } else {
                     ""
                 };
                 tracing::info!("cold start: backfilling from block {start}{src} (tip {tip})");
+                if let Some(span) = long_backfill(start, tip, window).filter(|_| from_deployment) {
+                    tracing::info!(
+                        "that is {span} blocks of history; `--backfill N` indexes only the last N \
+                         blocks instead"
+                    );
+                }
                 start
             }
         };
@@ -7247,6 +7254,13 @@ fn cold_start_block(start_block: Option<u64>, backfill: Option<u64>, tip: u64) -
         (None, Some(b)) => b.min(tip),
         (None, None) => tip.saturating_sub(DEFAULT_BACKFILL),
     }
+}
+
+/// The span of a backfill long enough that `init` and `dev` point at `--backfill` (#1607): over a
+/// thousand windows. A public endpoint will not serve that in the time a first run is given.
+pub(crate) fn long_backfill(start: u64, tip: u64, window: u64) -> Option<u64> {
+    let span = tip.saturating_sub(start);
+    (span > window.saturating_mul(1_000)).then_some(span)
 }
 
 /// The highest block safe to seal under `finality`: the `finalized` tag when the chain uses it and
@@ -10303,6 +10317,14 @@ template = "pool"
         assert_eq!(children.template_of(pool_addr), Some("pool"));
         // The child registry rolls the pool back on a reorg to before its creation block.
         assert_eq!(children.clone().rollback_to(99), 1);
+    }
+
+    #[test]
+    fn a_backfill_is_long_past_a_thousand_windows() {
+        assert_eq!(long_backfill(6_082_465, 26_096_175, 20), Some(20_013_710));
+        assert_eq!(long_backfill(0, 20_000, 20), None);
+        assert_eq!(long_backfill(0, 20_001, 20), Some(20_001));
+        assert_eq!(long_backfill(500, 100, 20), None);
     }
 
     #[test]
