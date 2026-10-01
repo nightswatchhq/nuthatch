@@ -10,7 +10,7 @@
 //! The binary stays single-file: DuckDB is statically bundled. Memory is capped so an analytical
 //! query can't blow the embedded-mode RAM budget.
 
-use crate::engine::{Died, Engine, Interrupt, Session};
+use crate::engine::{Collected, Died, Engine, Interrupt, Session};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 #[cfg(test)]
@@ -280,6 +280,9 @@ pub struct QueryGuard {
 #[derive(Debug, Default, Clone)]
 pub struct QueryOutput {
     pub rows: Vec<Value>,
+    /// The statement's columns in its projection order (#1609). Each row is a `serde_json::Map`,
+    /// which sorts its keys, so this is the only place that order survives.
+    pub columns: Vec<String>,
     pub truncated: bool,
     pub degraded_tables: std::collections::BTreeSet<String>,
     pub tip_unavailable: bool,
@@ -1265,7 +1268,11 @@ fn attempt(
             ..Default::default()
         }));
     };
-    let (mut rows, over_cap) = match outcome {
+    let Collected {
+        mut rows,
+        columns,
+        truncated: over_cap,
+    } = match outcome {
         Ok(v) => v,
         // #529: the watchdog's `interrupt()` cancels whatever DuckDB phase is currently running, not
         // just an in-flight execute - a query that gets no further than `conn.prepare` before the
@@ -1305,6 +1312,7 @@ fn attempt(
     };
     Ok(Attempt::Ok(QueryOutput {
         rows,
+        columns,
         truncated,
         degraded_tables,
         tip_unavailable: false,
@@ -3703,7 +3711,7 @@ impl FoldEvaluator {
     }
 
     pub(crate) fn rows(&self, sql: &str) -> Result<Vec<Value>> {
-        Ok(self.session.collect(sql, None)?.0)
+        Ok(self.session.collect(sql, None)?.rows)
     }
 }
 
@@ -6547,6 +6555,19 @@ template="pool"
             },
         )
         .expect("a reduced table must still answer")
+    }
+
+    /// #1609: the projection order reaches the caller, including on an answer with no rows.
+    #[test]
+    fn a_result_names_its_columns_in_the_querys_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = cold(dir.path(), "SELECT 1 AS z, 2 AS a, 3 AS m");
+        assert_eq!(out.columns, ["z", "a", "m"]);
+        assert_eq!(out.rows, vec![serde_json::json!({"z": 1, "a": 2, "m": 3})]);
+
+        let empty = cold(dir.path(), "SELECT 1 AS z, 2 AS a WHERE false");
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.columns, ["z", "a"]);
     }
 
     /// **Issue #435, the control.** A nest whose segments are all intact must report **no**

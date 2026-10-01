@@ -454,10 +454,17 @@ fn format_sql_result(raw: &str) -> String {
     if rows.is_empty() {
         out.push_str("(0 rows)\n");
     } else {
-        let cols: Vec<String> = rows[0]
-            .as_object()
-            .map(|o| o.keys().cloned().collect())
-            .unwrap_or_default();
+        // A node older than #1609 sends no `columns`; its rows' keys come back sorted.
+        let cols: Vec<String> = match v.get("columns").and_then(Value::as_array) {
+            Some(named) if !named.is_empty() => named
+                .iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect(),
+            _ => rows[0]
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default(),
+        };
         let mut w: Vec<usize> = cols.iter().map(String::len).collect();
         for r in &rows {
             if let Some(o) = r.as_object() {
@@ -782,6 +789,18 @@ mod tests {
         assert!(out.contains("sealed_through 93"));
         assert!(out.contains("registry 30ced74d"));
         assert!(out.len() < raw.len(), "compact must beat verbose JSON");
+    }
+
+    /// #1609: the table follows the response's `columns`, not the parsed rows' sorted keys.
+    #[test]
+    fn sql_result_table_keeps_the_querys_column_order() {
+        let raw =
+            r#"{"count":1,"truncated":false,"columns":["z","a","m"],"rows":[{"z":1,"a":2,"m":3}]}"#;
+        let out = format_sql_result(raw);
+        let header: Vec<&str> = out.lines().next().unwrap().split_whitespace().collect();
+        assert_eq!(header, ["z", "a", "m"], "{out}");
+        let row: Vec<&str> = out.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(row, ["1", "2", "3"], "{out}");
     }
 
     #[test]
