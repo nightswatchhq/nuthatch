@@ -103,7 +103,7 @@ impl BurrmillSession {
 /// The walls `analytics_budget` sets for DuckDB, as Burrmill's budget.
 fn budget(cfg: &crate::analytics_budget::AnalyticsConfig, spill: &Path) -> burrmill::Budget {
     burrmill::Budget {
-        memory_bytes: (cfg.memory_limit_mb as usize) << 20,
+        memory_bytes: (cfg.burrmill_limit_mb() as usize) << 20,
         threads: cfg.threads.max(1) as usize,
         spill: Some((
             spill.to_path_buf(),

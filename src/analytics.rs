@@ -39,6 +39,17 @@ pub(crate) fn engine() -> &'static dyn Engine {
 
 static PRIMARY: OnceLock<&'static dyn Engine> = OnceLock::new();
 
+/// How many sessions of each engine a SQL permit holds, `(DuckDB, Burrmill)`, for the memory split.
+pub(crate) fn resident_engines() -> (u64, u64) {
+    if PRIMARY.get().is_some() {
+        (0, 1)
+    } else if crate::engine_shadow::installed().is_some() {
+        (1, 1)
+    } else {
+        (1, 0)
+    }
+}
+
 /// The operator's switch between engines, read from this variable at startup.
 pub const ENV_ENGINE: &str = "NUTHATCH_ENGINE";
 
