@@ -1,0 +1,6 @@
+arb-mainnet.g.alchemy.com
+  getLogs window   up to 163840 blocks (recommend --window 320)
+  JSON-RPC batch   200+ (fine)
+  archive depth    yes - deep backfills and pinned eth_call work
+  · window measured RANGE-ONLY - capped at 320 because a range-only probe cannot see the result-count limit; your real window is very likely much larger. Re-probe with --address <contract> before backfilling to get a number that reflects both limits
+

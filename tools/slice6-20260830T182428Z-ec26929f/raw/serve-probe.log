@@ -1,0 +1,5 @@
+Error: no hot store to serve from at 'horizon-nest' - `serve` never creates or writes to the local redb, only reads it. Index the nest first with `nuthatch dev`, or point at a shared store with --hot-store
+
+Caused by:
+    0: failed to open an existing redb at horizon-nest/nuthatch.redb
+    1: I/O error: No such file or directory (os error 2)
