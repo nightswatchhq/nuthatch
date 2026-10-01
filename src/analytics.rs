@@ -6773,13 +6773,18 @@ template="pool"
     /// depend on - and the caveat therefore must not name - a segment-level cause.
     #[test]
     fn an_undefinable_view_degrades_with_every_segment_intact() {
+        crate::engine::each_engine(an_undefinable_view_degrades_with_every_segment_intact_on);
+    }
+
+    fn an_undefinable_view_degrades_with_every_segment_intact_on(
+        conn: &dyn crate::engine::Session,
+    ) {
         let dir = two_table_nest();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(r#"CREATE TABLE "t__transfer" (x INTEGER)"#)
+        conn.execute(r#"CREATE TABLE "t__transfer" AS SELECT CAST(1 AS INTEGER) AS x"#)
             .unwrap();
 
         let degraded = define_views(
-            &conn,
+            conn,
             dir.path(),
             &HotRows::new(),
             u64::MAX,
