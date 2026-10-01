@@ -116,6 +116,10 @@ async fn main() -> Result<()> {
                 nuthatch::analytics::EngineChoice::Burrmill => {
                     tracing::warn!("Burrmill serves every statement; DuckDB is not consulted")
                 }
+                nuthatch::analytics::EngineChoice::Checked => tracing::warn!(
+                    "Burrmill serves every statement; DuckDB also runs each one, and differences \
+                     go to the `shadow` log target"
+                ),
             }
             let dir = std::path::PathBuf::from(&args.dir);
             if dir.join(nuthatch::runtime::MOUNTS_FILE).exists()

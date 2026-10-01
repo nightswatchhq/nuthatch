@@ -255,6 +255,7 @@ pub(crate) struct ShadowEngine {
     tally: Arc<Tally>,
     /// How much of a guard's budget the primary may use before the shadow is skipped.
     budget_share: f64,
+    reversed: bool,
 }
 
 impl ShadowEngine {
@@ -265,7 +266,15 @@ impl ShadowEngine {
             sink,
             tally: Arc::default(),
             budget_share: 0.5,
+            reversed: false,
         }
+    }
+
+    /// The primary, still the one served, is the engine under test and the secondary the one it is
+    /// held against. Records keep their meaning: `primary` is the reference in either mode.
+    pub(crate) fn reversed(mut self) -> Self {
+        self.reversed = true;
+        self
     }
 
     /// Also append the running counts to `path`, the file the differences go to.
@@ -305,6 +314,7 @@ impl Engine for ShadowEngine {
             sink: self.sink.clone(),
             tally: self.tally.clone(),
             budget_share: self.budget_share,
+            reversed: self.reversed,
             deadline: std::sync::Mutex::new(None),
         }))
     }
@@ -335,11 +345,21 @@ pub(crate) struct ShadowSession {
     sink: Sink,
     tally: Arc<Tally>,
     budget_share: f64,
+    reversed: bool,
     /// The guard's deadline for the statement in flight, when the caller told us one.
     deadline: std::sync::Mutex<Option<Instant>>,
 }
 
 impl ShadowSession {
+    /// `(reference, candidate)` of what the served engine and the other one gave.
+    fn roles<T>(&self, served: T, other: T) -> (T, T) {
+        if self.reversed {
+            (other, served)
+        } else {
+            (served, other)
+        }
+    }
+
     /// Forward a catalogue call to both; the secondary's refusal is recorded, never returned.
     fn both<T>(
         &self,
@@ -351,11 +371,12 @@ impl ShadowSession {
         if let Some(secondary) = &self.secondary {
             let shadow = f(&**secondary);
             if shadow.is_err() != primary.is_err() {
+                let (reference, candidate) = self.roles(&primary, &shadow);
                 (self.sink)(&Difference {
                     sql: what.to_string(),
                     kind: Kind::Catalogue,
-                    primary: describe(&primary),
-                    secondary: describe(&shadow),
+                    primary: describe(reference),
+                    secondary: describe(candidate),
                     primary_ms: 0,
                     secondary_ms: 0,
                     primary_rss_mb: 0,
@@ -460,35 +481,40 @@ impl Session for ShadowSession {
 
     fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
         let started = Instant::now();
-        let primary = self.primary.collect(sql, cap);
-        let primary_ms = started.elapsed();
-        let primary_rss_mb = rss_mb();
+        let served = self.primary.collect(sql, cap);
+        let served_ms = started.elapsed().as_millis();
+        let served_rss_mb = rss_mb();
         let Some(secondary) = &self.secondary else {
-            return primary;
+            return served;
         };
         let deadline = *self.deadline.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(deadline) = deadline {
             let budget = deadline.saturating_duration_since(started);
-            if primary_ms > budget.mul_f64(self.budget_share) {
+            if started.elapsed() > budget.mul_f64(self.budget_share) {
+                let not_run = "not run: the served engine used the budget".to_string();
+                let (primary, secondary) = self.roles(outcome(&served), not_run);
+                let (primary_ms, secondary_ms) = self.roles(served_ms, 0);
+                let (primary_rss_mb, secondary_rss_mb) = self.roles(served_rss_mb, 0);
                 (self.sink)(&Difference {
                     sql: sql.to_string(),
                     kind: Kind::Skipped,
-                    primary: outcome(&primary),
-                    secondary: "not run: the primary used the budget".into(),
-                    primary_ms: primary_ms.as_millis(),
-                    secondary_ms: 0,
+                    primary,
+                    secondary,
+                    primary_ms,
+                    secondary_ms,
                     primary_rss_mb,
-                    secondary_rss_mb: 0,
+                    secondary_rss_mb,
                 });
                 self.tally.note(Outcome::Skipped);
-                return primary;
+                return served;
             }
         }
         let shadow_started = Instant::now();
         let shadow = secondary.collect(sql, cap);
-        let secondary_ms = shadow_started.elapsed();
-        let secondary_rss_mb = rss_mb();
-        let kind = match (&primary, &shadow) {
+        let shadow_ms = shadow_started.elapsed().as_millis();
+        let shadow_rss_mb = rss_mb();
+        let (reference, candidate) = self.roles(&served, &shadow);
+        let kind = match (reference, candidate) {
             // A truncated answer is a prefix in the engine's own row order, and the two orders
             // need not agree; once both have truncated there is nothing sound left to compare.
             (Ok(a), Ok(b)) if a.truncated && b.truncated => None,
@@ -507,30 +533,32 @@ impl Session for ShadowSession {
             (Err(_), Ok(_)) => Some((Kind::Looser, String::new())),
             (Err(_), Err(_)) => None,
         };
-        self.tally.note(match (&kind, &primary, &shadow) {
+        self.tally.note(match (&kind, reference, candidate) {
             (Some(_), ..) => Outcome::Differed,
-            (None, Ok(_), Ok(_)) if truncated_answer(&primary) => Outcome::BothTruncated,
+            (None, Ok(_), Ok(_)) if truncated_answer(reference) => Outcome::BothTruncated,
             (None, Err(_), _) => Outcome::BothRefused,
             (None, ..) => Outcome::Agreed,
         });
         if let Some((kind, why)) = kind {
-            let secondary_text = outcome(&shadow);
+            let candidate_text = outcome(candidate);
+            let (primary_ms, secondary_ms) = self.roles(served_ms, shadow_ms);
+            let (primary_rss_mb, secondary_rss_mb) = self.roles(served_rss_mb, shadow_rss_mb);
             (self.sink)(&Difference {
                 sql: sql.to_string(),
                 kind,
-                primary: outcome(&primary),
+                primary: outcome(reference),
                 secondary: if why.is_empty() {
-                    secondary_text
+                    candidate_text
                 } else {
-                    format!("{secondary_text}; {why}")
+                    format!("{candidate_text}; {why}")
                 },
-                primary_ms: primary_ms.as_millis(),
-                secondary_ms: secondary_ms.as_millis(),
+                primary_ms,
+                secondary_ms,
                 primary_rss_mb,
                 secondary_rss_mb,
             });
         }
-        primary
+        served
     }
 
     fn for_each_row(&self, sql: &str, f: &mut dyn FnMut(&[Value]) -> Result<()>) -> Result<()> {
@@ -597,7 +625,8 @@ impl Session for ShadowSession {
                 if *s { " (surveys)" } else { "" }
             ),
         };
-        let kind = match (&primary, &shadow) {
+        let (reference, candidate) = self.roles(&primary, &shadow);
+        let kind = match (reference, candidate) {
             (None, _) | (_, None) => None,
             (Some(Ok((a, sa))), Some(Ok((b, sb)))) => {
                 if a == b && sa == sb {
@@ -616,8 +645,8 @@ impl Session for ShadowSession {
             (self.sink)(&Difference {
                 sql: sql.to_string(),
                 kind,
-                primary: show(&primary),
-                secondary: show(&shadow),
+                primary: show(reference),
+                secondary: show(candidate),
                 primary_ms: 0,
                 secondary_ms: 0,
                 primary_rss_mb: 0,
@@ -635,7 +664,8 @@ impl Session for ShadowSession {
             return primary;
         };
         let shadow = secondary.table_refs(sql);
-        let kind = match (&primary, &shadow) {
+        let (reference, candidate) = self.roles(&primary, &shadow);
+        let kind = match (reference, candidate) {
             (Some(_), None) => Some(Kind::ParserStricter),
             (a, b) if a == b => None,
             _ => Some(Kind::Catalogue),
@@ -648,8 +678,8 @@ impl Session for ShadowSession {
             (self.sink)(&Difference {
                 sql: sql.to_string(),
                 kind,
-                primary: show(&primary),
-                secondary: show(&shadow),
+                primary: show(reference),
+                secondary: show(candidate),
                 primary_ms: 0,
                 secondary_ms: 0,
                 primary_rss_mb: 0,
@@ -960,6 +990,31 @@ mod tests {
         assert_eq!(
             (engine.counts().statements, engine.counts().differed),
             (1, 1)
+        );
+    }
+
+    /// Reversed, the engine under test is served and the record still names the reference first:
+    /// the same planted fault reads the same in the log whichever engine answered the caller.
+    #[test]
+    fn reversed_serves_the_engine_under_test_and_records_as_before() {
+        let (sink, seen) = recording();
+        let engine =
+            ShadowEngine::new(Box::new(ShortEngine), Box::new(DuckEngine), sink).reversed();
+        let dir = tempfile::tempdir().unwrap();
+        let session = engine.open(dir.path()).unwrap();
+        session
+            .execute("CREATE TABLE t AS SELECT * FROM range(5) r(n)")
+            .unwrap();
+        let rows = session.collect("SELECT n FROM t", None).unwrap().rows;
+        assert_eq!(rows.len(), 4, "the engine under test is what is served");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, Kind::Rows);
+        assert_eq!(seen[0].primary, "5 rows");
+        assert!(
+            seen[0].secondary.starts_with("4 rows"),
+            "{}",
+            seen[0].secondary
         );
     }
 

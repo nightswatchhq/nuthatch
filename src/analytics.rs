@@ -42,12 +42,14 @@ static PRIMARY: OnceLock<&'static dyn Engine> = OnceLock::new();
 /// The operator's switch between engines, read from this variable at startup.
 pub const ENV_ENGINE: &str = "NUTHATCH_ENGINE";
 
-/// Which engine serves: DuckDB, Burrmill alone, or DuckDB with Burrmill beside it in shadow.
+/// Which engine serves: DuckDB, Burrmill alone, DuckDB with Burrmill beside it in shadow, or
+/// Burrmill with DuckDB checking behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineChoice {
     DuckDb,
     Burrmill,
     Shadow,
+    Checked,
 }
 
 /// [`ENV_ENGINE`]'s value as a choice. Unset, a build carrying Burrmill shadows as it always has;
@@ -63,7 +65,10 @@ fn choose(value: Option<&str>, built_with_burrmill: bool) -> Result<EngineChoice
         Some("duckdb") => EngineChoice::DuckDb,
         Some("burrmill") => EngineChoice::Burrmill,
         Some("shadow") => EngineChoice::Shadow,
-        Some(other) => bail!("{ENV_ENGINE}={other}: expected duckdb, burrmill or shadow"),
+        Some("checked") => EngineChoice::Checked,
+        Some(other) => {
+            bail!("{ENV_ENGINE}={other}: expected duckdb, burrmill, shadow or checked")
+        }
     };
     if choice != EngineChoice::DuckDb && !built_with_burrmill {
         bail!("{ENV_ENGINE} asks for {choice:?}, and this build has no Burrmill (feature `shadow-burrmill`)");
@@ -77,6 +82,8 @@ pub fn install_engine(choice: EngineChoice) -> Result<()> {
         EngineChoice::DuckDb => Ok(()),
         #[cfg(feature = "shadow-burrmill")]
         EngineChoice::Shadow => crate::engine_burrmill::enable_shadow(),
+        #[cfg(feature = "shadow-burrmill")]
+        EngineChoice::Checked => crate::engine_burrmill::enable_checked(),
         #[cfg(feature = "shadow-burrmill")]
         EngineChoice::Burrmill => {
             static BURRMILL: crate::engine_burrmill::BurrmillEngine =
@@ -4568,6 +4575,8 @@ template="pool"
         assert_eq!(choose(Some("duckdb"), false).unwrap(), DuckDb);
         assert!(choose(Some("burrmill"), false).is_err());
         assert!(choose(Some("shadow"), false).is_err());
+        assert_eq!(choose(Some("checked"), true).unwrap(), Checked);
+        assert!(choose(Some("checked"), false).is_err());
         assert!(choose(Some("burmill"), true).is_err());
     }
 
