@@ -18,8 +18,8 @@ published: there, and on other platforms, build from source with Rust 1.95.0 ([d
 `init` creates a **nest**: a directory holding the contract's ABI, its config and, once `dev` runs,
 its indexed data. `--backfill 300` starts 300 blocks behind the tip, about an hour of mainnet, so there
 are rows to query within seconds on the bundled public endpoints. Without it, `dev` backfills from the
-contract's deployment block: for USDC that is 20 million blocks, which the public endpoints will not
-serve in any useful time and which wants your own archive-capable RPC (`--rpc`).
+contract's deployment block: for USDC that is 20 million blocks, a long backfill on free public endpoints
+and a job for your own RPC (`--rpc`).
 
 | | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
 |---|---|---|---|---|---|

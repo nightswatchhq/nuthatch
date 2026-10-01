@@ -102,25 +102,19 @@ const MAINNET: Chain = Chain {
     chain_id: 1,
     rpc_urls: &[
         // **Ordered by measured backfill capability, best first** - see the module note above on why
-        // this list has an expiry date. Re-measured 2026-07-31 with a 10-block address-filtered
-        // `eth_getLogs` 5,000 blocks behind tip, which is the smallest request a real backfill makes.
-        // Re-measured 2026-08-23 with `nuthatch doctor --rpc … --address <usdc>` (#761), confirmed
-        // 2026-08-24 with a 10-block address-filtered getLogs 5,000 behind tip:
-        //   eth-pokt.nodies.app   archive YES, topic0-only YES
-        //   eth.drpc.org          archive YES, topic0-only YES (batch-of-5 500s; the timestamp
-        //                         fetcher already splits down to the cap)
-        // 2026-10-01 (#1607): eth.drpc.org no longer keeps history. Every getLogs below its pruning
-        // horizon is HTTP 400 "Unknown state. First available state is 1"; the tip still serves.
-        // eth-pokt.nodies.app keeps history but caps getLogs at 50 blocks.
-        // `eth.api.onfinality.io/public` dropped: the 23rd's doctor probe did not complete (empty
-        // hang). A spare that stalls the run is not failover. It answered the same probes on the
-        // 24th; it stays off the list until it survives a doctor run, not a one-shot getLogs.
-        // A batch cap *degrades* - the timestamp fetcher splits down to it.
-        "https://eth-pokt.nodies.app",
-        "https://eth.drpc.org",
-        // Removed 2026-08-23 (#761): `eth.api.onfinality.io/public` - doctor probe does not complete,
-        // and it was never archive. Removed 2026-07-31: `ethereum-rpc.publicnode.com` (archive token)
-        // and `eth.llamarpc.com` (HTTP 521).
+        // this list has an expiry date. Re-measured 2026-10-01 with `nuthatch doctor --rpc … --address
+        // <usdc>` across twenty keyless endpoints, then with getLogs at blocks 6.5M and 12M, which
+        // doctor's archive probe (state 1M behind tip) does not reach:
+        //   mainnet.gateway.tenderly.co   archive YES, getLogs 160 blocks, batch 20, topic0-only YES
+        //   rpc.mevblocker.io             archive YES, getLogs 80 blocks, batch 200, topic0-only YES
+        // USDC from deployment on this pair: 126,362 rows in 121 s, no retries. On the pair it
+        // replaces: 0 rows in 122 s (#1607).
+        "https://mainnet.gateway.tenderly.co",
+        "https://rpc.mevblocker.io",
+        // Removed 2026-10-01 (#1607): `eth.drpc.org` keeps no history (HTTP 400 "Unknown state" below
+        // its pruning horizon, while doctor still reports it archive) and `eth-pokt.nodies.app` caps
+        // getLogs at 50 blocks and throttles. Removed 2026-08-23 (#761): `eth.api.onfinality.io/public`.
+        // Removed 2026-07-31: `ethereum-rpc.publicnode.com` (archive token), `eth.llamarpc.com` (521).
     ],
     // ~2 epochs; real finality signals arrive with the ExEx mode. The `finalized` tag exists
     // post-merge but Depth keeps a single conservative policy until ExEx lands.
