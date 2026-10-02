@@ -2021,6 +2021,41 @@ async fn suspend_and_resume_over_the_admin_api() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// #1643: `?reclaim=true` on a suspended mount frees its dataset as it would a live one's, rather
+/// than dropping the record and answering 500 with the data still on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaiming_a_suspended_mount_frees_its_dataset() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6c".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &routes,
+        "DELETE",
+        "/_admin/nests/usdc?reclaim=true",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["reclaim"]["outcome"], "reclaimed", "{body}");
+    assert!(
+        !data_dir.exists(),
+        "reclaiming the suspended mount left its dataset"
+    );
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert!(file.runtime.suspended.is_empty() && file.mounts.is_empty());
+}
+
 /// #1547: an API-only operator can free a dataset's disk. Unmounting one of two mounts of a NID with
 /// `?reclaim=true` keeps the dataset and names who holds it; unmounting the last one removes it.
 /// A dataset unmounted earlier is reclaimed by NID, and a malformed NID is a caller error.
