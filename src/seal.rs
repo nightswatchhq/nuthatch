@@ -121,6 +121,10 @@ pub struct Segment {
     /// [`ORIGINAL_WRITER_PROFILE`]: every segment sealed before this field existed was that profile.
     #[serde(default = "default_writer_profile")]
     pub writer_profile: String,
+    /// Hash of the parquet this seal was given, before a fold rewrote the file (#1631). Those rows
+    /// stay hot until the watermark, and the file hash no longer names them. Absent reads as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
 }
 
 /// Rows a table needs before its segment at a cut is final rather than provisional (#1150).
@@ -254,8 +258,12 @@ pub fn seal_range_with_snapshot(
         // Content-addressed idempotency: an identical segment (same table + hash) is already
         // catalogued, so re-sealing the same rows - e.g. re-running `nuthatch screen` over a range to
         // re-audit - is a no-op rather than a double-listed (double-counted) segment. Checked on the
-        // incoming rows alone, before any fold, so the rule is the same one it always was.
-        if segments.iter().any(|s| s.hash == hash) {
+        // incoming rows alone, before any fold. A fold's file hash is the folded bytes, so the
+        // incoming hash is kept beside it (#1631).
+        let input_hash = hash.clone();
+        if segments.iter().any(|s| {
+            s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str())
+        }) {
             continue;
         }
         let new_rows = rows.len();
@@ -322,6 +330,7 @@ pub fn seal_range_with_snapshot(
             registry_snapshot: registry_snapshot.map(str::to_string),
             provisional,
             writer_profile: WRITER_PROFILE.to_string(),
+            input_hash: Some(input_hash),
         });
     }
 

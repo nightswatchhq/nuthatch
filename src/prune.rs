@@ -562,6 +562,7 @@ mod tests {
             registry_snapshot: None,
             provisional: false,
             writer_profile: crate::seal::ORIGINAL_WRITER_PROFILE.to_string(),
+            input_hash: None,
         };
         for (nid_, hashes) in [
             (&keep, vec![shared_hash.clone()]),
@@ -640,6 +641,7 @@ mod tests {
             registry_snapshot: None,
             provisional: false,
             writer_profile: crate::seal::ORIGINAL_WRITER_PROFILE.to_string(),
+            input_hash: None,
         };
         for (nid_, hashes) in [
             (&keep, vec![shared.clone()]),
