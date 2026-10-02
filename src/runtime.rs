@@ -357,6 +357,21 @@ pub fn check_mount_name(name: &str, default_tenant: &str) -> Result<()> {
             "'{name}' names the default tenant; mount it as '{alias}'"
         ));
     }
+    // Boot refuses these. Accepting one here persists it, and the next start stays down (#1640).
+    if let Err(e) = refuse_reserved_mount(tenant, alias) {
+        return refuse(format!("{e:#}"));
+    }
+    Ok(())
+}
+
+/// `health` and `nests` are routes of the runtime itself. A mount of either name collides.
+fn refuse_reserved_mount(tenant: Option<&str>, alias: &str) -> Result<()> {
+    if alias == "nests" || alias == "health" {
+        bail!("nest name '{alias}' is reserved (collides with a runtime route)");
+    }
+    if let Some(tenant) = tenant.filter(|part| *part == "nests" || *part == "health") {
+        bail!("tenant '{tenant}' is reserved (collides with a runtime route)");
+    }
     Ok(())
 }
 
@@ -574,20 +589,8 @@ impl MountTable {
         for m in mounts.mount_refs() {
             safe_segment(&m.alias, "nest name")?;
             safe_segment(&m.tenant, "tenant")?;
-            if m.alias == "nests" || m.alias == "health" {
-                bail!(
-                    "nest name '{}' is reserved (collides with a runtime route)",
-                    m.alias
-                );
-            }
-            // In a multi-tenant runtime the tenant is the *first* path segment, so it collides with
-            // the same two routes an alias would.
-            if m.tenant == "nests" || m.tenant == "health" {
-                bail!(
-                    "tenant '{}' is reserved (collides with a runtime route)",
-                    m.tenant
-                );
-            }
+            // In a multi-tenant runtime the tenant is the first path segment, so it collides too.
+            refuse_reserved_mount(Some(&m.tenant), &m.alias)?;
             if !seen.insert((m.tenant.clone(), m.alias.clone())) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
@@ -3546,6 +3549,9 @@ impl RuntimeHandles {
             ))
             .into());
         }
+        if let Err(e) = refuse_reserved_mount(tenant, alias) {
+            return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
+        }
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the
         // caller does not know it, e.g. remounting a nest this runtime has already seen.
@@ -5981,6 +5987,34 @@ mod tests {
         drop(tx);
         assert!(moved.is_err());
         assert_eq!(seen.await.unwrap(), ["usdc->other"]);
+    }
+
+    /// #1640: boot refuses these, and a live mount of one takes the runtime down at the next start.
+    #[test]
+    fn a_mount_named_health_or_nests_is_refused() {
+        for name in [
+            "health",
+            "nests",
+            "health/usdc",
+            "nests/usdc",
+            "acme/health",
+            "acme/nests",
+        ] {
+            let err = check_mount_name(name, DEFAULT_TENANT)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{name}: {err}");
+        }
+        check_mount_name("usdc", DEFAULT_TENANT).unwrap();
+        check_mount_name("acme/usdc", DEFAULT_TENANT).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let handles = idle_handles(dir.path());
+        for name in ["health", "nests", "acme/health", "health/usdc"] {
+            let err = handles.plan_mount(name, None).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "plan_mount {name}: {err}");
+        }
+        assert!(handles.plan_mount("usdc", None).is_ok());
     }
 
     fn idle_handles(dir: &std::path::Path) -> RuntimeHandles {
