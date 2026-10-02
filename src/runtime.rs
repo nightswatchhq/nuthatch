@@ -5699,6 +5699,138 @@ mod tests {
         );
     }
 
+    /// Boot sums every nest on the chain. A live mount that only prices its own entities is
+    /// admitted, and the next restart is what refuses the cursor.
+    #[test]
+    fn a_live_mount_past_the_entity_ceiling_is_refused() {
+        fn write_entities(dir: &std::path::Path, n: usize) {
+            std::fs::create_dir_all(dir).unwrap();
+            let mut body = String::new();
+            for i in 0..n {
+                body.push_str(&format!(
+                    "[[entities]]\nname = \"e{i}\"\nsql = \"entities/e{i}.sql\"\n\
+                     key = [\"id\"]\nmax_rows = 1\n\n"
+                ));
+            }
+            std::fs::write(dir.join("entities.toml"), body).unwrap();
+        }
+        fn nest_config(chain: &str) -> Config {
+            toml::from_str(&format!(
+                "[nest]\nname = \"n\"\nchain = \"{chain}\"\nchain_id = 1\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"t\"\naddress = \"0x1\"\nabi = \"a.json\"\n"
+            ))
+            .unwrap()
+        }
+        fn nest_state(dir: &std::path::Path, chain: &str) -> crate::serve::AppState {
+            crate::serve::AppState {
+                store: Arc::new(crate::store::Store::open(&dir.join("hot.redb")).unwrap()),
+                address: None,
+                chain: chain.to_string(),
+                dir: dir.to_path_buf(),
+                balances: crate::views::BalanceView::start().unwrap(),
+                exposure: crate::exposure::ExposureView::start(true).unwrap(),
+                velocity: crate::velocity::VelocityView::start(true).unwrap(),
+                entities: Arc::new(Vec::new()),
+                #[cfg(feature = "folds")]
+                folds: None,
+                threshold: None,
+                velocity_threshold: None,
+                admin_enabled: false,
+                admin_token: None,
+                nest_info: Arc::new(serde_json::json!({})),
+                tables: Arc::new(vec![]),
+                sql_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+                sql_queued: Default::default(),
+                sql_max_hot_rows: crate::serve::SQL_MAX_HOT_ROWS,
+                sql_max_hot_bytes: crate::serve::SQL_MAX_HOT_BYTES,
+                sql_max_named_scan_bytes: crate::serve::SQL_MAX_NAMED_SCAN_BYTES,
+                cursorless: true,
+                seal_span: crate::chains::DEFAULT_SEAL_SPAN,
+                freshness: Default::default(),
+                surface: Arc::new(crate::allowlist::Surface::default()),
+                #[cfg(feature = "counter")]
+                counter: None,
+                nid: None,
+                runtime_health: None,
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let held = root.path().join("held");
+        let other = root.path().join("other");
+        let over = root.path().join("over");
+        let exact = root.path().join("exact");
+        // 26 on the cursor, plus an alias of that same dataset, plus 20 on another chain.
+        // 26 + 7 is over. 26 + 6 is the ceiling. The alias and the other chain must not count.
+        write_entities(&held, 26);
+        write_entities(&other, 20);
+        write_entities(&over, 7);
+        write_entities(&exact, 6);
+        let held_state = nest_state(&held, "ethereum");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sources = std::collections::HashMap::new();
+        let source: Arc<dyn Source> = Arc::new(crate::source::UnpolledSource);
+        sources.insert("ethereum".to_string(), source);
+        let mut lifecycle = std::collections::HashMap::new();
+        lifecycle.insert("ethereum".to_string(), tx);
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let roster = serde_json::json!({"runtime": "prod", "nests": []});
+        let handles = RuntimeHandles {
+            live: crate::serve::LiveRuntime::new(crate::serve::compose_runtime(
+                roster.clone(),
+                Vec::new(),
+                health.clone(),
+            )),
+            states: vec![
+                ("usdc".to_string(), held_state.clone()),
+                ("acme/usdc".to_string(), held_state),
+                ("other".to_string(), nest_state(&other, "optimism")),
+            ],
+            alert_workers: Vec::new(),
+            publishers: Vec::new(),
+            lifecycle,
+            health,
+            roster,
+            estimates: std::collections::HashMap::new(),
+            default_tenant: DEFAULT_TENANT.to_string(),
+            suspended: std::collections::BTreeMap::new(),
+            mount_ctx: MountContext {
+                dir: root.path().to_path_buf(),
+                mounts: Vec::new(),
+                sources,
+                endpoint_counts: std::collections::HashMap::new(),
+                backfill: None,
+                seal_direct: false,
+                concurrency: 1,
+                ipfs_window_deadline: std::time::Duration::from_secs(1),
+                window_override: None,
+                admin_enabled: true,
+                admin_token: None,
+                max_rss_mb: DEFAULT_MAX_RSS_MB,
+                freshness: Default::default(),
+                chain_freshness: std::collections::HashMap::new(),
+                dormant: std::collections::HashMap::new(),
+                fail_fast: false,
+                cursors: None,
+                registry: None,
+            },
+        };
+
+        let err = match handles.admit("new", &nest_config("ethereum"), &over) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("33 authored entities on one cursor is over the ceiling"),
+        };
+        assert!(err.contains("mounts 'prod'"), "{err}");
+        assert!(err.contains("cursor on ethereum"), "{err}");
+        assert!(err.contains("declares 33"), "{err}");
+        assert!(err.contains("across 2 nest(s)"), "{err}");
+        assert!(err.contains("over the ceiling of 32"), "{err}");
+
+        if let Err(e) = handles.admit("new", &nest_config("ethereum"), &exact) {
+            panic!("32 across the cursor is the ceiling, not past it: {e:#}");
+        }
+    }
+
     /// A `max_rows` large enough to overflow the multiplication must not wrap into a small
     /// projection and be admitted. Saturating is the safe direction: an absurd declaration projects
     /// as absurd and is refused, rather than as nothing and let in.
