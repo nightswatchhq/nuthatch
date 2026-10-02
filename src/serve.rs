@@ -2855,8 +2855,7 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
             // A hot miss scans sealed segments. Same admission and deadline as `/sql` (#1657).
             let admission = std::time::Instant::now();
             let busy = || {
-                crate::metrics::METRICS
-                    .inc_sql_rejected(crate::metrics::SqlRejection::Busy);
+                crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
