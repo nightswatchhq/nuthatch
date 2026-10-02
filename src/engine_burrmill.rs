@@ -592,4 +592,16 @@ mod tests {
         assert_ne!(a, s.canonical_plan("SELECT a.x FROM u a WHERE a.y > 1"));
         assert!(s.engine_version().starts_with("burrmill "));
     }
+
+    /// Burrmill #10: `__raw`, `__hot` and `__union` are not names a statement can reach.
+    #[test]
+    fn a_hidden_registration_name_is_refused() {
+        use crate::engine::Session;
+        let s = super::BurrmillSession::new().unwrap();
+        let err = s
+            .reach("SELECT max(block_number) FROM t__union")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("t__union"), "{err}");
+    }
 }
