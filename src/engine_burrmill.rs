@@ -418,6 +418,15 @@ impl Session for BurrmillSession {
         Ok(())
     }
 
+    fn staged_hot_len(&self, table: &str) -> usize {
+        self.hot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(table)
+            .map(|rows| rows.len())
+            .unwrap_or(0)
+    }
+
     fn drop_relation(&self, name: &str) -> Result<()> {
         self.hot
             .lock()

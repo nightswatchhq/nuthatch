@@ -2538,6 +2538,10 @@ fn define_views_bound(
         } else {
             Vec::new()
         };
+        // Stage an empty tip too. A narrower window must not keep the rows the last one loaded.
+        if !relation && hot_rows.is_empty() {
+            let _ = session.load_hot(table, &hot_rows);
+        }
         let hot_loaded = (!hot_rows.is_empty() || !declared_relation.is_empty())
             && match if relation {
                 session.load_relation(table, &declared_relation, &hot_rows)
@@ -3957,16 +3961,8 @@ mod tests {
                 .unwrap()
                 .as_u64()
                 .unwrap();
-            // Where each engine keeps the hot rows it was handed.
-            let hot = match conn.engine_version().starts_with("burrmill") {
-                true => "t__hot",
-                false => "__hot_t",
-            };
-            let hot_loaded = conn
-                .one_value(&format!("SELECT count(*) FROM \"{hot}\""))
-                .ok()
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            // `__hot` is not a name a statement can read. The staged rows are what was loaded.
+            let hot_loaded = conn.staged_hot_len("t") as u64;
             (n, defined.tables["t"].segments, hot_loaded)
         };
         assert_eq!(
