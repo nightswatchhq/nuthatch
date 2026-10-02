@@ -287,6 +287,39 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_whose_write_fails_does_not_block_the_retry() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(JOBS_FILE), b"[]").unwrap();
+        let jobs = MountJobs::load(d.path());
+        let mut perms = std::fs::metadata(d.path()).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(d.path(), perms).unwrap();
+        struct Unlock<'a>(&'a Path);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                let mut perms = std::fs::metadata(self.0).unwrap().permissions();
+                perms.set_readonly(false);
+                std::fs::set_permissions(self.0, perms).unwrap();
+            }
+        }
+        let unlock = Unlock(d.path());
+
+        let err = jobs
+            .claim(MountJob::new("a", None, MountPhase::Accepted))
+            .expect_err("a claim that cannot be written is not a started job");
+        assert!(
+            matches!(err, ClaimError::Persist(_)),
+            "the failure is the write, not a running job"
+        );
+        drop(unlock);
+        assert!(
+            jobs.claim(MountJob::new("a", None, MountPhase::Accepted))
+                .is_ok(),
+            "the failed claim must not still be running"
+        );
+    }
+
+    #[test]
     fn only_one_of_several_identical_claims_wins() {
         let d = tempfile::tempdir().unwrap();
         let jobs = MountJobs::load(d.path());
