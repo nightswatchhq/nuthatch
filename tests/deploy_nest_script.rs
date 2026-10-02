@@ -38,7 +38,7 @@ bin=$(cat "$FAKE_STATE/running")
 # A restart that came back on the old process, as a no-op roll does.
 [ -f "$FAKE_STATE/stale" ] && bin=$(dirname "$bin")/nuthatch-4.1.0
 v=$("$bin" --version | awk '{print $2}')
-printf '{"version":"%s","ready":true,"last_block":42}' "$v"
+if [ -f "$FAKE_STATE/serve-only" ]; then printf '{"version":"%s","ready":true}' "$v"; else printf '{"version":"%s","ready":true,"last_block":42}' "$v"; fi
 "#;
 
 fn fake_binary(dir: &Path, version: &str) -> PathBuf {
@@ -146,6 +146,17 @@ fn a_roll_edits_the_drop_in_that_overrides_the_unit_file() {
         std::fs::read_to_string(b.units.join("dips.service.d/rpc-graphops.conf")).unwrap();
     assert!(drop_in.contains("nuthatch-4.1.1 dev"), "{drop_in}");
     assert!(out.contains("via rpc-graphops.conf"), "{out}");
+}
+
+/// The read-only legacy unit runs `serve`, whose /ready has no last_block. Reading a field that is
+/// absent must not end the script under `set -e` and `pipefail`.
+#[test]
+fn a_serve_only_unit_with_no_last_block_still_rolls() {
+    let b = a_box(false);
+    std::fs::write(b.state.join("serve-only"), "").unwrap();
+    let (ok, out) = roll(&b);
+    assert!(ok, "the roll died on a /ready with no last_block:\n{out}");
+    assert!(running(&b).ends_with("nuthatch-4.1.1"), "{out}");
 }
 
 #[test]
