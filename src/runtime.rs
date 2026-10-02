@@ -357,6 +357,21 @@ pub fn check_mount_name(name: &str, default_tenant: &str) -> Result<()> {
             "'{name}' names the default tenant; mount it as '{alias}'"
         ));
     }
+    // Boot refuses these. Accepting one here persists it, and the next start stays down (#1640).
+    if let Err(e) = refuse_reserved_mount(tenant, alias) {
+        return refuse(format!("{e:#}"));
+    }
+    Ok(())
+}
+
+/// `health` and `nests` are routes of the runtime itself. A mount of either name collides.
+fn refuse_reserved_mount(tenant: Option<&str>, alias: &str) -> Result<()> {
+    if alias == "nests" || alias == "health" {
+        bail!("nest name '{alias}' is reserved (collides with a runtime route)");
+    }
+    if let Some(tenant) = tenant.filter(|part| *part == "nests" || *part == "health") {
+        bail!("tenant '{tenant}' is reserved (collides with a runtime route)");
+    }
     Ok(())
 }
 
@@ -574,20 +589,8 @@ impl MountTable {
         for m in mounts.mount_refs() {
             safe_segment(&m.alias, "nest name")?;
             safe_segment(&m.tenant, "tenant")?;
-            if m.alias == "nests" || m.alias == "health" {
-                bail!(
-                    "nest name '{}' is reserved (collides with a runtime route)",
-                    m.alias
-                );
-            }
-            // In a multi-tenant runtime the tenant is the *first* path segment, so it collides with
-            // the same two routes an alias would.
-            if m.tenant == "nests" || m.tenant == "health" {
-                bail!(
-                    "tenant '{}' is reserved (collides with a runtime route)",
-                    m.tenant
-                );
-            }
+            // In a multi-tenant runtime the tenant is the first path segment, so it collides too.
+            refuse_reserved_mount(Some(&m.tenant), &m.alias)?;
             if !seen.insert((m.tenant.clone(), m.alias.clone())) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
@@ -2412,7 +2415,7 @@ pub fn lifecycle_routes(
                 return (StatusCode::CONFLICT, Json(serde_json::json!(running)))
             }
         };
-        spawn_mount_job(handles, jobs, body.name, nid);
+        spawn_mount_job(handles, jobs, body.name, nid, job.generation);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
 
@@ -2699,7 +2702,7 @@ pub fn lifecycle_routes(
                 return (StatusCode::ACCEPTED, Json(serde_json::json!(running)))
             }
         };
-        spawn_mount_job(handles, jobs, name, Some(nid));
+        spawn_mount_job(handles, jobs, name, Some(nid), job.generation);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
 
@@ -3165,13 +3168,29 @@ pub async fn start_mount_jobs(
                     spawn_move_job(handles.clone(), jobs.clone(), job.name, nid);
                 }
                 (_, nid) => {
-                    spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid);
+                    let generation = job.generation;
+                    spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid, generation);
                 }
             }
         }
     }
     Ok(jobs)
 }
+
+#[cfg(test)]
+type MountJoinFn = std::sync::Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type MountJoinHook = std::sync::Mutex<Option<MountJoinFn>>;
+
+/// The gap between a job's fetch and its join. A test forgets the job here (#1638).
+#[cfg(test)]
+fn before_mount_join() -> &'static MountJoinHook {
+    static HOOK: std::sync::OnceLock<MountJoinHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+static MOUNT_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Run a mount as a job (#1544). The fetch happens with no lock held, so a slow registry holds up no
 /// other admin call; only the join takes the runtime's lock.
@@ -3180,6 +3199,7 @@ pub fn spawn_mount_job(
     jobs: Arc<crate::mount_jobs::MountJobs>,
     name: String,
     nid: Option<Nid>,
+    generation: u64,
 ) -> tokio::task::JoinHandle<()> {
     use crate::mount_jobs::MountPhase;
     let wanted = nid.as_ref().map(|n| n.as_str().to_string());
@@ -3188,14 +3208,25 @@ pub fn spawn_mount_job(
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
             let fetched = match (&plan.fetch_from, &plan.nid) {
                 (Some(registry), Some(n)) => {
-                    jobs.advance(&name, MountPhase::Fetching, None)?;
+                    jobs.advance_if_owned(&name, generation, MountPhase::Fetching, None)?;
                     fetch_nid(registry, n, &plan.dir, &name).await?;
                     true
                 }
                 _ => false,
             };
-            jobs.advance(&name, MountPhase::Joining, None)?;
+            jobs.advance_if_owned(&name, generation, MountPhase::Joining, None)?;
+            #[cfg(test)]
+            if let Some(hook) = before_mount_join().lock().unwrap().clone() {
+                hook();
+            }
+            // The unmount holds this lock across forget. A check before it still joins (#1638).
             let mut h = handles.lock().await;
+            if !jobs.owns(&name, generation) {
+                if fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                    let _ = std::fs::remove_dir_all(&plan.dir);
+                }
+                bail!("mount of '{name}' was unmounted before it joined");
+            }
             let mounted = h.mount(&name, nid).await;
             // Only a fetch no live mount has since taken up is ours to remove.
             if mounted.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
@@ -3212,7 +3243,7 @@ pub fn spawn_mount_job(
         };
         match outcome {
             Ok(()) => {
-                if let Err(e) = jobs.advance(&name, MountPhase::Live, None) {
+                if let Err(e) = jobs.advance_if_owned(&name, generation, MountPhase::Live, None) {
                     tracing::warn!("'{name}' is mounted but the job file was not updated: {e:#}");
                 }
             }
@@ -3222,14 +3253,21 @@ pub fn spawn_mount_job(
                     Some(MountRefusal::AlreadyMounted(_))
                 ) && reached(&*handles.lock().await) =>
             {
-                if let Err(e) = jobs.advance(&name, MountPhase::Live, None) {
+                if let Err(e) = jobs.advance_if_owned(&name, generation, MountPhase::Live, None) {
                     tracing::warn!("'{name}' is mounted but the job file was not updated: {e:#}");
                 }
             }
+            Err(e) if !jobs.owns(&name, generation) => {
+                tracing::info!("mount of '{name}' stopped before it joined: {e:#}");
+            }
             Err(e) => {
                 tracing::warn!("mounting '{name}' failed: {e:#}");
-                if let Err(write) = jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")))
-                {
+                if let Err(write) = jobs.advance_if_owned(
+                    &name,
+                    generation,
+                    MountPhase::Failed,
+                    Some(format!("{e:#}")),
+                ) {
                     tracing::warn!(
                         "mount of '{name}' failed and the job file was not updated: {write:#}"
                     );
@@ -3376,6 +3414,8 @@ impl RuntimeHandles {
     /// given an absolute string. [`Nid::parse`] is the only way to produce one, so nothing can call
     /// this function with a raw string.
     pub async fn mount(&mut self, name: &str, nid: Option<Nid>) -> Result<()> {
+        #[cfg(test)]
+        MOUNT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let plan = self.plan_mount(name, nid.as_ref())?;
         // A NID this runtime does not hold is fetched first (#1543). Whatever refuses the mount after
         // that removes the fetch again, so a refusal still leaves nothing behind.
@@ -3548,6 +3588,9 @@ impl RuntimeHandles {
                 "'{name}' names the default tenant; mount it as '{alias}'"
             ))
             .into());
+        }
+        if let Err(e) = refuse_reserved_mount(tenant, alias) {
+            return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
         }
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the
@@ -6071,5 +6114,157 @@ mod tests {
         drop(tx);
         assert!(moved.is_err());
         assert_eq!(seen.await.unwrap(), ["usdc->other"]);
+    }
+
+    /// #1640: boot refuses these, and a live mount of one takes the runtime down at the next start.
+    #[test]
+    fn a_mount_named_health_or_nests_is_refused() {
+        for name in [
+            "health",
+            "nests",
+            "health/usdc",
+            "nests/usdc",
+            "acme/health",
+            "acme/nests",
+        ] {
+            let err = check_mount_name(name, DEFAULT_TENANT)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{name}: {err}");
+        }
+        check_mount_name("usdc", DEFAULT_TENANT).unwrap();
+        check_mount_name("acme/usdc", DEFAULT_TENANT).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let handles = idle_handles(dir.path());
+        for name in ["health", "nests", "acme/health", "health/usdc"] {
+            let err = handles.plan_mount(name, None).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "plan_mount {name}: {err}");
+        }
+        assert!(handles.plan_mount("usdc", None).is_ok());
+    }
+
+    fn idle_handles(dir: &std::path::Path) -> RuntimeHandles {
+        let health = std::sync::Arc::new(crate::health::RuntimeHealth::new());
+        let roster = serde_json::json!({"runtime": "t", "nests": []});
+        let live = crate::serve::LiveRuntime::new(crate::serve::compose_runtime(
+            roster.clone(),
+            Vec::new(),
+            health.clone(),
+        ));
+        RuntimeHandles {
+            live,
+            states: Vec::new(),
+            alert_workers: Vec::new(),
+            publishers: Vec::new(),
+            lifecycle: std::collections::HashMap::new(),
+            health,
+            roster,
+            estimates: std::collections::HashMap::new(),
+            default_tenant: DEFAULT_TENANT.to_string(),
+            suspended: std::collections::BTreeMap::new(),
+            mount_ctx: MountContext {
+                dir: dir.to_path_buf(),
+                mounts: Vec::new(),
+                sources: std::collections::HashMap::new(),
+                endpoint_counts: std::collections::HashMap::new(),
+                backfill: None,
+                seal_direct: false,
+                concurrency: 1,
+                ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+                window_override: None,
+                admin_enabled: true,
+                admin_token: None,
+                max_rss_mb: DEFAULT_MAX_RSS_MB,
+                freshness: Default::default(),
+                chain_freshness: std::collections::HashMap::new(),
+                dormant: std::collections::HashMap::new(),
+                fail_fast: false,
+                cursors: None,
+                registry: None,
+            },
+        }
+    }
+
+    /// #1638: forgetting the job in the gap before the join must stop the mount.
+    #[tokio::test]
+    async fn an_unmount_of_an_accepted_job_is_not_overtaken_by_it() {
+        use crate::mount_jobs::{MountJob, MountPhase};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n",
+        )
+        .unwrap();
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
+        let claimed = jobs
+            .claim(MountJob::new("usdc", None, MountPhase::Accepted))
+            .unwrap();
+        super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
+        let jobs_hook = jobs.clone();
+        *super::before_mount_join().lock().unwrap() = Some(Arc::new(move || {
+            jobs_hook.forget("usdc");
+            jobs_hook
+                .claim(MountJob::new("usdc", None, MountPhase::Accepted))
+                .expect("the name is free once the first job is forgotten");
+        }));
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                *super::before_mount_join().lock().unwrap() = None;
+            }
+        }
+        let _clear = Clear;
+        let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
+        spawn_mount_job(
+            handles,
+            jobs.clone(),
+            "usdc".into(),
+            None,
+            claimed.generation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            super::MOUNT_ENTRIES.load(Ordering::SeqCst),
+            0,
+            "the forgotten job must not mount"
+        );
+        let again = jobs.get("usdc").expect("the replacement claim stays");
+        assert_eq!(again.phase, MountPhase::Accepted);
+
+        // The generation is the one claim returned. A worker that reads the map adopts this
+        // replacement and mounts it.
+        *super::before_mount_join().lock().unwrap() = None;
+        let claimed = jobs
+            .claim(MountJob::new("dai", None, MountPhase::Accepted))
+            .unwrap();
+        jobs.forget("dai");
+        let replacement = jobs
+            .claim(MountJob::new("dai", None, MountPhase::Accepted))
+            .expect("the name is free once the first job is forgotten");
+        super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
+        let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
+        spawn_mount_job(
+            handles,
+            jobs.clone(),
+            "dai".into(),
+            None,
+            claimed.generation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            super::MOUNT_ENTRIES.load(Ordering::SeqCst),
+            0,
+            "the replaced claim must not mount"
+        );
+        let again = jobs.get("dai").expect("the replacement claim stays");
+        assert_eq!(again.phase, MountPhase::Accepted);
+        assert_eq!(again.generation, replacement.generation);
     }
 }
