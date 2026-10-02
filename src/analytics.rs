@@ -4728,10 +4728,7 @@ template="pool"
         for terms in [65usize, 1000] {
             let err = query(dir.path(), &plus_chain(terms)).unwrap_err();
             let msg = format!("{err:#}");
-            assert!(
-                msg.contains("deeper than 64"),
-                "{terms} terms: {msg}"
-            );
+            assert!(msg.contains("deeper than 64"), "{terms} terms: {msg}");
             assert_eq!(
                 session_opens_for(dir.path()),
                 opened,
@@ -4786,10 +4783,7 @@ template="pool"
             msg.contains("cancelled"),
             "a statement that started after shutdown was not cancelled: {msg}"
         );
-        assert!(
-            took < Duration::from_secs(2),
-            "shutdown waited {took:?}"
-        );
+        assert!(took < Duration::from_secs(2), "shutdown waited {took:?}");
     }
 
     /// SIGTERM waited 5.63 s behind a `/sql` still executing: the server drains in-flight requests, and
