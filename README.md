@@ -84,14 +84,16 @@ published**; the installer says so and points at the source build below.
 **The Linux binary is dynamically linked and needs one thing**, measured off the published
 artifact with `objdump -T` rather than inferred:
 
-- **glibc 2.34 or newer** - the measured ABI floor. The release is *built* on glibc 2.35, but the
-  binary references no symbol newer than `GLIBC_2.34`: **2.34 is what you need to run it, 2.35 is what
-  we compile it on** ([#978](https://github.com/nightswatchhq/nuthatch/issues/978)).
+- **glibc 2.35 or newer** - the measured ABI floor, and also what the release is *built* on. Up to
+  4.0.2 the binary referenced no symbol newer than `GLIBC_2.34`, so 2.34 was what you needed to run
+  it and 2.35 only what we compiled it on ([#978](https://github.com/nightswatchhq/nuthatch/issues/978));
+  4.1.0 references `hypot` at `GLIBC_2.35`, where libm re-versioned it, so the two numbers now agree.
 
 It links `libc`, `libm` and `libgcc` and no C++ runtime. Releases before 4.1 embedded DuckDB and
 also needed libstdc++ from GCC 11.
 
-Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear it.
+Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34 and ran 4.0.x; for
+4.1.0 they need the source build.
 
 **Verify who built it.** Every release binary carries a build provenance attestation, which a
 checksum cannot give you:
