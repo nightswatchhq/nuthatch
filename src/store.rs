@@ -900,8 +900,10 @@ impl Store {
                 b.insert(key.as_str(), packed.as_str())?;
             }
             let mut m = wtx.open_table(META)?;
-            // A checkpoint below the sealed watermark is never walked: a reorg there is a terminal
-            // fault. A graph build keeps them, because a pinned read resolves through them (#1636).
+            // A reorg walk stops at the newest checkpoint at or below the sealed watermark; nothing
+            // below that one is walked. Keyed off the newest rather than the watermark itself, since
+            // the pin at the watermark can fail (#1665). A graph build keeps them all for pinned
+            // reads (#1636).
             if !INDEX_CHECKPOINT_HASHES {
                 let sealed: u64 = m
                     .get("sealed_through")?
@@ -909,7 +911,13 @@ impl Store {
                     .unwrap_or(0);
                 if sealed > 0 {
                     let mut b = wtx.open_table(BLOCKS)?;
-                    let below = Self::block_key(sealed);
+                    let at_or_below = Self::block_key(sealed);
+                    let floor = b
+                        .range(..=at_or_below.as_str())?
+                        .next_back()
+                        .transpose()?
+                        .map(|(k, _)| k.value().to_string());
+                    let below = floor.unwrap_or_default();
                     let doomed: Vec<String> = b
                         .range(..below.as_str())?
                         .take(CHECKPOINTS_PRUNED_PER_COMMIT)
@@ -2443,6 +2451,31 @@ mod tests {
         assert_eq!(store.get_block_hash(6).unwrap().as_deref(), Some("0x06"));
     }
 
+    /// #1665: the pin at the watermark can fail, leaving no checkpoint there. The newest one below
+    /// it is then where a reorg walk stops, so the prune keeps that one rather than nothing.
+    #[test]
+    fn a_failed_watermark_pin_keeps_the_newest_checkpoint_below_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        for b in (1..=10u64).filter(|&b| b != 6) {
+            store
+                .commit_window(&[], Some((b, &format!("0x{b:02x}"))), b)
+                .unwrap();
+        }
+        store.set_meta("sealed_through", "6").unwrap();
+        store.commit_window(&[], Some((11, "0x0b")), 11).unwrap();
+        let kept: Vec<u64> = store
+            .checkpoints_desc()
+            .unwrap()
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        if cfg!(feature = "graph") {
+            assert_eq!(kept, vec![11, 10, 9, 8, 7, 5, 4, 3, 2, 1]);
+        } else {
+            assert_eq!(kept, vec![11, 10, 9, 8, 7, 5]);
+        }
+    }
     /// The rollback scans start above the fork point, and still remove everything above it.
     #[test]
     fn a_rollback_removes_only_what_lies_above_the_fork() {
