@@ -139,15 +139,23 @@ impl MountJobs {
     /// Record `job` unless one is already running for its name, which is returned instead. One step
     /// under the lock, so of several identical requests exactly one starts a worker.
     ///
-    /// A failed write leaves the job in memory and returns [`ClaimError::Persist`]. The caller
-    /// must not report a claim that a restart will not resume.
+    /// A failed write rolls the claim back. No worker was started, so a retry must be able to take
+    /// the name. A finished job this claim replaced is put back.
     pub fn claim(&self, job: MountJob) -> std::result::Result<MountJob, ClaimError> {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(running) = jobs.get(&job.name).filter(|j| !j.phase.finished()) {
             return Err(ClaimError::Running(running.clone()));
         }
-        jobs.insert(job.name.clone(), job.clone());
+        let previous = jobs.insert(job.name.clone(), job.clone());
         if let Err(e) = self.persist(&jobs) {
+            match previous {
+                Some(old) => {
+                    jobs.insert(job.name.clone(), old);
+                }
+                None => {
+                    jobs.remove(&job.name);
+                }
+            }
             return Err(ClaimError::Persist(e));
         }
         Ok(job)
@@ -190,7 +198,7 @@ impl MountJobs {
 }
 
 /// Why [`MountJobs::claim`] did not start a job. A running job is the caller's conflict. A failed
-/// write is a different answer: the job is in memory, and the file does not have it.
+/// write leaves no claim: the name is free, or it still holds the finished job it had.
 #[derive(Debug)]
 pub enum ClaimError {
     Running(MountJob),
