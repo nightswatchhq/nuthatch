@@ -2056,6 +2056,53 @@ async fn reclaiming_a_suspended_mount_frees_its_dataset() {
     assert!(file.runtime.suspended.is_empty() && file.mounts.is_empty());
 }
 
+/// #1643, from review: a jobs write that fails after the unmount has removed the record still names
+/// the NID, so the caller can reclaim the dataset by `DELETE /_admin/datasets/<nid>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_jobs_write_after_a_reclaiming_unmount_names_the_nid() {
+    use std::os::unix::fs::PermissionsExt;
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6d".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs_dir = tempfile::tempdir().unwrap();
+    let jobs = Arc::new(nuthatch::mount_jobs::MountJobs::load(jobs_dir.path()));
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let mode = std::fs::metadata(jobs_dir.path())
+        .unwrap()
+        .permissions()
+        .mode();
+    std::fs::set_permissions(jobs_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (status, body) = call(
+        &routes,
+        "DELETE",
+        "/_admin/nests/usdc?reclaim=true",
+        None,
+        None,
+    )
+    .await;
+    std::fs::set_permissions(jobs_dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+    assert_eq!(
+        status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "{body}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        body["nid"].as_str(),
+        Some(nid.as_str()),
+        "the record is gone and the answer does not name the dataset: {body}"
+    );
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert!(
+        file.mounts.is_empty(),
+        "premise: the unmount happened before the jobs write"
+    );
+}
+
 /// #1547: an API-only operator can free a dataset's disk. Unmounting one of two mounts of a NID with
 /// `?reclaim=true` keeps the dataset and names who holds it; unmounting the last one removes it.
 /// A dataset unmounted earlier is reclaimed by NID, and a malformed NID is a caller error.
