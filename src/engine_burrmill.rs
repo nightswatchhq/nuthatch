@@ -131,6 +131,29 @@ fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
     anyhow!("{e}")
 }
 
+/// Rows of one batch turned into JSON before the byte cap is checked again (#1650).
+const ENCODE_ROWS: usize = 32;
+
+#[cfg(test)]
+thread_local! {
+    static ENCODED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_encoded_rows(rows: usize) {
+    ENCODED_ROWS.with(|c| c.set(c.get().max(rows)));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_encoded_rows() {
+    ENCODED_ROWS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn max_encoded_rows() -> usize {
+    ENCODED_ROWS.with(|c| c.get())
+}
+
 /// Refused before running, or died running: the split the integrity sweep depends on.
 fn died(e: burrmill::BurrmillError) -> Died {
     use burrmill::BurrmillError::*;
@@ -259,22 +282,36 @@ impl Session for BurrmillSession {
                     .map(|f| f.name().clone())
                     .collect();
             }
-            for row in burrmill::df::encode::rows(&batch)? {
-                if byte_cap.is_some() {
-                    bytes += row
-                        .as_object()
-                        .map(|o| {
-                            o.iter()
-                                .map(|(k, v)| k.len() + crate::engine::value_bytes(v))
-                                .sum::<usize>()
-                        })
-                        .unwrap_or(0);
-                }
-                out.push(row);
-                if hard.is_some_and(|h| out.len() >= h) || byte_cap.is_some_and(|max| bytes >= max)
-                {
-                    over = true;
-                    return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+            // A batch can still be wider than the 64 MiB cap, so the cap runs on a slice (#1650).
+            let encode = |part| {
+                let rows = burrmill::df::encode::rows(&part);
+                #[cfg(test)]
+                note_encoded_rows(part.num_rows());
+                rows
+            };
+            let mut start = 0;
+            while start < batch.num_rows() {
+                let n = (batch.num_rows() - start).min(ENCODE_ROWS);
+                let part = batch.slice(start, n);
+                start += n;
+                for row in encode(part)? {
+                    if byte_cap.is_some() {
+                        bytes += row
+                            .as_object()
+                            .map(|o| {
+                                o.iter()
+                                    .map(|(k, v)| k.len() + crate::engine::value_bytes(v))
+                                    .sum::<usize>()
+                            })
+                            .unwrap_or(0);
+                    }
+                    out.push(row);
+                    if hard.is_some_and(|h| out.len() >= h)
+                        || byte_cap.is_some_and(|max| bytes >= max)
+                    {
+                        over = true;
+                        return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                    }
                 }
             }
             Ok(())

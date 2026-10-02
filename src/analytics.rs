@@ -6297,6 +6297,19 @@ template="pool"
         );
     }
 
+    /// macOS reports bytes. Other targets report kilobytes.
+    fn resident_bytes() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        let rss = unsafe { usage.assume_init().ru_maxrss } as u64;
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
+            rss
+        } else {
+            rss.saturating_mul(1024)
+        }
+    }
+
     /// #1650: one DataFusion batch of 8,192 cells, 100 KB each, before the 64 MiB cap runs.
     /// Ignored because the point is the resident size, and the suite should not allocate it.
     #[test]
@@ -6313,18 +6326,88 @@ template="pool"
             guard,
         )
         .unwrap();
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        let rss = unsafe {
-            libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
-            usage.assume_init().ru_maxrss as u64
-        };
         eprintln!(
-            "probe rows={} truncated={} rss_bytes={rss}",
+            "probe rows={} truncated={} rss_bytes={}",
+            out.rows.len(),
+            out.truncated,
+            resident_bytes()
+        );
+        assert!(out.truncated, "the byte cap did not fire");
+        assert!(out.rows.len() < 8192, "the cap kept the whole batch");
+    }
+
+    /// #1650: the byte cap has to see a slice of the batch.
+    /// Encoding the whole batch is the allocation.
+    #[test]
+    fn a_wide_batch_is_encoded_in_slices() {
+        crate::engine_burrmill::reset_encoded_rows();
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(30),
+            max_rows: 50_000,
+        };
+        let out = query_guarded(
+            dir.path(),
+            "SELECT repeat('A', 8) AS x FROM range(200)",
+            guard,
+        )
+        .unwrap();
+        assert_eq!(out.rows.len(), 200);
+        assert!(!out.truncated);
+        assert_eq!(
+            crate::engine_burrmill::max_encoded_rows(),
+            32,
+            "the cap encoded a whole batch"
+        );
+    }
+
+    /// #1650: one statement of 8,192 wide cells stays inside the cursor. The resident size is the
+    /// process's, so the query runs in a child. On main that child peaks near 1.8 GB.
+    #[test]
+    fn a_wide_batch_stays_under_the_cursor() {
+        if std::env::var_os("NUTHATCH_WIDE_RSS").is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let child = std::process::Command::new(exe)
+                .args([
+                    "analytics::tests::a_wide_batch_stays_under_the_cursor",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("NUTHATCH_WIDE_RSS", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            eprint!("{stdout}{stderr}");
+            assert!(
+                child.status.success() && stderr.contains("wide rows="),
+                "wide batch child failed\n{stdout}{stderr}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(120),
+            max_rows: 50_000,
+        };
+        let out = query_guarded(
+            dir.path(),
+            "SELECT repeat('A', 100000) AS x FROM range(8192)",
+            guard,
+        )
+        .unwrap();
+        let rss = resident_bytes();
+        eprintln!(
+            "wide rows={} truncated={} rss_bytes={rss}",
             out.rows.len(),
             out.truncated
         );
         assert!(out.truncated, "the byte cap did not fire");
         assert!(out.rows.len() < 8192, "the cap kept the whole batch");
+        assert!(
+            rss < 512 * 1024 * 1024,
+            "one wide batch resident {rss} bytes"
+        );
     }
 
     /// **Issue #419.** A sealed segment that is present on disk but unreadable must *reduce* the
