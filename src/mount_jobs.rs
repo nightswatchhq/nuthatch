@@ -184,7 +184,10 @@ impl MountJobs {
         reason: Option<String>,
     ) {
         let mut jobs = self.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(name).filter(|job| job.generation == generation) {
+        if let Some(job) = jobs
+            .get_mut(name)
+            .filter(|job| job.generation == generation)
+        {
             job.phase = phase;
             job.reason = reason;
             job.since_unixtime = now_unix();

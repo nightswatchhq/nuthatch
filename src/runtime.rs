@@ -3190,7 +3190,12 @@ pub fn spawn_mount_job(
             // The unmount already forgot this claim. Joining now would bring the name back.
             if !jobs.owns(&name, generation) {
                 if fetched {
-                    let held = handles.lock().await.states.iter().any(|(_, s)| s.dir == plan.dir);
+                    let held = handles
+                        .lock()
+                        .await
+                        .states
+                        .iter()
+                        .any(|(_, s)| s.dir == plan.dir);
                     if !held {
                         let _ = std::fs::remove_dir_all(&plan.dir);
                     }
