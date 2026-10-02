@@ -3556,7 +3556,10 @@ async fn run_sql_query_at(
         };
         // Charged against the query's own deadline, so queuing can never extend the total time a
         // request occupies the node.
-        (Some(permit), SQL_TIMEOUT.saturating_sub(admission.elapsed()))
+        (
+            Some(permit),
+            SQL_TIMEOUT.saturating_sub(admission.elapsed()),
+        )
     };
     METRICS.inc_sql();
     let dir = s.dir.clone();

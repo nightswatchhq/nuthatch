@@ -1698,7 +1698,9 @@ fn derived_list_sql(
                     return Err(Unsupported::Argument("`where` must be an object".into()));
                 };
                 for (key, value) in filters {
-                    wheres.push(lower_predicate(schema, child, key, value, alias, 0, 0, caps)?);
+                    wheres.push(lower_predicate(
+                        schema, child, key, value, alias, 0, 0, caps,
+                    )?);
                 }
             }
             "first" | "skip" | "orderBy" | "orderDirection" => {}
@@ -1913,7 +1915,16 @@ fn lower_predicate(
         let parts: Result<Vec<String>, Unsupported> = inner
             .iter()
             .map(|(k, vv)| {
-                lower_predicate(schema, child, k, vv, &alias, depth + 1, pred_depth + 1, caps)
+                lower_predicate(
+                    schema,
+                    child,
+                    k,
+                    vv,
+                    &alias,
+                    depth + 1,
+                    pred_depth + 1,
+                    caps,
+                )
             })
             .collect();
         // Membership preserves parent row counts even with duplicate child IDs. Avoid correlated
@@ -3348,18 +3359,13 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
     /// A flat `or` never passes the 16 KiB check `/sql` applies to free-form text (#1658).
     #[test]
     fn a_wide_or_is_refused() {
-        let items: Vec<String> = (0..2_000)
-            .map(|i| format!(r#"{{ id: "{i}" }}"#))
-            .collect();
+        let items: Vec<String> = (0..2_000).map(|i| format!(r#"{{ id: "{i}" }}"#)).collect();
         let q = format!(
             "{{ pools(where: {{ or: [{}] }}) {{ id }} }}",
             items.join(", ")
         );
         let err = compile(&schema(), &one(&q)).unwrap_err();
-        assert!(
-            err.to_string().contains("16384"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("16384"), "{err}");
     }
 
     /// Nested `or` under the parser's ceiling is still the planner's stack (#1658).
@@ -3379,8 +3385,8 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
             )]));
         }
         let list = Value::List(vec![item]);
-        let err = lower_predicate(&schema, ent, "or", &list, "b", 0, 0, &Capabilities::CORE)
-            .unwrap_err();
+        let err =
+            lower_predicate(&schema, ent, "or", &list, "b", 0, 0, &Capabilities::CORE).unwrap_err();
         assert!(err.to_string().contains("64"), "{err}");
     }
 
