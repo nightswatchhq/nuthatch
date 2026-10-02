@@ -15,11 +15,30 @@ use nuthatch::{health::RuntimeHealth, indexer, runtime, serve, store::Store};
 use common::tape::*;
 
 /// A two-nest, one-chain mounts over a scripted tape, wrapped in the driver handles a live mounts keeps.
+/// A lifecycle change is written back, and a runtime with no table to write to reports that as a
+/// failure (#1639). A test that brought its own table keeps it.
+fn write_table_if_absent(dir: &std::path::Path, nests: &[&str]) {
+    let table = dir.join(runtime::MOUNTS_FILE);
+    if table.exists() {
+        return;
+    }
+    let listed: Vec<String> = nests.iter().map(|n| format!("\"{n}\"")).collect();
+    std::fs::write(
+        &table,
+        format!(
+            "[runtime]\nname = \"r\"\nnests = [{}]\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
+            listed.join(", ")
+        ),
+    )
+    .unwrap();
+}
+
 async fn two_nest_roost(
     roost_dir: &std::path::Path,
     usdc_dir: &std::path::Path,
     arb_dir: &std::path::Path,
 ) -> (runtime::RuntimeHandles, Arc<TapeSource>) {
+    write_table_if_absent(roost_dir, &["usdc", "arb"]);
     let tape = Arc::new(TapeSource::new());
     let a1 = account(1);
     let a2 = account(2);
@@ -420,6 +439,7 @@ async fn route_named_runtime(
     nest_dir: &std::path::Path,
     route: &str,
 ) -> (runtime::RuntimeHandles, Arc<TapeSource>) {
+    write_table_if_absent(nest_dir, &[route]);
     let tape = Arc::new(TapeSource::new());
     let (a1, a2) = (account(1), account(2));
     for b in 1..=6u64 {
@@ -1373,6 +1393,7 @@ async fn empty_runtime(
     let data_dir = runtime::MountTable::data_dir(roost_dir, nid);
     std::fs::create_dir_all(&data_dir).unwrap();
     scaffold_nest(&data_dir, "usdc", USDC);
+    write_table_if_absent(roost_dir, &[]);
 
     let health = Arc::new(RuntimeHealth::new());
     let roster = serde_json::json!({"runtime": "test", "nests": []});
