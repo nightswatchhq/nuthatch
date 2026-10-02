@@ -354,6 +354,50 @@ mod tests {
         assert!(err.contains("no checks found"), "{err}");
     }
 
+    /// #1656: a key no struct reads is dropped, and `check` agrees. `sq1 = "deny"` then leaves
+    /// `/sql` open.
+    #[test]
+    fn a_misspelt_key_in_the_other_config_files_fails_check() {
+        let err_of = |file: &str, body: &str, needle: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(file), body).unwrap();
+            let err = check(CheckArgs {
+                name: None,
+                dir: dir.path().display().to_string(),
+                update: false,
+                #[cfg(feature = "folds")]
+                folds: false,
+                #[cfg(feature = "folds")]
+                from_genesis: false,
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(needle), "{file}: {err}");
+        };
+        err_of(
+            "mounts.toml",
+            "[runtime]\nname = \"r\"\nchain = \"mainnet\"\nchain_id = 1\n\n\
+             [[mounts]]\nalias = \"usdc\"\nnid = \"aa\"\nsq1 = \"deny\"\n",
+            "sq1 (did you mean `sql`)",
+        );
+        err_of(
+            "entities.toml",
+            "[[entites]]\nname = \"holder\"\nsql = \"entities/holder.sql\"\n\
+             key = [\"id\"]\nmax_rows = 1\n",
+            "entites (did you mean `entities`)",
+        );
+        err_of(
+            "queries.toml",
+            "querys = []\n",
+            "querys (did you mean `queries`)",
+        );
+        err_of(
+            "semantic.toml",
+            "schema_versio = 1\n",
+            "schema_versio (did you mean `schema_version`)",
+        );
+    }
+
     #[test]
     fn no_checks_directory_still_validates_a_clean_entity() {
         let dir = tempfile::tempdir().unwrap();
