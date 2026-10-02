@@ -116,6 +116,8 @@ const CHECKPOINT_HASHES: TableDefinition<&str, u64> = TableDefinition::new("chec
 /// RFC-0060: only a `graph` build keeps the index. A default build never creates or writes it, so its
 /// on-disk layout is unchanged.
 const INDEX_CHECKPOINT_HASHES: bool = cfg!(feature = "graph");
+/// Bounds the one-off backlog a store from before #1636 carries, a window at a time.
+const CHECKPOINTS_PRUNED_PER_COMMIT: usize = 4096;
 
 /// The `block_hash` a stored row JSON carries.
 pub(crate) fn row_block_hash(json: &str) -> Option<String> {
@@ -898,6 +900,27 @@ impl Store {
                 b.insert(key.as_str(), packed.as_str())?;
             }
             let mut m = wtx.open_table(META)?;
+            // A checkpoint below the sealed watermark is never walked: a reorg there is a terminal
+            // fault. A graph build keeps them, because a pinned read resolves through them (#1636).
+            if !INDEX_CHECKPOINT_HASHES {
+                let sealed: u64 = m
+                    .get("sealed_through")?
+                    .and_then(|v| v.value().parse().ok())
+                    .unwrap_or(0);
+                if sealed > 0 {
+                    let mut b = wtx.open_table(BLOCKS)?;
+                    let below = Self::block_key(sealed);
+                    let doomed: Vec<String> = b
+                        .range(..below.as_str())?
+                        .take(CHECKPOINTS_PRUNED_PER_COMMIT)
+                        .filter_map(|row| row.ok())
+                        .map(|(k, _)| k.value().to_string())
+                        .collect();
+                    for k in doomed {
+                        b.remove(k.as_str())?;
+                    }
+                }
+            }
             m.insert("last_block", last_block.to_string().as_str())?;
         }
         self.commit(wtx)?;
@@ -1291,14 +1314,11 @@ impl Store {
         let mut removed = 0u64;
         {
             let mut entities = wtx.open_table(ENTITIES)?;
+            let above = format!("{:012}-", block.saturating_add(1));
             let doomed: Vec<String> = entities
-                .iter()?
+                .range(above.as_str()..)?
                 .filter_map(|row| row.ok())
-                .filter_map(|(k, _)| {
-                    let key = k.value().to_string();
-                    let b: u64 = key.split('-').next()?.parse().ok()?;
-                    (b > block).then_some(key)
-                })
+                .map(|(k, _)| k.value().to_string())
                 .collect();
             for k in doomed {
                 entities.remove(k.as_str())?;
@@ -1306,14 +1326,11 @@ impl Store {
             }
 
             let mut blocks = wtx.open_table(BLOCKS)?;
+            let above = Self::block_key(block.saturating_add(1));
             let doomed: Vec<String> = blocks
-                .iter()?
+                .range(above.as_str()..)?
                 .filter_map(|row| row.ok())
-                .filter_map(|(k, _)| {
-                    let key = k.value().to_string();
-                    let b: u64 = key.parse().ok()?;
-                    (b > block).then_some(key)
-                })
+                .map(|(k, _)| k.value().to_string())
                 .collect();
             for k in doomed {
                 if let Some(value) = blocks.remove(k.as_str())? {
@@ -1351,14 +1368,11 @@ impl Store {
         let mut removed = 0u64;
         {
             let mut entities = wtx.open_table(ENTITIES)?;
+            let above = format!("{:012}-", block.saturating_add(1));
             let doomed: Vec<String> = entities
-                .iter()?
+                .range(above.as_str()..)?
                 .filter_map(|row| row.ok())
-                .filter_map(|(k, _)| {
-                    let key = k.value().to_string();
-                    let b: u64 = key.split('-').next()?.parse().ok()?;
-                    (b > block).then_some(key)
-                })
+                .map(|(k, _)| k.value().to_string())
                 .collect();
             for k in doomed {
                 entities.remove(k.as_str())?;
@@ -1366,14 +1380,11 @@ impl Store {
             }
 
             let mut blocks = wtx.open_table(BLOCKS)?;
+            let above = Self::block_key(block.saturating_add(1));
             let doomed: Vec<String> = blocks
-                .iter()?
+                .range(above.as_str()..)?
                 .filter_map(|row| row.ok())
-                .filter_map(|(k, _)| {
-                    let key = k.value().to_string();
-                    let b: u64 = key.parse().ok()?;
-                    (b > block).then_some(key)
-                })
+                .map(|(k, _)| k.value().to_string())
                 .collect();
             for k in doomed {
                 if let Some(value) = blocks.remove(k.as_str())? {
@@ -2403,6 +2414,69 @@ mod tests {
             Some(1_700_000_000),
             "a hash-only commit must not drop the timestamp"
         );
+    }
+
+    /// #1636: a window commit drops the checkpoints below the sealed watermark and keeps the one at
+    /// it, which is where a reorg walk has to stop. A graph build keeps them all for pinned reads.
+    #[test]
+    fn a_window_commit_prunes_checkpoints_below_the_sealed_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        for b in 1..=10u64 {
+            store
+                .commit_window(&[], Some((b, &format!("0x{b:02x}"))), b)
+                .unwrap();
+        }
+        store.set_meta("sealed_through", "6").unwrap();
+        store.commit_window(&[], Some((11, "0x0b")), 11).unwrap();
+        let kept: Vec<u64> = store
+            .checkpoints_desc()
+            .unwrap()
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        if cfg!(feature = "graph") {
+            assert_eq!(kept, (1..=11).rev().collect::<Vec<_>>());
+        } else {
+            assert_eq!(kept, (6..=11).rev().collect::<Vec<_>>());
+        }
+        assert_eq!(store.get_block_hash(6).unwrap().as_deref(), Some("0x06"));
+    }
+
+    /// The rollback scans start above the fork point, and still remove everything above it.
+    #[test]
+    fn a_rollback_removes_only_what_lies_above_the_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        for b in 1..=5u64 {
+            let rows = vec![(Store::entity_key(b, 0), "{}".to_string())];
+            store
+                .commit_window(&rows, Some((b, &format!("0x{b:02x}"))), b)
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .rollback_to_and_set_meta(3, "last_block", "3")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store.entity_keys().unwrap(),
+            vec![
+                Store::entity_key(1, 0),
+                Store::entity_key(2, 0),
+                Store::entity_key(3, 0)
+            ]
+        );
+        let kept: Vec<u64> = store
+            .checkpoints_desc()
+            .unwrap()
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(kept, vec![3, 2, 1]);
+        assert_eq!(store.rollback_to(1).unwrap(), 2);
+        assert_eq!(store.entity_keys().unwrap(), vec![Store::entity_key(1, 0)]);
     }
 
     /// #1410: a prefix read stops at the end of its prefix and at `limit`, in key order, and the count
