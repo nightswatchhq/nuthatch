@@ -6495,6 +6495,30 @@ impl NestIngest {
         let timestamps = block_data.timestamps;
         apply_row_timestamps(&mut rows, &timestamps);
         self.children.apply_timestamps(&timestamps);
+        // The logs and this hash are two calls. A tip that moved between them would commit the
+        // fork's rows under the hash the chain has now, and the next reorg check would see them agree.
+        // When no kept row stamped `to`, its hash and timestamp come from one header (#1494).
+        let record = match timestamps.get(&to).copied() {
+            Some(t) => source.block_hash(to).await.map(|h| h.map(|h| (h, Some(t)))),
+            None => source.block_record(to).await,
+        };
+        let checkpoint = match &record {
+            Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(hash, *ts))),
+            _ => None,
+        };
+        if let Some((hash, _)) = record.as_ref().ok().and_then(|r| r.as_ref()) {
+            if rows.iter().any(|r| {
+                r.block_number == to
+                    && !r.block_hash.is_empty()
+                    && !r.block_hash.eq_ignore_ascii_case(hash)
+            }) {
+                tracing::warn!(
+                    "block {to} moved between the log fetch and the checkpoint: refusing this window, retrying"
+                );
+                sleep_secs(2).await;
+                return Ok(None);
+            }
+        }
 
         let mut stored = 0usize;
         let mut deltas = Vec::new();
@@ -6646,17 +6670,6 @@ impl NestIngest {
                 );
             }
         }
-        // Fetch the window boundary's canonical hash for future reorg detection, then commit the whole
-        // window - rows + annotations + the checkpoint + the `last_block` watermark - in one atomic txn.
-        // When no kept row stamped `to`, its hash and timestamp come from one header (#1494).
-        let record = match timestamps.get(&to).copied() {
-            Some(t) => source.block_hash(to).await.map(|h| h.map(|h| (h, Some(t)))),
-            None => source.block_record(to).await,
-        };
-        let checkpoint = match record {
-            Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(&hash, ts))),
-            _ => None,
-        };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
         // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
@@ -14702,8 +14715,8 @@ template = "pool"
         );
         nest.balances.flush();
         assert_eq!(
-            nest.balances.balance(recipient).unwrap(),
-            0,
+            nest.balances.balance(recipient),
+            None,
             "the refused window was folded"
         );
         drop(nest);
