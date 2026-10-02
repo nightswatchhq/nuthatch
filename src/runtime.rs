@@ -6207,7 +6207,7 @@ mod tests {
         super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
         let jobs_hook = jobs.clone();
         *super::before_mount_join().lock().unwrap() = Some(Arc::new(move || {
-            jobs_hook.forget("usdc");
+            jobs_hook.forget("usdc").unwrap();
             jobs_hook
                 .claim(MountJob::new("usdc", None, MountPhase::Accepted))
                 .expect("the name is free once the first job is forgotten");
@@ -6243,7 +6243,7 @@ mod tests {
         let claimed = jobs
             .claim(MountJob::new("dai", None, MountPhase::Accepted))
             .unwrap();
-        jobs.forget("dai");
+        jobs.forget("dai").unwrap();
         let replacement = jobs
             .claim(MountJob::new("dai", None, MountPhase::Accepted))
             .expect("the name is free once the first job is forgotten");
