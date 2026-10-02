@@ -5938,4 +5938,24 @@ mod tests {
         assert!(moved.is_err());
         assert_eq!(seen.await.unwrap(), ["usdc->other"]);
     }
+
+    /// #1640: boot refuses these, and a live mount of one takes the runtime down at the next start.
+    #[test]
+    fn a_mount_named_health_or_nests_is_refused() {
+        for name in [
+            "health",
+            "nests",
+            "health/usdc",
+            "nests/usdc",
+            "acme/health",
+            "acme/nests",
+        ] {
+            let err = check_mount_name(name, DEFAULT_TENANT)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{name}: {err}");
+        }
+        check_mount_name("usdc", DEFAULT_TENANT).unwrap();
+        check_mount_name("acme/usdc", DEFAULT_TENANT).unwrap();
+    }
 }
