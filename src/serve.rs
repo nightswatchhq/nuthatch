@@ -930,7 +930,7 @@ pub async fn bind_and_serve(
         Some(layer) => app.layer(layer),
         None => app,
     };
-    let listener = tokio::net::TcpListener::bind(listen)
+    let mut listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind {listen}"))?;
     tracing::info!("API live on http://{listen}  (try GET /  and  /metrics)");
@@ -943,12 +943,28 @@ pub async fn bind_and_serve(
              before exposing it publicly. See docs/operators.md."
         );
     }
-    // Graceful shutdown on SIGTERM/SIGINT: axum drains in-flight requests, then this returns so the
+    // Not `axum::serve`: it gives hyper no timer, so the header-read timeout never fires (#1660).
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    // Graceful shutdown on SIGTERM/SIGINT: in-flight requests drain, then this returns so the
     // caller can abort the ingest task(s) (progress is checkpointed, so a restart resumes cleanly).
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut shutdown = std::pin::pin!(shutdown_signal());
+    loop {
+        let (io, _) = tokio::select! {
+            conn = axum::serve::Listener::accept(&mut listener) => conn,
+            _ = &mut shutdown => break,
+        };
+        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        let conn = graceful.watch(http.serve_connection(hyper_util::rt::TokioIo::new(io), service));
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::trace!("connection ended: {e:#}");
+            }
+        });
+    }
+    graceful.shutdown().await;
     tracing::info!("shutdown signal received; API stopped");
     Ok(())
 }
