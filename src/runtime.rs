@@ -2483,32 +2483,36 @@ pub fn lifecycle_routes(
                 )
             }
         };
+        // The record is gone from the API by now, so the NID is the caller's only way back to the
+        // dataset.
+        let failed = |e: String| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "unmounted": name,
+                    "nid": nid.as_ref().map(Nid::as_str),
+                    "error": e,
+                })),
+            )
+        };
         if let Err(e) = h.unmount(&name).await {
-            return write_failed(&e);
+            return failed(format!("{e:#}"));
         }
         if let Err(e) = jobs.forget(&name) {
-            return write_failed(&e);
+            return failed(format!("{e:#}"));
         }
-        let Some(nid) = nid.filter(|_| q.reclaim) else {
+        let Some(nid) = nid.as_ref().filter(|_| q.reclaim) else {
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"unmounted": name, "was_mounted": was_mounted})),
             );
         };
-        match h.reclaim(&nid) {
+        match h.reclaim(nid) {
             Ok(r) => (
                 StatusCode::OK,
                 Json(serde_json::json!({"unmounted": name, "reclaim": r})),
             ),
-            // The record is gone, so the NID is the caller's only way back to the dataset.
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "unmounted": name,
-                    "nid": nid.as_str(),
-                    "error": format!("{e:#}"),
-                })),
-            ),
+            Err(e) => failed(format!("{e:#}")),
         }
     }
 
