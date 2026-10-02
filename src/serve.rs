@@ -35,6 +35,10 @@ use tokio::sync::Semaphore;
 /// identity and belongs in a gateway). The permit count is not an unconstrained config key.
 pub const SQL_MAX_CONCURRENCY: usize = 2;
 
+/// How long a connection may take to send a complete request head before it is closed (#1660). A
+/// real client sends it in one write; ten seconds covers a slow link and still frees a stalled socket.
+pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Hard ceiling on the override below.
 ///
 /// The permit count is a **memory** bound, not a throughput one (#1006, and the correction in
