@@ -6297,6 +6297,36 @@ template="pool"
         );
     }
 
+    /// #1650: one DataFusion batch of 8,192 cells, 100 KB each, before the 64 MiB cap runs.
+    /// Ignored because the point is the resident size, and the suite should not allocate it.
+    #[test]
+    #[ignore = "resident size of one wide batch"]
+    fn probe_wide_batch_rss() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(120),
+            max_rows: 50_000,
+        };
+        let out = query_guarded(
+            dir.path(),
+            "SELECT repeat('A', 100000) AS x FROM range(8192)",
+            guard,
+        )
+        .unwrap();
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        let rss = unsafe {
+            libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
+            usage.assume_init().ru_maxrss as u64
+        };
+        eprintln!(
+            "probe rows={} truncated={} rss_bytes={rss}",
+            out.rows.len(),
+            out.truncated
+        );
+        assert!(out.truncated, "the byte cap did not fire");
+        assert!(out.rows.len() < 8192, "the cap kept the whole batch");
+    }
+
     /// **Issue #419.** A sealed segment that is present on disk but unreadable must *reduce* the
     /// table, not delete it.
     ///
