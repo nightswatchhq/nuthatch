@@ -230,6 +230,34 @@ pub fn clear_stale_fetches(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Directory writes fail until this drops, which puts the mode it had back.
+    struct ReadonlyDir {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl ReadonlyDir {
+        fn new(path: &Path) -> Self {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(path, perms).unwrap();
+            Self {
+                path: path.to_path_buf(),
+                mode,
+            }
+        }
+    }
+
+    impl Drop for ReadonlyDir {
+        fn drop(&mut self) {
+            let mut perms = std::fs::metadata(&self.path).unwrap().permissions();
+            perms.set_mode(self.mode);
+            let _ = std::fs::set_permissions(&self.path, perms);
+        }
+    }
 
     #[test]
     fn a_restart_resumes_unfinished_jobs_reports_failed_ones_and_forgets_live_ones() {
@@ -264,18 +292,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(JOBS_FILE), b"[]").unwrap();
         let jobs = MountJobs::load(d.path());
-        let mut perms = std::fs::metadata(d.path()).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(d.path(), perms).unwrap();
-        struct Unlock<'a>(&'a Path);
-        impl Drop for Unlock<'_> {
-            fn drop(&mut self) {
-                let mut perms = std::fs::metadata(self.0).unwrap().permissions();
-                perms.set_readonly(false);
-                std::fs::set_permissions(self.0, perms).unwrap();
-            }
-        }
-        let _unlock = Unlock(d.path());
+        let _unlock = ReadonlyDir::new(d.path());
 
         let err = jobs
             .put(MountJob::new("a", None, MountPhase::Accepted))
@@ -299,18 +316,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(JOBS_FILE), b"[]").unwrap();
         let jobs = MountJobs::load(d.path());
-        let mut perms = std::fs::metadata(d.path()).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(d.path(), perms).unwrap();
-        struct Unlock<'a>(&'a Path);
-        impl Drop for Unlock<'_> {
-            fn drop(&mut self) {
-                let mut perms = std::fs::metadata(self.0).unwrap().permissions();
-                perms.set_readonly(false);
-                std::fs::set_permissions(self.0, perms).unwrap();
-            }
-        }
-        let unlock = Unlock(d.path());
+        let unlock = ReadonlyDir::new(d.path());
 
         let err = jobs
             .claim(MountJob::new("a", None, MountPhase::Accepted))
@@ -333,18 +339,7 @@ mod tests {
         let jobs = MountJobs::load(d.path());
         jobs.put(MountJob::new("a", Some("old"), MountPhase::Failed))
             .unwrap();
-        let mut perms = std::fs::metadata(d.path()).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(d.path(), perms).unwrap();
-        struct Unlock<'a>(&'a Path);
-        impl Drop for Unlock<'_> {
-            fn drop(&mut self) {
-                let mut perms = std::fs::metadata(self.0).unwrap().permissions();
-                perms.set_readonly(false);
-                std::fs::set_permissions(self.0, perms).unwrap();
-            }
-        }
-        let _unlock = Unlock(d.path());
+        let _unlock = ReadonlyDir::new(d.path());
 
         let err = jobs
             .claim(MountJob::new("a", Some("new"), MountPhase::Accepted))

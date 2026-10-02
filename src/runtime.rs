@@ -5272,18 +5272,21 @@ mod tests {
                 registry: None,
             },
         };
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(root.path()).unwrap().permissions().mode();
         let mut perms = std::fs::metadata(root.path()).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(root.path(), perms).unwrap();
-        struct Unlock<'a>(&'a std::path::Path);
+        struct Unlock<'a>(&'a std::path::Path, u32);
         impl Drop for Unlock<'_> {
             fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
                 let mut perms = std::fs::metadata(self.0).unwrap().permissions();
-                perms.set_readonly(false);
-                std::fs::set_permissions(self.0, perms).unwrap();
+                perms.set_mode(self.1);
+                let _ = std::fs::set_permissions(self.0, perms);
             }
         }
-        let _unlock = Unlock(root.path());
+        let _unlock = Unlock(root.path(), mode);
 
         let err = handles
             .unmount("usdc")
