@@ -2089,11 +2089,9 @@ fn graph_sql_root(name: &str) -> bool {
 /// One clock for every root. A fresh instant per root is how one request runs for hours (#1658).
 #[cfg(feature = "graph")]
 fn graph_remaining(started: std::time::Instant) -> Duration {
-    let mut elapsed = started.elapsed();
+    let elapsed = started.elapsed();
     #[cfg(test)]
-    if let Some(extra) = GRAPH_CLOCK_SKEW.with(|c| c.get()) {
-        elapsed = elapsed.saturating_add(extra);
-    }
+    let elapsed = elapsed.saturating_add(GRAPH_CLOCK_SKEW.with(|c| c.get()).unwrap_or_default());
     SQL_TIMEOUT.saturating_sub(elapsed)
 }
 
