@@ -192,3 +192,6 @@ debug = "line-tables-only"
 [profile.release]
 lto = "thin"
 strip = true
+
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = "0.6"
