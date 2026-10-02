@@ -1725,7 +1725,9 @@ async fn a_mount_is_accepted_at_once_and_read_until_it_is_live() {
     std::fs::remove_dir_all(runtime::MountTable::data_dir(roost.path(), &nid)).unwrap();
     handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
     let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
 
@@ -1801,7 +1803,9 @@ async fn a_failed_mount_is_reported_with_its_reason() {
     let empty = tempfile::tempdir().unwrap();
     handles.mount_ctx.registry = Some(empty.path().to_str().unwrap().to_string());
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
     let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
@@ -1834,7 +1838,9 @@ async fn a_restart_resumes_an_interrupted_mount() {
     .unwrap();
 
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     assert!(!stale.exists(), "the killed fetch was left staged");
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
     let job = wait_for_phase(&routes, "usdc", "live").await;
@@ -1952,7 +1958,9 @@ async fn suspend_and_resume_over_the_admin_api() {
     let nid = "6b".repeat(32);
     let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
     let (status, _) = call(&routes, "POST", "/_admin/suspend/nope", None, None).await;
@@ -2420,7 +2428,9 @@ async fn a_move_over_the_admin_api_is_a_job() {
     std::fs::create_dir_all(&new_dir).unwrap();
     scaffold_nest(&new_dir, "usdc", USDC);
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
     let (status, _) = call(
@@ -2462,7 +2472,9 @@ async fn a_refused_move_leaves_no_fetched_dataset_behind() {
     let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
     assert!(!new_dir.exists(), "premise: the new nid is not held");
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
     let body = format!(r#"{{"nid":"{new_nid}"}}"#);
@@ -2520,7 +2532,9 @@ async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
     let nid = "d7".repeat(32);
     let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
     let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
@@ -2530,7 +2544,9 @@ async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
 
     // A restart with no jobs file, as after a hand edit: `mounts.toml` alone says it is suspended.
     std::fs::remove_file(roost.path().join(nuthatch::mount_jobs::JOBS_FILE)).unwrap();
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
     let job = wait_for_phase(&routes, "usdc", "suspended").await;
     assert_eq!(job["phase"], "suspended", "after a restart: {job}");
@@ -2842,7 +2858,9 @@ async fn a_restart_mid_move_resumes_the_move() {
     )
     .unwrap();
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
     let job = wait_for_phase(&routes, "usdc", "live").await;
     assert_eq!(job["phase"], "live", "{job}");
@@ -2874,7 +2892,9 @@ async fn identical_mounts_once() {
     let nid = "f6".repeat(32);
     let (handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
     let body = format!(r#"{{"name":"race","nid":"{nid}"}}"#);
     // One task per request, as hyper serves them: on a single task the check and insert never
@@ -2909,7 +2929,9 @@ async fn a_configured_default_tenant_spelled_out_is_refused_at_the_api() {
     let (mut handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
     handles.default_tenant = "acme".to_string();
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true).await;
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
     let body = serde_json::json!({"name": "acme/usdc", "nid": nid}).to_string();

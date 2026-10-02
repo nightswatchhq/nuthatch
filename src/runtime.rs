@@ -3228,8 +3228,7 @@ pub fn spawn_mount_job(
             }
             Err(e) => {
                 tracing::warn!("mounting '{name}' failed: {e:#}");
-                if let Err(write) =
-                    jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")))
+                if let Err(write) = jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")))
                 {
                     tracing::warn!(
                         "mount of '{name}' failed and the job file was not updated: {write:#}"
@@ -3323,8 +3322,7 @@ pub fn spawn_move_job(
             }
             Err(e) => {
                 tracing::warn!("moving '{name}' failed: {e:#}");
-                if let Err(write) =
-                    jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")))
+                if let Err(write) = jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")))
                 {
                     tracing::warn!(
                         "move of '{name}' failed and the job file was not updated: {write:#}"
@@ -3929,13 +3927,18 @@ impl RuntimeHandles {
             .filter(|n| !n.ends_with(STAGING_SUFFIX))
             .collect();
         let suspended: Vec<String> = self.suspended.keys().cloned().collect();
-        persist_mounted_nests(&self.mount_ctx.dir, &names, &self.mount_ctx.mounts, &suspended)
-            .with_context(|| {
-                format!(
-                    "the runtime's nest set changed but {MOUNTS_FILE} could not be updated - the \
+        persist_mounted_nests(
+            &self.mount_ctx.dir,
+            &names,
+            &self.mount_ctx.mounts,
+            &suspended,
+        )
+        .with_context(|| {
+            format!(
+                "the runtime's nest set changed but {MOUNTS_FILE} could not be updated - the \
                      change is live now but will not survive a restart"
-                )
-            })
+            )
+        })
     }
 
     /// Reclaim an unmounted dataset's disk (#1547). A mount record naming it keeps it, and a store
