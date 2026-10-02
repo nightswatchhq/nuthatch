@@ -103,6 +103,25 @@ const DISTROS: &[(&str, (u32, u32))] = &[
     ("Debian 12", (2, 36)),
 ];
 
+/// What is left of the list once every distro this test knows is taken out. Anything but joining
+/// words is a platform nobody has a glibc version for, and so one nothing compared.
+fn platforms_this_test_cannot_check(clearing: &str) -> Vec<String> {
+    let mut rest = clearing.to_string();
+    for (name, _) in DISTROS {
+        rest = rest.replace(name, ",");
+    }
+    rest.split(',')
+        .map(|p| {
+            p.trim()
+                .trim_start_matches("and ")
+                .trim_end_matches(" and")
+                .trim()
+        })
+        .filter(|p| !p.is_empty() && *p != "and")
+        .map(str::to_string)
+        .collect()
+}
+
 /// The supported-platform list has to agree with the requirement, or one of them is wrong.
 ///
 /// This is the assertion that would have caught #978 on the day it was written: the contradiction
@@ -141,6 +160,12 @@ fn the_supported_platforms_clear_the_stated_requirement() {
         listed > 0,
         "the platform list names none of the distros this test knows; if the list changed, teach \
          the test the new names rather than letting it pass on nothing (#978):\n{clearing}"
+    );
+    let unknown = platforms_this_test_cannot_check(clearing);
+    assert!(
+        unknown.is_empty(),
+        "the platform list names {unknown:?}, which this test has no glibc version for and so \
+         never compared. Add it to DISTROS with the glibc it ships."
     );
 }
 
@@ -220,4 +245,17 @@ fn control_a_mention_without_or_newer_is_not_read_as_the_requirement() {
         "a bullet without `or newer` is a statement of fact, not a runtime requirement; reading it \
          as one would make the test fire on documentation that is correct"
     );
+}
+
+/// A platform added to the list without a row in `DISTROS` used to pass: `listed > 0` held on the
+/// names already known, and the new one was never compared.
+#[test]
+fn control_a_listed_platform_the_test_does_not_know_is_detected() {
+    let added = "Debian 12, Ubuntu 22.04 and Fedora 34 clear it.\n";
+    assert_eq!(
+        platforms_this_test_cannot_check(platforms_said_to_clear_it(added)),
+        ["Fedora 34"]
+    );
+    let known = "Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear it.\n";
+    assert!(platforms_this_test_cannot_check(platforms_said_to_clear_it(known)).is_empty());
 }
