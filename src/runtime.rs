@@ -3170,20 +3170,32 @@ pub fn spawn_mount_job(
     use crate::mount_jobs::MountPhase;
     let wanted = nid.as_ref().map(|n| n.as_str().to_string());
     tokio::spawn(async move {
+        // Taken now. A forget, then a new claim, must not look like this worker's own (#1638).
+        let generation = jobs.get(&name).map(|job| job.generation).unwrap_or(0);
         let outcome = async {
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
             let fetched = match (&plan.fetch_from, &plan.nid) {
                 (Some(registry), Some(n)) => {
-                    jobs.advance(&name, MountPhase::Fetching, None);
+                    jobs.advance_if_owned(&name, generation, MountPhase::Fetching, None);
                     fetch_nid(registry, n, &plan.dir, &name).await?;
                     true
                 }
                 _ => false,
             };
-            jobs.advance(&name, MountPhase::Joining, None);
+            jobs.advance_if_owned(&name, generation, MountPhase::Joining, None);
             #[cfg(test)]
             if let Some(hook) = before_mount_join().lock().unwrap().clone() {
                 hook();
+            }
+            // The unmount already forgot this claim. Joining now would bring the name back.
+            if !jobs.owns(&name, generation) {
+                if fetched {
+                    let held = handles.lock().await.states.iter().any(|(_, s)| s.dir == plan.dir);
+                    if !held {
+                        let _ = std::fs::remove_dir_all(&plan.dir);
+                    }
+                }
+                bail!("mount of '{name}' was unmounted before it joined");
             }
             let mut h = handles.lock().await;
             let mounted = h.mount(&name, nid).await;
@@ -3201,18 +3213,26 @@ pub fn spawn_mount_job(
             })
         };
         match outcome {
-            Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Ok(()) => jobs.advance_if_owned(&name, generation, MountPhase::Live, None),
             Err(e)
                 if matches!(
                     e.downcast_ref::<MountRefusal>(),
                     Some(MountRefusal::AlreadyMounted(_))
                 ) && reached(&*handles.lock().await) =>
             {
-                jobs.advance(&name, MountPhase::Live, None)
+                jobs.advance_if_owned(&name, generation, MountPhase::Live, None)
+            }
+            Err(e) if !jobs.owns(&name, generation) => {
+                tracing::info!("mount of '{name}' stopped before it joined: {e:#}");
             }
             Err(e) => {
                 tracing::warn!("mounting '{name}' failed: {e:#}");
-                jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));
+                jobs.advance_if_owned(
+                    &name,
+                    generation,
+                    MountPhase::Failed,
+                    Some(format!("{e:#}")),
+                );
             }
         }
     })
