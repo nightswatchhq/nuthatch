@@ -2651,7 +2651,7 @@ pub fn lifecycle_routes(
                 return (StatusCode::CONFLICT, Json(serde_json::json!(running)))
             }
         };
-        spawn_move_job(handles, jobs, name, nid);
+        spawn_move_job(handles, jobs, name, nid, job.generation);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
 
@@ -3165,7 +3165,7 @@ pub async fn start_mount_jobs(
             let nid = job.nid.as_deref().and_then(|n| Nid::parse(n).ok());
             match (job.is_move, nid) {
                 (true, Some(nid)) => {
-                    spawn_move_job(handles.clone(), jobs.clone(), job.name, nid);
+                    spawn_move_job(handles.clone(), jobs.clone(), job.name, nid, job.generation);
                 }
                 (_, nid) => {
                     let generation = job.generation;
@@ -3328,6 +3328,7 @@ pub fn spawn_move_job(
     jobs: Arc<crate::mount_jobs::MountJobs>,
     name: String,
     nid: Nid,
+    generation: u64,
 ) -> tokio::task::JoinHandle<()> {
     use crate::mount_jobs::MountPhase;
     tokio::spawn(async move {
@@ -3336,14 +3337,21 @@ pub fn spawn_move_job(
             let plan = handles.lock().await.plan_mount(&staging, Some(&nid))?;
             let fetched = match (&plan.fetch_from, &plan.nid) {
                 (Some(registry), Some(n)) => {
-                    jobs.advance(&name, MountPhase::Fetching, None)?;
+                    jobs.advance_if_owned(&name, generation, MountPhase::Fetching, None)?;
                     fetch_nid(registry, n, &plan.dir, &name).await?;
                     true
                 }
                 _ => false,
             };
-            jobs.advance(&name, MountPhase::Joining, None)?;
+            jobs.advance_if_owned(&name, generation, MountPhase::Joining, None)?;
             let mut h = handles.lock().await;
+            // As for a mount: a claim that was forgotten, or replaced, must not move the name (#1638).
+            if !jobs.owns(&name, generation) {
+                if fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                    let _ = std::fs::remove_dir_all(&plan.dir);
+                }
+                bail!("move of '{name}' was unmounted before it moved");
+            }
             let moved = h.move_name(&name, nid).await;
             // As for a mount: a refused move removes only a fetch no live mount has since taken up.
             if moved.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
@@ -3354,14 +3362,21 @@ pub fn spawn_move_job(
         .await;
         match outcome {
             Ok(()) => {
-                if let Err(e) = jobs.advance(&name, MountPhase::Live, None) {
+                if let Err(e) = jobs.advance_if_owned(&name, generation, MountPhase::Live, None) {
                     tracing::warn!("'{name}' is moved but the job file was not updated: {e:#}");
                 }
             }
+            Err(e) if !jobs.owns(&name, generation) => {
+                tracing::info!("move of '{name}' stopped before it moved: {e:#}");
+            }
             Err(e) => {
                 tracing::warn!("moving '{name}' failed: {e:#}");
-                if let Err(write) = jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")))
-                {
+                if let Err(write) = jobs.advance_if_owned(
+                    &name,
+                    generation,
+                    MountPhase::Failed,
+                    Some(format!("{e:#}")),
+                ) {
                     tracing::warn!(
                         "move of '{name}' failed and the job file was not updated: {write:#}"
                     );
@@ -6266,5 +6281,48 @@ mod tests {
         let again = jobs.get("dai").expect("the replacement claim stays");
         assert_eq!(again.phase, MountPhase::Accepted);
         assert_eq!(again.generation, replacement.generation);
+    }
+
+    /// #1638, review: a move worker is fenced as a mount worker is. One whose claim was forgotten
+    /// and replaced must leave the replacement's job alone, whatever its own outcome.
+    #[tokio::test]
+    async fn a_forgotten_move_job_leaves_the_replacement_claim_alone() {
+        use crate::mount_jobs::{MountJob, MountPhase};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n",
+        )
+        .unwrap();
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
+        let nid = "7c".repeat(32);
+        let mut first = MountJob::new("usdc", Some(&nid), MountPhase::Accepted);
+        first.is_move = true;
+        let claimed = jobs.claim(first).unwrap();
+        jobs.forget("usdc").unwrap();
+        let replacement = jobs
+            .claim(MountJob::new("usdc", None, MountPhase::Accepted))
+            .expect("the name is free once the first job is forgotten");
+        assert_ne!(claimed.generation, replacement.generation);
+        let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
+        spawn_move_job(
+            handles,
+            jobs.clone(),
+            "usdc".into(),
+            Nid::parse(&nid).unwrap(),
+            claimed.generation,
+        )
+        .await
+        .unwrap();
+        let after = jobs.get("usdc").expect("the replacement claim stays");
+        assert_eq!(after.generation, replacement.generation);
+        assert_eq!(
+            (after.phase, after.reason),
+            (MountPhase::Accepted, None),
+            "the old move worker wrote its outcome onto a claim that is not its own"
+        );
     }
 }
