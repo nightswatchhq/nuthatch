@@ -50,6 +50,10 @@ pub struct MountJob {
     /// A move to `nid` rather than a mount of it, so a restart resumes it as a move (#1549).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_move: bool,
+    /// Which claim this record is. `forget` drops the record; a later claim must not reuse this,
+    /// or the worker that was forgotten mounts over the new one (#1638).
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl MountJob {
@@ -61,6 +65,7 @@ impl MountJob {
             reason: None,
             since_unixtime: now_unix(),
             is_move: false,
+            generation: 0,
         }
     }
 }
@@ -78,6 +83,8 @@ pub struct MountJobs {
     jobs: std::sync::Mutex<BTreeMap<String, MountJob>>,
     /// The runtime's default tenant, for refusing a name that spells it out before a job starts.
     default_tenant: String,
+    /// Never reused, including after `forget`, so a worker can tell its claim from the next one.
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 impl MountJobs {
@@ -98,10 +105,17 @@ impl MountJobs {
             },
             Err(_) => BTreeMap::new(),
         };
+        let next = jobs
+            .values()
+            .map(|j| j.generation)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         MountJobs {
             file,
             jobs: std::sync::Mutex::new(jobs),
             default_tenant: crate::runtime::DEFAULT_TENANT.to_string(),
+            next_generation: std::sync::atomic::AtomicU64::new(next),
         }
     }
 
@@ -138,14 +152,47 @@ impl MountJobs {
 
     /// Record `job` unless one is already running for its name, which is returned instead. One step
     /// under the lock, so of several identical requests exactly one starts a worker.
-    pub fn claim(&self, job: MountJob) -> Result<MountJob, MountJob> {
+    pub fn claim(&self, mut job: MountJob) -> Result<MountJob, MountJob> {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(running) = jobs.get(&job.name).filter(|j| !j.phase.finished()) {
             return Err(running.clone());
         }
+        job.generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         jobs.insert(job.name.clone(), job.clone());
         self.persist(&jobs);
         Ok(job)
+    }
+
+    /// Whether `generation` is still the claim on `name`. False after `forget`, and false for a
+    /// later claim of the same name.
+    pub fn owns(&self, name: &str, generation: u64) -> bool {
+        self.jobs
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|job| job.generation == generation)
+    }
+
+    /// [`advance`](Self::advance) that leaves a different claim alone (#1638).
+    pub fn advance_if_owned(
+        &self,
+        name: &str,
+        generation: u64,
+        phase: MountPhase,
+        reason: Option<String>,
+    ) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs
+            .get_mut(name)
+            .filter(|job| job.generation == generation)
+        {
+            job.phase = phase;
+            job.reason = reason;
+            job.since_unixtime = now_unix();
+            self.persist(&jobs);
+        }
     }
 
     /// Move a job on. A reason is kept only for a failure.
