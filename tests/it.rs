@@ -35,6 +35,8 @@ mod core_stays_pristine;
 mod cors_reaches_the_bind;
 #[path = "dbsp_step_cost.rs"]
 mod dbsp_step_cost;
+#[path = "deploy_nest_script.rs"]
+mod deploy_nest_script;
 #[path = "doc_command_check.rs"]
 mod doc_command_check;
 #[path = "e2e_bare_help.rs"]
