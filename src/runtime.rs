@@ -2274,6 +2274,27 @@ pub fn lifecycle_routes(
         )
     }
 
+    /// The `415` a body-less POST answers without a JSON content type, as the bodied ones already do:
+    /// a cross-site form can POST without a preflight, but cannot send `application/json` (#1642).
+    fn not_json(headers: &HeaderMap) -> Option<(StatusCode, Json<serde_json::Value>)> {
+        let json = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(|m| m.trim().to_ascii_lowercase())
+            .is_some_and(|m| {
+                m == "application/json" || (m.starts_with("application/") && m.ends_with("+json"))
+            });
+        (!json).then(|| {
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(serde_json::json!({
+                    "error": "Expected request with `Content-Type: application/json`"
+                })),
+            )
+        })
+    }
+
     if !admin_enabled {
         return axum::Router::new();
     }
@@ -2570,6 +2591,9 @@ pub fn lifecycle_routes(
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
             return unauthorized();
         }
+        if let Some(refused) = not_json(&headers) {
+            return refused;
+        }
         let mut h = handles.lock().await;
         if !h.states.iter().any(|(n, _)| *n == name) {
             return (
@@ -2670,6 +2694,9 @@ pub fn lifecycle_routes(
     ) -> (StatusCode, Json<serde_json::Value>) {
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
             return unauthorized();
+        }
+        if let Some(refused) = not_json(&headers) {
+            return refused;
         }
         let mut h = handles.lock().await;
         let Some(nid) = h.suspended.get(&name).and_then(|n| Nid::parse(n).ok()) else {

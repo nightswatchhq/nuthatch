@@ -849,8 +849,8 @@ nuthatch serve --cors '*'          # any origin; fine for a public read-only nes
 It sets allow-origin, allow-methods `GET,POST,OPTIONS` and allow-headers, and answers preflight.
 `POST` is there for the GraphQL routes (`/graphql`, `/subgraphs/id/{id}`, `/subgraphs/name/…`,
 present only in a `--features graph` build), which take their query in a body - a `GET`-only list would leave a browser GraphQL client
-preflighting `POST`, being refused, and never sending the query. Nothing on the router accepts a
-write. Values
+preflighting `POST`, being refused, and never sending the query. No `/_admin` path is ever
+given the headers, so the flag cannot open a runtime's lifecycle routes to another origin (#1642). Values
 must be exact origins **with a scheme and no trailing slash** - `app.example.com` and
 `https://app.example.com/` are both refused at startup, because an `Origin` header never looks like
 either and the browser-side failure is a generic CORS error that tells an operator nothing. A single

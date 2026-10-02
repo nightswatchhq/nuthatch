@@ -1984,9 +1984,9 @@ async fn suspend_and_resume_over_the_admin_api() {
         .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
-    let (status, _) = call(&routes, "POST", "/_admin/suspend/nope", None, None).await;
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/nope", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
-    let (status, _) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
+    let (status, _) = call(&routes, "POST", "/_admin/resume/usdc", None, Some("{}")).await;
     assert_eq!(
         status,
         axum::http::StatusCode::NOT_FOUND,
@@ -1994,16 +1994,16 @@ async fn suspend_and_resume_over_the_admin_api() {
     );
 
     slash_agrees(&handles, axum::http::StatusCode::OK).await;
-    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     slash_agrees(&handles, axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
-    let (status, body) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
+    let (status, body) = call(&routes, "POST", "/_admin/resume/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
     let job = wait_for_phase(&routes, "usdc", "live").await;
     assert_eq!(job["phase"], "live", "{job}");
     assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
 
-    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let (status, body) = call(&routes, "DELETE", "/_admin/nests/usdc", None, None).await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -2033,12 +2033,12 @@ async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let service = handles.lock().await.live.service().merge(runtime::lifecycle_routes(
-        handles.clone(),
-        jobs,
-        true,
-        None,
-    ));
+    let service = handles
+        .lock()
+        .await
+        .live
+        .service()
+        .merge(runtime::lifecycle_routes(handles.clone(), jobs, true, None));
     let cors = serve::cors_layer(&["*".to_string()]).unwrap();
     let addr = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2078,18 +2078,20 @@ async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
         preflight.headers()
     );
 
-    let form = client
-        .post(&url)
-        .header("origin", "https://evil.example")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        form.status(),
-        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "a cross-site form POST reached suspend"
-    );
+    for route in ["suspend", "resume"] {
+        let form = client
+            .post(format!("http://{addr}/_admin/{route}/usdc"))
+            .header("origin", "https://evil.example")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            form.status(),
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a cross-site form POST reached {route}"
+        );
+    }
     assert_eq!(
         status_of(&handles).await,
         axum::http::StatusCode::OK,
@@ -2635,7 +2637,7 @@ async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
         .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
-    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let job = wait_for_phase(&routes, "usdc", "suspended").await;
     assert_eq!(job["phase"], "suspended", "{job}");
