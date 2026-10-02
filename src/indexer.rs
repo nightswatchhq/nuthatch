@@ -14587,6 +14587,61 @@ template = "pool"
         );
     }
 
+    /// #1635: a window that fails after the views are fed and before the commit is retried with the
+    /// cursor unmoved. The transfer has to land in the balance once.
+    #[tokio::test]
+    async fn a_retried_window_folds_its_transfer_once() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        // The declared read is what fails the first attempt, after the fold and before the commit.
+        // Clearing it is the retry the runtime does once the fault is gone.
+        nest.calls = vec![crate::calls::CallDecl {
+            name: "tok__supply".into(),
+            contract: addr.into(),
+            calldata: "0x18160ddd".into(),
+            on: None,
+            on_any: Vec::new(),
+            canonical: false,
+            signature: None,
+            args: Vec::new(),
+            contract_column: None,
+            every: 1,
+            start: None,
+        }];
+        assert!(nest.state_rpc.is_none(), "premise: no archive endpoint");
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let logs = vec![transfer_log(10, 0)];
+        let first = nest
+            .process_window(source.as_ref(), &logs, 10, 10, 100)
+            .await;
+        let msg = format!("{:#}", first.expect_err("premise: the first attempt must fail"));
+        assert!(
+            msg.contains("state-rpc"),
+            "premise: the failure is the declared read, after the fold, got {msg}"
+        );
+        nest.calls.clear();
+        nest.process_window(source.as_ref(), &logs, 10, 10, 100)
+            .await
+            .expect("the retry commits")
+            .expect("the retry commits");
+        nest.balances.flush();
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        let got = nest.balances.balance(recipient);
+        assert_eq!(
+            got,
+            Some(0x1cd4ad20),
+            "one transfer, retried: the balance must credit it once, got {got:?}"
+        );
+        drop(nest);
+        let store = Store::open(&d.path().join(DB_FILE)).unwrap();
+        assert_eq!(
+            store.entity_keys().unwrap().len(),
+            1,
+            "the row is stored by the retry, not by the attempt that failed"
+        );
+    }
+
     /// #1144, review: a refetched tail row that is already stored under a *different* block hash is
     /// a reorg the handler has not yet rolled back. The window is refused and nothing is folded or
     /// stored, rather than the stale row being kept as if it were current.
