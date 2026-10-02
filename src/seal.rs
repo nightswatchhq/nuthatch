@@ -261,9 +261,10 @@ pub fn seal_range_with_snapshot(
         // incoming rows alone, before any fold. A fold's file hash is the folded bytes, so the
         // incoming hash is kept beside it (#1631).
         let input_hash = hash.clone();
-        if segments.iter().any(|s| {
-            s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str())
-        }) {
+        if segments
+            .iter()
+            .any(|s| s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str()))
+        {
             continue;
         }
         let new_rows = rows.len();
@@ -2429,7 +2430,10 @@ mod tests {
         seal_range(provisional.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
         let added = vec![transfer(11, 0, "2"), transfer(12, 0, "3")];
         seal_range(provisional.path(), &added, 11, 12).unwrap();
-        let folded = only(&load_manifest(provisional.path()).unwrap(), "usdc__transfer");
+        let folded = only(
+            &load_manifest(provisional.path()).unwrap(),
+            "usdc__transfer",
+        );
         assert!(folded.provisional, "premise: still under the floor");
         assert_eq!(folded.rows, 3, "premise: the fold holds every row once");
         let again = seal_range(provisional.path(), &added, 11, 12)
@@ -2440,7 +2444,10 @@ mod tests {
             (0, 0),
             "the rows the fold already took must not be sealed again"
         );
-        let after = only(&load_manifest(provisional.path()).unwrap(), "usdc__transfer");
+        let after = only(
+            &load_manifest(provisional.path()).unwrap(),
+            "usdc__transfer",
+        );
         assert_eq!((after.hash, after.rows), (folded.hash, 3));
         let back =
             read_segment_rows(&provisional.path().join(SEGMENTS_DIR).join(&after.file)).unwrap();
@@ -2463,7 +2470,11 @@ mod tests {
             .unwrap();
         assert_eq!((again.tables, again.rows), (0, 0));
         let segs = &load_manifest(final_dir.path()).unwrap().tables["usdc__transfer"];
-        assert_eq!(segs.len(), 1, "a final fold must not gain a second copy of its last cut: {segs:?}");
+        assert_eq!(
+            segs.len(),
+            1,
+            "a final fold must not gain a second copy of its last cut: {segs:?}"
+        );
         assert_eq!(segs[0].rows, SEAL_TABLE_FLOOR);
     }
 
