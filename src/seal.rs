@@ -293,6 +293,8 @@ pub fn seal_range_with_snapshot(
                 std::fs::create_dir_all(&store).context("creating the shared segment store")?;
                 let shared = store.join(format!("{hash}.parquet"));
                 if !shared.exists() {
+                    #[cfg(test)]
+                    note_durable(Durable::WroteFinal(shared.clone()));
                     std::fs::write(&shared, &bytes).context("failed to write shared segment")?;
                 }
                 // The folded file is left for `nuthatch prune`, which reclaims what no manifest
@@ -300,7 +302,10 @@ pub fn seal_range_with_snapshot(
                 // hash, and this nest cannot know.
             }
             None => {
-                std::fs::write(seg_dir.join(&file), &bytes).context("failed to write segment")?;
+                let dest = seg_dir.join(&file);
+                #[cfg(test)]
+                note_durable(Durable::WroteFinal(dest.clone()));
+                std::fs::write(&dest, &bytes).context("failed to write segment")?;
                 if let Some(prev) = &replaced {
                     // This nest's own copy, and not yet: see `folded_away`.
                     folded_away.push(seg_dir.join(&prev.file));
@@ -1256,6 +1261,37 @@ pub fn check_catalogue(dir: &Path) -> Result<CatalogueCheck> {
     Ok(out)
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Durable {
+    FileSync(PathBuf),
+    SegmentDir(PathBuf),
+    ManifestDir(PathBuf),
+    WroteFinal(PathBuf),
+}
+
+#[cfg(test)]
+thread_local! {
+    static DURABLE_TRACE: std::cell::RefCell<Option<Vec<Durable>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn note_durable(event: Durable) {
+    DURABLE_TRACE.with(|trace| {
+        if let Some(buf) = trace.borrow_mut().as_mut() {
+            buf.push(event);
+        }
+    });
+}
+
+#[cfg(test)]
+fn capture_durable(run: impl FnOnce()) -> Vec<Durable> {
+    DURABLE_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+    run();
+    DURABLE_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
+}
+
 fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     let raw = serde_json::to_string_pretty(manifest)?;
     // The manifest is the segment catalogue - the crown jewels of a `kill -9`-survivable single binary
@@ -1277,6 +1313,8 @@ fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     }
     std::fs::rename(&tmp, &path).context("failed to install manifest")?;
     if let Ok(d) = std::fs::File::open(dir) {
+        #[cfg(test)]
+        note_durable(Durable::ManifestDir(dir.to_path_buf()));
         let _ = d.sync_all(); // best-effort dir fsync (unsupported on some platforms)
     }
     manifest_signal(dir).send_modify(|installs| *installs += 1);
@@ -2103,6 +2141,60 @@ mod tests {
             load_manifest(&dir).unwrap().tables["usdc__transfer"].len(),
             1,
             "a re-seal double-listed the segment in the manifest"
+        );
+    }
+
+    /// #1632: the watermark is fsynced after `seal_range` returns. The segment bytes and the
+    /// manifest's directory entry have to be durable already. The entry lives in `segments/`.
+    #[test]
+    fn a_seal_is_durable_before_the_watermark_can_be() {
+        let solo = tempfile::tempdir().unwrap();
+        let trace = capture_durable(|| {
+            seal_range(solo.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        });
+        assert_seal_durable(solo.path(), &trace, solo.path().join(SEGMENTS_DIR));
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        std::fs::create_dir_all(&dir).unwrap();
+        let trace = capture_durable(|| {
+            seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        });
+        assert_seal_durable(&dir, &trace, shared_store(&dir).unwrap());
+    }
+
+    fn assert_seal_durable(nest: &Path, trace: &[Durable], bytes_dir: PathBuf) {
+        let manifest_dir = nest.join(SEGMENTS_DIR);
+        let manifest_at = trace.iter().rposition(|event| {
+            matches!(event, Durable::ManifestDir(path) if path == &manifest_dir)
+        });
+        let manifest_at = manifest_at.unwrap_or_else(|| {
+            panic!(
+                "the manifest entry lives in {}: that directory was not synced. trace: {trace:?}",
+                manifest_dir.display()
+            )
+        });
+        let file_at = trace.iter().position(|event| {
+            matches!(event, Durable::FileSync(path) if path.starts_with(&bytes_dir))
+        });
+        let file_at = file_at.unwrap_or_else(|| {
+            panic!(
+                "segment bytes in {} were not fsynced. trace: {trace:?}",
+                bytes_dir.display()
+            )
+        });
+        let segment_at = trace.iter().position(|event| {
+            matches!(event, Durable::SegmentDir(path) if path == &bytes_dir)
+        });
+        let segment_at = segment_at.unwrap_or_else(|| {
+            panic!(
+                "the segment directory {} was not synced. trace: {trace:?}",
+                bytes_dir.display()
+            )
+        });
+        assert!(
+            file_at < segment_at && segment_at < manifest_at,
+            "bytes, then their directory entry, then the manifest entry. trace: {trace:?}"
         );
     }
 
