@@ -626,6 +626,7 @@ impl Ceiling {
         };
         let ceiling: Ceiling =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        crate::config::warn_unknown::<Ceiling>(CEILING_FILE, &raw);
         for q in &ceiling.queries {
             q.validate()
                 .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;

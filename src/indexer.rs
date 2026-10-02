@@ -2184,6 +2184,9 @@ async fn runtime_index_loop(
                     tracing::warn!(
                         "mounts reorg to block {ancestor}: rolling back every live nest"
                     );
+                    // The timestamp cache is keyed by height. Drop it before the re-index, or the
+                    // replaced blocks seal with the time they had before the reorg.
+                    source.forget_cached_above(ancestor);
                     fan_out_rollback(&mut nests, &mut nexts, &mut sup, &live, ancestor)?;
                     continue;
                 }
@@ -5915,21 +5918,18 @@ impl NestIngest {
             }
         }
 
-        // The discovered-child registry (RFC-0009). Empty for a static nest; for a factory nest it is
-        // rebuilt from stored factory events on a warm restart (a pure fold - determinism preserved) and
-        // grown inline as the loop decodes new factory events.
+        // The discovered-child registry (RFC-0009), folded from stored factory events.
+        // A seal-direct resume has those events sealed and `LAST_BLOCK` still unset (#1630).
         if let Some(fs) = self.factory.as_deref() {
-            if self.store.get_meta(LAST_BLOCK_KEY)?.is_some() {
-                // Propagated, not defaulted (#373): a rebuild that cannot read its own stored
-                // factory events must fault the nest into quarantine, not start it watching a
-                // silently-short set of children.
-                self.children = rebuild_children(&self.dir, &self.store, &self.registry, fs)?;
-                if !self.children.is_empty() {
-                    tracing::info!(
-                        "rebuilt child registry: {} discovered child contract(s)",
-                        self.children.len()
-                    );
-                }
+            // Propagated, not defaulted (#373): a rebuild that cannot read its own stored
+            // factory events must fault the nest into quarantine, not start it watching a
+            // silently-short set of children.
+            self.children = rebuild_children(&self.dir, &self.store, &self.registry, fs)?;
+            if !self.children.is_empty() {
+                tracing::info!(
+                    "rebuilt child registry: {} discovered child contract(s)",
+                    self.children.len()
+                );
             }
         }
         // Phase 0 (cold start, `--seal-direct`): fast-seal the finalized history straight to Parquet,
@@ -6512,6 +6512,30 @@ impl NestIngest {
         let timestamps = block_data.timestamps;
         apply_row_timestamps(&mut rows, &timestamps);
         self.children.apply_timestamps(&timestamps);
+        // The logs and this hash are two calls. A tip that moved between them would commit the
+        // fork's rows under the hash the chain has now, and the next reorg check would see them agree.
+        // When no kept row stamped `to`, its hash and timestamp come from one header (#1494).
+        let record = match timestamps.get(&to).copied() {
+            Some(t) => source.block_hash(to).await.map(|h| h.map(|h| (h, Some(t)))),
+            None => source.block_record(to).await,
+        };
+        let checkpoint = match &record {
+            Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(hash, *ts))),
+            _ => None,
+        };
+        if let Some((hash, _)) = record.as_ref().ok().and_then(|r| r.as_ref()) {
+            if rows.iter().any(|r| {
+                r.block_number == to
+                    && !r.block_hash.is_empty()
+                    && !r.block_hash.eq_ignore_ascii_case(hash)
+            }) {
+                tracing::warn!(
+                    "block {to} moved between the log fetch and the checkpoint: refusing this window, retrying"
+                );
+                sleep_secs(2).await;
+                return Ok(None);
+            }
+        }
 
         let mut stored = 0usize;
         let mut deltas = Vec::new();
@@ -6648,17 +6672,6 @@ impl NestIngest {
                 );
             }
         }
-        // Fetch the window boundary's canonical hash for future reorg detection, then commit the whole
-        // window - rows + annotations + the checkpoint + the `last_block` watermark - in one atomic txn.
-        // When no kept row stamped `to`, its hash and timestamp come from one header (#1494).
-        let record = match timestamps.get(&to).copied() {
-            Some(t) => source.block_hash(to).await.map(|h| h.map(|h| (h, Some(t)))),
-            None => source.block_record(to).await,
-        };
-        let checkpoint = match record {
-            Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(&hash, ts))),
-            _ => None,
-        };
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
         // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
@@ -9912,6 +9925,203 @@ template="pool"
         let row =
             crate::analytics::query(dir.path(), r#"SELECT address FROM "pool__swap""#).unwrap();
         assert_eq!(row[0]["address"], serde_json::Value::from(pool_addr));
+    }
+
+    /// #1630: a seal-direct factory backfill that dies after a segment is sealed restarts with
+    /// `SEALED_THROUGH` set and `LAST_BLOCK` unset. The child that factory event named has to be in
+    /// the registry before the resume, or the rest of the range seals without it.
+    #[tokio::test]
+    async fn a_seal_direct_resume_seals_a_child_discovered_before_the_restart() {
+        use crate::rpc::Log;
+
+        let factory_addr = "0x1111111111111111111111111111111111111111";
+        let pool_addr = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name="factory-resume-1630"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[templates]]
+name="pool"
+abi="abis/p.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/f.json"),
+            r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[{"name":"pool","type":"address","indexed":false}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/p.json"),
+            r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let idle: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (mut nest, _state, worker, _w) = build_nest(
+            &idle,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        let topic0 = |table: &str| {
+            format!(
+                "0x{}",
+                hex::encode(
+                    nest.registry
+                        .tables()
+                        .iter()
+                        .find(|d| d.table == table)
+                        .unwrap()
+                        .topic0
+                )
+            )
+        };
+        // The interrupted run: one factory event, sealed, then the process is gone. The registry it
+        // grew is not on disk. What survives is the segment and `SEALED_THROUGH`.
+        let seed = FilteringSource {
+            logs: vec![Log {
+                address: factory_addr.into(),
+                topics: vec![topic0("factory__pool_created")],
+                data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
+                block_number: 10,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt1".into(),
+                log_index: 0,
+            }],
+        };
+        let mut discarded = ChildRegistry::new();
+        let sealed = backfill_direct_factory(
+            &seed,
+            &nest.registry,
+            nest.factory.as_ref().unwrap(),
+            &mut discarded,
+            &nest.dir,
+            &nest.topic0s,
+            &nest.calls,
+            None,
+            nest.chain_id,
+            0,
+            10,
+            100,
+            nest.seal_span,
+            false,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sealed, 1,
+            "premise: the factory event sealed before the crash"
+        );
+        assert!(
+            discarded.contains(pool_addr),
+            "premise: that event names the pool"
+        );
+        let seeded =
+            crate::analytics::query(&nest.dir, r#"SELECT pool FROM "factory__pool_created""#)
+                .expect("premise: the sealed factory row is readable");
+        assert_eq!(
+            seeded[0]["pool"].as_str().map(|s| s.to_ascii_lowercase()),
+            Some(pool_addr.to_string()),
+            "premise: rebuild has a pool address to fold, got {seeded:?}"
+        );
+        nest.store.set_meta(SEALED_THROUGH_KEY, "10").unwrap();
+        assert!(
+            nest.store.get_meta(LAST_BLOCK_KEY).unwrap().is_none(),
+            "premise: seal-direct resume is the path with no last_block"
+        );
+        assert!(
+            nest.children.is_empty(),
+            "premise: a restarted process has not rebuilt yet"
+        );
+
+        // The child's swap is past the watermark. A resume that did not fold the sealed factory
+        // event never puts this address in the filter, so the source never returns it.
+        struct ResumeSource {
+            swap: Log,
+        }
+        #[async_trait::async_trait]
+        impl Source for ResumeSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(200)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                filter: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<Log>> {
+                let allow: std::collections::HashSet<String> = filter
+                    .addresses()
+                    .iter()
+                    .map(|a| a.to_ascii_lowercase())
+                    .collect();
+                let hit = self.swap.block_number >= from
+                    && self.swap.block_number <= to
+                    && (allow.is_empty()
+                        || allow.contains(&self.swap.address.to_ascii_lowercase()));
+                Ok(if hit {
+                    vec![self.swap.clone()]
+                } else {
+                    Vec::new()
+                })
+            }
+        }
+        let source = ResumeSource {
+            swap: Log {
+                address: pool_addr.into(),
+                topics: vec![topic0("pool__swap")],
+                data: format!("0x{:064x}", 999u64),
+                block_number: 30,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt2".into(),
+                log_index: 0,
+            },
+        };
+        nest.prepare(&source, Some(200), true, 1, 100)
+            .await
+            .expect("the resume itself must finish");
+        assert!(
+            nest.children.contains(pool_addr),
+            "the pool sealed before the restart must be back in the registry"
+        );
+        let swaps = crate::analytics::query(&nest.dir, r#"SELECT count(*) AS n FROM "pool__swap""#)
+            .unwrap_or_else(|e| panic!("the child's swap was never sealed: {e:#}"));
+        assert_eq!(
+            swaps[0]["n"],
+            serde_json::Value::from(1u64),
+            "the range after the watermark must seal the child's swap"
+        );
     }
 
     /// Pass 2 must shrink the window on a provider response cap, exactly as pass 1 already does.
@@ -14770,6 +14980,102 @@ template = "pool"
         }
     }
 
+    /// The checkpoint hash is a second call, after the logs. If `to` was replaced between them,
+    /// the fork's rows must not commit under the hash the chain has now.
+    struct MovedTip {
+        canonical: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for MovedTip {
+        async fn tip(&self) -> Result<u64> {
+            Ok(100)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(Some(self.canonical.clone()))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_window_whose_tip_moved_between_the_logs_and_the_checkpoint_is_refused() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let source = MovedTip {
+            canonical: "0xcanonical".into(),
+        };
+        let mut log = transfer_log(10, 0);
+        log.block_hash = "0xfork".into();
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        let outcome = nest
+            .process_window(&source, &[log], 10, 10, 100)
+            .await
+            .unwrap();
+        assert!(
+            outcome.is_none(),
+            "fork rows committed under the hash the chain has now"
+        );
+        nest.balances.flush();
+        assert_eq!(
+            nest.balances.balance(recipient),
+            None,
+            "the refused window was folded"
+        );
+        drop(nest);
+        let store = Store::open(&d.path().join(DB_FILE)).unwrap();
+        assert!(
+            store.entity_keys().unwrap().is_empty(),
+            "the refused window was stored"
+        );
+        assert_eq!(
+            store.get_block_hash(10).unwrap(),
+            None,
+            "the checkpoint recorded the hash from after the fork"
+        );
+    }
+
+    /// The same two calls, when they still name one block, commit that block under its hash.
+    #[tokio::test]
+    async fn a_window_whose_tip_hash_still_matches_the_logs_commits() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let source = MovedTip {
+            canonical: "0xcanonical".into(),
+        };
+        let mut log = transfer_log(10, 0);
+        log.block_hash = "0xcanonical".into();
+        let outcome = nest
+            .process_window(&source, &[log], 10, 10, 100)
+            .await
+            .unwrap();
+        assert!(
+            outcome.is_some(),
+            "a window whose hash still matches must commit"
+        );
+        drop(nest);
+        let store = Store::open(&d.path().join(DB_FILE)).unwrap();
+        assert_eq!(store.entity_keys().unwrap().len(), 1);
+        assert_eq!(
+            store.get_block_hash(10).unwrap().as_deref(),
+            Some("0xcanonical")
+        );
+    }
+
     /// RFC-0004 §3: the pipelined (concurrent-fetch) backfill produces **byte-identical** segments to
     /// the sequential path - concurrency overlaps latency without changing the output.
     #[tokio::test]
@@ -18553,6 +18859,78 @@ template="pool"
         assert!(
             rt_fetched,
             "runtime_index_loop must still fetch logs for a live nest with a contract"
+        );
+    }
+
+    /// Records `forget_cached_above`, which is what drops a block-number timestamp after a reorg.
+    struct ForgetSource {
+        forgotten: std::sync::Mutex<Vec<u64>>,
+        fetched: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for ForgetSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(10_000_000)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(if n >= 20 {
+                "0xnew".into()
+            } else {
+                format!("0x{n:064x}")
+            }))
+        }
+        fn forget_cached_above(&self, block: u64) {
+            self.forgotten.lock().unwrap().push(block);
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.fetched
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_runtime_cursor_forgets_cached_timestamps_when_it_reorgs() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(d.path(), addr).await;
+        nest.store.set_meta(LAST_BLOCK_KEY, "20").unwrap();
+        nest.store.set_block_hash(20, "0xold").unwrap();
+        let src = Arc::new(ForgetSource {
+            forgotten: std::sync::Mutex::new(Vec::new()),
+            fetched: std::sync::atomic::AtomicBool::new(false),
+        });
+        let watch = src.clone();
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![nest],
+            Some(0),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+        let progressed = within_deadline(|| {
+            !watch.forgotten.lock().unwrap().is_empty()
+                || watch.fetched.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        let forgotten = watch.forgotten.lock().unwrap().clone();
+        assert!(progressed, "the runtime neither reorged nor fetched");
+        assert_eq!(
+            forgotten.first().copied(),
+            Some(0),
+            "a runtime reorg left the timestamp cache in place: {forgotten:?}"
         );
     }
 
