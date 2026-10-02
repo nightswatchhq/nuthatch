@@ -10,6 +10,14 @@
 //! a built-in admin UI, an MCP server, and multi-nest roosts - all from one static binary. This file is
 //! just the CLI front door; the engine lives in the library crate.
 
+// glibc's malloc keeps what a large statement freed: after the QoS ingest's four whole-day
+// statements the process held 1.72 GB with a 2 GB engine pool and never gave it back, and in a day
+// it reached 7 GB and was throttled (2026-10-02). jemalloc peaked at 1.28 GB on the same four and
+// was at 0.95 GB twenty seconds later.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use nuthatch::{
     analytics, audit, bench, blob, check, cli, config, distribution, doctor, help, indexer, labels,
     lists, mcp, offchain, pack, project, publish, runtime, screen, store, transform,
