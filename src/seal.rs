@@ -2411,6 +2411,53 @@ mod tests {
         assert_eq!(parquet_files(dir.path()).len(), 1);
     }
 
+    /// #1631: the rows a fold just took are still hot when the process dies before the watermark.
+    /// Sealing them again must not fold them in a second time, whether the folded file is still
+    /// provisional or the fold is what carried it over the floor.
+    #[test]
+    fn re_sealing_rows_a_fold_already_took_does_not_count_them_twice() {
+        let provisional = tempfile::tempdir().unwrap();
+        seal_range(provisional.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let added = vec![transfer(11, 0, "2"), transfer(12, 0, "3")];
+        seal_range(provisional.path(), &added, 11, 12).unwrap();
+        let folded = only(&load_manifest(provisional.path()).unwrap(), "usdc__transfer");
+        assert!(folded.provisional, "premise: still under the floor");
+        assert_eq!(folded.rows, 3, "premise: the fold holds every row once");
+        let again = seal_range(provisional.path(), &added, 11, 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (again.tables, again.rows),
+            (0, 0),
+            "the rows the fold already took must not be sealed again"
+        );
+        let after = only(&load_manifest(provisional.path()).unwrap(), "usdc__transfer");
+        assert_eq!((after.hash, after.rows), (folded.hash, 3));
+        let back =
+            read_segment_rows(&provisional.path().join(SEGMENTS_DIR).join(&after.file)).unwrap();
+        assert_eq!(
+            back.iter()
+                .map(|r| r["block_number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+
+        let final_dir = tempfile::tempdir().unwrap();
+        let half = SEAL_TABLE_FLOOR / 2;
+        seal_range(final_dir.path(), &transfers(1_000, half), 1_000, 1_999).unwrap();
+        let second = transfers(2_000, half);
+        seal_range(final_dir.path(), &second, 2_000, 2_999).unwrap();
+        let sealed = only(&load_manifest(final_dir.path()).unwrap(), "usdc__transfer");
+        assert!(!sealed.provisional, "premise: the fold crossed the floor");
+        let again = seal_range(final_dir.path(), &second, 2_000, 2_999)
+            .unwrap()
+            .unwrap();
+        assert_eq!((again.tables, again.rows), (0, 0));
+        let segs = &load_manifest(final_dir.path()).unwrap().tables["usdc__transfer"];
+        assert_eq!(segs.len(), 1, "a final fold must not gain a second copy of its last cut: {segs:?}");
+        assert_eq!(segs[0].rows, SEAL_TABLE_FLOOR);
+    }
+
     #[test]
     fn a_fold_that_cannot_install_its_manifest_leaves_the_provisional_file_in_place() {
         // The crash window Jules named on #1153: the replacement file written, the old file
