@@ -48,6 +48,9 @@ pub(crate) trait Engine: Send + Sync {
 /// Cancels a running statement from another thread.
 pub(crate) trait Interrupt: Send + Sync {
     fn interrupt(&self);
+    /// Clear a cancel left by an earlier statement. The host does this before it arms the next
+    /// one; the engine leaves the token alone, or an interrupt during planning would be lost.
+    fn reset(&self) {}
 }
 
 /// Which phase of a statement failed.
@@ -167,6 +170,9 @@ pub(crate) trait Session: Send {
 
     /// Load one table's hot rows so that `bind_facts(.., hot = true, ..)` can union them in.
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()>;
+
+    /// How many hot rows [`Session::load_hot`] last staged for `table`.
+    fn staged_hot_len(&self, table: &str) -> usize;
 
     /// Remove a maintained relation's public name, so a pooled session cannot answer from one an
     /// earlier request defined after the entity faulted (#1598).

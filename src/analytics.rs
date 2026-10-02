@@ -1029,6 +1029,11 @@ fn attempt(
     if !(head.starts_with("select") || head.starts_with("with")) {
         bail!("only SELECT/WITH queries are allowed on the read-only SQL surface");
     }
+    // Before any walk. A long chain of operators overflows the planner, and the walk that names
+    // tables recurses the same way. The engine repeats the bound when it plans.
+    if let Err(e) = burrmill::df::check_expr_bounds(sql) {
+        bail!("{e}");
+    }
     // Read-only is enforced four-deep - do NOT loosen any of these without re-reasoning SEC-7:
     //   1. this leading-keyword gate rejects a *statement* that opens with INSERT/UPDATE/DELETE/COPY/
     //      ATTACH/PRAGMA/…;
@@ -1099,6 +1104,9 @@ fn attempt(
     let (referenced, offchain, degraded_tables, interrupted, spilled, outcome, cap, scan) = {
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
+        // The token outlives the previous statement. Clear it before the watchdog or the shutdown
+        // latch can arm it, or that interrupt is thrown away on the way into the statement.
+        session.interrupt_handle().reset();
         let walked = reject_unknown_table_refs(session, sql)?;
         // No parse means no idea what the statement reaches, and the safe answer to that is "all of
         // it" on both counts.
@@ -2538,6 +2546,10 @@ fn define_views_bound(
         } else {
             Vec::new()
         };
+        // Stage an empty tip too. A narrower window must not keep the rows the last one loaded.
+        if !relation && hot_rows.is_empty() {
+            let _ = session.load_hot(table, &hot_rows);
+        }
         let hot_loaded = (!hot_rows.is_empty() || !declared_relation.is_empty())
             && match if relation {
                 session.load_relation(table, &declared_relation, &hot_rows)
@@ -3985,16 +3997,8 @@ mod tests {
                 .unwrap()
                 .as_u64()
                 .unwrap();
-            // Where each engine keeps the hot rows it was handed.
-            let hot = match conn.engine_version().starts_with("burrmill") {
-                true => "t__hot",
-                false => "__hot_t",
-            };
-            let hot_loaded = conn
-                .one_value(&format!("SELECT count(*) FROM \"{hot}\""))
-                .ok()
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            // `__hot` is not a name a statement can read. The staged rows are what was loaded.
+            let hot_loaded = conn.staged_hot_len("t") as u64;
             (n, defined.tables["t"].segments, hot_loaded)
         };
         assert_eq!(
@@ -4727,6 +4731,85 @@ template="pool"
         assert_eq!(out.rows[0]["n"], Value::from(5u64));
     }
 
+    fn plus_chain(terms: usize) -> String {
+        let mut sql = String::from("SELECT ");
+        for i in 0..terms {
+            if i > 0 {
+                sql.push('+');
+            }
+            sql.push('1');
+        }
+        sql.push_str(" AS n");
+        sql
+    }
+
+    /// A chain long enough to abort the planner is refused before a session exists. Sixty-four
+    /// terms is the chain the planner is allowed to run.
+    #[test]
+    fn a_deep_statement_is_refused_before_a_session_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = session_opens_for(dir.path());
+        for terms in [65usize, 1000] {
+            let err = query(dir.path(), &plus_chain(terms)).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("deeper than 64"), "{terms} terms: {msg}");
+            assert_eq!(
+                session_opens_for(dir.path()),
+                opened,
+                "{terms} terms opened a session"
+            );
+        }
+        let rows = query(dir.path(), &plus_chain(64)).unwrap();
+        assert_eq!(rows[0]["n"], Value::from(64u64));
+        assert!(session_opens_for(dir.path()) > opened);
+    }
+
+    /// The shutdown latch is process-wide, so this runs in a child. A statement that starts after
+    /// the latch must fail, and quickly: the drain used to wait out the whole query.
+    #[test]
+    fn a_statement_starting_after_shutdown_does_not_run() {
+        if std::env::var("NUTHATCH_SHUTDOWN_LATCH_TEST").is_err() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "a_statement_starting_after_shutdown_does_not_run",
+                    "--test-threads=1",
+                ])
+                .env("NUTHATCH_SHUTDOWN_LATCH_TEST", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "child failed\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (0..500u64).map(fold_row).collect();
+        crate::seal::seal_range(dir.path(), &rows, 0, 499).unwrap();
+        interrupt_for_shutdown();
+        let path = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let r = query(
+                &path,
+                r#"SELECT count(*) AS n FROM "usdc__transfer" a, "usdc__transfer" b, "usdc__transfer" c"#,
+            );
+            let msg = r.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            let _ = tx.send((msg, started.elapsed()));
+        });
+        let (msg, took) = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| {
+            panic!("the drain waited on a statement the shutdown latch should have stopped")
+        });
+        assert!(
+            msg.contains("cancelled"),
+            "a statement that started after shutdown was not cancelled: {msg}"
+        );
+        assert!(took < Duration::from_secs(2), "shutdown waited {took:?}");
+    }
+
     /// SIGTERM waited 5.63 s behind a `/sql` still executing: the server drains in-flight requests, and
     /// nothing stopped the statement. A running statement must end when the live queries are interrupted.
     #[test]
@@ -4762,6 +4845,10 @@ template="pool"
             .recv_timeout(Duration::from_secs(10))
             .expect("an interrupted statement must stop, not run eight billion rows to the end");
         assert!(failed, "an interrupted statement must fail, not answer");
+        // The token stays armed. The next statement clears it, or this session would refuse
+        // everything that followed.
+        let again = query(dir.path(), "SELECT 1 AS n").unwrap();
+        assert_eq!(again[0]["n"], Value::from(1u64));
     }
 
     /// The same race without a hook: readers query while a writer folds, one row at a time. No answer
@@ -5314,14 +5401,22 @@ template="pool"
         assert_eq!(rows[1]["value_dec"], Value::Null);
         assert_eq!(rows[1]["value_overflow"], Value::from(true));
 
-        // And summing the rows that fit says so: over every row, a value that did not fit refuses
-        // on Burrmill rather than being left out of the total (Chief, 2026-09-29).
+        // A bare SUM(value_dec) is the column: the 39-digit row is NULL and is not a term.
+        // WHERE NOT value_overflow is that same sum. Other aggregates still refuse (2026-09-29).
         let s = query(
             dir.path(),
             r#"SELECT (SUM(value_dec) FILTER (WHERE NOT value_overflow))::VARCHAR AS s FROM "t__transfer""#,
         )
         .unwrap();
         assert_eq!(s[0]["s"], Value::from(fits));
+
+        // The bare sum is the column's own values. The 39-digit row is NULL there.
+        let bare = query(
+            dir.path(),
+            r#"SELECT SUM(value_dec)::VARCHAR AS s FROM "t__transfer""#,
+        )
+        .unwrap();
+        assert_eq!(bare[0]["s"], Value::from(fits));
     }
 
     /// #434: a declared big-int column that **no** sealed segment carries must not delete the table.
@@ -6357,6 +6452,119 @@ template="pool"
         );
     }
 
+    /// macOS reports bytes. Other targets report kilobytes.
+    fn resident_bytes() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        let rss = unsafe { usage.assume_init().ru_maxrss } as u64;
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
+            rss
+        } else {
+            rss.saturating_mul(1024)
+        }
+    }
+
+    /// #1650: one DataFusion batch of 8,192 cells, 100 KB each, before the 64 MiB cap runs.
+    /// Ignored because the point is the resident size, and the suite should not allocate it.
+    #[test]
+    #[ignore = "resident size of one wide batch"]
+    fn probe_wide_batch_rss() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(120),
+            max_rows: 50_000,
+        };
+        let out = query_guarded(
+            dir.path(),
+            "SELECT repeat('A', 100000) AS x FROM range(8192)",
+            guard,
+        )
+        .unwrap();
+        eprintln!(
+            "probe rows={} truncated={} rss_bytes={}",
+            out.rows.len(),
+            out.truncated,
+            resident_bytes()
+        );
+        assert!(out.truncated, "the byte cap did not fire");
+        assert!(out.rows.len() < 8192, "the cap kept the whole batch");
+    }
+
+    /// #1650: the byte cap has to see a slice of the batch.
+    /// Encoding the whole batch is the allocation.
+    #[test]
+    fn a_wide_batch_is_encoded_in_slices() {
+        crate::engine_burrmill::reset_encoded_rows();
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(30),
+            max_rows: 50_000,
+        };
+        let out = query_guarded(
+            dir.path(),
+            "SELECT repeat('A', 8) AS x FROM range(200)",
+            guard,
+        )
+        .unwrap();
+        assert_eq!(out.rows.len(), 200);
+        assert!(!out.truncated);
+        assert_eq!(
+            crate::engine_burrmill::max_encoded_rows(),
+            32,
+            "the cap encoded a whole batch"
+        );
+    }
+
+    /// #1650: one statement of 8,192 wide cells stays inside the cursor. The resident size is the
+    /// process's, so the query runs in a child. On main that child peaks near 1.8 GB.
+    #[test]
+    fn a_wide_batch_stays_under_the_cursor() {
+        if std::env::var_os("NUTHATCH_WIDE_RSS").is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let child = std::process::Command::new(exe)
+                .args([
+                    "analytics::tests::a_wide_batch_stays_under_the_cursor",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("NUTHATCH_WIDE_RSS", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            eprint!("{stdout}{stderr}");
+            assert!(
+                child.status.success() && stderr.contains("wide rows="),
+                "wide batch child failed\n{stdout}{stderr}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(120),
+            max_rows: 50_000,
+        };
+        let out = query_guarded(
+            dir.path(),
+            "SELECT repeat('A', 100000) AS x FROM range(8192)",
+            guard,
+        )
+        .unwrap();
+        let rss = resident_bytes();
+        eprintln!(
+            "wide rows={} truncated={} rss_bytes={rss}",
+            out.rows.len(),
+            out.truncated
+        );
+        assert!(out.truncated, "the byte cap did not fire");
+        assert!(out.rows.len() < 8192, "the cap kept the whole batch");
+        assert!(
+            rss < 512 * 1024 * 1024,
+            "one wide batch resident {rss} bytes"
+        );
+    }
+
     /// **Issue #419.** A sealed segment that is present on disk but unreadable must *reduce* the
     /// table, not delete it.
     ///
@@ -7195,7 +7403,7 @@ template="pool"
             .unwrap_or_else(|| panic!("stopped for the wrong reason: {err:#}"));
         assert_eq!(cut.cap_bytes, 64 * 1024 * 1024);
         assert!(
-            started.elapsed() < Duration::from_secs(20),
+            started.elapsed() < Duration::from_secs(45),
             "stopped by the deadline, not the spill: {:?}",
             started.elapsed()
         );

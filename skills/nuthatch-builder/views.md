@@ -47,11 +47,12 @@ nuthatch sql "SELECT * FROM top_recipients"
 
 1. **Reserved-word columns.** `from` and `to` are SQL keywords - double-quote them: `SELECT "from"`.
    Call the MCP `schema` tool; it lists exactly which columns are reserved for this nest.
-2. **Big-int columns are exact text.** A `uint256`/`int256` column (e.g. `value`) is stored as a text
-   string. Never `SUM(value)` - for **amounts** use the derived `value_dec` companion:
-   `SUM(value_dec)`. **Ids, nonces and hashes stay on the raw column.** `_dec` is `DECIMAL(38,0)`
-   and is NULL for a full-width uint256, so a nonce filter on `nonce_dec` returns no rows while the
-   raw column is right. `schema` lists `_dec` columns and which of them overflow.
+2. **Big-int columns are exact text.** A `uint256`/`int256` column (e.g. `value`) is stored as a
+   text string. Never `SUM(value)`. For **amounts**, `SUM(value_dec)` is the values that fit:
+   a full-width word is NULL and is not a term. `WHERE NOT value_overflow` is that same sum.
+   **Ids, nonces and hashes stay on the raw column.** `_dec` is `DECIMAL(38,0)` and is NULL for a
+   full-width uint256, so a nonce filter on `nonce_dec` returns no rows while the raw column
+   is right. `schema` lists `_dec` columns and which of them overflow.
 3. **Bool columns are exact text too.** A Solidity `bool` column (e.g. `enabled`) is stored as text
    `'true'`/`'false'`, not a SQL boolean. `enabled = true` and `AND`/`NOT` implicitly cast and work;
    `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not, and fail to build with "an explicit

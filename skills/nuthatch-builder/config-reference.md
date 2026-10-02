@@ -206,10 +206,12 @@ value = "Amount, base units (6 decimals). Use value_dec for arithmetic."
 
 [table.usdc__transfer.footguns]   # DERIVED - do not edit
 reserved_words = ["from", "to"]   # double-quote these in SQL
-big_ints = ["value"]              # use value_dec for SUM/AVG/compare
-overflows_dec = []                # the subset of big_ints too wide for DECIMAL(38,0) - their
-                                  # _dec companion is NULL past 38 digits, so exact-decimal math
-                                  # silently drops those rows. CAST(col AS DOUBLE) instead.
+big_ints = ["value"]              # SUM(value_dec) is the values that fit; WHERE NOT
+                                  # value_overflow is that same sum
+overflows_dec = []                # the subset of big_ints too wide for DECIMAL(38,0).
+                                  # _dec is NULL past 38 digits, so a sum of _dec omits
+                                  # those rows. WHERE NOT col_overflow is that same sum.
+                                  # CAST(col AS DOUBLE) for a price that never fits.
 bools = []                        # Solidity `bool` columns, stored as exact text 'true'/'false'
                                   # rather than a SQL boolean. A direct comparison (col = true) or
                                   # a boolean operator (AND/NOT) casts implicitly and works; a

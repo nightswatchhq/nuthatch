@@ -20,7 +20,7 @@ are node self-protection, not obstacles to remove.
 ```sh
 nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48   # USDC - chain auto-detected
 nuthatch dev            # backfill from deployment, follow the tip, serve an API on :8288
-nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer"
+nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT value_overflow"
 ```
 
 - `init` resolves the ABI (Sourcify → Etherscan), writes `nuthatch.toml`, `schema.json`,
@@ -28,6 +28,8 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer"
   known chains for the contract's bytecode. Pass several addresses to index them together.
 - `dev` shows a live backfill progress line, then "caught up to tip". It *is* the serve command.
 - `nuthatch sql` with no query opens a REPL (`.tables`, `.schema <t>`, history).
+- `sum(value_dec)` is the amounts that fit. A full-width word is NULL and is not a term, so
+  `WHERE NOT value_overflow` is that same sum. Ids, nonces and hashes stay on the raw column.
 
 ## When to read what
 
