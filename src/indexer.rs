@@ -5918,21 +5918,18 @@ impl NestIngest {
             }
         }
 
-        // The discovered-child registry (RFC-0009). Empty for a static nest; for a factory nest it is
-        // rebuilt from stored factory events on a warm restart (a pure fold - determinism preserved) and
-        // grown inline as the loop decodes new factory events.
+        // The discovered-child registry (RFC-0009), folded from stored factory events.
+        // A seal-direct resume has those events sealed and `LAST_BLOCK` still unset (#1630).
         if let Some(fs) = self.factory.as_deref() {
-            if self.store.get_meta(LAST_BLOCK_KEY)?.is_some() {
-                // Propagated, not defaulted (#373): a rebuild that cannot read its own stored
-                // factory events must fault the nest into quarantine, not start it watching a
-                // silently-short set of children.
-                self.children = rebuild_children(&self.dir, &self.store, &self.registry, fs)?;
-                if !self.children.is_empty() {
-                    tracing::info!(
-                        "rebuilt child registry: {} discovered child contract(s)",
-                        self.children.len()
-                    );
-                }
+            // Propagated, not defaulted (#373): a rebuild that cannot read its own stored
+            // factory events must fault the nest into quarantine, not start it watching a
+            // silently-short set of children.
+            self.children = rebuild_children(&self.dir, &self.store, &self.registry, fs)?;
+            if !self.children.is_empty() {
+                tracing::info!(
+                    "rebuilt child registry: {} discovered child contract(s)",
+                    self.children.len()
+                );
             }
         }
         // Phase 0 (cold start, `--seal-direct`): fast-seal the finalized history straight to Parquet,
@@ -9869,6 +9866,203 @@ template="pool"
         let row =
             crate::analytics::query(dir.path(), r#"SELECT address FROM "pool__swap""#).unwrap();
         assert_eq!(row[0]["address"], serde_json::Value::from(pool_addr));
+    }
+
+    /// #1630: a seal-direct factory backfill that dies after a segment is sealed restarts with
+    /// `SEALED_THROUGH` set and `LAST_BLOCK` unset. The child that factory event named has to be in
+    /// the registry before the resume, or the rest of the range seals without it.
+    #[tokio::test]
+    async fn a_seal_direct_resume_seals_a_child_discovered_before_the_restart() {
+        use crate::rpc::Log;
+
+        let factory_addr = "0x1111111111111111111111111111111111111111";
+        let pool_addr = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name="factory-resume-1630"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[templates]]
+name="pool"
+abi="abis/p.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/f.json"),
+            r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[{"name":"pool","type":"address","indexed":false}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/p.json"),
+            r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let idle: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (mut nest, _state, worker, _w) = build_nest(
+            &idle,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
+        if let Some(w) = worker {
+            w.abort();
+        }
+
+        let topic0 = |table: &str| {
+            format!(
+                "0x{}",
+                hex::encode(
+                    nest.registry
+                        .tables()
+                        .iter()
+                        .find(|d| d.table == table)
+                        .unwrap()
+                        .topic0
+                )
+            )
+        };
+        // The interrupted run: one factory event, sealed, then the process is gone. The registry it
+        // grew is not on disk. What survives is the segment and `SEALED_THROUGH`.
+        let seed = FilteringSource {
+            logs: vec![Log {
+                address: factory_addr.into(),
+                topics: vec![topic0("factory__pool_created")],
+                data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
+                block_number: 10,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt1".into(),
+                log_index: 0,
+            }],
+        };
+        let mut discarded = ChildRegistry::new();
+        let sealed = backfill_direct_factory(
+            &seed,
+            &nest.registry,
+            nest.factory.as_ref().unwrap(),
+            &mut discarded,
+            &nest.dir,
+            &nest.topic0s,
+            &nest.calls,
+            None,
+            nest.chain_id,
+            0,
+            10,
+            100,
+            nest.seal_span,
+            false,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sealed, 1,
+            "premise: the factory event sealed before the crash"
+        );
+        assert!(
+            discarded.contains(pool_addr),
+            "premise: that event names the pool"
+        );
+        let seeded =
+            crate::analytics::query(&nest.dir, r#"SELECT pool FROM "factory__pool_created""#)
+                .expect("premise: the sealed factory row is readable");
+        assert_eq!(
+            seeded[0]["pool"].as_str().map(|s| s.to_ascii_lowercase()),
+            Some(pool_addr.to_string()),
+            "premise: rebuild has a pool address to fold, got {seeded:?}"
+        );
+        nest.store.set_meta(SEALED_THROUGH_KEY, "10").unwrap();
+        assert!(
+            nest.store.get_meta(LAST_BLOCK_KEY).unwrap().is_none(),
+            "premise: seal-direct resume is the path with no last_block"
+        );
+        assert!(
+            nest.children.is_empty(),
+            "premise: a restarted process has not rebuilt yet"
+        );
+
+        // The child's swap is past the watermark. A resume that did not fold the sealed factory
+        // event never puts this address in the filter, so the source never returns it.
+        struct ResumeSource {
+            swap: Log,
+        }
+        #[async_trait::async_trait]
+        impl Source for ResumeSource {
+            async fn tip(&self) -> Result<u64> {
+                Ok(200)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                filter: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<Log>> {
+                let allow: std::collections::HashSet<String> = filter
+                    .addresses()
+                    .iter()
+                    .map(|a| a.to_ascii_lowercase())
+                    .collect();
+                let hit = self.swap.block_number >= from
+                    && self.swap.block_number <= to
+                    && (allow.is_empty()
+                        || allow.contains(&self.swap.address.to_ascii_lowercase()));
+                Ok(if hit {
+                    vec![self.swap.clone()]
+                } else {
+                    Vec::new()
+                })
+            }
+        }
+        let source = ResumeSource {
+            swap: Log {
+                address: pool_addr.into(),
+                topics: vec![topic0("pool__swap")],
+                data: format!("0x{:064x}", 999u64),
+                block_number: 30,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt2".into(),
+                log_index: 0,
+            },
+        };
+        nest.prepare(&source, Some(200), true, 1, 100)
+            .await
+            .expect("the resume itself must finish");
+        assert!(
+            nest.children.contains(pool_addr),
+            "the pool sealed before the restart must be back in the registry"
+        );
+        let swaps = crate::analytics::query(&nest.dir, r#"SELECT count(*) AS n FROM "pool__swap""#)
+            .unwrap_or_else(|e| panic!("the child's swap was never sealed: {e:#}"));
+        assert_eq!(
+            swaps[0]["n"],
+            serde_json::Value::from(1u64),
+            "the range after the watermark must seal the child's swap"
+        );
     }
 
     /// Pass 2 must shrink the window on a provider response cap, exactly as pass 1 already does.
