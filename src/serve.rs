@@ -6413,6 +6413,25 @@ mod tests {
         drop(held);
     }
 
+    /// #1657: a hot miss on `/entity` is a cold scan, so it waits on the same gate as `/sql`.
+    #[tokio::test]
+    async fn entity_cold_read_waits_on_the_sql_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        let started = std::time::Instant::now();
+        let resp = entity(State(state.clone()), Path("1-1".into()))
+            .await
+            .into_response();
+        let waited = started.elapsed();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            waited >= Duration::from_millis(200),
+            "refused after {waited:?}, so the cold read never queued"
+        );
+        drop(held);
+    }
+
     /// The case the wait exists for: a permit freed while the caller is queued admits it, where
     /// fail-fast answered 503 for a query that would have run milliseconds later. This is the one
     /// in five the hackathon nests were bouncing.
