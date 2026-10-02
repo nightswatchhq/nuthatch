@@ -357,6 +357,21 @@ pub fn check_mount_name(name: &str, default_tenant: &str) -> Result<()> {
             "'{name}' names the default tenant; mount it as '{alias}'"
         ));
     }
+    // Boot refuses these. Accepting one here persists it, and the next start stays down (#1640).
+    if let Err(e) = refuse_reserved_mount(tenant, alias) {
+        return refuse(format!("{e:#}"));
+    }
+    Ok(())
+}
+
+/// `health` and `nests` are routes of the runtime itself. A mount of either name collides.
+fn refuse_reserved_mount(tenant: Option<&str>, alias: &str) -> Result<()> {
+    if alias == "nests" || alias == "health" {
+        bail!("nest name '{alias}' is reserved (collides with a runtime route)");
+    }
+    if let Some(tenant) = tenant.filter(|part| *part == "nests" || *part == "health") {
+        bail!("tenant '{tenant}' is reserved (collides with a runtime route)");
+    }
     Ok(())
 }
 
@@ -567,6 +582,13 @@ impl MountTable {
             .with_context(|| format!("no {MOUNTS_FILE} in {}", dir.display()))?;
         let mounts: MountTable =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        // `sq1 = "deny"` would otherwise leave /sql open with no record that the key was dropped.
+        crate::config::warn_unknown::<MountTable>(
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(MOUNTS_FILE),
+            &raw,
+        );
         mounts.validate_mounts()?;
         // Every mount, whichever form declared it, must be a safe path segment and must not collide
         // with a reserved top-level route - the roster and the per-nest prefixes share one namespace.
@@ -574,20 +596,8 @@ impl MountTable {
         for m in mounts.mount_refs() {
             safe_segment(&m.alias, "nest name")?;
             safe_segment(&m.tenant, "tenant")?;
-            if m.alias == "nests" || m.alias == "health" {
-                bail!(
-                    "nest name '{}' is reserved (collides with a runtime route)",
-                    m.alias
-                );
-            }
-            // In a multi-tenant runtime the tenant is the *first* path segment, so it collides with
-            // the same two routes an alias would.
-            if m.tenant == "nests" || m.tenant == "health" {
-                bail!(
-                    "tenant '{}' is reserved (collides with a runtime route)",
-                    m.tenant
-                );
-            }
+            // In a multi-tenant runtime the tenant is the first path segment, so it collides too.
+            refuse_reserved_mount(Some(&m.tenant), &m.alias)?;
             if !seen.insert((m.tenant.clone(), m.alias.clone())) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
@@ -3401,6 +3411,26 @@ impl RuntimeHandles {
             .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
             .sum();
         let projected_mb = RUNTIME_BASE_RSS_MB + existing + incoming_mb;
+        // An alias clones the dataset's state, so counting every state would tax a shared nest
+        // twice. Boot groups by dataset; this does the same by directory.
+        let runtime = self.roster["runtime"].as_str().unwrap_or("runtime");
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut already = 0usize;
+        let mut nests_here = 0usize;
+        for (_, state) in self.states.iter().filter(|(_, s)| s.chain == chain) {
+            if !seen_dirs.insert(state.dir.clone()) {
+                continue;
+            }
+            already += declared_entities(&state.dir).0;
+            nests_here += 1;
+        }
+        // A second name for a directory already on the cursor shares that dataset.
+        let (on_cursor, nests) = if seen_dirs.contains(dir) {
+            (already, nests_here)
+        } else {
+            (already + entity_count, nests_here + 1)
+        };
+        refuse_over_entity_ceiling(on_cursor, nests, runtime, &chain)?;
         if projected_mb > self.mount_ctx.max_rss_mb {
             return Err(MountRefusal::OverBudget {
                 nest: name.to_string(),
@@ -3501,6 +3531,9 @@ impl RuntimeHandles {
                 "'{name}' names the default tenant; mount it as '{alias}'"
             ))
             .into());
+        }
+        if let Err(e) = refuse_reserved_mount(tenant, alias) {
+            return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
         }
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the
@@ -5699,6 +5732,143 @@ mod tests {
         );
     }
 
+    /// Boot sums every nest on the chain. A live mount that only prices its own entities is
+    /// admitted, and the next restart is what refuses the cursor.
+    #[test]
+    fn a_live_mount_past_the_entity_ceiling_is_refused() {
+        fn write_entities(dir: &std::path::Path, n: usize) {
+            std::fs::create_dir_all(dir).unwrap();
+            let mut body = String::new();
+            for i in 0..n {
+                body.push_str(&format!(
+                    "[[entities]]\nname = \"e{i}\"\nsql = \"entities/e{i}.sql\"\n\
+                     key = [\"id\"]\nmax_rows = 1\n\n"
+                ));
+            }
+            std::fs::write(dir.join("entities.toml"), body).unwrap();
+        }
+        fn nest_config(chain: &str) -> Config {
+            toml::from_str(&format!(
+                "[nest]\nname = \"n\"\nchain = \"{chain}\"\nchain_id = 1\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"t\"\naddress = \"0x1\"\nabi = \"a.json\"\n"
+            ))
+            .unwrap()
+        }
+        fn nest_state(dir: &std::path::Path, chain: &str) -> crate::serve::AppState {
+            crate::serve::AppState {
+                store: Arc::new(crate::store::Store::open(&dir.join("hot.redb")).unwrap()),
+                address: None,
+                chain: chain.to_string(),
+                dir: dir.to_path_buf(),
+                balances: crate::views::BalanceView::start().unwrap(),
+                exposure: crate::exposure::ExposureView::start(true).unwrap(),
+                velocity: crate::velocity::VelocityView::start(true).unwrap(),
+                entities: Arc::new(Vec::new()),
+                #[cfg(feature = "folds")]
+                folds: None,
+                threshold: None,
+                velocity_threshold: None,
+                admin_enabled: false,
+                admin_token: None,
+                nest_info: Arc::new(serde_json::json!({})),
+                tables: Arc::new(vec![]),
+                sql_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+                sql_queued: Default::default(),
+                sql_max_hot_rows: crate::serve::SQL_MAX_HOT_ROWS,
+                sql_max_hot_bytes: crate::serve::SQL_MAX_HOT_BYTES,
+                sql_max_named_scan_bytes: crate::serve::SQL_MAX_NAMED_SCAN_BYTES,
+                cursorless: true,
+                seal_span: crate::chains::DEFAULT_SEAL_SPAN,
+                freshness: Default::default(),
+                surface: Arc::new(crate::allowlist::Surface::default()),
+                #[cfg(feature = "counter")]
+                counter: None,
+                nid: None,
+                runtime_health: None,
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let held = root.path().join("held");
+        let other = root.path().join("other");
+        let over = root.path().join("over");
+        let exact = root.path().join("exact");
+        // 26 on the cursor, plus an alias of that same dataset, plus 20 on another chain.
+        // 26 + 7 is over. 26 + 6 is the ceiling. The alias and the other chain must not count.
+        write_entities(&held, 26);
+        write_entities(&other, 20);
+        write_entities(&over, 7);
+        write_entities(&exact, 6);
+        let held_state = nest_state(&held, "ethereum");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sources = std::collections::HashMap::new();
+        let source: Arc<dyn Source> = Arc::new(crate::source::UnpolledSource);
+        sources.insert("ethereum".to_string(), source);
+        let mut lifecycle = std::collections::HashMap::new();
+        lifecycle.insert("ethereum".to_string(), tx);
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let roster = serde_json::json!({"runtime": "prod", "nests": []});
+        let handles = RuntimeHandles {
+            live: crate::serve::LiveRuntime::new(crate::serve::compose_runtime(
+                roster.clone(),
+                Vec::new(),
+                health.clone(),
+            )),
+            states: vec![
+                ("usdc".to_string(), held_state.clone()),
+                ("acme/usdc".to_string(), held_state),
+                ("other".to_string(), nest_state(&other, "optimism")),
+            ],
+            alert_workers: Vec::new(),
+            publishers: Vec::new(),
+            lifecycle,
+            health,
+            roster,
+            estimates: std::collections::HashMap::new(),
+            default_tenant: DEFAULT_TENANT.to_string(),
+            suspended: std::collections::BTreeMap::new(),
+            mount_ctx: MountContext {
+                dir: root.path().to_path_buf(),
+                mounts: Vec::new(),
+                sources,
+                endpoint_counts: std::collections::HashMap::new(),
+                backfill: None,
+                seal_direct: false,
+                concurrency: 1,
+                ipfs_window_deadline: std::time::Duration::from_secs(1),
+                window_override: None,
+                admin_enabled: true,
+                admin_token: None,
+                max_rss_mb: DEFAULT_MAX_RSS_MB,
+                freshness: Default::default(),
+                chain_freshness: std::collections::HashMap::new(),
+                dormant: std::collections::HashMap::new(),
+                fail_fast: false,
+                cursors: None,
+                registry: None,
+            },
+        };
+
+        let err = match handles.admit("new", &nest_config("ethereum"), &over) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("33 authored entities on one cursor is over the ceiling"),
+        };
+        assert!(err.contains("mounts 'prod'"), "{err}");
+        assert!(err.contains("cursor on ethereum"), "{err}");
+        assert!(err.contains("declares 33"), "{err}");
+        assert!(err.contains("across 2 nest(s)"), "{err}");
+        assert!(err.contains("over the ceiling of 32"), "{err}");
+
+        if let Err(e) = handles.admit("new", &nest_config("ethereum"), &exact) {
+            panic!("32 across the cursor is the ceiling, not past it: {e:#}");
+        }
+        // The directory is already on the cursor, as `usdc` and `acme/usdc`. A new name for it
+        // is an alias, not a second dataset.
+        if let Err(e) = handles.admit("alias", &nest_config("ethereum"), &held) {
+            panic!("an alias of a dataset already on the cursor is not a second nest: {e:#}");
+        }
+    }
+
     /// A `max_rows` large enough to overflow the multiplication must not wrap into a small
     /// projection and be admitted. Saturating is the safe direction: an absurd declaration projects
     /// as absurd and is refused, rather than as nothing and let in.
@@ -5937,5 +6107,75 @@ mod tests {
         drop(tx);
         assert!(moved.is_err());
         assert_eq!(seen.await.unwrap(), ["usdc->other"]);
+    }
+
+    /// #1640: boot refuses these, and a live mount of one takes the runtime down at the next start.
+    #[test]
+    fn a_mount_named_health_or_nests_is_refused() {
+        for name in [
+            "health",
+            "nests",
+            "health/usdc",
+            "nests/usdc",
+            "acme/health",
+            "acme/nests",
+        ] {
+            let err = check_mount_name(name, DEFAULT_TENANT)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{name}: {err}");
+        }
+        check_mount_name("usdc", DEFAULT_TENANT).unwrap();
+        check_mount_name("acme/usdc", DEFAULT_TENANT).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let handles = idle_handles(dir.path());
+        for name in ["health", "nests", "acme/health", "health/usdc"] {
+            let err = handles.plan_mount(name, None).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "plan_mount {name}: {err}");
+        }
+        assert!(handles.plan_mount("usdc", None).is_ok());
+    }
+
+    fn idle_handles(dir: &std::path::Path) -> RuntimeHandles {
+        let health = std::sync::Arc::new(crate::health::RuntimeHealth::new());
+        let roster = serde_json::json!({"runtime": "t", "nests": []});
+        let live = crate::serve::LiveRuntime::new(crate::serve::compose_runtime(
+            roster.clone(),
+            Vec::new(),
+            health.clone(),
+        ));
+        RuntimeHandles {
+            live,
+            states: Vec::new(),
+            alert_workers: Vec::new(),
+            publishers: Vec::new(),
+            lifecycle: std::collections::HashMap::new(),
+            health,
+            roster,
+            estimates: std::collections::HashMap::new(),
+            default_tenant: DEFAULT_TENANT.to_string(),
+            suspended: std::collections::BTreeMap::new(),
+            mount_ctx: MountContext {
+                dir: dir.to_path_buf(),
+                mounts: Vec::new(),
+                sources: std::collections::HashMap::new(),
+                endpoint_counts: std::collections::HashMap::new(),
+                backfill: None,
+                seal_direct: false,
+                concurrency: 1,
+                ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+                window_override: None,
+                admin_enabled: true,
+                admin_token: None,
+                max_rss_mb: DEFAULT_MAX_RSS_MB,
+                freshness: Default::default(),
+                chain_freshness: std::collections::HashMap::new(),
+                dormant: std::collections::HashMap::new(),
+                fail_fast: false,
+                cursors: None,
+                registry: None,
+            },
+        }
     }
 }

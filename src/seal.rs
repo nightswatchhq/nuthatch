@@ -121,6 +121,10 @@ pub struct Segment {
     /// [`ORIGINAL_WRITER_PROFILE`]: every segment sealed before this field existed was that profile.
     #[serde(default = "default_writer_profile")]
     pub writer_profile: String,
+    /// Hash of the parquet this seal was given, before a fold rewrote the file (#1631). Those rows
+    /// stay hot until the watermark, and the file hash no longer names them. Absent reads as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
 }
 
 /// Rows a table needs before its segment at a cut is final rather than provisional (#1150).
@@ -240,6 +244,8 @@ pub fn seal_range_with_snapshot(
         .with_context(|| format!("cannot create {}", seg_dir.display()))?;
     let mut manifest = load_manifest(dir)?;
     let mut summary = SealSummary::default();
+    // Shared files this seal will name. Dropped only after the manifest that names them is installed.
+    let mut publishing: Vec<SegmentHold> = Vec::new();
     // Per-nest provisional files a fold has replaced. Removed only once the manifest that no longer
     // names them is durably installed (below), never before: a crash between the two would leave
     // a manifest pointing at a file that is gone, and the folded rows would read as missing.
@@ -254,8 +260,13 @@ pub fn seal_range_with_snapshot(
         // Content-addressed idempotency: an identical segment (same table + hash) is already
         // catalogued, so re-sealing the same rows - e.g. re-running `nuthatch screen` over a range to
         // re-audit - is a no-op rather than a double-listed (double-counted) segment. Checked on the
-        // incoming rows alone, before any fold, so the rule is the same one it always was.
-        if segments.iter().any(|s| s.hash == hash) {
+        // incoming rows alone, before any fold. A fold's file hash is the folded bytes, so the
+        // incoming hash is kept beside it (#1631).
+        let input_hash = hash.clone();
+        if segments
+            .iter()
+            .any(|s| s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str()))
+        {
             continue;
         }
         let new_rows = rows.len();
@@ -290,7 +301,14 @@ pub fn seal_range_with_snapshot(
         // the write is a no-op rather than a duplicate.
         match shared_store(dir) {
             Some(store) => {
+                let shared = store.join(format!("{hash}.parquet"));
+                // Before the exists check. A reclaim that looks between the check and the hold
+                // deletes the file this manifest is about to name (#1644).
+                let hold = SegmentHold::acquire(&shared);
                 publish_durable(&store, &format!("{hash}.parquet"), &bytes)?;
+                publishing.push(hold);
+                #[cfg(test)]
+                before_manifest();
                 // The folded file is left for `nuthatch prune`, which reclaims what no manifest
                 // references: another dataset in the store may hold the same bytes under the same
                 // hash, and this nest cannot know.
@@ -318,11 +336,13 @@ pub fn seal_range_with_snapshot(
             registry_snapshot: registry_snapshot.map(str::to_string),
             provisional,
             writer_profile: WRITER_PROFILE.to_string(),
+            input_hash: Some(input_hash),
         });
     }
 
     manifest.manifest_version = MANIFEST_VERSION;
     save_manifest(dir, &manifest)?;
+    drop(publishing);
     // The new manifest no longer names these, but a reader holding a lease from before it was
     // installed may still be about to open one; see `retire`.
     retire(dir, folded_away);
@@ -344,6 +364,73 @@ struct Leases {
     readers: BTreeMap<u64, usize>,
     /// Replaced files with the epoch they were retired in.
     retired: Vec<(u64, PathBuf)>,
+}
+
+/// One shared segment a seal will catalogue, held until that manifest is on disk (#1644).
+struct SegmentHold {
+    path: PathBuf,
+}
+
+fn publishing() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn segment_key(path: &Path) -> PathBuf {
+    // The parent, not the file. A hold taken before the write has to match the path a reclaim
+    // canonicalises once the file exists (on macOS that spelling gains a `/private` prefix).
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    match path.parent() {
+        Some(parent) => {
+            let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            parent.join(name)
+        }
+        None => path.to_path_buf(),
+    }
+}
+
+impl SegmentHold {
+    fn acquire(path: &Path) -> Self {
+        let path = segment_key(path);
+        let mut held = publishing().lock().unwrap();
+        *held.entry(path.clone()).or_default() += 1;
+        SegmentHold { path }
+    }
+}
+
+impl Drop for SegmentHold {
+    fn drop(&mut self) {
+        let mut held = publishing().lock().unwrap();
+        if let Some(n) = held.get_mut(&self.path) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.path);
+            }
+        }
+    }
+}
+
+/// Whether a live seal is about to name `path` and has not installed that manifest yet.
+pub fn segment_held(path: &Path) -> bool {
+    publishing()
+        .lock()
+        .unwrap()
+        .contains_key(&segment_key(path))
+}
+
+/// Delete `path` unless a live seal holds it. The check and the unlink share the publishing lock.
+pub fn remove_segment_if_unheld(path: &Path) -> Result<bool> {
+    let held = publishing().lock().unwrap();
+    if held.contains_key(&segment_key(path)) {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).context(format!("removing {}", path.display())),
+    }
 }
 
 fn leases() -> &'static Mutex<HashMap<PathBuf, Leases>> {
@@ -1342,6 +1429,37 @@ fn capture_durable(run: impl FnOnce()) -> Vec<Durable> {
     DURABLE_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MANIFEST: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct BeforeManifestGuard;
+
+#[cfg(test)]
+impl Drop for BeforeManifestGuard {
+    fn drop(&mut self) {
+        BEFORE_MANIFEST.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn set_before_manifest(hook: impl FnMut() + 'static) -> BeforeManifestGuard {
+    BEFORE_MANIFEST.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    BeforeManifestGuard
+}
+
+#[cfg(test)]
+fn before_manifest() {
+    BEFORE_MANIFEST.with(|hook| {
+        if let Some(run) = hook.borrow_mut().as_mut() {
+            run();
+        }
+    });
+}
+
 fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     let raw = serde_json::to_string_pretty(manifest)?;
     // The manifest is the segment catalogue - the crown jewels of a `kill -9`-survivable single binary
@@ -2303,6 +2421,81 @@ mod tests {
         );
     }
 
+    /// The hold is taken before the file exists. A reclaim that canonicalises the file afterwards
+    /// must still see it: on macOS that path gains a `/private` prefix the moment the file appears.
+    #[test]
+    fn a_hold_taken_before_the_file_exists_still_covers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc.parquet");
+        let _hold = SegmentHold::acquire(&path);
+        std::fs::write(&path, b"parquet").unwrap();
+        let canon = std::fs::canonicalize(&path).unwrap();
+        assert!(
+            segment_held(&canon),
+            "the hold was keyed on the spelling from before the file existed"
+        );
+        assert!(
+            !remove_segment_if_unheld(&canon).unwrap(),
+            "a held segment must survive the reclaim that checks and deletes together"
+        );
+        assert!(canon.is_file());
+        drop(_hold);
+        assert!(remove_segment_if_unheld(&canon).unwrap());
+        assert!(!canon.is_file());
+    }
+
+    /// #1644: B skips the shared write because A's file is already there, and A's reclaim runs
+    /// before B's manifest names it. The file has to still be there when B's catalogue lands.
+    #[test]
+    fn a_reclaim_during_a_shared_seal_keeps_the_segment_the_seal_will_name() {
+        use crate::runtime::{MountTable, MOUNTS_FILE};
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let dir_a = MountTable::data_dir(root.path(), &a);
+        let dir_b = MountTable::data_dir(root.path(), &b);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let rows = [transfer(10, 0, "1")];
+        seal_range(&dir_a, &rows, 10, 10).unwrap();
+        let hash = load_manifest(&dir_a).unwrap().tables["usdc__transfer"][0]
+            .hash
+            .clone();
+        let shared = shared_store(&dir_a)
+            .unwrap()
+            .join(format!("{hash}.parquet"));
+        assert!(shared.is_file(), "premise: A published the shared segment");
+
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+                 chain_id = 42161\nrpc_urls = []\n\n[[mounts]]\nalias = \"b\"\nnid = \"{b}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let runtime = root.path().to_path_buf();
+        let reclaim_a = a.clone();
+        let _hook = set_before_manifest(move || {
+            crate::prune::reclaim(&runtime, &reclaim_a)
+                .expect("A is unmounted and its store is not open");
+        });
+        seal_range(&dir_b, &rows, 10, 10).unwrap();
+
+        assert!(
+            shared.is_file(),
+            "reclaim removed the segment B's manifest is about to name"
+        );
+        assert_eq!(
+            load_manifest(&dir_b).unwrap().tables["usdc__transfer"][0].hash,
+            hash
+        );
+        assert!(
+            !dir_a.exists(),
+            "premise: the reclaim did run and took A's dataset"
+        );
+    }
+
     #[test]
     fn empty_range_seals_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -2606,6 +2799,63 @@ mod tests {
         let after = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
         assert_eq!((after.hash, after.rows), (before.hash, 2));
         assert_eq!(parquet_files(dir.path()).len(), 1);
+    }
+
+    /// #1631: the rows a fold just took are still hot when the process dies before the watermark.
+    /// Sealing them again must not fold them in a second time, whether the folded file is still
+    /// provisional or the fold is what carried it over the floor.
+    #[test]
+    fn re_sealing_rows_a_fold_already_took_does_not_count_them_twice() {
+        let provisional = tempfile::tempdir().unwrap();
+        seal_range(provisional.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let added = vec![transfer(11, 0, "2"), transfer(12, 0, "3")];
+        seal_range(provisional.path(), &added, 11, 12).unwrap();
+        let folded = only(
+            &load_manifest(provisional.path()).unwrap(),
+            "usdc__transfer",
+        );
+        assert!(folded.provisional, "premise: still under the floor");
+        assert_eq!(folded.rows, 3, "premise: the fold holds every row once");
+        let again = seal_range(provisional.path(), &added, 11, 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (again.tables, again.rows),
+            (0, 0),
+            "the rows the fold already took must not be sealed again"
+        );
+        let after = only(
+            &load_manifest(provisional.path()).unwrap(),
+            "usdc__transfer",
+        );
+        assert_eq!((after.hash, after.rows), (folded.hash, 3));
+        let back =
+            read_segment_rows(&provisional.path().join(SEGMENTS_DIR).join(&after.file)).unwrap();
+        assert_eq!(
+            back.iter()
+                .map(|r| r["block_number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+
+        let final_dir = tempfile::tempdir().unwrap();
+        let half = SEAL_TABLE_FLOOR / 2;
+        seal_range(final_dir.path(), &transfers(1_000, half), 1_000, 1_999).unwrap();
+        let second = transfers(2_000, half);
+        seal_range(final_dir.path(), &second, 2_000, 2_999).unwrap();
+        let sealed = only(&load_manifest(final_dir.path()).unwrap(), "usdc__transfer");
+        assert!(!sealed.provisional, "premise: the fold crossed the floor");
+        let again = seal_range(final_dir.path(), &second, 2_000, 2_999)
+            .unwrap()
+            .unwrap();
+        assert_eq!((again.tables, again.rows), (0, 0));
+        let segs = &load_manifest(final_dir.path()).unwrap().tables["usdc__transfer"];
+        assert_eq!(
+            segs.len(),
+            1,
+            "a final fold must not gain a second copy of its last cut: {segs:?}"
+        );
+        assert_eq!(segs[0].rows, SEAL_TABLE_FLOOR);
     }
 
     #[test]

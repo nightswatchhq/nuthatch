@@ -29,17 +29,18 @@ below rather than installing something that will not run.
 The Linux binary is dynamically linked and needs one thing, measured off the published artifact
 with `objdump -T` rather than inferred.
 
-**glibc 2.34 or newer.** This is the measured ABI floor. The release is *built* on glibc 2.35
-(`ubuntu-22.04` in `.github/workflows/release.yml`), but building on 2.35 does not make 2.35 a runtime
-requirement: the binary references no symbol newer than `GLIBC_2.34`, and that reference set is what
-the loader checks. The two numbers answer different questions - 2.34 is what you need to run it, 2.35
-is what we compile it on - and stating the build baseline as the requirement once excluded a platform
-we support ([#978](https://github.com/nightswatchhq/nuthatch/issues/978): RHEL 9 ships glibc 2.34).
+**glibc 2.35 or newer.** This is the measured ABI floor, read with `objdump -T` from the published
+binary: 4.1.0 references `hypot` and `hypotf` at `GLIBC_2.35`, where libm re-versioned them. It is
+also the glibc the release is *built* on (`ubuntu-22.04` in `.github/workflows/release.yml`), which is
+a coincidence and not the reason: up to 4.0.2 the binary referenced nothing newer than `GLIBC_2.34`
+and ran on RHEL 9, and stating the build baseline as the requirement once wrongly excluded it
+([#978](https://github.com/nightswatchhq/nuthatch/issues/978)). The floor is what the loader checks.
 
 **No C++ runtime.** The binary links `libc`, `libm` and `libgcc`. Releases before 4.1 embedded DuckDB,
 which is C++, and also needed libstdc++ from GCC 11 (`GLIBCXX_3.4.29`).
 
-Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear it.
+Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34: they ran 4.0.x and
+need the source build for 4.1.0.
 
 ## Verifying a download
 

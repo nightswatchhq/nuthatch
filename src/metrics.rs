@@ -1780,6 +1780,7 @@ mod tests {
             registry_snapshot: None,
             provisional: false,
             writer_profile: crate::seal::ORIGINAL_WRITER_PROFILE.to_string(),
+            input_hash: None,
         };
         let m = Metrics::new();
         for (name, nid, hashes, redb) in [
