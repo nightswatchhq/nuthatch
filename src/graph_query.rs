@@ -144,6 +144,8 @@ pub enum Unsupported {
     /// A `null` where this dialect has no lowering for one. Named rather than guessed at: in a filter it
     /// could mean `IS NULL`, or the absence of the condition, and the two select different rows.
     NullValue(String),
+    /// One operation asked for more SQL than a single request may run (#1658).
+    Budget(String),
 }
 
 impl fmt::Display for Unsupported {
@@ -200,6 +202,7 @@ impl fmt::Display for Unsupported {
                  (nuthatch#1267). Every answer here is as of the nest's current head, reported in \
                  `_meta`"
             ),
+            Unsupported::Budget(w) => write!(f, "{w}"),
         }
     }
 }
@@ -510,6 +513,18 @@ const MAX_NESTING: usize = 128;
 
 /// How many selections a document may expand to once its fragments are spliced in (#1581).
 const MAX_SELECTIONS: usize = 10_000;
+
+/// Root fields one operation may carry. The selection budget above is not a work budget (#1658).
+pub const MAX_OPERATION_ROOTS: usize = 32;
+
+/// Rows those roots may ask for between them. Eight full pages; captured clients use two.
+pub const MAX_OPERATION_ROWS: usize = 8_000;
+
+/// Same ceiling `/sql` puts on free-form text. Compiled GraphQL never reaches that check.
+const MAX_COMPILED_SQL: usize = 16 * 1024;
+
+/// Nested `and`/`or` past this is a chain of binary operators, which aborts the planner.
+const MAX_PREDICATE_DEPTH: usize = 64;
 
 struct Cursor<'a> {
     b: &'a [u8],
@@ -1127,6 +1142,43 @@ pub struct Compiled {
     pub min_block: Option<u64>,
 }
 
+/// Refuse an operation whose roots, or the rows they ask for, exceed one request (#1658).
+pub fn operation_bounds(schema: &Schema, roots: &[RootField]) -> Result<(), Unsupported> {
+    if roots.len() > MAX_OPERATION_ROOTS {
+        return Err(Unsupported::Budget(format!(
+            "an operation may have {MAX_OPERATION_ROOTS} root fields, not {}",
+            roots.len()
+        )));
+    }
+    let mut rows = 0usize;
+    for root in roots {
+        if matches!(root.name.as_str(), "__schema" | "__type" | "_meta") {
+            continue;
+        }
+        let singular = resolve_root(schema, &root.name)
+            .map(|(_, singular)| singular)
+            .unwrap_or(false);
+        let add = if singular {
+            1
+        } else {
+            match root.args.get("first") {
+                None => 100,
+                Some(Value::Int(n)) if (0..=1000).contains(n) => *n as usize,
+                // An illegal `first` is refused by the compiler. Count the per-root ceiling so
+                // the sum still cannot walk past this budget on the way there.
+                Some(_) => 1000,
+            }
+        };
+        rows = rows.saturating_add(add);
+        if rows > MAX_OPERATION_ROWS {
+            return Err(Unsupported::Budget(format!(
+                "an operation may ask for {MAX_OPERATION_ROWS} rows, not {rows}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Compile one root field against the generated schema.
 ///
 /// The view name is the entity's snake_case alias, which is what `port-emit` writes.
@@ -1410,7 +1462,18 @@ pub fn compile_with(
                     return Err(Unsupported::Argument("`where` must be an object".into()));
                 };
                 for (key, v) in m {
-                    wheres.push(lower_predicate(schema, ent, key, v, BASE, 0, caps)?);
+                    wheres.push(lower_predicate(
+                        &Pred {
+                            schema,
+                            ent,
+                            base: BASE,
+                            depth: 0,
+                            pred_depth: 0,
+                            caps,
+                        },
+                        key,
+                        v,
+                    )?);
                 }
             }
             "first" | "skip" | "orderBy" | "orderDirection" if !singular => {}
@@ -1530,6 +1593,13 @@ pub fn compile_with(
         sql.push_str(" LIMIT 1");
     }
 
+    if sql.len() > MAX_COMPILED_SQL {
+        return Err(Unsupported::Budget(format!(
+            "compiled query is {} bytes (max {MAX_COMPILED_SQL})",
+            sql.len()
+        )));
+    }
+
     Ok(Compiled {
         sql,
         shape,
@@ -1639,7 +1709,18 @@ fn derived_list_sql(
                     return Err(Unsupported::Argument("`where` must be an object".into()));
                 };
                 for (key, value) in filters {
-                    wheres.push(lower_predicate(schema, child, key, value, alias, 0, caps)?);
+                    wheres.push(lower_predicate(
+                        &Pred {
+                            schema,
+                            ent: child,
+                            base: alias,
+                            depth: 0,
+                            pred_depth: 0,
+                            caps,
+                        },
+                        key,
+                        value,
+                    )?);
                 }
             }
             "first" | "skip" | "orderBy" | "orderDirection" => {}
@@ -1747,16 +1828,32 @@ pub fn minimum_block(value: &Value, caps: &Capabilities) -> Result<Option<u64>, 
         .map_err(|_| Unsupported::Argument("`block.number_gte` must not be negative".into()))
 }
 
-fn lower_predicate(
-    schema: &Schema,
-    ent: &graph_schema::Entity,
-    key: &str,
-    v: &Value,
-    base: &str,
+/// One step of a filter walk. `depth` is nested relations and `pred_depth` is `and`/`or`.
+#[derive(Clone, Copy)]
+struct Pred<'a> {
+    schema: &'a Schema,
+    ent: &'a graph_schema::Entity,
+    base: &'a str,
     depth: usize,
-    caps: &Capabilities,
-) -> Result<String, Unsupported> {
+    pred_depth: usize,
+    caps: &'a Capabilities,
+}
+
+fn lower_predicate(p: &Pred<'_>, key: &str, v: &Value) -> Result<String, Unsupported> {
+    let Pred {
+        schema,
+        ent,
+        base,
+        depth,
+        pred_depth,
+        caps,
+    } = *p;
     if key == "and" || key == "or" {
+        if pred_depth >= MAX_PREDICATE_DEPTH {
+            return Err(Unsupported::Budget(format!(
+                "`{key}` nests more than {MAX_PREDICATE_DEPTH} levels"
+            )));
+        }
         let Value::List(items) = v else {
             return Err(Unsupported::Argument(format!(
                 "`{key}` needs a list of filters"
@@ -1786,7 +1883,16 @@ fn lower_predicate(
             }
             let inner: Result<Vec<String>, Unsupported> = m
                 .iter()
-                .map(|(k, vv)| lower_predicate(schema, ent, k, vv, base, depth, caps))
+                .map(|(k, vv)| {
+                    lower_predicate(
+                        &Pred {
+                            pred_depth: pred_depth + 1,
+                            ..*p
+                        },
+                        k,
+                        vv,
+                    )
+                })
                 .collect();
             // Conditions within one filter object are ANDed, which is what `where` itself does.
             parts.push(format!("({})", inner?.join(" AND ")));
@@ -1845,7 +1951,19 @@ fn lower_predicate(
         let view = crate::subgraph_import::to_alias(&target);
         let parts: Result<Vec<String>, Unsupported> = inner
             .iter()
-            .map(|(k, vv)| lower_predicate(schema, child, k, vv, &alias, depth + 1, caps))
+            .map(|(k, vv)| {
+                lower_predicate(
+                    &Pred {
+                        ent: child,
+                        base: &alias,
+                        depth: depth + 1,
+                        pred_depth: pred_depth + 1,
+                        ..*p
+                    },
+                    k,
+                    vv,
+                )
+            })
             .collect();
         // Membership preserves parent row counts even with duplicate child IDs. Avoid correlated
         // EXISTS: combined with a selected relation over the recursive network indexer view, DuckDB
@@ -3274,5 +3392,112 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
         // not be refused: every generated client sends it, because it is a defaulted argument.
         let c = compile(&schema(), &one("{ pools(subgraphError: deny) { id } }")).unwrap();
         assert!(c.sql.contains("FROM \"pool\""), "{}", c.sql);
+    }
+
+    /// A flat `or` never passes the 16 KiB check `/sql` applies to free-form text (#1658).
+    #[test]
+    fn a_wide_or_is_refused() {
+        let items: Vec<String> = (0..2_000).map(|i| format!(r#"{{ id: "{i}" }}"#)).collect();
+        let q = format!(
+            "{{ pools(where: {{ or: [{}] }}) {{ id }} }}",
+            items.join(", ")
+        );
+        let err = compile(&schema(), &one(&q)).unwrap_err();
+        assert!(err.to_string().contains("16384"), "{err}");
+    }
+
+    /// Nested `or` under the parser's ceiling is still the planner's stack (#1658).
+    #[test]
+    fn a_deep_or_is_refused() {
+        let schema = schema();
+        let ent = schema.entities.iter().find(|e| e.name == "Pool").unwrap();
+        let leaf = Value::Object(std::collections::BTreeMap::from([(
+            "id".into(),
+            Value::Str("a".into()),
+        )]));
+        let mut item = leaf.clone();
+        for _ in 0..64 {
+            item = Value::Object(std::collections::BTreeMap::from([(
+                "or".into(),
+                Value::List(vec![leaf.clone(), item]),
+            )]));
+        }
+        let list = Value::List(vec![item]);
+        let err = lower_predicate(
+            &Pred {
+                schema: &schema,
+                ent,
+                base: "b",
+                depth: 0,
+                pred_depth: 0,
+                caps: &Capabilities::CORE,
+            },
+            "or",
+            &list,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("64"), "{err}");
+    }
+
+    #[test]
+    fn a_deep_or_under_the_cap_still_compiles() {
+        let schema = schema();
+        let ent = schema.entities.iter().find(|e| e.name == "Pool").unwrap();
+        let leaf = Value::Object(std::collections::BTreeMap::from([(
+            "id".into(),
+            Value::Str("a".into()),
+        )]));
+        let mut item = leaf.clone();
+        for _ in 0..63 {
+            item = Value::Object(std::collections::BTreeMap::from([(
+                "or".into(),
+                Value::List(vec![leaf.clone(), item]),
+            )]));
+        }
+        let list = Value::List(vec![item]);
+        lower_predicate(
+            &Pred {
+                schema: &schema,
+                ent,
+                base: "b",
+                depth: 0,
+                pred_depth: 0,
+                caps: &Capabilities::CORE,
+            },
+            "or",
+            &list,
+        )
+        .expect("64 levels is the cap, not past it");
+    }
+
+    #[test]
+    fn an_operation_refuses_a_thirty_third_root() {
+        let mut q = String::from("{ ");
+        for i in 0..33 {
+            q.push_str(&format!("a{i}: pools {{ id }} "));
+        }
+        q.push('}');
+        let err = operation_bounds(&schema(), &parse(&q).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("32"), "{err}");
+    }
+
+    #[test]
+    fn an_operation_refuses_nine_full_pages() {
+        let mut q = String::from("{ ");
+        for i in 0..9 {
+            q.push_str(&format!("a{i}: pools(first: 1000) {{ id }} "));
+        }
+        q.push('}');
+        let err = operation_bounds(&schema(), &parse(&q).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("8000"), "{err}");
+    }
+
+    #[test]
+    fn two_full_pages_fit_the_operation_budget() {
+        let q = concat!(
+            "{ a: pools(first: 1000) { id } b: pools(first: 1000) { id } ",
+            "_meta { block { number } } }"
+        );
+        operation_bounds(&schema(), &parse(q).unwrap()).unwrap();
     }
 }
