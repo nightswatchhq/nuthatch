@@ -74,7 +74,7 @@ jobs:
   report-scheduled-failure:
     name: surface a failed scheduled run
     needs: [drift]
-    if: failure() && github.event_name == 'schedule'
+    if: always() && github.event_name == 'schedule' && (failure() || contains(needs.*.result, 'cancelled'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
