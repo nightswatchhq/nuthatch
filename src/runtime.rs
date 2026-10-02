@@ -3401,6 +3401,20 @@ impl RuntimeHandles {
             .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
             .sum();
         let projected_mb = RUNTIME_BASE_RSS_MB + existing + incoming_mb;
+        // An alias clones the dataset's state, so counting every state would tax a shared nest
+        // twice. Boot groups by dataset; this does the same by directory.
+        let runtime = self.roster["runtime"].as_str().unwrap_or("runtime");
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut already = 0usize;
+        let mut nests_here = 0usize;
+        for (_, state) in self.states.iter().filter(|(_, s)| s.chain == chain) {
+            if !seen_dirs.insert(state.dir.clone()) {
+                continue;
+            }
+            already += declared_entities(&state.dir).0;
+            nests_here += 1;
+        }
+        refuse_over_entity_ceiling(already + entity_count, nests_here + 1, runtime, &chain)?;
         if projected_mb > self.mount_ctx.max_rss_mb {
             return Err(MountRefusal::OverBudget {
                 nest: name.to_string(),
