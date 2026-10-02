@@ -5174,6 +5174,92 @@ mod tests {
         );
     }
 
+    /// The unmount has already dropped the suspension. A mounts.toml that cannot be rewritten must
+    /// still come back as a failure, or a restart brings the nest back and nobody was told.
+    #[tokio::test]
+    async fn a_failed_mounts_write_is_not_reported_as_success() {
+        let root = tempfile::tempdir().unwrap();
+        let nid = "ab".repeat(32);
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"prod\"\nchain = \"ethereum\"\nchain_id = 1\n\
+                 suspended = [\"usdc\"]\n\n\
+                 [[mounts]]\nalias = \"usdc\"\nnid = \"{nid}\"\n"
+            ),
+        )
+        .unwrap();
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let roster = serde_json::json!({"runtime": "prod", "nests": []});
+        let mut handles = RuntimeHandles {
+            live: crate::serve::LiveRuntime::new(crate::serve::compose_runtime(
+                roster.clone(),
+                Vec::new(),
+                health.clone(),
+            )),
+            states: Vec::new(),
+            alert_workers: Vec::new(),
+            publishers: Vec::new(),
+            lifecycle: std::collections::HashMap::new(),
+            health,
+            roster,
+            estimates: std::collections::HashMap::new(),
+            default_tenant: DEFAULT_TENANT.to_string(),
+            suspended: std::collections::BTreeMap::from([("usdc".to_string(), nid.clone())]),
+            mount_ctx: MountContext {
+                dir: root.path().to_path_buf(),
+                mounts: Vec::new(),
+                sources: std::collections::HashMap::new(),
+                endpoint_counts: std::collections::HashMap::new(),
+                backfill: None,
+                seal_direct: false,
+                concurrency: 1,
+                ipfs_window_deadline: std::time::Duration::from_secs(1),
+                window_override: None,
+                admin_enabled: true,
+                admin_token: None,
+                max_rss_mb: DEFAULT_MAX_RSS_MB,
+                freshness: Default::default(),
+                chain_freshness: std::collections::HashMap::new(),
+                dormant: std::collections::HashMap::new(),
+                fail_fast: false,
+                cursors: None,
+                registry: None,
+            },
+        };
+        let mut perms = std::fs::metadata(root.path()).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(root.path(), perms).unwrap();
+        struct Unlock<'a>(&'a std::path::Path);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                let mut perms = std::fs::metadata(self.0).unwrap().permissions();
+                perms.set_readonly(false);
+                std::fs::set_permissions(self.0, perms).unwrap();
+            }
+        }
+        let _unlock = Unlock(root.path());
+
+        let err = handles
+            .unmount("usdc")
+            .await
+            .expect_err("a mounts.toml that cannot be written is not a successful unmount");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("will not survive a restart"),
+            "the caller must hear that the live change is not durable: {err}"
+        );
+        assert!(
+            !handles.suspended.contains_key("usdc"),
+            "the live unmount stays; only the report of success was wrong"
+        );
+        let on_disk = std::fs::read_to_string(root.path().join(MOUNTS_FILE)).unwrap();
+        assert!(
+            on_disk.contains("usdc"),
+            "the failed rewrite must leave the old table: {on_disk}"
+        );
+    }
+
     /// #1565, and the 3.13.0 tyre-kick: a mount's route key depends on its own tenant alone, so it
     /// is the same before and after a restart whatever else is mounted, and a suspended
     /// `tenant/alias` is still found suspended when the table is read back.
