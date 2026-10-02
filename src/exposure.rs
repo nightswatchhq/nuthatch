@@ -354,6 +354,19 @@ impl ExposureView {
         }
     }
 
+    /// The same batch with each weight negated. A failed attempt leaves the view as it found it.
+    pub fn retract(&self, batch: ExposureBatch) {
+        self.apply(
+            batch
+                .into_iter()
+                .map(|mut item| {
+                    item.weight = -item.weight;
+                    item
+                })
+                .collect(),
+        );
+    }
+
     /// Block until every batch enqueued so far has been folded in (used after a restart rebuild).
     pub fn flush(&self) {
         let (ack, wait) = sync_channel(0);

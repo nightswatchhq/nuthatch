@@ -229,6 +229,16 @@ impl BalanceView {
         }
     }
 
+    /// The same batch with each weight negated. A failed attempt leaves the view as it found it.
+    pub fn retract(&self, batch: WeightedBatch) {
+        self.apply(
+            batch
+                .into_iter()
+                .map(|Tup2(delta, weight)| Tup2(delta, -weight))
+                .collect(),
+        );
+    }
+
     /// Block until every batch enqueued so far has been folded into the view. Used after a restart
     /// rebuild so the API serves complete balances from the first request.
     pub fn flush(&self) {

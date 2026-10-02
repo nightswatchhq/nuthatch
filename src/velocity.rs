@@ -306,6 +306,19 @@ impl VelocityView {
         }
     }
 
+    /// The same batch with each weight negated. A failed attempt leaves the view as it found it.
+    pub fn retract(&self, batch: VelocityBatch) {
+        self.apply(
+            batch
+                .into_iter()
+                .map(|mut item| {
+                    item.weight = -item.weight;
+                    item
+                })
+                .collect(),
+        );
+    }
+
     pub fn flush(&self) {
         let (ack, wait) = sync_channel(0);
         if self.tx.send(Msg::Flush(ack)).is_ok() {
