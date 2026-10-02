@@ -5915,21 +5915,18 @@ impl NestIngest {
             }
         }
 
-        // The discovered-child registry (RFC-0009). Empty for a static nest; for a factory nest it is
-        // rebuilt from stored factory events on a warm restart (a pure fold - determinism preserved) and
-        // grown inline as the loop decodes new factory events.
+        // The discovered-child registry (RFC-0009), folded from stored factory events.
+        // A seal-direct resume has those events sealed and `LAST_BLOCK` still unset (#1630).
         if let Some(fs) = self.factory.as_deref() {
-            if self.store.get_meta(LAST_BLOCK_KEY)?.is_some() {
-                // Propagated, not defaulted (#373): a rebuild that cannot read its own stored
-                // factory events must fault the nest into quarantine, not start it watching a
-                // silently-short set of children.
-                self.children = rebuild_children(&self.dir, &self.store, &self.registry, fs)?;
-                if !self.children.is_empty() {
-                    tracing::info!(
-                        "rebuilt child registry: {} discovered child contract(s)",
-                        self.children.len()
-                    );
-                }
+            // Propagated, not defaulted (#373): a rebuild that cannot read its own stored
+            // factory events must fault the nest into quarantine, not start it watching a
+            // silently-short set of children.
+            self.children = rebuild_children(&self.dir, &self.store, &self.registry, fs)?;
+            if !self.children.is_empty() {
+                tracing::info!(
+                    "rebuilt child registry: {} discovered child contract(s)",
+                    self.children.len()
+                );
             }
         }
         // Phase 0 (cold start, `--seal-direct`): fast-seal the finalized history straight to Parquet,
