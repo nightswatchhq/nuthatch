@@ -14611,7 +14611,10 @@ template = "pool"
         let first = nest
             .process_window(source.as_ref(), &logs, 10, 10, 100)
             .await;
-        let msg = format!("{:#}", first.expect_err("premise: the first attempt must fail"));
+        let msg = format!(
+            "{:#}",
+            first.expect_err("premise: the first attempt must fail")
+        );
         assert!(
             msg.contains("state-rpc"),
             "premise: the failure is the declared read, after the fold, got {msg}"
