@@ -2090,7 +2090,7 @@ fn graph_sql_root(name: &str) -> bool {
 #[cfg(feature = "graph")]
 fn graph_remaining(started: std::time::Instant) -> Duration {
     let elapsed = started.elapsed();
-    #[cfg(test)]
+    #[cfg(all(test, feature = "graph"))]
     let elapsed = elapsed.saturating_add(GRAPH_CLOCK_SKEW.with(|c| c.get()).unwrap_or_default());
     SQL_TIMEOUT.saturating_sub(elapsed)
 }
@@ -2255,18 +2255,18 @@ async fn graph_graphql(
                 }
             }
         };
-        #[cfg(test)]
+        #[cfg(all(test, feature = "graph"))]
         GRAPH_PERMITS.with(|c| c.set(c.get() + 1));
         Some(permit)
     } else {
         None
     };
     let mut data = serde_json::Map::new();
-    #[cfg(test)]
+    #[cfg(all(test, feature = "graph"))]
     let byte_cap = GRAPH_BYTE_CAP
         .with(|c| c.get())
         .unwrap_or(crate::engine::SQL_MAX_RESULT_BYTES);
-    #[cfg(not(test))]
+    #[cfg(not(all(test, feature = "graph")))]
     let byte_cap = crate::engine::SQL_MAX_RESULT_BYTES;
     let mut bytes_left = byte_cap;
     // Rendered at most once, and only if a root asks for it.
@@ -2734,7 +2734,7 @@ async fn graph_rows(
             SQL_TIMEOUT.as_secs()
         ));
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "graph"))]
     {
         GRAPH_SQL_CALLS.with(|c| c.set(c.get() + 1));
         GRAPH_LAST_LIMIT.with(|c| c.set(byte_budget));
