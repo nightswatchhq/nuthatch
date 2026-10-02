@@ -2068,7 +2068,7 @@ pub async fn dev(
             h.live.swap(h.compose());
         }
     }
-    let jobs = start_mount_jobs(&dir, &handles, admin_enabled).await;
+    let jobs = start_mount_jobs(&dir, &handles, admin_enabled).await?;
     let service = handles.lock().await.live.service().merge(lifecycle_routes(
         handles.clone(),
         jobs.clone(),
@@ -2204,7 +2204,7 @@ pub fn lifecycle_routes(
     admin_enabled: bool,
     admin_token: Option<String>,
 ) -> axum::Router {
-    use crate::mount_jobs::{MountJob, MountPhase};
+    use crate::mount_jobs::{ClaimError, MountJob, MountPhase};
     use axum::extract::{Path as AxPath, Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::{delete, get, post};
@@ -2274,6 +2274,13 @@ pub fn lifecycle_routes(
         err.downcast_ref::<MountRefusal>()
             .and_then(|r| StatusCode::from_u16(r.status()).ok())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+
+    fn write_failed(err: &anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{err:#}")})),
+        )
     }
 
     async fn mount_nest(
@@ -2349,11 +2356,13 @@ pub fn lifecycle_routes(
             let mut h = handles.lock().await;
             return match h.mount(&body.name, nid).await {
                 Ok(()) => {
-                    jobs.put(MountJob::new(
+                    if let Err(e) = jobs.put(MountJob::new(
                         &body.name,
                         nid_str.as_deref(),
                         MountPhase::Live,
-                    ));
+                    )) {
+                        return write_failed(&e);
+                    }
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({"mounted": body.name})),
@@ -2395,10 +2404,13 @@ pub fn lifecycle_routes(
             MountPhase::Accepted,
         )) {
             Ok(job) => job,
-            Err(running) if running.nid == nid_str => {
+            Err(ClaimError::Persist(e)) => return write_failed(&e),
+            Err(ClaimError::Running(running)) if running.nid == nid_str => {
                 return (StatusCode::ACCEPTED, Json(serde_json::json!(running)))
             }
-            Err(running) => return (StatusCode::CONFLICT, Json(serde_json::json!(running))),
+            Err(ClaimError::Running(running)) => {
+                return (StatusCode::CONFLICT, Json(serde_json::json!(running)))
+            }
         };
         spawn_mount_job(handles, jobs, body.name, nid);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
@@ -2439,12 +2451,11 @@ pub fn lifecycle_routes(
             .and_then(|(_, s)| s.nid.as_deref().map(Nid::parse))
             .transpose();
         if let Err(e) = h.unmount(&name).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("{e:#}")})),
-            );
+            return write_failed(&e);
         }
-        jobs.forget(&name);
+        if let Err(e) = jobs.forget(&name) {
+            return write_failed(&e);
+        }
         if !q.reclaim {
             return (
                 StatusCode::OK,
@@ -2559,7 +2570,9 @@ pub fn lifecycle_routes(
         match h.suspend(&name).await {
             Ok(()) => {
                 let nid = h.suspended.get(&name).map(String::as_str);
-                jobs.put(MountJob::new(&name, nid, MountPhase::Suspended));
+                if let Err(e) = jobs.put(MountJob::new(&name, nid, MountPhase::Suspended)) {
+                    return write_failed(&e);
+                }
                 (StatusCode::OK, Json(serde_json::json!({"suspended": name})))
             }
             Err(e) => (
@@ -2607,7 +2620,11 @@ pub fn lifecycle_routes(
             let mut h = handles.lock().await;
             return match h.move_name(&name, nid.clone()).await {
                 Ok(()) => {
-                    jobs.put(MountJob::new(&name, Some(nid.as_str()), MountPhase::Live));
+                    if let Err(e) =
+                        jobs.put(MountJob::new(&name, Some(nid.as_str()), MountPhase::Live))
+                    {
+                        return write_failed(&e);
+                    }
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({"moved": name, "nid": nid.as_str()})),
@@ -2626,7 +2643,10 @@ pub fn lifecycle_routes(
         job.is_move = true;
         let job = match jobs.claim(job) {
             Ok(job) => job,
-            Err(running) => return (StatusCode::CONFLICT, Json(serde_json::json!(running))),
+            Err(ClaimError::Persist(e)) => return write_failed(&e),
+            Err(ClaimError::Running(running)) => {
+                return (StatusCode::CONFLICT, Json(serde_json::json!(running)))
+            }
         };
         spawn_move_job(handles, jobs, name, nid);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
@@ -2651,7 +2671,11 @@ pub fn lifecycle_routes(
         if q.wait {
             return match h.mount(&name, Some(nid.clone())).await {
                 Ok(()) => {
-                    jobs.put(MountJob::new(&name, Some(nid.as_str()), MountPhase::Live));
+                    if let Err(e) =
+                        jobs.put(MountJob::new(&name, Some(nid.as_str()), MountPhase::Live))
+                    {
+                        return write_failed(&e);
+                    }
                     (StatusCode::OK, Json(serde_json::json!({"resumed": name})))
                 }
                 Err(e) => (
@@ -2670,7 +2694,10 @@ pub fn lifecycle_routes(
             MountPhase::Accepted,
         )) {
             Ok(job) => job,
-            Err(running) => return (StatusCode::ACCEPTED, Json(serde_json::json!(running))),
+            Err(ClaimError::Persist(e)) => return write_failed(&e),
+            Err(ClaimError::Running(running)) => {
+                return (StatusCode::ACCEPTED, Json(serde_json::json!(running)))
+            }
         };
         spawn_mount_job(handles, jobs, name, Some(nid));
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
@@ -3107,7 +3134,7 @@ pub async fn start_mount_jobs(
     dir: &Path,
     handles: &Arc<tokio::sync::Mutex<RuntimeHandles>>,
     admin_enabled: bool,
-) -> Arc<crate::mount_jobs::MountJobs> {
+) -> Result<Arc<crate::mount_jobs::MountJobs>> {
     use crate::mount_jobs::{MountJob, MountJobs, MountPhase};
     // Before any job runs, so a fetch a killed process left staged cannot be mistaken for one running.
     crate::mount_jobs::clear_stale_fetches(dir);
@@ -3123,10 +3150,10 @@ pub async fn start_mount_jobs(
             {
                 continue;
             }
-            jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live));
+            jobs.put(MountJob::new(name, state.nid.as_deref(), MountPhase::Live))?;
         }
         for (name, nid) in &h.suspended {
-            jobs.put(MountJob::new(name, Some(nid), MountPhase::Suspended));
+            jobs.put(MountJob::new(name, Some(nid), MountPhase::Suspended))?;
         }
     }
     if admin_enabled {
@@ -3143,7 +3170,7 @@ pub async fn start_mount_jobs(
             }
         }
     }
-    jobs
+    Ok(jobs)
 }
 
 /// Run a mount as a job (#1544). The fetch happens with no lock held, so a slow registry holds up no
@@ -3161,13 +3188,13 @@ pub fn spawn_mount_job(
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
             let fetched = match (&plan.fetch_from, &plan.nid) {
                 (Some(registry), Some(n)) => {
-                    jobs.advance(&name, MountPhase::Fetching, None);
+                    jobs.advance(&name, MountPhase::Fetching, None)?;
                     fetch_nid(registry, n, &plan.dir, &name).await?;
                     true
                 }
                 _ => false,
             };
-            jobs.advance(&name, MountPhase::Joining, None);
+            jobs.advance(&name, MountPhase::Joining, None)?;
             let mut h = handles.lock().await;
             let mounted = h.mount(&name, nid).await;
             // Only a fetch no live mount has since taken up is ours to remove.
@@ -3184,18 +3211,30 @@ pub fn spawn_mount_job(
             })
         };
         match outcome {
-            Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Ok(()) => {
+                if let Err(e) = jobs.advance(&name, MountPhase::Live, None) {
+                    tracing::warn!("'{name}' is mounted but the job file was not updated: {e:#}");
+                }
+            }
             Err(e)
                 if matches!(
                     e.downcast_ref::<MountRefusal>(),
                     Some(MountRefusal::AlreadyMounted(_))
                 ) && reached(&*handles.lock().await) =>
             {
-                jobs.advance(&name, MountPhase::Live, None)
+                if let Err(e) = jobs.advance(&name, MountPhase::Live, None) {
+                    tracing::warn!("'{name}' is mounted but the job file was not updated: {e:#}");
+                }
             }
             Err(e) => {
                 tracing::warn!("mounting '{name}' failed: {e:#}");
-                jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));
+                if let Err(write) =
+                    jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")))
+                {
+                    tracing::warn!(
+                        "mount of '{name}' failed and the job file was not updated: {write:#}"
+                    );
+                }
             }
         }
     })
@@ -3260,13 +3299,13 @@ pub fn spawn_move_job(
             let plan = handles.lock().await.plan_mount(&staging, Some(&nid))?;
             let fetched = match (&plan.fetch_from, &plan.nid) {
                 (Some(registry), Some(n)) => {
-                    jobs.advance(&name, MountPhase::Fetching, None);
+                    jobs.advance(&name, MountPhase::Fetching, None)?;
                     fetch_nid(registry, n, &plan.dir, &name).await?;
                     true
                 }
                 _ => false,
             };
-            jobs.advance(&name, MountPhase::Joining, None);
+            jobs.advance(&name, MountPhase::Joining, None)?;
             let mut h = handles.lock().await;
             let moved = h.move_name(&name, nid).await;
             // As for a mount: a refused move removes only a fetch no live mount has since taken up.
@@ -3277,10 +3316,20 @@ pub fn spawn_move_job(
         }
         .await;
         match outcome {
-            Ok(()) => jobs.advance(&name, MountPhase::Live, None),
+            Ok(()) => {
+                if let Err(e) = jobs.advance(&name, MountPhase::Live, None) {
+                    tracing::warn!("'{name}' is moved but the job file was not updated: {e:#}");
+                }
+            }
             Err(e) => {
                 tracing::warn!("moving '{name}' failed: {e:#}");
-                jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")));
+                if let Err(write) =
+                    jobs.advance(&name, MountPhase::Failed, Some(format!("{e:#}")))
+                {
+                    tracing::warn!(
+                        "move of '{name}' failed and the job file was not updated: {write:#}"
+                    );
+                }
             }
         }
     })
@@ -3348,8 +3397,8 @@ impl RuntimeHandles {
         }
         // A mount of a suspended name is its resume; it stays suspended until the join has landed.
         if mounted.is_ok() && self.suspended.remove(name).is_some() {
-            self.persist();
             self.live.swap(self.compose());
+            self.persist()?;
         }
         mounted
     }
@@ -3829,7 +3878,7 @@ impl RuntimeHandles {
             &self.estimates,
         ));
         self.live.swap(self.compose());
-        self.persist();
+        self.persist()?;
         Ok(())
     }
 
@@ -3860,19 +3909,17 @@ impl RuntimeHandles {
         self.unmount(name).await?;
         self.suspended.insert(name.to_string(), nid);
         self.health.suspend_nest(name);
-        self.persist();
         self.live.swap(self.compose());
+        self.persist()?;
         tracing::info!("nest '{name}' suspended");
         Ok(())
     }
 
     /// Write the current mounted set to `mounts.toml`.
     ///
-    /// Best-effort by design: the mount or unmount has *already happened* in the running process, and
-    /// failing the operation because the manifest could not be rewritten would leave the caller with a
-    /// reported failure and a completed change - the worst of both. A loud warning is the honest
-    /// outcome, and the operator can fix the file.
-    fn persist(&self) {
+    /// The live change has already happened and is not undone if the rewrite fails. The error
+    /// is returned so the route does not report success for a change a restart will drop.
+    fn persist(&self) -> Result<()> {
         // A move's staging mount is never recorded: a restart mid-move keeps the old nest, and the
         // move job, resumed, stages the new one again.
         let names: Vec<String> = self
@@ -3882,17 +3929,13 @@ impl RuntimeHandles {
             .filter(|n| !n.ends_with(STAGING_SUFFIX))
             .collect();
         let suspended: Vec<String> = self.suspended.keys().cloned().collect();
-        if let Err(e) = persist_mounted_nests(
-            &self.mount_ctx.dir,
-            &names,
-            &self.mount_ctx.mounts,
-            &suspended,
-        ) {
-            tracing::warn!(
-                "the runtime's nest set changed but {MOUNTS_FILE} could not be updated ({e:#}) - the \
-                 change is live now but will not survive a restart"
-            );
-        }
+        persist_mounted_nests(&self.mount_ctx.dir, &names, &self.mount_ctx.mounts, &suspended)
+            .with_context(|| {
+                format!(
+                    "the runtime's nest set changed but {MOUNTS_FILE} could not be updated - the \
+                     change is live now but will not survive a restart"
+                )
+            })
     }
 
     /// Reclaim an unmounted dataset's disk (#1547). A mount record naming it keeps it, and a store
@@ -3919,9 +3962,8 @@ impl RuntimeHandles {
             // A suspended mount is already off its cursor; unmounting it drops the record.
             if self.suspended.remove(name).is_some() {
                 self.health.retire_nest(name);
-                self.persist();
                 self.live.swap(self.compose());
-                return Ok(());
+                return self.persist();
             }
             tracing::debug!("nest '{name}' is not mounted; nothing to unmount");
             return Ok(());
@@ -3946,8 +3988,7 @@ impl RuntimeHandles {
         if still_held {
             self.publishers.retain(|(n, _)| n != name);
             self.states.remove(idx);
-            self.recompose_after_unmount(name);
-            return Ok(());
+            return self.recompose_after_unmount(name);
         }
 
         self.drain_cursor_nest(&chain, &cursor_key, name).await?;
@@ -3959,7 +4000,7 @@ impl RuntimeHandles {
         crate::analytics::invalidate_session_cache(&dataset_dir);
         crate::metrics::METRICS.remove_nest(&cursor_key);
         crate::metrics::METRICS.remove_nest(name);
-        self.recompose_after_unmount(name);
+        self.recompose_after_unmount(name)?;
         Ok(())
     }
 
@@ -4116,7 +4157,7 @@ impl RuntimeHandles {
             crate::analytics::invalidate_session_cache(&old_state.dir);
         }
         drop(old_state);
-        self.recompose();
+        self.recompose()?;
         tracing::info!("'{name}' moved to nid {nid}");
         Ok(())
     }
@@ -4176,12 +4217,13 @@ impl RuntimeHandles {
         Ok(())
     }
 
-    fn recompose_after_unmount(&mut self, name: &str) {
-        self.recompose();
+    fn recompose_after_unmount(&mut self, name: &str) -> Result<()> {
+        self.recompose()?;
         tracing::info!("nest '{name}' unmounted from the runtime");
+        Ok(())
     }
 
-    fn recompose(&mut self) {
+    fn recompose(&mut self) -> Result<()> {
         // Rebuilt from `states`, same as `mount` - so the departed nest, and any dataset co-tenant's
         // `shared_with` entry naming it, both drop out of the roster in the same step its routes do.
         let datasets = live_datasets(
@@ -4197,7 +4239,7 @@ impl RuntimeHandles {
             &self.estimates,
         ));
         self.live.swap(self.compose());
-        self.persist();
+        self.persist()
     }
 }
 
