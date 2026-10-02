@@ -18536,7 +18536,9 @@ template="pool"
     #[async_trait::async_trait]
     impl Source for TailSource {
         async fn tip(&self) -> Result<u64> {
-            Ok(10_000_000)
+            // Two windows and then the tip, with nothing final. A far tip lets the loop run on and
+            // seal block 19 out of the hot store before the assertion reads it.
+            Ok(30)
         }
         async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
             Ok(None)
