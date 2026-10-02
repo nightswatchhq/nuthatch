@@ -14747,7 +14747,10 @@ template = "pool"
             .process_window(&source, &[log], 10, 10, 100)
             .await
             .unwrap();
-        assert!(outcome.is_some(), "a window whose hash still matches must commit");
+        assert!(
+            outcome.is_some(),
+            "a window whose hash still matches must commit"
+        );
         drop(nest);
         let store = Store::open(&d.path().join(DB_FILE)).unwrap();
         assert_eq!(store.entity_keys().unwrap().len(), 1);
