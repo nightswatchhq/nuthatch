@@ -5294,6 +5294,14 @@ template="pool"
         )
         .unwrap();
         assert_eq!(s[0]["s"], Value::from(fits));
+
+        // The bare sum is the column's own values. The 39-digit row is NULL there.
+        let bare = query(
+            dir.path(),
+            r#"SELECT SUM(value_dec)::VARCHAR AS s FROM "t__transfer""#,
+        )
+        .unwrap();
+        assert_eq!(bare[0]["s"], Value::from(fits));
     }
 
     /// #434: a declared big-int column that **no** sealed segment carries must not delete the table.
