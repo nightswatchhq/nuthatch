@@ -14,7 +14,7 @@ use serde_json::Value;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -247,8 +247,8 @@ fn spilled_bytes(dir: &Path) -> u64 {
 
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
 /// interrupting the running DuckDB query) and a cap on materialised rows. Trusted internal callers
-/// (`net_balances`, `get_row`) run *unguarded* - their SQL is registry-built, never user text, and
-/// they must run to completion. Access control (who may query, per-caller quotas) is deliberately
+/// (`net_balances`, `get_row`) run *unguarded*. A public `/entity` miss uses [`get_row_guarded`]
+/// (#1657). Access control (who may query, per-caller quotas) is deliberately
 /// *not* here: that needs caller identity a sovereign single-tenant node doesn't have - it's a
 /// gateway's job. This guard is only about the node protecting itself from any single query.
 #[derive(Clone, Copy)]
@@ -2203,7 +2203,37 @@ fn define_children_views(session: &dyn Session, dir: &Path) {
 
 /// Point-read fallback: fetch a single sealed transfer by (block, log_index). Used when the hot
 /// store has already pruned it. Integers are interpolated (not user text), so no injection surface.
+/// Unguarded: trusted callers. The public route is [`get_row_guarded`].
 pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> {
+    read_sealed(dir, block, log_index, None)
+}
+
+/// As [`get_row`], under one deadline for the probe and the read (#1657).
+pub fn get_row_guarded(
+    dir: &Path,
+    block: u64,
+    log_index: u64,
+    guard: QueryGuard,
+) -> Result<Option<Value>> {
+    #[cfg(test)]
+    ENTITY_GUARDED.fetch_add(1, Ordering::Relaxed);
+    read_sealed(dir, block, log_index, Some(guard))
+}
+
+#[cfg(test)]
+static ENTITY_GUARDED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn entity_guarded_reads() -> usize {
+    ENTITY_GUARDED.load(Ordering::Relaxed)
+}
+
+fn read_sealed(
+    dir: &Path,
+    block: u64,
+    log_index: u64,
+    mut guard: Option<QueryGuard>,
+) -> Result<Option<Value>> {
     let manifest = crate::seal::load_manifest(dir)?;
     // The id names no table. Asking each in turn cost a query per table (#1574), so one probe finds
     // the table and the row is then read from it alone, in the shape a single-table query gives.
@@ -2220,17 +2250,36 @@ pub fn get_row(dir: &Path, block: u64, log_index: u64) -> Result<Option<Value>> 
     if probe.is_empty() {
         return Ok(None);
     }
-    let found = query(
+    let started = Instant::now();
+    let found = sealed_rows(
         dir,
         &format!("{} ORDER BY t LIMIT 1", probe.join(" UNION ALL ")),
+        guard,
     )?;
+    // The second read spends what the probe left of the one deadline.
+    if let Some(g) = guard.as_mut() {
+        g.timeout = g.timeout.saturating_sub(started.elapsed());
+    }
     let Some(table) = found.first().and_then(|r| r["t"].as_str()) else {
         return Ok(None);
     };
     let sql = format!(
         "SELECT * FROM \"{table}\" WHERE block_number = {block} AND log_index = {log_index} LIMIT 1"
     );
-    Ok(query(dir, &sql)?.into_iter().next())
+    Ok(sealed_rows(dir, &sql, guard)?.into_iter().next())
+}
+
+fn sealed_rows(dir: &Path, sql: &str, guard: Option<QueryGuard>) -> Result<Vec<Value>> {
+    match guard {
+        None => query(dir, sql),
+        Some(g) => {
+            let out = query_guarded(dir, sql, g)?;
+            if out.truncated {
+                bail!("sealed point read exceeded its row cap");
+            }
+            Ok(out.rows)
+        }
+    }
 }
 
 /// Expose each table's sealed segments as a read-only DuckDB view named after the table. Tables with
@@ -4311,6 +4360,18 @@ template="pool"
         // Point-read searches all tables by (block, log_index).
         let one = get_row(dir.path(), 10, 1).unwrap().unwrap();
         assert_eq!(one["to"], Value::from("0xc"));
+        let guarded = get_row_guarded(
+            dir.path(),
+            10,
+            1,
+            QueryGuard {
+                timeout: Duration::from_secs(30),
+                max_rows: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(guarded["to"], one["to"]);
         let appr = get_row(dir.path(), 10, 2).unwrap().unwrap();
         assert_eq!(appr["spender"], Value::from("0xd"));
 
