@@ -2021,6 +2021,83 @@ async fn suspend_and_resume_over_the_admin_api() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// #1642: a localhost runtime needs no token, so the only thing between a hostile page and the
+/// lifecycle routes is the browser. Over the real bind with `--cors '*'`, the page may neither have a
+/// preflight granted nor suspend a mount with a form POST, which is sent without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6c".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let service = handles.lock().await.live.service().merge(runtime::lifecycle_routes(
+        handles.clone(),
+        jobs,
+        true,
+        None,
+    ));
+    let cors = serve::cors_layer(&["*".to_string()]).unwrap();
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let serving = {
+        let addr = addr.clone();
+        tokio::spawn(async move { serve::bind_and_serve(&addr, service, cors).await })
+    };
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    while client
+        .get(format!("http://{addr}/usdc/health"))
+        .send()
+        .await
+        .is_err()
+    {
+        assert!(started.elapsed() < POLL_TIMEOUT, "never came up on {addr}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let url = format!("http://{addr}/_admin/suspend/usdc");
+
+    let preflight = client
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("origin", "https://evil.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "--cors granted a cross-origin preflight to a lifecycle route: {:?}",
+        preflight.headers()
+    );
+
+    let form = client
+        .post(&url)
+        .header("origin", "https://evil.example")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        form.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "a cross-site form POST reached suspend"
+    );
+    assert_eq!(
+        status_of(&handles).await,
+        axum::http::StatusCode::OK,
+        "a form POST suspended the mount"
+    );
+    serving.abort();
+}
+
 /// #1547: an API-only operator can free a dataset's disk. Unmounting one of two mounts of a NID with
 /// `?reclaim=true` keeps the dataset and names who holds it; unmounting the last one removes it.
 /// A dataset unmounted earlier is reclaimed by NID, and a malformed NID is a caller error.
