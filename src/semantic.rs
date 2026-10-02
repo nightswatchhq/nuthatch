@@ -85,8 +85,9 @@ pub struct Footguns {
     pub big_ints: Vec<String>,
     /// The subset of `big_ints` whose storage exceeds `DECIMAL(38,0)`'s range (int/uint wider than 128
     /// bits - e.g. a Uniswap-v3 `sqrtPriceX96` uint160): their `{col}_dec` companion is **NULL**
-    /// whenever the value has more than 38 digits, so exact-decimal math silently drops those rows.
-    /// Use `CAST({col} AS DOUBLE)` for arithmetic on such price/sqrt-scale values.
+    /// whenever the value has more than 38 digits. `SUM({col}_dec)` is the values that fit, and
+    /// `WHERE NOT {col}_overflow` is that same sum. A price that never fits wants
+    /// `CAST({col} AS DOUBLE)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overflows_dec: Vec<String>,
     /// Columns holding a Solidity `bool`, stored as exact text `'true'`/`'false'`, not a SQL boolean
@@ -535,7 +536,8 @@ pub fn compose(
         }
         if !fg.big_ints.is_empty() {
             out.push_str(&format!(
-                "    ⚠ big-int columns (exact text; use the `_dec` companion for SUM/AVG/compare): {}\n",
+                "    ⚠ big-int columns (exact text; SUM/AVG of `_dec` is the values that fit, \
+                 and WHERE NOT <col>_overflow is that same sum): {}\n",
                 fg.big_ints
                     .iter()
                     .map(|c| format!("{c} → {c}_dec"))
@@ -545,7 +547,9 @@ pub fn compose(
         }
         if !fg.overflows_dec.is_empty() {
             out.push_str(&format!(
-                "    ⚠ wide columns (>128-bit) whose `_dec` is NULL above 38 digits - amounts that fit can use `_dec`; ids, nonces and hashes stay on the raw column: {}\n",
+                "    ⚠ wide columns (>128-bit) whose `_dec` is NULL above 38 digits. A sum of \
+                 `_dec` is the values that fit; WHERE NOT <col>_overflow is that same sum. Ids, \
+                 nonces and hashes stay on the raw column: {}\n",
                 fg.overflows_dec.join(", ")
             ));
         }
