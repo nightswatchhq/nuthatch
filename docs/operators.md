@@ -740,7 +740,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /health` | liveness. `200 "ok"` while the process serves |
 | `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, the cursor stops advancing (`wedged`), or the seal stops advancing (`tip_seal_stalled`, 3.6.1) |
 | `GET /metrics` | Prometheus text exposition |
-| `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold |
+| `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold; `"degraded": true` and the table in `degraded_tables`, as on `/sql`, when the sealed rows could not be read |
 | `GET /schema` | the full data model |
 | `GET /sql?q=…` | read-only analytical SQL over hot and sealed data |
 | `GET /explain` | query plan and cost hints |
