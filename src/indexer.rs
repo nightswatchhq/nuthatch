@@ -1793,11 +1793,16 @@ async fn fan_out_window(
         if nexts[i] > to {
             continue;
         }
-        let nest_logs: Vec<crate::rpc::Log> = logs
-            .iter()
-            .filter(|l| l.block_number >= nexts[i] && live_ref(nests, i).owns(l))
-            .cloned()
-            .collect();
+        // Two blocks before this nest's cursor are the previous window's tail (#1144).
+        // process_window drops the rows the store already holds.
+        let nest_logs: Vec<crate::rpc::Log> = {
+            let nest = live_ref(nests, i);
+            let from = overlap_from(nexts[i], nest.start_block.unwrap_or(0));
+            logs.iter()
+                .filter(|l| l.block_number >= from && nest.owns(l))
+                .cloned()
+                .collect()
+        };
         // `Some(_)` → committed, advance this nest past the window. `None` → timestamps were
         // unavailable, so leave its cursor put: `global_next` (the min) stays here, the next
         // iteration re-fetches, and this nest retries while nests that did advance simply
@@ -2246,9 +2251,18 @@ async fn runtime_index_loop(
         // `LogFilter::new` is what makes that unaskable; the `None` arm is this site deciding what
         // "nothing to ask for" means, which here is an empty window that still gets fanned out to the
         // live nests rather than skipped, so the shared cursor advances in step for all of them.
+        let fetch_from = live
+            .iter()
+            .map(|&i| {
+                let n = live_ref(&nests, i);
+                overlap_from(nexts[i], n.start_block.unwrap_or(0))
+            })
+            .min()
+            .unwrap_or(global_next);
         let filter = LogFilter::new(&u_addrs, &u_topics);
         let fetched = match &filter {
-            Some(f) => source.logs(f, global_next, to).await,
+            // Same tail as the solo loop (#1144). A short answer is filled in on the next window.
+            Some(f) => source.logs(f, fetch_from, to).await,
             None => Ok(Vec::new()),
         };
         match fetched {
@@ -18812,6 +18826,91 @@ template="pool"
             forgotten.first().copied(),
             Some(0),
             "a runtime reorg left the timestamp cache in place: {forgotten:?}"
+        );
+    }
+
+    /// The runtime cursor asks again for the two blocks before its cursor. A log the previous
+    /// window missed lives there, and dropping it on the way into the nest loses it for good.
+    struct TailSource {
+        ranges: std::sync::Mutex<Vec<(u64, u64)>>,
+        missed: crate::rpc::Log,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for TailSource {
+        async fn tip(&self) -> Result<u64> {
+            // Two windows and then the tip, with nothing final. A far tip lets the loop run on and
+            // seal block 19 out of the hot store before the assertion reads it.
+            Ok(30)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.ranges.lock().unwrap().push((from, to));
+            if from <= self.missed.block_number && self.missed.block_number <= to {
+                Ok(vec![self.missed.clone()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_runtime_cursor_refetches_the_block_the_previous_window_missed() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(d.path(), addr).await;
+        nest.store.set_meta(LAST_BLOCK_KEY, "20").unwrap();
+        let dir = nest.dir.clone();
+        let src = Arc::new(TailSource {
+            ranges: std::sync::Mutex::new(Vec::new()),
+            missed: transfer_log(19, 0),
+        });
+        let ranges = src.clone();
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![nest],
+            Some(0),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+        let fetched_twice = within_deadline(|| ranges.ranges.lock().unwrap().len() >= 2).await;
+        task.abort();
+        let _ = task.await;
+        let seen = ranges.ranges.lock().unwrap().clone();
+        assert!(
+            fetched_twice,
+            "the runtime did not reach a second window: {seen:?}"
+        );
+        // The commit runs on the blocking pool and can outlive the aborted task by a moment.
+        let mut opened = None;
+        for _ in 0..50 {
+            if let Ok(store) = Store::open(&dir.join(DB_FILE)) {
+                opened = Some(store);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let store = opened.expect("the cursor did not release the store");
+        assert!(
+            !store.entities_in_range(19, 19).unwrap().is_empty(),
+            "block 19 was missed by the previous window and the runtime never stored it: {seen:?}"
         );
     }
 
