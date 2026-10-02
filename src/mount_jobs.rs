@@ -320,6 +320,34 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_whose_write_fails_puts_the_finished_job_back() {
+        let d = tempfile::tempdir().unwrap();
+        let jobs = MountJobs::load(d.path());
+        jobs.put(MountJob::new("a", Some("old"), MountPhase::Failed))
+            .unwrap();
+        let mut perms = std::fs::metadata(d.path()).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(d.path(), perms).unwrap();
+        struct Unlock<'a>(&'a Path);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                let mut perms = std::fs::metadata(self.0).unwrap().permissions();
+                perms.set_readonly(false);
+                std::fs::set_permissions(self.0, perms).unwrap();
+            }
+        }
+        let _unlock = Unlock(d.path());
+
+        let err = jobs
+            .claim(MountJob::new("a", Some("new"), MountPhase::Accepted))
+            .expect_err("a claim that cannot be written is not a started job");
+        assert!(matches!(err, ClaimError::Persist(_)));
+        let kept = jobs.get("a").expect("the finished job stays");
+        assert_eq!(kept.phase, MountPhase::Failed);
+        assert_eq!(kept.nid.as_deref(), Some("old"));
+    }
+
+    #[test]
     fn only_one_of_several_identical_claims_wins() {
         let d = tempfile::tempdir().unwrap();
         let jobs = MountJobs::load(d.path());
