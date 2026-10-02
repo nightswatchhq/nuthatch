@@ -3146,6 +3146,19 @@ pub async fn start_mount_jobs(
     jobs
 }
 
+/// The gap between a job's fetch and its join. A test forgets the job here (#1638).
+#[cfg(test)]
+fn before_mount_join() -> &'static std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>
+{
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+static MOUNT_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Run a mount as a job (#1544). The fetch happens with no lock held, so a slow registry holds up no
 /// other admin call; only the join takes the runtime's lock.
 pub fn spawn_mount_job(
@@ -3168,6 +3181,10 @@ pub fn spawn_mount_job(
                 _ => false,
             };
             jobs.advance(&name, MountPhase::Joining, None);
+            #[cfg(test)]
+            if let Some(hook) = before_mount_join().lock().unwrap().clone() {
+                hook();
+            }
             let mut h = handles.lock().await;
             let mounted = h.mount(&name, nid).await;
             // Only a fetch no live mount has since taken up is ours to remove.
@@ -3329,6 +3346,8 @@ impl RuntimeHandles {
     /// given an absolute string. [`Nid::parse`] is the only way to produce one, so nothing can call
     /// this function with a raw string.
     pub async fn mount(&mut self, name: &str, nid: Option<Nid>) -> Result<()> {
+        #[cfg(test)]
+        MOUNT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let plan = self.plan_mount(name, nid.as_ref())?;
         // A NID this runtime does not hold is fetched first (#1543). Whatever refuses the mount after
         // that removes the fetch again, so a refusal still leaves nothing behind.
@@ -5937,5 +5956,92 @@ mod tests {
         drop(tx);
         assert!(moved.is_err());
         assert_eq!(seen.await.unwrap(), ["usdc->other"]);
+    }
+
+    fn idle_handles(dir: &std::path::Path) -> RuntimeHandles {
+        let health = std::sync::Arc::new(crate::health::RuntimeHealth::new());
+        let roster = serde_json::json!({"runtime": "t", "nests": []});
+        let live = crate::serve::LiveRuntime::new(crate::serve::compose_runtime(
+            roster.clone(),
+            Vec::new(),
+            health.clone(),
+        ));
+        RuntimeHandles {
+            live,
+            states: Vec::new(),
+            alert_workers: Vec::new(),
+            publishers: Vec::new(),
+            lifecycle: std::collections::HashMap::new(),
+            health,
+            roster,
+            estimates: std::collections::HashMap::new(),
+            default_tenant: DEFAULT_TENANT.to_string(),
+            suspended: std::collections::BTreeMap::new(),
+            mount_ctx: MountContext {
+                dir: dir.to_path_buf(),
+                mounts: Vec::new(),
+                sources: std::collections::HashMap::new(),
+                endpoint_counts: std::collections::HashMap::new(),
+                backfill: None,
+                seal_direct: false,
+                concurrency: 1,
+                ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+                window_override: None,
+                admin_enabled: true,
+                admin_token: None,
+                max_rss_mb: DEFAULT_MAX_RSS_MB,
+                freshness: Default::default(),
+                chain_freshness: std::collections::HashMap::new(),
+                dormant: std::collections::HashMap::new(),
+                fail_fast: false,
+                cursors: None,
+                registry: None,
+            },
+        }
+    }
+
+    /// #1638: forgetting the job in the gap before the join must stop the mount.
+    #[tokio::test]
+    async fn an_unmount_of_an_accepted_job_is_not_overtaken_by_it() {
+        use crate::mount_jobs::{MountJob, MountPhase};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n",
+        )
+        .unwrap();
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
+        jobs.claim(MountJob::new("usdc", None, MountPhase::Accepted))
+            .unwrap();
+        super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
+        let jobs_hook = jobs.clone();
+        *super::before_mount_join().lock().unwrap() = Some(Arc::new(move || {
+            jobs_hook.forget("usdc");
+            jobs_hook
+                .claim(MountJob::new("usdc", None, MountPhase::Accepted))
+                .expect("the name is free once the first job is forgotten");
+        }));
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                *super::before_mount_join().lock().unwrap() = None;
+            }
+        }
+        let _clear = Clear;
+        let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
+        spawn_mount_job(handles, jobs.clone(), "usdc".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::MOUNT_ENTRIES.load(Ordering::SeqCst),
+            0,
+            "the forgotten job must not mount"
+        );
+        let again = jobs.get("usdc").expect("the replacement claim stays");
+        assert_eq!(again.phase, MountPhase::Accepted);
     }
 }
