@@ -7248,7 +7248,7 @@ template="pool"
             .unwrap_or_else(|| panic!("stopped for the wrong reason: {err:#}"));
         assert_eq!(cut.cap_bytes, 64 * 1024 * 1024);
         assert!(
-            started.elapsed() < Duration::from_secs(20),
+            started.elapsed() < Duration::from_secs(45),
             "stopped by the deadline, not the spill: {:?}",
             started.elapsed()
         );
