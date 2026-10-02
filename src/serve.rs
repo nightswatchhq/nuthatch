@@ -2070,6 +2070,32 @@ struct TableQuery {
     to_block: Option<u64>,
 }
 
+#[cfg(all(test, feature = "graph"))]
+thread_local! {
+    static GRAPH_SQL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_PERMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_CLOCK_SKEW: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+    static GRAPH_BYTE_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static GRAPH_LAST_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_GUARD_TIMEOUT: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "graph")]
+fn graph_sql_root(name: &str) -> bool {
+    !matches!(name, "__schema" | "__type" | "_meta")
+}
+
+/// One clock for every root. A fresh instant per root is how one request runs for hours (#1658).
+#[cfg(feature = "graph")]
+fn graph_remaining(started: std::time::Instant) -> Duration {
+    let elapsed = started.elapsed();
+    #[cfg(all(test, feature = "graph"))]
+    let elapsed = elapsed.saturating_add(GRAPH_CLOCK_SKEW.with(|c| c.get()).unwrap_or_default());
+    SQL_TIMEOUT.saturating_sub(elapsed)
+}
+
 /// The enriched schema document (RFC-0016 §2): the composition of registry **structure**, the
 /// authored **meaning** from `semantic.toml`, the derived **footguns**, and live **coverage** (the
 /// hot/cold seam as numbers). Assembled per call from this running nest - the MCP `schema` tool
@@ -2199,7 +2225,51 @@ async fn graph_graphql(
             root.args.remove("block");
         }
     }
+    if let Err(e) = crate::graph_query::operation_bounds(&schema, &roots) {
+        return (StatusCode::OK, Json(gql_error(&e.to_string())));
+    }
+    // Taken once for the document. Re-acquiring per root resets the 30s clock (#1658).
+    let started = std::time::Instant::now();
+    let _operation_permit = if roots.iter().any(|r| graph_sql_root(&r.name)) {
+        let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
+                    return (
+                        StatusCode::OK,
+                        Json(gql_error("server busy: too many concurrent SQL queries")),
+                    );
+                };
+                match tokio::time::timeout(
+                    SQL_ADMISSION_WAIT,
+                    Arc::clone(&s.sql_gate).acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(p)) => p,
+                    _ => {
+                        return (
+                            StatusCode::OK,
+                            Json(gql_error("server busy: too many concurrent SQL queries")),
+                        );
+                    }
+                }
+            }
+        };
+        #[cfg(all(test, feature = "graph"))]
+        GRAPH_PERMITS.with(|c| c.set(c.get() + 1));
+        Some(permit)
+    } else {
+        None
+    };
     let mut data = serde_json::Map::new();
+    #[cfg(all(test, feature = "graph"))]
+    let byte_cap = GRAPH_BYTE_CAP
+        .with(|c| c.get())
+        .unwrap_or(crate::engine::SQL_MAX_RESULT_BYTES);
+    #[cfg(not(all(test, feature = "graph")))]
+    let byte_cap = crate::engine::SQL_MAX_RESULT_BYTES;
+    let mut bytes_left = byte_cap;
     // Rendered at most once, and only if a root asks for it.
     let mut doc: Option<serde_json::Value> = None;
     // **Every root field is answered.** Routing on `any(… == "__schema")` and returning early meant
@@ -2322,8 +2392,32 @@ async fn graph_graphql(
         {
             return (StatusCode::OK, Json(gql_error(&e)));
         }
-        match graph_rows(&s, &compiled, historical_blocks.get(&root.key).copied()).await {
-            Ok(rows) => {
+        if graph_remaining(started).is_zero() {
+            return (
+                StatusCode::OK,
+                Json(gql_error(&format!(
+                    "the operation exceeded its {}s budget",
+                    SQL_TIMEOUT.as_secs()
+                ))),
+            );
+        }
+        if bytes_left == 0 {
+            return (
+                StatusCode::OK,
+                Json(gql_error("the operation exceeds its result budget")),
+            );
+        }
+        match graph_rows(
+            &s,
+            &compiled,
+            historical_blocks.get(&root.key).copied(),
+            started,
+            bytes_left,
+        )
+        .await
+        {
+            Ok((rows, used)) => {
+                bytes_left = bytes_left.saturating_sub(used);
                 let shaped: Result<Vec<serde_json::Value>, String> =
                     rows.iter().map(|r| graph_shape(&compiled, r)).collect();
                 let shaped = match shaped {
@@ -2632,14 +2726,34 @@ async fn graph_rows(
     s: &AppState,
     compiled: &crate::graph_query::Compiled,
     historical_block: Option<u64>,
-) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
-    let resp = run_sql_query_at(s.clone(), compiled.sql.clone(), None, historical_block).await;
-    let body = axum::body::to_bytes(resp.into_response().into_body(), 64 << 20)
+    started: std::time::Instant,
+    byte_budget: usize,
+) -> Result<(Vec<serde_json::Map<String, serde_json::Value>>, usize), String> {
+    if graph_remaining(started).is_zero() {
+        return Err(format!(
+            "the operation exceeded its {}s budget",
+            SQL_TIMEOUT.as_secs()
+        ));
+    }
+    #[cfg(all(test, feature = "graph"))]
+    {
+        GRAPH_SQL_CALLS.with(|c| c.set(c.get() + 1));
+        GRAPH_LAST_LIMIT.with(|c| c.set(byte_budget));
+    }
+    let resp = run_sql_query_at(
+        s.clone(),
+        compiled.sql.clone(),
+        None,
+        historical_block,
+        Some(graph_remaining(started)),
+    )
+    .await;
+    let body = axum::body::to_bytes(resp.into_response().into_body(), byte_budget)
         .await
-        .map_err(|e| format!("reading the query result: {e}"))?;
+        .map_err(|e| format!("the operation exceeds its result budget ({e})"))?;
     let v: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| format!("decoding the query result: {e}"))?;
-    graph_result_rows(&v)
+    graph_result_rows(&v).map(|rows| (rows, body.len()))
 }
 
 /// SQL may return a useful partial answer with explicit warnings. GraphQL clients do not see that
@@ -3336,7 +3450,7 @@ async fn run_sql_query(
     sql_text: String,
     requested_max_rows: Option<usize>,
 ) -> axum::response::Response {
-    run_sql_query_at(s, sql_text, requested_max_rows, None).await
+    run_sql_query_at(s, sql_text, requested_max_rows, None, None).await
 }
 
 async fn run_sql_query_at(
@@ -3344,6 +3458,7 @@ async fn run_sql_query_at(
     sql_text: String,
     requested_max_rows: Option<usize>,
     historical_block: Option<u64>,
+    operation_timeout: Option<Duration>,
 ) -> axum::response::Response {
     use crate::metrics::METRICS;
     let q = SqlQuery {
@@ -3419,42 +3534,70 @@ async fn run_sql_query_at(
             }
         }
     }
-    // Admission is two bounds, and it needs both. `SQL_ADMISSION_WAIT` bounds how long any one
-    // request waits; `SQL_MAX_QUEUED` bounds how many wait at once. Without the second, a burst
-    // parks arrival-rate-times-250 ms requests before any of them time out, which is a worse
-    // failure than the bouncing this change exists to stop. The permit count is untouched and
-    // still decides how many queries run at once (#1319).
-    let admission = std::time::Instant::now();
-    let busy = || {
-        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
-        )
-            .into_response()
-    };
-    let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
-        // A free permit needs no queue at all, so the uncontended path never touches the counter.
-        Ok(p) => p,
-        Err(_) => {
-            // Saturated: park, but only if this nest has room to park another.
-            let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
-                return busy();
-            };
-            match tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(&s.sql_gate).acquire_owned())
-                .await
-            {
-                Ok(Ok(p)) => p,
-                // Elapsed, or the semaphore was closed on shutdown. Only a request that actually
-                // gets the 503 is counted; one that waited and was then admitted is an accepted
-                // query.
-                _ => return busy(),
-            }
+    // A GraphQL operation acquires once and passes the time it has left. Taking another permit
+    // here would start that root's 30s from now (#1658). `/sql` still admits itself.
+    let (permit, sql_timeout) = if let Some(timeout) = operation_timeout {
+        if timeout.is_zero() {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({
+                    "error": format!(
+                        "the operation exceeded its {}s budget",
+                        SQL_TIMEOUT.as_secs()
+                    ),
+                    "timeout_secs": SQL_TIMEOUT.as_secs(),
+                })),
+            )
+                .into_response();
         }
+        #[cfg(all(test, feature = "graph"))]
+        GRAPH_GUARD_TIMEOUT.with(|c| c.set(Some(timeout)));
+        (None, timeout)
+    } else {
+        // Admission is two bounds, and it needs both. `SQL_ADMISSION_WAIT` bounds how long any one
+        // request waits; `SQL_MAX_QUEUED` bounds how many wait at once. Without the second, a burst
+        // parks arrival-rate-times-250 ms requests before any of them time out, which is a worse
+        // failure than the bouncing this change exists to stop. The permit count is untouched and
+        // still decides how many queries run at once (#1319).
+        let admission = std::time::Instant::now();
+        let busy = || {
+            METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
+            )
+                .into_response()
+        };
+        let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+            // A free permit needs no queue at all, so the uncontended path never touches
+            // the counter.
+            Ok(p) => p,
+            Err(_) => {
+                // Saturated: park, but only if this nest has room to park another.
+                let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
+                    return busy();
+                };
+                match tokio::time::timeout(
+                    SQL_ADMISSION_WAIT,
+                    Arc::clone(&s.sql_gate).acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(p)) => p,
+                    // Elapsed, or the semaphore was closed on shutdown. Only a request that
+                    // gets the 503 is counted; one that waited and was then admitted is an accepted
+                    // query.
+                    _ => return busy(),
+                }
+            }
+        };
+        // Charged against the query's own deadline, so queuing can never extend the total time a
+        // request occupies the node.
+        (
+            Some(permit),
+            SQL_TIMEOUT.saturating_sub(admission.elapsed()),
+        )
     };
-    // Charged against the query's own deadline, so queuing can never extend the total time a
-    // request occupies the node.
-    let sql_timeout = SQL_TIMEOUT.saturating_sub(admission.elapsed());
     METRICS.inc_sql();
     let dir = s.dir.clone();
     let sql = q.q.clone();
@@ -8141,6 +8284,171 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[cfg(feature = "graph")]
+    fn reset_graph_budget() {
+        GRAPH_SQL_CALLS.with(|c| c.set(0));
+        GRAPH_PERMITS.with(|c| c.set(0));
+        GRAPH_CLOCK_SKEW.with(|c| c.set(None));
+        GRAPH_BYTE_CAP.with(|c| c.set(None));
+        GRAPH_LAST_LIMIT.with(|c| c.set(0));
+        GRAPH_GUARD_TIMEOUT.with(|c| c.set(None));
+    }
+
+    #[cfg(feature = "graph")]
+    struct GraphBudgetGuard;
+
+    #[cfg(feature = "graph")]
+    impl Drop for GraphBudgetGuard {
+        fn drop(&mut self) {
+            reset_graph_budget();
+        }
+    }
+
+    #[cfg(feature = "graph")]
+    fn account_nest() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Account @entity { id: ID! }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/account.sql"),
+            "CREATE VIEW account AS SELECT 'a' AS id;",
+        )
+        .unwrap();
+        let state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        (dir, state)
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_graphql_operation_refuses_too_many_roots() {
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        let (_dir, state) = account_nest();
+        let mut q = String::from("{ ");
+        for i in 0..33 {
+            q.push_str(&format!("a{i}: accounts {{ id }} "));
+        }
+        q.push('}');
+        let answer = graph_ask("/graphql", &q, state).await;
+        assert_eq!(GRAPH_SQL_CALLS.with(|c| c.get()), 0, "{answer}");
+        assert_eq!(GRAPH_PERMITS.with(|c| c.get()), 0, "{answer}");
+        assert!(
+            answer["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("32"),
+            "{answer}"
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_graphql_operation_refuses_nine_full_pages() {
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        let (_dir, state) = account_nest();
+        let mut q = String::from("{ ");
+        for i in 0..9 {
+            q.push_str(&format!("a{i}: accounts(first: 1000) {{ id }} "));
+        }
+        q.push('}');
+        let answer = graph_ask("/graphql", &q, state).await;
+        assert_eq!(GRAPH_SQL_CALLS.with(|c| c.get()), 0, "{answer}");
+        assert!(
+            answer["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("8000"),
+            "{answer}"
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn two_graphql_roots_share_one_permit_and_one_byte_budget() {
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        let (_dir, state) = account_nest();
+        let answer = graph_ask(
+            "/graphql",
+            "{ a: accounts { id } b: accounts { id } }",
+            state,
+        )
+        .await;
+        assert!(answer.get("errors").is_none(), "{answer}");
+        assert_eq!(answer["data"]["a"][0]["id"], "a", "{answer}");
+        assert_eq!(GRAPH_SQL_CALLS.with(|c| c.get()), 2, "{answer}");
+        assert_eq!(GRAPH_PERMITS.with(|c| c.get()), 1, "{answer}");
+        assert!(
+            GRAPH_LAST_LIMIT.with(|c| c.get()) < crate::engine::SQL_MAX_RESULT_BYTES,
+            "the second root was given a fresh byte cap"
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_graphql_operation_stops_when_its_clock_is_spent() {
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        GRAPH_CLOCK_SKEW.with(|c| c.set(Some(SQL_TIMEOUT)));
+        let (_dir, state) = account_nest();
+        let answer = graph_ask(
+            "/graphql",
+            "{ a: accounts { id } b: accounts { id } }",
+            state,
+        )
+        .await;
+        assert_eq!(GRAPH_SQL_CALLS.with(|c| c.get()), 0, "{answer}");
+        assert!(
+            answer["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("budget"),
+            "{answer}"
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_graphql_root_keeps_the_operation_clock() {
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        GRAPH_CLOCK_SKEW.with(|c| c.set(Some(SQL_TIMEOUT.saturating_sub(Duration::from_secs(5)))));
+        let (_dir, state) = account_nest();
+        let answer = graph_ask("/graphql", "{ accounts { id } }", state).await;
+        let timeout = GRAPH_GUARD_TIMEOUT.with(|c| c.get()).unwrap();
+        assert!(timeout > Duration::from_secs(4), "{timeout:?} {answer}");
+        assert!(timeout <= Duration::from_secs(5), "{timeout:?} {answer}");
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_graphql_operation_stops_at_its_byte_budget() {
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        GRAPH_BYTE_CAP.with(|c| c.set(Some(1)));
+        let (_dir, state) = account_nest();
+        let answer = graph_ask(
+            "/graphql",
+            "{ a: accounts { id } b: accounts { id } }",
+            state,
+        )
+        .await;
+        assert_eq!(GRAPH_SQL_CALLS.with(|c| c.get()), 1, "{answer}");
+        assert!(
+            answer["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("result budget"),
+            "{answer}"
+        );
     }
 
     #[cfg(feature = "graph")]

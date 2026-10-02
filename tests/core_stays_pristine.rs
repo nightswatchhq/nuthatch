@@ -192,7 +192,7 @@ fn the_graph_lane_reads_through_the_same_sql_path() {
     );
     let wrapper = src.split_once("async fn run_sql_query(").unwrap().1;
     let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
-    assert!(wrapper.contains("run_sql_query_at(s, sql_text, requested_max_rows, None).await"));
+    assert!(wrapper.contains("run_sql_query_at(s, sql_text, requested_max_rows, None, None).await"));
     let shared = src.split_once("async fn run_sql_query_at(").unwrap().1;
     let shared = &shared[..shared.find("\n}\n").unwrap()];
     assert!(
