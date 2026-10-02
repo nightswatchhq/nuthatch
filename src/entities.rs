@@ -179,8 +179,15 @@ pub fn load(dir: &Path) -> Result<Vec<EntityDecl>> {
     };
     let file: EntityFile =
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    // `[[entites]]` parses as no entities. The nest then maintains nothing and says so only here.
+    crate::config::warn_unknown::<EntityFile>(ENTITY_FILE, &raw);
     crate::analytics::hold_relations(dir, &file.entities);
     Ok(file.entities)
+}
+
+/// #1656. `[[entites]]` is not a declaration this build reads.
+pub fn refuse_unknown_keys(dir: &Path) -> Result<()> {
+    crate::config::refuse_unknown_file::<EntityFile>(dir, ENTITY_FILE)
 }
 
 pub fn validate(dir: &Path) -> Vec<EntityIssue> {

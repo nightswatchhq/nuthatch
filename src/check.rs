@@ -26,25 +26,18 @@ pub fn check(args: CheckArgs) -> Result<()> {
         return check_folds(&dir, args.from_genesis);
     }
 
-    // A misspelt key is dropped and its default used, silently (#1582); this is where an author learns.
-    if let Ok(raw) = std::fs::read_to_string(dir.join(crate::config::CONFIG_FILE)) {
-        let unknown = crate::config::Config::unknown_keys(&raw);
-        if !unknown.is_empty() {
-            let named: Vec<String> = unknown
-                .iter()
-                .map(|k| match crate::config::Config::suggest_key(&raw, k) {
-                    Some(s) => format!("{k} (did you mean `{s}`?)"),
-                    None => k.clone(),
-                })
-                .collect();
-            bail!(
-                "{} has key(s) nuthatch does not read, so their defaults apply instead: {}. Check \
-                 the spelling against the config reference.",
-                crate::config::CONFIG_FILE,
-                named.join(", ")
-            );
-        }
-    }
+    // A misspelt key is dropped and its default used (#1582, #1656). Here an author learns.
+    crate::config::refuse_unknown_file::<crate::config::Config>(&dir, crate::config::CONFIG_FILE)?;
+    crate::config::refuse_unknown_file::<crate::runtime::MountTable>(
+        &dir,
+        crate::runtime::MOUNTS_FILE,
+    )?;
+    crate::entities::refuse_unknown_keys(&dir)?;
+    crate::config::refuse_unknown_file::<crate::allowlist::Ceiling>(
+        &dir,
+        crate::allowlist::CEILING_FILE,
+    )?;
+    crate::config::refuse_unknown_file::<crate::semantic::Semantic>(&dir, "semantic.toml")?;
 
     // Grafting (RFC-0033) is reported **before** the parity checks, and before the no-checks bail: a
     // nest with no `checks/*.sql` is the common case, and its author still deserves to know which of
@@ -378,24 +371,58 @@ mod tests {
             "mounts.toml",
             "[runtime]\nname = \"r\"\nchain = \"mainnet\"\nchain_id = 1\n\n\
              [[mounts]]\nalias = \"usdc\"\nnid = \"aa\"\nsq1 = \"deny\"\n",
-            "sq1 (did you mean `sql`)",
+            "sq1 (did you mean `sql`?)",
         );
         err_of(
             "entities.toml",
             "[[entites]]\nname = \"holder\"\nsql = \"entities/holder.sql\"\n\
              key = [\"id\"]\nmax_rows = 1\n",
-            "entites (did you mean `entities`)",
+            "entites (did you mean `entities`?)",
         );
         err_of(
             "queries.toml",
-            "querys = []\n",
-            "querys (did you mean `queries`)",
+            "queres = []\n",
+            "queres (did you mean `queries`?)",
         );
         err_of(
             "semantic.toml",
             "schema_versio = 1\n",
-            "schema_versio (did you mean `schema_version`)",
+            "schema_versio (did you mean `schema_version`?)",
         );
+    }
+
+    /// The same files, spelled as shipped, must not fail check. A false positive fails every nest.
+    #[test]
+    fn shipped_config_files_declare_only_keys_nuthatch_reads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap();
+        for rel in [
+            "tests/fixtures/upgrade/config-4.0/mounts.toml",
+            "tests/fixtures/upgrade/v3.13.2/runtime/mounts.toml",
+        ] {
+            let unknown = crate::config::unknown_paths::<crate::runtime::MountTable>(&read(rel));
+            assert_eq!(unknown, Vec::<String>::new(), "{rel}: {unknown:?}");
+        }
+        let nid = "2bca092694c5833d2fecec20983b307f23c3a5507402c39bab4d3fab91231576";
+        let old = format!("tests/fixtures/upgrade/v3.13.2/runtime/data/{nid}/entities.toml");
+        for rel in ["tests/fixtures/upgrade/config-4.0/nest/entities.toml", old.as_str()] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("entities.toml"), read(rel)).unwrap();
+            crate::entities::refuse_unknown_keys(dir.path())
+                .unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        for rel in ["obib-case2/semantic.toml", "obib-case3/semantic.toml"] {
+            let unknown = crate::config::unknown_paths::<crate::semantic::Semantic>(&read(rel));
+            assert_eq!(unknown, Vec::<String>::new(), "{rel}: {unknown:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("queries.toml"),
+            "[[queries]]\nname = \"held\"\nsql = \"select 1\"\n",
+        )
+        .unwrap();
+        crate::config::refuse_unknown_file::<crate::allowlist::Ceiling>(dir.path(), "queries.toml")
+            .unwrap();
     }
 
     #[test]

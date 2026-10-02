@@ -354,6 +354,7 @@ pub fn load(dir: &std::path::Path) -> Result<Option<Semantic>> {
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let sem: Semantic =
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    crate::config::warn_unknown::<Semantic>("semantic.toml", &text);
     Ok(Some(sem))
 }
 
