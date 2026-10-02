@@ -1549,7 +1549,7 @@ dependencies = [
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nightswatchhq/burrmill?rev=17e0a2210716fe376243f65e8878bf8b07ed650b#17e0a2210716fe376243f65e8878bf8b07ed650b"
+source = "git+https://github.com/nightswatchhq/burrmill?rev=3aa733075777f57d6fc0f4dbfcdaec4dd537e32a#3aa733075777f57d6fc0f4dbfcdaec4dd537e32a"
 dependencies = [
  "arrow 59.3.0",
  "arrow-schema 59.3.0",
@@ -4064,7 +4064,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -5736,7 +5736,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5774,7 +5774,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]

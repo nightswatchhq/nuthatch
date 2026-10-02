@@ -4699,6 +4699,91 @@ template="pool"
         assert_eq!(out.rows[0]["n"], Value::from(5u64));
     }
 
+    fn plus_chain(terms: usize) -> String {
+        let mut sql = String::from("SELECT ");
+        for i in 0..terms {
+            if i > 0 {
+                sql.push('+');
+            }
+            sql.push('1');
+        }
+        sql.push_str(" AS n");
+        sql
+    }
+
+    /// A chain long enough to abort the planner is refused before a session exists. Sixty-four
+    /// terms is the chain the planner is allowed to run.
+    #[test]
+    fn a_deep_statement_is_refused_before_a_session_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = session_opens_for(dir.path());
+        for terms in [65usize, 1000] {
+            let err = query(dir.path(), &plus_chain(terms)).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("deeper than 64"),
+                "{terms} terms: {msg}"
+            );
+            assert_eq!(
+                session_opens_for(dir.path()),
+                opened,
+                "{terms} terms opened a session"
+            );
+        }
+        let rows = query(dir.path(), &plus_chain(64)).unwrap();
+        assert_eq!(rows[0]["n"], Value::from(64u64));
+        assert!(session_opens_for(dir.path()) > opened);
+    }
+
+    /// The shutdown latch is process-wide, so this runs in a child. A statement that starts after
+    /// the latch must fail, and quickly: the drain used to wait out the whole query.
+    #[test]
+    fn a_statement_starting_after_shutdown_does_not_run() {
+        if std::env::var("NUTHATCH_SHUTDOWN_LATCH_TEST").is_err() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "a_statement_starting_after_shutdown_does_not_run",
+                    "--test-threads=1",
+                ])
+                .env("NUTHATCH_SHUTDOWN_LATCH_TEST", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "child failed\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (0..500u64).map(fold_row).collect();
+        crate::seal::seal_range(dir.path(), &rows, 0, 499).unwrap();
+        interrupt_for_shutdown();
+        let path = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let r = query(
+                &path,
+                r#"SELECT count(*) AS n FROM "usdc__transfer" a, "usdc__transfer" b, "usdc__transfer" c"#,
+            );
+            let msg = r.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            let _ = tx.send((msg, started.elapsed()));
+        });
+        let (msg, took) = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| {
+            panic!("the drain waited on a statement the shutdown latch should have stopped")
+        });
+        assert!(
+            msg.contains("cancelled"),
+            "a statement that started after shutdown was not cancelled: {msg}"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "shutdown waited {took:?}"
+        );
+    }
+
     /// SIGTERM waited 5.63 s behind a `/sql` still executing: the server drains in-flight requests, and
     /// nothing stopped the statement. A running statement must end when the live queries are interrupted.
     #[test]
@@ -4734,6 +4819,10 @@ template="pool"
             .recv_timeout(Duration::from_secs(10))
             .expect("an interrupted statement must stop, not run eight billion rows to the end");
         assert!(failed, "an interrupted statement must fail, not answer");
+        // The token stays armed. The next statement clears it, or this session would refuse
+        // everything that followed.
+        let again = query(dir.path(), "SELECT 1 AS n").unwrap();
+        assert_eq!(again[0]["n"], Value::from(1u64));
     }
 
     /// The same race without a hook: readers query while a writer folds, one row at a time. No answer
