@@ -3150,13 +3150,15 @@ pub async fn start_mount_jobs(
     jobs
 }
 
+#[cfg(test)]
+type MountJoinFn = std::sync::Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type MountJoinHook = std::sync::Mutex<Option<MountJoinFn>>;
+
 /// The gap between a job's fetch and its join. A test forgets the job here (#1638).
 #[cfg(test)]
-fn before_mount_join() -> &'static std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>
-{
-    static HOOK: std::sync::OnceLock<
-        std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
-    > = std::sync::OnceLock::new();
+fn before_mount_join() -> &'static MountJoinHook {
+    static HOOK: std::sync::OnceLock<MountJoinHook> = std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
