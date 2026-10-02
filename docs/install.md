@@ -29,22 +29,18 @@ below rather than installing something that will not run.
 The Linux binary is dynamically linked and needs one thing, measured off the published artifact
 with `objdump -T` rather than inferred.
 
-**glibc 2.35 or newer.** This is the measured ABI floor: the set of versioned symbols the binary
-references, which is what the loader checks. The release is *built* on glibc 2.35 (`ubuntu-22.04`
-in `.github/workflows/release.yml`), and building on 2.35 does not by itself make 2.35 a
-requirement: up to 4.0.2 the binary referenced nothing past `GLIBC_2.34` and ran on 2.34, which is
-why the two numbers were kept apart ([#978](https://github.com/nightswatchhq/nuthatch/issues/978):
-stating the build baseline as the requirement had excluded RHEL 9). The 4.1.0 artifact references
-`hypot` and `hypotf` at `GLIBC_2.35`, where libm re-versioned them, so from 4.1.0 the floor and the
-build baseline are the same number
-([#1649](https://github.com/nightswatchhq/nuthatch/issues/1649)). It is re-measured on each
-release's artifact, not carried forward.
+**glibc 2.35 or newer.** This is the measured ABI floor, read with `objdump -T` from the published
+binary: 4.1.0 references `hypot` and `hypotf` at `GLIBC_2.35`, where libm re-versioned them. It is
+also the glibc the release is *built* on (`ubuntu-22.04` in `.github/workflows/release.yml`), which is
+a coincidence and not the reason: up to 4.0.2 the binary referenced nothing newer than `GLIBC_2.34`
+and ran on RHEL 9, and stating the build baseline as the requirement once wrongly excluded it
+([#978](https://github.com/nightswatchhq/nuthatch/issues/978)). The floor is what the loader checks.
 
 **No C++ runtime.** The binary links `libc`, `libm` and `libgcc`. Releases before 4.1 embedded DuckDB,
 which is C++, and also needed libstdc++ from GCC 11 (`GLIBCXX_3.4.29`).
 
-Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34: build from
-source there, or run the container image.
+Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34: they ran 4.0.x and
+need the source build for 4.1.0.
 
 ## Verifying a download
 

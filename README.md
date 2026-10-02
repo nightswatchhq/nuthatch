@@ -13,7 +13,7 @@ nuthatch dev --backfill 300                                             # the la
 nuthatch sql "SELECT count(*) FROM usdc__transfer"                      # in a second terminal
 ```
 
-The Linux binary needs glibc 2.35 or newer to run. No Intel Mac binary is
+The Linux binary needs glibc 2.34 or newer to run (it is built on 2.35). No Intel Mac binary is
 published: there, and on other platforms, build from source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
 `init` creates a **nest**: a directory holding the contract's ABI, its config and, once `dev` runs,
 its indexed data. `--backfill 300` starts 300 blocks behind the tip, about an hour of mainnet, so there
@@ -84,18 +84,16 @@ published**; the installer says so and points at the source build below.
 **The Linux binary is dynamically linked and needs one thing**, measured off the published
 artifact with `objdump -T` rather than inferred:
 
-- **glibc 2.35 or newer** - the measured ABI floor, and also the glibc the release is built on.
-  Up to 4.0.2 the binary referenced nothing past `GLIBC_2.34` and would run on 2.34; the 4.1.0
-  artifact references `hypot` and `hypotf` at `GLIBC_2.35`, where libm re-versioned them, so what
-  you need to run it and what we build it on are now the same number
-  ([#978](https://github.com/nightswatchhq/nuthatch/issues/978),
-  [#1649](https://github.com/nightswatchhq/nuthatch/issues/1649)).
+- **glibc 2.35 or newer** - the measured ABI floor, and also what the release is *built* on. Up to
+  4.0.2 the binary referenced no symbol newer than `GLIBC_2.34`, so 2.34 was what you needed to run
+  it and 2.35 only what we compiled it on ([#978](https://github.com/nightswatchhq/nuthatch/issues/978));
+  4.1.0 references `hypot` at `GLIBC_2.35`, where libm re-versioned it, so the two numbers now agree.
 
 It links `libc`, `libm` and `libgcc` and no C++ runtime. Releases before 4.1 embedded DuckDB and
 also needed libstdc++ from GCC 11.
 
-Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34 and need the
-source build below, or the container image.
+Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34 and ran 4.0.x; for
+4.1.0 they need the source build.
 
 **Verify who built it.** Every release binary carries a build provenance attestation, which a
 checksum cannot give you:
@@ -119,8 +117,9 @@ default toolchain fails to compile a dependency.
 embedded, `:<version>-scaled` for the scaled build. The image ships the *same binary attached to the
 release*, so the two cannot drift.
 
-[docs/install.md](docs/install.md) has the detail behind each of these: why the glibc floor moved
-at 4.1, what the attestation proves and what `--repo` is for, and why the toolchain pin exists.
+[docs/install.md](docs/install.md) has the detail behind each of these: why the two ABI floors are
+different numbers, what the attestation proves and what `--repo` is for, and why the toolchain pin
+exists.
 
 **Chains.** Ethereum, Arbitrum One, Base, BSC, Polygon, Gnosis, Optimism, Monad and Robinhood Chain are *built in*, with
 measured public endpoints and tuned finality settings - **omit `--chain` and nuthatch probes each for
@@ -524,7 +523,7 @@ who need more - none of it in the way of the happy path:
 
 nuthatch is built to be **fronted**, not exposed raw - gateways, auth, and metering are the operator's
 layer; nuthatch ships the *guards* (query timeout, row cap, result-byte cap, concurrency limit, a
-table and function allowlist on `/sql`) and *signals* (`/metrics`) that make fronting it safe. It binds `127.0.0.1` by
+filesystem-access denylist on `/sql`) and *signals* (`/metrics`) that make fronting it safe. It binds `127.0.0.1` by
 default; `--listen` elsewhere and put a gateway in front. See [`docs/operators.md`](docs/operators.md).
 
 - **Footprint:** ≤2 GB RAM per active-chain cursor, single static binary, graceful SIGTERM shutdown with

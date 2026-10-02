@@ -599,47 +599,14 @@ impl Config {
     /// Serde drops them, so a misspelling silently takes the default (#1582): `start_blok` backfilled
     /// from recent history instead of the declared block. Empty when the file does not parse as v2.
     pub fn unknown_keys(raw: &str) -> Vec<String> {
-        let mut unknown = Vec::new();
-        let parsed: Result<Config, _> =
-            serde_ignored::deserialize(toml::Deserializer::new(raw), |path| {
-                unknown.push(path.to_string())
-            });
-        if parsed.is_err() {
-            return Vec::new();
-        }
-        unknown
+        unknown_paths::<Config>(raw)
     }
 
     /// The key nuthatch reads that `path` (an entry of [`Config::unknown_keys`]) most likely meant, if
     /// one spelling is one edit away (#1584). The parser is the oracle: each candidate is put in the
     /// typo's place and kept only if the file then reads it, so there is no list of keys to go stale.
     pub fn suggest_key(raw: &str, path: &str) -> Option<String> {
-        let doc: toml::Value = toml::from_str(raw).ok()?;
-        let (parent, typo) = path.rsplit_once('.').unwrap_or(("", path));
-        let mut candidates: Vec<String> = one_edit_away(typo).into_iter().collect();
-        candidates.sort();
-        candidates.into_iter().find(|candidate| {
-            let mut doc = doc.clone();
-            let Some(table) = table_at(&mut doc, parent) else {
-                return false;
-            };
-            if table.contains_key(candidate.as_str()) {
-                return false;
-            }
-            let Some(value) = table.remove(typo) else {
-                return false;
-            };
-            table.insert(candidate.clone(), value);
-            let Ok(text) = toml::to_string(&doc) else {
-                return false;
-            };
-            let at = if parent.is_empty() {
-                candidate.clone()
-            } else {
-                format!("{parent}.{candidate}")
-            };
-            toml::from_str::<Config>(&text).is_ok() && !Self::unknown_keys(&text).contains(&at)
-        })
+        suggest_path::<Config>(raw, path)
     }
 
     /// Parse and validate a nest **without** the serving-path policy refusals.
@@ -843,6 +810,98 @@ impl Config {
             .first()
             .ok_or_else(|| anyhow!("nest has no contracts"))
     }
+}
+
+/// Keys in `raw` that no field of `T` reads, as dotted paths. Empty when `raw` does not parse:
+/// a file that fails to parse has a louder error than a key it would have ignored (#1582).
+pub fn unknown_paths<T>(raw: &str) -> Vec<String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut unknown = Vec::new();
+    let parsed: Result<T, _> = serde_ignored::deserialize(toml::Deserializer::new(raw), |path| {
+        unknown.push(path.to_string());
+    });
+    if parsed.is_err() {
+        return Vec::new();
+    }
+    unknown
+}
+
+/// The field `path` most likely meant, if one spelling is one edit away (#1584). The parser is the
+/// oracle: the candidate is kept only when `T` then reads it.
+pub fn suggest_path<T>(raw: &str, path: &str) -> Option<String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let doc: toml::Value = toml::from_str(raw).ok()?;
+    let (parent, typo) = path.rsplit_once('.').unwrap_or(("", path));
+    let mut candidates: Vec<String> = one_edit_away(typo).into_iter().collect();
+    candidates.sort();
+    candidates.into_iter().find(|candidate| {
+        let mut doc = doc.clone();
+        let Some(table) = table_at(&mut doc, parent) else {
+            return false;
+        };
+        if table.contains_key(candidate.as_str()) {
+            return false;
+        }
+        let Some(value) = table.remove(typo) else {
+            return false;
+        };
+        table.insert(candidate.clone(), value);
+        let Ok(text) = toml::to_string(&doc) else {
+            return false;
+        };
+        let at = if parent.is_empty() {
+            candidate.clone()
+        } else {
+            format!("{parent}.{candidate}")
+        };
+        toml::from_str::<T>(&text).is_ok() && !unknown_paths::<T>(&text).contains(&at)
+    })
+}
+
+/// A running process says that a key was dropped. `check` is what fails on it (#1582, #1656).
+pub fn warn_unknown<T>(file: &str, raw: &str)
+where
+    T: for<'de> Deserialize<'de>,
+{
+    for key in unknown_paths::<T>(raw) {
+        let hint = suggest_path::<T>(raw, &key)
+            .map(|k| format!(" (did you mean `{k}`?)"))
+            .unwrap_or_default();
+        tracing::warn!(
+            "{file}: `{key}` is not a key nuthatch reads, so it is ignored and its default \
+             applies{hint} - `nuthatch check` fails on it"
+        );
+    }
+}
+
+/// `check`'s failure for the same keys. Absent file is fine: not every directory has every file.
+pub fn refuse_unknown_file<T>(dir: &Path, file: &str) -> Result<()>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let Ok(raw) = std::fs::read_to_string(dir.join(file)) else {
+        return Ok(());
+    };
+    let unknown = unknown_paths::<T>(&raw);
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = unknown
+        .iter()
+        .map(|k| match suggest_path::<T>(&raw, k) {
+            Some(s) => format!("{k} (did you mean `{s}`?)"),
+            None => k.clone(),
+        })
+        .collect();
+    bail!(
+        "{file} has key(s) nuthatch does not read, so their defaults apply instead: {}. Check \
+         the spelling against the config reference.",
+        named.join(", ")
+    )
 }
 
 /// The table at a dotted path such as `contracts.0`, where a numeric segment indexes an array.
