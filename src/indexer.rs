@@ -2184,6 +2184,9 @@ async fn runtime_index_loop(
                     tracing::warn!(
                         "mounts reorg to block {ancestor}: rolling back every live nest"
                     );
+                    // The timestamp cache is keyed by height. Drop it before the re-index, or the
+                    // replaced blocks seal with the time they had before the reorg.
+                    source.forget_cached_above(ancestor);
                     fan_out_rollback(&mut nests, &mut nexts, &mut sup, &live, ancestor)?;
                     continue;
                 }
