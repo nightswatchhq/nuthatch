@@ -50,9 +50,9 @@ used for this: it PUTs a whole protection object, so on `main` it would also wri
 `enforce_admins` that the caller never mentioned.
 
 Together the three are read, write-new-branch, write-main - and the committed list is the source of
-truth for all of them. Note that the drift checker cannot currently run in CI at all (#1095): the
-`PROTECTION_READ_TOKEN` secret has never existed, so it has failed on `main` every day since
-2026-08-28 without blocking anything.
+truth for all of them. The drift checker does run in CI: the `PROTECTION_READ_TOKEN` secret exists (#1095, closed
+2026-09-03), and the daily `required-contexts.yml` runs have been green since, with `GH_TOKEN`
+set from the secret.
 
 Since 2026-08-20 sprint work has gone straight to `main` (a sprint is a labelled set of issues, not a
 branch - #810), so in practice this script is only needed if that changes back.
