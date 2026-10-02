@@ -1267,14 +1267,14 @@ fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     if created {
         if let Some(parent) = dir.parent() {
-            sync_dir(parent);
+            sync_dir(parent)?;
         }
     }
     let final_path = dir.join(file_name);
     // The shared store: another nest already published this content. Its bytes were synced before
     // the name existed. The directory entry still has to be, before our manifest names the file.
     if final_path.is_file() {
-        sync_segment_dir(dir);
+        sync_segment_dir(dir)?;
         return Ok(());
     }
     let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
@@ -1291,32 +1291,39 @@ fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
     }
     std::fs::rename(&tmp, &final_path)
         .with_context(|| format!("installing {}", final_path.display()))?;
-    sync_segment_dir(dir);
+    sync_segment_dir(dir)?;
     Ok(())
 }
 
-fn sync_segment_dir(dir: &Path) {
+fn sync_segment_dir(dir: &Path) -> Result<()> {
     #[cfg(test)]
     note_durable(Durable::SegmentDir(dir.to_path_buf()));
-    sync_dir(dir);
+    sync_dir(dir)
 }
 
-fn sync_manifest_dir(dir: &Path) {
+fn sync_manifest_dir(dir: &Path) -> Result<()> {
     #[cfg(test)]
     note_durable(Durable::ManifestDir(dir.to_path_buf()));
-    sync_dir(dir);
+    sync_dir(dir)
 }
 
-fn sync_dir(dir: &Path) {
-    if let Ok(directory) = std::fs::File::open(dir) {
-        let _ = directory.sync_all();
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with(|fail| fail.get()) {
+        anyhow::bail!("fsyncing {} failed", dir.display());
     }
+    let directory = std::fs::File::open(dir)
+        .with_context(|| format!("opening {} to fsync it", dir.display()))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("fsyncing {}", dir.display()))
 }
 
 #[cfg(test)]
 thread_local! {
     static DURABLE_TRACE: std::cell::RefCell<Option<Vec<Durable>>> =
         const { std::cell::RefCell::new(None) };
+    static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1357,7 +1364,7 @@ fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     std::fs::rename(&tmp, &path).context("failed to install manifest")?;
     // The renamed entry lives in `segments/`. Syncing `dir` does not install it (#1632).
     if let Some(parent) = path.parent() {
-        sync_manifest_dir(parent);
+        sync_manifest_dir(parent)?;
     }
     manifest_signal(dir).send_modify(|installs| *installs += 1);
     Ok(())
@@ -2183,6 +2190,28 @@ mod tests {
             load_manifest(&dir).unwrap().tables["usdc__transfer"].len(),
             1,
             "a re-seal double-listed the segment in the manifest"
+        );
+    }
+
+    /// A directory fsync that fails is the seal's error. Swallowing it would advance the
+    /// watermark over an entry that may not be on disk.
+    #[test]
+    fn a_directory_fsync_failure_fails_the_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                FAIL_DIR_SYNC.with(|fail| fail.set(false));
+            }
+        }
+        let _clear = Clear;
+        FAIL_DIR_SYNC.with(|fail| fail.set(true));
+        let err = seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10)
+            .expect_err("a seal whose directory entry could not be synced");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("fsyncing"),
+            "the caller must hear the directory fsync failed: {err}"
         );
     }
 
