@@ -5843,6 +5843,11 @@ mod tests {
         if let Err(e) = handles.admit("new", &nest_config("ethereum"), &exact) {
             panic!("32 across the cursor is the ceiling, not past it: {e:#}");
         }
+        // The directory is already on the cursor, as `usdc` and `acme/usdc`. A new name for it
+        // is an alias, not a second dataset.
+        if let Err(e) = handles.admit("alias", &nest_config("ethereum"), &held) {
+            panic!("an alias of a dataset already on the cursor is not a second nest: {e:#}");
+        }
     }
 
     /// A `max_rows` large enough to overflow the multiplication must not wrap into a small
