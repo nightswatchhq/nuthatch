@@ -240,6 +240,8 @@ pub fn seal_range_with_snapshot(
         .with_context(|| format!("cannot create {}", seg_dir.display()))?;
     let mut manifest = load_manifest(dir)?;
     let mut summary = SealSummary::default();
+    // Shared files this seal will name. Dropped only after the manifest that names them is installed.
+    let mut publishing: Vec<SegmentHold> = Vec::new();
     // Per-nest provisional files a fold has replaced. Removed only once the manifest that no longer
     // names them is durably installed (below), never before: a crash between the two would leave
     // a manifest pointing at a file that is gone, and the folded rows would read as missing.
@@ -295,7 +297,9 @@ pub fn seal_range_with_snapshot(
                 if !shared.exists() {
                     std::fs::write(&shared, &bytes).context("failed to write shared segment")?;
                 }
-                // The manifest that will name this file is not on disk yet (#1644).
+                // Until the manifest below names it. A live reclaim sees no catalogue entry yet and
+                // would delete the file as exclusive to the dataset it is removing (#1644).
+                publishing.push(SegmentHold::acquire(&shared));
                 #[cfg(test)]
                 before_manifest();
                 // The folded file is left for `nuthatch prune`, which reclaims what no manifest
@@ -330,6 +334,7 @@ pub fn seal_range_with_snapshot(
 
     manifest.manifest_version = MANIFEST_VERSION;
     save_manifest(dir, &manifest)?;
+    drop(publishing);
     // The new manifest no longer names these, but a reader holding a lease from before it was
     // installed may still be about to open one; see `retire`.
     retire(dir, folded_away);
@@ -351,6 +356,49 @@ struct Leases {
     readers: BTreeMap<u64, usize>,
     /// Replaced files with the epoch they were retired in.
     retired: Vec<(u64, PathBuf)>,
+}
+
+/// One shared segment a seal will catalogue, held until that manifest is on disk (#1644).
+struct SegmentHold {
+    path: PathBuf,
+}
+
+fn publishing() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn segment_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+impl SegmentHold {
+    fn acquire(path: &Path) -> Self {
+        let path = segment_key(path);
+        let mut held = publishing().lock().unwrap();
+        *held.entry(path.clone()).or_default() += 1;
+        SegmentHold { path }
+    }
+}
+
+impl Drop for SegmentHold {
+    fn drop(&mut self) {
+        let mut held = publishing().lock().unwrap();
+        if let Some(n) = held.get_mut(&self.path) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.path);
+            }
+        }
+    }
+}
+
+/// Whether a live seal is about to name `path` and has not installed that manifest yet.
+pub fn segment_held(path: &Path) -> bool {
+    publishing()
+        .lock()
+        .unwrap()
+        .contains_key(&segment_key(path))
 }
 
 fn leases() -> &'static Mutex<HashMap<PathBuf, Leases>> {

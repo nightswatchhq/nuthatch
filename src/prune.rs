@@ -318,6 +318,8 @@ pub fn reclaim(dir: &Path, nid: &str) -> Result<Reclaim> {
         .flatten()
         .filter(|s| !referenced.contains(&s.hash))
         .map(|s| segments.join(format!("{}.parquet", s.hash)))
+        // Named by a seal whose manifest is not installed yet (#1644).
+        .filter(|p| !crate::seal::segment_held(p))
         .filter_map(|p| {
             let len = std::fs::metadata(&p).ok()?.len();
             Some((p, len))
