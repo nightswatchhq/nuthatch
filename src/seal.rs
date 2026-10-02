@@ -295,6 +295,9 @@ pub fn seal_range_with_snapshot(
                 if !shared.exists() {
                     std::fs::write(&shared, &bytes).context("failed to write shared segment")?;
                 }
+                // The manifest that will name this file is not on disk yet (#1644).
+                #[cfg(test)]
+                before_manifest();
                 // The folded file is left for `nuthatch prune`, which reclaims what no manifest
                 // references: another dataset in the store may hold the same bytes under the same
                 // hash, and this nest cannot know.
@@ -1256,6 +1259,37 @@ pub fn check_catalogue(dir: &Path) -> Result<CatalogueCheck> {
     Ok(out)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MANIFEST: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct BeforeManifestGuard;
+
+#[cfg(test)]
+impl Drop for BeforeManifestGuard {
+    fn drop(&mut self) {
+        BEFORE_MANIFEST.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn set_before_manifest(hook: impl FnMut() + 'static) -> BeforeManifestGuard {
+    BEFORE_MANIFEST.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    BeforeManifestGuard
+}
+
+#[cfg(test)]
+fn before_manifest() {
+    BEFORE_MANIFEST.with(|hook| {
+        if let Some(run) = hook.borrow_mut().as_mut() {
+            run();
+        }
+    });
+}
+
 fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     let raw = serde_json::to_string_pretty(manifest)?;
     // The manifest is the segment catalogue - the crown jewels of a `kill -9`-survivable single binary
@@ -2103,6 +2137,58 @@ mod tests {
             load_manifest(&dir).unwrap().tables["usdc__transfer"].len(),
             1,
             "a re-seal double-listed the segment in the manifest"
+        );
+    }
+
+    /// #1644: B skips the shared write because A's file is already there, and A's reclaim runs
+    /// before B's manifest names it. The file has to still be there when B's catalogue lands.
+    #[test]
+    fn a_reclaim_during_a_shared_seal_keeps_the_segment_the_seal_will_name() {
+        use crate::runtime::{MountTable, MOUNTS_FILE};
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let dir_a = MountTable::data_dir(root.path(), &a);
+        let dir_b = MountTable::data_dir(root.path(), &b);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let rows = [transfer(10, 0, "1")];
+        seal_range(&dir_a, &rows, 10, 10).unwrap();
+        let hash = load_manifest(&dir_a).unwrap().tables["usdc__transfer"][0]
+            .hash
+            .clone();
+        let shared = shared_store(&dir_a)
+            .unwrap()
+            .join(format!("{hash}.parquet"));
+        assert!(shared.is_file(), "premise: A published the shared segment");
+
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+                 chain_id = 42161\nrpc_urls = []\n\n[[mounts]]\nalias = \"b\"\nnid = \"{b}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let runtime = root.path().to_path_buf();
+        let reclaim_a = a.clone();
+        let _hook = set_before_manifest(move || {
+            crate::prune::reclaim(&runtime, &reclaim_a)
+                .expect("A is unmounted and its store is not open");
+        });
+        seal_range(&dir_b, &rows, 10, 10).unwrap();
+
+        assert!(
+            shared.is_file(),
+            "reclaim removed the segment B's manifest is about to name"
+        );
+        assert_eq!(
+            load_manifest(&dir_b).unwrap().tables["usdc__transfer"][0].hash,
+            hash
+        );
+        assert!(
+            !dir_a.exists(),
+            "premise: the reclaim did run and took A's dataset"
         );
     }
 
