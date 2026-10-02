@@ -1793,11 +1793,16 @@ async fn fan_out_window(
         if nexts[i] > to {
             continue;
         }
-        let nest_logs: Vec<crate::rpc::Log> = logs
-            .iter()
-            .filter(|l| l.block_number >= nexts[i] && live_ref(nests, i).owns(l))
-            .cloned()
-            .collect();
+        // Two blocks before this nest's cursor are the previous window's tail (#1144).
+        // process_window drops the rows the store already holds.
+        let nest_logs: Vec<crate::rpc::Log> = {
+            let nest = live_ref(nests, i);
+            let from = overlap_from(nexts[i], nest.start_block.unwrap_or(0));
+            logs.iter()
+                .filter(|l| l.block_number >= from && nest.owns(l))
+                .cloned()
+                .collect()
+        };
         // `Some(_)` → committed, advance this nest past the window. `None` → timestamps were
         // unavailable, so leave its cursor put: `global_next` (the min) stays here, the next
         // iteration re-fetches, and this nest retries while nests that did advance simply
@@ -2243,9 +2248,18 @@ async fn runtime_index_loop(
         // `LogFilter::new` is what makes that unaskable; the `None` arm is this site deciding what
         // "nothing to ask for" means, which here is an empty window that still gets fanned out to the
         // live nests rather than skipped, so the shared cursor advances in step for all of them.
+        let fetch_from = live
+            .iter()
+            .map(|&i| {
+                let n = live_ref(&nests, i);
+                overlap_from(nexts[i], n.start_block.unwrap_or(0))
+            })
+            .min()
+            .unwrap_or(global_next);
         let filter = LogFilter::new(&u_addrs, &u_topics);
         let fetched = match &filter {
-            Some(f) => source.logs(f, global_next, to).await,
+            // Same tail as the solo loop (#1144). A short answer is filled in on the next window.
+            Some(f) => source.logs(f, fetch_from, to).await,
             None => Ok(Vec::new()),
         };
         match fetched {
