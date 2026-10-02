@@ -2403,7 +2403,7 @@ pub fn lifecycle_routes(
             }
             Err(running) => return (StatusCode::CONFLICT, Json(serde_json::json!(running))),
         };
-        spawn_mount_job(handles, jobs, body.name, nid);
+        spawn_mount_job(handles, jobs, body.name, nid, job.generation);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
 
@@ -2675,7 +2675,7 @@ pub fn lifecycle_routes(
             Ok(job) => job,
             Err(running) => return (StatusCode::ACCEPTED, Json(serde_json::json!(running))),
         };
-        spawn_mount_job(handles, jobs, name, Some(nid));
+        spawn_mount_job(handles, jobs, name, Some(nid), job.generation);
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
 
@@ -3141,7 +3141,8 @@ pub async fn start_mount_jobs(
                     spawn_move_job(handles.clone(), jobs.clone(), job.name, nid);
                 }
                 (_, nid) => {
-                    spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid);
+                    let generation = job.generation;
+                    spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid, generation);
                 }
             }
         }
@@ -3169,12 +3170,11 @@ pub fn spawn_mount_job(
     jobs: Arc<crate::mount_jobs::MountJobs>,
     name: String,
     nid: Option<Nid>,
+    generation: u64,
 ) -> tokio::task::JoinHandle<()> {
     use crate::mount_jobs::MountPhase;
     let wanted = nid.as_ref().map(|n| n.as_str().to_string());
     tokio::spawn(async move {
-        // Taken now. A forget, then a new claim, must not look like this worker's own (#1638).
-        let generation = jobs.get(&name).map(|job| job.generation).unwrap_or(0);
         let outcome = async {
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
             let fetched = match (&plan.fetch_from, &plan.nid) {
@@ -3190,22 +3190,14 @@ pub fn spawn_mount_job(
             if let Some(hook) = before_mount_join().lock().unwrap().clone() {
                 hook();
             }
-            // The unmount already forgot this claim. Joining now would bring the name back.
+            // The unmount holds this lock across forget. A check before it still joins (#1638).
+            let mut h = handles.lock().await;
             if !jobs.owns(&name, generation) {
-                if fetched {
-                    let held = handles
-                        .lock()
-                        .await
-                        .states
-                        .iter()
-                        .any(|(_, s)| s.dir == plan.dir);
-                    if !held {
-                        let _ = std::fs::remove_dir_all(&plan.dir);
-                    }
+                if fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                    let _ = std::fs::remove_dir_all(&plan.dir);
                 }
                 bail!("mount of '{name}' was unmounted before it joined");
             }
-            let mut h = handles.lock().await;
             let mounted = h.mount(&name, nid).await;
             // Only a fetch no live mount has since taken up is ours to remove.
             if mounted.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
@@ -6074,7 +6066,8 @@ mod tests {
         )
         .unwrap();
         let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
-        jobs.claim(MountJob::new("usdc", None, MountPhase::Accepted))
+        let claimed = jobs
+            .claim(MountJob::new("usdc", None, MountPhase::Accepted))
             .unwrap();
         super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
         let jobs_hook = jobs.clone();
@@ -6092,9 +6085,15 @@ mod tests {
         }
         let _clear = Clear;
         let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
-        spawn_mount_job(handles, jobs.clone(), "usdc".into(), None)
-            .await
-            .unwrap();
+        spawn_mount_job(
+            handles,
+            jobs.clone(),
+            "usdc".into(),
+            None,
+            claimed.generation,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             super::MOUNT_ENTRIES.load(Ordering::SeqCst),
             0,
@@ -6102,5 +6101,35 @@ mod tests {
         );
         let again = jobs.get("usdc").expect("the replacement claim stays");
         assert_eq!(again.phase, MountPhase::Accepted);
+
+        // The generation is the one claim returned. A worker that reads the map adopts this
+        // replacement and mounts it.
+        *super::before_mount_join().lock().unwrap() = None;
+        let claimed = jobs
+            .claim(MountJob::new("dai", None, MountPhase::Accepted))
+            .unwrap();
+        jobs.forget("dai");
+        let replacement = jobs
+            .claim(MountJob::new("dai", None, MountPhase::Accepted))
+            .expect("the name is free once the first job is forgotten");
+        super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
+        let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
+        spawn_mount_job(
+            handles,
+            jobs.clone(),
+            "dai".into(),
+            None,
+            claimed.generation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            super::MOUNT_ENTRIES.load(Ordering::SeqCst),
+            0,
+            "the replaced claim must not mount"
+        );
+        let again = jobs.get("dai").expect("the replacement claim stays");
+        assert_eq!(again.phase, MountPhase::Accepted);
+        assert_eq!(again.generation, replacement.generation);
     }
 }
