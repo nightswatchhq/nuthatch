@@ -3011,6 +3011,22 @@ fn view_build_failure(
     view_build_failure_at(dir, schema, missing, 8)
 }
 
+#[cfg(test)]
+thread_local! {
+    static VIEW_BUILD_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread opened an engine to explain a missing view (#1652).
+#[cfg(test)]
+pub(crate) fn view_build_opens() -> usize {
+    VIEW_BUILD_OPENS.with(|n| n.get())
+}
+
+#[cfg(test)]
+fn note_view_build_open() {
+    VIEW_BUILD_OPENS.with(|n| n.set(n.get() + 1));
+}
+
 fn view_build_failure_at(
     dir: &Path,
     schema: &[crate::registry::TableSchema],
@@ -3021,6 +3037,9 @@ fn view_build_failure_at(
     if files.is_empty() {
         return None;
     }
+    // Counts the rebind an unknown name must not pay (#1652).
+    #[cfg(test)]
+    note_view_build_open();
     let session = engine().open_bare().ok()?;
     let empty_hot = HotRows::new();
     let _ = define_views(
@@ -5828,8 +5847,13 @@ template="pool"
         // The exact DuckDB message a query against the broken view produces.
         let raw = "Catalog Error: Table with name pool_effective_fee does not exist!\nDid you \
                     mean \"pool_manager__set_default_fee_alias\"?";
+        let before = view_build_opens();
         let msg = enrich_query_error(dir.path(), raw, "SELECT * FROM pool_effective_fee", &schema)
             .unwrap();
+        assert!(
+            view_build_opens() > before,
+            "a broken view is still replayed"
+        );
         assert!(
             msg.contains("pool_effective_fee") && msg.contains("failed to build"),
             "names the view and says it failed to build: {msg}"
@@ -5951,6 +5975,33 @@ template="pool"
             msg.contains("usdc__transfer"),
             "still suggests the real table: {msg}"
         );
+    }
+
+    /// #1652: `nosuch` is not an authored view, so explaining it must not open an engine.
+    #[test]
+    fn an_unknown_table_does_not_rebuild_authored_views() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-recipients.sql"),
+            r#"CREATE VIEW recipients AS SELECT "to" AS addr FROM "usdc__transfer";"#,
+        )
+        .unwrap();
+        let schema = vec![crate::registry::TableSchema {
+            table: "usdc__transfer".into(),
+            alias: "usdc".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "Transfer".into(),
+            topic0: "0xddf2".into(),
+            columns: vec![],
+        }];
+        let before = view_build_opens();
+        let raw = "Catalog Error: Table with name nosuch does not exist!";
+        let msg = enrich_query_error(dir.path(), raw, "SELECT * FROM nosuch", &schema).unwrap();
+        assert_eq!(view_build_opens() - before, 0);
+        assert!(msg.contains("no table `nosuch`"), "{msg}");
     }
 
     /// RFC-0001 acceptance: `/sql` can JOIN across two per-event tables.
