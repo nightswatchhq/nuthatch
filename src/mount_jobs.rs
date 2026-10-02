@@ -144,24 +144,37 @@ impl MountJobs {
             .collect()
     }
 
-    pub fn put(&self, job: MountJob) {
+    pub fn put(&self, job: MountJob) -> Result<()> {
         let mut jobs = self.jobs.lock().unwrap();
         jobs.insert(job.name.clone(), job);
-        self.persist(&jobs);
+        self.persist(&jobs)
     }
 
     /// Record `job` unless one is already running for its name, which is returned instead. One step
     /// under the lock, so of several identical requests exactly one starts a worker.
-    pub fn claim(&self, mut job: MountJob) -> Result<MountJob, MountJob> {
+    ///
+    /// A failed write rolls the claim back. No worker was started, so a retry must be able to take
+    /// the name. A finished job this claim replaced is put back.
+    pub fn claim(&self, mut job: MountJob) -> std::result::Result<MountJob, ClaimError> {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(running) = jobs.get(&job.name).filter(|j| !j.phase.finished()) {
-            return Err(running.clone());
+            return Err(ClaimError::Running(running.clone()));
         }
         job.generation = self
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        jobs.insert(job.name.clone(), job.clone());
-        self.persist(&jobs);
+        let previous = jobs.insert(job.name.clone(), job.clone());
+        if let Err(e) = self.persist(&jobs) {
+            match previous {
+                Some(old) => {
+                    jobs.insert(job.name.clone(), old);
+                }
+                None => {
+                    jobs.remove(&job.name);
+                }
+            }
+            return Err(ClaimError::Persist(e));
+        }
         Ok(job)
     }
 
@@ -182,7 +195,7 @@ impl MountJobs {
         generation: u64,
         phase: MountPhase,
         reason: Option<String>,
-    ) {
+    ) -> Result<()> {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(job) = jobs
             .get_mut(name)
@@ -191,42 +204,53 @@ impl MountJobs {
             job.phase = phase;
             job.reason = reason;
             job.since_unixtime = now_unix();
-            self.persist(&jobs);
+            return self.persist(&jobs);
         }
+        Ok(())
     }
 
-    /// Move a job on. A reason is kept only for a failure.
-    pub fn advance(&self, name: &str, phase: MountPhase, reason: Option<String>) {
+    /// Move a job on. A reason is kept only for a failure. Memory updates even when the file
+    /// cannot be written, and the error is the caller's to report.
+    pub fn advance(&self, name: &str, phase: MountPhase, reason: Option<String>) -> Result<()> {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(job) = jobs.get_mut(name) {
             job.phase = phase;
             job.reason = reason;
             job.since_unixtime = now_unix();
         }
-        self.persist(&jobs);
+        self.persist(&jobs)
     }
 
-    pub fn forget(&self, name: &str) {
+    pub fn forget(&self, name: &str) -> Result<()> {
         let mut jobs = self.jobs.lock().unwrap();
         if jobs.remove(name).is_some() {
-            self.persist(&jobs);
+            self.persist(&jobs)?;
         }
+        Ok(())
     }
 
-    /// Best-effort, as `mounts.toml` is: the job has happened in this process whether or not the
-    /// file could be written, and the warning says a restart will not know about it.
-    fn persist(&self, jobs: &BTreeMap<String, MountJob>) {
+    /// The job is already changed in memory. The error says the file does not know, and the caller
+    /// decides not to call that a success.
+    fn persist(&self, jobs: &BTreeMap<String, MountJob>) -> Result<()> {
         let kept: Vec<&MountJob> = jobs
             .values()
             .filter(|j| j.phase != MountPhase::Live)
             .collect();
-        if let Err(e) = write_atomically(&self.file, &kept) {
-            tracing::warn!(
-                "mount jobs changed but {} could not be written ({e:#}); a restart will not see them",
+        write_atomically(&self.file, &kept).with_context(|| {
+            format!(
+                "mount jobs changed but {} could not be written; a restart will not see them",
                 self.file.display()
-            );
-        }
+            )
+        })
     }
+}
+
+/// Why [`MountJobs::claim`] did not start a job. A running job is the caller's conflict. A failed
+/// write leaves no claim: the name is free, or it still holds the finished job it had.
+#[derive(Debug)]
+pub enum ClaimError {
+    Running(MountJob),
+    Persist(anyhow::Error),
 }
 
 fn write_atomically(file: &Path, jobs: &[&MountJob]) -> Result<()> {
@@ -254,15 +278,47 @@ pub fn clear_stale_fetches(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Directory writes fail until this drops, which puts the mode it had back.
+    struct ReadonlyDir {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl ReadonlyDir {
+        fn new(path: &Path) -> Self {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(path, perms).unwrap();
+            Self {
+                path: path.to_path_buf(),
+                mode,
+            }
+        }
+    }
+
+    impl Drop for ReadonlyDir {
+        fn drop(&mut self) {
+            let mut perms = std::fs::metadata(&self.path).unwrap().permissions();
+            perms.set_mode(self.mode);
+            let _ = std::fs::set_permissions(&self.path, perms);
+        }
+    }
 
     #[test]
     fn a_restart_resumes_unfinished_jobs_reports_failed_ones_and_forgets_live_ones() {
         let d = tempfile::tempdir().unwrap();
         let jobs = MountJobs::load(d.path());
-        jobs.put(MountJob::new("a", Some("aa"), MountPhase::Fetching));
-        jobs.put(MountJob::new("b", Some("bb"), MountPhase::Accepted));
-        jobs.advance("b", MountPhase::Failed, Some("no such nid".into()));
-        jobs.put(MountJob::new("c", None, MountPhase::Live));
+        jobs.put(MountJob::new("a", Some("aa"), MountPhase::Fetching))
+            .unwrap();
+        jobs.put(MountJob::new("b", Some("bb"), MountPhase::Accepted))
+            .unwrap();
+        jobs.advance("b", MountPhase::Failed, Some("no such nid".into()))
+            .unwrap();
+        jobs.put(MountJob::new("c", None, MountPhase::Live))
+            .unwrap();
 
         let again = MountJobs::load(d.path());
         let names: Vec<String> = again.unfinished().into_iter().map(|j| j.name).collect();
@@ -275,8 +331,71 @@ mod tests {
             "a live mount belongs to mounts.toml, not here"
         );
 
-        again.forget("b");
+        again.forget("b").unwrap();
         assert!(MountJobs::load(d.path()).get("b").is_none());
+    }
+
+    #[test]
+    fn a_failed_jobs_write_is_not_reported_as_success() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(JOBS_FILE), b"[]").unwrap();
+        let jobs = MountJobs::load(d.path());
+        let _unlock = ReadonlyDir::new(d.path());
+
+        let err = jobs
+            .put(MountJob::new("a", None, MountPhase::Accepted))
+            .expect_err("a mount-jobs.json that cannot be written is not a recorded job");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("a restart will not see them"),
+            "the caller must hear that the job is not durable: {err}"
+        );
+        assert_eq!(
+            jobs.get("a").map(|j| j.phase),
+            Some(MountPhase::Accepted),
+            "the live job stays; only the report of success was wrong"
+        );
+        let on_disk = std::fs::read_to_string(d.path().join(JOBS_FILE)).unwrap();
+        assert_eq!(on_disk, "[]", "the failed rewrite must leave the old table");
+    }
+
+    #[test]
+    fn a_claim_whose_write_fails_does_not_block_the_retry() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(JOBS_FILE), b"[]").unwrap();
+        let jobs = MountJobs::load(d.path());
+        let unlock = ReadonlyDir::new(d.path());
+
+        let err = jobs
+            .claim(MountJob::new("a", None, MountPhase::Accepted))
+            .expect_err("a claim that cannot be written is not a started job");
+        assert!(
+            matches!(err, ClaimError::Persist(_)),
+            "the failure is the write, not a running job"
+        );
+        drop(unlock);
+        assert!(
+            jobs.claim(MountJob::new("a", None, MountPhase::Accepted))
+                .is_ok(),
+            "the failed claim must not still be running"
+        );
+    }
+
+    #[test]
+    fn a_claim_whose_write_fails_puts_the_finished_job_back() {
+        let d = tempfile::tempdir().unwrap();
+        let jobs = MountJobs::load(d.path());
+        jobs.put(MountJob::new("a", Some("old"), MountPhase::Failed))
+            .unwrap();
+        let _unlock = ReadonlyDir::new(d.path());
+
+        let err = jobs
+            .claim(MountJob::new("a", Some("new"), MountPhase::Accepted))
+            .expect_err("a claim that cannot be written is not a started job");
+        assert!(matches!(err, ClaimError::Persist(_)));
+        let kept = jobs.get("a").expect("the finished job stays");
+        assert_eq!(kept.phase, MountPhase::Failed);
+        assert_eq!(kept.nid.as_deref(), Some("old"));
     }
 
     #[test]
@@ -288,8 +407,12 @@ mod tests {
         let running = jobs
             .claim(job())
             .expect_err("a second claim while the first runs");
+        let ClaimError::Running(running) = running else {
+            panic!("a second claim is the running job, not a write failure");
+        };
         assert_eq!(running.phase, MountPhase::Accepted);
-        jobs.advance("race", MountPhase::Failed, Some("x".into()));
+        jobs.advance("race", MountPhase::Failed, Some("x".into()))
+            .unwrap();
         assert!(
             jobs.claim(job()).is_ok(),
             "a finished job does not block a new one"
