@@ -5286,8 +5286,8 @@ template="pool"
         assert_eq!(rows[1]["value_dec"], Value::Null);
         assert_eq!(rows[1]["value_overflow"], Value::from(true));
 
-        // And summing the rows that fit says so: over every row, a value that did not fit refuses
-        // on Burrmill rather than being left out of the total (Chief, 2026-09-29).
+        // A bare SUM(value_dec) is the column: the 39-digit row is NULL and is not a term.
+        // WHERE NOT value_overflow is that same sum. Other aggregates still refuse (2026-09-29).
         let s = query(
             dir.path(),
             r#"SELECT (SUM(value_dec) FILTER (WHERE NOT value_overflow))::VARCHAR AS s FROM "t__transfer""#,

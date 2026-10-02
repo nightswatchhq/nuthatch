@@ -984,8 +984,8 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
          --\n\
          -- Footguns (see the builder skill's views.md):\n\
          --   • reserved-word columns like \"from\"/\"to\" must be double-quoted\n\
-         --   • big-int amounts use `<col>_dec` for SUM/AVG; ids, nonces and hashes stay on the raw column\n\
-         --     (`_dec` is NULL for a full-width uint256)\n\
+         --   • SUM(<col>_dec) is the values that fit; WHERE NOT <col>_overflow is that sum\n\
+         --     ids, nonces and hashes stay raw (`_dec` is NULL for a full-width uint256)\n\
          --\n\
          -- Example over this nest's `{table}` table:\n\
          --\n\

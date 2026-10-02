@@ -1549,7 +1549,7 @@ dependencies = [
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nightswatchhq/burrmill?rev=17e0a2210716fe376243f65e8878bf8b07ed650b#17e0a2210716fe376243f65e8878bf8b07ed650b"
+source = "git+https://github.com/nightswatchhq/burrmill?rev=70085f6a071d5c043151a1c508d7f849199682be#70085f6a071d5c043151a1c508d7f849199682be"
 dependencies = [
  "arrow 59.3.0",
  "arrow-schema 59.3.0",
