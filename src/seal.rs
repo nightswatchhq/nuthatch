@@ -1279,8 +1279,8 @@ fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
     }
     let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
     {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         use std::io::Write;
         f.write_all(bytes)
             .with_context(|| format!("writing {}", tmp.display()))?;
@@ -2241,27 +2241,27 @@ mod tests {
 
     fn assert_seal_durable(nest: &Path, trace: &[Durable], bytes_dir: PathBuf) {
         let manifest_dir = nest.join(SEGMENTS_DIR);
-        let manifest_at = trace.iter().rposition(|event| {
-            matches!(event, Durable::ManifestDir(path) if path == &manifest_dir)
-        });
+        let manifest_at = trace.iter().rposition(
+            |event| matches!(event, Durable::ManifestDir(path) if path == &manifest_dir),
+        );
         let manifest_at = manifest_at.unwrap_or_else(|| {
             panic!(
                 "the manifest entry lives in {}: that directory was not synced. trace: {trace:?}",
                 manifest_dir.display()
             )
         });
-        let file_at = trace.iter().position(|event| {
-            matches!(event, Durable::FileSync(path) if path.starts_with(&bytes_dir))
-        });
+        let file_at = trace.iter().position(
+            |event| matches!(event, Durable::FileSync(path) if path.starts_with(&bytes_dir)),
+        );
         let file_at = file_at.unwrap_or_else(|| {
             panic!(
                 "segment bytes in {} were not fsynced. trace: {trace:?}",
                 bytes_dir.display()
             )
         });
-        let segment_at = trace.iter().position(|event| {
-            matches!(event, Durable::SegmentDir(path) if path == &bytes_dir)
-        });
+        let segment_at = trace
+            .iter()
+            .position(|event| matches!(event, Durable::SegmentDir(path) if path == &bytes_dir));
         let segment_at = segment_at.unwrap_or_else(|| {
             panic!(
                 "the segment directory {} was not synced. trace: {trace:?}",
