@@ -6608,25 +6608,10 @@ impl NestIngest {
             }
         }
 
-        self.balances.apply(deltas);
-        self.exposure.apply(exp_deltas);
-        self.velocity.apply(vel_deltas);
-        // §5.1: the same decoded window, at weight +1, to every authored entity. Backfill and tip
-        // are the same call - they differ in how many rows `rows` holds, which is the whole of what
-        // "backfill uses larger batches, but not different semantics" means.
-        //
-        // `to` and not the nest's head: an entity carries its own applied-through watermark, and
-        // stamping it with a block it has not folded is how a partial relation gets served as
-        // current (criterion 2).
-        for entity in self.entities.iter() {
-            entity
-                .apply_window(&rows, 1, to)
-                .with_context(|| format!("feeding this window to entity `{}`", entity.name()))?;
-        }
-        // A derived-view circuit thread that has died silently drops those applies and freezes
+        // A derived-view circuit thread that has died silently drops its batches and freezes
         // `/balances` + the compliance flags while ingest keeps committing - stale data served as
-        // healthy. Surface it as fatal here (the dead-task-must-surface rule, extended to the IVM
-        // threads that were previously exempt).
+        // healthy. Surface it before the commit (the dead-task-must-surface rule, extended to the
+        // IVM threads that were previously exempt).
         self.ensure_views_healthy()?;
 
         // Live sanctions screening (RFC-0008 C2): screen this window's transfers against the
@@ -6739,6 +6724,17 @@ impl NestIngest {
         self.store
             .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
             .await?;
+        // After the commit. A retry of a window that never committed would fold this batch a second
+        // time, and a restart rebuilds these views from the store (#1635).
+        // §5.1: the same decoded window, at weight +1. `to` is this window, not the nest's head.
+        for entity in self.entities.iter() {
+            entity
+                .apply_window(&rows, 1, to)
+                .with_context(|| format!("feeding this window to entity `{}`", entity.name()))?;
+        }
+        self.balances.apply(deltas);
+        self.exposure.apply(exp_deltas);
+        self.velocity.apply(vel_deltas);
         // After the commit, so a rebuild reads exactly the history the entities have folded. Off the
         // runtime: it reads the manifest and snapshots, and a rebuild reads the sealed corpus.
         if self
