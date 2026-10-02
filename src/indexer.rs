@@ -6750,32 +6750,44 @@ impl NestIngest {
             }
         }
 
-        // Before the commit. A failure retracts what this attempt fed, so a retry folds the
-        // window once. A restart still rebuilds these views from the store (#1635).
-        for (i, entity) in self.entities.iter().enumerate() {
-            if let Err(e) = entity.apply_window(&rows, 1, to) {
-                for done in self.entities.iter().take(i) {
-                    let _ = done.apply_window(&rows, -1, to);
+        // The commit is the watermark. A later failure leaves this fold in place, and a retry
+        // sees `last_block` and does not feed the window again (#1635).
+        let committed_through = self
+            .store
+            .get_meta("last_block")?
+            .and_then(|v| v.parse::<u64>().ok());
+        if committed_through.is_none_or(|n| n < to) {
+            // Before the commit. A failure retracts what this attempt fed, so a retry folds the
+            // window once. A restart still rebuilds these views from the store.
+            for (i, entity) in self.entities.iter().enumerate() {
+                if let Err(e) = entity.apply_window(&rows, 1, to) {
+                    for done in self.entities.iter().take(i) {
+                        let _ = done.apply_window(&rows, -1, to);
+                    }
+                    return Err(
+                        e.context(format!("feeding this window to entity `{}`", entity.name()))
+                    );
                 }
-                return Err(e.context(format!("feeding this window to entity `{}`", entity.name())));
+            }
+            self.balances.apply(deltas.clone());
+            self.exposure.apply(exp_deltas.clone());
+            self.velocity.apply(vel_deltas.clone());
+            #[cfg(test)]
+            if let Err(e) = take_fold_failure() {
+                self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
+                return Err(e);
+            }
+            if let Err(e) = self
+                .store
+                .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
+                .await
+            {
+                self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
+                return Err(e);
             }
         }
-        self.balances.apply(deltas.clone());
-        self.exposure.apply(exp_deltas.clone());
-        self.velocity.apply(vel_deltas.clone());
         #[cfg(test)]
-        if let Err(e) = take_fold_failure() {
-            self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
-            return Err(e);
-        }
-        if let Err(e) = self
-            .store
-            .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
-            .await
-        {
-            self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
-            return Err(e);
-        }
+        take_after_commit_failure()?;
         // After the commit, so a rebuild reads exactly the history the entities have folded. Off the
         // runtime: it reads the manifest and snapshots, and a rebuild reads the sealed corpus.
         if self
@@ -6794,10 +6806,7 @@ impl NestIngest {
             })
             .await
             .context("the offchain refresh task did not complete")?;
-            if let Err(e) = refreshed {
-                self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
-                return Err(e);
-            }
+            refreshed?;
         }
         self.metrics.set_last_block(to);
         self.metrics.add_rows_decoded(stored as u64);
@@ -6819,13 +6828,7 @@ impl NestIngest {
         };
         let finalized_through = seal_ceiling(self.finality, tip, finalized_tag);
         let held_for_documents = match &self.ipfs_gate {
-            Some(gate) => match hold_for_documents(self.store.as_ref(), gate, finalized_through) {
-                Ok(through) => through,
-                Err(e) => {
-                    self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
-                    return Err(e);
-                }
-            },
+            Some(gate) => hold_for_documents(self.store.as_ref(), gate, finalized_through)?,
             None => Some(finalized_through),
         };
         let Some(finalized_through) = held_for_documents else {
@@ -8138,6 +8141,7 @@ mod entity_fixture;
 #[cfg(test)]
 thread_local! {
     static FAIL_AFTER_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_AFTER_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The next `process_window` feeds its views and then fails, before the commit.
@@ -8155,6 +8159,25 @@ fn clear_fold_failure() {
 fn take_fold_failure() -> Result<()> {
     if FAIL_AFTER_FOLD.with(|fail| fail.replace(false)) {
         anyhow::bail!("the fold landed and the commit has not");
+    }
+    Ok(())
+}
+
+/// The next `process_window` commits and then fails, with the fold left in place.
+#[cfg(test)]
+fn fail_the_next_commit() {
+    FAIL_AFTER_COMMIT.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn clear_commit_failure() {
+    FAIL_AFTER_COMMIT.with(|fail| fail.set(false));
+}
+
+#[cfg(test)]
+fn take_after_commit_failure() -> Result<()> {
+    if FAIL_AFTER_COMMIT.with(|fail| fail.replace(false)) {
+        anyhow::bail!("the commit landed and the window is not done");
     }
     Ok(())
 }
@@ -14868,6 +14891,7 @@ template = "pool"
         impl Drop for Clear {
             fn drop(&mut self) {
                 super::clear_fold_failure();
+                super::clear_commit_failure();
             }
         }
         let _clear = Clear;
@@ -14914,6 +14938,63 @@ template = "pool"
             1,
             "the row is stored by the retry, not by the attempt that failed"
         );
+    }
+
+    /// #1635: the commit landed, then a later step failed. The fold stays, and the retry must
+    /// not feed the transfer again.
+    #[tokio::test]
+    async fn a_committed_window_keeps_its_fold_when_a_later_step_fails() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                super::clear_fold_failure();
+                super::clear_commit_failure();
+            }
+        }
+        let _clear = Clear;
+        super::fail_the_next_commit();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let logs = vec![transfer_log(10, 0)];
+        let first = nest
+            .process_window(source.as_ref(), &logs, 10, 10, 100)
+            .await;
+        let msg = format!(
+            "{:#}",
+            first.expect_err("premise: the step after the commit fails")
+        );
+        assert!(
+            msg.contains("the commit landed"),
+            "the failure is after the commit, got {msg}"
+        );
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        nest.balances.flush();
+        assert_eq!(
+            nest.balances.balance(recipient),
+            Some(0x1cd4ad20),
+            "a committed window keeps the fold"
+        );
+        assert_eq!(
+            nest.store.sample_entity_keys(8).unwrap().len(),
+            1,
+            "the commit kept the row"
+        );
+        nest.process_window(source.as_ref(), &logs, 10, 10, 100)
+            .await
+            .expect("the retry finishes")
+            .expect("the retry finishes");
+        nest.balances.flush();
+        let got = nest.balances.balance(recipient);
+        assert_eq!(
+            got,
+            Some(0x1cd4ad20),
+            "the retry must not fold the committed window again, got {got:?}"
+        );
+        drop(nest);
+        let store = Store::open(&d.path().join(DB_FILE)).unwrap();
+        assert_eq!(store.entity_keys().unwrap().len(), 1, "one row");
     }
 
     /// #1144, review: a refetched tail row that is already stored under a *different* block hash is
