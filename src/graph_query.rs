@@ -3275,4 +3275,51 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
         let c = compile(&schema(), &one("{ pools(subgraphError: deny) { id } }")).unwrap();
         assert!(c.sql.contains("FROM \"pool\""), "{}", c.sql);
     }
+
+    /// A flat `or` never passes the 16 KiB check `/sql` applies to free-form text (#1658).
+    #[test]
+    fn a_wide_or_is_refused() {
+        let items: Vec<String> = (0..2_000)
+            .map(|i| format!(r#"{{ id: "{i}" }}"#))
+            .collect();
+        let q = format!(
+            "{{ pools(where: {{ or: [{}] }}) {{ id }} }}",
+            items.join(", ")
+        );
+        let err = compile(&schema(), &one(&q)).unwrap_err();
+        assert!(
+            err.to_string().contains("16384"),
+            "{err}"
+        );
+    }
+
+    /// Nested `or` under the parser's ceiling is still the planner's stack (#1658).
+    #[test]
+    fn a_deep_or_is_refused() {
+        let schema = schema();
+        let ent = schema.entities.iter().find(|e| e.name == "Pool").unwrap();
+        let leaf = Value::Object(std::collections::BTreeMap::from([(
+            "id".into(),
+            Value::Str("a".into()),
+        )]));
+        let mut item = leaf.clone();
+        for _ in 0..64 {
+            item = Value::Object(std::collections::BTreeMap::from([(
+                "or".into(),
+                Value::List(vec![leaf.clone(), item]),
+            )]));
+        }
+        let list = Value::List(vec![item]);
+        let err = lower_predicate(
+            &schema,
+            ent,
+            "or",
+            &list,
+            "b",
+            0,
+            &Capabilities::CORE,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("64"), "{err}");
+    }
 }
