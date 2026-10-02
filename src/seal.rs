@@ -294,12 +294,13 @@ pub fn seal_range_with_snapshot(
             Some(store) => {
                 std::fs::create_dir_all(&store).context("creating the shared segment store")?;
                 let shared = store.join(format!("{hash}.parquet"));
+                // Before the exists check. A reclaim that looks between the check and the hold
+                // deletes the file this manifest is about to name (#1644).
+                let hold = SegmentHold::acquire(&shared);
                 if !shared.exists() {
                     std::fs::write(&shared, &bytes).context("failed to write shared segment")?;
                 }
-                // Until the manifest below names it. A live reclaim sees no catalogue entry yet and
-                // would delete the file as exclusive to the dataset it is removing (#1644).
-                publishing.push(SegmentHold::acquire(&shared));
+                publishing.push(hold);
                 #[cfg(test)]
                 before_manifest();
                 // The folded file is left for `nuthatch prune`, which reclaims what no manifest
@@ -369,7 +370,18 @@ fn publishing() -> &'static Mutex<HashMap<PathBuf, usize>> {
 }
 
 fn segment_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    // The parent, not the file. A hold taken before the write has to match the path a reclaim
+    // canonicalises once the file exists (on macOS that spelling gains a `/private` prefix).
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    match path.parent() {
+        Some(parent) => {
+            let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            parent.join(name)
+        }
+        None => path.to_path_buf(),
+    }
 }
 
 impl SegmentHold {
@@ -399,6 +411,19 @@ pub fn segment_held(path: &Path) -> bool {
         .lock()
         .unwrap()
         .contains_key(&segment_key(path))
+}
+
+/// Delete `path` unless a live seal holds it. The check and the unlink share the publishing lock.
+pub fn remove_segment_if_unheld(path: &Path) -> Result<bool> {
+    let held = publishing().lock().unwrap();
+    if held.contains_key(&segment_key(path)) {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).context(format!("removing {}", path.display())),
+    }
 }
 
 fn leases() -> &'static Mutex<HashMap<PathBuf, Leases>> {
@@ -2201,6 +2226,14 @@ mod tests {
             segment_held(&canon),
             "the hold was keyed on the spelling from before the file existed"
         );
+        assert!(
+            !remove_segment_if_unheld(&canon).unwrap(),
+            "a held segment must survive the reclaim that checks and deletes together"
+        );
+        assert!(canon.is_file());
+        drop(_hold);
+        assert!(remove_segment_if_unheld(&canon).unwrap());
+        assert!(!canon.is_file());
     }
 
     /// #1644: B skips the shared write because A's file is already there, and A's reclaim runs
