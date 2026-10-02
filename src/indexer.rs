@@ -5802,6 +5802,8 @@ fn publish_direct_seal(
 ) -> Result<()> {
     // The durable key first: if the store write fails, nothing in memory has claimed a watermark that
     // was never persisted, and `/ready` keeps saying what the last successful write said.
+    // `seal_range` fsyncs the segment and the manifest entry before it returns. redb fsyncs this
+    // write, so it has to stay after that call (#1632).
     store.set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())?;
     metrics.set_seal_direct_completed(sealed_to);
     metrics.set_sealed_through(sealed_to);
@@ -7484,6 +7486,8 @@ async fn maybe_seal(
         let to_seal = store.entities_in_range(from, cut)?;
         match seal::seal_range_with_snapshot(dir, &to_seal, from, cut, registry_snapshot)? {
             Some(summary) => {
+                // After the seal. It fsyncs the bytes and the manifest entry before returning, and
+                // this commit fsyncs the watermark (#1632).
                 let pruned =
                     store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
                 metrics.set_sealed_through(cut);

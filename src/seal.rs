@@ -290,22 +290,13 @@ pub fn seal_range_with_snapshot(
         // the write is a no-op rather than a duplicate.
         match shared_store(dir) {
             Some(store) => {
-                std::fs::create_dir_all(&store).context("creating the shared segment store")?;
-                let shared = store.join(format!("{hash}.parquet"));
-                if !shared.exists() {
-                    #[cfg(test)]
-                    note_durable(Durable::WroteFinal(shared.clone()));
-                    std::fs::write(&shared, &bytes).context("failed to write shared segment")?;
-                }
+                publish_durable(&store, &format!("{hash}.parquet"), &bytes)?;
                 // The folded file is left for `nuthatch prune`, which reclaims what no manifest
                 // references: another dataset in the store may hold the same bytes under the same
                 // hash, and this nest cannot know.
             }
             None => {
-                let dest = seg_dir.join(&file);
-                #[cfg(test)]
-                note_durable(Durable::WroteFinal(dest.clone()));
-                std::fs::write(&dest, &bytes).context("failed to write segment")?;
+                publish_durable(&seg_dir, &file, &bytes)?;
                 if let Some(prev) = &replaced {
                     // This nest's own copy, and not yet: see `folded_away`.
                     folded_away.push(seg_dir.join(&prev.file));
@@ -1267,7 +1258,59 @@ enum Durable {
     FileSync(PathBuf),
     SegmentDir(PathBuf),
     ManifestDir(PathBuf),
-    WroteFinal(PathBuf),
+}
+
+/// Install `bytes` as `dir/file_name`. The bytes are fsynced before the name exists, and that
+/// directory entry is fsynced before this returns (#1632). A watermark is written only afterwards.
+fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
+    let created = !dir.exists();
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    if created {
+        if let Some(parent) = dir.parent() {
+            sync_dir(parent);
+        }
+    }
+    let final_path = dir.join(file_name);
+    // The shared store: another nest already published this content. Its bytes were synced before
+    // the name existed. The directory entry still has to be, before our manifest names the file.
+    if final_path.is_file() {
+        sync_segment_dir(dir);
+        return Ok(());
+    }
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        use std::io::Write;
+        f.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsyncing {}", tmp.display()))?;
+        #[cfg(test)]
+        note_durable(Durable::FileSync(tmp.clone()));
+    }
+    std::fs::rename(&tmp, &final_path)
+        .with_context(|| format!("installing {}", final_path.display()))?;
+    sync_segment_dir(dir);
+    Ok(())
+}
+
+fn sync_segment_dir(dir: &Path) {
+    #[cfg(test)]
+    note_durable(Durable::SegmentDir(dir.to_path_buf()));
+    sync_dir(dir);
+}
+
+fn sync_manifest_dir(dir: &Path) {
+    #[cfg(test)]
+    note_durable(Durable::ManifestDir(dir.to_path_buf()));
+    sync_dir(dir);
+}
+
+fn sync_dir(dir: &Path) {
+    if let Ok(directory) = std::fs::File::open(dir) {
+        let _ = directory.sync_all();
+    }
 }
 
 #[cfg(test)]
@@ -1312,10 +1355,9 @@ fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
         f.sync_all().context("failed to fsync manifest temp")?;
     }
     std::fs::rename(&tmp, &path).context("failed to install manifest")?;
-    if let Ok(d) = std::fs::File::open(dir) {
-        #[cfg(test)]
-        note_durable(Durable::ManifestDir(dir.to_path_buf()));
-        let _ = d.sync_all(); // best-effort dir fsync (unsupported on some platforms)
+    // The renamed entry lives in `segments/`. Syncing `dir` does not install it (#1632).
+    if let Some(parent) = path.parent() {
+        sync_manifest_dir(parent);
     }
     manifest_signal(dir).send_modify(|installs| *installs += 1);
     Ok(())
@@ -2160,7 +2202,41 @@ mod tests {
         let trace = capture_durable(|| {
             seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
         });
-        assert_seal_durable(&dir, &trace, shared_store(&dir).unwrap());
+        let store = shared_store(&dir).unwrap();
+        assert_seal_durable(&dir, &trace, store.clone());
+
+        let other = root.path().join(crate::runtime::DATA_DIR).join("nid1");
+        std::fs::create_dir_all(&other).unwrap();
+        let again = capture_durable(|| {
+            seal_range(&other, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        });
+        assert_catalogue_durable(&other, &again, store);
+    }
+
+    fn assert_catalogue_durable(nest: &Path, trace: &[Durable], bytes_dir: PathBuf) {
+        let manifest_dir = nest.join(SEGMENTS_DIR);
+        let manifest_at = trace
+            .iter()
+            .rposition(|event| matches!(event, Durable::ManifestDir(path) if path == &manifest_dir))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the manifest entry lives in {}: that directory was not synced. trace: {trace:?}",
+                    manifest_dir.display()
+                )
+            });
+        let segment_at = trace
+            .iter()
+            .position(|event| matches!(event, Durable::SegmentDir(path) if path == &bytes_dir))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the segment directory {} was not synced. trace: {trace:?}",
+                    bytes_dir.display()
+                )
+            });
+        assert!(
+            segment_at < manifest_at,
+            "the segment directory entry must be durable before the manifest names it. trace: {trace:?}"
+        );
     }
 
     fn assert_seal_durable(nest: &Path, trace: &[Durable], bytes_dir: PathBuf) {
