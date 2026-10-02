@@ -3037,7 +3037,17 @@ fn view_build_failure_at(
     if files.is_empty() {
         return None;
     }
-    // Counts the rebind an unknown name must not pay (#1652).
+    let target = missing.trim_matches('"').to_ascii_lowercase();
+    // Opening the engine rebinds every table. A name that is not a view
+    // has nothing to explain (#1652).
+    let authored = files.iter().any(|v| {
+        split_sql_statements(&v.sql).iter().any(|stmt| {
+            view_target_name(stmt).is_some_and(|name| name.to_ascii_lowercase() == target)
+        })
+    });
+    if !authored {
+        return None;
+    }
     #[cfg(test)]
     note_view_build_open();
     let session = engine().open_bare().ok()?;
@@ -3054,7 +3064,6 @@ fn view_build_failure_at(
     define_labels_view(&*session, dir);
     define_children_views(&*session, dir);
 
-    let target = missing.trim_matches('"').to_ascii_lowercase();
     for v in &files {
         for stmt in split_sql_statements(&v.sql) {
             let result = session.execute(&stmt);
