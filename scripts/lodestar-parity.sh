@@ -26,7 +26,8 @@
 # On disagreement it prints the differing rows, not just a count.
 set -euo pipefail
 
-NEST=${NEST_URL:-http://127.0.0.1:8105}
+# graph-allocations-nest-next on the Lodestar box. 8105 was its predecessor and no longer answers.
+NEST=${NEST_URL:-http://127.0.0.1:8107}
 BLOCK=${PINNED_BLOCK:-}
 NETWORK_SG=DZz4kDTdmzWLWsV373w2bSmoar3umKKH9y82SUKr5qmp
 GATEWAY=${GRAPH_GATEWAY:-https://gateway-arbitrum.network.thegraph.com}
