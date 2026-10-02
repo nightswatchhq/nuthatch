@@ -141,6 +141,9 @@ uses is kept and the answer says by whom:
 {"outcome": "kept", "nid": "9f2c…", "mounted_by": ["acme/usdc"]}
 ```
 
+An unmount that fails part-way answers `500` with the `nid`, so the dataset can still be freed by
+`DELETE /_admin/datasets/<nid>`.
+
 Inside a running runtime this removes the dataset and the segments only it references. Segments a live
 fold left behind stay for an offline `nuthatch prune`.
 
