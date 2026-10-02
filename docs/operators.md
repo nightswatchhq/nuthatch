@@ -137,8 +137,9 @@ anyone deploying without containers.
 > `0.7.1` is the first working tag, and the job now tests before it pushes. `:latest` was broken for the
 > same reason and is fixed by `0.7.1`.
 
-**glibc floor.** The Linux binary is dynamically linked and built against **glibc 2.35**, so it runs on
-Ubuntu 22.04+, Debian 12+, RHEL 9+ and anything newer. It is built on a pinned runner rather than
+**glibc floor.** The Linux binary is dynamically linked and needs **glibc 2.35** (measured on the
+4.1.0 artifact; 2.34 up to 4.0.2), so it runs on Ubuntu 22.04+, Debian 12+ and anything newer, and
+not on RHEL 9 or Amazon Linux 2023, which ship 2.34. It is built on a pinned runner rather than
 `ubuntu-latest` precisely so that floor does not drift upward unnoticed - which it had, to 2.39, until
 the container image's smoke test caught it.
 

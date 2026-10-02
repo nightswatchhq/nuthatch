@@ -130,7 +130,7 @@ level0() {
     skip 0.2 "the published tarball matches its checksum" "neither sha256sum nor shasum is on PATH"
   fi
 
-  # The glibc floor. A failure here is a distro older than 2.34, not a nuthatch bug.
+  # The glibc floor. A failure here is a distro older than 2.35, not a nuthatch bug.
   check 0.3 "it starts on this libc (no GLIBC_… not found)" \
     bash -c "$NUTHATCH --version 2>&1 | grep -qv 'GLIBC_'"
 
