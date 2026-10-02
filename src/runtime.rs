@@ -2459,36 +2459,55 @@ pub fn lifecycle_routes(
             .iter()
             .find(|(n, _)| *n == name)
             .and_then(|(_, s)| s.nid.as_deref().map(Nid::parse))
+            .or_else(|| h.suspended.get(&name).map(|n| Nid::parse(n)))
             .transpose();
+        // Refused before the unmount: once the record is gone the caller cannot learn the NID.
+        let nid = match nid {
+            Ok(Some(nid)) => Some(nid),
+            Ok(None) if !q.reclaim || !was_mounted => None,
+            Ok(None) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": format!(
+                        "'{name}' has no recorded dataset identity to reclaim; it is on the \
+                         pre-2.0 layout (`nuthatch migrate`). Nothing was unmounted"
+                    )})),
+                )
+            }
+            Err(e) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": format!(
+                        "'{name}' records an unreadable nid ({e:#}). Nothing was unmounted"
+                    )})),
+                )
+            }
+        };
         if let Err(e) = h.unmount(&name).await {
             return write_failed(&e);
         }
         if let Err(e) = jobs.forget(&name) {
             return write_failed(&e);
         }
-        if !q.reclaim {
+        let Some(nid) = nid.filter(|_| q.reclaim) else {
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"unmounted": name, "was_mounted": was_mounted})),
             );
-        }
-        let reclaim = match nid {
-            Ok(Some(nid)) => h.reclaim(&nid).map_err(|e| format!("{e:#}")),
-            Ok(None) => Err(
-                "no dataset identity to reclaim: the nest was not mounted, or is on \
-                             the pre-2.0 layout (`nuthatch migrate`)"
-                    .to_string(),
-            ),
-            Err(e) => Err(format!("{e:#}")),
         };
-        match reclaim {
+        match h.reclaim(&nid) {
             Ok(r) => (
                 StatusCode::OK,
                 Json(serde_json::json!({"unmounted": name, "reclaim": r})),
             ),
+            // The record is gone, so the NID is the caller's only way back to the dataset.
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"unmounted": name, "error": e})),
+                Json(serde_json::json!({
+                    "unmounted": name,
+                    "nid": nid.as_str(),
+                    "error": format!("{e:#}"),
+                })),
             ),
         }
     }
