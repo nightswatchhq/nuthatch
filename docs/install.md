@@ -26,7 +26,7 @@ below rather than installing something that will not run.
 
 ## Linux requirements
 
-The Linux binary is dynamically linked and needs two things, both measured off the published artifact
+The Linux binary is dynamically linked and needs one thing, measured off the published artifact
 with `objdump -T` rather than inferred.
 
 **glibc 2.34 or newer.** This is the measured ABI floor. The release is *built* on glibc 2.35
@@ -36,11 +36,10 @@ the loader checks. The two numbers answer different questions - 2.34 is what you
 is what we compile it on - and stating the build baseline as the requirement once excluded a platform
 we support ([#978](https://github.com/nightswatchhq/nuthatch/issues/978): RHEL 9 ships glibc 2.34).
 
-**libstdc++ from GCC 11 or newer** (`GLIBCXX_3.4.29`, `CXXABI_1.3.13`). The binary embeds DuckDB,
-which is C++, so it links `libstdc++.so.6` alongside `libc`, `libm` and `libgcc`.
+**No C++ runtime.** The binary links `libc`, `libm` and `libgcc`. Releases before 4.1 embedded DuckDB,
+which is C++, and also needed libstdc++ from GCC 11 (`GLIBCXX_3.4.29`).
 
-Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear both. A system with a new glibc and an old
-libstdc++ would not, which is why both are stated rather than only the first.
+Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear it.
 
 ## Verifying a download
 

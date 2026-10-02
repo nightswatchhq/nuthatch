@@ -362,7 +362,7 @@ nothing - and two tenants sharing one dataset can expose different surfaces over
 ### `[mounts.publish]` - mirroring a mount's dataset (RFC-0052 S2)
 
 A mount can mirror its dataset's sealed segments to a directory or an S3-compatible prefix as they
-seal, for Trino, Snowflake, BigQuery, Databricks or another DuckDB to read as external tables:
+seal, for Trino, Snowflake, BigQuery, Databricks or DuckDB to read as external tables:
 
 ```toml
 [[mounts]]

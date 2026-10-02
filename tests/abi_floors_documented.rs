@@ -1,13 +1,8 @@
-//! #946 - the README must name **both** ABI floors the Linux binary actually has.
+//! #946 - the README must name every ABI floor the Linux binary actually has.
 //!
-//! It named glibc and nothing else. The binary also links `libstdc++.so.6`, because it embeds DuckDB,
-//! and therefore requires `GLIBCXX_3.4.29` (GCC 11+). Every platform the README lists clears it, so
-//! this was incompleteness rather than a broken promise - but a reader on new glibc with an old
-//! libstdc++ meets a requirement nobody stated.
-//!
-//! The failure this guards is the one that produced it: a floor gets measured once, written once, and
-//! the *other* floor is never noticed because nothing looks for it. If RFC-0042 ever removes DuckDB
-//! the C++ line should go - and this test failing is how somebody finds out it should.
+//! It once named glibc and nothing else, while the binary also linked `libstdc++.so.6` for DuckDB
+//! and needed `GLIBCXX_3.4.29`. DuckDB left in 4.1 and the C++ floor with it, so there is one floor
+//! now and a stated second one would be the same fault the other way round.
 
 use std::path::PathBuf;
 
@@ -17,7 +12,7 @@ fn readme() -> String {
 }
 
 #[test]
-fn the_install_section_names_both_abi_floors() {
+fn the_install_section_names_the_glibc_floor_and_no_other() {
     let s = readme();
     assert!(
         s.contains("glibc 2.34"),
@@ -25,24 +20,9 @@ fn the_install_section_names_both_abi_floors() {
          decides whether the binary runs (#946, #978)"
     );
     assert!(
-        s.contains("GLIBCXX_3.4.29"),
-        "README states a glibc floor but not the libstdc++ one. The Linux binary links \
-         libstdc++.so.6 because it embeds DuckDB, and needs GLIBCXX_3.4.29 (GCC 11+). A reader on \
-         new glibc with an old libstdc++ meets a requirement we never mentioned (#946)."
-    );
-}
-
-/// The C++ floor exists *because* of DuckDB. Saying so is what makes it removable knowledge rather
-/// than a magic number, and it is the concrete form of RFC-0042's Tier 2 payoff.
-#[test]
-fn the_libstdcxx_floor_says_why_it_exists() {
-    let s = readme();
-    let at = s.find("GLIBCXX_3.4.29").expect("the libstdc++ floor");
-    let window = &s[at.saturating_sub(400)..(at + 400).min(s.len())];
-    assert!(
-        window.contains("DuckDB"),
-        "the libstdc++ requirement is stated without its cause. It exists because the binary embeds \
-         DuckDB; without that, it reads as an arbitrary number nobody may ever remove:\n{window}"
+        !s.contains("GLIBCXX_"),
+        "README states a libstdc++ floor. The binary has linked no C++ runtime since DuckDB left \
+         it in 4.1; a requirement nobody has is as wrong as one nobody stated (#946)."
     );
 }
 
@@ -97,7 +77,7 @@ fn the_abi_floor_is_not_stated_as_the_build_baseline() {
 fn stated_glibc_requirement(readme: &str) -> Option<(u32, u32)> {
     readme.lines().find_map(|l| {
         let t = l.trim_start();
-        // The requirement bullets are the ones under "needs two things", each `- **<thing>**`.
+        // The requirement bullet is the one under "needs one thing", `- **<thing>**`.
         let rest = t.strip_prefix("- **glibc ")?;
         // "2.34 or newer** - ..." ; require the "or newer" so a passing mention is not a requirement.
         let (ver, tail) = rest.split_once(' ')?;
@@ -162,7 +142,7 @@ fn control_the_original_contradictory_readme_is_detected() {
 - **glibc 2.35 or newer.** The measured floor is 2.34; 2.35 is what the release is built against, \
 so it is the number to trust.\n\
 \n\
-Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear both.\n";
+Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear it.\n";
     let req = stated_glibc_requirement(broken).expect("the broken form still states a requirement");
     assert_eq!(
         req,

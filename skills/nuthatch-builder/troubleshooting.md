@@ -46,7 +46,7 @@ use a provider with a higher/no result cap. This fails loudly rather than loopin
 
 - The budget is per-runtime and CI-enforced. With several nests in one runtime it's shared across them (`max_rss_mb`, default
   2048); a mount projected to exceed it is refused. Check actual `nuthatch_rss_bytes` in the roster.
-- DuckDB queries have their own 512 MB / 2-thread cap; the concurrency gate bounds the aggregate. If
+- Analytical queries have their own 512 MB / 2-thread cap; the concurrency gate bounds the aggregate. If
   you're tight, lower concurrency rather than the per-query cap.
 
 ## "semantic.toml drift" warnings at startup

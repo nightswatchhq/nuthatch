@@ -898,12 +898,7 @@ mod tests {
     fn only_keys_nothing_reads_are_unknown() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut seen = 0;
-        for rel in [
-            "docs/bench/nests/usdc-120",
-            "tests/fixtures/dune_emit/nest",
-            "obib-case2",
-            "obib-case3",
-        ] {
+        for rel in ["docs/bench/nests/usdc-120", "obib-case2", "obib-case3"] {
             let raw = std::fs::read_to_string(root.join(rel).join(CONFIG_FILE)).unwrap();
             assert_eq!(Config::unknown_keys(&raw), Vec::<String>::new(), "{rel}");
             let parsed: Config = toml::from_str(&raw).unwrap();
@@ -948,7 +943,7 @@ mod tests {
                 assert_eq!(Config::suggest_key(&nonsense, &unknown[0]), None);
             }
         }
-        assert_eq!(seen, 4);
+        assert_eq!(seen, 3);
     }
 
     #[test]

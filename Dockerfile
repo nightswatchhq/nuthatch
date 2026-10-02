@@ -5,7 +5,7 @@
 # artifact nobody diffed, and "the image behaves differently from the binary" is a miserable thing to
 # debug at 3am.
 #
-# Deliberately not a builder-stage image: a from-source build here would recompile duckdb and dbsp on
+# Deliberately not a builder-stage image: a from-source build here would recompile DataFusion and dbsp on
 # every tag for no benefit, and would make the image's provenance harder to state, not easier.
 FROM debian:bookworm-slim
 

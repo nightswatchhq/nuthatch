@@ -2,7 +2,7 @@
 //!
 //! **Why this file exists is a measurement, not a principle.** The largest row count any of
 //! `analytics.rs`'s 72 tests builds is **8**. Across every integration test and `seal.rs` the largest
-//! is **600**. DuckDB's vector is **2,048**, DataFusion's default batch **8,192**, dbsp's transaction
+//! is **600**. DataFusion's default batch is **8,192** (DuckDB's vector was 2,048), dbsp's transaction
 //! step **10,000**.
 //!
 //! So the entire analytical suite sits below the engine's first internal boundary, and a defect that
@@ -18,21 +18,21 @@
 
 use serde_json::{json, Value};
 
-/// DuckDB's vector size. A dataset at or below this is processed in one chunk and proves nothing about
-/// chunking.
-const DUCKDB_VECTOR: usize = 2_048;
+/// The engine's batch size. A dataset at or below this is processed in one chunk and proves nothing
+/// about chunking.
+const ENGINE_BATCH: usize = 8_192;
 
 /// The dataset sizes the cases run at. A `const` rather than literals inline, so the guard at the
 /// bottom can check the **values** instead of grepping the source for them.
 ///
-/// The first version of that guard did grep, for `"DUCKDB_VECTOR * 2"` - and passed with every case
+/// The first version of that guard did grep, for `"ENGINE_BATCH * 2"` - and passed with every case
 /// shrunk to 8 rows, because that literal appears in the guard's own assertion. A gate matching its
 /// own source, which is the third instance this sprint and the first that stripping comments would
 /// not have caught.
-const SIZES: [usize; 4] = [DUCKDB_VECTOR - 1, DUCKDB_VECTOR, DUCKDB_VECTOR + 1, 5_000];
+const SIZES: [usize; 4] = [ENGINE_BATCH - 1, ENGINE_BATCH, ENGINE_BATCH + 1, 20_000];
 
 /// Two full vectors and a ragged tail, for the grouped case.
-const GROUPED_SIZE: usize = DUCKDB_VECTOR * 2 + 7;
+const GROUPED_SIZE: usize = ENGINE_BATCH * 2 + 7;
 
 /// Enforced by the **compiler**, not a test. Clippy pointed out the runtime form was a constant
 /// assertion and was right: if the grouped case ever stops spanning more than two vectors, this file
@@ -42,7 +42,7 @@ const GROUPED_SIZE: usize = DUCKDB_VECTOR * 2 + 7;
 /// Verified: shrinking `GROUPED_SIZE` gives
 /// `error[E0080]: evaluation panicked: the grouped case must span more than two vectors`.
 const _: () = assert!(
-    GROUPED_SIZE > DUCKDB_VECTOR * 2,
+    GROUPED_SIZE > ENGINE_BATCH * 2,
     "the grouped case must span more than two vectors"
 );
 
@@ -92,10 +92,10 @@ fn scalar(dir: &std::path::Path, n: usize, sql: &str) -> i128 {
         .unwrap_or_else(|| panic!("not a number: {cell:?}"))
 }
 
-/// The headline case. `n = DUCKDB_VECTOR + 1` is the smallest dataset that forces a second vector, so
+/// The headline case. `n = ENGINE_BATCH + 1` is the smallest dataset that forces a second vector, so
 /// a failure here is specifically about the seam and not about size in general.
 #[test]
-fn aggregates_are_exact_across_duckdbs_vector_boundary() {
+fn aggregates_are_exact_across_the_batch_boundary() {
     let dir = tempfile::tempdir().unwrap();
     for n in SIZES {
         // Sum of 1..=n, in closed form: nothing about this expectation comes from running the query.
@@ -108,8 +108,8 @@ fn aggregates_are_exact_across_duckdbs_vector_boundary() {
         assert_eq!(
             got,
             want,
-            "SUM over {n} rows: got {got}, want {want}. {n} spans {} vector(s) of {DUCKDB_VECTOR}.",
-            n.div_ceil(DUCKDB_VECTOR)
+            "SUM over {n} rows: got {got}, want {want}. {n} spans {} vector(s) of {ENGINE_BATCH}.",
+            n.div_ceil(ENGINE_BATCH)
         );
         let count = scalar(dir.path(), n, "SELECT COUNT(*) AS c FROM tok__transfer");
         assert_eq!(count as usize, n, "COUNT over {n} rows");
@@ -147,7 +147,7 @@ fn grouped_aggregates_are_exact_across_the_boundary() {
         regrouped,
         total,
         "grouped sums must total the ungrouped sum across {n} rows ({} vectors)",
-        n.div_ceil(DUCKDB_VECTOR)
+        n.div_ceil(ENGINE_BATCH)
     );
     assert_eq!(
         total,
@@ -162,12 +162,12 @@ fn grouped_aggregates_are_exact_across_the_boundary() {
 fn the_corpus_actually_crosses_the_boundary() {
     let largest = SIZES.iter().copied().max().unwrap().max(GROUPED_SIZE);
     assert!(
-        largest > DUCKDB_VECTOR,
-        "the largest case is {largest} rows and DuckDB's vector is {DUCKDB_VECTOR}: every case fits \
+        largest > ENGINE_BATCH,
+        "the largest case is {largest} rows and the engine's batch is {ENGINE_BATCH}: every case fits \
          in one chunk, so this file proves nothing it was written to prove"
     );
     assert!(
-        SIZES.contains(&(DUCKDB_VECTOR + 1)),
+        SIZES.contains(&(ENGINE_BATCH + 1)),
         "keep the smallest dataset that forces a second vector: a failure there is about the seam, \
          not about size in general"
     );
@@ -206,7 +206,7 @@ fn rows_out(dir: &std::path::Path, n: usize, sql: &str) -> Vec<Value> {
 fn a_point_lookup_past_the_boundary_finds_its_row() {
     let dir = tempfile::tempdir().unwrap();
     let n = GROUPED_SIZE;
-    let target = (DUCKDB_VECTOR + 500) as u64; // comfortably inside the second vector
+    let target = (ENGINE_BATCH + 500) as u64; // comfortably inside the second vector
     let got = rows_out(
         dir.path(),
         n,
@@ -248,7 +248,7 @@ fn multi_column_grouping_is_exact_across_the_boundary() {
 #[test]
 fn large_integer_sums_do_not_narrow_across_the_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let n = DUCKDB_VECTOR + 1;
+    let n = ENGINE_BATCH + 1;
     // 1e18 per row: n * 1e18 overflows i64 (max ~9.2e18) at n >= 10, so any narrowing shows.
     let got = rows_out(
         dir.path(),
@@ -304,7 +304,7 @@ fn bounded_ordering_returns_the_true_top_across_the_boundary() {
 #[test]
 fn refused_sql_is_still_refused_past_the_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let n = DUCKDB_VECTOR + 1;
+    let n = ENGINE_BATCH + 1;
     let err = nuthatch::analytics::query_hot_cold(
         dir.path(),
         "DROP TABLE tok__transfer",
@@ -388,15 +388,15 @@ fn union_scalar(
 
 /// **The disjointness invariant, with the seam inside the second vector.**
 ///
-/// `cold` is deliberately larger than one DuckDB vector, so the cold side alone spans a chunk boundary
+/// `cold` is deliberately larger than one batch, so the cold side alone spans a chunk boundary
 /// *and* the hot tail begins mid-way through the second. A union that double-counts the seam or drops
 /// it fails on the closed form; nothing here is copied from a run.
 #[test]
 fn the_hot_cold_union_counts_every_row_exactly_once() {
     for (cold, total) in [
-        (DUCKDB_VECTOR - 1, DUCKDB_VECTOR + 500), // seam just before the boundary
-        (DUCKDB_VECTOR, DUCKDB_VECTOR + 500),     // seam exactly on it
-        (DUCKDB_VECTOR + 1, GROUPED_SIZE),        // seam just past it, hot tail into a third vector
+        (ENGINE_BATCH - 1, ENGINE_BATCH + 500), // seam just before the boundary
+        (ENGINE_BATCH, ENGINE_BATCH + 500),     // seam exactly on it
+        (ENGINE_BATCH + 1, GROUPED_SIZE),       // seam just past it, hot tail into a third vector
     ] {
         let dir = tempfile::tempdir().unwrap();
         let hot = hot_and_cold(dir.path(), cold, total);
@@ -430,7 +430,7 @@ fn the_hot_cold_union_counts_every_row_exactly_once() {
 #[test]
 fn grouping_across_the_hot_cold_seam_is_exact() {
     let dir = tempfile::tempdir().unwrap();
-    let (cold, total) = (DUCKDB_VECTOR + 1, GROUPED_SIZE);
+    let (cold, total) = (ENGINE_BATCH + 1, GROUPED_SIZE);
     let hot = hot_and_cold(dir.path(), cold, total);
     let groups = union_scalar(
         dir.path(),
@@ -466,9 +466,9 @@ fn grouping_across_the_hot_cold_seam_is_exact() {
 #[test]
 fn a_join_is_exact_across_the_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let n = DUCKDB_VECTOR + 1;
+    let n = ENGINE_BATCH + 1;
     const _: () = assert!(
-        DUCKDB_VECTOR + 1 > DUCKDB_VECTOR,
+        ENGINE_BATCH + 1 > ENGINE_BATCH,
         "the join inputs must exceed one vector or this test cannot see a seam"
     );
 

@@ -81,16 +81,17 @@ involved.** Prebuilt binaries cover macOS Apple Silicon and Linux x86_64 and are
 release with their checksums, if you would rather fetch one by hand. **No Intel Mac binary is
 published**; the installer says so and points at the source build below.
 
-**The Linux binary is dynamically linked and needs two things**, both measured off the published
+**The Linux binary is dynamically linked and needs one thing**, measured off the published
 artifact with `objdump -T` rather than inferred:
 
 - **glibc 2.34 or newer** - the measured ABI floor. The release is *built* on glibc 2.35, but the
   binary references no symbol newer than `GLIBC_2.34`: **2.34 is what you need to run it, 2.35 is what
   we compile it on** ([#978](https://github.com/nightswatchhq/nuthatch/issues/978)).
-- **libstdc++ from GCC 11 or newer** (`GLIBCXX_3.4.29`, `CXXABI_1.3.13`), because the binary embeds
-  DuckDB, which is C++, so it links `libstdc++.so.6` alongside `libc`, `libm` and `libgcc`.
 
-Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear both.
+It links `libc`, `libm` and `libgcc` and no C++ runtime. Releases before 4.1 embedded DuckDB and
+also needed libstdc++ from GCC 11.
+
+Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear it.
 
 **Verify who built it.** Every release binary carries a build provenance attestation, which a
 checksum cannot give you:
@@ -225,7 +226,7 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
   and `degraded_tables` naming the affected tables, `nuthatch sql` prints a warning line, and the MCP
   server carries the same notice. The caveat is a fact about the *nest*, not about the row count you
   happened to get, so it appears whether or not this particular query touched the gap.
-- **A failed query tells you how to fix it.** A DuckDB error is classified against the nest's own
+- **A failed query tells you how to fix it.** An engine error is classified against the nest's own
   schema and an actionable line is appended - the engine's raw message is always kept, the hint is
   added after it. An unknown table names the closest real one; a view that failed to *build* says so
   rather than reporting "does not exist" and sending you hunting for a missing view; and a Solidity
@@ -331,10 +332,12 @@ address list, so a **factory nest was measured without its children** - 232 even
 expected 35,039, reported as a success. Running an outside benchmark has now found two things our own
 testing did not.
 
-**Analytical queries** run on DuckDB over sealed Parquet. We benchmark-gated the alternative rather
-than arguing about it: DataFusion measured **1.6–2.7× slower** on the fold that matters, with the gap
-widening as segments grow, at exact result parity -
-[RFC-0013 §5](docs/rfcs/0013-storage-and-query-engine-direction.md).
+**Analytical queries** run on [Burrmill](https://github.com/nightswatchhq/burrmill), our engine on
+DataFusion, over sealed Parquet. Until 4.1 they ran on DuckDB, and the change was not made for speed:
+measured on a production nest on 2026-10-01, Burrmill takes about **2.5× DuckDB's time** for each
+statement and needs more memory for the same joins. What it buys is one language in the binary and
+exact arithmetic that refuses rather than wraps. The reasons and the log of the switch are in
+[Replacing DuckDB, after all](https://nuthatch-indexer.com/blog/replacing-duckdb-after-all).
 
 ---
 
@@ -345,7 +348,7 @@ RPC ingestion  →  deterministic decode  →  redb hot store (tip)
                                                             │
                                         past finality  →  content-addressed Parquet segments
                                                             │
-                                        DuckDB attaches segments read-only  →  SQL (hot ∪ cold)
+                                        Burrmill reads segments read-only   →  SQL (hot ∪ cold)
 ```
 
 - **Deterministic core.** Decode, reorg handling, and entity derivation are deterministic and
@@ -486,12 +489,6 @@ who need more - none of it in the way of the happy path:
   local segment (`--deep` re-downloads and re-hashes), and `doctor --publish` puts the mirror in a
   health check. Reading it needs no nuthatch: DuckDB, Trino or anything that reads Parquet, as
   [Reading a published nest](docs/reading-published-nest.md) describes.
-- **Dune queries for a nest** ([RFC-0055](docs/rfcs/0055-the-dune-view-emitter.md)). `nuthatch emit
-  dune --dir <nest> --out <dir> --source <namespace>` writes one DuneSQL query per event table,
-  casting every column to its DuneSQL type: 256-bit values to `uint256`/`int256`, addresses and
-  hashes to `varbinary`, block timestamps to `timestamp`. It is offline and deterministic and writes
-  nothing into the nest. Getting the rows into Dune is yours to arrange; the queries read
-  `dune.<source>.<table>`.
 - **Safe upgrades - no resync tax** (RFC-0020, RFC-0033). Updating a nest is not a subgraph-style
   genesis resync, and in 2.0 it needs no command to remember. The **runtime** classifies the update
   when a nest's identity changes: *compatible* (additive only) is applied, *breaking* (a

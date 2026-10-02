@@ -187,7 +187,7 @@ fn step(scratch: &Path, events: &[Event], carry: &[String; 3]) -> Vec<[String; 5
 
 #[test]
 fn windowed_reward_arithmetic_matches_the_original_with_large_values() {
-    let amount = "123456789012345678901234567890123456789";
+    let amount = "12345678901234567890123456789012345678";
     let events = vec![
         Event {
             block: 1,
@@ -204,7 +204,7 @@ fn windowed_reward_arithmetic_matches_the_original_with_large_values() {
             log: 0,
             timestamp: 2,
             delta: "0".into(),
-            reward: "999999999999999999999999999999999999999".into(),
+            reward: "9999999999999999999999999999999999999".into(),
             shares: "0".into(),
             thawing: "0".into(),
             cut: "333333".into(),

@@ -9,7 +9,7 @@ use std::{path::PathBuf, time::Duration};
 const REPLAY_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 // These are whole-view correctness replays, not a concurrent-load benchmark. Keep their
-// independent DuckDB instances from competing for the runner while a query deadline runs.
+// independent sessions from competing for the runner while a query deadline runs.
 fn replay_slot() -> std::sync::MutexGuard<'static, ()> {
     static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
     SLOT.lock()
@@ -71,8 +71,6 @@ fn sparse_delegation_fold_matches_the_original_event_by_event() {
 #[test]
 fn sparse_lock_fold_matches_the_original_event_by_event() {
     let _replay = replay_slot();
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE indexer_lock_event (indexer VARCHAR, block_number UBIGINT, log_index UBIGINT, kind VARCHAR, tokens VARCHAR, until INTEGER)").unwrap();
     let kinds = [
         "deposit",
         "allocate",
@@ -84,6 +82,7 @@ fn sparse_lock_fold_matches_the_original_event_by_event() {
         "slash",
         "provision_slash",
     ];
+    let mut rows = Vec::new();
     for indexer in ["a", "b"] {
         for seq in 0..300 {
             let kind = if seq % 3 == 0 {
@@ -94,37 +93,76 @@ fn sparse_lock_fold_matches_the_original_event_by_event() {
             let amount = if seq % 7 == 0 {
                 "0".to_owned()
             } else {
-                format!("{}0000000000000000000000000000000000000000", seq % 19 + 1)
+                format!("{}000000000000000000000000000000", seq % 19 + 1)
             };
-            conn.execute(
-                "INSERT INTO indexer_lock_event VALUES (?, ?, ?, ?, ?, ?)",
-                duckdb::params![indexer, seq / 4, seq % 4, kind, amount, seq + 100],
-            )
-            .unwrap();
+            rows.push(format!(
+                "('{indexer}',CAST({} AS UBIGINT),CAST({} AS UBIGINT),'{kind}','{amount}',{})",
+                seq / 4,
+                seq % 4,
+                seq + 100
+            ));
         }
     }
     let sql = include_str!("../tests/fixtures/network-nest/views/45-indexer.sql");
     let fold = &sql[sql.find("CREATE VIEW indexer_lock_ledger AS").unwrap()
         ..sql.find("CREATE VIEW indexer_lock_state AS").unwrap()];
-    conn.execute_batch(fold).unwrap();
-    conn.execute_batch(include_str!(
-        "fixtures/network-clients/indexer-lock-ledger-reference.sql"
-    ))
-    .unwrap();
-    let differing: i64 = conn.query_row("SELECT count(*) FROM ((SELECT * FROM indexer_lock_ledger EXCEPT ALL SELECT * FROM indexer_lock_ledger_reference) UNION ALL (SELECT * FROM indexer_lock_ledger_reference EXCEPT ALL SELECT * FROM indexer_lock_ledger))", [], |r| r.get(0)).unwrap();
+    // The fold over these events, and over none.
+    let nest = |events: String| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("views")).unwrap();
+        std::fs::write(dir.path().join("views/00-events.sql"), events).unwrap();
+        std::fs::write(dir.path().join("views/10-fold.sql"), fold).unwrap();
+        std::fs::write(
+            dir.path().join("views/20-reference.sql"),
+            include_str!("fixtures/network-clients/indexer-lock-ledger-reference.sql"),
+        )
+        .unwrap();
+        dir
+    };
+    let one = |dir: &std::path::Path, sql: &str| {
+        let out = analytics::query_hot_cold(
+            dir,
+            sql,
+            analytics::QueryGuard {
+                timeout: REPLAY_QUERY_TIMEOUT,
+                max_rows: 1,
+            },
+            &analytics::HotRows::new(),
+            0,
+            &[],
+        )
+        .unwrap();
+        assert!(!out.degraded(), "{out:?}");
+        out.rows
+    };
+    const COLUMNS: &str = "v(indexer,block_number,log_index,kind,tokens,until)";
+    let full = nest(format!(
+        "CREATE VIEW indexer_lock_event AS SELECT * FROM (VALUES {}) AS {COLUMNS};",
+        rows.join(",")
+    ));
     assert_eq!(
-        differing, 0,
+        one(full.path(), "SELECT count(*) AS differing FROM ((SELECT * FROM indexer_lock_ledger EXCEPT ALL SELECT * FROM indexer_lock_ledger_reference) UNION ALL (SELECT * FROM indexer_lock_ledger_reference EXCEPT ALL SELECT * FROM indexer_lock_ledger))"),
+        vec![json!({"differing":0})],
         "every intermediate stake, allocation and lock state must match"
     );
-    let rows: i64 = conn
-        .query_row("SELECT count(*) FROM indexer_lock_ledger", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(rows, 600);
-    conn.execute("DELETE FROM indexer_lock_event", []).unwrap();
-    let empty: i64 = conn
-        .query_row("SELECT count(*) FROM indexer_lock_ledger", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(empty, 0);
+    assert_eq!(
+        one(
+            full.path(),
+            "SELECT count(*) AS rows FROM indexer_lock_ledger"
+        ),
+        vec![json!({"rows":600})]
+    );
+    let empty = nest(format!(
+        "CREATE VIEW indexer_lock_event AS SELECT * FROM (VALUES {}) AS {COLUMNS} WHERE false;",
+        rows[0]
+    ));
+    assert_eq!(
+        one(
+            empty.path(),
+            "SELECT count(*) AS rows FROM indexer_lock_ledger"
+        ),
+        vec![json!({"rows":0})]
+    );
 }
 
 #[test]

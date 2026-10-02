@@ -99,7 +99,7 @@ pub fn sql_max_concurrency() -> usize {
                     requested = n,
                     ceiling = SQL_MAX_CONCURRENCY_CEILING,
                     "NUTHATCH_SQL_MAX_CONCURRENCY above the ceiling; clamping. Each concurrent query \
-                     can open its own DuckDB, and the per-cursor budget is 2 GB shared across every \
+                     can open its own session, and the per-cursor budget is 2 GB shared across every \
                      nest on the cursor (#1006)"
                 );
                 SQL_MAX_CONCURRENCY_CEILING
@@ -109,7 +109,11 @@ pub fn sql_max_concurrency() -> usize {
     }
 }
 /// Wall-clock deadline for a single analytical query; a runaway (e.g. cartesian) is interrupted.
-const SQL_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Ten times that under test: the tests through the router are built unoptimised, where the engine
+/// plans the network nest's thirty-view queries in tens of seconds and not the release build's one.
+/// They test answers, not latency, as `tests/network_contract.rs` says of its own allowance.
+const SQL_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 300 } else { 30 });
 /// How long a request waits for an analytical permit before it is told the node is busy (#1319).
 ///
 /// The permit count still caps what *runs*; this only caps how long a caller waits to be told no.
@@ -3327,7 +3331,7 @@ async fn run_sql_query_at(
                 .filter(|e| e.unavailable().is_none() && e.fault().is_none())
                 .map(|e| (e.name().to_string(), e.fence_watermark()))
                 .collect();
-            let files = crate::analytics::duck_inputs(&s.dir);
+            let files = crate::analytics::cache_inputs(&s.dir);
             let sealed_through = s.store.sealed_through();
             let key = crate::sqlmemo::Inputs {
                 dir: &s.dir,
@@ -4674,15 +4678,14 @@ mod tests {
         assert!(chain.get("offchain").is_none(), "{chain}");
     }
 
-    /// The `/sql` concurrency sweep through the router, on one engine alone: the permits, the
+    /// The `/sql` concurrency sweep through the router: the permits, the
     /// 250 ms admission wait and the 503 past it, as production serves them. Every authored view is
     /// read whole, each client starting at its own offset. Ignored unless `NUTHATCH_SWEEP_NEST`
     /// names a nest; run it on a copy, since the store is opened inside it. With the memo on, a
     /// repeated view never reaches the engine, so `NUTHATCH_SQL_MEMO_BYTES=0` measures the engine.
     ///
-    ///     NUTHATCH_SWEEP_NEST=/copy/of/nest NUTHATCH_SWEEP_ENGINE=burrmill CLIENTS=1,8,32 \
-    ///         cargo test --release --features shadow-burrmill --lib sql_sweep -- --ignored --nocapture
-    #[cfg(feature = "shadow-burrmill")]
+    ///     NUTHATCH_SWEEP_NEST=/copy/of/nest CLIENTS=1,8,32 \
+    ///         cargo test --release --lib sql_sweep -- --ignored --nocapture
     #[test]
     #[ignore]
     fn sql_sweep_over_a_nest() {
@@ -4692,12 +4695,6 @@ mod tests {
             return;
         };
         let dir = std::path::PathBuf::from(nest);
-        let engine = std::env::var("NUTHATCH_SWEEP_ENGINE").unwrap_or_else(|_| "burrmill".into());
-        if engine == "burrmill" {
-            static BURRMILL: crate::engine_burrmill::BurrmillEngine =
-                crate::engine_burrmill::BurrmillEngine;
-            crate::analytics::TEST_PRIMARY.set(&BURRMILL).ok();
-        }
         let secs: u64 = std::env::var("SECONDS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -4741,7 +4738,7 @@ mod tests {
         state.tables = Arc::new(crate::indexer::full_schema(&registry, &config));
         let app = router(SharedNest::new(state));
         println!(
-            "SWEEP\tengine={engine}\tviews={}\tpermits={SQL_MAX_CONCURRENCY}\tseconds={secs}",
+            "SWEEP\tviews={}\tpermits={SQL_MAX_CONCURRENCY}\tseconds={secs}",
             views.len()
         );
         // One pass first, so no point pays the first open of the nest's session.
@@ -8092,7 +8089,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("graph/history.toml"),
-            "version = 1\nfirst_block = 42440000\nmax_head_age_seconds = 60\n",
+            "version = 1\nfirst_block = 42440000\nmax_head_age_seconds = 600\n",
         )
         .unwrap();
         for entry in std::fs::read_dir(source.join("views")).unwrap() {
@@ -8235,7 +8232,8 @@ mod tests {
             }
             let document = std::fs::read_to_string(&path).unwrap();
             // This corpus checks document compatibility, not elapsed freshness. Keep the synthetic
-            // head current for each request: on CI the preceding documents can take over 60 seconds.
+            // head current for each request: on CI the preceding documents can take minutes, and one
+            // alone over 60 seconds unoptimised, which is why the fixture's limit is 600.
             state
                 .store
                 .set_block_timestamp(42_460_000, crate::metrics::now_unix())
@@ -8350,7 +8348,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("graph/history.toml"),
-            "version = 1\nfirst_block = 10\nmax_head_age_seconds = 60\n",
+            "version = 1\nfirst_block = 10\nmax_head_age_seconds = 600\n",
         )
         .unwrap();
         for entry in std::fs::read_dir(source.join("views")).unwrap() {

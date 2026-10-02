@@ -9,13 +9,9 @@
 //! segment's `value` falls off the end of its file and reads as NULL rather than failing a type
 //! check, which is what `hive.parquet.use-column-names=true` exists to prevent.
 //!
-//! `value` holds numbers past `i64::MAX`, so the sum is `TRY_CAST(value AS DECIMAL(38,0))` on both
-//! engines; a `BIGINT` cast would read every row as NULL.
-//!
-//! #1359, RFC-0055 S3 uses the same fixture. The nest carries authored views, `emit dune` translates
-//! them, and each translation must return the rows the nest's own view returns: in DuckDB over
-//! tables shaped like the Dune upload here, and on Trino over the prefix in the CI job. `usdc__wide`
-//! holds values past `DECIMAL(38,0)`, so `_dec` and `_overflow` are compared where they do something.
+//! `value` holds numbers past `i64::MAX`, so the sum is over `DECIMAL(38,0)` on both engines; a
+//! `BIGINT` cast would read every row as NULL. `usdc__wide` holds values past `DECIMAL(38,0)`, which
+//! both leave out of the sum.
 //!
 //! Gated like `e2e_minio_publish.rs`: skips without `NUTHATCH_MINIO_ENDPOINT`, fails without it
 //! under `NUTHATCH_REQUIRE_MINIO`. `NUTHATCH_TRINO_FIXTURE_OUT` names the file the expected numbers
@@ -36,57 +32,6 @@ const ROWS_PER_SEAL: u64 = 1_000;
 const PLAIN: &str = "usdc__transfer";
 const DRIFTED: &str = "usdc__drift";
 const WIDE: &str = "usdc__wide";
-
-/// The Dune namespace the translated views read, swapped for the Trino catalogue in the CI job.
-const SOURCE: &str = "trino_fixture";
-
-const BASE_VIEWS: &str = r#"
-CREATE VIEW transfer_totals AS
-SELECT count(*) AS transfers, CAST(sum(value_dec) AS VARCHAR) AS total,
-       min(block_number) AS first_block, max(block_number) AS last_block
-FROM usdc__transfer;
-
-CREATE VIEW wide_values AS
-SELECT value_overflow AS overflowed, count(*) AS n,
-       sum(CASE WHEN NOT value_overflow THEN value_dec END) AS total_dec,
-       count(CASE WHEN NOT value_overflow THEN value_dec END) AS with_dec
-FROM usdc__wide
-GROUP BY value_overflow;
-
-CREATE VIEW top_blocks AS
-SELECT lower(address) AS contract, block_number AS block, value_dec AS amount
-FROM usdc__wide
-WHERE NOT value_overflow AND value_dec < 3000
-ORDER BY value_dec DESC, block_number ASC
-LIMIT 3;
-
--- Valid DuckDB, and refused: avg is a double in DuckDB and a decimal in DuneSQL.
-CREATE VIEW mean_value AS SELECT avg(value_dec) AS mean FROM usdc__transfer;
-"#;
-
-const DERIVED_VIEWS: &str = r#"
-CREATE VIEW sender_kinds AS
-WITH marked AS (
-    SELECT CASE WHEN sender IS NULL THEN 'none' ELSE 'some' END AS kind, block_number, value_dec
-    FROM usdc__drift
-    WHERE block_number BETWEEN 10 AND 1509 AND tx_hash LIKE '0x%' AND log_index IN (0, 1)
-)
-SELECT m.kind AS kind, count(*) AS n, sum(m.value_dec) AS total, max(t.last_block) AS last_block
-FROM marked m CROSS JOIN transfer_totals t
-GROUP BY m.kind
-UNION ALL
-SELECT 'all' AS kind, count(*) AS n, sum(value_dec) AS total, NULL AS last_block
-FROM usdc__drift;
-
-CREATE VIEW drift_summary AS
-SELECT coalesce(max(sender), 'no sender') AS any_sender,
-       count(*) FILTER (WHERE sender IS NOT NULL) AS with_sender,
-       CAST(sum(- value_dec) AS VARCHAR) AS negated,
-       'rows:' || CAST(count(*) AS VARCHAR) AS label,
-       (SELECT count(*) FROM usdc__transfer WHERE block_number NOT IN (10, 11, 12)) AS transfers,
-       EXISTS (SELECT 1 FROM transfer_totals WHERE transfers > 5000) AS has_totals
-FROM usdc__drift;
-"#;
 
 fn endpoint() -> Option<String> {
     match std::env::var("NUTHATCH_MINIO_ENDPOINT") {
@@ -173,9 +118,6 @@ abi = "abis/usdc.json"
         serde_json::to_string(&serde_json::json!({ "tables": tables })).unwrap(),
     )
     .unwrap();
-    std::fs::create_dir_all(dir.join("views")).unwrap();
-    std::fs::write(dir.join("views/10-base.sql"), BASE_VIEWS).unwrap();
-    std::fs::write(dir.join("views/20-derived.sql"), DERIVED_VIEWS).unwrap();
 }
 
 fn row(table: &str, block: u64, value: u128, sender: Option<[u8; 20]>) -> String {
@@ -267,28 +209,27 @@ fn files(dir: &Path, segs: &[Segment]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn file_list(files: &[PathBuf]) -> String {
-    files
-        .iter()
-        .map(|p| format!("'{}'", p.display()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// `(count(*), sum(value) as decimal text, count(sender))` via nuthatch's bundled DuckDB, by name.
-fn duckdb_numbers(files: &[PathBuf], has_sender: bool) -> (i64, String, i64) {
-    let list = file_list(files);
+/// `(count(*), sum(value) as decimal text, count(sender))` as the nest's own engine reads the table,
+/// its segments unioned by name. A value past `DECIMAL(38,0)` is left out of the sum.
+fn local_numbers(nest: &Path, table: &str, has_sender: bool) -> (i64, String, i64) {
     let sender = if has_sender { "count(sender)" } else { "0" };
-    let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
-    conn.prepare(&format!(
-        "SELECT count(*), CAST(sum(TRY_CAST(value AS DECIMAL(38,0))) AS VARCHAR), {sender} \
-         FROM read_parquet([{list}], union_by_name=true)"
-    ))
-    .and_then(|mut s| s.query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))
-    .expect("count/sum over the sealed segments")
+    let rows = nuthatch::analytics::query(
+        nest,
+        &format!(
+            "SELECT count(*) AS n, CAST(sum(CASE WHEN TRY_CAST(value AS DECIMAL(38,0)) IS NOT NULL \
+             THEN CAST(value AS DECIMAL(38,0)) END) AS VARCHAR) AS total, {sender} AS senders \
+             FROM \"{table}\""
+        ),
+    )
+    .expect("count/sum over the sealed segments");
+    (
+        rows[0]["n"].as_i64().unwrap(),
+        rows[0]["total"].as_str().unwrap().to_string(),
+        rows[0]["senders"].as_i64().unwrap(),
+    )
 }
 
-/// Seals the fixture, proves the drift from the footers, and returns DuckDB's numbers per table.
+/// Seals the fixture, proves the drift from the footers, and returns the local numbers per table.
 fn sealed_fixture() -> (
     tempfile::TempDir,
     serde_json::Map<String, serde_json::Value>,
@@ -335,48 +276,41 @@ fn sealed_fixture() -> (
 
     let rows = 2 * ROWS_PER_SEAL;
     let mut expected = serde_json::Map::new();
-    for (table, files, value, has_sender) in [
-        (PLAIN, &plain, plain_value as fn(u64) -> u128, false),
-        (DRIFTED, &drifted, drifted_value as fn(u64) -> u128, true),
+    for (table, value, has_sender) in [
+        (PLAIN, plain_value as fn(u64) -> u128, false),
+        (DRIFTED, drifted_value as fn(u64) -> u128, true),
     ] {
-        let (count, sum, senders) = duckdb_numbers(files, has_sender);
+        let (count, sum, senders) = local_numbers(nest.path(), table, has_sender);
         let want: u128 = (0..rows).map(value).sum();
         assert!(
             want > i64::MAX as u128,
             "the sum must need the decimal cast"
         );
-        assert_eq!(count, rows as i64, "{table}: DuckDB count");
-        assert_eq!(
-            sum,
-            want.to_string(),
-            "{table}: DuckDB sum against the fixture"
-        );
+        assert_eq!(count, rows as i64, "{table}: count");
+        assert_eq!(sum, want.to_string(), "{table}: sum against the fixture");
         if has_sender {
-            assert_eq!(
-                senders, ROWS_PER_SEAL as i64,
-                "{table}: DuckDB count(sender)"
-            );
+            assert_eq!(senders, ROWS_PER_SEAL as i64, "{table}: count(sender)");
         }
-        eprintln!("duckdb {table}: count={count} sum={sum} count_sender={senders}");
+        eprintln!("local {table}: count={count} sum={sum} count_sender={senders}");
         expected.insert(
             table.to_string(),
             serde_json::json!({ "count": count, "sum": sum, "count_sender": senders }),
         );
     }
 
-    let (count, sum, _) = duckdb_numbers(&files(nest.path(), &manifest.tables[WIDE]), false);
+    let (count, sum, _) = local_numbers(nest.path(), WIDE, false);
     assert!(
         (0..rows).map(wide_value).any(|v| v >= DECIMAL_38),
         "premise: {WIDE} must hold values past DECIMAL(38,0)"
     );
     let fits: u128 = (0..rows).map(wide_value).filter(|v| *v < DECIMAL_38).sum();
-    assert_eq!(count, rows as i64, "{WIDE}: DuckDB count");
+    assert_eq!(count, rows as i64, "{WIDE}: count");
     assert_eq!(
         sum,
         fits.to_string(),
-        "{WIDE}: DuckDB sums only the values that fit"
+        "{WIDE}: the sum takes only the values that fit"
     );
-    eprintln!("duckdb {WIDE}: count={count} sum={sum}");
+    eprintln!("local {WIDE}: count={count} sum={sum}");
     expected.insert(
         WIDE.to_string(),
         serde_json::json!({ "count": count, "sum": sum, "count_sender": 0 }),
@@ -384,171 +318,10 @@ fn sealed_fixture() -> (
     (nest, expected)
 }
 
-/// One `|`-joined text line per row. The same projection wraps the nest's view and its translation,
-/// so a difference between them belongs to the translation.
-fn lines_query(inner: &str, columns: &[String]) -> String {
-    let expr = columns
-        .iter()
-        .map(|c| {
-            format!(
-                "coalesce(CAST(\"{}\" AS VARCHAR), '<null>')",
-                c.replace('"', "\"\"")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" || '|' || ");
-    format!("SELECT {expr} AS line FROM ({inner}) q")
-}
-
-/// Every view translated and run both ways in DuckDB: the nest's own view through `analytics`, and
-/// the translation over tables in the upload's shape. Returns what the Trino half runs and expects.
-fn translated_views(nest: &Path) -> serde_json::Map<String, serde_json::Value> {
-    let schema: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(nest.join("schema.json")).unwrap()).unwrap();
-    let tables: Vec<nuthatch::registry::TableSchema> =
-        serde_json::from_value(schema["tables"].clone()).unwrap();
-    let outcomes = nuthatch::dune_views::translate(
-        &nuthatch::analytics::nest_view_files(nest),
-        &tables,
-        SOURCE,
-    )
-    .unwrap();
-
-    let manifest = load_manifest(nest).unwrap();
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    conn.execute_batch(&format!(
-        "ATTACH ':memory:' AS dune; CREATE SCHEMA dune.{SOURCE};"
-    ))
-    .unwrap();
-    for table in [PLAIN, DRIFTED, WIDE] {
-        let list = file_list(&files(nest, &manifest.tables[table]));
-        // RFC-0055 §4's upload: the four counters as integers, every other column as its text.
-        conn.execute_batch(&format!(
-            "CREATE TABLE dune.{SOURCE}.{table} AS SELECT * REPLACE (\
-             CAST(block_number AS BIGINT) AS block_number, CAST(log_index AS BIGINT) AS log_index, \
-             CAST(_seq AS BIGINT) AS _seq, CAST(block_timestamp AS BIGINT) AS block_timestamp) \
-             FROM read_parquet([{list}], union_by_name=true)"
-        ))
-        .unwrap();
-    }
-
-    let mut out = serde_json::Map::new();
-    let mut refused = Vec::new();
-    for o in outcomes {
-        let name = o.name.clone().expect("every fixture statement is a view");
-        let view = match o.result {
-            Ok(v) => v,
-            Err(why) => {
-                refused.push((name, why));
-                continue;
-            }
-        };
-        let own = format!("SELECT * FROM \"{name}\"");
-        let mut want: Vec<String> =
-            nuthatch::analytics::query(nest, &lines_query(&own, &view.columns))
-                .unwrap_or_else(|e| panic!("the nest's own view `{name}` did not answer: {e:#}"))
-                .iter()
-                .map(|r| r["line"].as_str().expect("a text line").to_string())
-                .collect();
-        want.sort();
-        let mut got: Vec<String> = conn
-            .prepare(&lines_query(&view.sql, &view.columns))
-            .unwrap_or_else(|e| {
-                panic!(
-                    "`{name}` translated to SQL DuckDB rejects: {e}\n{}",
-                    view.sql
-                )
-            })
-            .query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        got.sort();
-        assert!(
-            !want.is_empty(),
-            "`{name}` answered no rows, so agreement would prove nothing"
-        );
-        assert_eq!(
-            got, want,
-            "`{name}`: the translation and the nest's view disagree\n{}",
-            view.sql
-        );
-        let trino = view
-            .sql
-            .replace(&format!("dune.{SOURCE}."), "hive.nuthatch.");
-        assert!(
-            !trino.contains("dune."),
-            "`{name}` still names Dune after the catalogue swap:\n{trino}"
-        );
-        eprintln!("view {name}: {} rows agree", want.len());
-        out.insert(
-            name,
-            serde_json::json!({
-                "columns": view.columns,
-                "lines": want,
-                "trino_sql": lines_query(&trino, &view.columns),
-            }),
-        );
-    }
-
-    assert_eq!(
-        refused.len(),
-        1,
-        "only `mean_value` is refused: {refused:?}"
-    );
-    assert_eq!(refused[0].0, "mean_value");
-    assert!(refused[0].1.contains("`avg`"), "{}", refused[0].1);
-    let mut names = out.keys().map(String::as_str).collect::<Vec<_>>();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "drift_summary",
-            "sender_kinds",
-            "top_blocks",
-            "transfer_totals",
-            "wide_values"
-        ]
-    );
-
-    // Anchored to the fixture's own numbers, so two engines agreeing on a wrong answer still fails.
-    let rows = 2 * ROWS_PER_SEAL;
-    let plain: u128 = (0..rows).map(plain_value).sum();
-    assert_eq!(
-        out["transfer_totals"]["lines"],
-        serde_json::json!([format!("{rows}|{plain}|10|2009")])
-    );
-    let fits: Vec<u128> = (0..rows)
-        .map(wide_value)
-        .filter(|v| *v < DECIMAL_38)
-        .collect();
-    let overflowed = rows as usize - fits.len();
-    assert_eq!(
-        out["wide_values"]["lines"],
-        serde_json::json!([
-            format!(
-                "false|{}|{}|{}",
-                fits.len(),
-                fits.iter().sum::<u128>(),
-                fits.len()
-            ),
-            format!("true|{overflowed}|<null>|0"),
-        ])
-    );
-    out
-}
-
 /// Offline, so the drift is proven wherever the suite runs, not only where MinIO does.
 #[test]
-fn the_fixture_drifts_and_duckdb_reads_it_by_name() {
+fn the_fixture_drifts_and_is_read_by_name() {
     sealed_fixture();
-}
-
-/// RFC-0055 S3 (#1359): every translated view returns what the nest's own view returns.
-#[test]
-fn every_translated_view_returns_the_rows_the_nest_view_returns() {
-    let (nest, _) = sealed_fixture();
-    translated_views(nest.path());
 }
 
 #[tokio::test]
@@ -563,7 +336,6 @@ async fn publish_a_drifted_nest_and_record_what_trino_must_return() {
     let target = format!("s3://{bucket}/{prefix}");
 
     let (nest, expected) = sealed_fixture();
-    let views = translated_views(nest.path());
     let report = sync(nest.path(), &target, false).await.unwrap();
     verify(nest.path(), &target, true, false).await.unwrap();
 
@@ -572,7 +344,6 @@ async fn publish_a_drifted_nest_and_record_what_trino_must_return() {
         "prefix": prefix,
         "dataset": report.dataset,
         "tables": expected,
-        "views": views,
     });
     eprintln!("fixture: {fixture}");
     if let Ok(out) = std::env::var("NUTHATCH_TRINO_FIXTURE_OUT") {

@@ -3956,7 +3956,7 @@ impl RuntimeHandles {
         // 3. Drop the serving state - the third - and re-compose without it. Requests already in
         //    flight finish against the old composition; new ones 404.
         self.states.remove(idx);
-        crate::analytics::invalidate_duck_cache(&dataset_dir);
+        crate::analytics::invalidate_session_cache(&dataset_dir);
         crate::metrics::METRICS.remove_nest(&cursor_key);
         crate::metrics::METRICS.remove_nest(name);
         self.recompose_after_unmount(name);
@@ -4113,7 +4113,7 @@ impl RuntimeHandles {
             m.nid = nid.as_str().to_string();
         }
         if !old_shared {
-            crate::analytics::invalidate_duck_cache(&old_state.dir);
+            crate::analytics::invalidate_session_cache(&old_state.dir);
         }
         drop(old_state);
         self.recompose();

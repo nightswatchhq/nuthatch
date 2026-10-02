@@ -1824,7 +1824,7 @@ async fn a_maintained_count_is_numeric_in_sql() {
     };
     assert_eq!(
         one("SELECT typeof(n) AS t FROM counts LIMIT 1").await["t"],
-        "HUGEINT"
+        "DECIMAL(38,0)"
     );
     assert_eq!(
         one("SELECT count(*) AS c FROM counts WHERE nothing IS NULL").await["c"],
@@ -1836,7 +1836,7 @@ async fn a_maintained_count_is_numeric_in_sql() {
     assert_eq!(summed.trim_matches('"'), raw.trim_matches('"'));
     assert_eq!(
         one("SELECT any_value(typeof(n)) AS t FROM by_block").await["t"],
-        "HUGEINT"
+        "DECIMAL(38,0)"
     );
     let named = one("SELECT log_index FROM named_like_counters LIMIT 1").await["log_index"].clone();
     assert!(
@@ -1848,7 +1848,7 @@ async fn a_maintained_count_is_numeric_in_sql() {
     std::fs::write(dir.path().join("entities.toml"), "[[entities\nnot toml").unwrap();
     assert_eq!(
         one("SELECT typeof(n) AS t FROM counts ORDER BY n LIMIT 1").await["t"],
-        "HUGEINT"
+        "DECIMAL(38,0)"
     );
     shutdown_and_settle(rt).await;
 }
@@ -1871,7 +1871,7 @@ async fn a_file_broken_before_the_first_query_keeps_the_started_types() {
     let sql = "SELECT typeof(n) AS t FROM counts LIMIT 1";
     let (status, body) = get_json(&rt, &format!("/sql?q={}", urlencoding_lite(sql))).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    assert_eq!(body["rows"][0]["t"], "HUGEINT", "{body}");
+    assert_eq!(body["rows"][0]["t"], "DECIMAL(38,0)", "{body}");
     shutdown_and_settle(rt).await;
 }
 

@@ -8,11 +8,8 @@
 //! A circuit on its own thread, a channel of weighted batches, a health flag that latches false when
 //! the thread dies, and a flush barrier. Three things are added that the built-in views do not need.
 //!
-//! **The circuit comes from the entity's plan** (#870). This used to drive
-//! [`authored_entity_spike::Spike`](crate::authored_entity_spike::Spike), whose input relations were
-//! fixed Rust structs for one hardcoded query - so the lifecycle was real and the entity was not.
-//! It now drives [`EntityCircuit`], built from a [`Plan`], fed through a [`Binding`] that turns a
-//! decoded window into that plan's input relations (§5.1).
+//! **The circuit comes from the entity's plan** (#870): an [`EntityCircuit`], built from a [`Plan`],
+//! fed through a [`Binding`] that turns a decoded window into that plan's input relations (§5.1).
 //!
 //! **An applied-through watermark** (criterion 2). A built-in view is fed from the same commit as the
 //! facts and has no separate identity, so "how far has this got" is the nest's own cursor. An
