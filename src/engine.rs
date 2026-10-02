@@ -168,6 +168,9 @@ pub(crate) trait Session: Send {
     /// Load one table's hot rows so that `bind_facts(.., hot = true, ..)` can union them in.
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()>;
 
+    /// How many hot rows [`Session::load_hot`] last staged for `table`.
+    fn staged_hot_len(&self, table: &str) -> usize;
+
     /// Remove a maintained relation's public name, so a pooled session cannot answer from one an
     /// earlier request defined after the entity faulted (#1598).
     fn drop_relation(&self, name: &str) -> Result<()> {
