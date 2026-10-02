@@ -569,7 +569,9 @@ impl MountTable {
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         // `sq1 = "deny"` would otherwise leave /sql open with no record that the key was dropped.
         crate::config::warn_unknown::<MountTable>(
-            path.file_name().and_then(|s| s.to_str()).unwrap_or(MOUNTS_FILE),
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(MOUNTS_FILE),
             &raw,
         );
         mounts.validate_mounts()?;

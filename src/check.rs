@@ -405,7 +405,10 @@ mod tests {
         }
         let nid = "2bca092694c5833d2fecec20983b307f23c3a5507402c39bab4d3fab91231576";
         let old = format!("tests/fixtures/upgrade/v3.13.2/runtime/data/{nid}/entities.toml");
-        for rel in ["tests/fixtures/upgrade/config-4.0/nest/entities.toml", old.as_str()] {
+        for rel in [
+            "tests/fixtures/upgrade/config-4.0/nest/entities.toml",
+            old.as_str(),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("entities.toml"), read(rel)).unwrap();
             crate::entities::refuse_unknown_keys(dir.path())
