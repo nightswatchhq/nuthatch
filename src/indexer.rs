@@ -9961,24 +9961,23 @@ template="pool"
         )
         .await
         .unwrap();
-        assert_eq!(sealed, 1, "premise: the factory event sealed before the crash");
+        assert_eq!(
+            sealed, 1,
+            "premise: the factory event sealed before the crash"
+        );
         assert!(
             discarded.contains(pool_addr),
             "premise: that event names the pool"
         );
-        let seeded = crate::analytics::query(
-            &nest.dir,
-            r#"SELECT pool FROM "factory__pool_created""#,
-        )
-        .expect("premise: the sealed factory row is readable");
+        let seeded =
+            crate::analytics::query(&nest.dir, r#"SELECT pool FROM "factory__pool_created""#)
+                .expect("premise: the sealed factory row is readable");
         assert_eq!(
             seeded[0]["pool"].as_str().map(|s| s.to_ascii_lowercase()),
             Some(pool_addr.to_string()),
             "premise: rebuild has a pool address to fold, got {seeded:?}"
         );
-        nest.store
-            .set_meta(SEALED_THROUGH_KEY, "10")
-            .unwrap();
+        nest.store.set_meta(SEALED_THROUGH_KEY, "10").unwrap();
         assert!(
             nest.store.get_meta(LAST_BLOCK_KEY).unwrap().is_none(),
             "premise: seal-direct resume is the path with no last_block"
@@ -10014,8 +10013,13 @@ template="pool"
                     .collect();
                 let hit = self.swap.block_number >= from
                     && self.swap.block_number <= to
-                    && (allow.is_empty() || allow.contains(&self.swap.address.to_ascii_lowercase()));
-                Ok(if hit { vec![self.swap.clone()] } else { Vec::new() })
+                    && (allow.is_empty()
+                        || allow.contains(&self.swap.address.to_ascii_lowercase()));
+                Ok(if hit {
+                    vec![self.swap.clone()]
+                } else {
+                    Vec::new()
+                })
             }
         }
         let source = ResumeSource {
