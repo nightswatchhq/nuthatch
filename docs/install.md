@@ -29,17 +29,22 @@ below rather than installing something that will not run.
 The Linux binary is dynamically linked and needs one thing, measured off the published artifact
 with `objdump -T` rather than inferred.
 
-**glibc 2.34 or newer.** This is the measured ABI floor. The release is *built* on glibc 2.35
-(`ubuntu-22.04` in `.github/workflows/release.yml`), but building on 2.35 does not make 2.35 a runtime
-requirement: the binary references no symbol newer than `GLIBC_2.34`, and that reference set is what
-the loader checks. The two numbers answer different questions - 2.34 is what you need to run it, 2.35
-is what we compile it on - and stating the build baseline as the requirement once excluded a platform
-we support ([#978](https://github.com/nightswatchhq/nuthatch/issues/978): RHEL 9 ships glibc 2.34).
+**glibc 2.35 or newer.** This is the measured ABI floor: the set of versioned symbols the binary
+references, which is what the loader checks. The release is *built* on glibc 2.35 (`ubuntu-22.04`
+in `.github/workflows/release.yml`), and building on 2.35 does not by itself make 2.35 a
+requirement: up to 4.0.2 the binary referenced nothing past `GLIBC_2.34` and ran on 2.34, which is
+why the two numbers were kept apart ([#978](https://github.com/nightswatchhq/nuthatch/issues/978):
+stating the build baseline as the requirement had excluded RHEL 9). The 4.1.0 artifact references
+`hypot` and `hypotf` at `GLIBC_2.35`, where libm re-versioned them, so from 4.1.0 the floor and the
+build baseline are the same number
+([#1649](https://github.com/nightswatchhq/nuthatch/issues/1649)). It is re-measured on each
+release's artifact, not carried forward.
 
 **No C++ runtime.** The binary links `libc`, `libm` and `libgcc`. Releases before 4.1 embedded DuckDB,
 which is C++, and also needed libstdc++ from GCC 11 (`GLIBCXX_3.4.29`).
 
-Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 clear it.
+Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34: build from
+source there, or run the container image.
 
 ## Verifying a download
 

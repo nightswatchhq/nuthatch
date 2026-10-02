@@ -127,9 +127,9 @@ beside the binary, which is only true if that is how you got it. A binary you bu
 nuthatch --version && echo started-ok
 ```
 
-Expect no `GLIBC_… not found`. The Linux build targets **glibc 2.34**, so RHEL 9, Debian 12,
-Ubuntu 22.04 and newer are fine. *If this fails*, your distro is older than the floor; build from
-source or use the container image.
+Expect no `GLIBC_… not found`. The Linux binary needs **glibc 2.35** since 4.1.0 (2.34 before),
+so Debian 12, Ubuntu 22.04 and newer are fine, and RHEL 9 and Amazon Linux 2023 are not. *If this
+fails*, your distro is older than the floor; build from source or use the container image.
 
 **0.4 Embedded mode carries no database driver**
 
