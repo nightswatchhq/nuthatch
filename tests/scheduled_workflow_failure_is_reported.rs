@@ -250,18 +250,29 @@ fn every_scheduled_workflow_reports_its_failures() {
                  surfaces nothing - a `uses:` elsewhere in the file does not count"
             ));
         }
-        // Both halves, because either one missing makes the job useless in a different way: without
+        // Every part, because each one missing makes the job useless in a different way: without
         // `failure()` it files an issue on every green run, and without the event check it files
         // one for a failing pull request that is already visible on the pull request.
+        //
+        // And a timeout is not a failure (#1715). A job that hits `timeout-minutes` ends
+        // `cancelled`, `failure()` is false for it, and a job guarded by `failure()` alone is
+        // skipped: the nightly mutation run timed out twelve days running and filed nothing. So the
+        // guard must also read its needs' results, under `always()` or it is never evaluated.
         let armed = block
             .iter()
             .filter_map(|l| l.trim().strip_prefix("if:"))
-            .any(|c| c.contains("failure()") && c.contains("github.event_name == 'schedule'"));
+            .any(|c| {
+                c.contains("always()")
+                    && c.contains("failure()")
+                    && c.contains("contains(needs.*.result, 'cancelled')")
+                    && c.contains("github.event_name == 'schedule'")
+            });
         if !armed {
             failures.push(format!(
-                "{name}: the `{REPORTER_JOB}` job has no `if:` combining `failure()` with \
-                 `github.event_name == 'schedule'`, so the reporter cannot fire on the case it \
-                 exists for"
+                "{name}: the `{REPORTER_JOB}` job has no `if:` combining `always()`, `failure()` \
+                 and `contains(needs.*.result, 'cancelled')` with `github.event_name == \
+                 'schedule'`, so the reporter cannot fire on a failure, or on the timeout that \
+                 ends a job as cancelled"
             ));
         }
         // `failure()` is true only when an *ancestor* job failed, so the reporter observes exactly

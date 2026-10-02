@@ -44,7 +44,7 @@ on:
 
 jobs:
   mutants:
-    name: mutation coverage (nightly, advisory) - ${{ matrix.file }}
+    name: mutation coverage (nightly, advisory) - ${{ matrix.file }} ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -53,17 +53,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Scoped deliberately. Not the whole crate: 4,503 mutants crate-wide against 39 here, and a
+          # Scoped deliberately. Not the whole crate: 4,503 mutants crate-wide against about 230 here, and a
           # signal nobody reads is not a signal. These are the paths that feed stored state or decide
           # what gets fetched - where a decorative test is most expensive.
-          - file: src/chunker.rs
-            timeout: 240
-          - file: src/seal.rs
-            timeout: 150
+          #
+          # Sharded since #1715. seal.rs went from about 10 mutants to 185 and chunker.rs from 26 to
+          # 43, at seven to nine minutes a mutant, and a job cannot run past 360 minutes. A shard is
+          # sized to about 25 mutants.
+          - { file: src/chunker.rs, shard: 0/2, timeout: 330 }
+          - { file: src/chunker.rs, shard: 1/2, timeout: 330 }
+          - { file: src/seal.rs, shard: 0/8, timeout: 330 }
+          - { file: src/seal.rs, shard: 1/8, timeout: 330 }
+          - { file: src/seal.rs, shard: 2/8, timeout: 330 }
+          - { file: src/seal.rs, shard: 3/8, timeout: 330 }
+          - { file: src/seal.rs, shard: 4/8, timeout: 330 }
+          - { file: src/seal.rs, shard: 5/8, timeout: 330 }
+          - { file: src/seal.rs, shard: 6/8, timeout: 330 }
+          - { file: src/seal.rs, shard: 7/8, timeout: 330 }
           # Only 3 mutants because #581 moved decode into its own crate, so the decode path is
           # covered by the `decode` entry rather than by the file it used to live in.
-          - file: src/registry.rs
-            timeout: 120
+          - { file: src/registry.rs, shard: 0/1, timeout: 120 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
@@ -99,7 +108,7 @@ jobs:
         # a run with survivors were equally invisible. The verdict now comes from the artifact, which
         # can tell those two apart; the raw status stays visible in this step's log.
         continue-on-error: true
-        run: cargo mutants --no-shuffle -j 2 --file ${{ matrix.file }} -- --lib
+        run: cargo mutants --no-shuffle -j 2 --file ${{ matrix.file }} --shard ${{ matrix.shard }} -- --lib
 
       # `if: always()` so the reading survives the failure it explains - the whole point of #733's
       # trailing `df` in `ci.yml`. Without it, the run that runs out of disk is the one run with no
@@ -143,10 +152,13 @@ jobs:
   # itself on the PR or the commit, and filing an issue for those would be noise. Guarded by
   # `tests/scheduled_workflow_failure_is_reported.rs`, which checks this condition rather than only
   # the job's presence - a reporter that can never fire would otherwise pass a presence check.
+  #
+  # A job that hits `timeout-minutes` ends `cancelled`, and `failure()` is false for it. Twelve
+  # nightly runs timed out from 2026-09-21 and this job was skipped on every one (#1715).
   report-scheduled-failure:
     name: surface a failed scheduled run
     needs: [mutants]
-    if: failure() && github.event_name == 'schedule'
+    if: always() && github.event_name == 'schedule' && (failure() || contains(needs.*.result, 'cancelled'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
