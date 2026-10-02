@@ -33,6 +33,7 @@ pub mod controlplane;
 /// module, which is the S0 deletion boundary rather than an assurance about it.
 #[cfg(feature = "counter")]
 pub mod counter;
+pub mod crash;
 pub mod distribution;
 pub mod doctor;
 pub mod effectful;

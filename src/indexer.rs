@@ -5822,6 +5822,7 @@ fn publish_direct_seal(
     // `seal_range` fsyncs the segment and the manifest entry before it returns. redb fsyncs this
     // write, so it has to stay after that call (#1632).
     store.set_meta(SEALED_THROUGH_KEY, &sealed_to.to_string())?;
+    crate::crash::point("seal-direct:after-watermark");
     metrics.set_seal_direct_completed(sealed_to);
     metrics.set_sealed_through(sealed_to);
     Ok(())
