@@ -172,6 +172,9 @@ impl Interrupt for Cancel {
     fn interrupt(&self) {
         self.0.cancel();
     }
+    fn reset(&self) {
+        self.0.reset();
+    }
 }
 
 impl Session for BurrmillSession {

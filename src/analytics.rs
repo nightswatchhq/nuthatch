@@ -1029,6 +1029,11 @@ fn attempt(
     if !(head.starts_with("select") || head.starts_with("with")) {
         bail!("only SELECT/WITH queries are allowed on the read-only SQL surface");
     }
+    // Before any walk. A long chain of operators overflows the planner, and the walk that names
+    // tables recurses the same way. The engine repeats the bound when it plans.
+    if let Err(e) = burrmill::df::check_expr_bounds(sql) {
+        bail!("{e}");
+    }
     // Read-only is enforced four-deep - do NOT loosen any of these without re-reasoning SEC-7:
     //   1. this leading-keyword gate rejects a *statement* that opens with INSERT/UPDATE/DELETE/COPY/
     //      ATTACH/PRAGMA/…;
@@ -1099,6 +1104,9 @@ fn attempt(
     let (referenced, offchain, degraded_tables, interrupted, spilled, outcome, cap, scan) = {
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
+        // The token outlives the previous statement. Clear it before the watchdog or the shutdown
+        // latch can arm it, or that interrupt is thrown away on the way into the statement.
+        session.interrupt_handle().reset();
         let walked = reject_unknown_table_refs(session, sql)?;
         // No parse means no idea what the statement reaches, and the safe answer to that is "all of
         // it" on both counts.

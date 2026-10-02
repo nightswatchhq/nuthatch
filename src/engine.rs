@@ -48,6 +48,9 @@ pub(crate) trait Engine: Send + Sync {
 /// Cancels a running statement from another thread.
 pub(crate) trait Interrupt: Send + Sync {
     fn interrupt(&self);
+    /// Clear a cancel left by an earlier statement. The host does this before it arms the next
+    /// one; the engine leaves the token alone, or an interrupt during planning would be lost.
+    fn reset(&self) {}
 }
 
 /// Which phase of a statement failed.
