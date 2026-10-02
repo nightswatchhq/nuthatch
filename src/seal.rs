@@ -301,14 +301,11 @@ pub fn seal_range_with_snapshot(
         // the write is a no-op rather than a duplicate.
         match shared_store(dir) {
             Some(store) => {
-                std::fs::create_dir_all(&store).context("creating the shared segment store")?;
                 let shared = store.join(format!("{hash}.parquet"));
                 // Before the exists check. A reclaim that looks between the check and the hold
                 // deletes the file this manifest is about to name (#1644).
                 let hold = SegmentHold::acquire(&shared);
-                if !shared.exists() {
-                    std::fs::write(&shared, &bytes).context("failed to write shared segment")?;
-                }
+                publish_durable(&store, &format!("{hash}.parquet"), &bytes)?;
                 publishing.push(hold);
                 #[cfg(test)]
                 before_manifest();
@@ -317,7 +314,7 @@ pub fn seal_range_with_snapshot(
                 // hash, and this nest cannot know.
             }
             None => {
-                std::fs::write(seg_dir.join(&file), &bytes).context("failed to write segment")?;
+                publish_durable(&seg_dir, &file, &bytes)?;
                 if let Some(prev) = &replaced {
                     // This nest's own copy, and not yet: see `folded_away`.
                     folded_away.push(seg_dir.join(&prev.file));
@@ -1343,6 +1340,96 @@ pub fn check_catalogue(dir: &Path) -> Result<CatalogueCheck> {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Durable {
+    FileSync(PathBuf),
+    SegmentDir(PathBuf),
+    ManifestDir(PathBuf),
+}
+
+/// Install `bytes` as `dir/file_name`. The bytes are fsynced before the name exists, and that
+/// directory entry is fsynced before this returns (#1632). A watermark is written only afterwards.
+fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
+    let created = !dir.exists();
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    if created {
+        if let Some(parent) = dir.parent() {
+            sync_dir(parent)?;
+        }
+    }
+    let final_path = dir.join(file_name);
+    // The shared store: another nest already published this content. Its bytes were synced before
+    // the name existed. The directory entry still has to be, before our manifest names the file.
+    if final_path.is_file() {
+        sync_segment_dir(dir)?;
+        return Ok(());
+    }
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        use std::io::Write;
+        f.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsyncing {}", tmp.display()))?;
+        #[cfg(test)]
+        note_durable(Durable::FileSync(tmp.clone()));
+    }
+    std::fs::rename(&tmp, &final_path)
+        .with_context(|| format!("installing {}", final_path.display()))?;
+    sync_segment_dir(dir)?;
+    Ok(())
+}
+
+fn sync_segment_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    note_durable(Durable::SegmentDir(dir.to_path_buf()));
+    sync_dir(dir)
+}
+
+fn sync_manifest_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    note_durable(Durable::ManifestDir(dir.to_path_buf()));
+    sync_dir(dir)
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with(|fail| fail.get()) {
+        anyhow::bail!("fsyncing {} failed", dir.display());
+    }
+    let directory = std::fs::File::open(dir)
+        .with_context(|| format!("opening {} to fsync it", dir.display()))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("fsyncing {}", dir.display()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static DURABLE_TRACE: std::cell::RefCell<Option<Vec<Durable>>> =
+        const { std::cell::RefCell::new(None) };
+    static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn note_durable(event: Durable) {
+    DURABLE_TRACE.with(|trace| {
+        if let Some(buf) = trace.borrow_mut().as_mut() {
+            buf.push(event);
+        }
+    });
+}
+
+#[cfg(test)]
+fn capture_durable(run: impl FnOnce()) -> Vec<Durable> {
+    DURABLE_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+    run();
+    DURABLE_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
 thread_local! {
     static BEFORE_MANIFEST: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
@@ -1393,8 +1480,9 @@ fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
         f.sync_all().context("failed to fsync manifest temp")?;
     }
     std::fs::rename(&tmp, &path).context("failed to install manifest")?;
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all(); // best-effort dir fsync (unsupported on some platforms)
+    // The renamed entry lives in `segments/`. Syncing `dir` does not install it (#1632).
+    if let Some(parent) = path.parent() {
+        sync_manifest_dir(parent)?;
     }
     manifest_signal(dir).send_modify(|installs| *installs += 1);
     Ok(())
@@ -2220,6 +2308,116 @@ mod tests {
             load_manifest(&dir).unwrap().tables["usdc__transfer"].len(),
             1,
             "a re-seal double-listed the segment in the manifest"
+        );
+    }
+
+    /// A directory fsync that fails is the seal's error. Swallowing it would advance the
+    /// watermark over an entry that may not be on disk.
+    #[test]
+    fn a_directory_fsync_failure_fails_the_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                FAIL_DIR_SYNC.with(|fail| fail.set(false));
+            }
+        }
+        let _clear = Clear;
+        FAIL_DIR_SYNC.with(|fail| fail.set(true));
+        let err = seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10)
+            .expect_err("a seal whose directory entry could not be synced");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("fsyncing"),
+            "the caller must hear the directory fsync failed: {err}"
+        );
+    }
+
+    /// #1632: the watermark is fsynced after `seal_range` returns. The segment bytes and the
+    /// manifest's directory entry have to be durable already. The entry lives in `segments/`.
+    #[test]
+    fn a_seal_is_durable_before_the_watermark_can_be() {
+        let solo = tempfile::tempdir().unwrap();
+        let trace = capture_durable(|| {
+            seal_range(solo.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        });
+        assert_seal_durable(solo.path(), &trace, solo.path().join(SEGMENTS_DIR));
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        std::fs::create_dir_all(&dir).unwrap();
+        let trace = capture_durable(|| {
+            seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        });
+        let store = shared_store(&dir).unwrap();
+        assert_seal_durable(&dir, &trace, store.clone());
+
+        let other = root.path().join(crate::runtime::DATA_DIR).join("nid1");
+        std::fs::create_dir_all(&other).unwrap();
+        let again = capture_durable(|| {
+            seal_range(&other, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        });
+        assert_catalogue_durable(&other, &again, store);
+    }
+
+    fn assert_catalogue_durable(nest: &Path, trace: &[Durable], bytes_dir: PathBuf) {
+        let manifest_dir = nest.join(SEGMENTS_DIR);
+        let manifest_at = trace
+            .iter()
+            .rposition(|event| matches!(event, Durable::ManifestDir(path) if path == &manifest_dir))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the manifest entry lives in {}: that directory was not synced. trace: {trace:?}",
+                    manifest_dir.display()
+                )
+            });
+        let segment_at = trace
+            .iter()
+            .position(|event| matches!(event, Durable::SegmentDir(path) if path == &bytes_dir))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the segment directory {} was not synced. trace: {trace:?}",
+                    bytes_dir.display()
+                )
+            });
+        assert!(
+            segment_at < manifest_at,
+            "the segment directory entry must be durable before the manifest names it. trace: {trace:?}"
+        );
+    }
+
+    fn assert_seal_durable(nest: &Path, trace: &[Durable], bytes_dir: PathBuf) {
+        let manifest_dir = nest.join(SEGMENTS_DIR);
+        let manifest_at = trace.iter().rposition(
+            |event| matches!(event, Durable::ManifestDir(path) if path == &manifest_dir),
+        );
+        let manifest_at = manifest_at.unwrap_or_else(|| {
+            panic!(
+                "the manifest entry lives in {}: that directory was not synced. trace: {trace:?}",
+                manifest_dir.display()
+            )
+        });
+        let file_at = trace.iter().position(
+            |event| matches!(event, Durable::FileSync(path) if path.starts_with(&bytes_dir)),
+        );
+        let file_at = file_at.unwrap_or_else(|| {
+            panic!(
+                "segment bytes in {} were not fsynced. trace: {trace:?}",
+                bytes_dir.display()
+            )
+        });
+        let segment_at = trace
+            .iter()
+            .position(|event| matches!(event, Durable::SegmentDir(path) if path == &bytes_dir));
+        let segment_at = segment_at.unwrap_or_else(|| {
+            panic!(
+                "the segment directory {} was not synced. trace: {trace:?}",
+                bytes_dir.display()
+            )
+        });
+        assert!(
+            file_at < segment_at && segment_at < manifest_at,
+            "bytes, then their directory entry, then the manifest entry. trace: {trace:?}"
         );
     }
 
