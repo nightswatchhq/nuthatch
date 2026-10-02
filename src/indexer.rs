@@ -18437,6 +18437,86 @@ template="pool"
         );
     }
 
+    /// The runtime cursor asks again for the two blocks before its cursor. A log the previous
+    /// window missed lives there, and dropping it on the way into the nest loses it for good.
+    struct TailSource {
+        ranges: std::sync::Mutex<Vec<(u64, u64)>>,
+        missed: crate::rpc::Log,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for TailSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(10_000_000)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.ranges.lock().unwrap().push((from, to));
+            if from <= self.missed.block_number && self.missed.block_number <= to {
+                Ok(vec![self.missed.clone()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_runtime_cursor_refetches_the_block_the_previous_window_missed() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(d.path(), addr).await;
+        nest.store.set_meta(LAST_BLOCK_KEY, "20").unwrap();
+        let dir = nest.dir.clone();
+        let src = Arc::new(TailSource {
+            ranges: std::sync::Mutex::new(Vec::new()),
+            missed: transfer_log(19, 0),
+        });
+        let ranges = src.clone();
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![nest],
+            Some(0),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+        let fetched_twice = within_deadline(|| ranges.ranges.lock().unwrap().len() >= 2).await;
+        task.abort();
+        let _ = task.await;
+        let seen = ranges.ranges.lock().unwrap().clone();
+        assert!(fetched_twice, "the runtime did not reach a second window: {seen:?}");
+        // The commit runs on the blocking pool and can outlive the aborted task by a moment.
+        let mut opened = None;
+        for _ in 0..50 {
+            if let Ok(store) = Store::open(&dir.join(DB_FILE)) {
+                opened = Some(store);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let store = opened.expect("the cursor did not release the store");
+        assert!(
+            !store.entities_in_range(19, 19).unwrap().is_empty(),
+            "block 19 was missed by the previous window and the runtime never stored it: {seen:?}"
+        );
+    }
+
     /// Every sealed segment's columns, as `name -> values` in row order, across all of a nest's
     /// tables. Reads the Parquet the way a consumer would, so a test comparing two runs is comparing
     /// what was actually written rather than what the manifest claims about it.
