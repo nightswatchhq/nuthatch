@@ -2188,6 +2188,21 @@ mod tests {
         );
     }
 
+    /// The hold is taken before the file exists. A reclaim that canonicalises the file afterwards
+    /// must still see it: on macOS that path gains a `/private` prefix the moment the file appears.
+    #[test]
+    fn a_hold_taken_before_the_file_exists_still_covers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc.parquet");
+        let _hold = SegmentHold::acquire(&path);
+        std::fs::write(&path, b"parquet").unwrap();
+        let canon = std::fs::canonicalize(&path).unwrap();
+        assert!(
+            segment_held(&canon),
+            "the hold was keyed on the spelling from before the file existed"
+        );
+    }
+
     /// #1644: B skips the shared write because A's file is already there, and A's reclaim runs
     /// before B's manifest names it. The file has to still be there when B's catalogue lands.
     #[test]
