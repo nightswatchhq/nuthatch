@@ -237,8 +237,9 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
     let orphans = orphan_segments(dir, &surviving)?;
     let mut freed_segments = 0u64;
     for (path, size) in &orphans {
-        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
-        freed_segments += size;
+        if crate::seal::remove_segment_if_unheld(path)? {
+            freed_segments += size;
+        }
     }
     if !orphans.is_empty() {
         println!(
@@ -318,6 +319,8 @@ pub fn reclaim(dir: &Path, nid: &str) -> Result<Reclaim> {
         .flatten()
         .filter(|s| !referenced.contains(&s.hash))
         .map(|s| segments.join(format!("{}.parquet", s.hash)))
+        // Named by a seal whose manifest is not installed yet (#1644).
+        .filter(|p| !crate::seal::segment_held(p))
         .filter_map(|p| {
             let len = std::fs::metadata(&p).ok()?.len();
             Some((p, len))
@@ -330,8 +333,9 @@ pub fn reclaim(dir: &Path, nid: &str) -> Result<Reclaim> {
     std::fs::remove_dir_all(&data).with_context(|| format!("removing {}", data.display()))?;
     let _ = std::fs::remove_dir_all(crate::runtime::adopt_staging(&data));
     for (path, len) in &exclusive {
-        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
-        bytes += len;
+        if crate::seal::remove_segment_if_unheld(path)? {
+            bytes += len;
+        }
     }
     Ok(Reclaim::Reclaimed {
         nid: nid.to_string(),
