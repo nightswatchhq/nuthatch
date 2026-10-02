@@ -6408,6 +6408,23 @@ impl NestIngest {
         Ok(())
     }
 
+    /// Undo the views this attempt just fed. The commit did not land, so a retry starts from here.
+    fn retract_folded_window(
+        &self,
+        rows: &[crate::registry::DecodedRow],
+        through: u64,
+        deltas: crate::views::WeightedBatch,
+        exp_deltas: crate::exposure::ExposureBatch,
+        vel_deltas: crate::velocity::VelocityBatch,
+    ) {
+        for entity in self.entities.iter() {
+            let _ = entity.apply_window(rows, -1, through);
+        }
+        self.balances.retract(deltas);
+        self.exposure.retract(exp_deltas);
+        self.velocity.retract(vel_deltas);
+    }
+
     /// Decode, store, IVM-feed, screen, checkpoint, seal and deliver webhooks for one fetched window
     /// `[next, to]` (with `tip` the current chain tip, used for the finality ceiling). Returns
     /// `Ok(Some(stored))` - the row count, caller advances the cursor - or `Ok(None)` when block
@@ -6445,9 +6462,17 @@ impl NestIngest {
         // ever does, the stale row must not be mistaken for the current one and silently kept. The
         // window is refused instead and asked for again on the next poll, by which time the reorg
         // handler has run over it.
+        // A window that committed and then failed is asked for again, and not always with the same
+        // end: the ceiling has moved by the time a quarantined nest is re-admitted. So its rows take
+        // the same check as the tail, row by row, up to what the store has committed (#1635).
+        let committed_through = self
+            .store
+            .get_meta("last_block")?
+            .and_then(|v| v.parse::<u64>().ok());
+        let fold_floor = next.max(committed_through.map_or(0, |b| b + 1));
         let mut stale_tail: Option<(u64, u64)> = None;
         rows.retain(|r| {
-            if r.block_number >= next {
+            if r.block_number >= fold_floor {
                 return true;
             }
             match self
@@ -6646,25 +6671,10 @@ impl NestIngest {
             }
         }
 
-        self.balances.apply(deltas);
-        self.exposure.apply(exp_deltas);
-        self.velocity.apply(vel_deltas);
-        // §5.1: the same decoded window, at weight +1, to every authored entity. Backfill and tip
-        // are the same call - they differ in how many rows `rows` holds, which is the whole of what
-        // "backfill uses larger batches, but not different semantics" means.
-        //
-        // `to` and not the nest's head: an entity carries its own applied-through watermark, and
-        // stamping it with a block it has not folded is how a partial relation gets served as
-        // current (criterion 2).
-        for entity in self.entities.iter() {
-            entity
-                .apply_window(&rows, 1, to)
-                .with_context(|| format!("feeding this window to entity `{}`", entity.name()))?;
-        }
-        // A derived-view circuit thread that has died silently drops those applies and freezes
+        // A derived-view circuit thread that has died silently drops its batches and freezes
         // `/balances` + the compliance flags while ingest keeps committing - stale data served as
-        // healthy. Surface it as fatal here (the dead-task-must-surface rule, extended to the IVM
-        // threads that were previously exempt).
+        // healthy. Surface it before the commit (the dead-task-must-surface rule, extended to the
+        // IVM threads that were previously exempt).
         self.ensure_views_healthy()?;
 
         // Live sanctions screening (RFC-0008 C2): screen this window's transfers against the
@@ -6762,10 +6772,34 @@ impl NestIngest {
             }
         }
 
-        // requests. `to_store` is moved rather than borrowed - the work outlives this borrow.
-        self.store
+        // Before the commit. A failure retracts what this attempt fed, so a retry folds the
+        // window once. A restart still rebuilds these views from the store.
+        for (i, entity) in self.entities.iter().enumerate() {
+            if let Err(e) = entity.apply_window(&rows, 1, to) {
+                for done in self.entities.iter().take(i) {
+                    let _ = done.apply_window(&rows, -1, to);
+                }
+                return Err(e.context(format!("feeding this window to entity `{}`", entity.name())));
+            }
+        }
+        self.balances.apply(deltas.clone());
+        self.exposure.apply(exp_deltas.clone());
+        self.velocity.apply(vel_deltas.clone());
+        #[cfg(test)]
+        if let Err(e) = take_fold_failure() {
+            self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
+            return Err(e);
+        }
+        if let Err(e) = self
+            .store
             .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
-            .await?;
+            .await
+        {
+            self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
+            return Err(e);
+        }
+        #[cfg(test)]
+        take_after_commit_failure()?;
         // After the commit, so a rebuild reads exactly the history the entities have folded. Off the
         // runtime: it reads the manifest and snapshots, and a rebuild reads the sealed corpus.
         if self
@@ -6779,11 +6813,12 @@ impl NestIngest {
                 self.registry.clone(),
                 self.entities.clone(),
             );
-            tokio::task::spawn_blocking(move || {
+            let refreshed = tokio::task::spawn_blocking(move || {
                 refresh_offchain(&dir, store.as_ref(), &registry, &entities, to)
             })
             .await
-            .context("the offchain refresh task did not complete")??;
+            .context("the offchain refresh task did not complete")?;
+            refreshed?;
         }
         self.metrics.set_last_block(to);
         self.metrics.add_rows_decoded(stored as u64);
@@ -6804,10 +6839,11 @@ impl NestIngest {
             Finality::Depth(_) => None,
         };
         let finalized_through = seal_ceiling(self.finality, tip, finalized_tag);
-        let Some(finalized_through) = (match &self.ipfs_gate {
+        let held_for_documents = match &self.ipfs_gate {
             Some(gate) => hold_for_documents(self.store.as_ref(), gate, finalized_through)?,
             None => Some(finalized_through),
-        }) else {
+        };
+        let Some(finalized_through) = held_for_documents else {
             return Ok(Some(stored));
         };
 
@@ -8113,6 +8149,50 @@ fn webhook_host(url: &str) -> String {
 #[cfg(test)]
 #[path = "../tests/common/entity_fixture.rs"]
 mod entity_fixture;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_AFTER_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The next `process_window` feeds its views and then fails, before the commit.
+#[cfg(test)]
+fn fail_the_next_fold() {
+    FAIL_AFTER_FOLD.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn clear_fold_failure() {
+    FAIL_AFTER_FOLD.with(|fail| fail.set(false));
+}
+
+#[cfg(test)]
+fn take_fold_failure() -> Result<()> {
+    if FAIL_AFTER_FOLD.with(|fail| fail.replace(false)) {
+        anyhow::bail!("the fold landed and the commit has not");
+    }
+    Ok(())
+}
+
+/// The next `process_window` commits and then fails, with the fold left in place.
+#[cfg(test)]
+fn fail_the_next_commit() {
+    FAIL_AFTER_COMMIT.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn clear_commit_failure() {
+    FAIL_AFTER_COMMIT.with(|fail| fail.set(false));
+}
+
+#[cfg(test)]
+fn take_after_commit_failure() -> Result<()> {
+    if FAIL_AFTER_COMMIT.with(|fail| fail.replace(false)) {
+        anyhow::bail!("the commit landed and the window is not done");
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -14809,6 +14889,160 @@ template = "pool"
             12,
             "six blocks of two rows, each stored exactly once"
         );
+    }
+
+    /// #1635: a window that fails after the views are fed and before the commit is retried with the
+    /// cursor unmoved. The transfer has to land in the balance once.
+    #[tokio::test]
+    async fn a_retried_window_folds_its_transfer_once() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        // Armed for one attempt. The fold runs, the commit does not, and the views are retracted.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                super::clear_fold_failure();
+                super::clear_commit_failure();
+            }
+        }
+        let _clear = Clear;
+        super::fail_the_next_fold();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let logs = vec![transfer_log(10, 0)];
+        let first = nest
+            .process_window(source.as_ref(), &logs, 10, 10, 100)
+            .await;
+        let msg = format!(
+            "{:#}",
+            first.expect_err("premise: the first attempt must fail")
+        );
+        assert!(
+            msg.contains("the commit has not"),
+            "the failure is after the fold and before the commit, got {msg}"
+        );
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        nest.balances.flush();
+        assert_eq!(
+            nest.balances.balance(recipient),
+            None,
+            "the failed attempt must retract the fold"
+        );
+        assert!(
+            nest.store.sample_entity_keys(8).unwrap().is_empty(),
+            "the failed attempt must not commit"
+        );
+        nest.process_window(source.as_ref(), &logs, 10, 10, 100)
+            .await
+            .expect("the retry commits")
+            .expect("the retry commits");
+        nest.balances.flush();
+        let got = nest.balances.balance(recipient);
+        assert_eq!(
+            got,
+            Some(0x1cd4ad20),
+            "one transfer, retried: the balance must credit it once, got {got:?}"
+        );
+        drop(nest);
+        let store = Store::open(&d.path().join(DB_FILE)).unwrap();
+        assert_eq!(
+            store.entity_keys().unwrap().len(),
+            1,
+            "the row is stored by the retry, not by the attempt that failed"
+        );
+    }
+
+    /// #1635: the commit landed, then a later step failed. The fold stays, and the retry must
+    /// not feed the transfer again.
+    #[tokio::test]
+    async fn a_committed_window_keeps_its_fold_when_a_later_step_fails() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                super::clear_fold_failure();
+                super::clear_commit_failure();
+            }
+        }
+        let _clear = Clear;
+        super::fail_the_next_commit();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let logs = vec![transfer_log(10, 0)];
+        let first = nest
+            .process_window(source.as_ref(), &logs, 10, 10, 100)
+            .await;
+        let msg = format!(
+            "{:#}",
+            first.expect_err("premise: the step after the commit fails")
+        );
+        assert!(
+            msg.contains("the commit landed"),
+            "the failure is after the commit, got {msg}"
+        );
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        nest.balances.flush();
+        assert_eq!(
+            nest.balances.balance(recipient),
+            Some(0x1cd4ad20),
+            "a committed window keeps the fold"
+        );
+        assert_eq!(
+            nest.store.sample_entity_keys(8).unwrap().len(),
+            1,
+            "the commit kept the row"
+        );
+        nest.process_window(source.as_ref(), &logs, 10, 10, 100)
+            .await
+            .expect("the retry finishes")
+            .expect("the retry finishes");
+        nest.balances.flush();
+        let got = nest.balances.balance(recipient);
+        assert_eq!(
+            got,
+            Some(0x1cd4ad20),
+            "the retry must not fold the committed window again, got {got:?}"
+        );
+        drop(nest);
+        let store = Store::open(&d.path().join(DB_FILE)).unwrap();
+        assert_eq!(store.entity_keys().unwrap().len(), 1, "one row");
+    }
+
+    /// #1635, review: the retry of a committed window is not the same window. A nest re-admitted at
+    /// the tip is asked for `next..=to` under a ceiling that has moved, so the committed blocks
+    /// arrive beside new ones. The committed row folds once and the new one folds.
+    #[tokio::test]
+    async fn a_committed_window_retried_wider_folds_only_the_new_blocks() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                super::clear_commit_failure();
+            }
+        }
+        let _clear = Clear;
+        super::fail_the_next_commit();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        nest.process_window(source.as_ref(), &[transfer_log(10, 0)], 10, 10, 100)
+            .await
+            .expect_err("premise: the step after the commit fails");
+        let wider = vec![transfer_log(10, 0), transfer_log(11, 0)];
+        nest.process_window(source.as_ref(), &wider, 10, 11, 100)
+            .await
+            .expect("the retry finishes")
+            .expect("the retry finishes");
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+        nest.balances.flush();
+        let got = nest.balances.balance(recipient);
+        assert_eq!(
+            got,
+            Some(2 * 0x1cd4ad20),
+            "two transfers in two blocks, the first committed before the retry, got {got:?}"
+        );
+        assert_eq!(nest.store.sample_entity_keys(8).unwrap().len(), 2);
     }
 
     /// #1144, review: a refetched tail row that is already stored under a *different* block hash is
