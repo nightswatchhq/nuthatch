@@ -39,6 +39,18 @@ fn repo_root() -> PathBuf {
 /// no longer needs to exist as a separate check - a stale entry is just the actual-count-0 case).
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
+        "docs/releases/v4.1.0.md",
+        "emit",
+        1,
+        "the 4.1.0 notes list what left with DuckDB; a removed command is named in the release that removed it",
+    ),
+    (
+        "docs/releases/v4.1.0.md",
+        "authored-entity",
+        1,
+        "the 4.1.0 notes list what left with DuckDB; a removed command is named in the release that removed it",
+    ),
+    (
         "docs/rfcs/0055-the-dune-view-emitter.md",
         "emit",
         3,
