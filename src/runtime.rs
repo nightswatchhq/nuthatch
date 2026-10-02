@@ -3414,7 +3414,13 @@ impl RuntimeHandles {
             already += declared_entities(&state.dir).0;
             nests_here += 1;
         }
-        refuse_over_entity_ceiling(already + entity_count, nests_here + 1, runtime, &chain)?;
+        // A second name for a directory already on the cursor shares that dataset.
+        let (on_cursor, nests) = if seen_dirs.contains(dir) {
+            (already, nests_here)
+        } else {
+            (already + entity_count, nests_here + 1)
+        };
+        refuse_over_entity_ceiling(on_cursor, nests, runtime, &chain)?;
         if projected_mb > self.mount_ctx.max_rss_mb {
             return Err(MountRefusal::OverBudget {
                 nest: name.to_string(),
