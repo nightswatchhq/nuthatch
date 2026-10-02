@@ -121,6 +121,10 @@ pub struct Segment {
     /// [`ORIGINAL_WRITER_PROFILE`]: every segment sealed before this field existed was that profile.
     #[serde(default = "default_writer_profile")]
     pub writer_profile: String,
+    /// Hash of the parquet this seal was given, before a fold rewrote the file (#1631). Those rows
+    /// stay hot until the watermark, and the file hash no longer names them. Absent reads as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
 }
 
 /// Rows a table needs before its segment at a cut is final rather than provisional (#1150).
@@ -254,8 +258,13 @@ pub fn seal_range_with_snapshot(
         // Content-addressed idempotency: an identical segment (same table + hash) is already
         // catalogued, so re-sealing the same rows - e.g. re-running `nuthatch screen` over a range to
         // re-audit - is a no-op rather than a double-listed (double-counted) segment. Checked on the
-        // incoming rows alone, before any fold, so the rule is the same one it always was.
-        if segments.iter().any(|s| s.hash == hash) {
+        // incoming rows alone, before any fold. A fold's file hash is the folded bytes, so the
+        // incoming hash is kept beside it (#1631).
+        let input_hash = hash.clone();
+        if segments
+            .iter()
+            .any(|s| s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str()))
+        {
             continue;
         }
         let new_rows = rows.len();
@@ -322,6 +331,7 @@ pub fn seal_range_with_snapshot(
             registry_snapshot: registry_snapshot.map(str::to_string),
             provisional,
             writer_profile: WRITER_PROFILE.to_string(),
+            input_hash: Some(input_hash),
         });
     }
 
@@ -2409,6 +2419,63 @@ mod tests {
         let after = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
         assert_eq!((after.hash, after.rows), (before.hash, 2));
         assert_eq!(parquet_files(dir.path()).len(), 1);
+    }
+
+    /// #1631: the rows a fold just took are still hot when the process dies before the watermark.
+    /// Sealing them again must not fold them in a second time, whether the folded file is still
+    /// provisional or the fold is what carried it over the floor.
+    #[test]
+    fn re_sealing_rows_a_fold_already_took_does_not_count_them_twice() {
+        let provisional = tempfile::tempdir().unwrap();
+        seal_range(provisional.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let added = vec![transfer(11, 0, "2"), transfer(12, 0, "3")];
+        seal_range(provisional.path(), &added, 11, 12).unwrap();
+        let folded = only(
+            &load_manifest(provisional.path()).unwrap(),
+            "usdc__transfer",
+        );
+        assert!(folded.provisional, "premise: still under the floor");
+        assert_eq!(folded.rows, 3, "premise: the fold holds every row once");
+        let again = seal_range(provisional.path(), &added, 11, 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (again.tables, again.rows),
+            (0, 0),
+            "the rows the fold already took must not be sealed again"
+        );
+        let after = only(
+            &load_manifest(provisional.path()).unwrap(),
+            "usdc__transfer",
+        );
+        assert_eq!((after.hash, after.rows), (folded.hash, 3));
+        let back =
+            read_segment_rows(&provisional.path().join(SEGMENTS_DIR).join(&after.file)).unwrap();
+        assert_eq!(
+            back.iter()
+                .map(|r| r["block_number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+
+        let final_dir = tempfile::tempdir().unwrap();
+        let half = SEAL_TABLE_FLOOR / 2;
+        seal_range(final_dir.path(), &transfers(1_000, half), 1_000, 1_999).unwrap();
+        let second = transfers(2_000, half);
+        seal_range(final_dir.path(), &second, 2_000, 2_999).unwrap();
+        let sealed = only(&load_manifest(final_dir.path()).unwrap(), "usdc__transfer");
+        assert!(!sealed.provisional, "premise: the fold crossed the floor");
+        let again = seal_range(final_dir.path(), &second, 2_000, 2_999)
+            .unwrap()
+            .unwrap();
+        assert_eq!((again.tables, again.rows), (0, 0));
+        let segs = &load_manifest(final_dir.path()).unwrap().tables["usdc__transfer"];
+        assert_eq!(
+            segs.len(),
+            1,
+            "a final fold must not gain a second copy of its last cut: {segs:?}"
+        );
+        assert_eq!(segs[0].rows, SEAL_TABLE_FLOOR);
     }
 
     #[test]
