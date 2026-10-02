@@ -1462,7 +1462,18 @@ pub fn compile_with(
                     return Err(Unsupported::Argument("`where` must be an object".into()));
                 };
                 for (key, v) in m {
-                    wheres.push(lower_predicate(schema, ent, key, v, BASE, 0, 0, caps)?);
+                    wheres.push(lower_predicate(
+                        &Pred {
+                            schema,
+                            ent,
+                            base: BASE,
+                            depth: 0,
+                            pred_depth: 0,
+                            caps,
+                        },
+                        key,
+                        v,
+                    )?);
                 }
             }
             "first" | "skip" | "orderBy" | "orderDirection" if !singular => {}
@@ -1699,7 +1710,16 @@ fn derived_list_sql(
                 };
                 for (key, value) in filters {
                     wheres.push(lower_predicate(
-                        schema, child, key, value, alias, 0, 0, caps,
+                        &Pred {
+                            schema,
+                            ent: child,
+                            base: alias,
+                            depth: 0,
+                            pred_depth: 0,
+                            caps,
+                        },
+                        key,
+                        value,
                     )?);
                 }
             }
@@ -1808,16 +1828,26 @@ pub fn minimum_block(value: &Value, caps: &Capabilities) -> Result<Option<u64>, 
         .map_err(|_| Unsupported::Argument("`block.number_gte` must not be negative".into()))
 }
 
-fn lower_predicate(
-    schema: &Schema,
-    ent: &graph_schema::Entity,
-    key: &str,
-    v: &Value,
-    base: &str,
+/// One step of a filter walk. `depth` is nested relations and `pred_depth` is `and`/`or`.
+#[derive(Clone, Copy)]
+struct Pred<'a> {
+    schema: &'a Schema,
+    ent: &'a graph_schema::Entity,
+    base: &'a str,
     depth: usize,
     pred_depth: usize,
-    caps: &Capabilities,
-) -> Result<String, Unsupported> {
+    caps: &'a Capabilities,
+}
+
+fn lower_predicate(p: &Pred<'_>, key: &str, v: &Value) -> Result<String, Unsupported> {
+    let Pred {
+        schema,
+        ent,
+        base,
+        depth,
+        pred_depth,
+        caps,
+    } = *p;
     if key == "and" || key == "or" {
         if pred_depth >= MAX_PREDICATE_DEPTH {
             return Err(Unsupported::Budget(format!(
@@ -1854,7 +1884,14 @@ fn lower_predicate(
             let inner: Result<Vec<String>, Unsupported> = m
                 .iter()
                 .map(|(k, vv)| {
-                    lower_predicate(schema, ent, k, vv, base, depth, pred_depth + 1, caps)
+                    lower_predicate(
+                        &Pred {
+                            pred_depth: pred_depth + 1,
+                            ..*p
+                        },
+                        k,
+                        vv,
+                    )
                 })
                 .collect();
             // Conditions within one filter object are ANDed, which is what `where` itself does.
@@ -1916,14 +1953,15 @@ fn lower_predicate(
             .iter()
             .map(|(k, vv)| {
                 lower_predicate(
-                    schema,
-                    child,
+                    &Pred {
+                        ent: child,
+                        base: &alias,
+                        depth: depth + 1,
+                        pred_depth: pred_depth + 1,
+                        ..*p
+                    },
                     k,
                     vv,
-                    &alias,
-                    depth + 1,
-                    pred_depth + 1,
-                    caps,
                 )
             })
             .collect();
@@ -3385,8 +3423,19 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
             )]));
         }
         let list = Value::List(vec![item]);
-        let err =
-            lower_predicate(&schema, ent, "or", &list, "b", 0, 0, &Capabilities::CORE).unwrap_err();
+        let err = lower_predicate(
+            &Pred {
+                schema: &schema,
+                ent,
+                base: "b",
+                depth: 0,
+                pred_depth: 0,
+                caps: &Capabilities::CORE,
+            },
+            "or",
+            &list,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("64"), "{err}");
     }
 
@@ -3406,8 +3455,19 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
             )]));
         }
         let list = Value::List(vec![item]);
-        lower_predicate(&schema, ent, "or", &list, "b", 0, 0, &Capabilities::CORE)
-            .expect("64 levels is the cap, not past it");
+        lower_predicate(
+            &Pred {
+                schema: &schema,
+                ent,
+                base: "b",
+                depth: 0,
+                pred_depth: 0,
+                caps: &Capabilities::CORE,
+            },
+            "or",
+            &list,
+        )
+        .expect("64 levels is the cap, not past it");
     }
 
     #[test]
