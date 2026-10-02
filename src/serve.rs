@@ -26,8 +26,9 @@ use crate::views::BalanceView;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// How many analytical (DuckDB) queries may run at once across `/sql` and cold `/table` reads. Each
-/// DuckDB query is capped at `analytics.memory_limit` / `analytics.threads` (defaults 512 MB / 2;
+/// How many analytical (DuckDB) queries may run at once across `/sql`, cold `/table` and a cold
+/// `/entity` (#1657). Each DuckDB query is capped at `analytics.memory_limit` /
+/// `analytics.threads` (defaults 512 MB / 2;
 /// see `analytics_budget`), so this bounds the whole analytical surface's worst-case footprint - the
 /// real DoS multiplier is *concurrency*, not any one query. Kept small to stay well inside the
 /// embedded RAM budget; this is node self-protection, not per-caller rate-limiting (that needs
@@ -2851,10 +2852,48 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
 
     match parse_id(&id) {
         Some((block, log_index)) => {
+            // A hot miss scans sealed segments. Same admission and deadline as `/sql` (#1657).
+            let admission = std::time::Instant::now();
+            let busy = || {
+                crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
+                )
+                    .into_response()
+            };
+            let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
+                        return busy();
+                    };
+                    match tokio::time::timeout(
+                        SQL_ADMISSION_WAIT,
+                        Arc::clone(&s.sql_gate).acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(p)) => p,
+                        _ => return busy(),
+                    }
+                }
+            };
+            let timeout = SQL_TIMEOUT.saturating_sub(admission.elapsed());
             let dir = s.dir.clone();
-            let sealed =
-                tokio::task::spawn_blocking(move || analytics::get_row(&dir, block, log_index))
-                    .await;
+            let sealed = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                analytics::get_row_guarded(
+                    &dir,
+                    block,
+                    log_index,
+                    analytics::QueryGuard {
+                        timeout,
+                        max_rows: 1,
+                    },
+                )
+            })
+            .await;
             match sealed {
                 Ok(Ok(Some(v))) => Json(v).into_response(),
                 Ok(Ok(None)) => not_found(&id),
@@ -6411,6 +6450,39 @@ mod tests {
             "refused after {waited:?}, so the request was never queued"
         );
         drop(held);
+    }
+
+    /// #1657: a hot miss on `/entity` is a cold scan, so it waits on the same gate as `/sql`.
+    #[tokio::test]
+    async fn entity_cold_read_waits_on_the_sql_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        let started = std::time::Instant::now();
+        let resp = entity(State(state.clone()), Path("1-1".into()))
+            .await
+            .into_response();
+        let waited = started.elapsed();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            waited >= Duration::from_millis(200),
+            "refused after {waited:?}, so the cold read never queued"
+        );
+        drop(held);
+    }
+
+    /// #1657: the cold read that does run is the guarded one. A permit alone still leaves the scan
+    /// without a deadline.
+    #[tokio::test]
+    async fn entity_cold_read_uses_the_query_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        let before = crate::analytics::entity_guarded_reads();
+        let resp = entity(State(state), Path("1-1".into()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(crate::analytics::entity_guarded_reads(), before + 1);
     }
 
     /// The case the wait exists for: a permit freed while the caller is queued admits it, where
