@@ -18437,6 +18437,78 @@ template="pool"
         );
     }
 
+    /// Records `forget_cached_above`, which is what drops a block-number timestamp after a reorg.
+    struct ForgetSource {
+        forgotten: std::sync::Mutex<Vec<u64>>,
+        fetched: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for ForgetSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(10_000_000)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(if n >= 20 {
+                "0xnew".into()
+            } else {
+                format!("0x{n:064x}")
+            }))
+        }
+        fn forget_cached_above(&self, block: u64) {
+            self.forgotten.lock().unwrap().push(block);
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.fetched
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_runtime_cursor_forgets_cached_timestamps_when_it_reorgs() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(d.path(), addr).await;
+        nest.store.set_meta(LAST_BLOCK_KEY, "20").unwrap();
+        nest.store.set_block_hash(20, "0xold").unwrap();
+        let src = Arc::new(ForgetSource {
+            forgotten: std::sync::Mutex::new(Vec::new()),
+            fetched: std::sync::atomic::AtomicBool::new(false),
+        });
+        let watch = src.clone();
+        let task = tokio::spawn(runtime_index_loop(
+            src as Arc<dyn Source>,
+            vec![nest],
+            Some(0),
+            false,
+            1,
+            5,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+        let progressed = within_deadline(|| {
+            !watch.forgotten.lock().unwrap().is_empty()
+                || watch.fetched.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        let forgotten = watch.forgotten.lock().unwrap().clone();
+        assert!(progressed, "the runtime neither reorged nor fetched");
+        assert_eq!(
+            forgotten.first().copied(),
+            Some(0),
+            "a runtime reorg left the timestamp cache in place: {forgotten:?}"
+        );
+    }
+
     /// Every sealed segment's columns, as `name -> values` in row order, across all of a nest's
     /// tables. Reads the Parquet the way a consumer would, so a test comparing two runs is comparing
     /// what was actually written rather than what the manifest claims about it.
