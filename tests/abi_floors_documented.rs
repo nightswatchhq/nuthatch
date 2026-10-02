@@ -15,9 +15,9 @@ fn readme() -> String {
 fn the_install_section_names_the_glibc_floor_and_no_other() {
     let s = readme();
     assert!(
-        s.contains("glibc 2.34"),
-        "README no longer states the measured glibc ABI floor (2.34), which is the number that \
-         decides whether the binary runs (#946, #978)"
+        s.contains("glibc 2.35"),
+        "README no longer states the measured glibc ABI floor (2.35 since 4.1.0, which references \
+         hypot at GLIBC_2.35), which is the number that decides whether the binary runs (#946, #978)"
     );
     assert!(
         !s.contains("GLIBCXX_"),
@@ -37,13 +37,13 @@ fn the_install_section_names_the_glibc_floor_and_no_other() {
 #[test]
 fn the_abi_floor_is_not_stated_as_the_build_baseline() {
     let s = readme();
-    let at = s.find("glibc 2.34").expect("the measured glibc floor");
+    let at = s.find("glibc 2.35").expect("the measured glibc floor");
     let window = &s[at.saturating_sub(200)..(at + 700).min(s.len())];
 
     assert!(
-        window.contains("2.35"),
-        "the README names an ABI floor but no longer says which glibc the release is built on. Both \
-         belong: dropping one is how they get conflated again (#978):\n{window}"
+        window.contains("2.34"),
+        "the README names the 4.1.0 floor but no longer says it was 2.34 before, with the symbol that \
+         raised it. Both belong: a floor without its cause is a number nobody may ever lower (#978):\n{window}"
     );
     for needed in ["built", "run"] {
         assert!(
@@ -54,10 +54,8 @@ fn the_abi_floor_is_not_stated_as_the_build_baseline() {
         );
     }
     assert!(
-        !s.contains("glibc 2.35 or newer"),
-        "the README is back to stating the build baseline as the runtime requirement. It is not: \
-         the binary references no symbol newer than GLIBC_2.34, and RHEL 9 - listed below as \
-         supported - ships 2.34 (#978)."
+        !s.contains("RHEL 9 and Amazon Linux 2023 clear"),
+        "the README lists RHEL 9 as clearing the floor. It ships glibc 2.34 and 4.1.0 needs 2.35 (#978)."
     );
 }
 
@@ -96,9 +94,10 @@ fn stated_glibc_requirement(readme: &str) -> Option<(u32, u32)> {
 #[test]
 fn the_supported_platforms_clear_the_stated_requirement() {
     let s = readme();
-    // Oldest glibc among the platforms the README names, at the time of writing.
-    // RHEL 9 and Amazon Linux 2023 both ship 2.34; Ubuntu 22.04 ships 2.35; Debian 12 ships 2.36.
-    const OLDEST_LISTED: (&str, (u32, u32)) = ("RHEL 9", (2, 34));
+    // Oldest glibc among the platforms the README says clear the floor, at the time of writing.
+    // Ubuntu 22.04 ships 2.35; Debian 12 ships 2.36. RHEL 9 and Amazon Linux 2023 (2.34) are named
+    // as not clearing it since 4.1.0.
+    const OLDEST_LISTED: (&str, (u32, u32)) = ("Ubuntu 22.04", (2, 35));
 
     assert!(
         s.contains(OLDEST_LISTED.0),
@@ -194,8 +193,8 @@ fn the_shipped_readme_states_a_parseable_requirement() {
     let req = stated_glibc_requirement(&readme());
     assert_eq!(
         req,
-        Some((2, 34)),
-        "the shipped README must state glibc 2.34 as the runtime requirement - the measured ABI \
-         floor, not the 2.35 build baseline"
+        Some((2, 35)),
+        "the shipped README must state glibc 2.35 as the runtime requirement: the floor measured on \
+         the 4.1.0 artifact (hypot at GLIBC_2.35)"
     );
 }
