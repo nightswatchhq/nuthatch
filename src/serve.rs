@@ -6628,6 +6628,90 @@ mod tests {
         assert_eq!(crate::analytics::entity_guarded_reads(), before + 1);
     }
 
+    /// `table` sealed at `sealed`, hot at `hot`, one row per block, served through `router()`.
+    fn table_fixture(
+        dir: &std::path::Path,
+        sealed: std::ops::RangeInclusive<u64>,
+        hot: std::ops::RangeInclusive<u64>,
+    ) -> AppState {
+        let row = |b: u64| json!({"table":"t","block_number":b,"log_index":0,"v":"x"}).to_string();
+        let cold: Vec<String> = sealed.clone().map(row).collect();
+        crate::seal::seal_range(dir, &cold, *sealed.start(), *sealed.end()).unwrap();
+        let mut state = test_state(dir, 1);
+        for b in hot {
+            state
+                .store
+                .put_entity(&Store::entity_key(b, 0), &row(b))
+                .unwrap();
+        }
+        state.tables = Arc::new(vec![crate::registry::TableSchema {
+            table: "t".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "T".into(),
+            topic0: "0x".into(),
+            columns: vec![],
+        }]);
+        state
+    }
+
+    async fn get_json(state: AppState, uri: &str) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router(SharedNest::new(state)).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// #1659: with the SQL gate saturated `/table` cannot read the sealed rows, and its answer must
+    /// say it is degraded rather than pass the hot rows off as the merged table.
+    #[tokio::test]
+    async fn a_table_answer_without_its_sealed_rows_says_it_is_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        let (status, body) = get_json(state.clone(), "/table/t?limit=10").await;
+        drop(held);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 2, "{body}");
+        assert_eq!(
+            body["degraded"], true,
+            "hot-only rows reported as the merged table: {body}"
+        );
+        assert_eq!(body["degraded_tables"], json!(["t"]), "{body}");
+
+        let (status, body) = get_json(state, "/table/t?limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 5, "hot and sealed merge: {body}");
+        assert_eq!(body["degraded"], false, "{body}");
+        assert_eq!(body["degraded_tables"], json!([]), "{body}");
+    }
+
+    /// #1659: a block window is applied to the hot rows before the limit, so a window older than
+    /// the newest `limit` hot rows still finds the rows inside it.
+    #[tokio::test]
+    async fn a_table_window_below_the_newest_hot_rows_finds_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=9);
+        let (status, body) = get_json(state, "/table/t?limit=2&from_block=4&to_block=5").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let blocks: Vec<u64> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["block_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(blocks, vec![5, 4], "{body}");
+    }
+
     /// The case the wait exists for: a permit freed while the caller is queued admits it, where
     /// fail-fast answered 503 for a query that would have run milliseconds later. This is the one
     /// in five the hackathon nests were bouncing.
