@@ -5,6 +5,10 @@
 //! grepping the file it had just written. These tests run the real script against a fake
 //! `systemctl` that resolves ExecStart the way systemd does (last file that sets it wins) and a fake
 //! `curl` whose `/ready` reports the version of whatever binary was running at the last restart.
+//!
+//! #1750 - with `--smoke <file>` the roll then runs each statement against `/sql`, and on any refusal
+//! puts the unit back on its previous binary. The fake answers `/sql` from `sql-<version>` in the
+//! state directory: `<substring> <mode>` fails any statement containing the substring.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +39,26 @@ esac
 
 const FAKE_CURL: &str = r#"#!/usr/bin/env bash
 bin=$(cat "$FAKE_STATE/running")
+url="" q=""
+for a in "$@"; do
+  case "$a" in http://*) url=$a ;; q=*) q=${a#q=} ;; esac
+done
+case "$url" in */sql*)
+  v=$("$bin" --version | awk '{print $2}')
+  printf '%s\n' "$q" >> "$FAKE_STATE/sql-log"
+  mode=ok
+  if [ -f "$FAKE_STATE/sql-$v" ]; then
+    read -r pat m < "$FAKE_STATE/sql-$v"
+    case "$q" in *"$pat"*) mode=$m ;; esac
+  fi
+  case "$mode" in
+    ok) printf '{"columns":["count"],"rows":[[7]]}\n200' ;;
+    error) printf '{"error":"Catalog Error: Table lodestar_epochs does not exist"}\n200' ;;
+    oom) printf '{"columns":["msg"],"rows":[["Out of Memory Error: failed to allocate 2.0 GiB"]]}\n200' ;;
+    http500) printf 'internal failure\n500' ;;
+  esac
+  exit 0 ;;
+esac
 # A restart that came back on the old process, as a no-op roll does.
 [ -f "$FAKE_STATE/stale" ] && bin=$(dirname "$bin")/nuthatch-4.1.0
 v=$("$bin" --version | awk '{print $2}')
@@ -107,9 +131,14 @@ fn a_box(with_drop_in: bool) -> Rig {
 }
 
 fn roll(b: &Rig) -> (bool, String) {
+    roll_with(b, &[])
+}
+
+fn roll_with(b: &Rig, extra: &[&str]) -> (bool, String) {
     let out = Command::new("bash")
         .arg(script())
         .args(["roll", "dips", "4.1.1"])
+        .args(extra)
         .env("PATH", &b.path)
         .env("NUTHATCH_BIN_DIR", &b.bin)
         .env("NUTHATCH_UNIT_DIR", &b.units)
@@ -203,4 +232,100 @@ fn a_roll_whose_restart_still_serves_the_old_version_fails() {
         !ok && out.contains("reports version 4.1.0 on /ready, not 4.1.1"),
         "the script must refuse a roll /ready does not confirm, got ok={ok}:\n{out}"
     );
+}
+
+const SMOKE: &str = "-- the panels Lodestar sends\n\nSELECT count(*) FROM lodestar_indexer_daily\n  -- indented comment\nSELECT count(*) FROM lodestar_epochs\n";
+
+fn smoke_file(b: &Rig) -> String {
+    let p = b.state.join("smoke.sql");
+    std::fs::write(&p, SMOKE).unwrap();
+    p.display().to_string()
+}
+
+fn sql_log(b: &Rig) -> Vec<String> {
+    std::fs::read_to_string(b.state.join("sql-log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// 4.1.1 refuses any statement containing `statement` in the given way; 4.1.0 answers everything.
+fn new_version_refuses(b: &Rig, statement: &str, mode: &str) {
+    std::fs::write(b.state.join("sql-4.1.1"), format!("{statement} {mode}\n")).unwrap();
+}
+
+#[test]
+fn a_smoke_that_passes_runs_every_statement_and_keeps_the_roll() {
+    let b = a_box(true);
+    let smoke = smoke_file(&b);
+    let (ok, out) = roll_with(&b, &["--smoke", &smoke]);
+    assert!(ok, "a passing smoke failed the roll:\n{out}");
+    assert!(running(&b).ends_with("nuthatch-4.1.1"), "{out}");
+    assert_eq!(
+        sql_log(&b),
+        [
+            "SELECT count(*) FROM lodestar_indexer_daily",
+            "SELECT count(*) FROM lodestar_epochs"
+        ],
+        "comments and blank lines are not statements, and every statement runs:\n{out}"
+    );
+}
+
+fn assert_rolled_back(b: &Rig, ok: bool, out: &str, why: &str) {
+    assert!(!ok, "a refused smoke must fail the roll:\n{out}");
+    assert!(
+        out.contains("SELECT count(*) FROM lodestar_epochs") && out.contains(why),
+        "the failure must name the statement and the error ({why}):\n{out}"
+    );
+    assert!(
+        running(b).ends_with("nuthatch-4.1.0"),
+        "the unit was left on {} after its smoke failed:\n{out}",
+        running(b)
+    );
+    let drop_in =
+        std::fs::read_to_string(b.units.join("dips.service.d/rpc-graphops.conf")).unwrap();
+    assert!(
+        drop_in.contains("nuthatch-4.1.0 dev") && !drop_in.contains("4.1.1"),
+        "the file systemd runs must name the previous binary again:\n{drop_in}"
+    );
+    assert!(out.contains("rolled back to 4.1.0"), "{out}");
+}
+
+#[test]
+fn a_smoke_answered_with_an_error_rolls_the_unit_back() {
+    let b = a_box(true);
+    let smoke = smoke_file(&b);
+    new_version_refuses(&b, "lodestar_epochs", "error");
+    let (ok, out) = roll_with(&b, &["--smoke", &smoke]);
+    assert_rolled_back(&b, ok, &out, "Catalog Error");
+}
+
+#[test]
+fn a_smoke_answered_out_of_memory_rolls_the_unit_back() {
+    let b = a_box(true);
+    let smoke = smoke_file(&b);
+    new_version_refuses(&b, "lodestar_epochs", "oom");
+    let (ok, out) = roll_with(&b, &["--smoke", &smoke]);
+    assert_rolled_back(&b, ok, &out, "Out of Memory");
+}
+
+#[test]
+fn a_smoke_answered_with_an_http_error_rolls_the_unit_back() {
+    let b = a_box(true);
+    let smoke = smoke_file(&b);
+    new_version_refuses(&b, "lodestar_epochs", "http500");
+    let (ok, out) = roll_with(&b, &["--smoke", &smoke]);
+    assert_rolled_back(&b, ok, &out, "HTTP 500");
+}
+
+/// A smoke file with no statements would examine nothing and report all clear.
+#[test]
+fn a_smoke_file_with_no_statements_is_refused_before_the_unit_is_touched() {
+    let b = a_box(true);
+    let p = b.state.join("empty.sql");
+    std::fs::write(&p, "-- nothing here\n\n").unwrap();
+    let (ok, out) = roll_with(&b, &["--smoke", &p.display().to_string()]);
+    assert!(!ok && out.contains("no statements"), "{out}");
+    assert!(running(&b).ends_with("nuthatch-4.1.0"), "{out}");
 }
