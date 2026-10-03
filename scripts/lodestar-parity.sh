@@ -16,8 +16,8 @@
 # PARITY_MODE=sealed (the default) pins at the nest's sealed_through. PARITY_MODE=head (#1718) pins
 # at its last_block, inside the hot window, and needs the subgraph's _meta.block.number at or above
 # it; a subgraph or a gateway-routed indexer short of that head is exit 3, not a pass. The pin
-# itself must not move during the run: last_block may not fall below it, and the nest's counts at
-# the pin are read again afterwards and must not have changed.
+# itself must not move during the run: last_block may not fall below it, and the nest's reorg and
+# missed-checkpoint counters on /metrics must read the same before and after.
 #
 # The first run compared incomparable populations (all-time subgraph totals vs
 # Horizon-only nest views) and reported four DIFFs that were not row disagreements.
@@ -137,6 +137,20 @@ if [ "$MODE" = sealed ]; then
   [ "$NEST_SEALED" -ge "$BLOCK" ] || die "PINNED_BLOCK=$BLOCK is above sealed_through=$NEST_SEALED, so it is not settled history"
 fi
 echo "PIN mode=$MODE block=$BLOCK version=$VERSION"
+
+# "<nuthatch_reorgs_total> <nuthatch_checkpoints_missed_total>" from the nest's /metrics.
+reorg_counters() {
+  local m r c
+  m=$(curl -fsS -m10 -A 'nuthatch-lodestar-parity' "$NEST/metrics" || true)
+  r=$(printf '%s\n' "$m" | sed -n 's/^nuthatch_reorgs_total \([0-9][0-9]*\)$/\1/p' | head -n 1)
+  c=$(printf '%s\n' "$m" | sed -n 's/^nuthatch_checkpoints_missed_total \([0-9][0-9]*\)$/\1/p' | head -n 1)
+  [ -n "$r" ] && [ -n "$c" ] || return 1
+  echo "$r $c"
+}
+if [ "$MODE" = head ]; then
+  REORGS_BEFORE=$(reorg_counters) \
+    || die "nest /metrics has no nuthatch_reorgs_total and nuthatch_checkpoints_missed_total, so a reorg under the head pin could not be seen"
+fi
 
 nest_count() {
   local view="$1" col="$2"
@@ -877,21 +891,18 @@ EOF
 if [ "$MODE" = sealed ]; then
   [ "$AFTER_SEALED" -ge "$BLOCK" ] || die "sealed boundary went backwards during comparison: $BLOCK -> $AFTER_SEALED"
 else
-  # The hot window can reorg under the pin. A head that moved under the comparison is a comparison
-  # of two states, so it is not measured rather than passed.
+  # The hot window can reorg under the pin, and a rollback that re-ingests leaves heights and counts
+  # as they were. The nest's reorg counter is the state identity: any reorg, or any window committed
+  # without a checkpoint to detect one, means the reads may span two states.
   if [ "$AFTER_BLOCK" -lt "$BLOCK" ]; then
     echo "parity NOT MEASURED at head $BLOCK: last_block fell to $AFTER_BLOCK during the comparison"
     exit 3
   fi
-  for pair in "lodestar_allocations created_at_block $ALLOC_N" "lodestar_epochs start_block $EPOCH_N" \
-    "lodestar_disputes created_at_block $DISPUTE_N" "lodestar_escrow_transactions block_number $ESCROW_N"; do
-    set -- $pair
-    now=$(nest_count "$1" "$2")
-    if [ "$now" != "$3" ]; then
-      echo "parity NOT MEASURED at head $BLOCK: $1 at the pin went from $3 to $now during the comparison"
-      exit 3
-    fi
-  done
+  REORGS_AFTER=$(reorg_counters) || die "nest /metrics lost its reorg counters during the comparison"
+  if [ "$REORGS_AFTER" != "$REORGS_BEFORE" ]; then
+    echo "parity NOT MEASURED at head $BLOCK: reorgs and missed checkpoints went from $REORGS_BEFORE to $REORGS_AFTER during the comparison"
+    exit 3
+  fi
 fi
 read -r EPOCH_GATED EPOCH_KNOWN < "$EPOCH_SUMMARY"
 echo "  proved: allocation counts, dispute id sets, escrow rows joined by id, and the epoch reward trio over ${EPOCH_GATED} closed epochs"

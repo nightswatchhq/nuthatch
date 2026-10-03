@@ -392,6 +392,9 @@ for a in "$@"; do
   case "$a" in
     */ready) printf '{"ready":true,"version":"4.2.0","last_block":1000,"sealed_through":900}'; exit 0 ;;
     */sql) printf '{"columns":["n"],"rows":[{"n":5}]}'; exit 0 ;;
+    */metrics)
+      [ -n "${FAKE_NO_REORG_METRICS:-}" ] && { printf 'nuthatch_rows_sealed_total 3\n'; exit 0; }
+      printf '# TYPE nuthatch_reorgs_total counter\nnuthatch_reorgs_total 2\nnuthatch_checkpoints_missed_total 0\n'; exit 0 ;;
   esac
 done
 exit 7
@@ -491,6 +494,13 @@ fn head_mode_refuses_an_explicit_pin() {
         text.contains("PINNED_BLOCK cannot be combined with PARITY_MODE=head"),
         "{text}"
     );
+}
+
+#[test]
+fn head_mode_needs_the_reorg_counters() {
+    let (code, text) = parity(Some("head"), &meta(2000), &[("FAKE_NO_REORG_METRICS", "1")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("nuthatch_reorgs_total"), "{text}");
 }
 
 #[test]
