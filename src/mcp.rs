@@ -66,15 +66,57 @@ fn client_config_json(exe: &str, base: &str) -> Value {
     })
 }
 
+/// One message in either direction. A `/sql` answer is capped at 64 MiB already, so nothing legitimate
+/// is larger, and an unbounded line is an unbounded allocation (#1661).
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The next newline-delimited message, or `None` at end of input. A line longer than `max` is read
+/// through to its newline and dropped rather than held.
+async fn next_message<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let buf = r.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok((!line.is_empty() && !oversized)
+                .then(|| String::from_utf8_lossy(&line).into_owned()));
+        }
+        let (take, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (buf.len(), false),
+        };
+        if !oversized {
+            if line.len() + take > max {
+                oversized = true;
+                line = Vec::new();
+            } else {
+                line.extend_from_slice(&buf[..take]);
+            }
+        }
+        r.consume(take);
+        if done {
+            if oversized {
+                eprintln!("nuthatch mcp: dropped a message over {max} bytes");
+                oversized = false;
+                continue;
+            }
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+    }
+}
+
 /// Run the stdio MCP loop, bridging tool calls to `base` (a running `nuthatch dev` HTTP API).
 pub async fn serve(base: String) -> Result<()> {
     if guide_if_interactive(&base) {
         return Ok(());
     }
     let client = reqwest::Client::new();
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = next_message(&mut stdin, MAX_MESSAGE_BYTES).await? {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -550,11 +592,28 @@ async fn get_query(client: &reqwest::Client, url: &str, q: &[(&str, &str)]) -> R
 }
 
 async fn fetch(req: reqwest::RequestBuilder, url: &str) -> Result<String> {
-    let resp = req.send().await.map_err(|e| {
-        anyhow!("cannot reach nuthatch at {url} - is `nuthatch dev` running? ({e})")
+    fetch_capped(req, url, MAX_MESSAGE_BYTES).await
+}
+
+/// The error reaches the model's transcript, and the configured URL may carry credentials, so it
+/// names the endpoint by scheme and host only (#1690).
+async fn fetch_capped(req: reqwest::RequestBuilder, url: &str, cap: usize) -> Result<String> {
+    let mut resp = req.send().await.map_err(|e| {
+        anyhow!(
+            "cannot reach nuthatch at {} - is `nuthatch dev` running? ({})",
+            crate::rpc::redact_url(url),
+            e.without_url()
+        )
     })?;
     let status = resp.status();
-    let body = resp.text().await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.without_url())? {
+        if bytes.len() + chunk.len() > cap {
+            bail!("the response from nuthatch is larger than {cap} bytes; ask for fewer rows");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&bytes).into_owned();
     // A 404 or a refused query is a failed tool call, with the body as the agent's explanation.
     if !status.is_success() {
         bail!("HTTP {}: {body}", status.as_u16());
@@ -577,6 +636,56 @@ fn content(text: &str, is_error: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1661: a line over the cap is read through and dropped, and the next message still arrives.
+    #[tokio::test]
+    async fn an_oversized_message_is_dropped_and_the_next_one_read() {
+        let input = format!("{}\n{{\"id\":1}}\n{{\"id\":2}}", "x".repeat(100));
+        let mut r = tokio::io::BufReader::with_capacity(8, input.as_bytes());
+        assert_eq!(
+            super::next_message(&mut r, 16).await.unwrap().as_deref(),
+            Some("{\"id\":1}\n")
+        );
+        assert_eq!(
+            super::next_message(&mut r, 16).await.unwrap().as_deref(),
+            Some("{\"id\":2}")
+        );
+        assert_eq!(super::next_message(&mut r, 16).await.unwrap(), None);
+    }
+
+    /// #1690: the configured URL can carry credentials and the error goes to the model, and a target
+    /// cannot make the bridge buffer more than the cap.
+    #[tokio::test]
+    async fn a_fetch_error_names_no_credentials_and_a_large_answer_is_refused() {
+        let client = reqwest::Client::new();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://user:hunter2@127.0.0.1:{port}/secret-path/sql");
+        let err = super::fetch_capped(client.get(&url), &url, 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("hunter2") && !err.contains("secret-path"),
+            "{err}"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app =
+            axum::Router::new().route("/big", axum::routing::get(|| async { "y".repeat(4096) }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let big = format!("http://{addr}/big");
+        let err = super::fetch_capped(client.get(&big), &big, 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("larger than 1024 bytes"), "{err}");
+        server.abort();
+    }
 
     /// A one-endpoint fake nest. `shape` of `None` means "no `/shape` route" - an older nest, which is
     /// exactly the case the fail-open default exists for.
