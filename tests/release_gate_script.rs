@@ -612,7 +612,18 @@ fn poll_gates_a_prerelease_of_a_newer_version() {
         ],
         &[("v4.9.0", "success")],
     );
-    let (code, text) = r.runner(&c, &set, &["--poll"], &[]);
+    // The runner holds the copy's lock itself from before the refresh, so a gate run by hand cannot
+    // slip in between the refresh and the two measurements.
+    let lock = std::fs::canonicalize(c.dir.path())
+        .unwrap()
+        .join("nest.gate-lock.d/pid");
+    let refresh = format!("[ \"$(cat '{}')\" = \"$PPID\" ]", lock.display());
+    let (code, text) = r.runner(
+        &c,
+        &set,
+        &["--poll"],
+        &[("GATE_LOCK_PORTABLE", "1"), ("GATE_REFRESH", &refresh)],
+    );
     assert_eq!(code, Some(0), "{text}");
     let posted = r.read("posted");
     assert!(
