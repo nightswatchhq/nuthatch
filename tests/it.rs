@@ -90,6 +90,8 @@ mod e2e_solo;
 mod e2e_sql_cli_backend;
 #[path = "e2e_stall_isolation.rs"]
 mod e2e_stall_isolation;
+#[path = "e2e_stop_releases_store.rs"]
+mod e2e_stop_releases_store;
 #[path = "e2e_transform_cli.rs"]
 mod e2e_transform_cli;
 #[path = "e2e_trino_contract.rs"]

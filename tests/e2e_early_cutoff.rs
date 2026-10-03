@@ -172,7 +172,7 @@ async fn bring_up(
     // is what makes the lock actually free before this returns to a caller about to open the same
     // databases. It used to be written out here; it now lives on `ChainCursor` so the next fixture
     // that reopens a store cannot step in the same hole (#407).
-    cursor.shutdown().await;
+    cursor.shutdown().await.expect("the cursor stops");
 
     // The tip path will not seal four rows (#1067). Seal through the public API so the
     // adoption assertions see real Parquet without stuffing dummy events into a fixture

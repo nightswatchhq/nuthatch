@@ -42,17 +42,6 @@ async fn spawn(dir: &std::path::Path, tape: Arc<TapeSource>) -> indexer::NestRun
     .expect("spawn_nest with folds/")
 }
 
-/// Stop the nest and wait for it, so the store's lock and the writer's thread are both released.
-async fn stop(rt: indexer::NestRuntime) {
-    rt.ingest.abort();
-    let _ = rt.ingest.await;
-    if let Some(w) = rt.alert_worker {
-        w.abort();
-        let _ = w.await;
-    }
-    drop(rt.state);
-}
-
 fn writer(rt: &indexer::NestRuntime) -> Arc<folds::Writer> {
     rt.state
         .folds
@@ -134,7 +123,7 @@ async fn the_seal_loop_checkpoints_what_it_seals_and_a_restart_recovers_a_lost_w
     );
     let through = status.checkpointed_through;
     drop((w, store));
-    stop(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 
     let expected = sealed_rows(dir.path());
     assert_eq!(
@@ -162,7 +151,7 @@ async fn the_seal_loop_checkpoints_what_it_seals_and_a_restart_recovers_a_lost_w
         w.status()
     );
     drop(w);
-    stop(rt).await;
+    rt.shutdown().await.expect("the nest stops");
     let rebuilt: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(

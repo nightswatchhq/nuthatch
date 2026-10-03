@@ -168,7 +168,7 @@ async fn bring_up(
     // `shutdown` so the ingest and alert tasks are actually stopped — and their
     // `Store` clones dropped — rather than merely asked to stop.
     let states_in = std::mem::take(&mut cursor.states);
-    cursor.shutdown().await;
+    cursor.shutdown().await.expect("the cursor stops");
 
     let mut estimates = std::collections::HashMap::new();
     let states = runtime::fan_out_aliases(

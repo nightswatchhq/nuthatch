@@ -9,7 +9,6 @@ mod entity_fixture;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use nuthatch::runtime::{MountTable, DATA_DIR, MOUNTS_FILE};
 use nuthatch::store::Store;
@@ -147,8 +146,7 @@ async fn write_upgrade_fixture() {
     tape.advance_tip_to(6);
     let cursor = start(&out, tape.clone()).await;
     assert!(last_block_reaches(&cursor, 6).await, "did not index to 6");
-    cursor.shutdown().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    cursor.shutdown().await.expect("the cursor stops");
 
     force_seal_through(&out.join(DATA_DIR).join(&nid), 4);
     println!("fixture written to {} with nid {nid}", out.display());
@@ -278,8 +276,7 @@ async fn a_v3_13_2_runtime_directory_opens_drop_in() {
     );
 
     server.abort();
-    cursor.shutdown().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    cursor.shutdown().await.expect("the cursor stops");
 
     // And a later seal works. The fixture's segment is provisional, so it is merged into the new one.
     force_seal_through(&data, 7);

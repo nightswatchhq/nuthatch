@@ -410,6 +410,48 @@ pub struct NestRuntime {
     pub alert_worker: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// How long a stop waits for the last handle on a store to drop before saying which store it was.
+pub const STORE_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait for `released` (from [`crate::store::HotStore::released`]), failing after
+/// [`STORE_RELEASE_TIMEOUT`] rather than hanging on a handle someone kept.
+pub async fn await_store_release(
+    released: futures::future::BoxFuture<'static, ()>,
+    dir: &std::path::Path,
+) -> Result<()> {
+    tokio::time::timeout(STORE_RELEASE_TIMEOUT, released)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the store at {} was still held {}s after its nest stopped",
+                dir.display(),
+                STORE_RELEASE_TIMEOUT.as_secs()
+            )
+        })
+}
+
+impl NestRuntime {
+    /// Stop the nest and return once its store is closed (#1764).
+    ///
+    /// Awaiting an aborted task proves its future dropped, not that its store did: a commit it had
+    /// handed to the blocking pool runs on with a handle, and redb keeps the file locked until the
+    /// last one goes.
+    pub async fn shutdown(self) -> Result<()> {
+        let released = self.state.store.released();
+        let dir = self.state.dir.clone();
+        self.ingest.abort();
+        if let Some(w) = &self.alert_worker {
+            w.abort();
+        }
+        let _ = self.ingest.await;
+        if let Some(w) = self.alert_worker {
+            let _ = w.await;
+        }
+        drop(self.state);
+        await_store_release(released, &dir).await
+    }
+}
+
 /// The two heads at the instant the flip swapped. The old writer is quiesced first, so they
 /// describe the swap (#1314).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2458,7 +2500,12 @@ impl ChainCursor {
     /// Consuming `self` makes "stopped" a state the caller cannot forget to reach,
     /// and drops the `AppState` clones as part of the contract rather than as
     /// something each caller has to remember.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self) -> Result<()> {
+        let released: Vec<_> = self
+            .states
+            .iter()
+            .map(|(_, s)| (s.store.released(), s.dir.clone()))
+            .collect();
         self.ingest.abort();
         for (_, w) in &self.alert_workers {
             w.abort();
@@ -2471,10 +2518,12 @@ impl ChainCursor {
         for (_, w) in self.alert_workers {
             let _ = w.await;
         }
-        // Explicit rather than incidental: these are the remaining `Store` clones,
-        // and dropping them is the reason the file lock is actually free when this
-        // returns.
         drop(self.states);
+        // A commit the cursor handed to the blocking pool outlives its abort (#1764).
+        for (r, dir) in released {
+            await_store_release(r, &dir).await?;
+        }
+        Ok(())
     }
 }
 
