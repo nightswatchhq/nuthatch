@@ -5366,7 +5366,7 @@ pub async fn backfill_direct_pipelined_with(
     // (`source`, `registry`, filters) are shared across the concurrent futures - fine, they run on
     // one task; `buffered` yields them back in window order. A window that comes back short of
     // `asked_to` (#1671) has its remainder fetched by the consumer, in order, before the next one.
-    let run_window = move |w_from: u64, asked_to: u64, final_pass: bool| async move {
+    let run_window = move |w_from: u64, asked_to: u64, final_pass: bool, rest: bool| async move {
         // Split-and-retry on a provider result cap instead of aborting the whole backfill (H2/H3),
         // and retry the whole fetch on a transient all-endpoints failure (rate-limit / provider
         // blip) so one bad window doesn't abort the run.
@@ -5376,8 +5376,9 @@ pub async fn backfill_direct_pipelined_with(
         // produce no signal, or every run would cap itself on its final chunk.
         let mut served_width = 0u64;
         let mut whole_width = 0u64;
-        // The tail of the previous window is asked for again (#1144).
-        let fetch_from = if final_pass {
+        // The tail of the previous window is asked for again (#1144), but not before the rest of a
+        // cut window: those blocks may be what filled the budget, and asking again would not advance.
+        let fetch_from = if final_pass || rest {
             w_from
         } else {
             overlap_from(w_from, from)
@@ -5531,7 +5532,7 @@ pub async fn backfill_direct_pipelined_with(
         })
     };
     let stream = windows
-        .map(move |(w_from, w_to, final_pass)| run_window(w_from, w_to, final_pass))
+        .map(move |(w_from, w_to, final_pass)| run_window(w_from, w_to, final_pass, false))
         .buffered(concurrency.max(1));
     // `unfold`'s generator future is not `Unpin` (it borrows `chunker` across an await), so the stream
     // has to be pinned before it can be polled in a loop.
@@ -5611,7 +5612,7 @@ pub async fn backfill_direct_pipelined_with(
             // The in-flight windows keep being polled, or their requests would time out unread;
             // with the gate shut, at most `concurrency` of them land in `ready`.
             gate.0.store(true, std::sync::atomic::Ordering::SeqCst);
-            let mut rest = std::pin::pin!(run_window(w_to + 1, asked_to, final_pass));
+            let mut rest = std::pin::pin!(run_window(w_to + 1, asked_to, final_pass, true));
             let res = loop {
                 tokio::select! {
                     biased;
@@ -15874,6 +15875,17 @@ template = "pool"
     struct ResultCapSource {
         logs: Vec<crate::rpc::Log>,
         cap: usize,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ResultCapSource {
+        fn new(logs: Vec<crate::rpc::Log>, cap: usize) -> Self {
+            Self {
+                logs,
+                cap,
+                asked: Default::default(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -15890,6 +15902,12 @@ template = "pool"
             from: u64,
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
+            // A backfill that stops advancing never yields to a timeout, so it is stopped here.
+            let asked = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                asked < 500,
+                "{asked} getLogs calls: the backfill is not advancing"
+            );
             let lo = self.logs.partition_point(|l| l.block_number < from);
             let hi = self.logs.partition_point(|l| l.block_number <= to);
             if hi - lo > self.cap {
@@ -15941,13 +15959,12 @@ template = "pool"
         let logs: Vec<_> = (200_001u64..=215_000)
             .flat_map(|b| (0..3).map(move |li| transfer_log(b, li)))
             .collect();
-        let source = ResultCapSource { logs, cap: 1_000 };
 
         for concurrency in [1, 4] {
             let d = tempfile::tempdir().unwrap();
             let mut widest = 0u64;
             let total = backfill_direct_pipelined(
-                &source,
+                &ResultCapSource::new(logs.clone(), 1_000),
                 &reg,
                 d.path(),
                 &addresses,
@@ -15973,7 +15990,7 @@ template = "pool"
             );
             let d_seq = tempfile::tempdir().unwrap();
             backfill_direct(
-                &source,
+                &ResultCapSource::new(logs.clone(), 1_000),
                 &reg,
                 d_seq.path(),
                 &addresses,
@@ -16002,6 +16019,67 @@ template = "pool"
                 "{concurrency}-way: a cut window must seal the same bytes"
             );
         }
+    }
+
+    /// #1671: the rest of a cut window must start where the cut fell. Asking for the overlap again
+    /// re-fills the budget from the same two blocks and never advances.
+    #[tokio::test]
+    async fn the_rest_of_a_cut_window_advances_past_a_block_that_fills_the_budget() {
+        use crate::registry::{ContractSpec, DecodeRegistry};
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let addresses: Vec<String> = reg
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = reg
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+        // Block 10 alone fills the budget, and the provider will not serve 10..=11 together.
+        let logs: Vec<_> = (0..20_000)
+            .map(|li| transfer_log(10, li))
+            .chain((0..5).map(|li| transfer_log(11, li)))
+            .collect();
+        let source = ResultCapSource::new(logs, 20_000);
+        let d = tempfile::tempdir().unwrap();
+        let total = backfill_direct_pipelined(
+            &source,
+            &reg,
+            d.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            11,
+            1_000,
+            SPAN_OFF,
+            1,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 20_005, "every row once");
+        let m = seal::load_manifest(d.path()).unwrap();
+        let sealed: usize = m.tables.values().flatten().map(|s| s.rows).sum();
+        assert_eq!(sealed, 20_005, "every row sealed once");
     }
 
     // ---------------------------------------------------------------------------------------------
