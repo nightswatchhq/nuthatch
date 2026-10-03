@@ -175,11 +175,7 @@ fn human(bytes: u64) -> String {
 pub fn run(dir: &Path, yes: bool) -> Result<()> {
     let found = collectable(dir)?;
     if found.is_empty() {
-        println!(
-            "Nothing to prune in {} - every dataset is mounted.",
-            dir.display()
-        );
-        return Ok(());
+        return collect_leftover_segments(dir, yes);
     }
 
     let total: u64 = found.iter().map(|c| c.bytes).sum();
@@ -205,20 +201,7 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    // A query in a running runtime can have planned against a shared segment a fold has since
-    // replaced, and its lease does not reach this process.
-    if let Some(nid) = MountTable::load(dir)?
-        .mounts
-        .iter()
-        .map(|m| m.nid.clone())
-        .find(|nid| store_is_held(&MountTable::data_dir(dir, nid)))
-    {
-        anyhow::bail!(
-            "data/{} is open in a running runtime: removing shared segments now could delete one a \
-             query there is about to read. Stop the runtime, then prune again. Nothing was deleted.",
-            &nid[..nid.len().min(12)]
-        );
-    }
+    refuse_while_a_store_is_open(dir)?;
 
     // **Manifest first, bytes second** (RFC-0033 §11a). Removing the dataset - and with it the
     // manifest referencing its segments - before collecting orphans means an interrupted prune leaves
@@ -230,6 +213,7 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
         let _ = std::fs::remove_dir_all(crate::runtime::adopt_staging(&c.dir));
         println!("Removed data/{}", &c.nid[..12]);
     }
+    crate::crash::point("prune:after-datasets");
 
     let surviving: Vec<String> = MountTable::load(dir)
         .map(|r| r.mounts.iter().map(|m| m.nid.clone()).collect())
@@ -250,6 +234,62 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
     }
 
     println!("\nFreed {}.", human(total + freed_segments));
+    Ok(())
+}
+
+/// A query in a running runtime can have planned against a shared segment a fold has since
+/// replaced, and its lease does not reach this process.
+fn refuse_while_a_store_is_open(dir: &Path) -> Result<()> {
+    if let Some(nid) = MountTable::load(dir)?
+        .mounts
+        .iter()
+        .map(|m| m.nid.clone())
+        .find(|nid| store_is_held(&MountTable::data_dir(dir, nid)))
+    {
+        anyhow::bail!(
+            "data/{} is open in a running runtime: removing shared segments now could delete one a \
+             query there is about to read. Stop the runtime, then prune again. Nothing was deleted.",
+            &nid[..nid.len().min(12)]
+        );
+    }
+    Ok(())
+}
+
+/// With no dataset left to remove, the segments no mounted dataset references: what a prune killed
+/// between removing its datasets and its orphan pass leaves behind, and what a fold replaces (#1717).
+fn collect_leftover_segments(dir: &Path, yes: bool) -> Result<()> {
+    let mounted: Vec<String> = MountTable::load(dir)?
+        .mounts
+        .iter()
+        .map(|m| m.nid.clone())
+        .collect();
+    let orphans = orphan_segments(dir, &mounted)?;
+    if orphans.is_empty() {
+        println!(
+            "Nothing to prune in {} - every dataset is mounted.",
+            dir.display()
+        );
+        return Ok(());
+    }
+    let bytes: u64 = orphans.iter().map(|(_, size)| size).sum();
+    println!(
+        "Every dataset in {} is mounted, and {} shared segment(s) no dataset references hold {}.",
+        dir.display(),
+        orphans.len(),
+        human(bytes)
+    );
+    if !yes {
+        println!(
+            "Nothing was deleted. Run `nuthatch prune --dir {} --yes` to remove them.",
+            dir.display()
+        );
+        return Ok(());
+    }
+    refuse_while_a_store_is_open(dir)?;
+    for (path, _) in &orphans {
+        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    println!("Removed them. Freed {}.", human(bytes));
     Ok(())
 }
 

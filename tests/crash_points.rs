@@ -94,9 +94,8 @@ fn pin(rpc_port: u16, path: &str, n: u64) {
 }
 
 /// A fixture chain and an `init`ed nest pointed at it.
-fn chain_and_nest(dir: &Path) -> (Reaped, PathBuf) {
-    let abi = dir.join("erc20.json");
-    std::fs::write(&abi, ERC20_TRANSFER_ABI).unwrap();
+/// The fixture chain over HTTP, pinned to the tip and finality the cases expect.
+fn fixture_chain() -> (Reaped, u16) {
     let rpc_port = free_port();
     let rpc = Reaped(
         Command::new("python3")
@@ -112,15 +111,21 @@ fn chain_and_nest(dir: &Path) -> (Reaped, PathBuf) {
     });
     pin(rpc_port, "tip", TIP);
     pin(rpc_port, "finalized", FINALIZED);
+    (rpc, rpc_port)
+}
 
-    let nest = dir.join("nest");
+/// `init` a nest at `nest`, pointed at the fixture chain.
+fn init_nest(nest: &Path, rpc_port: u16) {
+    std::fs::create_dir_all(nest.parent().unwrap()).unwrap();
+    let abi = nest.with_extension("abi.json");
+    std::fs::write(&abi, ERC20_TRANSFER_ABI).unwrap();
     let init = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
         .args(["init", CONTRACT, "--chain", "arbitrum-one"])
         .args(["--rpc", &format!("http://127.0.0.1:{rpc_port}/")])
         .arg("--abi")
         .arg(&abi)
         .arg("--dir")
-        .arg(&nest)
+        .arg(nest)
         .output()
         .expect("run init");
     assert!(
@@ -128,6 +133,13 @@ fn chain_and_nest(dir: &Path) -> (Reaped, PathBuf) {
         "init failed:\n{}",
         String::from_utf8_lossy(&init.stderr)
     );
+}
+
+/// A fixture chain and an `init`ed nest pointed at it.
+fn chain_and_nest(dir: &Path) -> (Reaped, PathBuf) {
+    let (rpc, rpc_port) = fixture_chain();
+    let nest = dir.join("nest");
+    init_nest(&nest, rpc_port);
     (rpc, nest)
 }
 
@@ -248,6 +260,129 @@ fn an_unnamed_point_does_not_abort() {
     assert!(
         run.0.try_wait().unwrap().is_none(),
         "the nest exited under a point name nothing carries:\n{}",
+        read(&log)
+    );
+}
+
+/// Run `dev` on `nest` until it has sealed the fixture history, then stop it.
+fn seal_once(nest: &Path, log: &Path) {
+    let port = free_port();
+    let mut run = Reaped(dev(nest, port, None, log));
+    let api = format!("http://127.0.0.1:{port}");
+    poll("the nest to seal the history", 120, || {
+        sql(&api, "SELECT 1")?["provenance"]["sealed_through"]
+            .as_u64()
+            .filter(|&n| n >= FINALIZED)
+    });
+    let _ = Command::new("kill")
+        .args(["-TERM", &run.0.id().to_string()])
+        .status();
+    let _ = run.0.wait();
+}
+
+fn prune(runtime: &Path, crash_at: Option<&str>) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nuthatch"));
+    cmd.args(["prune", "--yes", "--dir"]).arg(runtime);
+    match crash_at {
+        Some(point) => cmd.env("NUTHATCH_CRASH_AT", point),
+        None => cmd.env_remove("NUTHATCH_CRASH_AT"),
+    };
+    cmd.output().expect("run prune")
+}
+
+fn segment_files(runtime: &Path) -> usize {
+    std::fs::read_dir(runtime.join("segments"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+        .count()
+}
+
+/// A prune dies after removing an unmounted dataset and before its orphan pass. The surviving mount
+/// must read every row, and the next prune must reclaim the segment only the removed dataset named.
+/// Before #1717 it answered "Nothing to prune" and kept that segment for good.
+#[test]
+fn a_prune_killed_before_its_orphan_pass_loses_nothing_and_is_finished_by_the_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    let (_rpc, rpc_port) = fixture_chain();
+    // Two nests over one chain: `usdc` from genesis, `late` from block 5, so they share no segment
+    // and each owns one. `late` is the one unmounted and pruned.
+    for name in ["usdc", "late"] {
+        let nest = runtime.join("nests").join(name);
+        init_nest(&nest, rpc_port);
+        if name == "late" {
+            let toml = nest.join("nuthatch.toml");
+            let raw = std::fs::read_to_string(&toml).unwrap();
+            std::fs::write(&toml, format!("{raw}start_block = 5\n")).unwrap();
+        }
+        seal_once(&nest, &dir.path().join(format!("{name}.log")));
+    }
+    std::fs::write(
+        runtime.join("mounts.toml"),
+        format!(
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = [\"http://127.0.0.1:{rpc_port}/\"]\nnests = [\"usdc\", \"late\"]\n"
+        ),
+    )
+    .unwrap();
+    let migrate = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(["migrate", "--dir"])
+        .arg(&runtime)
+        .output()
+        .unwrap();
+    assert!(
+        migrate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrate.stderr)
+    );
+    assert_eq!(
+        segment_files(&runtime),
+        2,
+        "premise: each dataset owns a segment"
+    );
+
+    let table = std::fs::read_to_string(runtime.join("mounts.toml")).unwrap();
+    let kept = table
+        .split("[[mounts]]")
+        .filter(|block| !block.contains("alias = \"late\""))
+        .collect::<Vec<_>>()
+        .join("[[mounts]]");
+    assert_ne!(kept, table, "premise: `late` had a mount record to remove");
+    std::fs::write(runtime.join("mounts.toml"), kept).unwrap();
+
+    let killed = prune(&runtime, Some("prune:after-datasets"));
+    let said = String::from_utf8_lossy(&killed.stderr);
+    assert!(
+        !killed.status.success() && said.contains("crash point prune:after-datasets: aborting"),
+        "the prune was meant to die between its two passes:\n{said}"
+    );
+    assert_eq!(
+        segment_files(&runtime),
+        2,
+        "premise: the dead prune left the removed dataset's segment behind"
+    );
+
+    let finished = prune(&runtime, None);
+    assert!(finished.status.success());
+    assert_eq!(
+        segment_files(&runtime),
+        1,
+        "the next prune left the segment no dataset references:\n{}",
+        String::from_utf8_lossy(&finished.stdout)
+    );
+
+    let port = free_port();
+    let log = dir.path().join("runtime.log");
+    let _rt = Reaped(dev(&runtime, port, None, &log));
+    let api = format!("http://127.0.0.1:{port}/usdc");
+    let answer = poll("the surviving mount to answer", 120, || {
+        sql(&api, "SELECT count(*) AS n FROM c0__transfer")
+    });
+    assert_eq!(
+        answer["rows"][0]["n"].as_u64(),
+        Some(TRANSFERS),
+        "the surviving mount lost rows to the prune:\n{}",
         read(&log)
     );
 }
