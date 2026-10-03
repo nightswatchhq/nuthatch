@@ -50,7 +50,7 @@ Other consumers may join later; the set is Lodestar's and kittiwake's first.
 
 ## Running the gate
 
-    scripts/release-gate.sh [--baseline F] [--write-baseline F] [--passes N] <binary> <nest-copy> <set>
+    scripts/release-gate.sh [--baseline F] [--write-baseline F] [--passes N] [--concurrency N] <binary> <nest-copy> <set>
 
 The copy needs its sealed segments **and** a copy of its `nuthatch.redb`: without the redb it serves
 no sealed history. The script starts `nuthatch serve` on the copy under production's environment,
@@ -64,6 +64,14 @@ When that unit's environment changes, change `PROD_ENV` with it, or the gate tes
 runs. Each pass starts a fresh server, because of the memo; a query's status is its worst pass and
 its time the median of its passes. For each query it records status, rows, time and the digest of
 its answer from the first pass that answered; an answer that moves between passes is noted.
+
+`--concurrency N` (default 1; `release-gate-run.sh` passes 2, as 8107 serves two statements at once)
+sends the set N statements at a time in its own order, waiting for a whole group before the next, so
+every pass pairs the same statements (#1773). The set lists each kittiwake call site's statements
+together, so a pair is mostly two statements one route sends at once. Each statement keeps its own
+time, and `schedule-pass-N.tsv` in the output directory records each statement's group, start and
+end. When the binary exports the analytics pool and jemalloc gauges (#1778), the run also reports
+what they read at the RSS peak and the largest single pool reservation.
 
 It fails (exit 1) on:
 

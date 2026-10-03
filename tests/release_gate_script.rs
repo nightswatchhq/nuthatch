@@ -504,10 +504,10 @@ fn at_concurrency_two_a_pair_is_in_flight_together_and_both_are_recorded() {
     let c = case();
     // Slow enough on eight rows that two run one after the other cannot overlap by accident.
     let slow = |salt: u32| {
-        let from: Vec<String> = (0..7).map(|i| format!("\"{}\" t{i}", c.table)).collect();
+        let from: Vec<String> = (0..6).map(|i| format!("\"{}\" t{i}", c.table)).collect();
         format!(
             "SELECT count(DISTINCT {}) AS n FROM {}",
-            (0..7)
+            (0..6)
                 .map(|i| format!("t{i}.block_number * {}", 10u64.pow(i) + u64::from(salt)))
                 .collect::<Vec<_>>()
                 .join(" + "),
