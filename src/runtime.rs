@@ -2884,10 +2884,23 @@ fn persist_mounted_nests(
     }
     mounts.runtime.suspended = suspended.to_vec();
     let out = toml::to_string_pretty(&mounts).context("serialising mounts.toml")?;
+    #[cfg(test)]
+    persisted_tables()
+        .lock()
+        .unwrap()
+        .push((dir.to_path_buf(), out.clone()));
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
+}
+
+/// Every `mounts.toml` a test build writes, by runtime directory, so a test can see each one (#1647).
+#[cfg(test)]
+fn persisted_tables() -> &'static std::sync::Mutex<Vec<(PathBuf, String)>> {
+    static WRITTEN: std::sync::OnceLock<std::sync::Mutex<Vec<(PathBuf, String)>>> =
+        std::sync::OnceLock::new();
+    WRITTEN.get_or_init(Default::default)
 }
 
 /// The handles a runtime driver keeps so it can change its nest set while running (RFC-0027 §6).
@@ -4089,11 +4102,15 @@ impl RuntimeHandles {
         let Some(nid) = state.nid.as_deref().map(str::to_string) else {
             bail!("'{name}' has no recorded nid to resume from; `nuthatch migrate` records one");
         };
-        self.unmount(name).await?;
+        // Suspended before the unmount writes the table, so its one write keeps the record (#1647).
         self.suspended.insert(name.to_string(), nid);
+        let unmounted = self.unmount(name).await;
+        if self.states.iter().any(|(n, _)| n == name) {
+            self.suspended.remove(name);
+            return unmounted;
+        }
         self.health.suspend_nest(name);
-        self.live.swap(self.compose());
-        self.persist()?;
+        unmounted?;
         tracing::info!("nest '{name}' suspended");
         Ok(())
     }
@@ -6040,39 +6057,6 @@ mod tests {
             ))
             .unwrap()
         }
-        fn nest_state(dir: &std::path::Path, chain: &str) -> crate::serve::AppState {
-            crate::serve::AppState {
-                store: Arc::new(crate::store::Store::open(&dir.join("hot.redb")).unwrap()),
-                address: None,
-                chain: chain.to_string(),
-                dir: dir.to_path_buf(),
-                balances: crate::views::BalanceView::start().unwrap(),
-                exposure: crate::exposure::ExposureView::start(true).unwrap(),
-                velocity: crate::velocity::VelocityView::start(true).unwrap(),
-                entities: Arc::new(Vec::new()),
-                #[cfg(feature = "folds")]
-                folds: None,
-                threshold: None,
-                velocity_threshold: None,
-                admin_enabled: false,
-                admin_token: None,
-                nest_info: Arc::new(serde_json::json!({})),
-                tables: Arc::new(vec![]),
-                sql_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-                sql_queued: Default::default(),
-                sql_max_hot_rows: crate::serve::SQL_MAX_HOT_ROWS,
-                sql_max_hot_bytes: crate::serve::SQL_MAX_HOT_BYTES,
-                sql_max_named_scan_bytes: crate::serve::SQL_MAX_NAMED_SCAN_BYTES,
-                cursorless: true,
-                seal_span: crate::chains::DEFAULT_SEAL_SPAN,
-                freshness: Default::default(),
-                surface: Arc::new(crate::allowlist::Surface::default()),
-                #[cfg(feature = "counter")]
-                counter: None,
-                nid: None,
-                runtime_health: None,
-            }
-        }
 
         let root = tempfile::tempdir().unwrap();
         let held = root.path().join("held");
@@ -6421,6 +6405,97 @@ mod tests {
             assert!(err.contains("reserved"), "plan_mount {name}: {err}");
         }
         assert!(handles.plan_mount("usdc", None).is_ok());
+    }
+
+    fn nest_state(dir: &std::path::Path, chain: &str) -> crate::serve::AppState {
+        crate::serve::AppState {
+            store: Arc::new(crate::store::Store::open(&dir.join("hot.redb")).unwrap()),
+            address: None,
+            chain: chain.to_string(),
+            dir: dir.to_path_buf(),
+            balances: crate::views::BalanceView::start().unwrap(),
+            exposure: crate::exposure::ExposureView::start(true).unwrap(),
+            velocity: crate::velocity::VelocityView::start(true).unwrap(),
+            entities: Arc::new(Vec::new()),
+            #[cfg(feature = "folds")]
+            folds: None,
+            threshold: None,
+            velocity_threshold: None,
+            admin_enabled: false,
+            admin_token: None,
+            nest_info: Arc::new(serde_json::json!({})),
+            tables: Arc::new(vec![]),
+            sql_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            sql_queued: Default::default(),
+            sql_max_hot_rows: crate::serve::SQL_MAX_HOT_ROWS,
+            sql_max_hot_bytes: crate::serve::SQL_MAX_HOT_BYTES,
+            sql_max_named_scan_bytes: crate::serve::SQL_MAX_NAMED_SCAN_BYTES,
+            cursorless: true,
+            seal_span: crate::chains::DEFAULT_SEAL_SPAN,
+            freshness: Default::default(),
+            surface: Arc::new(crate::allowlist::Surface::default()),
+            #[cfg(feature = "counter")]
+            counter: None,
+            nid: None,
+            runtime_health: None,
+        }
+    }
+
+    /// #1647: every write of mounts.toml a suspend makes still holds the mount, so a crash at any
+    /// point leaves it live or suspended, never gone.
+    #[tokio::test]
+    async fn a_suspend_never_writes_a_table_without_the_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let nid = "8a".repeat(32);
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+                 chain_id = 42161\nrpc_urls = []\n\n[[mounts]]\nalias = \"usdc\"\nnid = \"{nid}\"\n"
+            ),
+        )
+        .unwrap();
+        let data = MountTable::data_dir(dir.path(), &nid);
+        std::fs::create_dir_all(&data).unwrap();
+        let mut state = nest_state(&data, "arbitrum-one");
+        state.nid = Some(Arc::from(nid.as_str()));
+        let mut handles = idle_handles(dir.path());
+        handles.states.push(("usdc".to_string(), state));
+        handles.mount_ctx.mounts = MountTable::load(dir.path()).unwrap().mounts;
+        handles
+            .suspend("usdc")
+            .await
+            .expect_err("premise: with no cursor channel the drain refuses");
+        assert!(
+            handles.suspended.is_empty(),
+            "a suspend whose drain refused left the mount both live and suspended"
+        );
+        // A cursor that has already stopped: the drain finds it gone and goes on.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        handles.lifecycle.insert("arbitrum-one".to_string(), tx);
+
+        handles.suspend("usdc").await.expect("suspend");
+        let writes: Vec<String> = super::persisted_tables()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(d, _)| d == dir.path())
+            .map(|(_, t)| t.clone())
+            .collect();
+        assert!(!writes.is_empty(), "premise: the suspend was written");
+        for table in &writes {
+            let table: MountTable = toml::from_str(table).unwrap();
+            assert!(
+                table
+                    .mounts
+                    .iter()
+                    .any(|m| m.alias == "usdc" && m.nid == nid)
+                    && table.runtime.suspended == ["usdc"],
+                "a crash here boots with usdc neither live nor suspended: {table:?}"
+            );
+        }
+        assert_eq!(writes.len(), 1, "one suspend is one write");
     }
 
     fn idle_handles(dir: &std::path::Path) -> RuntimeHandles {
