@@ -146,6 +146,7 @@ async fn migrating_preserves_every_sealed_byte() {
     );
 
     // Stop the cursor before moving files out from under it.
+    drop(stores);
     cursor.shutdown().await.expect("the cursor stops");
 
     // --- The migration. ---

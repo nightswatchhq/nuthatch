@@ -189,6 +189,7 @@ async fn a_dead_chain_does_not_stall_its_co_tenant_cursor() {
         "chain B stays at its own tip throughout"
     );
 
+    drop((store_a, store_b));
     shutdown(rt_a).await;
     shutdown(rt_b).await;
 }

@@ -137,6 +137,7 @@ async fn a_warm_restart_rebuilds_balances_identically_to_a_clean_replay() {
     .await;
     assert!(caught_up, "restarted nest did not resume to the tip");
     let after = balances_of(&restarted);
+    drop(restarted_store);
     restarted.shutdown().await.expect("the nest stops");
 
     // ---- The reference: a clean nest indexing the same chain from an empty directory. ----
@@ -153,6 +154,7 @@ async fn a_warm_restart_rebuilds_balances_identically_to_a_clean_replay() {
     .await;
     assert!(clean_caught_up, "clean nest did not reach the tip");
     let clean_balances = balances_of(&clean);
+    drop(clean_store);
     clean.shutdown().await.expect("the nest stops");
 
     // The property: a restart is invisible in the derived view.
