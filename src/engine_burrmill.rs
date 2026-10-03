@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct BurrmillEngine;
 
 impl Engine for BurrmillEngine {
-    fn open(&self, _dir: &Path) -> Result<Box<dyn Session>> {
-        Ok(Box::new(BurrmillSession::new()?))
+    fn open(&self, dir: &Path) -> Result<Box<dyn Session>> {
+        Ok(Box::new(BurrmillSession::new(Some(dir))?))
     }
 
     fn open_bare(&self) -> Result<Box<dyn Session>> {
-        Ok(Box::new(BurrmillSession::new()?))
+        Ok(Box::new(BurrmillSession::new(None)?))
     }
 }
 
@@ -117,11 +117,18 @@ impl BurrmillSession {
         }
     }
 
-    fn new() -> Result<Self> {
+    fn new(dir: Option<&Path>) -> Result<Self> {
         let spill = crate::spill::new_spill_dir()?;
         let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
         #[allow(unused_mut)]
-        let mut engine = burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?;
+        let mut engine = match dir {
+            Some(dir) => {
+                let pool = nest_pool(dir, budget.memory_bytes);
+                burrmill::Engine::open_empty_sharing(budget, &pool)
+            }
+            None => burrmill::Engine::open_empty_budgeted(budget),
+        }
+        .map_err(engine_err)?;
         #[cfg(feature = "graph")]
         crate::analytics_scalars::register(&mut engine);
         Ok(Self {
@@ -145,6 +152,20 @@ impl BurrmillSession {
             .get(table)
             .map_or(0, |(rows, _)| rows.len())
     }
+}
+
+// A statement that finds the cached session busy opens another, so the limit has to bound the
+// nest's sessions together (#1792). The pool keeps the size its first session gave it.
+static NEST_POOLS: Mutex<std::collections::BTreeMap<PathBuf, burrmill::SharedPool>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn nest_pool(dir: &Path, memory_bytes: usize) -> burrmill::SharedPool {
+    NEST_POOLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(dir.to_path_buf())
+        .or_insert_with(|| burrmill::SharedPool::new(memory_bytes))
+        .clone()
 }
 
 /// The walls `analytics_budget` sets, as Burrmill's budget.
@@ -666,13 +687,13 @@ mod tests {
         assert_eq!(budget.memory_bytes, 512 << 20);
         assert_eq!(budget.threads, 2);
         assert_eq!(budget.spill, Some((spill.0.clone(), 2 << 30)));
-        assert!(super::BurrmillSession::new().is_ok());
+        assert!(super::BurrmillSession::new(None).is_ok());
     }
 
     #[test]
     fn burrmill_keys_derivations_by_its_own_parse_and_build() {
         use crate::engine::Session;
-        let s = super::BurrmillSession::new().unwrap();
+        let s = super::BurrmillSession::new(None).unwrap();
         let a = s.canonical_plan("SELECT a.x FROM t a -- c\nWHERE a.y > 1");
         assert!(a.is_some());
         assert_eq!(a, s.canonical_plan("select b.x from t b where b.y > 1"));
@@ -767,7 +788,7 @@ mod tests {
     #[test]
     fn binding_releases_the_staged_hot_rows() {
         use crate::engine::{FactWindow, Session};
-        let s = super::BurrmillSession::new().unwrap();
+        let s = super::BurrmillSession::new(None).unwrap();
         let rows: Vec<serde_json::Value> = (1..=1000)
             .map(|b| serde_json::json!({ "block_number": b, "n": b.to_string() }))
             .collect();
@@ -825,7 +846,7 @@ mod tests {
     #[test]
     fn a_hidden_registration_name_is_refused() {
         use crate::engine::Session;
-        let s = super::BurrmillSession::new().unwrap();
+        let s = super::BurrmillSession::new(None).unwrap();
         let err = s
             .reach("SELECT max(block_number) FROM t__union")
             .unwrap()
