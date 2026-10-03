@@ -1,0 +1,47 @@
+# The product's first promise, against a real chain, with a clock on it (#1719): the latest published
+# release, `init` on mainnet USDC with the shipped keyless endpoints, `dev` to /ready, one /sql with a
+# row, all inside 180 s, then SIGTERM and a clean exit. The logic is `scripts/live-smoke.sh`, which
+# runs the same by hand.
+#
+# Weekly and on demand, never on push, for the reason live-endpoints.yml gives: a provider's bad
+# afternoon must not redden an unrelated PR. The script retries a whole attempt three times.
+name: live smoke
+
+on:
+  schedule:
+    # Monday, an hour after live-endpoints, so a dead default is already named when this reads it.
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      limit_secs:
+        description: wall clock per attempt, from the start of init
+        default: "180"
+
+jobs:
+  smoke:
+    name: init to first row on mainnet within the limit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: smoke the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SMOKE_REPO: ${{ github.repository }}
+          SMOKE_LIMIT_SECS: ${{ inputs.limit_secs || '180' }}
+        run: scripts/live-smoke.sh
+
+  report-scheduled-failure:
+    name: surface a failed scheduled run
+    needs: [smoke]
+    if: always() && github.event_name == 'schedule' && (failure() || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # The reporter is a local composite action, so the tree has to be present to load it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/report-scheduled-failure
