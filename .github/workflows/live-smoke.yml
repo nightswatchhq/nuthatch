@@ -36,7 +36,7 @@ jobs:
   report-scheduled-failure:
     name: surface a failed scheduled run
     needs: [smoke]
-    if: always() && github.event_name == 'schedule' && (failure() || contains(needs.*.result, 'cancelled'))
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (failure() || contains(needs.*.result, 'cancelled'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
