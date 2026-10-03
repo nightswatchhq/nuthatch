@@ -139,7 +139,7 @@ error between. The old nest is then taken off its cursor. A move keeps its chain
 
 Unmounting keeps the dataset, so a remount is free. `?reclaim=true` on the unmount, or
 `DELETE /_admin/datasets/<nid>` later, removes it once no mount names it; a dataset another mount still
-uses is kept and the answer says by whom:
+uses, or a mount still in progress is fetching or joining, is kept and the answer says by whom:
 
 ```json
 {"outcome": "kept", "nid": "9f2c…", "mounted_by": ["acme/usdc"]}

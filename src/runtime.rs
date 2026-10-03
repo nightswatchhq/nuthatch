@@ -2564,7 +2564,7 @@ pub fn lifecycle_routes(
                 Json(serde_json::json!({"unmounted": name, "was_mounted": was_mounted})),
             );
         };
-        match h.reclaim(nid) {
+        match h.reclaim(nid, &jobs) {
             Ok(r) => (
                 StatusCode::OK,
                 Json(serde_json::json!({"unmounted": name, "reclaim": r})),
@@ -2575,7 +2575,7 @@ pub fn lifecycle_routes(
 
     /// Reclaim a dataset unmounted earlier without `?reclaim=true` (#1547).
     async fn reclaim_dataset(
-        State((handles, _, required)): State<Shared>,
+        State((handles, jobs, required)): State<Shared>,
         AxPath(nid): AxPath<String>,
         Query(q): Query<TokenQuery>,
         headers: HeaderMap,
@@ -2593,7 +2593,7 @@ pub fn lifecycle_routes(
             }
         };
         let h = handles.lock().await;
-        match h.reclaim(&nid) {
+        match h.reclaim(&nid, &jobs) {
             Ok(r) => {
                 let status = match r {
                     crate::prune::Reclaim::Reclaimed { .. } => StatusCode::OK,
@@ -3294,13 +3294,13 @@ pub async fn start_mount_jobs(
 #[cfg(test)]
 type MountJoinFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
-type MountJoinHook = std::sync::Mutex<Option<MountJoinFn>>;
+type MountJoinHook = std::sync::Mutex<std::collections::HashMap<String, MountJoinFn>>;
 
-/// The gap between a job's fetch and its join. A test forgets the job here (#1638).
+/// The gap between a job's fetch and its join, by job name. A test forgets the job here (#1638).
 #[cfg(test)]
 fn before_mount_join() -> &'static MountJoinHook {
     static HOOK: std::sync::OnceLock<MountJoinHook> = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+    HOOK.get_or_init(Default::default)
 }
 
 #[cfg(test)]
@@ -3330,8 +3330,11 @@ pub fn spawn_mount_job(
             };
             jobs.advance_if_owned(&name, generation, MountPhase::Joining, None)?;
             #[cfg(test)]
-            if let Some(hook) = before_mount_join().lock().unwrap().clone() {
-                hook();
+            {
+                let hook = before_mount_join().lock().unwrap().get(&name).cloned();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
             // The unmount holds this lock across forget. A check before it still joins (#1638).
             let mut h = handles.lock().await;
@@ -4148,7 +4151,39 @@ impl RuntimeHandles {
 
     /// Reclaim an unmounted dataset's disk (#1547). A mount record naming it keeps it, and a store
     /// this process still holds is refused.
-    pub fn reclaim(&self, nid: &Nid) -> Result<crate::prune::Reclaim> {
+    ///
+    /// So does an unfinished mount job for it, which may have fetched it and not joined yet (#1674).
+    /// A job claimed after this check plans its mount under the lock held here, so after the removal.
+    pub fn reclaim(
+        &self,
+        nid: &Nid,
+        jobs: &crate::mount_jobs::MountJobs,
+    ) -> Result<crate::prune::Reclaim> {
+        let mounting: Vec<String> = jobs
+            .list()
+            .into_iter()
+            .filter(|j| !j.phase.finished())
+            .filter(|j| {
+                let recorded = || {
+                    self.mount_ctx
+                        .mounts
+                        .iter()
+                        .find(|m| mount_route(m, &self.default_tenant) == j.name)
+                        .map(|m| m.nid.as_str())
+                };
+                j.nid.as_deref().or_else(recorded) == Some(nid.as_str())
+            })
+            .map(|j| {
+                let (tenant, alias) = split_route_key(&j.name);
+                format!("{}/{alias}", tenant.unwrap_or(&self.default_tenant))
+            })
+            .collect();
+        if !mounting.is_empty() {
+            return Ok(crate::prune::Reclaim::Kept {
+                nid: nid.as_str().to_string(),
+                mounted_by: mounting,
+            });
+        }
         crate::prune::reclaim(&self.mount_ctx.dir, nid.as_str())
     }
 
@@ -6501,6 +6536,94 @@ mod tests {
         assert_eq!(writes.len(), 1, "one suspend is one write");
     }
 
+    /// #1674: a reclaim that lands between a mount job's fetch and its join must not delete the
+    /// dataset the job is about to join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reclaim_keeps_the_dataset_a_mount_job_is_about_to_join() {
+        use crate::mount_jobs::{MountJob, MountPhase};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+             chain_id = 42161\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let nid = "8b".repeat(32);
+        let data = MountTable::data_dir(dir.path(), &nid);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join(CONFIG_FILE), "fetched").unwrap();
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
+        let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
+        let routes = lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+        let claimed = jobs
+            .claim(MountJob::new("joining", Some(&nid), MountPhase::Accepted))
+            .unwrap();
+
+        let answer = Arc::new(std::sync::Mutex::new(None));
+        let (answer_hook, jobs_hook, uri) = (
+            answer.clone(),
+            jobs.clone(),
+            format!("/_admin/datasets/{nid}"),
+        );
+        super::before_mount_join().lock().unwrap().insert(
+            "joining".to_string(),
+            Arc::new(move || {
+                let req = axum::http::Request::delete(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(routes.clone().oneshot(req))
+                })
+                .unwrap();
+                *answer_hook.lock().unwrap() = Some(resp.status());
+                // Stop the job before it joins: what is under test is the reclaim's answer.
+                jobs_hook.forget("joining").unwrap();
+            }),
+        );
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                super::before_mount_join().lock().unwrap().remove("joining");
+            }
+        }
+        let _clear = Clear;
+        spawn_mount_job(
+            handles.clone(),
+            jobs.clone(),
+            "joining".into(),
+            Some(Nid::parse(&nid).unwrap()),
+            claimed.generation,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *answer.lock().unwrap(),
+            Some(axum::http::StatusCode::CONFLICT),
+            "a reclaim during the job was not answered kept"
+        );
+        assert!(
+            data.join(CONFIG_FILE).exists(),
+            "the reclaim deleted the dataset a mount job was about to join"
+        );
+
+        // A job that has finished holds nothing.
+        let mut failed = MountJob::new("joining", Some(&nid), MountPhase::Failed);
+        failed.reason = Some("refused".into());
+        jobs.put(failed).unwrap();
+        let req = axum::http::Request::delete(format!("/_admin/datasets/{nid}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = lifecycle_routes(handles, jobs, true, None)
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(!data.exists(), "a failed job kept its dataset from reclaim");
+    }
+
     fn idle_handles(dir: &std::path::Path) -> RuntimeHandles {
         let health = std::sync::Arc::new(crate::health::RuntimeHealth::new());
         let roster = serde_json::json!({"runtime": "t", "nests": []});
@@ -6563,16 +6686,19 @@ mod tests {
             .unwrap();
         super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
         let jobs_hook = jobs.clone();
-        *super::before_mount_join().lock().unwrap() = Some(Arc::new(move || {
-            jobs_hook.forget("usdc").unwrap();
-            jobs_hook
-                .claim(MountJob::new("usdc", None, MountPhase::Accepted))
-                .expect("the name is free once the first job is forgotten");
-        }));
+        super::before_mount_join().lock().unwrap().insert(
+            "usdc".to_string(),
+            Arc::new(move || {
+                jobs_hook.forget("usdc").unwrap();
+                jobs_hook
+                    .claim(MountJob::new("usdc", None, MountPhase::Accepted))
+                    .expect("the name is free once the first job is forgotten");
+            }),
+        );
         struct Clear;
         impl Drop for Clear {
             fn drop(&mut self) {
-                *super::before_mount_join().lock().unwrap() = None;
+                super::before_mount_join().lock().unwrap().remove("usdc");
             }
         }
         let _clear = Clear;
@@ -6596,7 +6722,7 @@ mod tests {
 
         // The generation is the one claim returned. A worker that reads the map adopts this
         // replacement and mounts it.
-        *super::before_mount_join().lock().unwrap() = None;
+        super::before_mount_join().lock().unwrap().remove("usdc");
         let claimed = jobs
             .claim(MountJob::new("dai", None, MountPhase::Accepted))
             .unwrap();
