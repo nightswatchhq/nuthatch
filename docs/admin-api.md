@@ -32,7 +32,8 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
   or `?token=<token>`. Without the variable an off-localhost runtime serves no admin routes at all.
   `--no-admin` removes them everywhere.
 - **Request bodies are JSON** and need `Content-Type: application/json`; without it a `POST` is
-  answered `415`.
+  answered `415`. That holds for suspend and resume too, though they read no body, so
+  a cross-site form cannot reach them (#1642).
 
 ## The lifecycle
 

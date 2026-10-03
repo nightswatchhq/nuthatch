@@ -874,7 +874,8 @@ fn check_origin(o: &str) -> Result<()> {
 /// the web speaks. A `GET`-only list reads as the safe choice and is in fact the broken one: the
 /// browser preflights `Access-Control-Request-Method: POST`, is refused, and never sends the query,
 /// so the flag appears to work everywhere except the surface a front end is most likely to want
-/// (Jules on #1384). Nothing here grants a *write*, because nothing on the router accepts one.
+/// (Jules on #1384). Nothing here grants a *write*: the runtime's lifecycle routes are writes, and
+/// [`bind_and_serve`] keeps every `/_admin` path out of this layer (#1642).
 ///
 /// Request headers are mirrored rather than set to `*`: equally safe with no credentials, better
 /// supported, and it is what admits the `content-type: application/json` a GraphQL POST carries. The
@@ -917,6 +918,17 @@ pub fn cors_layer(origins: &[String]) -> Result<Option<tower_http::cors::CorsLay
     ))
 }
 
+/// Apply `--cors` to everything but `/_admin`, a nest's own included: a runtime's lifecycle routes
+/// are writes, and no origin is ever granted them (#1642).
+fn cors_outside_admin(app: Router, layer: tower_http::cors::CorsLayer) -> Router {
+    use tower::ServiceExt;
+    let open = app.clone().layer(layer);
+    Router::new().fallback_service(tower::service_fn(move |req: axum::extract::Request| {
+        let admin = req.uri().path().split('/').any(|s| s == "_admin");
+        if admin { app.clone() } else { open.clone() }.oneshot(req)
+    }))
+}
+
 /// Bind `listen` and serve `app` until a shutdown signal - the shared tail of [`run`]/[`run_runtime`].
 ///
 /// `cors` is [`cors_layer`]'s result: `None` leaves the app exactly as it was composed, which is
@@ -927,7 +939,7 @@ pub async fn bind_and_serve(
     cors: Option<tower_http::cors::CorsLayer>,
 ) -> Result<()> {
     let app = match cors {
-        Some(layer) => app.layer(layer),
+        Some(layer) => cors_outside_admin(app, layer),
         None => app,
     };
     let mut listener = tokio::net::TcpListener::bind(listen)

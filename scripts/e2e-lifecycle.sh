@@ -149,7 +149,7 @@ ok "acme/ds hot store $hot bytes"
 ok "per-nest sealed series present"
 
 say "$((step += 1)). suspend, across a restart, and resume"
-api POST /_admin/suspend/globex/ds
+api POST /_admin/suspend/globex/ds '{}'
 expect 200 "suspend"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/globex/ds/health")" = 503 ] || fail "suspended routes are not 503"
 [ "$(curl -s "$BASE/globex/ds/health" | jq -r .suspended)" = true ] || fail "503 does not say suspended"
@@ -164,7 +164,7 @@ wait_phase acme/ds live 300
 wait_phase globex/ds suspended 10
 grep -q 'globex/ds' "$RUNTIME_DIR/mounts.toml" || fail "mounts.toml lost the suspended record"
 ok "still suspended after restart"
-api POST /_admin/resume/globex/ds
+api POST /_admin/resume/globex/ds '{}'
 expect 202 "resume"
 wait_phase globex/ds live 300
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/globex/ds/health")" = 200 ] || fail "resumed routes are not 200"

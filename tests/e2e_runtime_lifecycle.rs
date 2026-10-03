@@ -1984,9 +1984,9 @@ async fn suspend_and_resume_over_the_admin_api() {
         .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
-    let (status, _) = call(&routes, "POST", "/_admin/suspend/nope", None, None).await;
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/nope", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
-    let (status, _) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
+    let (status, _) = call(&routes, "POST", "/_admin/resume/usdc", None, Some("{}")).await;
     assert_eq!(
         status,
         axum::http::StatusCode::NOT_FOUND,
@@ -1994,16 +1994,16 @@ async fn suspend_and_resume_over_the_admin_api() {
     );
 
     slash_agrees(&handles, axum::http::StatusCode::OK).await;
-    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     slash_agrees(&handles, axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
-    let (status, body) = call(&routes, "POST", "/_admin/resume/usdc", None, None).await;
+    let (status, body) = call(&routes, "POST", "/_admin/resume/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
     let job = wait_for_phase(&routes, "usdc", "live").await;
     assert_eq!(job["phase"], "live", "{job}");
     assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
 
-    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let (status, body) = call(&routes, "DELETE", "/_admin/nests/usdc", None, None).await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -2021,6 +2021,85 @@ async fn suspend_and_resume_over_the_admin_api() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// #1642: a localhost runtime needs no token, so the only thing between a hostile page and the
+/// lifecycle routes is the browser. Over the real bind with `--cors '*'`, the page may neither have a
+/// preflight granted nor suspend a mount with a form POST, which is sent without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6c".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let service = handles
+        .lock()
+        .await
+        .live
+        .service()
+        .merge(runtime::lifecycle_routes(handles.clone(), jobs, true, None));
+    let cors = serve::cors_layer(&["*".to_string()]).unwrap();
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let serving = {
+        let addr = addr.clone();
+        tokio::spawn(async move { serve::bind_and_serve(&addr, service, cors).await })
+    };
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    while client
+        .get(format!("http://{addr}/usdc/health"))
+        .send()
+        .await
+        .is_err()
+    {
+        assert!(started.elapsed() < POLL_TIMEOUT, "never came up on {addr}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let url = format!("http://{addr}/_admin/suspend/usdc");
+
+    let preflight = client
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("origin", "https://evil.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "--cors granted a cross-origin preflight to a lifecycle route: {:?}",
+        preflight.headers()
+    );
+
+    for route in ["suspend", "resume"] {
+        let form = client
+            .post(format!("http://{addr}/_admin/{route}/usdc"))
+            .header("origin", "https://evil.example")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            form.status(),
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a cross-site form POST reached {route}"
+        );
+    }
+    assert_eq!(
+        status_of(&handles).await,
+        axum::http::StatusCode::OK,
+        "a form POST suspended the mount"
+    );
+    serving.abort();
+}
+
 /// #1643: `?reclaim=true` on a suspended mount frees its dataset as it would a live one's, rather
 /// than dropping the record and answering 500 with the data still on disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2035,7 +2114,7 @@ async fn reclaiming_a_suspended_mount_frees_its_dataset() {
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
     let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
 
-    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     let (status, body) = call(
         &routes,
@@ -2069,7 +2148,7 @@ async fn a_failed_jobs_write_after_a_reclaiming_unmount_names_the_nid() {
     let jobs = Arc::new(nuthatch::mount_jobs::MountJobs::load(jobs_dir.path()));
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
-    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     let mode = std::fs::metadata(jobs_dir.path())
         .unwrap()
@@ -2640,7 +2719,7 @@ async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
         .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
 
-    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, None).await;
+    let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let job = wait_for_phase(&routes, "usdc", "suspended").await;
     assert_eq!(job["phase"], "suspended", "{job}");
