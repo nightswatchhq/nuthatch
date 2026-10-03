@@ -1,0 +1,133 @@
+# The nine conditions in docs/operators.md "What to alert on", then what production added.
+# Every nest target carries `unit`, `box` and `role` from targets/nests.yml; role="archive" is a
+# frozen `serve` nest with no cursor and is left out of the ingest and readiness rules on purpose.
+#
+# A single-nest `dev` (every unit in production today) exports no nuthatch_nest_health,
+# nuthatch_cursor_live or nuthatch_nest_quarantine_total: those are a multi-nest runtime's series.
+# For a single nest the process is the cursor, so CursorDead also reads `up`.
+groups:
+  - name: nuthatch-documented
+    rules:
+      - alert: NestQuarantined
+        expr: nuthatch_nest_health == 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.unit }}: nest {{ $labels.nest }} is quarantined"
+
+      - alert: CursorDead
+        expr: nuthatch_cursor_live == 0 or up{job="nuthatch", role="cursor"} == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.unit }}: the cursor is not running{{ if $labels.chain }} ({{ $labels.chain }}){{ end }}"
+
+      - alert: TipLagGrowing
+        expr: >
+          delta(nuthatch_nest_tip_lag_blocks{role="cursor"}[15m]) > 0
+          and min_over_time(nuthatch_nest_tip_lag_blocks{role="cursor"}[15m]) > 0
+        for: 15m
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $labels.unit }}: {{ $labels.nest }} has not reached tip in 30 minutes and is falling further behind ({{ $value }} blocks more over 15m)"
+
+      # The documented threshold is 300 s; the units here poll every 5 minutes, so the age of the
+      # last poll reaches 300 s on every healthy cycle. max_over_time keeps the last value for an
+      # hour after the process has gone, so a stopped unit still fires this.
+      - alert: IngestStalled
+        expr: time() - max_over_time(nuthatch_last_poll_unixtime{role="cursor"}[1h]) > 600
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.unit }}: no successful poll for {{ $value | humanizeDuration }}"
+
+      - alert: OutboxBackingUp
+        expr: nuthatch_alert_outbox_depth > 0 and delta(nuthatch_alert_outbox_depth[15m]) > 0
+        for: 15m
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $labels.unit }}: webhook outbox at {{ $value }} and rising"
+
+      # 2 GiB per active-chain cursor is the footprint budget (CLAUDE.md non-negotiable 2).
+      - alert: MemoryNearBudget
+        expr: nuthatch_rss_bytes > 0.75 * 2147483648
+        for: 15m
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $labels.unit }}: RSS {{ $value | humanize1024 }}B, over 75% of the 2 GiB cursor budget"
+
+      - alert: SqlBusyRejectionsSpiking
+        expr: rate(nuthatch_sql_rejections_total{reason="busy"}[5m]) > 0.05
+        for: 10m
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $labels.unit }}: refusing {{ $value | printf \"%.2f\" }}/s of /sql as busy"
+
+      - alert: QuarantineFlapping
+        expr: increase(nuthatch_nest_quarantine_total[1h]) > 3
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $labels.unit }}: {{ $labels.nest }} quarantined {{ $value }} times in an hour"
+
+      - alert: MirrorBehind
+        expr: >
+          nuthatch_publish_dead_letter == 1
+          or (delta(nuthatch_publish_lag_blocks[30m]) > 0 and min_over_time(nuthatch_publish_lag_blocks[30m]) > 0)
+        for: 15m
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $labels.unit }}: the publish mirror is behind or has a dead letter"
+
+  - name: nuthatch-production
+    rules:
+      # 4.1.1 on 2026-10-03: the allocations nest refused Lodestar's join views out of memory for an
+      # hour and nothing paged. The `unless ... offset` arm catches a series born already non-zero,
+      # which is what a freshly rolled process that fails its first query looks like.
+      - alert: SqlOutOfMemory
+        expr: >
+          increase(nuthatch_sql_rejections_total{reason="out_of_memory"}[2m]) > 0
+          or (nuthatch_sql_rejections_total{reason="out_of_memory"} > 0
+              unless nuthatch_sql_rejections_total{reason="out_of_memory"} offset 1m)
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.unit }}: /sql queries are failing out of memory"
+
+      - record: nuthatch:sql_refusals:rate10m
+        expr: sum by (instance, unit) (rate(nuthatch_sql_rejections_total{reason=~"busy|too_large|timeout|out_of_memory"}[10m]))
+      - record: nuthatch:sql_queries:rate10m
+        expr: sum by (instance, unit) (rate(nuthatch_sql_queries_total[10m]))
+
+      # Refusals the node chose (saturation, budget, deadline, memory), not caller mistakes:
+      # `invalid`, `bounded` and `admission` are left out.
+      - alert: SqlRefusalRate
+        expr: >
+          nuthatch:sql_refusals:rate10m
+            / (nuthatch:sql_queries:rate10m + nuthatch:sql_refusals:rate10m) > 0.1
+          and nuthatch:sql_refusals:rate10m > 0.02
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.unit }}: {{ $value | humanizePercentage }} of /sql refused by the node over 10m"
+
+      - alert: NestNotReady
+        expr: probe_success{job="nuthatch-ready", role="cursor"} == 0
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.unit }}: /ready has answered not-ready for 10 minutes"
+
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.job }} target {{ $labels.instance }}{{ if $labels.unit }} ({{ $labels.unit }}){{ end }} has not answered a scrape for 2 minutes"
+
+  - name: meta
+    rules:
+      # Always firing. helsinki/deadman.sh pages when Alertmanager stops holding it:
+      # that is the ThinkPad, Prometheus or Alertmanager going quiet.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: {severity: none}
+        annotations:
+          summary: "The monitoring pipeline is alive"

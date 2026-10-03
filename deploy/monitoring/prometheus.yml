@@ -1,0 +1,60 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: thinkpad
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["100.83.44.63:9493"]
+
+scrape_configs:
+  - job_name: nuthatch
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/nests.yml]
+    relabel_configs:
+      # Keep the unit's own address as `instance`, then send Helsinki scrapes through the Caddy
+      # site, which maps /<port>/metrics to 127.0.0.1:<port>/metrics on the box.
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: [box, __address__]
+        regex: "helsinki;([^:]+):([0-9]+)"
+        target_label: __metrics_path__
+        replacement: /$2/metrics
+      - source_labels: [box, __address__]
+        regex: "helsinki;([^:]+):([0-9]+)"
+        target_label: __address__
+        replacement: $1:9180
+
+  # A single-nest `dev` exports no readiness series, so /ready is probed: it answers 503 when the
+  # nest is stalled or quarantined, and probe_success is then 0.
+  - job_name: nuthatch-ready
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/nests.yml]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: [__address__]
+        regex: "([^:]+):([0-9]+)"
+        target_label: __param_target
+        replacement: http://$1:$2/ready
+      - source_labels: [box, __address__]
+        regex: "helsinki;([^:]+):([0-9]+)"
+        target_label: __param_target
+        replacement: http://$1:9180/$2/ready
+      - target_label: __address__
+        replacement: 127.0.0.1:9115
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9490"]
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["100.83.44.63:9493"]

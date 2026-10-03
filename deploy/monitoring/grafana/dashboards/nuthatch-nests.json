@@ -1,0 +1,149 @@
+{
+  "uid": "nuthatch-nests",
+  "title": "Nuthatch nests",
+  "description": "Production nests: up, ready, lag, /sql and memory against the 2 GiB cursor budget. Source: deploy/monitoring in the nuthatch repo.",
+  "tags": ["nuthatch"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": {"from": "now-24h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "unit",
+        "label": "unit",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": {"query": "label_values(up{job=\"nuthatch\"}, unit)", "refId": "unit"},
+        "definition": "label_values(up{job=\"nuthatch\"}, unit)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Scrape up",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "up{job=\"nuthatch\", unit=~\"$unit\"}", "legendFormat": "{{unit}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "up", "color": "green"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "value_and_name"}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Ready (/ready answers 200)",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "probe_success{job=\"nuthatch-ready\", unit=~\"$unit\"}", "legendFormat": "{{unit}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "NOT READY", "color": "red"}, "1": {"text": "ready", "color": "green"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "value_and_name"}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Tip lag per nest (blocks)",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "nuthatch_nest_tip_lag_blocks{unit=~\"$unit\"}", "legendFormat": "{{unit}} / {{nest}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Age of last successful poll",
+      "description": "IngestStalled fires past 600 s.",
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "time() - nuthatch_last_poll_unixtime{role=\"cursor\", unit=~\"$unit\"}", "legendFormat": "{{unit}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {"thresholdsStyle": {"mode": "line"}},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 600}]}
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "/sql accepted per second",
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (unit) (rate(nuthatch_sql_queries_total{unit=~\"$unit\"}[5m]))", "legendFormat": "{{unit}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "/sql refused per second, by reason",
+      "description": "busy, too_large, timeout and out_of_memory are the node refusing; invalid, bounded and admission are the caller.",
+      "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (unit, reason) (rate(nuthatch_sql_rejections_total{reason!=\"\", unit=~\"$unit\"}[5m])) > 0", "legendFormat": "{{unit}} {{reason}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "reqps", "min": 0},
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": ".*out_of_memory"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+        ]
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "RSS against the 2 GiB cursor budget",
+      "description": "Lines at 75% (MemoryNearBudget) and 100% of the per-cursor budget.",
+      "gridPos": {"x": 0, "y": 20, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "nuthatch_rss_bytes{unit=~\"$unit\"}", "legendFormat": "{{unit}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {"thresholdsStyle": {"mode": "line+area"}},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "transparent", "value": null}, {"color": "orange", "value": 1610612736}, {"color": "red", "value": 2147483648}]}
+        },
+        "overrides": []
+      }
+    }
+  ]
+}
