@@ -7422,6 +7422,25 @@ fn held_pin_covers(store: &dyn crate::store::HotStore, from: u64, ceiling: u64) 
         && store.get_block_hash(block)?.as_deref() == Some(hash))
 }
 
+/// Checkpoint `block` with the source's hash before the watermark may move to it (#1665). `false`
+/// when the source could not answer; the watermark then stays where it is until a later poll.
+async fn pin_checkpoint(
+    store: &dyn crate::store::HotStore,
+    source: &dyn Source,
+    block: u64,
+) -> Result<bool> {
+    match source.block_hash(block).await {
+        Ok(Some(hash)) => {
+            store.set_block_hash(block, &hash)?;
+            Ok(true)
+        }
+        Ok(None) | Err(_) => {
+            tracing::debug!("no hash for block {block}; the sealed watermark waits for one");
+            Ok(false)
+        }
+    }
+}
+
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
 /// chosen from the data. Rows short of the threshold stay in the hot store until the next call.
 ///
@@ -7482,8 +7501,8 @@ async fn maybe_seal(
         // older sparse checkpoint and trip the finality guard on a block it never touched (#461).
         if let Some(first) = scan.first {
             if first > from {
-                if let Ok(Some(hash)) = source.block_hash(first - 1).await {
-                    store.set_block_hash(first - 1, &hash)?;
+                if !pin_checkpoint(store, source, first - 1).await? {
+                    return Ok(());
                 }
                 store.set_meta(SEALED_THROUGH_KEY, &(first - 1).to_string())?;
                 metrics.set_sealed_through(first - 1);
@@ -7501,9 +7520,9 @@ async fn maybe_seal(
                 // Finalized range with no transfers - just advance the watermark. Pinning a
                 // checkpoint at the new watermark is what stops a later reorg from walking past it
                 // to an older surviving checkpoint and tripping the finality guard on a block the
-                // reorg never touched (#461). Best-effort: a source hiccup leaves the walk sparse.
-                if let Ok(Some(hash)) = source.block_hash(ceiling).await {
-                    store.set_block_hash(ceiling, &hash)?;
+                // reorg never touched (#461).
+                if !pin_checkpoint(store, source, ceiling).await? {
+                    return Ok(());
                 }
                 store.set_meta(SEALED_THROUGH_KEY, &ceiling.to_string())?;
                 metrics.set_sealed_through(ceiling);
@@ -7543,8 +7562,8 @@ async fn maybe_seal(
             Some(cut) => cut,
         };
 
-        if let Ok(Some(hash)) = source.block_hash(cut).await {
-            store.set_block_hash(cut, &hash)?;
+        if !pin_checkpoint(store, source, cut).await? {
+            return Ok(());
         }
 
         let to_seal = store.entities_in_range(from, cut)?;
@@ -9385,6 +9404,128 @@ mod tests {
             Some("800000"),
             "an empty finalized range must advance the watermark to the ceiling"
         );
+    }
+
+    /// Errs for every block at or below `fail_through`, as a provider hiccup during a seal does;
+    /// hashes change at and above `fork_from`.
+    struct HiccupSource {
+        fail_through: std::sync::atomic::AtomicU64,
+        fork_from: std::sync::atomic::AtomicU64,
+    }
+
+    impl HiccupSource {
+        fn hash(&self, n: u64) -> String {
+            let chain = u64::from(n >= self.fork_from.load(std::sync::atomic::Ordering::SeqCst));
+            format!("0x{n:060x}{chain:04x}")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for HiccupSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(0)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            if n <= self.fail_through.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("eth_getBlockByNumber timed out");
+            }
+            Ok(Some(self.hash(n)))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(vec![])
+        }
+    }
+
+    /// #1665. A seal whose pin failed advanced the watermark anyway, so a wide window's only
+    /// checkpoints were its own `to` and one below the watermark, and a shallow reorg above the
+    /// watermark walked to the older one and read as a finality violation.
+    #[tokio::test]
+    async fn a_failed_seal_pin_does_not_advance_the_watermark() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let src = HiccupSource {
+            fail_through: std::sync::atomic::AtomicU64::new(30),
+            fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+        };
+        let metrics = crate::metrics::NestMetrics::default();
+        store.set_block_hash(5, &src.hash(5)).unwrap();
+        let entities: Vec<(String, String)> = (6..=40)
+            .map(|i| (Store::entity_key(i, 0), entity_json(i, 0)))
+            .collect();
+        store
+            .commit_window(&entities, Some((40, src.hash(40).as_str())), 40)
+            .unwrap();
+        store.set_meta(SEALED_THROUGH_KEY, "5").unwrap();
+        let sealed_through = || -> u64 {
+            store
+                .get_meta(SEALED_THROUGH_KEY)
+                .unwrap()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+
+        maybe_seal(tmp.path(), &store, &src, 30, None, &metrics, 10)
+            .await
+            .unwrap();
+        src.fail_through.store(0, SeqCst);
+        src.fork_from.store(35, SeqCst);
+        let sealed = sealed_through();
+        let ancestor = detect_reorg(&src, &store, 40).await.unwrap().unwrap();
+        assert!(
+            ancestor >= sealed,
+            "a reorg at block 35 walked to {ancestor}, below the watermark {sealed} that advanced \
+             past a pin which failed: rollback_reorg raises the #461 TerminalFault"
+        );
+
+        maybe_seal(tmp.path(), &store, &src, 30, None, &metrics, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            sealed_through(),
+            25,
+            "once the source answers, the seal goes ahead"
+        );
+        assert!(store.get_block_hash(25).unwrap().is_some());
+    }
+
+    /// The two arms that advance without sealing, an empty range and an empty leading stretch, hold
+    /// the watermark on a failed pin too (#1665).
+    #[tokio::test]
+    async fn a_failed_pin_holds_the_watermark_over_rows_that_are_not_there() {
+        let src = HiccupSource {
+            fail_through: std::sync::atomic::AtomicU64::new(u64::MAX),
+            fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+        };
+        let metrics = crate::metrics::NestMetrics::default();
+        for first_row in [None, Some(20u64)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+            let entities: Vec<(String, String)> = first_row
+                .map(|f| (f..=40).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|i| (Store::entity_key(i, 0), entity_json(i, 0)))
+                .collect();
+            store
+                .commit_window(&entities, Some((40, "aa")), 40)
+                .unwrap();
+            store.set_meta(SEALED_THROUGH_KEY, "5").unwrap();
+            maybe_seal(tmp.path(), &store, &src, 30, None, &metrics, SPAN_REAL)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_meta(SEALED_THROUGH_KEY).unwrap().as_deref(),
+                Some("5"),
+                "first row {first_row:?}: the watermark moved to a block with no checkpoint"
+            );
+        }
     }
 
     #[tokio::test]
