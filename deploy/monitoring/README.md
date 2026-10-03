@@ -28,7 +28,8 @@ rules on purpose.
 cd ~/nuthatch && git pull && cd deploy/monitoring
 mkdir -p secrets && cp secrets.example/* secrets/
 $EDITOR secrets/discord_webhook_url secrets/grafana.env
-sudo chown -R 65534:65534 secrets && sudo chmod 600 secrets/*   # Alertmanager runs as nobody
+sudo chmod 600 secrets/* && sudo chown 65534:65534 secrets/discord_webhook_url   # Alertmanager runs as nobody
+# grafana.env stays yours: compose reads env_file as the user running it, before any container starts
 docker compose up -d
 curl -s 127.0.0.1:9490/api/v1/targets | jq -r '.data.activeTargets[] | "\(.health) \(.scrapeUrl)"'
 ```
