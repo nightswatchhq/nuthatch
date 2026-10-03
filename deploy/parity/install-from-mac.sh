@@ -37,8 +37,9 @@ echo "deliberate failure: expect exit 1 and one PARITY line in Discord"
 ssh "$host" 'sed "s/if alloc_nest == alloc_sg else/if False else/" /usr/local/lib/nuthatch-parity/lodestar-parity.sh > /tmp/parity-broken.sh
 grep -q "if False else" /tmp/parity-broken.sh || { echo "the break did not apply; the script changed" >&2; exit 1; }
 chmod 755 /tmp/parity-broken.sh
-PARITY_SCRIPT=/tmp/parity-broken.sh PARITY_MODES=sealed nuthatch-parity; echo "exit $?"
-rm -f /tmp/parity-broken.sh'
+rc=0; PARITY_SCRIPT=/tmp/parity-broken.sh PARITY_MODES=sealed nuthatch-parity || rc=$?; echo "exit $rc"
+rm -f /tmp/parity-broken.sh
+[ "$rc" -eq 1 ] || { echo "the deliberate failure exited $rc, not 1: the timer would not page on a real one" >&2; exit 1; }'
 
 ssh "$host" 'systemctl start --no-block nuthatch-parity.service && systemctl enable --now nuthatch-parity.timer && systemctl list-timers nuthatch-parity.timer --no-pager | head -2'
 echo "done; results later with: ssh $host 'column -t -s \"\$(printf \"\\t\")\" /var/log/nuthatch/parity/runs.tsv | tail -n 8'"
