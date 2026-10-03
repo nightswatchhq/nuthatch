@@ -444,32 +444,42 @@ pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
     };
 
     // State at depth is not logs at depth: eth.drpc.org answered the state probe and refused every
-    // getLogs near USDC's deployment block (#1624). The oldest blocks are what a from-genesis
-    // backfill asks for first, so they are what the archive line has to have seen served.
-    let archive = archive && {
-        let filter = crate::source::LogFilter::new(addresses, &[]).unwrap_or_else(|| {
-            crate::source::LogFilter::new(&[], &[NO_MATCH_TOPIC0.to_string()])
-                .expect("a one-topic filter is non-empty")
-        });
-        match rpc.logs(&filter, 1, 10).await {
-            Ok(_) => true,
-            Err(e) => {
-                let msg = format!("{e:#}");
-                if refused(&msg) {
-                    archive_unknown = true;
-                    notes.push(format!(
+    // getLogs near USDC's deployment block (#1624). A refusal over the oldest blocks is evidence;
+    // an empty answer is not, since pruned and never-emitted look the same, so it is said so.
+    let archive = archive
+        && {
+            let filter = crate::source::LogFilter::new(addresses, &[]).unwrap_or_else(|| {
+                crate::source::LogFilter::new(&[], &[NO_MATCH_TOPIC0.to_string()])
+                    .expect("a one-topic filter is non-empty")
+            });
+            match rpc.logs(&filter, 1, 10).await {
+                Ok(logs) => {
+                    if logs.is_empty() {
+                        notes.push(
+                        "old logs not established: eth_getLogs over blocks 1-10 answered, but empty, \
+                         and an empty answer cannot tell pruned logs from none"
+                            .to_string(),
+                    );
+                    }
+                    true
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if refused(&msg) {
+                        archive_unknown = true;
+                        notes.push(format!(
                         "archive depth UNKNOWN - eth_getLogs over blocks 1-10 was refused: {msg}"
                     ));
-                } else {
-                    notes.push(format!(
+                    } else {
+                        notes.push(format!(
                         "keeps state ~1M blocks back but refused eth_getLogs over blocks 1-10, so \
                          its old logs are pruned: {msg}"
                     ));
+                    }
+                    false
                 }
-                false
             }
-        }
-    };
+        };
 
     // This probe filters on a topic0 no event can produce (see above), so its response is empty at
     // every span and it can never meet a result-count cap - it only ever measures the provider's
@@ -911,6 +921,22 @@ mod tests {
         assert_eq!(filtered.recommended_window(), Some(81_920));
     }
 
+    /// #1624, review: an empty answer over the oldest blocks cannot tell pruned logs from none, so
+    /// it must be reported as not established rather than taken as proof.
+    #[tokio::test]
+    async fn an_empty_old_logs_answer_is_reported_as_not_established() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, server) = filter_capturing_rpc(seen, None).await;
+        let p = probe(&url, &[]).await.unwrap();
+        server.abort();
+        assert!(
+            p.notes
+                .iter()
+                .any(|n| n.starts_with("old logs not established")),
+            "{:?}",
+            p.notes
+        );
+    }
     /// #1624: an endpoint that keeps state far back but refuses old logs is not an archive for a
     /// backfill. eth.drpc.org did exactly this on 2026-10-01 and doctor called it archive.
     #[tokio::test]
