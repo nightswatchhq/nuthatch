@@ -1,0 +1,125 @@
+# promtool test rules tests/nuthatch_test.yml
+rule_files:
+  - ../rules/nuthatch.yml
+
+evaluation_interval: 15s
+
+tests:
+  # The OOM counter rises at 60 s; the page must be firing within a minute of it.
+  - interval: 15s
+    input_series:
+      - series: 'nuthatch_sql_rejections_total{job="nuthatch", instance="100.82.188.91:8107", unit="graph-allocations-nest-next", box="helsinki", role="cursor", reason="out_of_memory"}'
+        values: '0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: SqlOutOfMemory
+        exp_alerts: []
+      - eval_time: 75s
+        alertname: SqlOutOfMemory
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8107", unit: graph-allocations-nest-next, box: helsinki, role: cursor, reason: out_of_memory}
+            exp_annotations:
+              summary: "graph-allocations-nest-next: /sql queries are failing out of memory"
+      - eval_time: 2m
+        alertname: SqlOutOfMemory
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8107", unit: graph-allocations-nest-next, box: helsinki, role: cursor, reason: out_of_memory}
+            exp_annotations:
+              summary: "graph-allocations-nest-next: /sql queries are failing out of memory"
+      # No further failures for longer than the window: it resolves.
+      - eval_time: 5m
+        alertname: SqlOutOfMemory
+        exp_alerts: []
+
+  # A freshly rolled process whose first scrape already counts an OOM.
+  - interval: 15s
+    input_series:
+      - series: 'nuthatch_sql_rejections_total{job="nuthatch", instance="100.82.188.91:8107", unit="graph-allocations-nest-next", box="helsinki", role="cursor", reason="out_of_memory"}'
+        values: '_ _ _ _ 2 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 75s
+        alertname: SqlOutOfMemory
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8107", unit: graph-allocations-nest-next, box: helsinki, role: cursor, reason: out_of_memory}
+            exp_annotations:
+              summary: "graph-allocations-nest-next: /sql queries are failing out of memory"
+
+  # A unit stops answering at 60 s: TargetDown and CursorDead fire after two minutes, not before.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="nuthatch", instance="100.82.188.91:8104", unit="nuthatch-dips", box="helsinki", role="cursor"}'
+        values: '1 1 1 1 0x30'
+    alert_rule_test:
+      - eval_time: 2m30s
+        alertname: TargetDown
+        exp_alerts: []
+      - eval_time: 3m15s
+        alertname: TargetDown
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8104", unit: nuthatch-dips, box: helsinki, role: cursor}
+            exp_annotations:
+              summary: "nuthatch target 100.82.188.91:8104 (nuthatch-dips) has not answered a scrape for 2 minutes"
+      - eval_time: 3m15s
+        alertname: CursorDead
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8104", unit: nuthatch-dips, box: helsinki, role: cursor}
+            exp_annotations:
+              summary: "nuthatch-dips: the cursor is not running"
+
+  # The archive is down too, but it has no cursor: TargetDown only.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="nuthatch", instance="100.82.188.91:8103", unit="graph-staking-legacy-readonly", box="helsinki", role="archive"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CursorDead
+        exp_alerts: []
+
+  # Polls every 15 s until 5 minutes in, then the process is gone and its series with it.
+  - interval: 15s
+    input_series:
+      - series: 'nuthatch_last_poll_unixtime{job="nuthatch", instance="100.82.188.91:8104", unit="nuthatch-dips", box="helsinki", role="cursor"}'
+        values: '0+15x20'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: IngestStalled
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: IngestStalled
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8104", unit: nuthatch-dips, box: helsinki, role: cursor}
+            exp_annotations:
+              summary: "nuthatch-dips: no successful poll for 11m 0s"
+
+  # A healthy 5-minute poller must never fire it.
+  - interval: 1m
+    input_series:
+      - series: 'nuthatch_last_poll_unixtime{job="nuthatch", instance="100.82.188.91:8107", unit="graph-allocations-nest-next", box="helsinki", role="cursor"}'
+        values: '0 0 0 0 0 300 300 300 300 300 600 600 600 600 600 900 900 900 900 900 1200'
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: IngestStalled
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'probe_success{job="nuthatch-ready", instance="100.82.188.91:8113", unit="graph-gns-nest-next", box="helsinki", role="cursor"}'
+        values: '1 0x15'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: NestNotReady
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch-ready, instance: "100.82.188.91:8113", unit: graph-gns-nest-next, box: helsinki, role: cursor}
+            exp_annotations:
+              summary: "graph-gns-nest-next: /ready has answered not-ready for 10 minutes"
+
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels: {severity: none}
+            exp_annotations:
+              summary: "The monitoring pipeline is alive"
