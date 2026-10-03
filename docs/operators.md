@@ -962,6 +962,8 @@ per-nest series below.
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
 | `nuthatch_rpc_methods_total{method=…}` | individual JSON-RPC method invocations; a batch of 200 `eth_getBlockByNumber` is 200 here and 1 on `nuthatch_rpc_requests_total`. Multiply by a provider's per-method CU schedule to estimate a bill |
 | `nuthatch_rss_bytes` | process memory: the number to provision against |
+| `nuthatch_analytics_pool_reserved_bytes`, `nuthatch_analytics_pool_peak_bytes`, `nuthatch_analytics_engines` | what `/sql` statements hold against the analytics memory pools (#1778). Every live analytics engine has a pool of its own, each bounded by `NUTHATCH_BURRMILL_MEMORY_LIMIT` less the eighth kept for the footer cache, and a statement that runs while the cached engine is busy opens another, so two concurrent statements can each reserve up to the limit. Reserved is the sum over engines now; peak is the most any one engine has held since start; engines counts the cached and in-flight ones |
+| `nuthatch_jemalloc_allocated_bytes`, `nuthatch_jemalloc_active_bytes`, `nuthatch_jemalloc_resident_bytes`, `nuthatch_jemalloc_retained_bytes` | the allocator's view, Linux glibc builds only, refreshed at each scrape. Allocated is what the program holds; resident less allocated is what jemalloc keeps in RAM for reuse; RSS less resident is memory jemalloc does not manage (C libraries calling glibc malloc, thread stacks, the binary, mapped files). Retained is mapped but already returned to the OS, so not in RSS |
 | `nuthatch_last_poll_unixtime` | liveness of the ingest loop itself |
 | `nuthatch_fetch_window_blocks` | the block span of the cursor's latest `eth_getLogs` window. A backfill whose window sat at ~10 blocks for three hours after a rate-limited hour (#1170) shows here long before it shows in its ETA; the controller now widens again after four clean windows at the lowered ceiling |
 | `nuthatch_seal_direct_fetched` vs `nuthatch_seal_direct_completed` | the seal-direct pass's fetch position against its durable watermark (#1169). A restart resumes from `completed`; the gap is the work it redoes, which on a sparse range can be tens of millions of blocks |
@@ -972,6 +974,9 @@ and its name in a single-nest `dev` (#1415) - the ones that make co-tenancy oper
 `nuthatch_nest_hot_store_bytes` and `nuthatch_nest_sealed_segments_bytes` (the segments this nest's
 manifest names; a segment two datasets share is counted under both, so for disk used read the
 unlabelled `nuthatch_sealed_segments_bytes`, which counts each store once),
+`nuthatch_nest_analytics_pool_reserved_bytes`, `nuthatch_nest_analytics_pool_peak_bytes` and
+`nuthatch_nest_analytics_engines` (the global pool series for the engines opened over this nest's
+dataset; two mounts of one dataset show the same engines),
 `nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
 `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_checkpoints_missed_total`,
