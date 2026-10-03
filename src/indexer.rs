@@ -3467,8 +3467,9 @@ fn tail_hold(w_to: u64, final_pass_done: bool) -> u64 {
 /// the block it touched, and the segment's content address depends on that order.
 pub(crate) type SealRow = (u64, u64, String);
 
-/// Logs one seal-direct window may hold before it stops splitting and hands the rest of its range
-/// back (#1671). Ten times the controller's target, so only a window that overshot reaches it.
+/// Logs one seal-direct window may hold, in whole blocks, before it hands the rest of its range back
+/// (#1671). Exceeded by at most one block's logs, because a block is never split. Ten times the
+/// controller's target, so only a window that overshot reaches it.
 const SEAL_DIRECT_WINDOW_LOGS: usize = 20_000;
 
 /// One pipelined seal-direct window, decoded. `w_to` falls short of `asked_to` when the window
@@ -4909,7 +4910,7 @@ fn suggested_split_point(err: &anyhow::Error, from: u64, to: u64) -> Option<u64>
 /// because the plain form has four call sites in tests that are about splitting behaviour and should
 /// stay as they are.
 ///
-/// Stops splitting once `budget` logs are in hand and returns the last block it covered (#1671): the
+/// Holds at most `budget` logs in whole blocks and returns the last block it covered (#1671): the
 /// pieces of a refused range were all merged, so a window grown wide over an empty range held its whole
 /// width of dense history at once. The caller fetches the rest.
 async fn fetch_logs_splitting_tracked(
@@ -4946,6 +4947,26 @@ async fn fetch_logs_splitting(
         .map(|(logs, _, _)| logs)
 }
 
+/// Truncate block-ordered `logs` to the whole blocks that fit `budget` and return the last block kept,
+/// or `None` when everything fits. A first block over the budget on its own is kept whole, since a
+/// block cannot be split.
+fn cut_to_budget(logs: &mut Vec<crate::rpc::Log>, budget: usize) -> Option<u64> {
+    if logs.len() <= budget {
+        return None;
+    }
+    let over = logs[budget].block_number;
+    let (keep, covered) = if logs[0].block_number < over {
+        (logs.partition_point(|l| l.block_number < over), over - 1)
+    } else {
+        (logs.partition_point(|l| l.block_number <= over), over)
+    };
+    if keep == logs.len() {
+        return None;
+    }
+    logs.truncate(keep);
+    Some(covered)
+}
+
 /// The logs, and the last block they cover.
 type SplitFetch<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(Vec<crate::rpc::Log>, u64)>> + Send + 'a>,
@@ -4979,9 +5000,12 @@ fn fetch_logs_splitting_tracking<'a>(
 ) -> SplitFetch<'a> {
     Box::pin(async move {
         match source.logs(filter, from, to).await {
-            Ok(logs) => {
+            Ok(mut logs) => {
                 widest.fetch_max(to - from + 1, std::sync::atomic::Ordering::SeqCst);
-                Ok((logs, to))
+                Ok(match cut_to_budget(&mut logs, budget) {
+                    Some(covered) => (logs, covered),
+                    None => (logs, to),
+                })
             }
             Err(e) if narrowing_can_help(&e, from, to) => {
                 if from >= to {
@@ -15992,9 +16016,8 @@ template = "pool"
             .unwrap();
             assert_eq!(total, 45_000, "{concurrency}-way: every row once");
             assert!(
-                widest <= 21_000,
-                "{concurrency}-way: one window carried {widest} rows; the budget is 20,000 plus one \
-                 capped response"
+                widest <= 20_000,
+                "{concurrency}-way: one window carried {widest} rows against a budget of 20,000"
             );
             let d_seq = tempfile::tempdir().unwrap();
             backfill_direct(
@@ -16089,6 +16112,71 @@ template = "pool"
         let m = seal::load_manifest(d.path()).unwrap();
         let sealed: usize = m.tables.values().flatten().map(|s| s.rows).sum();
         assert_eq!(sealed, 40_000, "every row sealed once");
+    }
+
+    /// #1671, review: a served piece is cut to what is left of the budget. Two 15,000-log halves of a
+    /// refused range would otherwise come back together, 30,000 against a budget of 20,000.
+    #[tokio::test]
+    async fn a_served_piece_is_cut_to_the_budget_that_is_left() {
+        use crate::registry::{ContractSpec, DecodeRegistry};
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let addresses: Vec<String> = reg
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = reg
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+        // 1,500 logs in each of blocks 10..=29: refused whole, served as two 15,000-log halves.
+        let logs: Vec<_> = (10u64..=29)
+            .flat_map(|b| (0..1_500).map(move |li| transfer_log(b, li)))
+            .collect();
+        let source = ResultCapSource::new(logs, 15_000);
+        let d = tempfile::tempdir().unwrap();
+        let mut widest = 0u64;
+        let total = backfill_direct_pipelined(
+            &source,
+            &reg,
+            d.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            29,
+            1_000,
+            SPAN_OFF,
+            1,
+            |_| Ok(()),
+            |_, n, _| widest = widest.max(n),
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 30_000, "every row once");
+        assert!(
+            widest <= 20_000,
+            "one window carried {widest} rows against a budget of 20,000"
+        );
+        let m = seal::load_manifest(d.path()).unwrap();
+        let sealed: usize = m.tables.values().flatten().map(|s| s.rows).sum();
+        assert_eq!(sealed, 30_000, "every row sealed once");
     }
 
     /// #1671: while the rest of a cut window is fetched, no further windows are issued, or every one
