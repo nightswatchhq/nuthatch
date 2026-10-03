@@ -27,7 +27,8 @@ impl Engine for BurrmillEngine {
 }
 
 // Every live session's engine, so a scrape reads the pools without waiting out a statement (#1778).
-static LIVE: Mutex<Vec<(Option<PathBuf>, Weak<RwLock<burrmill::Engine>>)>> = Mutex::new(Vec::new());
+type Live = (Option<PathBuf>, Weak<RwLock<burrmill::Engine>>);
+static LIVE: Mutex<Vec<Live>> = Mutex::new(Vec::new());
 
 struct Peaks {
     all: u64,
@@ -761,32 +762,38 @@ mod tests {
         assert!(s.engine_version().starts_with("burrmill "));
     }
 
-    /// #1778: a scrape during a statement reads what it holds, not a peak and not a value held
-    /// behind the statement's lock.
+    /// A session over `dir` with `table` bound to `n` rows in scrambled order.
+    fn sorting_session(dir: &std::path::Path, tables: &[(&str, u64)]) -> super::BurrmillSession {
+        use crate::engine::{FactWindow, Session};
+        let s = super::BurrmillSession::new(Some(dir)).unwrap();
+        for (table, n) in tables {
+            let rows: Vec<serde_json::Value> = (1..=*n)
+                .map(|b| serde_json::json!({ "block_number": b, "n": format!("{:09}", 7919 * b % 100_003) }))
+                .collect();
+            let refs: Vec<&serde_json::Value> = rows.iter().collect();
+            s.load_hot(table, &refs).unwrap();
+            assert!(s
+                .bind_facts(table, &[], &[], true, FactWindow::default())
+                .unwrap());
+        }
+        s
+    }
+
+    fn pool_of(dir: &std::path::Path) -> crate::engine::PoolUse {
+        super::pools().by_dir.get(dir).copied().unwrap_or_default()
+    }
+
+    /// #1778: a scrape during a statement reads what it holds, and a peak no scrape saw survives
+    /// the session.
     #[test]
     fn a_running_statement_shows_in_its_pool_and_its_peak_outlives_the_session() {
-        use crate::engine::{FactWindow, Session};
+        use crate::engine::Session;
         let dir = tempfile::tempdir().unwrap();
-        let s = super::BurrmillSession::new(Some(dir.path())).unwrap();
-        let rows: Vec<serde_json::Value> = (1..=5000)
-            .map(|b| serde_json::json!({ "block_number": b, "n": format!("{:08}", 7919 * b % 5003) }))
-            .collect();
-        let refs: Vec<&serde_json::Value> = rows.iter().collect();
-        s.load_hot("t", &refs).unwrap();
-        assert!(s
-            .bind_facts("t", &[], &[], true, FactWindow::default())
-            .unwrap());
-        let mine = || {
-            super::pools()
-                .by_dir
-                .get(dir.path())
-                .copied()
-                .unwrap_or_default()
-        };
+        let s = sorting_session(dir.path(), &[("small", 2_000), ("large", 40_000)]);
 
         let mut during = None;
-        s.for_each_row("SELECT n, block_number FROM t ORDER BY n", &mut |_| {
-            during.get_or_insert_with(mine);
+        s.for_each_row("SELECT n, block_number FROM small ORDER BY n", &mut |_| {
+            during.get_or_insert_with(|| pool_of(dir.path()));
             Ok(())
         })
         .unwrap();
@@ -796,15 +803,44 @@ mod tests {
             during.reserved > 0,
             "the sort was emitting and its pool read {during:?}"
         );
-        assert_eq!(mine().reserved, 0, "the statement is done");
+        assert_eq!(pool_of(dir.path()).reserved, 0, "the statement is done");
+        let seen = pool_of(dir.path()).peak;
 
+        // Larger, and finished without a scrape.
+        s.for_each_row("SELECT n, block_number FROM large ORDER BY n", &mut |_| {
+            Ok(())
+        })
+        .unwrap();
         drop(s);
-        let after = mine();
+        let after = pool_of(dir.path());
         assert_eq!(after.engines, 0);
         assert!(
-            after.peak >= during.reserved,
-            "the peak was folded in when the session dropped: {after:?} against {during:?}"
+            after.peak > seen,
+            "the larger sort's peak was lost with the session: {after:?}, {seen} before it"
         );
+    }
+
+    /// `/sql` collects, and a scrape must not wait behind it.
+    #[test]
+    fn a_scrape_reads_the_pool_while_a_collect_runs() {
+        use crate::engine::Session;
+        let dir = tempfile::tempdir().unwrap();
+        let s = sorting_session(dir.path(), &[("t", 100_000)]);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let seen = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut seen = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    seen = seen.max(pool_of(dir.path()).reserved);
+                }
+                seen
+            });
+            let out = s.collect("SELECT n, block_number FROM t ORDER BY n", None);
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(out.map(|c| c.rows.len()).ok(), Some(100_000));
+            watcher.join().unwrap()
+        });
+        assert!(seen > 0, "no scrape saw the sort's reservation");
     }
 
     /// #1677: a cached session held its hot rows twice, as the staged JSON and as the bound table.
