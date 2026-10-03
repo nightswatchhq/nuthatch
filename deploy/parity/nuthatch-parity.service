@@ -1,0 +1,22 @@
+# Daily Lodestar parity on Helsinki (#1713, #1718): scripts/lodestar-parity.sh at sealed_through,
+# then at the nest's head, through deploy/parity/nuthatch-parity.sh.
+# Install, as root on the box, with this repo's files copied to /tmp:
+#   install -D -m 755 /tmp/lodestar-parity.sh /usr/local/lib/nuthatch-parity/lodestar-parity.sh
+#   install -m 755 /tmp/nuthatch-parity.sh /usr/local/bin/nuthatch-parity
+#   install -m 644 /tmp/nuthatch-parity.service /tmp/nuthatch-parity.timer /etc/systemd/system/
+#   install -m 600 /etc/nuthatch/deadman_discord_webhook_url /etc/nuthatch/parity_discord_webhook_url
+#   /etc/nuthatch/parity.env, mode 0600: GRAPH_API_KEY=...
+#   systemctl daemon-reload && systemctl enable --now nuthatch-parity.timer
+# Runs land in /var/log/nuthatch/parity/, one log per mode and a line each in runs.tsv.
+[Unit]
+Description=Lodestar parity against the Graph Network subgraph, sealed and head
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nuthatch-parity
+# 2 is known differences only and 3 a head that could not be reached: recorded, not failures.
+SuccessExitStatus=2 3
+TimeoutStartSec=3h
+Nice=10

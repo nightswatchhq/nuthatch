@@ -126,6 +126,8 @@ mod lodestar_panel;
 mod mutants_check;
 #[path = "over_i128_is_reported.rs"]
 mod over_i128_is_reported;
+#[path = "parity_timer_script.rs"]
+mod parity_timer_script;
 #[path = "payment_absent.rs"]
 mod payment_absent;
 #[path = "pg_parity.rs"]
