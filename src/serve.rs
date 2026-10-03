@@ -8342,6 +8342,11 @@ mod tests {
             ADMIN_HTML.contains("s.publish") && ADMIN_HTML.contains("last_success_unixtime"),
             "admin UI renders the publish row (RFC-0052 §3.8)"
         );
+        assert!(
+            ADMIN_HTML.contains("nuthatch_rpc_methods_total")
+                && ADMIN_HTML.contains("nuthatch_start_time_seconds"),
+            "admin UI prices RPC from the method counters and the start time"
+        );
     }
 
     #[test]

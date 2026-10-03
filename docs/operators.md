@@ -960,6 +960,7 @@ per-nest series below.
 | `nuthatch_sql_memo_hits_total`, `nuthatch_sql_memo_misses_total`, `nuthatch_sql_memo_bytes` | the analytical memo (#1186): how many `/sql` answers were remembered rather than computed, and what it holds |
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
 | `nuthatch_rpc_methods_total{method=…}` | individual JSON-RPC method invocations; a batch of 200 `eth_getBlockByNumber` is 200 here and 1 on `nuthatch_rpc_requests_total`. Multiply by a provider's per-method CU schedule to estimate a bill |
+| `nuthatch_start_time_seconds` | unix time the runtime built its first cursor; the counters are since then, so this is what turns `nuthatch_rpc_methods_total` into a monthly figure. Absent on a serve-only process |
 | `nuthatch_rss_bytes` | process memory: the number to provision against |
 | `nuthatch_last_poll_unixtime` | liveness of the ingest loop itself |
 | `nuthatch_fetch_window_blocks` | the block span of the cursor's latest `eth_getLogs` window. A backfill whose window sat at ~10 blocks for three hours after a rate-limited hour (#1170) shows here long before it shows in its ETA; the controller now widens again after four clean windows at the lowered ceiling |
