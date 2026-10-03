@@ -373,9 +373,10 @@ url = "https://alerts.invalid/hook/{ALERT_PATH_SECRET}"
 ///
 /// **The list is hand-maintained, and that is a real limit - do not read it as "the whole surface".**
 /// `axum::Router` exposes no route table, so nothing here can enumerate what `serve::router`
-/// registers. The list below was written against that function and covers all 22 of its GETs as of
+/// registers. The list below was written against that function and covers all 24 of its GETs as of
 /// this commit: the 19 base routes, plus `/_admin` and `/_admin/` (two distinct registrations of
-/// `admin_index`), plus `/_admin/events`, which is an SSE stream and is probed separately. A route
+/// `admin_index`), `/_admin/config` and `/_admin/storage`, plus `/_admin/events`, which is an SSE
+/// stream and is probed separately. A route
 /// added to `serve::router` and not added here is a route this sweep does not check, and no
 /// assertion in this file will say so. An earlier revision claimed to enumerate the router while
 /// omitting six of them - `/table/{name}`, `/entity/{id}`, `/q/{name}`, `/balance/{address}`,
@@ -438,6 +439,9 @@ async fn the_admin_surface_discloses_no_credential_and_no_filesystem_path() {
         // Bare `/_admin`, distinct from the `/_admin/` above: they are two registered routes and
         // `admin_index` is reached by both.
         "/_admin?token=s3cret",
+        // Serves the authored files' text, which is where the credentials are written down.
+        "/_admin/config?token=s3cret",
+        "/_admin/storage?token=s3cret&table=usdc__transfer",
     ];
     let mut bodies: Vec<(String, String)> = Vec::new();
     for p in paths {
