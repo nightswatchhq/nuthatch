@@ -7605,6 +7605,7 @@ template="pool"
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             std::env::set_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE, "64MB");
+            std::env::set_var(crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT, "64MB");
             let r = query_hot_cold(
                 dir.path(),
                 "SELECT a.i FROM range(5000000) a(i), range(120) b(j) \
@@ -7615,6 +7616,7 @@ template="pool"
                 &[],
             );
             std::env::remove_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE);
+            std::env::remove_var(crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT);
             r
         };
         let err = result.expect_err("the cross join must not run to completion");
