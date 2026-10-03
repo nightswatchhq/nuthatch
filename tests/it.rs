@@ -136,6 +136,8 @@ mod port_report;
 mod pr_review_harness;
 #[path = "reading_published_nest.rs"]
 mod reading_published_nest;
+#[path = "release_gate_script.rs"]
+mod release_gate_script;
 #[path = "release_provenance.rs"]
 mod release_provenance;
 #[path = "required_checks.rs"]
