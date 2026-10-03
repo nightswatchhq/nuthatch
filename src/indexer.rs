@@ -562,10 +562,12 @@ async fn wait_live_then_quiesce(
 ) -> Result<Option<u64>, UpgradeAbandon> {
     let wait = wait_until_caught_up_probe(probe, snapshot, poll, stall).await;
     let head = abandon_or_head(wait, false)?;
-    quiesce_ingest(ingest_old, old_store, quiesce_for).await.map_err(|e| {
-        tracing::warn!(error = %e, "old ingest did not stop after abort");
-        UpgradeAbandon::QuiesceTimeout
-    })?;
+    quiesce_ingest(ingest_old, old_store, quiesce_for)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "old ingest did not stop after abort");
+            UpgradeAbandon::QuiesceTimeout
+        })?;
     Ok(head)
 }
 

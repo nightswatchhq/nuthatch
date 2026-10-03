@@ -400,9 +400,13 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     .expect("catch-up timed out")
     .expect("catch-up");
 
-    indexer::quiesce_ingest(&mut old_rt.ingest, Duration::from_secs(2))
-        .await
-        .expect("quiesce old writer");
+    indexer::quiesce_ingest(
+        &mut old_rt.ingest,
+        old_store.as_ref(),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("quiesce old writer");
     let frozen = old_store.indexed_head().unwrap();
     assert_eq!(frozen, Some(5), "old version was at the tip before quiesce");
 
