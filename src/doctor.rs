@@ -316,8 +316,12 @@ async fn discover_probe_address(url: &str, tip: u64) -> Option<(String, usize)> 
 /// narrower span than a single-address probe would suggest (#670). An empty slice is the range-only
 /// case: no address filter at all, same as before this could take more than one.
 /// An error that is a plan, quota or rate limit rather than an answer about the chain.
-fn refused(msg: &str) -> bool {
-    let msg = msg.to_ascii_lowercase();
+fn refused(msg: &str, url: &str) -> bool {
+    // The pool's verdicts name the endpoint, and a host or port can contain "plan" or "429" (#1760).
+    let msg = msg
+        .replace(url, "")
+        .replace(&crate::rpc::redact_url(url), "")
+        .to_ascii_lowercase();
     [
         "usage limit",
         "upgrade",
@@ -449,7 +453,7 @@ pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
             // capability one. Reporting that as "no archive" would send an operator hunting for a
             // different provider when they need a different *plan*, and this tool exists to stop
             // exactly that kind of misdirected bisection.
-            if refused(&msg) {
+            if refused(&msg, url) {
                 archive_unknown = true;
                 notes.push(format!(
                     "archive depth UNKNOWN - the endpoint refused rather than answered: {msg}"
@@ -482,7 +486,7 @@ pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
             Err(e) => {
                 let msg = format!("{e:#}");
                 old_logs = OldLogs::Refused;
-                if refused(&msg) {
+                if refused(&msg, url) {
                     archive_unknown = true;
                     notes.push(format!(
                         "archive depth UNKNOWN - eth_getLogs over blocks 1-10 was refused: {msg}"
@@ -963,6 +967,52 @@ mod tests {
     /// backfill. eth.drpc.org did exactly this on 2026-10-01 and doctor called it archive.
     #[tokio::test]
     async fn state_at_depth_without_old_logs_is_not_archive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (url, server) = pruned_old_logs_rpc(listener);
+        let p = probe(&url, &[]).await.unwrap();
+        server.abort();
+        assert!(
+            !p.archive,
+            "pruned old logs reported as archive: {:?}",
+            p.notes
+        );
+        assert_eq!(p.old_logs, OldLogs::Refused);
+        assert!(!p.archive_unknown, "{:?}", p.notes);
+        assert!(
+            p.notes
+                .iter()
+                .any(|n| n.contains("refused eth_getLogs over blocks 1-10")),
+            "{:?}",
+            p.notes
+        );
+    }
+
+    /// #1760: the pool's verdict names the endpoint, so a port or host containing "429" or "plan"
+    /// read as a provider refusal. CI drew such an ephemeral port.
+    #[tokio::test]
+    async fn the_endpoint_url_is_not_read_as_a_refusal() {
+        let mut listener = None;
+        for port in (42900..43000).chain(14290..14300) {
+            if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                listener = Some(l);
+                break;
+            }
+        }
+        let (url, server) = pruned_old_logs_rpc(listener.expect("no free port containing 429"));
+        let p = probe(&url, &[]).await.unwrap();
+        server.abort();
+        assert_eq!(p.old_logs, OldLogs::Refused);
+        assert!(
+            !p.archive_unknown,
+            "the endpoint's own URL was taken for a refusal: {:?}",
+            p.notes
+        );
+    }
+
+    /// Keeps state far back, refuses eth_getLogs below block 0x100000 the way eth.drpc.org did.
+    fn pruned_old_logs_rpc(
+        listener: tokio::net::TcpListener,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{routing::post, Json, Router};
         use serde_json::Value;
 
@@ -990,28 +1040,12 @@ mod tests {
             }
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new().route("/", post(handler));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let p = probe(&format!("http://{addr}/"), &[]).await.unwrap();
-        server.abort();
-        assert!(
-            !p.archive,
-            "pruned old logs reported as archive: {:?}",
-            p.notes
-        );
-        assert_eq!(p.old_logs, OldLogs::Refused);
-        assert!(!p.archive_unknown);
-        assert!(
-            p.notes
-                .iter()
-                .any(|n| n.contains("refused eth_getLogs over blocks 1-10")),
-            "{:?}",
-            p.notes
-        );
+        (format!("http://{addr}/"), server)
     }
     /// A one-endpoint fake JSON-RPC server that captures every `eth_getLogs` filter it is sent and
     /// answers everything else just well enough for `probe()` to run to completion. `cap`, if set,
