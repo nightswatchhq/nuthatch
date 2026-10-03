@@ -307,7 +307,7 @@ if [ -f "$FAKE_STATE/snapshot-out" ]; then cat "$FAKE_STATE/snapshot-out"; else 
 "#;
 
 /// Copies the stage into the last argument. `rsync-fail` fails after a partial copy; `corrupt`
-/// damages the redb in transit.
+/// damages the redb in transit, `corrupt-manifest` the segment manifest.
 const REFRESH_RSYNC: &str = r#"#!/usr/bin/env bash
 echo "$*" > "$FAKE_STATE/rsync-args"
 for dst; do :; done
@@ -319,6 +319,7 @@ if [ -f "$FAKE_STATE/rsync-fail" ]; then
 fi
 /bin/cp -R "$FAKE_STATE/stage/." "$dst/"
 [ -f "$FAKE_STATE/corrupt" ] && printf 'torn' >> "$dst/nuthatch.redb"
+[ -f "$FAKE_STATE/corrupt-manifest" ] && printf 'torn' >> "$dst/segments/manifest.json"
 exit 0
 "#;
 
@@ -332,9 +333,10 @@ struct ThinkPad {
 
 fn stage_provenance(stage: &Path, sealed: u64) {
     let p = format!(
-        "taken_at=2026-10-04T05:00:00Z\nnest_dir=/opt/nuthatch/graph-allocations-nest-next\nversion=4.2.0\nlast_block={}\nsealed_through={sealed}\nredb_sha256={}\nmanifest_sha256=x\nattempt=1\n",
+        "taken_at=2026-10-04T05:00:00Z\nnest_dir=/opt/nuthatch/graph-allocations-nest-next\nversion=4.2.0\nlast_block={}\nsealed_through={sealed}\nredb_sha256={}\nmanifest_sha256={}\nattempt=1\n",
         sealed + 100,
-        sha256(&stage.join("nuthatch.redb"))
+        sha256(&stage.join("nuthatch.redb")),
+        sha256(&stage.join("segments/manifest.json"))
     );
     std::fs::write(stage.join("PROVENANCE"), p).unwrap();
 }
@@ -487,6 +489,20 @@ fn a_torn_redb_is_refused() {
     let (code, text) = refresh(&t);
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("does not match the one staged"), "{text}");
+    unchanged(&t);
+}
+
+/// The manifest names the segment set `serve` reads; a damaged one is refused like a damaged redb.
+#[test]
+fn a_torn_manifest_is_refused() {
+    let t = thinkpad();
+    std::fs::write(t.state.join("corrupt-manifest"), "").unwrap();
+    let (code, text) = refresh(&t);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("segments/manifest.json does not match the one staged"),
+        "{text}"
+    );
     unchanged(&t);
 }
 

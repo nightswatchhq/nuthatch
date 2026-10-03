@@ -76,6 +76,10 @@ cmp -s "$snap" "$incoming/PROVENANCE" \
 got_sha=$(sha "$incoming/nuthatch.redb")
 [ "$got_sha" = "$want_sha" ] \
   || die "the pulled nuthatch.redb does not match the one staged ($got_sha, want $want_sha); nothing was changed"
+want_manifest=$(prov_key manifest_sha256 "$snap")
+got_manifest=$(sha "$incoming/segments/manifest.json")
+[ "$got_manifest" = "$want_manifest" ] \
+  || die "the pulled segments/manifest.json does not match the one staged ($got_manifest, want ${want_manifest:-none}); nothing was changed"
 
 old_sealed=""
 [ -f "$nest/PROVENANCE" ] && old_sealed=$(prov_key sealed_through "$nest/PROVENANCE")
