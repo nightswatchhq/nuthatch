@@ -183,6 +183,6 @@ summary=$(grep -E '^release-gate: [0-9]+ of [0-9]+ answered' "$run/candidate.txt
 result=$(grep -E '^RESULT: ' "$run/candidate.txt" | sed 's/^RESULT: //' || true)
 case "$rc" in
   0) post_status success "${summary:-passed} (against $production)" ;;
-  1) post_status failure "${result:-FAIL}; ${summary:-}" ; exit 1 ;;
+  1) post_status failure "${summary:-failed}; ${result#FAIL - }" ; exit 1 ;;
   *) post_status error "the gate could not run (exit $rc); see $run" ; exit 2 ;;
 esac

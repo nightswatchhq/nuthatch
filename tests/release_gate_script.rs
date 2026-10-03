@@ -193,7 +193,9 @@ impl Case {
         let path = self.dir.path().join("set.tsv");
         let mut body = String::from("# id\tconsumer\tsite\tsql\n");
         for (id, sql) in lines {
-            body.push_str(&format!("{id}\ttest\ttests/release_gate_script.rs\t{sql}\n"));
+            body.push_str(&format!(
+                "{id}\ttest\ttests/release_gate_script.rs\t{sql}\n"
+            ));
         }
         std::fs::write(&path, body).unwrap();
         path
@@ -261,7 +263,12 @@ fn a_set_the_binary_answers_passes_and_records_a_baseline() {
     let baseline = c.dir.path().join("baseline.tsv");
     let (out, text) = c.gate(
         &set,
-        &["--passes", "2", "--write-baseline", baseline.to_str().unwrap()],
+        &[
+            "--passes",
+            "2",
+            "--write-baseline",
+            baseline.to_str().unwrap(),
+        ],
         &[],
     );
     assert_eq!(out.status.code(), Some(0), "{text}");
@@ -304,14 +311,22 @@ fn a_regression_past_the_bound_fails_and_one_inside_it_does_not() {
     let base = baseline.to_str().unwrap();
 
     let (out, text) = c.gate(&set, &["--baseline", base], &[]);
-    assert_eq!(out.status.code(), Some(0), "inside the default bound:\n{text}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "inside the default bound:\n{text}"
+    );
 
     let (out, text) = c.gate(
         &set,
         &["--baseline", base],
         &[("GATE_QUERY_SLACK_MS", "0"), ("GATE_P99_SLACK_MS", "0")],
     );
-    assert_eq!(out.status.code(), Some(1), "past a zero-slack bound:\n{text}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "past a zero-slack bound:\n{text}"
+    );
     let answers = line_for(&text, "answers");
     assert!(
         answers.starts_with("SLOW ") && answers.contains("regressed"),
