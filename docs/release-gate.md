@@ -103,11 +103,12 @@ before each run, through the `GATE_REFRESH` hook, `deploy/release-gate/refresh-f
   timed: the redb and `segments/manifest.json` are hashed before and after, the copy is hashed, and
   `/ready`'s `last_block` is read on both sides. Any difference means a commit or a seal landed
   during the copy, and the copy is taken again, up to ten times. It ends with a `PROVENANCE` file
-  carrying the version, `last_block`, `sealed_through` and the redb's sha256. Nothing is stopped.
+  carrying the version, `last_block`, `sealed_through` and the sha256s of the redb and manifest.
+  Nothing is stopped.
 - The ThinkPad pulls the stage with rsync into `alloc-nest.incoming`, hardlinking unchanged
   segments from the current copy. It swaps the new copy in only when the pulled `PROVENANCE` is the
-  snapshot it asked for, the redb matches the staged sha256, and `sealed_through` has not gone
-  backwards. The previous copy is kept as `alloc-nest.prev`. Any failure leaves the copy as it was
+  snapshot it asked for, the redb and the manifest match their staged sha256s, and
+  `sealed_through` has not gone backwards. The previous copy is kept as `alloc-nest.prev`. Any failure leaves the copy as it was
   and fails the refresh, which `release-gate-run.sh` posts as `error`. It takes the copy's gate
   lock, so a refresh run by hand waits for a gate that is serving the copy.
 
