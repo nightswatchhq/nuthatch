@@ -20,7 +20,15 @@ die() { printf '\033[31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
 ok()  { printf '\033[32mok\033[0m   %s\n' "$*"; }
 
 unit_binary() { systemctl show -p ExecStart --value "$1" 2>/dev/null | grep -oE '/[^ ]*nuthatch[^ ]*' | head -1; }
-unit_port()   { systemctl show -p ExecStart --value "$1" 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1; }
+# The address the unit serves on: its `--listen`, any host (the QoS nest listens on a tailnet address),
+# with 0.0.0.0 read as loopback and nuthatch's default when there is none. `|| true` because a grep
+# that matches nothing would otherwise end the script under `pipefail` before any message.
+unit_port() {
+  local l
+  l=$(systemctl show -p ExecStart --value "$1" 2>/dev/null | grep -oE -- '--listen[= ][^ ;]+' | head -1 | sed -E 's/^--listen[= ]//' || true)
+  l=${l/0.0.0.0:/127.0.0.1:}
+  echo "${l:-127.0.0.1:8288}"
+}
 
 # --- install ------------------------------------------------------------------------------------
 # `mv` rather than `cp`: rename replaces the inode atomically and works against a running binary,
@@ -66,7 +74,6 @@ cmd_roll() {
 
   local port f before
   port=$(unit_port "$u")
-  [ -n "$port" ] || die "$u: no 127.0.0.1 listen address in its ExecStart"
   f=$(execstart_file "$u") || die "$u: no file under $UNIT_DIR sets its ExecStart"
   before=$(ready_field "$(curl -sS -m5 "http://$port/ready" 2>/dev/null || true)" last_block)
 
