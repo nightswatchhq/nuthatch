@@ -116,7 +116,7 @@ async fn a_checked_entity_file_starts_and_indexes() {
         std::fs::read(dir.path().join("entities/received.sql")).unwrap(),
         sql
     );
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 async fn spawn_with_entity(
@@ -158,16 +158,6 @@ async fn spawn_declared(
     .await;
     assert!(landed, "nest did not index to block {tip} in time");
     rt
-}
-
-/// Abort a nest **and wait for it to have stopped**, so its redb lock is released.
-async fn shutdown_and_settle(rt: indexer::NestRuntime) {
-    rt.ingest.abort();
-    let _ = (&mut { rt.ingest }).await;
-    if let Some(w) = rt.alert_worker {
-        w.abort();
-        let _ = w.await;
-    }
 }
 
 fn shutdown(rt: indexer::NestRuntime) {
@@ -789,7 +779,7 @@ async fn a_restarted_entity_is_rebuilt_from_stored_history_with_no_rpc() {
     let first = spawn_with_entity(dir.path(), tape.clone(), CHAIN_LEN).await;
     let before = relation(&first);
     assert!(!before.is_empty(), "the first run must actually fill it");
-    shutdown_and_settle(first).await;
+    first.shutdown().await.expect("the nest stops");
 
     // Restart over the same directory. Nothing new to index, so any `logs` call the restart makes is
     // a historical one - which is exactly what #865 forbids.
@@ -798,7 +788,7 @@ async fn a_restarted_entity_is_rebuilt_from_stored_history_with_no_rpc() {
     let after = relation(&second);
     let unavailable = second.state.entities[0].unavailable().map(str::to_string);
     let applied = second.state.entities[0].applied_through();
-    shutdown_and_settle(second).await;
+    second.shutdown().await.expect("the nest stops");
 
     assert_eq!(
         unavailable, None,
@@ -827,7 +817,7 @@ async fn a_restarted_entity_is_rebuilt_from_stored_history_with_no_rpc() {
     let cold_dir = tempfile::tempdir().unwrap();
     let cold = spawn_with_entity(cold_dir.path(), tape, CHAIN_LEN).await;
     let clean = relation(&cold);
-    shutdown_and_settle(cold).await;
+    cold.shutdown().await.expect("the nest stops");
     assert_eq!(
         after, clean,
         "criterion 5: a seeded entity matches uninterrupted execution"
@@ -853,7 +843,7 @@ async fn a_seeded_entity_includes_the_sealed_range_the_hot_store_no_longer_holds
     }
     tape.advance_tip_to(10);
     let first = spawn_with_entity(dir.path(), tape.clone(), 10).await;
-    shutdown_and_settle(first).await;
+    first.shutdown().await.expect("the nest stops");
 
     // The tip path will not seal eight rows (#1067). This test is about the entity
     // seed reading Parquet, not about maybe_seal, so the range is sealed through the
@@ -904,12 +894,12 @@ async fn a_seeded_entity_includes_the_sealed_range_the_hot_store_no_longer_holds
     let before = relation(&first);
     assert!(!before.is_empty());
     drop(store);
-    shutdown_and_settle(first).await;
+    first.shutdown().await.expect("the nest stops");
 
     let second = spawn_with_entity(dir.path(), tape.clone(), 14).await;
     let after = relation(&second);
     let unavailable = second.state.entities[0].unavailable().map(str::to_string);
-    shutdown_and_settle(second).await;
+    second.shutdown().await.expect("the nest stops");
 
     assert_eq!(unavailable, None, "the seed must have succeeded");
     assert_eq!(
@@ -962,7 +952,7 @@ async fn explain_binds_a_maintained_relation_on_a_cold_connection() {
     let (status, body) = get_json(&rt, "/explain?q=SELECT%20*%20FROM%20no_such_relation").await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
 
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 /// **The series an operator alerts on.** There were none until the alpha: a maintained relation had
@@ -1035,7 +1025,7 @@ async fn the_metrics_endpoint_carries_the_entity_series() {
         );
     }
 
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 /// **#822 criterion 6.** *"A query returning every maintained row still pays for those output rows
@@ -1093,7 +1083,7 @@ max_rows = 10000
         "and a capped result must say so rather than looking complete: {body}"
     );
 
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 /// **#822 criterion 10, the local half.** An edited definition rebuilds from the facts already on
@@ -1130,7 +1120,7 @@ max_rows = 10000
         !relation(&first).is_empty(),
         "the first run must actually fill it"
     );
-    shutdown_and_settle(first).await;
+    first.shutdown().await.expect("the nest stops");
 
     // Edit the definition. Nothing new to index, so any `logs` call is a historical re-fetch.
     let calls_before = tape.logs_call_count();
@@ -1140,7 +1130,7 @@ max_rows = 10000
     let rebuilt = relation(&second);
     let unavailable = second.state.entities[0].unavailable().map(str::to_string);
     let applied = second.state.entities[0].applied_through();
-    shutdown_and_settle(second).await;
+    second.shutdown().await.expect("the nest stops");
 
     assert_eq!(
         name, "sent",
@@ -1234,7 +1224,7 @@ max_rows = 10000
         !neighbour_before.is_empty(),
         "the neighbour must actually hold something"
     );
-    shutdown_and_settle(first).await;
+    first.shutdown().await.expect("the nest stops");
 
     let calls_before = tape.logs_call_count();
     let second = spawn_declared(dir.path(), tape.clone(), CHAIN_LEN, EDITED).await;
@@ -1264,7 +1254,7 @@ max_rows = 10000
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    shutdown_and_settle(second).await;
+    second.shutdown().await.expect("the nest stops");
 
     assert_eq!(names, vec!["received", "senders"]);
     for (i, (unavailable, fault, applied)) in states.iter().enumerate() {
@@ -1469,7 +1459,7 @@ async fn the_sql_route_serves_the_relation_by_name_and_says_where_it_came_from()
     assert_eq!(p["applied_through"], CHAIN_LEN);
     assert_eq!(p["current"], true);
 
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1507,7 +1497,7 @@ async fn a_derived_keyed_read_answers_from_maintained_state_with_provenance() {
     assert_eq!(entity.unavailable(), None);
     assert_eq!(entity.fault(), None);
 
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 /// #1437, end to end through `spawn_nest`: an entity joining an offchain table starts with the
@@ -1559,12 +1549,12 @@ async fn an_offchain_snapshot_dropped_while_running_reaches_the_entity_and_survi
         "account 2 is now both"
     );
     let before = relation(&rt);
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 
     let warm = spawn_declared(dir.path(), tape, 6, BY_TIER).await;
     let after = relation(&warm);
     let (_, applied) = warm.state.entities[0].len_and_watermark();
-    shutdown_and_settle(warm).await;
+    warm.shutdown().await.expect("the nest stops");
     assert_eq!(after, before, "a warm restart seeds the snapshots back");
     assert_eq!(applied.offchain["tiers"].snapshots, 2);
 }
@@ -1648,7 +1638,7 @@ async fn an_answer_that_read_offchain_data_says_it_is_reproducible_by_snapshot()
         doc.contains("reads offchain__tiers: reproducible by snapshot"),
         "{doc}"
     );
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 /// #1437's proof. Sealed chain facts, a hot tail, and two append-only price snapshots: after each
@@ -1716,7 +1706,7 @@ max_rows = 10000
     tape.advance_tip_to(10);
     prices("first", &[("USDC", 100_000_000)]);
     let first = spawn_declared(dir.path(), tape.clone(), 10, PRICED).await;
-    shutdown_and_settle(first).await;
+    first.shutdown().await.expect("the nest stops");
     {
         let store = nuthatch::store::Store::open(&dir.path().join("nuthatch.redb")).unwrap();
         let rows = store.entities_in_range(1, 8).unwrap();
@@ -1776,7 +1766,7 @@ max_rows = 10000
         "the second snapshot changed nothing, so the comparison is vacuous"
     );
     assert!(two.iter().any(|(k, _)| k == "USDCe"), "{two:?}");
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 /// From the 3.13.1 hardening pass: every maintained cell reached `/sql` as text, so a `COUNT(*)`
@@ -1850,7 +1840,7 @@ async fn a_maintained_count_is_numeric_in_sql() {
         one("SELECT typeof(n) AS t FROM counts ORDER BY n LIMIT 1").await["t"],
         "DECIMAL(38,0)"
     );
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 /// Astra's third review of #1583: the declarations a nest started from type its relations, even when
@@ -1872,7 +1862,7 @@ async fn a_file_broken_before_the_first_query_keeps_the_started_types() {
     let (status, body) = get_json(&rt, &format!("/sql?q={}", urlencoding_lite(sql))).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["t"], "DECIMAL(38,0)", "{body}");
-    shutdown_and_settle(rt).await;
+    rt.shutdown().await.expect("the nest stops");
 }
 
 /// The same quarantine when the fault lands on the **last** window and no block follows. An entity

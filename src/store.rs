@@ -408,6 +408,9 @@ pub trait HotStore: Send + Sync {
         checkpoint: Option<(u64, String)>,
         last_block: u64,
     ) -> Result<()>;
+    /// Return once no [`HotStore::commit_window_blocking`] is still committing, including one
+    /// whose caller was aborted.
+    async fn settle_commits(&self);
     fn rollback_to(&self, block: u64) -> Result<u64>;
     fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64>;
     fn prune_range(&self, from: u64, to: u64) -> Result<u64>;
@@ -466,11 +469,39 @@ pub trait HotStore: Send + Sync {
     async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()>;
     fn outbox_len(&self) -> u64;
     fn outbox_trim(&self, max: u64) -> Result<u64>;
+
+    /// Resolves once every handle on this store's file has dropped and the file may be opened
+    /// again. Take it before dropping your own handle. A backend with no local file resolves at once.
+    fn released(&self) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// The open database and the signal its last handle sends by dropping.
+struct OpenDb {
+    db: Database,
+    // After `db`: fields drop in order, so the lock is gone before a waiter hears of it.
+    _released: tokio::sync::watch::Sender<()>,
+}
+
+impl OpenDb {
+    fn share(db: Database) -> (Arc<OpenDb>, tokio::sync::watch::Receiver<()>) {
+        let (tx, rx) = tokio::sync::watch::channel(());
+        (Arc::new(OpenDb { db, _released: tx }), rx)
+    }
+}
+
+impl std::ops::Deref for OpenDb {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        &self.db
+    }
 }
 
 #[derive(Clone)]
 pub struct Store {
-    db: Arc<Database>,
+    db: Arc<OpenDb>,
+    released: tokio::sync::watch::Receiver<()>,
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
     /// the same owner. `0` means unclaimed, which disables enforcement entirely.
     held: Arc<std::sync::atomic::AtomicU64>,
@@ -478,13 +509,23 @@ pub struct Store {
     /// analytical memo keys on it (#1186): two `/sql` requests separated by no commit read the
     /// same hot rows, and it is this counter rather than a scan of them that says so.
     writes: Arc<std::sync::atomic::AtomicU64>,
+    /// Held for the whole of a blocking-pool commit, which outlives an abort of the task that
+    /// started it (#1767). [`HotStore::settle_commits`] waits on it.
+    commit_gate: Arc<tokio::sync::Mutex<()>>,
     /// Bytes of the largest `entities_in_range` answer, so a test can hold sealing to reading a cut.
     #[cfg(test)]
     pub(crate) largest_range_read: Arc<std::sync::atomic::AtomicUsize>,
     /// Rows visited by the longest single `scan_entities_in_range`, for the same reason.
     #[cfg(test)]
     pub(crate) largest_scan_rows: Arc<std::sync::atomic::AtomicUsize>,
+    /// When set, a blocking commit signals the sender and parks on the receiver before committing.
+    #[cfg(test)]
+    pub(crate) commit_hold: CommitHold,
 }
+
+#[cfg(test)]
+pub(crate) type CommitHold =
+    Arc<std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>;
 
 /// Does the store at `path` hold indexed rows, as opposed to merely existing?
 ///
@@ -625,14 +666,19 @@ impl Store {
                 })?;
             }
         }
+        let (db, released) = OpenDb::share(db);
         Ok(Store {
-            db: Arc::new(db),
+            db,
+            released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            commit_gate: Arc::default(),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            commit_hold: Arc::default(),
         })
     }
 
@@ -686,14 +732,19 @@ impl Store {
             }
         }
         wtx.commit()?;
+        let (db, released) = OpenDb::share(db);
         Ok(Store {
-            db: Arc::new(db),
+            db,
+            released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            commit_gate: Arc::default(),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            commit_hold: Arc::default(),
         })
     }
 
@@ -951,7 +1002,14 @@ impl Store {
         last_block: u64,
     ) -> Result<()> {
         let store = self.clone();
+        let gate = self.commit_gate.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            #[cfg(test)]
+            if let Some((entered, release)) = store.commit_hold.lock().unwrap().as_ref() {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
             let cp = checkpoint.as_ref().map(|(b, h)| (*b, h.as_str()));
             store.commit_window(&entities, cp, last_block)
         })
@@ -1563,6 +1621,14 @@ impl Store {
 
 #[async_trait::async_trait]
 impl HotStore for Store {
+    fn released(&self) -> futures::future::BoxFuture<'static, ()> {
+        let mut rx = self.released.clone();
+        // Nothing is ever sent, so this returns only once the sender has dropped.
+        Box::pin(async move {
+            let _ = rx.changed().await;
+        })
+    }
+
     fn write_generation(&self) -> Option<u64> {
         // Odd means a commit is in flight: see `Store::commit`.
         let g = self.writes.load(std::sync::atomic::Ordering::SeqCst);
@@ -1819,6 +1885,9 @@ impl HotStore for Store {
     ) -> Result<()> {
         Store::commit_window_blocking(self, entities, checkpoint, last_block).await
     }
+    async fn settle_commits(&self) {
+        drop(self.commit_gate.lock().await);
+    }
     async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
         Store::outbox_remove_batch_blocking(self, seqs).await
     }
@@ -1841,6 +1910,9 @@ fn unix_now() -> i64 {
 /// behind an `Arc` by construction. Sharing a store is not a different capability from having one.
 #[async_trait::async_trait]
 impl<T: HotStore + ?Sized> HotStore for Arc<T> {
+    fn released(&self) -> futures::future::BoxFuture<'static, ()> {
+        (**self).released()
+    }
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
         (**self).put_entity(key, json)
     }
@@ -2010,6 +2082,9 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
         (**self)
             .commit_window_blocking(entities, checkpoint, last_block)
             .await
+    }
+    async fn settle_commits(&self) {
+        (**self).settle_commits().await
     }
     async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
         (**self).outbox_remove_batch_blocking(seqs).await

@@ -115,9 +115,8 @@ async fn index_once(root: &Path) -> (usize, std::path::PathBuf, u64) {
     assert!(sealed, "did not seal in time");
     let watermark = store.sealed_through();
 
-    cursor.shutdown().await;
-    // Let the aborted holders drop, so the next bring-up can open the store.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(store);
+    cursor.shutdown().await.expect("the cursor stops");
     (tape.logs_call_count(), ds.dir.clone(), watermark)
 }
 

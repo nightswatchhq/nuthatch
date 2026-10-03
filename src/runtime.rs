@@ -4252,6 +4252,7 @@ impl RuntimeHandles {
             return self.recompose_after_unmount(name);
         }
 
+        let released = self.states[idx].1.store.released();
         self.drain_cursor_nest(&chain, &cursor_key, name).await?;
         self.health.unregister(name);
         self.health.unregister(&cursor_key);
@@ -4264,7 +4265,9 @@ impl RuntimeHandles {
         crate::metrics::METRICS.remove_nest(&cursor_key);
         crate::metrics::METRICS.remove_nest(name);
         self.recompose_after_unmount(name)?;
-        Ok(())
+        // An in-flight request, or a delivery the aborted alert worker had handed to the blocking
+        // pool, still holds the store; a remount of this dataset before it lets go fails (#1764).
+        indexer::await_store_release(released, &dataset_dir).await
     }
 
     /// The mounts other than `name` on the dataset behind `store`, the first of which inherits its key.
@@ -4416,13 +4419,18 @@ impl RuntimeHandles {
         {
             m.nid = nid.as_str().to_string();
         }
-        if !old_shared {
+        let released = (!old_shared).then(|| {
             crate::analytics::invalidate_session_cache(&old_state.dir);
-        }
-        drop(old_state);
+            (old_state.store.released(), old_state.dir.clone())
+        });
+        drop((old_state, old_store));
         self.recompose()?;
         tracing::info!("'{name}' moved to nid {nid}");
-        Ok(())
+        match released {
+            // A move back to the old NID reopens this store (#1764).
+            Some((released, dir)) => indexer::await_store_release(released, &dir).await,
+            None => Ok(()),
+        }
     }
 
     /// Take a nest off its cursor and stop its alert worker, waiting for both to let go of its store
