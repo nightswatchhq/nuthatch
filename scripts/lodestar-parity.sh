@@ -9,8 +9,15 @@
 #   0  parity CLEAN - every comparison ran and agreed
 #   2  parity NOT CLEAN - every gated comparison agreed, known differences remain (#1116, #1114)
 #   1  anything else, including a genuine disagreement and any failure to compare
+#   3  head mode only: the subgraph could not be asked at the nest's head, so nothing was compared
 # 0 is the only status that means parity. 2 exists so "agrees" is distinguishable from
 # "agrees on the parts we check", which is the distinction the epoch fields cost us.
+#
+# PARITY_MODE=sealed (the default) pins at the nest's sealed_through. PARITY_MODE=head (#1718) pins
+# at its last_block, inside the hot window, and needs the subgraph's _meta.block.number at or above
+# it; a subgraph or a gateway-routed indexer short of that head is exit 3, not a pass. The pin
+# itself must not move during the run: last_block may not fall below it, and the nest's counts at
+# the pin are read again afterwards and must not have changed.
 #
 # The first run compared incomparable populations (all-time subgraph totals vs
 # Horizon-only nest views) and reported four DIFFs that were not row disagreements.
@@ -29,6 +36,7 @@ set -euo pipefail
 # graph-allocations-nest-next on the Lodestar box. 8105 was its predecessor and no longer answers.
 NEST=${NEST_URL:-http://127.0.0.1:8107}
 BLOCK=${PINNED_BLOCK:-}
+MODE=${PARITY_MODE:-sealed}
 NETWORK_SG=DZz4kDTdmzWLWsV373w2bSmoar3umKKH9y82SUKr5qmp
 GATEWAY=${GRAPH_GATEWAY:-https://gateway-arbitrum.network.thegraph.com}
 
@@ -49,6 +57,11 @@ esac
 
 die() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 [ -z "${die_early:-}" ] || die "EPOCH_PARITY_FROM must be a decimal epoch, got ${EPOCH_PARITY_FROM}"
+case "$MODE" in
+  sealed) ;;
+  head) [ -z "$BLOCK" ] || die "PINNED_BLOCK cannot be combined with PARITY_MODE=head, which pins at last_block" ;;
+  *) die "PARITY_MODE must be sealed or head, got ${MODE}" ;;
+esac
 
 if [ -n "$BLOCK" ]; then
   case "$BLOCK" in
@@ -76,7 +89,23 @@ PY
 # monotonic in block, and fees and signal bucket by `block_number` inside a window that closes as
 # soon as the successor epoch is first observed. An epoch whose successor is already visible at the
 # pin cannot change. Only the newest epoch is open, and it is excluded below.
-if [ -z "$BLOCK" ]; then
+VERSION=$(python3 - "$ready" << 'PY'
+import json,sys
+print(json.loads(sys.argv[1]).get("version") or "unknown")
+PY
+)
+
+if [ "$MODE" = head ]; then
+  BLOCK=$(python3 - "$ready" << 'PY'
+import json,sys
+n=json.loads(sys.argv[1]).get("last_block") or 0
+if not n:
+    raise SystemExit(1)
+print(int(n))
+PY
+) || die "last_block is missing so there is no head to pin"
+  echo "PINNED_BLOCK set to last_block=$BLOCK (head mode)"
+elif [ -z "$BLOCK" ]; then
   BLOCK=$(python3 - "$ready" << 'PY'
 import json,sys
 d=json.loads(sys.argv[1])
@@ -104,7 +133,10 @@ EOF
 # sides describe immutable history. A pin *older* than the current watermark satisfies that more
 # strongly, not less - more of it is settled. Demanding equality made every run a race against the
 # sealer, which is a poor property for a check billed as continuous.
-[ "$NEST_SEALED" -ge "$BLOCK" ] || die "PINNED_BLOCK=$BLOCK is above sealed_through=$NEST_SEALED, so it is not settled history"
+if [ "$MODE" = sealed ]; then
+  [ "$NEST_SEALED" -ge "$BLOCK" ] || die "PINNED_BLOCK=$BLOCK is above sealed_through=$NEST_SEALED, so it is not settled history"
+fi
+echo "PIN mode=$MODE block=$BLOCK version=$VERSION"
 
 nest_count() {
   local view="$1" col="$2"
@@ -148,11 +180,21 @@ DISPUTE_N=$(nest_count lodestar_disputes created_at_block)
 ESCROW_N=$(nest_count lodestar_escrow_transactions block_number)
 
 export ALLOC_N EPOCH_N DISPUTE_N ESCROW_N BLOCK NETWORK_SG GATEWAY GRAPH_API_KEY NEST EPOCH_PARITY_FROM
-python3 - << 'PY' || die "subgraph comparison failed"
+export PARITY_MODE=$MODE
+cmp_rc=0
+python3 - << 'PY' || cmp_rc=$?
 import json, os, sys, urllib.parse, urllib.request
 
 key = os.environ["GRAPH_API_KEY"]
 block = int(os.environ["BLOCK"])
+head_mode = os.environ["PARITY_MODE"] == "head"
+
+
+def not_measured(why):
+    print("NOT MEASURED at head %s: %s" % (block, why), file=sys.stderr)
+    raise SystemExit(3)
+
+
 sg = os.environ["NETWORK_SG"]
 gateway = os.environ["GATEWAY"].rstrip("/")
 nest = os.environ["NEST"].rstrip("/")
@@ -176,6 +218,9 @@ def gql(query):
         raise SystemExit("subgraph HTTP %s: %s" % (e.code, e.read()[:300].decode(errors="replace")))
     d = json.loads(body)
     if d.get("errors"):
+        # The gateway may answer `_meta` from one indexer and a pinned query from another behind it.
+        if head_mode and "indexed up to block" in json.dumps(d["errors"]):
+            not_measured("an indexer behind the gateway is short of the pin: %s" % d["errors"])
         raise SystemExit("subgraph graphql error: %s" % d["errors"])
     if not d.get("data"):
         raise SystemExit("subgraph returned no data: %s" % body[:300])
@@ -237,6 +282,8 @@ if sg_block is None:
     raise SystemExit("subgraph _meta.block.number missing, so the pin cannot be checked")
 sg_block = int(sg_block)
 print("subgraph _meta.block.number=%s pin=%s" % (sg_block, block))
+if sg_block < block and head_mode:
+    not_measured("the subgraph's head %s is below the nest's" % sg_block)
 if sg_block < block:
     raise SystemExit(
         "subgraph head %s is below pin %s: a match here would not be a comparison at that block"
@@ -801,12 +848,17 @@ with open(os.environ["EPOCH_SUMMARY"], "w") as fh:
 if failed:
     raise SystemExit("nest and subgraph disagree at block %s" % block)
 PY
+if [ "$cmp_rc" -eq 3 ] && [ "$MODE" = head ]; then
+  echo "parity NOT MEASURED at head $BLOCK: the two sides could not be brought to the same head"
+  exit 3
+fi
+[ "$cmp_rc" -eq 0 ] || die "subgraph comparison failed"
 
 # `/sql` reads the live aggregate. The pre-read sealed boundary is immutable; this post-read check
 # rejects any progress, so the comparison cannot mix that sealed snapshot with later hot state.
 ready_after=$(curl -fsS -m10 -A 'nuthatch-lodestar-parity' "$NEST/ready" || true)
 [ -n "$ready_after" ] || die "nest at $NEST did not answer /ready after comparison"
-read -r _AFTER_BLOCK AFTER_SEALED <<EOF
+read -r AFTER_BLOCK AFTER_SEALED <<EOF
 $(python3 - "$ready_after" << 'PY'
 import json,sys
 d=json.loads(sys.argv[1])
@@ -822,16 +874,34 @@ EOF
 # past the pin, or a nest that lost sealed state - and `-ge` still catches exactly that. Under `-eq`
 # this failed a run in which every comparison had already passed, purely because the nest sealed a
 # batch while the escrow join was paging.
-[ "$AFTER_SEALED" -ge "$BLOCK" ] || die "sealed boundary went backwards during comparison: $BLOCK -> $AFTER_SEALED"
+if [ "$MODE" = sealed ]; then
+  [ "$AFTER_SEALED" -ge "$BLOCK" ] || die "sealed boundary went backwards during comparison: $BLOCK -> $AFTER_SEALED"
+else
+  # The hot window can reorg under the pin. A head that moved under the comparison is a comparison
+  # of two states, so it is not measured rather than passed.
+  if [ "$AFTER_BLOCK" -lt "$BLOCK" ]; then
+    echo "parity NOT MEASURED at head $BLOCK: last_block fell to $AFTER_BLOCK during the comparison"
+    exit 3
+  fi
+  for pair in "lodestar_allocations created_at_block $ALLOC_N" "lodestar_epochs start_block $EPOCH_N" \
+    "lodestar_disputes created_at_block $DISPUTE_N" "lodestar_escrow_transactions block_number $ESCROW_N"; do
+    set -- $pair
+    now=$(nest_count "$1" "$2")
+    if [ "$now" != "$3" ]; then
+      echo "parity NOT MEASURED at head $BLOCK: $1 at the pin went from $3 to $now during the comparison"
+      exit 3
+    fi
+  done
+fi
 read -r EPOCH_GATED EPOCH_KNOWN < "$EPOCH_SUMMARY"
 echo "  proved: allocation counts, dispute id sets, escrow rows joined by id, and the epoch reward trio over ${EPOCH_GATED} closed epochs"
 if [ "$EPOCH_KNOWN" = "-" ]; then
-  echo "parity CLEAN at block $BLOCK"
+  echo "parity CLEAN at block $BLOCK ($MODE)"
   exit 0
 fi
 # Every gated comparison agreed, and three epoch fields still do not. Reporting that as OK would be
 # the same fault this script was rewritten to remove, one level up: a known absence of proof reading
 # as proof. Distinct exit status, so an operator can tell "agrees" from "agrees on what we check".
 echo "  NOT proved: ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1116 and #1114"
-echo "parity NOT CLEAN at block $BLOCK: gated comparisons agree, known differences outstanding"
+echo "parity NOT CLEAN at block $BLOCK ($MODE): gated comparisons agree, known differences outstanding"
 exit 2
