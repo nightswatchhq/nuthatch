@@ -100,8 +100,12 @@ fn out(r: &Rig, mode: &str, body: &str) {
 }
 
 fn run(r: &Rig) -> (i32, String) {
-    let o = Command::new("bash")
-        .arg(root().join("deploy/parity/nuthatch-parity.sh"))
+    run_with(r, &[])
+}
+
+fn run_with(r: &Rig, extra: &[(&str, &str)]) -> (i32, String) {
+    let mut cmd = Command::new("bash");
+    cmd.arg(root().join("deploy/parity/nuthatch-parity.sh"))
         .env("PATH", &r.path)
         .env("FAKE_STATE", &r.state)
         .env("PARITY_SCRIPT", &r.parity)
@@ -110,8 +114,11 @@ fn run(r: &Rig) -> (i32, String) {
         .env("PARITY_LOG_DIR", &r.logs)
         .env("PARITY_HEAD_RETRY_SECS", "0")
         .env_remove("GRAPH_API_KEY")
-        .output()
-        .expect("run nuthatch-parity.sh");
+        .env_remove("PARITY_MODES");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let o = cmd.output().expect("run nuthatch-parity.sh");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&o.stdout),
@@ -295,6 +302,15 @@ fn a_missing_key_pages_rather_than_passing() {
         !r.state.join("calls").exists(),
         "the comparison ran without a key"
     );
+}
+
+#[test]
+fn an_empty_mode_list_is_not_a_pass() {
+    let r = rig();
+    let (code, text) = run_with(&r, &[("PARITY_MODES", " ")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("PARITY_MODES is empty"), "{text}");
+    assert_eq!(posts(&r).len(), 1, "{text}");
 }
 
 #[test]

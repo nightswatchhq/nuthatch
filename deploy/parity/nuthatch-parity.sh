@@ -65,6 +65,7 @@ fail() {
   exit 1
 }
 
+[ -n "${modes// /}" ] || fail "PARITY_MODES is empty, so no comparison would run"
 for m in $modes; do
   case "$m" in sealed | head) ;; *) fail "unknown mode $m in PARITY_MODES" ;; esac
 done
