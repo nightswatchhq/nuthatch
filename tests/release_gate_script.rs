@@ -497,6 +497,46 @@ fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
     );
 }
 
+/// #1773: production serves two statements at once. At `--concurrency 2` the set goes out a pair at
+/// a time, both statements of a pair in flight together, and each keeps its own row and time.
+#[test]
+fn at_concurrency_two_a_pair_is_in_flight_together_and_both_are_recorded() {
+    let c = case();
+    // Slow enough on eight rows that two run one after the other cannot overlap by accident.
+    let slow = |salt: u32| {
+        let from: Vec<String> = (0..7).map(|i| format!("\"{}\" t{i}", c.table)).collect();
+        format!(
+            "SELECT count(DISTINCT {}) AS n FROM {}",
+            (0..7)
+                .map(|i| format!("t{i}.block_number * {}", 10u64.pow(i) + u64::from(salt)))
+                .collect::<Vec<_>>()
+                .join(" + "),
+            from.join(", ")
+        )
+    };
+    let set = c.set(&[("first", slow(0)), ("second", slow(1))]);
+    let (out, text) = c.gate(&set, &["--concurrency", "2"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("concurrency 2"), "{text}");
+    for id in ["first", "second"] {
+        let line = line_for(&text, id);
+        assert!(line.starts_with("ok "), "{line}");
+        assert_eq!(line.split_whitespace().nth(2), Some("1"), "{line}");
+    }
+
+    // group<TAB>id<TAB>start ms<TAB>end ms, one line per statement sent.
+    let schedule = std::fs::read_to_string(c.dir.path().join("out/schedule-pass-1.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = schedule.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 2, "{schedule}");
+    assert_eq!(rows[0][0], rows[1][0], "one pair, one group: {schedule}");
+    let span = |r: &Vec<&str>| (r[2].parse::<u64>().unwrap(), r[3].parse::<u64>().unwrap());
+    let ((s0, e0), (s1, e1)) = (span(&rows[0]), span(&rows[1]));
+    assert!(
+        s0 < e1 && s1 < e0,
+        "the pair ran one after the other, not together: {schedule}"
+    );
+}
+
 /// A copy without its redb serves no sealed history; that is a broken rig, not a verdict on the
 /// binary, so it exits 2 rather than 1 and never starts a server.
 #[test]
