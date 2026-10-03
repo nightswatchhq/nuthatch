@@ -336,31 +336,40 @@ fn a_regression_past_the_bound_fails_and_one_inside_it_does_not() {
 }
 
 impl Case {
-    /// Defines `gate_probe` over the fixture table. `wrong` stands in for a candidate that answers
-    /// block 5 as 50, returns its rows in the reverse order, and is 1e-13 off on a float.
+    /// Defines `gate_probe` over the fixture table and `gate_rows` over literals. `wrong` stands
+    /// in for a candidate that answers block 5 as 50, sorts on `s` the other way round, is 1e-13
+    /// off on a float, and returns `gate_rows` in the reverse order: a view's own ORDER BY is not
+    /// kept, but a VALUES list's order is.
     fn probe(&self, wrong: bool) {
         let views = self.nest.join("views");
         std::fs::create_dir_all(&views).unwrap();
-        let (block, s, third) = if wrong {
+        let (block, s, third, rows) = if wrong {
             (
                 "CASE WHEN block_number = 5 THEN 50 ELSE block_number END",
                 "100 - CAST(block_number AS BIGINT)",
                 "CAST(block_number AS DOUBLE) / 3 + CAST(0.0000000000001 AS DOUBLE)",
+                "(3, 'c'), (2, 'b'), (1, 'a')",
             )
         } else {
             (
                 "block_number",
-                "block_number",
+                "CAST(block_number AS BIGINT)",
                 "CAST(block_number AS DOUBLE) / 3",
+                "(1, 'a'), (2, 'b'), (3, 'c')",
             )
         };
         std::fs::write(
             views.join("90-gate-probe.sql"),
             format!(
                 "CREATE VIEW gate_probe AS SELECT {block} AS block, {s} AS s, {third} AS third \
-                 FROM \"{}\" ORDER BY s;\n",
+                 FROM \"{}\";\n",
                 self.table
             ),
+        )
+        .unwrap();
+        std::fs::write(
+            views.join("91-gate-rows.sql"),
+            format!("CREATE VIEW gate_rows AS SELECT * FROM (VALUES {rows}) AS v(k, label);\n"),
         )
         .unwrap();
     }
@@ -388,8 +397,8 @@ impl Case {
 
 /// #1772: a statement that answers, but not what production answered, fails and is named, with
 /// the first row at which the two differ. Row order is part of the answer only under a top-level
-/// ORDER BY: the same statement without one passes with its rows reversed, and a float 1e-13 off
-/// is equal to 12 significant digits.
+/// ORDER BY: a statement without one passes with its rows reversed (the quoted ORDER BY is a
+/// literal, not a clause), and a float 1e-13 off is equal to 12 significant digits.
 #[test]
 fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row() {
     let c = case();
@@ -401,8 +410,9 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
         ),
         (
             "unordered",
-            "SELECT third FROM gate_probe WHERE 'ORDER BY' <> ''".to_string(),
+            "SELECT k, label FROM gate_rows WHERE 'ORDER BY' <> ''".to_string(),
         ),
+        ("float", "SELECT third FROM gate_probe".to_string()),
     ]);
     let (out, text) = c.against_a_wrong_candidate(&set);
     assert_eq!(out.status.code(), Some(1), "{text}");
@@ -427,6 +437,10 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
         "only the order differs, and it has no top-level ORDER BY:\n{text}"
     );
     assert!(
+        line_for(&text, "float").starts_with("ok "),
+        "equal to 12 significant digits:\n{text}"
+    );
+    assert!(
         text.contains("RESULT: FAIL - answer differs: value, ordered"),
         "{text}"
     );
@@ -441,7 +455,7 @@ fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
         ("changing", "SELECT block FROM gate_probe".to_string()),
         (
             "unordered",
-            "SELECT third FROM gate_probe WHERE 'ORDER BY' <> ''".to_string(),
+            "SELECT k, label FROM gate_rows WHERE 'ORDER BY' <> ''".to_string(),
         ),
     ]);
     let body = std::fs::read_to_string(&set).unwrap();
