@@ -10,6 +10,15 @@
 use crate::registry::TableSchema;
 use crate::semantic::derive_footguns;
 
+/// The engine ran out of its memory budget. Binder/parser/catalog echoes of the phrase are the
+/// caller's text, not an OOM.
+pub fn is_out_of_memory(raw: &str) -> bool {
+    raw.contains("Out of Memory Error")
+        && !raw.contains("Binder Error")
+        && !raw.contains("Parser Error")
+        && !raw.contains("Catalog Error")
+}
+
 /// Classify a DuckDB error for `query` against the nest `schema`, returning an actionable hint if the
 /// failure matches a known class (`None` otherwise - an unrecognised error is relayed raw, unadorned).
 /// The classes mirror the RFC-0016 §4 table; each is matched off DuckDB's real message text.
@@ -180,12 +189,7 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
     // but it would put an unbounded, caller-triggered sweep on the query path - the cost bound #476
     // and #478 are already about, reachable by anyone who can send a query.
     // RFC-0047 C4: a query that cannot run in its budget names the keys. Ingestion is not degraded.
-    // Binder/parser/catalog echoes of the phrase are the caller's text, not an OOM.
-    if raw.contains("Out of Memory Error")
-        && !raw.contains("Binder Error")
-        && !raw.contains("Parser Error")
-        && !raw.contains("Catalog Error")
-    {
+    if is_out_of_memory(raw) {
         if raw.contains("max_temp_directory_size") {
             return Some(
                 "this query exceeded analytics.max_temp_size (NUTHATCH_ANALYTICS_MAX_TEMP_SIZE). \

@@ -64,18 +64,80 @@ ready_field() {
     sed -E 's/^[^:]*:[[:space:]]*//; s/"//g' || true
 }
 
+# Polls /ready until it reports version $2 and ready; the last answer is left in READY_BODY.
+await_version() {
+  local port=$1 want=$2
+  READY_BODY=""
+  for _ in $(seq 1 60); do
+    sleep "${ROLL_POLL_SECS:-2}"
+    READY_BODY=$(curl -sS -m5 "http://$port/ready" 2>/dev/null || true)
+    [ "$(ready_field "$READY_BODY" version)" = "$want" ] &&
+      [ "$(ready_field "$READY_BODY" ready)" = true ] && return 0
+  done
+  return 1
+}
+
+# One statement per line; blank lines and `--` comments are skipped.
+smoke_statements() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    case "$line" in '' | --*) continue ;; esac
+    printf '%s\n' "$line"
+  done <"$1"
+}
+
+# Prints why the unit refused the statement and returns 1, or prints nothing. Ready means indexing,
+# not serving: on 2026-10-03 every unit was ready while one refused Lodestar's heaviest view (#1750).
+smoke_one() {
+  local port=$1 q=$2 out code body re='"error"[[:space:]]*:'
+  out=$(curl -sS -m "${SMOKE_TIMEOUT_SECS:-300}" --get "http://$port/sql" \
+    --data-urlencode "q=$q" -w '\n%{http_code}' 2>&1) || { echo "curl failed: $out"; return 1; }
+  code=${out##*$'\n'}
+  body=${out%$'\n'*}
+  case "$code" in 2??) ;; *) echo "HTTP $code: ${body:0:400}"; return 1 ;; esac
+  if [[ $body =~ $re ]]; then echo "${body:0:400}"; return 1; fi
+  case "$body" in *"Out of Memory"*) echo "${body:0:400}"; return 1 ;; esac
+}
+
+ROLL_SAVED=""
+trap '[ -z "$ROLL_SAVED" ] || rm -f "$ROLL_SAVED"' EXIT
+
 cmd_roll() {
-  local u=$1 want=$2
+  local u=${1:?usage: roll <unit> <version> [--smoke <file>]} want=${2:?usage: roll <unit> <version> [--smoke <file>]}
+  shift 2
+  local smoke=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --smoke) smoke=${2:?--smoke needs a file}; shift 2 ;;
+      *) die "roll: unknown argument $1" ;;
+    esac
+  done
   local target="$BIN_DIR/nuthatch-$want"
   [ -x "$target" ] || die "$target is not installed; run 'install' first"
   local got
   got=$("$target" --version | awk '{print $2}')
   [ "$got" = "$want" ] || die "$target reports $got, not $want"
 
-  local port f before
+  local stmts=() q
+  if [ -n "$smoke" ]; then
+    [ -r "$smoke" ] || die "cannot read smoke file $smoke"
+    while IFS= read -r q; do stmts+=("$q"); done < <(smoke_statements "$smoke")
+    [ "${#stmts[@]}" -gt 0 ] || die "$smoke holds no statements - the smoke would examine nothing"
+  fi
+
+  local port f before prev prev_v
   port=$(unit_port "$u")
   f=$(execstart_file "$u") || die "$u: no file under $UNIT_DIR sets its ExecStart"
   before=$(ready_field "$(curl -sS -m5 "http://$port/ready" 2>/dev/null || true)" last_block)
+  prev=$(unit_binary "$u" || true)
+  if [ -n "$smoke" ]; then
+    prev_v=$([ -x "$prev" ] && "$prev" --version 2>/dev/null | awk '{print $2}' || true)
+    [ -n "$prev_v" ] || die "$u: cannot tell what version ${prev:-its binary} is, so a failed smoke could not be rolled back"
+    ROLL_SAVED=$(mktemp)
+    cp "$f" "$ROLL_SAVED"
+  fi
 
   # Point the unit at the VERSIONED path, whatever it named before, so `systemctl show` can answer
   # "which version is this" (#1060).
@@ -90,19 +152,36 @@ cmd_roll() {
 
   # Readiness flips false to true across any restart, a no-op roll included. The version /ready
   # reports is the one proof that the new binary is the one serving.
-  local s="" v="" r=""
-  for _ in $(seq 1 60); do
-    sleep "${ROLL_POLL_SECS:-2}"
-    s=$(curl -sS -m5 "http://$port/ready" 2>/dev/null || true)
-    v=$(ready_field "$s" version)
-    r=$(ready_field "$s" ready)
-    [ "$v" = "$want" ] && [ "$r" = true ] && break
-  done
+  await_version "$port" "$want" || true
+  local s=$READY_BODY v r
+  v=$(ready_field "$s" version)
+  r=$(ready_field "$s" ready)
   [ "$(systemctl is-active "$u")" = active ] || die "$u is not active after restart"
   [ -n "$s" ] || die "$u never answered /ready"
   [ "$v" = "$want" ] || die "$u reports version ${v:-none} on /ready, not $want"
   [ "$r" = true ] || die "$u is on $want but not ready: $s"
+
+  local why=""
+  if [ -n "$smoke" ]; then
+    for q in "${stmts[@]}"; do
+      why=$(smoke_one "$port" "$q") && continue
+      why="$q -> $why"
+      break
+    done
+  fi
+  if [ -n "$why" ]; then
+    printf '\033[31mFAIL\033[0m %s: smoke on %s: %s\n' "$u" "$want" "$why" >&2
+    cat "$ROLL_SAVED" >"$f"
+    systemctl daemon-reload
+    [ "$(unit_binary "$u")" = "$prev" ] \
+      || die "$u: smoke failed and systemd would run $(unit_binary "$u") after restoring $f, not $prev"
+    systemctl restart "$u"
+    await_version "$port" "$prev_v" \
+      || die "$u: smoke failed and the rollback to $prev_v did not come back ready: $READY_BODY"
+    die "$u rolled back to $prev_v after its smoke failed on: $why"
+  fi
   ok "$u -> $want via $(basename "$f")   last_block ${before:-n/a} -> $(ready_field "$s" last_block)"
+  [ -z "$smoke" ] || ok "$u answered all ${#stmts[@]} statement(s) in $(basename "$smoke")"
 }
 
 # --- check --------------------------------------------------------------------------------------
@@ -181,7 +260,10 @@ case "${1:-}" in
   *) cat >&2 <<USAGE
 usage:
   deploy-nest.sh install <path-to-binary> <version>   install and verify it reports that version
-  deploy-nest.sh roll    <unit> <version>             point the unit at the versioned path, restart, verify
+  deploy-nest.sh roll    <unit> <version> [--smoke <file>]
+                                                      point the unit at the versioned path, restart, verify;
+                                                      then run each statement in <file> against /sql and
+                                                      roll back to the previous binary on any refusal
   deploy-nest.sh check                                what is every unit actually running
 USAGE
      exit 2 ;;

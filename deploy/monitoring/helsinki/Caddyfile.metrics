@@ -1,0 +1,13 @@
+# Append to Helsinki's /etc/caddy/Caddyfile. Tailnet only: `bind` keeps it off the public
+# interface. /<port>/metrics and /<port>/ready reach 127.0.0.1:<port>, for local nest ports only.
+http://100.82.188.91:9180 {
+	bind 100.82.188.91
+	@nest path_regexp nest ^/(81[0-9][0-9])/(metrics|ready)$
+	handle @nest {
+		rewrite * /{re.nest.2}
+		reverse_proxy 127.0.0.1:{re.nest.1}
+	}
+	handle {
+		respond 404
+	}
+}

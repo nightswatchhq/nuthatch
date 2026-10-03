@@ -1,0 +1,14 @@
+# The release gate's poll (#1749, docs/release-gate.md), as a systemd user unit on the ThinkPad.
+# Install: cp deploy/release-gate/release-gate.* ~/.config/systemd/user/
+#          systemctl --user daemon-reload && systemctl --user enable --now release-gate.timer
+#          loginctl enable-linger "$USER"   # so the timer runs without a login session
+[Unit]
+Description=nuthatch release gate: gate the newest ungated release against the allocations nest copy
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/nuthatch-ops
+ExecStart=%h/nuthatch-ops/scripts/release-gate-run.sh --poll
+# The QoS nest shares the box: the gate yields CPU and IO to it.
+Nice=10
+IOSchedulingClass=idle

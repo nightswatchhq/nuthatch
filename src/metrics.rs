@@ -24,16 +24,18 @@ pub enum SqlRejection {
     Bounded,
     Admission,
     Timeout,
+    OutOfMemory,
 }
 
 impl SqlRejection {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Busy,
         Self::TooLarge,
         Self::Invalid,
         Self::Bounded,
         Self::Admission,
         Self::Timeout,
+        Self::OutOfMemory,
     ];
 
     const fn index(self) -> usize {
@@ -44,6 +46,7 @@ impl SqlRejection {
             Self::Bounded => 3,
             Self::Admission => 4,
             Self::Timeout => 5,
+            Self::OutOfMemory => 6,
         }
     }
 
@@ -55,6 +58,7 @@ impl SqlRejection {
             Self::Bounded => "bounded",
             Self::Admission => "admission",
             Self::Timeout => "timeout",
+            Self::OutOfMemory => "out_of_memory",
         }
     }
 }
@@ -593,7 +597,7 @@ pub struct Metrics {
     sql_queries: AtomicU64,
     /// Backward-compatible aggregate of every member of `sql_rejections_by_reason`.
     sql_rejections: AtomicU64,
-    sql_rejections_by_reason: [AtomicU64; 6],
+    sql_rejections_by_reason: [AtomicU64; 7],
     /// Cumulative per [`NAMED_SCAN_BOUNDS`] entry, then `+Inf`.
     named_scan_buckets: [AtomicU64; 7],
     named_scan_bytes_sum: AtomicU64,
@@ -670,7 +674,7 @@ impl Metrics {
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
             sql_rejections: AtomicU64::new(0),
-            sql_rejections_by_reason: [const { AtomicU64::new(0) }; 6],
+            sql_rejections_by_reason: [const { AtomicU64::new(0) }; 7],
             named_scan_buckets: [const { AtomicU64::new(0) }; 7],
             named_scan_bytes_sum: AtomicU64::new(0),
             named_scan_refusals: AtomicU64::new(0),
@@ -1670,6 +1674,7 @@ mod tests {
         m.inc_sql();
         m.inc_sql_rejected(SqlRejection::Busy);
         m.inc_sql_rejected(SqlRejection::Invalid);
+        m.inc_sql_rejected(SqlRejection::OutOfMemory);
         let out = m.render();
         assert!(out.contains("# TYPE nuthatch_tip_height gauge"));
         assert!(out.contains("nuthatch_tip_height 1000"));
@@ -1677,9 +1682,10 @@ mod tests {
         assert!(out.contains("# TYPE nuthatch_rows_decoded_total counter"));
         assert!(out.contains("nuthatch_rows_decoded_total 5"));
         assert!(out.contains("nuthatch_sql_queries_total 1"));
-        assert!(out.contains("nuthatch_sql_rejections_total 2"));
+        assert!(out.contains("nuthatch_sql_rejections_total 3"));
         assert!(out.contains("nuthatch_sql_rejections_total{reason=\"busy\"} 1"));
         assert!(out.contains("nuthatch_sql_rejections_total{reason=\"invalid\"} 1"));
+        assert!(out.contains("nuthatch_sql_rejections_total{reason=\"out_of_memory\"} 1"));
     }
 
     /// #1399: a retried IPFS fetch is a series, globally and per nest, and not only a log line.
