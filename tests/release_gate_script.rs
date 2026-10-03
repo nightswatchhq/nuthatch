@@ -335,6 +335,135 @@ fn a_regression_past_the_bound_fails_and_one_inside_it_does_not() {
     assert!(text.contains("p99") && text.contains("REGRESSED"), "{text}");
 }
 
+impl Case {
+    /// Defines `gate_probe` over the fixture table. `wrong` stands in for a candidate that answers
+    /// block 5 as 50, returns its rows in the reverse order, and is 1e-13 off on a float.
+    fn probe(&self, wrong: bool) {
+        let views = self.nest.join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let (block, s, third) = if wrong {
+            (
+                "CASE WHEN block_number = 5 THEN 50 ELSE block_number END",
+                "100 - CAST(block_number AS BIGINT)",
+                "CAST(block_number AS DOUBLE) / 3 + CAST(0.0000000000001 AS DOUBLE)",
+            )
+        } else {
+            (
+                "block_number",
+                "block_number",
+                "CAST(block_number AS DOUBLE) / 3",
+            )
+        };
+        std::fs::write(
+            views.join("90-gate-probe.sql"),
+            format!(
+                "CREATE VIEW gate_probe AS SELECT {block} AS block, {s} AS s, {third} AS third \
+                 FROM \"{}\" ORDER BY s;\n",
+                self.table
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Writes a baseline from the right answers, then gates the wrong ones against it.
+    fn against_a_wrong_candidate(&self, set: &Path) -> (Output, String) {
+        let baseline = self.dir.path().join("baseline.tsv");
+        let base_out = self.dir.path().join("baseline-out");
+        self.probe(false);
+        let (out, text) = self.gate(
+            set,
+            &[
+                "--out",
+                base_out.to_str().unwrap(),
+                "--write-baseline",
+                baseline.to_str().unwrap(),
+            ],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(0), "the baseline run:\n{text}");
+        self.probe(true);
+        self.gate(set, &["--baseline", baseline.to_str().unwrap()], &[])
+    }
+}
+
+/// #1772: a statement that answers, but not what production answered, fails and is named, with
+/// the first row at which the two differ. Row order is part of the answer only under a top-level
+/// ORDER BY: the same statement without one passes with its rows reversed, and a float 1e-13 off
+/// is equal to 12 significant digits.
+#[test]
+fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row() {
+    let c = case();
+    let set = c.set(&[
+        ("value", "SELECT block FROM gate_probe".to_string()),
+        (
+            "ordered",
+            "SELECT third FROM gate_probe ORDER BY s".to_string(),
+        ),
+        (
+            "unordered",
+            "SELECT third FROM gate_probe WHERE 'ORDER BY' <> ''".to_string(),
+        ),
+    ]);
+    let (out, text) = c.against_a_wrong_candidate(&set);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    let value = line_for(&text, "value");
+    assert!(
+        value.starts_with("FAIL ") && value.contains("answer differs"),
+        "{value}"
+    );
+    assert!(
+        text.contains("first differing row, row 5:")
+            && text.contains("candidate: {\"block\":50}")
+            && text.contains("baseline:  {\"block\":5}"),
+        "the first differing row of each side:\n{text}"
+    );
+    let ordered = line_for(&text, "ordered");
+    assert!(
+        ordered.starts_with("FAIL ") && ordered.contains("answer differs (rows compared in order)"),
+        "{ordered}"
+    );
+    assert!(
+        line_for(&text, "unordered").starts_with("ok "),
+        "only the order differs, and it has no top-level ORDER BY:\n{text}"
+    );
+    assert!(
+        text.contains("RESULT: FAIL - answer differs: value, ordered"),
+        "{text}"
+    );
+}
+
+/// A statement tagged volatile in the set is held to its row count, so a different answer with
+/// the same number of rows passes; an untagged one in the same run would not.
+#[test]
+fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
+    let c = case();
+    let set = c.set(&[
+        ("changing", "SELECT block FROM gate_probe".to_string()),
+        (
+            "unordered",
+            "SELECT third FROM gate_probe WHERE 'ORDER BY' <> ''".to_string(),
+        ),
+    ]);
+    let body = std::fs::read_to_string(&set).unwrap();
+    std::fs::write(
+        &set,
+        format!("# volatile: changing its answer moves with the clock\n{body}"),
+    )
+    .unwrap();
+    let (out, text) = c.against_a_wrong_candidate(&set);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let changing = line_for(&text, "changing");
+    assert!(
+        changing.starts_with("ok ") && changing.contains("volatile, so compared on its row count"),
+        "{changing}"
+    );
+    assert!(line_for(&text, "unordered").starts_with("ok "), "{text}");
+    assert!(
+        text.contains("1 match, 0 differ, 1 compared on row count only"),
+        "{text}"
+    );
+}
+
 /// A copy without its redb serves no sealed history; that is a broken rig, not a verdict on the
 /// binary, so it exits 2 rather than 1 and never starts a server.
 #[test]
