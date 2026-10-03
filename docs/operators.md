@@ -367,6 +367,8 @@ over a pinned range; `nuthatch bench query` reports entity point-read p50/p99 pl
 cost and RSS. Run both against a representative nest on your hardware and your RPC before sizing a
 fleet.
 
+**The allocator.** The Linux (glibc) binary runs jemalloc with `narenas:4,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`, which took the allocations nest's query set from 1697-1830 MiB peak RSS to 1157 MiB at the same p99 (#1758). Set `_RJEM_MALLOC_CONF` (the binary's jemalloc is prefixed, so plain `MALLOC_CONF` is ignored) to override any of it.
+
 **Disk.** Sealed Parquet is Snappy-compressed and content-addressed. Growth is proportional to decoded
 events, not chain history: a nest tracking a few events on a few contracts stays small.
 

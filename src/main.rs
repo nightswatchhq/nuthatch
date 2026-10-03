@@ -18,6 +18,14 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// jemalloc's default of four arenas per CPU lets every analytics thread's arena keep the pages a
+// statement freed. On the allocations nest's query set this took peak RSS from 1697-1830 MiB to
+// 1157 MiB at the same p99 (#1758). `_RJEM_MALLOC_CONF` in the environment overrides it.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[export_name = "_rjem_malloc_conf"]
+static MALLOC_CONF: &u8 =
+    &b"narenas:4,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0"[0];
+
 use nuthatch::{
     analytics, audit, bench, blob, check, cli, config, distribution, doctor, help, indexer, labels,
     lists, mcp, offchain, pack, project, publish, runtime, screen, store, transform,
@@ -970,6 +978,16 @@ fn hostname_or_bail() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[test]
+    fn jemalloc_starts_with_the_bounded_retention_config() {
+        use tikv_jemalloc_ctl::{opt, raw};
+        assert_eq!(opt::narenas::read().unwrap(), 4);
+        assert!(opt::background_thread::read().unwrap());
+        let dirty: isize = unsafe { raw::read(b"opt.dirty_decay_ms\0") }.unwrap();
+        assert_eq!(dirty, 1000);
+    }
 
     #[test]
     fn an_offline_query_of_an_entity_says_it_needs_the_node() {

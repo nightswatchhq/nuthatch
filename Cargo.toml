@@ -206,3 +206,6 @@ strip = true
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = "0.6"
+
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dev-dependencies]
+tikv-jemalloc-ctl = "0.6"
