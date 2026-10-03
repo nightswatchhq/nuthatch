@@ -24,8 +24,8 @@ impl Engine for BurrmillEngine {
 
 pub(crate) struct BurrmillSession {
     engine: Mutex<burrmill::Engine>,
-    /// Hot rows staged by `load_hot`, bound by the next `bind_facts` for that table.
-    hot: Mutex<HashMap<String, Vec<Value>>>,
+    /// Hot rows staged by `load_hot` and how many, the rows taken by the `bind_facts` that binds them.
+    hot: Mutex<HashMap<String, (Vec<Value>, usize)>>,
     /// Held for the session's life; removed on drop and swept by pid after a crash.
     _spill: crate::spill::SpillDir,
     /// Each view's `CREATE VIEW` text as defined, for the integrity sweep's walk through views.
@@ -40,13 +40,7 @@ impl BurrmillSession {
     /// name (`register_rows` makes every column text), and a view under its own that casts each
     /// column. A marker column keeps the one placeholder row an empty relation needs out of it.
     fn bind_relation(&self, table: &str, declared: &[(String, &'static str)]) -> Result<bool> {
-        let staged = self
-            .hot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(table)
-            .cloned()
-            .unwrap_or_default();
+        let staged = self.take_hot(table);
         let mut rows: Vec<Value> = staged
             .iter()
             .map(|row| {
@@ -94,6 +88,28 @@ impl BurrmillSession {
         Ok(true)
     }
 
+    /// The rows `load_hot` staged for `table`, leaving their count. A bind that fails puts them back
+    /// with [`Self::restore_hot`], since the caller retries it without the segments that would not bind.
+    fn take_hot(&self, table: &str) -> Vec<Value> {
+        self.hot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(table)
+            .map(|(rows, _)| std::mem::take(rows))
+            .unwrap_or_default()
+    }
+
+    fn restore_hot(&self, table: &str, rows: Vec<Value>) {
+        if let Some((staged, _)) = self
+            .hot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(table)
+        {
+            *staged = rows;
+        }
+    }
+
     fn new() -> Result<Self> {
         let spill = crate::spill::new_spill_dir()?;
         let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
@@ -112,6 +128,15 @@ impl BurrmillSession {
 
     fn engine(&self) -> std::sync::MutexGuard<'_, burrmill::Engine> {
         self.engine.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[cfg(test)]
+    fn held_hot_rows(&self, table: &str) -> usize {
+        self.hot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(table)
+            .map_or(0, |(rows, _)| rows.len())
     }
 }
 
@@ -453,7 +478,7 @@ impl Session for BurrmillSession {
     fn load_hot(&self, table: &str, rows: &[&Value]) -> Result<()> {
         self.hot.lock().unwrap_or_else(|p| p.into_inner()).insert(
             table.to_string(),
-            rows.iter().map(|r| (*r).clone()).collect(),
+            (rows.iter().map(|r| (*r).clone()).collect(), rows.len()),
         );
         Ok(())
     }
@@ -463,8 +488,7 @@ impl Session for BurrmillSession {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(table)
-            .map(|rows| rows.len())
-            .unwrap_or(0)
+            .map_or(0, |(_, n)| *n)
     }
 
     fn drop_relation(&self, name: &str) -> Result<()> {
@@ -536,28 +560,28 @@ impl Session for BurrmillSession {
             return self.bind_relation(table, &declared);
         }
         let hot_rows: Vec<Value> = if hot {
-            self.hot
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(table)
-                .cloned()
-                .unwrap_or_default()
+            self.take_hot(table)
         } else {
             Vec::new()
         };
         if sealed.is_empty() && hot_rows.is_empty() && cols.is_empty() {
             return Ok(false);
         }
-        self.engine()
-            .register_facts(
-                table,
-                cols,
-                sized(sealed)?,
-                &hot_rows,
-                (window.after, window.through),
-            )
-            .map_err(engine_err)?;
-        Ok(true)
+        let bound = sized(sealed).and_then(|files| {
+            self.engine()
+                .register_facts(
+                    table,
+                    cols,
+                    files,
+                    &hot_rows,
+                    (window.after, window.through),
+                )
+                .map_err(engine_err)
+        });
+        if bound.is_err() {
+            self.restore_hot(table, hot_rows);
+        }
+        bound.map(|()| true)
     }
 
     fn segment_binds(&self, path: &Path) -> Result<()> {
@@ -640,6 +664,52 @@ mod tests {
         assert_eq!(a, s.canonical_plan("select b.x from t b where b.y > 1"));
         assert_ne!(a, s.canonical_plan("SELECT a.x FROM u a WHERE a.y > 1"));
         assert!(s.engine_version().starts_with("burrmill "));
+    }
+
+    /// #1677: a cached session held its hot rows twice, as the staged JSON and as the bound table.
+    #[test]
+    fn binding_releases_the_staged_hot_rows() {
+        use crate::engine::{FactWindow, Session};
+        let s = super::BurrmillSession::new().unwrap();
+        let rows: Vec<serde_json::Value> = (1..=1000)
+            .map(|b| serde_json::json!({ "block_number": b, "n": b.to_string() }))
+            .collect();
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        let count = |t: &str| s.one_value(&format!("SELECT count(*) FROM {t}")).unwrap();
+
+        s.load_hot("t", &refs).unwrap();
+        assert!(s
+            .bind_facts("t", &[], &[], true, FactWindow::default())
+            .unwrap());
+        assert_eq!(count("t"), serde_json::json!(1000));
+        assert_eq!(
+            s.staged_hot_len("t"),
+            1000,
+            "what was loaded is still known"
+        );
+        assert_eq!(s.held_hot_rows("t"), 0, "the bound table holds the rows");
+
+        // A bind that fails is retried without the segment that would not bind, from the same rows.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.parquet");
+        std::fs::write(&bad, b"not parquet").unwrap();
+        s.load_hot("u", &refs).unwrap();
+        let window = FactWindow::default();
+        assert!(s.bind_facts("u", &[], &[bad], true, window).is_err());
+        assert!(s.bind_facts("u", &[], &[], true, window).unwrap());
+        assert_eq!(
+            count("u"),
+            serde_json::json!(1000),
+            "the retry lost the hot rows"
+        );
+
+        let cols = [("n".to_string(), "HUGEINT")];
+        s.load_relation("r", &cols, &refs).unwrap();
+        assert!(s
+            .bind_facts("r", &[], &[], true, FactWindow::default())
+            .unwrap());
+        assert_eq!(count("r"), serde_json::json!(1000));
+        assert_eq!(s.held_hot_rows("r"), 0, "the bound relation holds the rows");
     }
 
     /// Burrmill #10: `__raw`, `__hot` and `__union` are not names a statement can reach.
