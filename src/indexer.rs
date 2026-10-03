@@ -4942,8 +4942,8 @@ fn fetch_logs_splitting_tracking<'a>(
 /// nothing, which is exactly how the gates in #913 became decorative.
 const NO_PROGRESS_LIMIT: usize = 64;
 
-/// A window committed with no checkpoint warns on the first and then every this many (#1666).
-const CHECKPOINT_MISS_WARN_EVERY: u64 = 100;
+/// A warning that can repeat every poll fires on the first and then every this many (#1666, #1667).
+const REPEAT_WARN_EVERY: u64 = 100;
 
 const BACKFILL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 const BACKFILL_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
@@ -6811,7 +6811,7 @@ impl NestIngest {
         }
         if let Some(why) = checkpoint_missed {
             let n = self.metrics.inc_checkpoints_missed();
-            if n == 1 || n.is_multiple_of(CHECKPOINT_MISS_WARN_EVERY) {
+            if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
                 tracing::warn!(
                     "blocks {next}..={to} committed with no reorg checkpoint: the source gave no hash \
                      for block {to} ({why}). {n} window(s) so far; a fork above the last checkpoint \
@@ -7360,9 +7360,26 @@ fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64
     match finality {
         Finality::Depth(d) => tip.saturating_sub(d),
         Finality::FinalizedTag { fallback_depth } => match finalized_tag {
-            Some(n) => n.min(tip),
+            Some(n) if n < tip => n,
+            Some(n) => {
+                warn_implausible_finalized(n, tip, fallback_depth);
+                tip.saturating_sub(fallback_depth)
+            }
             None => tip.saturating_sub(fallback_depth),
         },
+    }
+}
+
+/// A `finalized` tag at or past the tip is what an endpoint aliasing it to `latest` answers (#1667).
+/// It can also be a tip read a block or two before the tag, which costs one poll's seal advance.
+fn warn_implausible_finalized(finalized: u64, tip: u64, fallback_depth: u64) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
+        tracing::warn!(
+            "the endpoint's finalized block {finalized} is not below the tip {tip}, so it is not \
+             trusted: sealing falls back to {fallback_depth} blocks below the tip ({n} time(s) so far)"
+        );
     }
 }
 
@@ -10901,11 +10918,27 @@ template = "pool"
         let f = Finality::FinalizedTag {
             fallback_depth: 1800,
         };
-        // Tag present: seal up to it (clamped to tip).
+        // Tag present: seal up to it.
         assert_eq!(seal_ceiling(f, 10_000, Some(8_500)), 8_500);
-        assert_eq!(seal_ceiling(f, 10_000, Some(10_050)), 10_000);
         // Tag absent (endpoint doesn't serve it): fixed-depth fallback.
         assert_eq!(seal_ceiling(f, 10_000, None), 8_200);
+    }
+
+    /// #1667. A provider that maps `finalized` to `latest` answers the tip or past it, and sealing
+    /// there puts the next reorg below the watermark.
+    #[test]
+    fn a_finalized_tag_at_or_past_the_tip_falls_back_to_depth() {
+        let f = Finality::FinalizedTag {
+            fallback_depth: 1800,
+        };
+        for tag in [10_000, 10_050] {
+            assert_eq!(
+                seal_ceiling(f, 10_000, Some(tag)),
+                8_200,
+                "finalized {tag} at tip 10,000 was trusted and the tip block would seal"
+            );
+        }
+        assert_eq!(seal_ceiling(f, 10_000, Some(9_998)), 9_998);
     }
 
     #[test]
@@ -16527,7 +16560,7 @@ template="pool"
     #[async_trait::async_trait]
     impl Source for SealDirectSource {
         async fn tip(&self) -> Result<u64> {
-            Ok(5)
+            Ok(6)
         }
         async fn finalized(&self) -> Result<Option<u64>> {
             Ok(Some(5))
@@ -16589,9 +16622,9 @@ template="pool"
             w.abort();
         }
 
-        // `tip = 5`, `backfill = Some(4)` asks for blocks 1..=5 via seal-direct (`cold_start_block`);
+        // `tip = 6`, `backfill = Some(5)` asks for blocks 1..=5 via seal-direct (`cold_start_block`);
         // `every = 1` samples all five.
-        let result = nest.prepare(source.as_ref(), Some(4), true, 1, 100).await;
+        let result = nest.prepare(source.as_ref(), Some(5), true, 1, 100).await;
         assert!(
             result.is_ok(),
             "seal-direct with calls must succeed: {result:?}"
@@ -16657,9 +16690,9 @@ template="pool"
             w.abort();
         }
 
-        // `tip = 5`, `backfill = Some(4)` asks for blocks 1..=5 via seal-direct; `every = 1` samples
+        // `tip = 6`, `backfill = Some(5)` asks for blocks 1..=5 via seal-direct; `every = 1` samples
         // all five, so the sealed segment owes five `oracle_answer` rows.
-        let result = nest.prepare(source.as_ref(), Some(4), true, 1, 100).await;
+        let result = nest.prepare(source.as_ref(), Some(5), true, 1, 100).await;
         assert!(
             result.is_ok(),
             "seal-direct with calls must succeed: {result:?}"
