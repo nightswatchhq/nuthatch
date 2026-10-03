@@ -124,7 +124,7 @@ groups:
 
   - name: meta
     rules:
-      # Always firing. Alertmanager sends it to an external heartbeat, which pages when it stops:
+      # Always firing. helsinki/deadman.sh pages when Alertmanager stops holding it:
       # that is the ThinkPad, Prometheus or Alertmanager going quiet.
       - alert: Watchdog
         expr: vector(1)

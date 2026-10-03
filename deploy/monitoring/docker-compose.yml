@@ -25,7 +25,7 @@ services:
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
-      - --web.listen-address=127.0.0.1:9493
+      - --web.listen-address=100.83.44.63:9493
       - --cluster.listen-address=
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro

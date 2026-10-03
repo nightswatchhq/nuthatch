@@ -7,7 +7,7 @@ This directory is the whole configuration; nothing about it should live only on 
 | Piece | Listens on | What |
 |---|---|---|
 | Prometheus | `127.0.0.1:9490` | scrapes every nest's `/metrics` every 15 s, evaluates `rules/` |
-| Alertmanager | `127.0.0.1:9493` | routes to Discord, and the `Watchdog` to the heartbeat |
+| Alertmanager | `100.83.44.63:9493` (tailnet only) | routes to Discord; Helsinki reads its `Watchdog` |
 | blackbox | `127.0.0.1:9115` | probes each nest's `/ready` (`probe_success`) |
 | Grafana | `100.83.44.63:3300` (tailnet only) | the "Nuthatch nests" dashboard |
 
@@ -27,7 +27,7 @@ rules on purpose.
 ```sh
 cd ~/nuthatch && git pull && cd deploy/monitoring
 mkdir -p secrets && cp secrets.example/* secrets/
-$EDITOR secrets/discord_webhook_url secrets/heartbeat_url secrets/grafana.env
+$EDITOR secrets/discord_webhook_url secrets/grafana.env
 sudo chown -R 65534:65534 secrets && sudo chmod 600 secrets/*   # Alertmanager runs as nobody
 docker compose up -d
 curl -s 127.0.0.1:9490/api/v1/targets | jq -r '.data.activeTargets[] | "\(.health) \(.scrapeUrl)"'
@@ -36,14 +36,18 @@ curl -s 127.0.0.1:9490/api/v1/targets | jq -r '.data.activeTargets[] | "\(.healt
 `secrets/` is ignored by git. Grafana binds the tailnet address, so it starts only once Tailscale is
 up; `restart: unless-stopped` retries until it is.
 
-**The dead-man signal.** `Watchdog` always fires, and Alertmanager posts it to `heartbeat_url`
-every minute. Create a check at healthchecks.io (period 1 minute, grace 3 minutes) and give it the
-same Discord channel as an integration. When the ThinkPad, Prometheus or Alertmanager goes quiet,
-the pings stop and healthchecks.io pages, about four minutes later. It is the one external service
-here, and it was chosen because the failure it reports is the box that would otherwise report it.
-If an outside service is unwanted, the alternative is Helsinki's existing `nuthatch-probe` cron
-polling `http://100.83.44.63:9493/-/healthy`, which needs Alertmanager on the tailnet address and
-catches less: a stuck rule evaluation still pings healthy.
+**The dead-man signal.** `Watchdog` always fires, and Prometheus re-sends it to Alertmanager every
+evaluation; Alertmanager drops it a few minutes after the last one. `helsinki/deadman.sh`, run from
+Helsinki's cron every minute, asks Alertmanager over the tailnet whether `Watchdog` is still active
+and pages Discord once when it is not and once when it returns. That covers the ThinkPad going down,
+Prometheus stopping or wedging its rule evaluation, and Alertmanager dying, and nothing leaves the
+tailnet. On Helsinki:
+
+```sh
+install -m 755 deploy/monitoring/helsinki/deadman.sh /usr/local/bin/nuthatch-deadman
+install -m 600 /dev/stdin /etc/nuthatch/deadman_discord_webhook_url <<<"https://discord.com/api/webhooks/..."
+echo '* * * * * root /usr/local/bin/nuthatch-deadman' > /etc/cron.d/nuthatch-deadman
+```
 
 ## On Helsinki: /metrics on the tailnet only
 
@@ -85,7 +89,7 @@ respond @metrics 404
 | `SqlRefusalRate` | over 10% of `/sql` refused by the node (busy, too_large, timeout, out_of_memory) for 5 minutes |
 | `NestNotReady` | `/ready` not 200 for 10 minutes |
 | `TargetDown` | a scrape target has not answered for 2 minutes |
-| `Watchdog` | always; the heartbeat |
+| `Watchdog` | always; read by `helsinki/deadman.sh` |
 
 Three things differ from the page they come from, deliberately:
 
