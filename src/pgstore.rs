@@ -713,6 +713,18 @@ impl HotStore for PgStore {
                  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
             );
             tx.execute(&meta, &[&last_block.to_string()])?;
+            // As in redb (#1636, #1665): keep the newest checkpoint at or below the watermark and
+            // prune beneath it. Keys are zero-padded, so text order is block order.
+            if !cfg!(feature = "graph") {
+                let prune = format!(
+                    "DELETE FROM \"{schema}\".blocks WHERE key IN (\
+                     SELECT b.key FROM \"{schema}\".blocks b, \"{schema}\".meta m \
+                     WHERE m.key = 'sealed_through' AND b.key < (SELECT max(f.key) FROM \"{schema}\".blocks f \
+                     WHERE f.key <= lpad(m.value, 12, '0')) \
+                     ORDER BY b.key LIMIT 4096)"
+                );
+                tx.execute(&prune, &[])?;
+            }
             tx.commit()?;
             Ok(())
         })
