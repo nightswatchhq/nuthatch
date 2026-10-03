@@ -14,7 +14,8 @@
 # answers "what is actually running" without asking a human to remember.
 set -euo pipefail
 
-BIN_DIR=/usr/local/bin
+BIN_DIR=${NUTHATCH_BIN_DIR:-/usr/local/bin}
+UNIT_DIR=${NUTHATCH_UNIT_DIR:-/etc/systemd/system}
 die() { printf '\033[31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
 ok()  { printf '\033[32mok\033[0m   %s\n' "$*"; }
 
@@ -38,6 +39,23 @@ cmd_install() {
 }
 
 # --- roll one unit ------------------------------------------------------------------------------
+# The file holding the ExecStart systemd will run: the last of the unit file and its drop-ins, in the
+# order systemd reads them, that sets a non-empty one. A drop-in that clears and resets ExecStart
+# overrides the unit file, and editing the unit file then rolls nothing (#1729).
+execstart_file() {
+  local u=$1 last="" f
+  for f in "$UNIT_DIR/$u.service" "$UNIT_DIR/$u.service.d"/*.conf; do
+    [ -f "$f" ] && grep -qE '^ExecStart=/' "$f" && last=$f
+  done
+  [ -n "$last" ] && echo "$last"
+}
+
+# A field /ready may not carry (a `serve`-only unit has no last_block) reads as empty, not as a failure.
+ready_field() {
+  echo "$1" | grep -oE "\"$2\"[[:space:]]*:[[:space:]]*(\"[^\"]*\"|[a-z0-9]+)" | head -1 |
+    sed -E 's/^[^:]*:[[:space:]]*//; s/"//g' || true
+}
+
 cmd_roll() {
   local u=$1 want=$2
   local target="$BIN_DIR/nuthatch-$want"
@@ -46,26 +64,38 @@ cmd_roll() {
   got=$("$target" --version | awk '{print $2}')
   [ "$got" = "$want" ] || die "$target reports $got, not $want"
 
-  local port before
+  local port f before
   port=$(unit_port "$u")
-  before=$(curl -sS -m5 "http://$port/ready" 2>/dev/null | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("last_block"))' 2>/dev/null || echo n/a)
+  [ -n "$port" ] || die "$u: no 127.0.0.1 listen address in its ExecStart"
+  f=$(execstart_file "$u") || die "$u: no file under $UNIT_DIR sets its ExecStart"
+  before=$(ready_field "$(curl -sS -m5 "http://$port/ready" 2>/dev/null || true)" last_block)
 
-  # Point the unit at the VERSIONED path, whatever it named before. This is what makes
-  # `systemctl show` able to answer "which version is this" - #1060's whole point.
-  sed -i -E "s#ExecStart=([^ ]*/)?nuthatch(-[0-9][0-9A-Za-z.+-]*)?#ExecStart=$target#" "/etc/systemd/system/$u.service"
-  grep -q "ExecStart=$target" "/etc/systemd/system/$u.service" || die "$u: ExecStart did not take"
+  # Point the unit at the VERSIONED path, whatever it named before, so `systemctl show` can answer
+  # "which version is this" (#1060).
+  # `-i.bak` then remove it: the one spelling GNU and BSD sed both read as in-place.
+  sed -i.bak -E "s#^ExecStart=([^ ]*/)?nuthatch(-[0-9][0-9A-Za-z.+-]*)?#ExecStart=$target#" "$f"
+  rm -f "$f.bak"
   systemctl daemon-reload
+  # What systemd will run, not what this script wrote: the two differ when another file wins.
+  [ "$(unit_binary "$u")" = "$target" ] \
+    || die "$u: systemd would still run $(unit_binary "$u") after editing $f"
   systemctl restart "$u"
 
-  local s=""
-  for _ in $(seq 1 60); do sleep 2; s=$(curl -sS -m5 "http://$port/ready" 2>/dev/null) && [ -n "$s" ] && break; done
+  # Readiness flips false to true across any restart, a no-op roll included. The version /ready
+  # reports is the one proof that the new binary is the one serving.
+  local s="" v="" r=""
+  for _ in $(seq 1 60); do
+    sleep "${ROLL_POLL_SECS:-2}"
+    s=$(curl -sS -m5 "http://$port/ready" 2>/dev/null || true)
+    v=$(ready_field "$s" version)
+    r=$(ready_field "$s" ready)
+    [ "$v" = "$want" ] && [ "$r" = true ] && break
+  done
   [ "$(systemctl is-active "$u")" = active ] || die "$u is not active after restart"
   [ -n "$s" ] || die "$u never answered /ready"
-  # `ready` alone is not enough: a cold start answers before it has polled (#1044), so the watermark
-  # is read too - but only reported, never gated on, since a nest legitimately starts at 0.
-  local after
-  after=$(echo "$s" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("ready"),d.get("last_block"))')
-  ok "$u -> $want   ready/last=$after   (was last=$before)"
+  [ "$v" = "$want" ] || die "$u reports version ${v:-none} on /ready, not $want"
+  [ "$r" = true ] || die "$u is on $want but not ready: $s"
+  ok "$u -> $want via $(basename "$f")   last_block ${before:-n/a} -> $(ready_field "$s" last_block)"
 }
 
 # --- check --------------------------------------------------------------------------------------
