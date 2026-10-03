@@ -123,4 +123,4 @@ candidate does not go to production.
 
 A run that has posted any final status is not repeated by `--poll`; re-gate by hand with the tag.
 
-Installing the timer and the refresh hook on the ThinkPad is done separately from this change.
+The timer is `deploy/release-gate/release-gate.{service,timer}`, a systemd user unit running `--poll` every 15 minutes from `~/nuthatch-ops`, a worktree of the repo on `main`; the unit file carries the install lines. The copy at `~/release-gate/alloc-nest` is static until a `GATE_REFRESH` hook from Helsinki is set.

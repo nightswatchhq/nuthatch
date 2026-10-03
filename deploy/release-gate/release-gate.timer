@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll for an ungated nuthatch release every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
