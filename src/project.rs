@@ -1878,6 +1878,11 @@ fn scaffold_ai_surface(
     );
     std::fs::write(dir.join("llms.txt"), llms).context("failed to write llms.txt")?;
 
+    // A table this nest really has, so an agent copying the example gets an answer (#1662).
+    let example = schema
+        .first()
+        .map(|t| t.table.as_str())
+        .unwrap_or("<alias>__<event>");
     let skill_dir = dir.join(".claude/skills/nuthatch");
     std::fs::create_dir_all(&skill_dir).context("failed to create skill dir")?;
     let skill = format!(
@@ -1898,9 +1903,10 @@ fn scaffold_ai_surface(
          \n\
          ## Fallback: HTTP (a `nuthatch dev` must be running)\n\
          - Recent rows:  `curl localhost:8288/entities?limit=20`\n\
-         - Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM transfers'`\n\
+         - Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM {example}'`\n\
          \n\
-         `sql` sees finalized data only; balances/entity cover the live tip.\n"
+         `sql` reads hot and sealed rows together, so it covers the live tip. Each answer's\n\
+         `provenance.sealed_through` is where finalized data ends.\n"
     );
     std::fs::write(skill_dir.join("SKILL.md"), skill).context("failed to write SKILL.md")?;
     Ok(())
@@ -1944,6 +1950,26 @@ fn normalise_address(addr: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1662: the scaffolded skill's example names a table the nest has, and it does not steer an
+    /// agent away from `/sql` for live data, which reads hot and sealed rows together.
+    #[test]
+    fn the_scaffolded_skill_names_a_real_table_and_does_not_call_sql_finalized_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let contracts: Vec<Contract> = vec![serde_json::from_value(serde_json::json!({
+            "alias": "usdc", "address": "0xa0b8", "abi": "abis/usdc.json"
+        }))
+        .unwrap()];
+        let schema: Vec<crate::registry::TableSchema> = vec![serde_json::from_value(
+            serde_json::json!({"table": "usdc__transfer", "alias": "usdc", "event": "Transfer", "columns": []}),
+        )
+        .unwrap()];
+        scaffold_ai_surface(dir.path(), "mainnet", &contracts, &schema).unwrap();
+        let skill =
+            std::fs::read_to_string(dir.path().join(".claude/skills/nuthatch/SKILL.md")).unwrap();
+        assert!(skill.contains("FROM usdc__transfer"), "{skill}");
+        assert!(!skill.contains("finalized data only"), "{skill}");
+    }
 
     /// Pure mirror of the deployment binary search, for algorithm confidence without RPC.
     fn find_deploy_block(tip: u64, deployed_from: u64) -> Option<u64> {

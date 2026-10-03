@@ -196,10 +196,11 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
             );
         }
         return Some(
-            "this query exceeded analytics.memory_limit (NUTHATCH_ANALYTICS_MEMORY_LIMIT, default \
+            "this query exceeded the SQL engine's memory limit: NUTHATCH_BURRMILL_MEMORY_LIMIT when it \
+             is set, otherwise analytics.memory_limit (NUTHATCH_ANALYTICS_MEMORY_LIMIT, default \
              512MB). It cannot run in its budget; block processing is not degraded. Lower the \
-             query, or raise analytics.memory_limit only if (sql_permits × analytics.memory_limit) \
-             + ingestion_reservation still fits the 2 GiB per-cursor ceiling."
+             query, or raise the limit in effect only if (sql_permits × that limit) + \
+             ingestion_reservation still fits the 2 GiB per-cursor ceiling."
                 .into(),
         );
     }
@@ -717,10 +718,11 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        assert!(
-            hint.contains("analytics.memory_limit"),
-            "must name the key: {hint}"
-        );
+        // Both keys, and which one wins: the Burrmill limit replaces the general one when set (#1683).
+        for key in ["NUTHATCH_BURRMILL_MEMORY_LIMIT", "analytics.memory_limit"] {
+            assert!(hint.contains(key), "must name {key}: {hint}");
+        }
+        assert!(hint.contains("when it is set, otherwise"), "{hint}");
         assert!(
             hint.contains("block processing is not degraded"),
             "ingestion liveness is the point: {hint}"
