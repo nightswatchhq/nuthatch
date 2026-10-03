@@ -46,7 +46,7 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 | Resume it | `POST /_admin/resume/<name>` | `202` and the job |
 | Move a name to a new NID | `POST /_admin/move/<name>` `{"nid": "<new nid>"}` | `202` and the job |
 | Unmount | `DELETE /_admin/nests/<name>` | `200`, with `"was_mounted": false` when there was nothing to unmount (a retry is not a failure); `400` for a name no mount could have |
-| Unmount and free the disk | `DELETE /_admin/nests/<name>?reclaim=true` | `200` and the reclaim |
+| Unmount and free the disk | `DELETE /_admin/nests/<name>?reclaim=true` | `200` and the reclaim, for a live or suspended mount; `409`, with nothing unmounted, for a mount with no recorded NID |
 | Free a dataset unmounted earlier | `DELETE /_admin/datasets/<nid>` | `200`, `409` kept, `404` absent |
 
 `<name>` is the route the nest serves at, `/<name>/…`: `usdc` for the runtime's default tenant, and
@@ -140,6 +140,9 @@ uses is kept and the answer says by whom:
 ```json
 {"outcome": "kept", "nid": "9f2c…", "mounted_by": ["acme/usdc"]}
 ```
+
+An unmount that fails part-way answers `500` with the `nid`, so the dataset can still be freed by
+`DELETE /_admin/datasets/<nid>`.
 
 Inside a running runtime this removes the dataset and the segments only it references. Segments a live
 fold left behind stay for an offline `nuthatch prune`.
