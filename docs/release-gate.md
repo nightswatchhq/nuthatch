@@ -87,14 +87,26 @@ can show the row that differs. The canonical form decides what counts as the sam
 - A number written as an integer, and any string (a `CAST(... AS VARCHAR)` decimal or a uint256
   among them), compares exactly. Any other number is rounded to **12 significant digits**, so a
   float summed in another order compares equal; a type change from integer to float of the same
-  value does too.
+  value does too. So is a string in exponent form, `6.93379390844438e22`: that is a DOUBLE cast to
+  text, which no integer or DECIMAL renders as. A float cast to text without an exponent is
+  indistinguishable from a decimal and compares exactly.
 - Rows are compared in order when the statement has a top-level `ORDER BY`, and sorted first when it
   has none, since without one the order is the engine's choice. A window's or a subquery's `ORDER
   BY` sits inside parentheses and does not count. When it cannot tell (a comment, an unclosed quote,
   unbalanced parentheses) it sorts and says so; the baseline's `compared` column records which.
-- A statement whose answer legitimately moves with the clock or the tip is tagged in the set,
-  `# volatile: <id> <why>`, and held to its row count only. So is a truncated answer without a
-  top-level `ORDER BY`, which is an arbitrary subset of the rows.
+- Two tags in the set, written by `collect/main.rs`, override that. `# ties: <id> <why>` compares a
+  statement sorted although it has an `ORDER BY`, because its key has ties the engine may order
+  either way. `# volatile: <id> <why>` holds a statement whose answer moves with the clock or the
+  tip to its row count only. So is a truncated answer without a top-level `ORDER BY`, which is an
+  arbitrary subset of the rows.
+
+The tags come from gating production twice on one copy a minute apart and reading what moved. On
+2026-10-03 nothing in the set moved with the clock (its literals are pinned, and no view reads
+`now()`); four statements moved anyway. Two were a DOUBLE cast to text, now rounded as above. Two,
+`payments.accounts` and `delegation_events`, page with `ORDER BY ... LIMIT` on a key with ties, so
+the rows inside a tie came back in another order; they are tagged `ties`. If such a tie straddles
+the `LIMIT`, the page itself can differ, and the gate will say so with the row; the cure is a
+tiebreaker in kittiwake's statement. Re-run the double gate after refreshing the set.
 
 Answers only mean something against a baseline measured on the same copy, which is what the runner
 does. A baseline without the digest column (the committed `baseline-4.2.0.tsv`) is read as before,
@@ -105,7 +117,8 @@ its answers reported as not compared. A run writing a baseline and the run readi
 refused query fails and is named, an answered set passes and writes a baseline, a regression fails
 past the bound and passes inside it, and a candidate answering differently from its baseline (a view
 edited between the runs) fails with the first differing row, while rows reordered under no `ORDER
-BY`, a float 1e-13 off and a volatile statement's new answer pass.
+BY` or under a `ties` tag, a float 1e-13 off (as a number or as text) and a volatile statement's new
+answer pass.
 
 ## Where it runs: the ThinkPad
 

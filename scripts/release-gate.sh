@@ -24,7 +24,8 @@
 # With --baseline, also FAIL ("answer differs") on a statement whose answer is not the baseline's.
 # Each answer is kept canonical in <out>/answers/<id>.rows (keys sorted, floats to 12 significant
 # digits, rows sorted unless the statement has a top-level ORDER BY) and compared by its sha256.
-# A statement tagged `# volatile: <id> <why>` in the set is compared on its row count only.
+# A statement tagged `# volatile: <id> <why>` in the set is compared on its row count only, one
+# tagged `# ties: <id> <why>` sorted despite its ORDER BY.
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
 # Two runs against one copy wait for each other: the second `serve` could not open the redb.
 set -euo pipefail
@@ -58,7 +59,7 @@ while [ $# -gt 0 ]; do
     --passes) [ $# -ge 2 ] || die "--passes needs a number"; passes=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
     --timeout) [ $# -ge 2 ] || die "--timeout needs seconds"; timeout=$2; shift 2 ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) break ;;
   esac
