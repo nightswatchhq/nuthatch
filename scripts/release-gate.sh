@@ -9,6 +9,14 @@
 #   --passes N             measure every query N times, each on a freshly started server (default 3)
 #   --out DIR              keep the server logs and per-pass results here (default: a temp dir)
 #   --timeout SECS         per-query timeout (default 300)
+#   --concurrency N        statements in flight at once (default 1)
+#
+# At --concurrency N the set goes out N statements at a time in its own order: statements 1..N
+# together, then N+1..2N once all of the first group have answered, and so on, the same groups on
+# every pass. The set lists each kittiwake call site's statements together, so a pair is mostly two
+# statements one route sends at once (its tokio::join! sites); the refresh job's run in sequence in
+# kittiwake but alongside the warmer, which fires on the same minute. Each statement keeps its own
+# time, and $out/schedule-pass-N.tsv records group, id and start and end in ms.
 #
 # The copy needs its sealed segments *and* its nuthatch.redb: without the redb it serves no sealed
 # history. `serve` never writes either. The query set is a TSV, one statement per line:
@@ -20,7 +28,9 @@
 #   p99 of the set: slower than 1.5x the baseline's AND more than 1000 ms (GATE_P99_FACTOR/_SLACK_MS)
 # Both conditions must hold, so a 40 ms query taking 90 ms is noise, not a regression.
 # Also FAIL on the serving process's peak RSS over the 2 GiB per-cursor budget (GATE_MAX_RSS_MB).
-# It is sampled every half second, so a spike shorter than that can pass unseen.
+# It is sampled every half second, so a spike shorter than that can pass unseen. At each new peak
+# the binary's /metrics is read too, so a binary that exports the analytics pool and jemalloc gauges
+# (#1778) reports where the peak sat.
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
 # Two runs against one copy wait for each other: the second `serve` could not open the redb.
 set -euo pipefail
@@ -46,15 +56,16 @@ MAX_RSS_MB=${GATE_MAX_RSS_MB:-2048}
 die() { echo "release-gate: $*" >&2; exit 2; }
 trap 'rc=$?; echo "release-gate: internal error at line $LINENO (exit $rc)" >&2; exit 2' ERR
 
-baseline="" write_baseline="" passes=3 out="" timeout=300
+baseline="" write_baseline="" passes=3 out="" timeout=300 concurrency=1
 while [ $# -gt 0 ]; do
   case "$1" in
+    --concurrency) [ $# -ge 2 ] || die "--concurrency needs a number"; concurrency=$2; shift 2 ;;
     --baseline) [ $# -ge 2 ] || die "--baseline needs a file"; baseline=$2; shift 2 ;;
     --write-baseline) [ $# -ge 2 ] || die "--write-baseline needs a file"; write_baseline=$2; shift 2 ;;
     --passes) [ $# -ge 2 ] || die "--passes needs a number"; passes=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
     --timeout) [ $# -ge 2 ] || die "--timeout needs seconds"; timeout=$2; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) break ;;
   esac
@@ -63,6 +74,7 @@ done
 bin=$1 nest=$2 set_file=$3
 case "$passes" in ''|*[!0-9]*|0) die "--passes must be a positive integer" ;; esac
 case "$timeout" in ''|*[!0-9]*|0) die "--timeout must be a positive integer" ;; esac
+case "$concurrency" in ''|*[!0-9]*|0) die "--concurrency must be a positive integer" ;; esac
 [ -x "$bin" ] || die "not an executable: $bin"
 [ -f "$nest/nuthatch.toml" ] || die "no nuthatch.toml in $nest"
 [ -f "$nest/nuthatch.redb" ] || die "no nuthatch.redb in $nest: a copy without its redb serves no sealed history"
@@ -105,13 +117,24 @@ sample_rss() {
   while kill -0 "$pid" 2>/dev/null; do
     k=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
     p=$(cat "$file" 2>/dev/null || echo 0)
-    if [ -n "$k" ] && [ "$k" -gt "$p" ]; then echo "$k" >"$file"; fi
+    if [ -n "$k" ] && [ "$k" -gt "$p" ]; then
+      echo "$k" >"$file"
+      metrics_now | awk '$1 ~ /^nuthatch_(analytics_pool_reserved_bytes|analytics_engines|jemalloc_allocated_bytes|jemalloc_resident_bytes)$/' \
+        >"$out/rss-peak-gauges.tmp" || true
+      mv "$out/rss-peak-gauges.tmp" "$out/rss-peak-gauges"
+    fi
     sleep 0.5
   done
 }
+metrics_now() { curl -s -m 1 "http://127.0.0.1:$port/metrics" 2>/dev/null || true; }
 port=""
 stop_server() {
   if [ -n "$server_pid" ]; then
+    # Since start, so read before the server goes; the largest over every server is kept.
+    local pool p
+    pool=$(metrics_now | awk '$1 == "nuthatch_analytics_pool_peak_bytes" { print $2 }')
+    p=$(cat "$out/pool-peak-bytes" 2>/dev/null || echo 0)
+    if [ -n "$pool" ] && [ "$pool" -gt "$p" ]; then echo "$pool" >"$out/pool-peak-bytes"; fi
     [ -z "$sampler_pid" ] || kill "$sampler_pid" 2>/dev/null || true
     sampler_pid=""
     kill "$server_pid" 2>/dev/null || true
@@ -161,17 +184,20 @@ start_server() {
 
 ms_of() { awk -v s="$1" 'BEGIN { printf "%d", s * 1000 + 0.5 }'; }
 
-# One query against the running server. Prints: status<TAB>rows<TAB>ms<TAB>truncated<TAB>detail
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time() * 1000'; }
+
+# One query against the running server, in flight slot $2. Prints:
+# status<TAB>rows<TAB>ms<TAB>truncated<TAB>detail
 run_query() {
-  local q=$1 body=$out/body.json code_time rc=0 code secs ms detail
+  local q=$1 body=$out/body-$2.json err=$out/curl-$2.err code_time rc=0 code secs ms detail
   code_time=$(curl -sS -m "$timeout" -o "$body" -w '%{http_code} %{time_total}' \
-    --get "http://127.0.0.1:$port/sql" --data-urlencode "q=$q" 2>"$out/curl.err") || rc=$?
+    --get "http://127.0.0.1:$port/sql" --data-urlencode "q=$q" 2>"$err") || rc=$?
   if [ $rc -ne 0 ]; then
     if alive; then
       if [ $rc -eq 28 ]; then
         printf 'timeout\t-\t%s\t-\tno answer within %ss\n' "$((timeout * 1000))" "$timeout"
       else
-        printf 'transport\t-\t-\t-\tcurl exit %s: %s\n' "$rc" "$(head -c 160 "$out/curl.err" | tr '\n' ' ')"
+        printf 'transport\t-\t-\t-\tcurl exit %s: %s\n' "$rc" "$(head -c 160 "$err" | tr '\n' ' ')"
       fi
     else
       printf 'died\t-\t-\t-\tthe server exited under this query (out of memory or a crash; see its log)\n'
@@ -211,8 +237,9 @@ version=$("$bin" --version 2>/dev/null | head -n 1) || version="unknown"
 echo "release-gate: $version against $nest"
 echo "release-gate: $n queries from $set_file, $passes pass(es), results in $out"
 echo "release-gate: budget ${PROD_ENV[*]}"
+echo "release-gate: concurrency $concurrency (the set's statements sent $concurrency at a time, in order)"
 
-rm -f "$out/rss-peak-kb"
+rm -f "$out/rss-peak-kb" "$out/rss-peak-gauges" "$out/pool-peak-bytes"
 # Each pass on a fresh server: the nest memoises answers by statement text, so a second ask of the
 # same statement on one server would time the memo.
 pass=1
@@ -224,17 +251,36 @@ while [ "$pass" -le "$passes" ]; do
       | grep -o '"as_of":[0-9]*,"sealed_through":[0-9]*' || true)
     echo "release-gate: nest provenance ${prov:-unknown}"
   fi
-  i=0
+  : >"$out/schedule-pass-$pass.tsv"
+  i=0 group=0 sent=""
   while [ $i -lt "$n" ]; do
     if ! alive; then
-      # It answered the previous query and then died; that query is charged with it.
-      [ "$i" -eq 0 ] || printf '%s\n' "${ids[$((i - 1))]}" >>"$out/died-after"
+      # It answered the previous group and then died; that group is charged with it.
+      [ -z "$sent" ] || printf '%s\n' $sent >>"$out/died-after"
       stop_server
       start_server "$out/serve-pass-$pass-restart-$i.log"
     fi
-    r=$(run_query "${sqls[$i]}")
-    printf '%s\t%s\n' "${ids[$i]}" "$r" >>"$out/pass-$pass.tsv"
-    i=$((i + 1))
+    group=$((group + 1)) sent="" slot=0 pids=()
+    while [ $slot -lt "$concurrency" ] && [ $((i + slot)) -lt "$n" ]; do
+      j=$((i + slot))
+      (
+        start=$(now_ms)
+        r=$(run_query "${sqls[$j]}" "$slot")
+        printf '%s\t%s\t%s\t%s\n' "$group" "${ids[$j]}" "$start" "$(now_ms)" >"$out/slot-$slot.schedule"
+        printf '%s\t%s\n' "${ids[$j]}" "$r" >"$out/slot-$slot.result"
+      ) &
+      pids+=("$!")
+      sent="$sent ${ids[$j]}"
+      slot=$((slot + 1))
+    done
+    wait "${pids[@]}"
+    k=0
+    while [ $k -lt $slot ]; do
+      cat "$out/slot-$k.result" >>"$out/pass-$pass.tsv"
+      cat "$out/slot-$k.schedule" >>"$out/schedule-pass-$pass.tsv"
+      k=$((k + 1))
+    done
+    i=$((i + slot))
   done
   stop_server
   pass=$((pass + 1))
@@ -355,6 +401,14 @@ rss_line="peak RSS ${peak_mb} MiB, budget ${MAX_RSS_MB} MiB"
 if [ "$peak_mb" -gt "$MAX_RSS_MB" ]; then rss_failed=1; rss_line="$rss_line: OVER"; fi
 echo "release-gate: $((n - failures)) of $n answered, $failures failed, $regressions regressed; $p99_line"
 echo "release-gate: $rss_line"
+if [ -s "$out/rss-peak-gauges" ]; then
+  mib() { awk -v k="$1" '$1 == k { printf "%d", $2 / 1048576; f = 1 } END { if (!f) printf "-" }' "$out/rss-peak-gauges"; }
+  engines=$(awk '$1 == "nuthatch_analytics_engines" { print $2 }' "$out/rss-peak-gauges")
+  echo "release-gate: at the peak, analytics pools held $(mib nuthatch_analytics_pool_reserved_bytes) MiB over ${engines:--} engines; jemalloc allocated $(mib nuthatch_jemalloc_allocated_bytes) MiB, resident $(mib nuthatch_jemalloc_resident_bytes) MiB"
+fi
+if [ -s "$out/pool-peak-bytes" ]; then
+  echo "release-gate: largest single analytics pool reservation $(( $(cat "$out/pool-peak-bytes") / 1048576 )) MiB"
+fi
 if [ "$failures" -gt 0 ] || [ "$regressions" -gt 0 ] || [ "$p99_failed" -gt 0 ] || [ "$rss_failed" -gt 0 ]; then
   failed_ids=$(awk -F'\t' '$3 != "ok" { printf "%s%s", sep, $1; sep = ", " }' "$results")
   [ "$rss_failed" -eq 0 ] || failed_ids="${failed_ids:+$failed_ids, }peak RSS"
