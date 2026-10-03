@@ -955,7 +955,7 @@ per-nest series below.
 |---|---|
 | `nuthatch_tip_height`, `nuthatch_last_block`, `nuthatch_tip_lag_blocks` | is it keeping up |
 | `nuthatch_sealed_through` | cold-layer watermark |
-| `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_resolved_total`, `nuthatch_ipfs_given_up_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total`, `nuthatch_ipfs_rows_refused_total`, `nuthatch_ipfs_retries_total` | ingestion |
+| `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_checkpoints_missed_total` (windows committed with no reorg checkpoint; reorg detection is blind while it climbs), `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_resolved_total`, `nuthatch_ipfs_given_up_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total`, `nuthatch_ipfs_rows_refused_total`, `nuthatch_ipfs_retries_total` | ingestion |
 | `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total`, `nuthatch_sql_rejections_total{reason=…}` | serving; the unlabelled rejection total is the aggregate, and the fixed `reason` label classifies its refusals |
 | `nuthatch_sql_memo_hits_total`, `nuthatch_sql_memo_misses_total`, `nuthatch_sql_memo_bytes` | the analytical memo (#1186): how many `/sql` answers were remembered rather than computed, and what it holds |
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
@@ -973,7 +973,7 @@ manifest names; a segment two datasets share is counted under both, so for disk 
 unlabelled `nuthatch_sealed_segments_bytes`, which counts each store once),
 `nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
 `nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
-`nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`,
+`nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_checkpoints_missed_total`,
 `nuthatch_nest_ipfs_unreadable_total` (rows an `[[ipfs]]` declaration read that named no usable CID),
 `nuthatch_nest_ipfs_pending` (documents named and neither stored nor given up on; sealing holds below
 the lowest), `nuthatch_nest_ipfs_resolved_total`, `nuthatch_nest_ipfs_given_up_total`,

@@ -4942,6 +4942,9 @@ fn fetch_logs_splitting_tracking<'a>(
 /// nothing, which is exactly how the gates in #913 became decorative.
 const NO_PROGRESS_LIMIT: usize = 64;
 
+/// A window committed with no checkpoint warns on the first and then every this many (#1666).
+const CHECKPOINT_MISS_WARN_EVERY: u64 = 100;
+
 const BACKFILL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 const BACKFILL_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -6548,6 +6551,11 @@ impl NestIngest {
             Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(hash, *ts))),
             _ => None,
         };
+        let checkpoint_missed = match &record {
+            Ok(Some(_)) => None,
+            Ok(None) => Some("no block at that height".to_string()),
+            Err(e) => Some(format!("{e:#}")),
+        };
         if let Some((hash, _)) = record.as_ref().ok().and_then(|r| r.as_ref()) {
             if rows.iter().any(|r| {
                 r.block_number == to
@@ -6800,6 +6808,16 @@ impl NestIngest {
         {
             self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
             return Err(e);
+        }
+        if let Some(why) = checkpoint_missed {
+            let n = self.metrics.inc_checkpoints_missed();
+            if n == 1 || n.is_multiple_of(CHECKPOINT_MISS_WARN_EVERY) {
+                tracing::warn!(
+                    "blocks {next}..={to} committed with no reorg checkpoint: the source gave no hash \
+                     for block {to} ({why}). {n} window(s) so far; a fork above the last checkpoint \
+                     goes unseen until one is stored (nuthatch_nest_checkpoints_missed_total)."
+                );
+            }
         }
         #[cfg(test)]
         take_after_commit_failure()?;
@@ -15348,6 +15366,57 @@ template = "pool"
         assert_eq!(
             store.get_block_hash(10).unwrap().as_deref(),
             Some("0xcanonical")
+        );
+    }
+
+    /// A provider that serves logs and timestamps and cannot answer `eth_getBlockByNumber` for a hash.
+    struct NoBlockHash;
+
+    #[async_trait::async_trait]
+    impl Source for NoBlockHash {
+        async fn tip(&self) -> Result<u64> {
+            Ok(100)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            anyhow::bail!("eth_getBlockByNumber: method not available")
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// #1666. Windows kept committing with no checkpoint, so reorg detection answered None for ever,
+    /// and nothing said so above debug. Ingestion carries on; the miss is counted where an alert can
+    /// read it.
+    #[tokio::test]
+    async fn a_window_committed_without_a_checkpoint_is_counted() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        nest.metrics = Arc::new(crate::metrics::NestMetrics::default());
+        for b in [10u64, 11] {
+            let outcome = nest
+                .process_window(&NoBlockHash, &[transfer_log(b, 0)], b, b, 100)
+                .await
+                .unwrap();
+            assert!(outcome.is_some(), "a missing checkpoint stopped ingestion");
+        }
+        assert_eq!(nest.store.get_block_hash(11).unwrap(), None);
+        assert_eq!(
+            nest.metrics.checkpoints_missed(),
+            2,
+            "two windows committed with no reorg checkpoint and nothing counted them"
         );
     }
 

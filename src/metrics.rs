@@ -108,6 +108,8 @@ pub struct NestMetrics {
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
+    /// #1666: windows committed with no reorg checkpoint.
+    checkpoints_missed: AtomicU64,
     /// RFC-0059 §5: sealed blocks whose rows the folds are not yet checkpointed through, and whether
     /// the writer has stopped. Only a folds build has a writer, so only it has the series.
     #[cfg(feature = "folds")]
@@ -341,6 +343,14 @@ impl NestMetrics {
         self.reorgs.fetch_add(1, Relaxed);
         METRICS.inc_reorgs();
     }
+    /// The count including this one, so the caller can rate-limit its warning.
+    pub fn inc_checkpoints_missed(&self) -> u64 {
+        METRICS.inc_checkpoints_missed();
+        self.checkpoints_missed.fetch_add(1, Relaxed) + 1
+    }
+    pub fn checkpoints_missed(&self) -> u64 {
+        self.checkpoints_missed.load(Relaxed)
+    }
     pub fn add_ipfs_unreadable(&self, n: u64) {
         self.ipfs_unreadable.fetch_add(n, Relaxed);
         METRICS.add_ipfs_unreadable(n);
@@ -566,6 +576,7 @@ pub struct Metrics {
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
+    checkpoints_missed: AtomicU64,
     ipfs_unreadable: AtomicU64,
     ipfs_resolved: AtomicU64,
     ipfs_given_up: AtomicU64,
@@ -644,6 +655,7 @@ impl Metrics {
             rows_decoded: AtomicU64::new(0),
             rows_sealed: AtomicU64::new(0),
             reorgs: AtomicU64::new(0),
+            checkpoints_missed: AtomicU64::new(0),
             ipfs_unreadable: AtomicU64::new(0),
             ipfs_resolved: AtomicU64::new(0),
             ipfs_given_up: AtomicU64::new(0),
@@ -784,6 +796,9 @@ impl Metrics {
     }
     pub fn inc_reorgs(&self) {
         self.reorgs.fetch_add(1, Relaxed);
+    }
+    pub fn inc_checkpoints_missed(&self) {
+        self.checkpoints_missed.fetch_add(1, Relaxed);
     }
     pub fn add_ipfs_unreadable(&self, n: u64) {
         self.ipfs_unreadable.fetch_add(n, Relaxed);
@@ -1059,6 +1074,11 @@ impl Metrics {
             "nuthatch_reorgs_total",
             "Reorgs detected and rolled back since start.",
             self.reorgs.load(Relaxed),
+        ));
+        s.push_str(&counter(
+            "nuthatch_checkpoints_missed_total",
+            "Windows committed with no reorg checkpoint because the source gave no hash for the boundary block, since start.",
+            self.checkpoints_missed.load(Relaxed),
         ));
         s.push_str(&counter(
             "nuthatch_ipfs_unreadable_total",
@@ -1408,6 +1428,12 @@ impl Metrics {
                 &|m| m.reorgs.load(Relaxed),
             );
             labelled(
+                "nuthatch_nest_checkpoints_missed_total",
+                "Windows committed with no reorg checkpoint because the source gave no hash for the boundary block, per nest. Reorg detection is blind while it climbs.",
+                "counter",
+                &|m| m.checkpoints_missed.load(Relaxed),
+            );
+            labelled(
                 "nuthatch_nest_seal_direct_active",
                 "1 while this nest's --seal-direct pass is running.",
                 "gauge",
@@ -1683,6 +1709,7 @@ mod tests {
         horizon.add_rows_decoded(10);
         graph.set_last_block(400);
         graph.inc_reorgs();
+        graph.inc_checkpoints_missed();
         let out = m.render();
         // One labelled series per nest, distinct from the blended aggregates.
         assert!(out.contains("# TYPE nuthatch_nest_last_block gauge"));
@@ -1690,6 +1717,7 @@ mod tests {
         assert!(out.contains("nuthatch_nest_last_block{nest=\"graph-network\"} 400"));
         assert!(out.contains("nuthatch_nest_rows_decoded_total{nest=\"horizon\"} 10"));
         assert!(out.contains("nuthatch_nest_reorgs_total{nest=\"graph-network\"} 1"));
+        assert!(out.contains("nuthatch_nest_checkpoints_missed_total{nest=\"graph-network\"} 1"));
         // A per-nest update also feeds the process-global aggregate (backward-compatible).
         assert_eq!(horizon.last_block.load(Relaxed), 500);
     }
