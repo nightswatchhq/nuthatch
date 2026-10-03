@@ -521,11 +521,27 @@ pub struct Store {
     /// When set, a blocking commit signals the sender and parks on the receiver before committing.
     #[cfg(test)]
     pub(crate) commit_hold: CommitHold,
+    #[cfg(test)]
+    path: Arc<std::path::PathBuf>,
 }
 
 #[cfg(test)]
 pub(crate) type CommitHold =
     Arc<std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>;
+
+/// Per store file, a one-shot hold: the next outbox removal on it signals the sender and parks on
+/// the receiver, so a test can stop a nest while a delivery is on the blocking pool.
+#[cfg(test)]
+pub(crate) fn outbox_holds() -> &'static std::sync::Mutex<OutboxHolds> {
+    static HOLDS: std::sync::OnceLock<std::sync::Mutex<OutboxHolds>> = std::sync::OnceLock::new();
+    HOLDS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) type OutboxHolds = std::collections::HashMap<
+    std::path::PathBuf,
+    (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
+>;
 
 /// Does the store at `path` hold indexed rows, as opposed to merely existing?
 ///
@@ -619,7 +635,13 @@ impl Store {
         let db = builder()
             .create(path)
             .with_context(|| format!("failed to open redb at {}", path.display()))?;
-        Store::from_db(db)
+        let store = Store::from_db(db)?;
+        #[cfg(test)]
+        let store = Store {
+            path: Arc::new(path.to_path_buf()),
+            ..store
+        };
+        Ok(store)
     }
 
     /// Open a store that **already exists**, and fail rather than bring one into being.
@@ -679,6 +701,8 @@ impl Store {
             largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             commit_hold: Arc::default(),
+            #[cfg(test)]
+            path: Arc::new(path.to_path_buf()),
         })
     }
 
@@ -745,6 +769,8 @@ impl Store {
             largest_scan_rows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             commit_hold: Arc::default(),
+            #[cfg(test)]
+            path: Arc::default(),
         })
     }
 
@@ -1026,7 +1052,14 @@ impl Store {
             return Ok(());
         }
         let store = self.clone();
+        #[cfg(test)]
+        let hold = outbox_holds().lock().unwrap().remove(&*self.path);
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some((entered, release)) = hold {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
             for seq in seqs {
                 // Best-effort per entry, exactly as the caller's loop was: a failed removal means the
                 // alert is redelivered later, which the at-least-once contract already allows.

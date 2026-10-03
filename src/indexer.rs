@@ -430,6 +430,44 @@ pub async fn await_store_release(
         })
 }
 
+/// Stop a nest that never joined a cursor and return `err` once its store is closed (#1768). Drop
+/// its `NestIngest` first. A delivery the aborted worker left on the blocking pool still holds one.
+pub async fn release_refused(
+    err: anyhow::Error,
+    state: serve::AppState,
+    worker: Option<tokio::task::JoinHandle<()>>,
+) -> anyhow::Error {
+    let released = state.store.released();
+    let dir = state.dir.clone();
+    if let Some(w) = worker {
+        w.abort();
+        let _ = w.await;
+    }
+    drop(state);
+    match await_store_release(released, &dir).await {
+        Ok(()) => err,
+        Err(held) => err.context(format!("{held:#}")),
+    }
+}
+
+/// [`release_refused`] for every nest a cursor built before it failed to start.
+async fn release_unstarted(
+    mut err: anyhow::Error,
+    ingests: Vec<NestIngest>,
+    states: Vec<(String, serve::AppState)>,
+    mut workers: Vec<(String, tokio::task::JoinHandle<()>)>,
+) -> anyhow::Error {
+    drop(ingests);
+    for (name, state) in states {
+        let worker = workers
+            .iter()
+            .position(|(n, _)| *n == name)
+            .map(|i| workers.remove(i).1);
+        err = release_refused(err, state, worker).await;
+    }
+    err
+}
+
 impl NestRuntime {
     /// Stop the nest and return once its store is closed (#1764).
     ///
@@ -2421,7 +2459,7 @@ pub async fn spawn_runtime(
     let sql_gate = serve::new_sql_gate();
     for (name, dir, mut config) in nests {
         config.route = Some(name.clone());
-        let (nest, state, worker, w) = build_nest(
+        let (nest, state, worker, w) = match build_nest(
             &source,
             dir,
             &config,
@@ -2431,7 +2469,11 @@ pub async fn spawn_runtime(
             None,
             sql_gate.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(built) => built,
+            Err(e) => return Err(release_unstarted(e, ingests, states, alert_workers).await),
+        };
         window.get_or_insert(w);
         ingests.push(nest);
         // So `/<name>/ready` answers for THIS nest rather than the process-global poll freshness.
@@ -2448,14 +2490,12 @@ pub async fn spawn_runtime(
     // Every nest on this cursor, not merely the first: a runtime hosts N nests and one of them
     // declaring an entity is enough to make `--seal-direct` wrong for the whole cursor, which is the
     // only granularity the flag has.
-    for nest in &ingests {
-        // A live mount reaches this too (#1545), so the refusal must not leave a store locked (#1535).
-        if let Err(e) = refuse_seal_direct_with_entities(seal_direct, nest) {
-            for (_, w) in &alert_workers {
-                w.abort();
-            }
-            return Err(e);
-        }
+    // A live mount reaches this too (#1545), so the refusal must not leave a store locked (#1535).
+    if let Some(e) = ingests
+        .iter()
+        .find_map(|nest| refuse_seal_direct_with_entities(seal_direct, nest).err())
+    {
+        return Err(release_unstarted(e, ingests, states, alert_workers).await);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let ingest = tokio::spawn(runtime_index_loop(
@@ -2572,7 +2612,7 @@ pub async fn build_and_prepare_nest(
     Option<tokio::task::JoinHandle<()>>,
     u64,
 )> {
-    let (mut nest, state, mut worker, window) = build_nest(
+    let (mut nest, state, worker, window) = build_nest(
         source,
         dataset.into_dir(),
         config,
@@ -2588,15 +2628,19 @@ pub async fn build_and_prepare_nest(
     // The same refusal as `spawn_nest`. Inside `prepare` it would arrive after seal-direct had
     // already written history the entity never sees (#1537).
     if let Err(e) = refuse_seal_direct_with_entities(seal_direct, &nest) {
-        if let Some(w) = worker.take() {
-            w.abort();
-        }
-        return Err(e);
+        drop(nest);
+        return Err(release_refused(e, state, worker).await);
     }
-    let next = nest
+    match nest
         .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
-        .await?;
-    Ok((nest, state, worker, next))
+        .await
+    {
+        Ok(next) => Ok((nest, state, worker, next)),
+        Err(e) => {
+            drop(nest);
+            Err(release_refused(e, state, worker).await)
+        }
+    }
 }
 
 /// Every table this nest actually serves, not merely the ones a decoder produces.
@@ -2977,19 +3021,7 @@ async fn build_nest(
     // indexing, so a slow/dead endpoint never blocks the loop.
     let router = Arc::new(alerts::AlertRouter::new(config.alerts.clone()));
     let webhooks = Arc::new(config.webhooks.clone());
-    let alert_worker = if router.is_empty() && webhooks.is_empty() {
-        None
-    } else {
-        tracing::info!(
-            "{} alert sink(s), {} webhook(s) configured",
-            config.alerts.len(),
-            config.webhooks.len()
-        );
-        Some(tokio::spawn(alerts::run_delivery_worker(
-            std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn crate::store::HotStore>,
-            crate::webhooks::secrets(&config.webhooks),
-        )))
-    };
+    let alert_store = (!router.is_empty() || !webhooks.is_empty()).then(|| store.clone());
 
     // Group the per-nest state the loop owns and mutates into one struct, so a runtime can drive many
     // nests from one cursor (RFC-0012). `source` stays shared and borrowed, not owned; `children`
@@ -3218,6 +3250,18 @@ async fn build_nest(
         nest_info: Arc::new(nest_info),
     };
 
+    // Spawned last: a `?` above would detach it with its store clone (#1768).
+    let alert_worker = alert_store.map(|store| {
+        tracing::info!(
+            "{} alert sink(s), {} webhook(s) configured",
+            config.alerts.len(),
+            config.webhooks.len()
+        );
+        tokio::spawn(alerts::run_delivery_worker(
+            std::sync::Arc::new(store) as std::sync::Arc<dyn crate::store::HotStore>,
+            crate::webhooks::secrets(&config.webhooks),
+        ))
+    });
     Ok((nest, app_state, alert_worker, window))
 }
 
