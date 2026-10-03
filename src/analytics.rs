@@ -2608,6 +2608,8 @@ fn define_views_bound(
                 session.load_hot(table, &hot_rows)
             } {
                 Ok(()) => true,
+                // A statement that names the relation is told why it cannot be served (#1679).
+                Err(e) if relation && wanted.is_some() => return Err(e),
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
                     degraded.insert(table.clone());
@@ -3853,6 +3855,67 @@ mod tests {
             "a mistyped load answered: {:?}",
             mistyped.map(|o| o.rows)
         );
+    }
+
+    /// #1679: an entity's integer is an i128, and Burrmill's integer stops at DECIMAL(38,0). A value
+    /// past 10^38 - 1 is refused at load, naming the entity and the value, not at execution.
+    #[test]
+    fn an_entity_value_past_decimal_38_is_refused_at_load_by_name() {
+        use crate::entity_expr::Type;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['k']\nmax_rows=10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT k, sum(v) AS n FROM t GROUP BY k",
+        )
+        .unwrap();
+        crate::entities::load(dir.path()).unwrap();
+        super::hold_relation_types(
+            dir.path(),
+            "totals",
+            &["k".into(), "n".into()],
+            &[Some(Type::Str), Some(Type::Int)],
+        );
+        let run = |n: String| {
+            let row = serde_json::json!({"k": "a", "n": n});
+            let hot: super::HotRows = [("totals".to_string(), vec![row])].into_iter().collect();
+            let guard = super::QueryGuard {
+                timeout: std::time::Duration::from_secs(10),
+                max_rows: 10,
+            };
+            super::query_hot_cold(
+                dir.path(),
+                "SELECT n FROM totals",
+                guard,
+                &hot,
+                u64::MAX,
+                &[],
+            )
+        };
+        let largest = "9".repeat(38);
+        let out = run(largest.clone()).unwrap();
+        assert_eq!(
+            out.rows[0]["n"].to_string().trim_matches('"'),
+            largest,
+            "{:?}",
+            out.rows
+        );
+        for past in [
+            format!("1{}", "0".repeat(38)),
+            i128::MAX.to_string(),
+            format!("-1{}", "0".repeat(38)),
+        ] {
+            let err = format!("{:#}", run(past.clone()).unwrap_err());
+            assert!(
+                err.contains("entity totals") && err.contains(&past),
+                "{past} was not refused at load by entity and value: {err}"
+            );
+        }
     }
 
     #[test]

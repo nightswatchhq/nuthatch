@@ -520,9 +520,16 @@ impl Session for BurrmillSession {
                     (_, None | Some(Value::Null)) => {}
                     ("HUGEINT", Some(v)) => {
                         let text = v.as_str().map_or_else(|| v.to_string(), str::to_string);
-                        text.parse::<i128>().map_err(|_| {
+                        let n = text.parse::<i128>().map_err(|_| {
                             anyhow!("{c} = {text} is not the integer its plan declares")
                         })?;
+                        // HUGEINT is DECIMAL(38,0) here, short of the i128 the entity holds.
+                        if n.unsigned_abs() >= 10u128.pow(38) {
+                            return Err(anyhow!(
+                                "entity {table}: {c} = {text} is past the largest integer the \
+                                 query engine holds, 38 digits"
+                            ));
+                        }
                     }
                     ("BOOLEAN", Some(v)) if !v.is_boolean() => {
                         return Err(anyhow!("{c} = {v} is not the boolean its plan declares"));
