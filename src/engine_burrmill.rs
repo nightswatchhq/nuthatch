@@ -680,6 +680,89 @@ mod tests {
         assert!(s.engine_version().starts_with("burrmill "));
     }
 
+    /// Sessions over `dirs` under a 64 MB limit and no room to spill, each holding a table `t` its
+    /// sort needs a large share of that limit for.
+    fn bounded_sessions(dirs: &[&std::path::Path]) -> Vec<Box<dyn crate::engine::Session>> {
+        use crate::analytics_budget::{ENV_BURRMILL_MEMORY_LIMIT, ENV_MAX_TEMP_SIZE};
+        use crate::engine::{Engine as _, FactWindow};
+        let sessions: Vec<_> = {
+            let _env = crate::analytics_budget::tests::env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(ENV_BURRMILL_MEMORY_LIMIT, "64MB");
+            std::env::set_var(ENV_MAX_TEMP_SIZE, "0MB");
+            let opened = dirs
+                .iter()
+                .map(|d| super::BurrmillEngine.open(d).unwrap())
+                .collect();
+            std::env::remove_var(ENV_BURRMILL_MEMORY_LIMIT);
+            std::env::remove_var(ENV_MAX_TEMP_SIZE);
+            opened
+        };
+        let rows: Vec<serde_json::Value> = (1..=100_000u64)
+            .map(|b| serde_json::json!({ "block_number": b, "k": format!("{:0180}", b * 7919 % 100_003) }))
+            .collect();
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        for s in &sessions {
+            s.load_hot("t", &refs).unwrap();
+            assert!(s
+                .bind_facts("t", &[], &[], true, FactWindow::default())
+                .unwrap());
+        }
+        sessions
+    }
+
+    const SORT: &str = "SELECT k, block_number FROM t ORDER BY k";
+
+    /// Runs `SORT` on `first` and, while its first row is out, on `second`; hands `first` back with
+    /// how the second statement ended.
+    fn overlapped(
+        first: Box<dyn crate::engine::Session>,
+        second: &dyn crate::engine::Session,
+    ) -> (Box<dyn crate::engine::Session>, anyhow::Result<()>) {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let a = s.spawn(move || {
+                let mut sent = false;
+                first
+                    .for_each_row(SORT, &mut |_| {
+                        if !sent {
+                            sent = true;
+                            out_tx.send(()).unwrap();
+                            done_rx.recv().unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                first
+            });
+            out_rx.recv().unwrap();
+            let r = second.for_each_row(SORT, &mut |_| Ok(()));
+            done_tx.send(()).unwrap();
+            (a.join().unwrap(), r)
+        })
+    }
+
+    /// #1792: NUTHATCH_BURRMILL_MEMORY_LIMIT bounds a nest, so a second session of it competes for
+    /// what the first holds instead of reserving a limit of its own beside it.
+    #[test]
+    fn two_sessions_of_one_nest_share_its_memory_limit() {
+        let (nest, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut s = bounded_sessions(&[nest.path(), nest.path(), other.path()]);
+        let (c, b, a) = (s.pop().unwrap(), s.pop().unwrap(), s.pop().unwrap());
+        b.for_each_row(SORT, &mut |_| Ok(()))
+            .expect("the sort fits the limit alone");
+
+        let (a, second) = overlapped(a, b.as_ref());
+        assert!(
+            second.is_err(),
+            "a second session of the nest sorted beside the first, past one limit"
+        );
+        let (_, elsewhere) = overlapped(a, c.as_ref());
+        elsewhere.expect("another nest's session has a limit of its own");
+    }
+
     /// #1677: a cached session held its hot rows twice, as the staged JSON and as the bound table.
     #[test]
     fn binding_releases_the_staged_hot_rows() {
