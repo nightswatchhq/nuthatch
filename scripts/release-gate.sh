@@ -19,6 +19,8 @@
 #   per query: slower than 2x its baseline AND more than 1000 ms slower   (GATE_QUERY_FACTOR/_SLACK_MS)
 #   p99 of the set: slower than 1.5x the baseline's AND more than 1000 ms (GATE_P99_FACTOR/_SLACK_MS)
 # Both conditions must hold, so a 40 ms query taking 90 ms is noise, not a regression.
+# Also FAIL on the serving process's peak RSS over the 2 GiB per-cursor budget (GATE_MAX_RSS_MB).
+# It is sampled every half second, so a spike shorter than that can pass unseen.
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
 set -euo pipefail
 
@@ -38,6 +40,7 @@ QUERY_FACTOR=${GATE_QUERY_FACTOR:-2}
 QUERY_SLACK_MS=${GATE_QUERY_SLACK_MS:-1000}
 P99_FACTOR=${GATE_P99_FACTOR:-1.5}
 P99_SLACK_MS=${GATE_P99_SLACK_MS:-1000}
+MAX_RSS_MB=${GATE_MAX_RSS_MB:-2048}
 
 die() { echo "release-gate: $*" >&2; exit 2; }
 trap 'rc=$?; echo "release-gate: internal error at line $LINENO (exit $rc)" >&2; exit 2' ERR
@@ -89,9 +92,22 @@ n=${#ids[@]}
 [ "$n" -gt 0 ] || die "no queries in $set_file"
 
 server_pid=""
+sampler_pid=""
+# Keeps the highest RSS (KiB) seen for the serving process in $out/rss-peak-kb, across servers.
+sample_rss() {
+  local pid=$1 file=$2 k p
+  while kill -0 "$pid" 2>/dev/null; do
+    k=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    p=$(cat "$file" 2>/dev/null || echo 0)
+    if [ -n "$k" ] && [ "$k" -gt "$p" ]; then echo "$k" >"$file"; fi
+    sleep 0.5
+  done
+}
 port=""
 stop_server() {
   if [ -n "$server_pid" ]; then
+    [ -z "$sampler_pid" ] || kill "$sampler_pid" 2>/dev/null || true
+    sampler_pid=""
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
     server_pid=""
@@ -111,6 +127,8 @@ start_server() {
     if curl -s -m 1 -o /dev/null "http://127.0.0.1:$port/health"; then continue; fi
     env "${PROD_ENV[@]}" "$bin" serve --dir "$nest" --listen "127.0.0.1:$port" >"$log" 2>&1 &
     server_pid=$!
+    sample_rss "$server_pid" "$out/rss-peak-kb" &
+    sampler_pid=$!
     local waited=0
     while [ $waited -lt 240 ]; do
       if ! alive; then
@@ -188,6 +206,7 @@ echo "release-gate: $version against $nest"
 echo "release-gate: $n queries from $set_file, $passes pass(es), results in $out"
 echo "release-gate: budget ${PROD_ENV[*]}"
 
+rm -f "$out/rss-peak-kb"
 # Each pass on a fresh server: the nest memoises answers by statement text, so a second ask of the
 # same statement on one server would time the memo.
 pass=1
@@ -324,9 +343,15 @@ if [ -n "$write_baseline" ]; then
 fi
 
 echo
+peak_mb=$(( $(cat "$out/rss-peak-kb" 2>/dev/null || echo 0) / 1024 ))
+rss_failed=0
+rss_line="peak RSS ${peak_mb} MiB, budget ${MAX_RSS_MB} MiB"
+if [ "$peak_mb" -gt "$MAX_RSS_MB" ]; then rss_failed=1; rss_line="$rss_line: OVER"; fi
 echo "release-gate: $((n - failures)) of $n answered, $failures failed, $regressions regressed; $p99_line"
-if [ "$failures" -gt 0 ] || [ "$regressions" -gt 0 ] || [ "$p99_failed" -gt 0 ]; then
+echo "release-gate: $rss_line"
+if [ "$failures" -gt 0 ] || [ "$regressions" -gt 0 ] || [ "$p99_failed" -gt 0 ] || [ "$rss_failed" -gt 0 ]; then
   failed_ids=$(awk -F'\t' '$3 != "ok" { printf "%s%s", sep, $1; sep = ", " }' "$results")
+  [ "$rss_failed" -eq 0 ] || failed_ids="${failed_ids:+$failed_ids, }peak RSS"
   echo "RESULT: FAIL${failed_ids:+ - failed: $failed_ids}"
   exit 1
 fi

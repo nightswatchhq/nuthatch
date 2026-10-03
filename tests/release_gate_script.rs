@@ -346,3 +346,19 @@ fn a_copy_without_its_redb_is_a_setup_fault_not_a_failure() {
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(text.contains("no nuthatch.redb"), "{text}");
 }
+
+/// The serving process's peak RSS is held to the per-cursor budget. A one-megabyte ceiling no real
+/// server fits under must fail a set that otherwise answers, and name the peak.
+#[test]
+fn a_peak_rss_over_the_budget_fails_a_set_that_answers() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let (out, text) = c.gate(&set, &[], &[("GATE_MAX_RSS_MB", "1")]);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(line_for(&text, "answers").starts_with("ok "), "{text}");
+    assert!(text.contains("peak RSS") && text.contains("OVER"), "{text}");
+
+    let (out, text) = c.gate(&set, &[], &[]);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("peak RSS"), "the peak is reported on a pass too:\n{text}");
+}
