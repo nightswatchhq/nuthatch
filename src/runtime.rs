@@ -364,12 +364,15 @@ pub fn check_mount_name(name: &str, default_tenant: &str) -> Result<()> {
     Ok(())
 }
 
-/// `health` and `nests` are routes of the runtime itself. A mount of either name collides.
+/// Top-level routes of the runtime itself. A mount of any of these names collides; `_admin` is
+/// matched first and shadows the nest's own routes (#1673).
+const RESERVED_ROUTES: [&str; 3] = ["nests", "health", "_admin"];
+
 fn refuse_reserved_mount(tenant: Option<&str>, alias: &str) -> Result<()> {
-    if alias == "nests" || alias == "health" {
+    if RESERVED_ROUTES.contains(&alias) {
         bail!("nest name '{alias}' is reserved (collides with a runtime route)");
     }
-    if let Some(tenant) = tenant.filter(|part| *part == "nests" || *part == "health") {
+    if let Some(tenant) = tenant.filter(|part| RESERVED_ROUTES.contains(part)) {
         bail!("tenant '{tenant}' is reserved (collides with a runtime route)");
     }
     Ok(())

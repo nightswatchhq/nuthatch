@@ -55,9 +55,10 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 changes on a restart, whatever else is mounted. A name is one or two parts, `alias` or `tenant/alias`,
 each of letters, digits, `_` and `-` and at most 64 characters; an alias may not end in `__moving`,
 which a move reserves, and the default tenant is never spelled out (`usdc`, not `default/usdc`, nor
-`acme/usdc` when `[runtime] default_tenant = "acme"`). Any
-other name is refused with `400` before anything is recorded. `/<name>/ready` answers for the nest
-itself, and `GET /nests` lists the roster.
+`acme/usdc` when `[runtime] default_tenant = "acme"`). Neither part may be `health`, `nests` or `_admin`,
+which are the runtime's own routes; boot refuses those too. Any other name is refused with `400`
+before anything is recorded. `/<name>/ready` answers for the nest itself, and `GET /nests` lists the
+roster.
 
 ### Mounts are jobs
 

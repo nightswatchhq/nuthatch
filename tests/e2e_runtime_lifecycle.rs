@@ -1794,6 +1794,51 @@ async fn a_mount_is_accepted_at_once_and_read_until_it_is_live() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
 }
 
+/// #1673: `/_admin/…` belongs to the lifecycle routes, so a mount whose route would start there is
+/// refused over the API, and boot refuses a record that names one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_named_admin_is_refused_over_the_api_and_at_boot() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "7c".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+
+    for name in ["_admin", "_admin/suspend", "_admin/mounts", "acme/_admin"] {
+        let body = format!(r#"{{"name":"{name}","nid":"{nid}"}}"#);
+        for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+            let (status, answer) = call(&routes, "POST", uri, None, Some(&body)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{uri} accepted '{name}': {answer}"
+            );
+            assert!(answer.contains("reserved"), "{name}: {answer}");
+        }
+        assert!(jobs.get(name).is_none(), "'{name}' was recorded as a job");
+    }
+    assert_eq!(handles.lock().await.states.len(), 1);
+
+    for (tenant, alias) in [("default", "_admin"), ("_admin", "usdc")] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(runtime::MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+                 chain_id = 42161\nrpc_urls = []\n\n[[mounts]]\ntenant = \"{tenant}\"\n\
+                 alias = \"{alias}\"\nnid = \"{nid}\"\n"
+            ),
+        )
+        .unwrap();
+        let err = runtime::MountTable::load(dir.path())
+            .expect_err("boot loaded a mount routed under /_admin");
+        assert!(format!("{err:#}").contains("reserved"), "{err:#}");
+    }
+}
+
 /// #1646: `?wait=true` is idempotent as the job route is. A repeat of a live mount's name and NID
 /// answers 200, and another NID under the name is still a 409.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
