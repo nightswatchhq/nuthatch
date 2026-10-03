@@ -4541,11 +4541,21 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// layout. We keep the message and replace only the dir prefix with `<nest>`.
 fn sanitize_sql_error(raw: &str, dir: &std::path::Path) -> String {
     let mut out = raw.to_string();
-    // Both the canonical and as-configured forms - the error could carry either.
-    for p in [dir.canonicalize().ok(), Some(dir.to_path_buf())]
-        .into_iter()
-        .flatten()
-    {
+    // A runtime dataset lives at `<root>/data/<nid>`, and its shared segments under `<root>/segments`.
+    let root = dir
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == crate::runtime::DATA_DIR))
+        .and_then(|p| p.parent());
+    // Both the canonical and as-configured forms - the error could carry either. The dataset first:
+    // it is the longer prefix, and the runtime root is inside it.
+    let mut prefixes: Vec<(std::path::PathBuf, &str)> = Vec::new();
+    for (p, label) in [(Some(dir), "<nest>"), (root, "<runtime>")] {
+        if let Some(p) = p {
+            prefixes.extend(p.canonicalize().ok().map(|c| (c, label)));
+            prefixes.push((p.to_path_buf(), label));
+        }
+    }
+    for (p, label) in prefixes {
         // Only an *absolute* prefix is worth redacting, and only an absolute one is safe to. The
         // default `--dir` is `.`, which as a plain `replace` target matches every full stop in the
         // message: `1.5` became `1<nest>5` and DuckDB's `...` ellipsis became `<nest><nest><nest>`.
@@ -4555,8 +4565,12 @@ fn sanitize_sql_error(raw: &str, dir: &std::path::Path) -> String {
             continue;
         }
         let s = p.display().to_string();
-        if !s.is_empty() {
-            out = out.replace(&s, "<nest>");
+        out = out.replace(&s, label);
+        // object_store prints a filesystem path with its leading `/` stripped (#1651). Only a path of
+        // two or more components: `/data` stripped is the word `data`, which errors use freely.
+        let bare = s.trim_start_matches('/');
+        if bare.contains('/') {
+            out = out.replace(bare, label);
         }
     }
     out
@@ -4690,6 +4704,37 @@ mod tests {
         assert!(out.contains("<nest>/segments/usdc__transfer-abc.parquet"));
         // The useful DuckDB detail (the message + filename) survives.
         assert!(out.contains("No files found"));
+    }
+
+    /// #1651: object_store prints a filesystem path without its leading `/`, and a runtime dataset's
+    /// shared segments live two levels up from it. Neither form may reach a caller.
+    #[test]
+    fn sanitize_sql_error_redacts_object_store_paths_and_the_shared_store() {
+        let dir = std::path::Path::new("/srv/nuthatch/runtime/data/abc123");
+        let own = sanitize_sql_error(
+            "Object at location srv/nuthatch/runtime/data/abc123/segments/t.parquet not found",
+            dir,
+        );
+        assert_eq!(
+            own,
+            "Object at location <nest>/segments/t.parquet not found"
+        );
+        let shared = sanitize_sql_error(
+            "Object at location srv/nuthatch/runtime/segments/f00d.parquet not found",
+            dir,
+        );
+        assert_eq!(
+            shared,
+            "Object at location <runtime>/segments/f00d.parquet not found"
+        );
+        let slashed =
+            sanitize_sql_error("no file /srv/nuthatch/runtime/segments/f00d.parquet", dir);
+        assert_eq!(slashed, "no file <runtime>/segments/f00d.parquet");
+        let short = std::path::Path::new("/data");
+        assert_eq!(
+            sanitize_sql_error("column data not found in /data/x.parquet", short),
+            "column data not found in <nest>/x.parquet"
+        );
     }
 
     /// The default `--dir` is `.`, and a bare `replace(".", "<nest>")` corrupted every message that
