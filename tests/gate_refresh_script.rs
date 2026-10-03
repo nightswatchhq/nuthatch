@@ -371,17 +371,50 @@ fn thinkpad() -> ThinkPad {
 }
 
 fn refresh(t: &ThinkPad) -> (i32, String) {
-    output(
-        Command::new("bash")
-            .arg(root().join("deploy/release-gate/refresh-from-helsinki.sh"))
-            .env("PATH", &t.path)
-            .env("FAKE_STATE", &t.state)
-            .env("GATE_NEST", &t.nest)
-            .env("GATE_SSH_KEY", &t.key)
-            .env("TMPDIR", t.state.parent().unwrap())
-            .output()
-            .expect("run refresh-from-helsinki.sh"),
-    )
+    refresh_with(t, &[])
+}
+
+fn refresh_with(t: &ThinkPad, extra: &[(&str, &str)]) -> (i32, String) {
+    let mut cmd = Command::new("bash");
+    cmd.arg(root().join("deploy/release-gate/refresh-from-helsinki.sh"))
+        .env("PATH", &t.path)
+        .env("FAKE_STATE", &t.state)
+        .env("GATE_NEST", &t.nest)
+        .env("GATE_SSH_KEY", &t.key)
+        .env("TMPDIR", t.state.parent().unwrap())
+        .env_remove("GATE_LOCK_HELD");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    output(cmd.output().expect("run refresh-from-helsinki.sh"))
+}
+
+/// A refresh by hand must not swap the copy out from under a gate that is serving it.
+#[test]
+fn a_refresh_waits_for_a_gate_holding_the_copy() {
+    let t = thinkpad();
+    // Detached, so init reaps it when it ends: a zombie child of this test would pass `kill -0`.
+    let o = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 3 >/dev/null 2>&1 & echo $!")
+        .output()
+        .unwrap();
+    let pid = String::from_utf8(o.stdout).unwrap().trim().to_string();
+    let lock = t.nest.with_extension("gate-lock.d");
+    std::fs::create_dir_all(&lock).unwrap();
+    std::fs::write(lock.join("pid"), &pid).unwrap();
+    let (code, text) = refresh_with(&t, &[("GATE_LOCK_PORTABLE", "1")]);
+    let held_to_the_end = !Command::new("kill")
+        .args(["-0", &pid])
+        .status()
+        .unwrap()
+        .success();
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("waiting"), "{text}");
+    assert!(
+        held_to_the_end,
+        "the copy was swapped while the gate held it"
+    );
 }
 
 fn unchanged(t: &ThinkPad) {

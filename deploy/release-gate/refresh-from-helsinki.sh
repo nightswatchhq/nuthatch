@@ -45,7 +45,13 @@ prov_key() { sed -n "s/^$1=//p" "$2" | tail -n 1; }
 ssh_cmd="ssh -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=20"
 incoming=$nest.incoming
 snap=$(mktemp "${TMPDIR:-/tmp}/gate-provenance.XXXXXX")
-trap 'rm -rf "$snap" "$incoming"' EXIT
+# The gate's lock on the copy: a refresh run by hand waits for a gate serving it, and one run as
+# GATE_REFRESH rides on release-gate-run.sh's.
+# shellcheck source=../../scripts/gate/lock.sh
+. "$(cd "$(dirname "$0")" && pwd)/../../scripts/gate/lock.sh"
+trap 'rm -rf "$snap" "$incoming"; gate_unlock' EXIT
+mkdir -p "$(dirname "$nest")"
+gate_lock "$nest" || die "could not take the lock on $nest"
 
 say "asking $host for a snapshot"
 $ssh_cmd "$host" snapshot >"$snap" || die "Helsinki could not take a snapshot; nothing was changed"
@@ -55,7 +61,6 @@ case "$want_sha" in '' | *[!0-9a-f]*) die "the snapshot's PROVENANCE has no redb
 case "$new_sealed" in '' | *[!0-9]*) die "the snapshot's PROVENANCE has no sealed_through" ;; esac
 
 rm -rf "$incoming"
-mkdir -p "$(dirname "$nest")"
 link=()
 [ -d "$nest/segments" ] && link=(--link-dest="$nest")
 say "pulling $host:$remote/ into $incoming"
