@@ -7992,44 +7992,48 @@ fn rebuild_children(
     let mut children = ChildRegistry::new();
     let manifest = crate::seal::load_manifest(dir)
         .context("reading the segment catalogue to rebuild the child registry")?;
-    // Fold in block order so the earliest discovery of each child wins (matches the live path).
+    // Every announcing table's rows, then one fold in block order across all of them, so the earliest
+    // discovery of a child two rules announce wins as it does live (#1637).
+    let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
     for table in factory.factory_tables() {
-        let mut rows: Vec<serde_json::Value> = Vec::new();
         // Cold (sealed) rows via DuckDB - but only where the catalogue says a segment exists, so an
         // unsealed table is skipped rather than queried-and-forgiven.
         if manifest.tables.get(&table).is_some_and(|s| !s.is_empty()) {
             rows.extend(
                 crate::analytics::query(dir, &format!("SELECT * FROM \"{table}\""))
-                    .with_context(|| format!("reading sealed factory rows for '{table}' (#373)"))?,
+                    .with_context(|| format!("reading sealed factory rows for '{table}' (#373)"))?
+                    .into_iter()
+                    .map(|v| (table.clone(), v)),
             );
         }
         for raw in store
             .recent_by_table(&table, usize::MAX)
             .with_context(|| format!("reading hot factory rows for '{table}' (#373)"))?
         {
-            rows.push(
+            rows.push((
+                table.clone(),
                 serde_json::from_str::<serde_json::Value>(&raw).with_context(|| {
                     format!("unparseable stored row in factory table '{table}' (#373)")
                 })?,
-            );
+            ));
         }
-        rows.sort_by(|a, b| {
-            let key = |v: &serde_json::Value| {
-                (
-                    v.get("block_number")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                    v.get("log_index")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                )
-            };
-            key(a).cmp(&key(b))
-        });
-        for v in &rows {
-            for child in factory.discover_stored(&table, v) {
-                children.insert(child);
-            }
+    }
+    rows.sort_by(|(_, a), (_, b)| {
+        let key = |v: &serde_json::Value| {
+            (
+                v.get("block_number")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                v.get("log_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    for (table, v) in &rows {
+        for child in factory.discover_stored(table, v) {
+            children.insert(child);
         }
     }
     Ok(children)
@@ -20690,6 +20694,78 @@ rpc_urls = ["https://rpc.example"]
     }
 
     /// A factory set with one rule, so `factory_tables()` yields exactly one announcing table.
+
+    /// #1637: a child two factories announce is kept from its earliest announcement on a rebuild,
+    /// as the live path keeps it. Folding table by table took whichever table the factory map
+    /// yielded first, which changes with every process, so this repeats over fresh maps.
+    #[test]
+    fn a_rebuild_keeps_the_earliest_announcement_across_announcing_tables() {
+        let config: Config = toml::from_str(
+            r#"
+[nest]
+name="t"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="fa"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[contracts]]
+alias="fb"
+address="0x2222222222222222222222222222222222222222"
+abi="abis/f.json"
+[[templates]]
+name="early"
+abi="abis/p.json"
+[[templates]]
+name="late"
+abi="abis/p.json"
+[[factories]]
+watch="fa"
+event="PoolCreated"
+child_param="pool"
+template="late"
+[[factories]]
+watch="fb"
+event="PoolCreated"
+child_param="pool"
+template="early"
+"#,
+        )
+        .unwrap();
+        let child = "0x3333333333333333333333333333333333333333";
+        for _ in 0..32 {
+            let fs = FactorySet::build(&config).unwrap();
+            let tables = fs.factory_tables();
+            let fa = tables.iter().find(|t| t.starts_with("fa")).unwrap().clone();
+            let fb = tables.iter().find(|t| t.starts_with("fb")).unwrap().clone();
+            let dir = tempfile::tempdir().unwrap();
+            let store = crate::store::Store::open(&dir.path().join("t.redb")).unwrap();
+            let row = |table: &str, block: u64| {
+                serde_json::json!({"table": table, "pool": child, "block_number": block, "log_index": 0})
+                    .to_string()
+            };
+            store
+                .commit_window(
+                    &[
+                        (Store::entity_key(10, 0), row(&fb, 10)),
+                        (Store::entity_key(20, 0), row(&fa, 20)),
+                    ],
+                    None,
+                    20,
+                )
+                .unwrap();
+            let reg = DecodeRegistry::build(Vec::new()).unwrap();
+            let children = rebuild_children(dir.path(), &store, &reg, &fs).unwrap();
+            let got = children.get(child).expect("the child is discovered");
+            assert_eq!(
+                (got.discovered_block, got.template.as_str()),
+                (10, "early"),
+                "the rebuild kept a later announcement than the live path would"
+            );
+        }
+    }
     fn one_rule_factory_set() -> (FactorySet, String) {
         let config: Config = toml::from_str(
             r#"
