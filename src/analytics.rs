@@ -1146,7 +1146,7 @@ fn attempt(
         // this - they only touch the raw per-event tables.
         define_nest_views(session, dir, wanted.as_ref());
         let offchain = if as_of.is_none() {
-            define_offchain_views(session, dir, wanted.as_ref())
+            define_offchain_views(session, dir, wanted.as_ref())?
         } else {
             Default::default()
         };
@@ -2608,6 +2608,8 @@ fn define_views_bound(
                 session.load_hot(table, &hot_rows)
             } {
                 Ok(()) => true,
+                // A statement that names the relation is told why it cannot be served (#1679).
+                Err(e) if relation && wanted.is_some() => return Err(e),
                 Err(e) => {
                     tracing::debug!("hot rows for {table} skipped: {e:#}");
                     degraded.insert(table.clone());
@@ -2785,8 +2787,9 @@ fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
 /// filename order (so `10-foo.sql` can build on nothing and `20-bar.sql` can build on foo). Run
 /// after the per-event table views (§4 of RFC-0002), so views may reference `{alias}__{event}`
 /// tables. Best-effort: a view over a table with no sealed segment yet - or a bad statement - is
-/// skipped with a debug log rather than failing the whole query. Nest SQL is authored by the nest
-/// you chose to consume; it runs read-only in this ephemeral in-memory DuckDB, same trust as `/sql`.
+/// skipped rather than failing the whole query, warned once and named on `/ready` (#1653). Nest SQL
+/// is authored by the nest you chose to consume; it runs read-only in this ephemeral in-memory
+/// DuckDB, same trust as `/sql`.
 ///
 /// `wanted` is the same reachability set `define_views` narrows by (#896): only a view whose name is
 /// in it is (re)defined, and `None` defines every view as before. **The narrowing has to reach here
@@ -2821,28 +2824,78 @@ fn define_nest_views(
                     continue;
                 }
             }
-            if let Err(e) = session.execute(&with_or_replace_view(&stmt)) {
-                tracing::debug!("nest view {} statement skipped: {e}", v.file);
+            let name = view_name(&stmt).unwrap_or_default();
+            let failed = session
+                .execute(&with_or_replace_view(&stmt))
+                .err()
+                .map(|e| e.to_string());
+            let new = note_view_failure(dir, &v.file, &name, failed.clone());
+            // Warned once per fault, since every statement reaching the view defines it again.
+            match failed {
+                Some(e) if new => tracing::warn!("nest view {name} in {} skipped: {e}", v.file),
+                Some(e) => tracing::debug!("nest view {name} in {} skipped: {e}", v.file),
+                None => {}
             }
         }
     }
 }
 
+type ViewFailures =
+    Mutex<std::collections::HashMap<PathBuf, std::collections::BTreeMap<(String, String), String>>>;
+
+fn view_failure_record() -> &'static ViewFailures {
+    static FAILED: OnceLock<ViewFailures> = OnceLock::new();
+    FAILED.get_or_init(Default::default)
+}
+
+/// Record whether one authored view in `dir` last failed to build. True when `error` is a fault
+/// not already recorded for it.
+fn note_view_failure(dir: &Path, file: &str, view: &str, error: Option<String>) -> bool {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut all = view_failure_record()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = (file.to_string(), view.to_string());
+    match error {
+        Some(e) => all.entry(dir).or_default().insert(key, e.clone()) != Some(e),
+        None => {
+            if let Some(failed) = all.get_mut(&dir) {
+                failed.remove(&key);
+            }
+            false
+        }
+    }
+}
+
+/// `(file, view, error)` for each authored view in `dir` whose last build failed, for `/ready`.
+pub(crate) fn view_failures(dir: &Path) -> Vec<(String, String, String)> {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    view_failure_record()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&dir)
+        .into_iter()
+        .flatten()
+        .map(|((file, view), error)| (file.clone(), view.clone(), error.clone()))
+        .collect()
+}
+
 /// Bind immutable offchain snapshots beneath an explicit namespace. They deliberately have no hot
 /// half, no watermark, and no path back into chain replay: they are query inputs only.
 /// Returns each view it defined and the content hashes of the snapshots behind it, in append order,
-/// so an answer can name what it read (#1437).
+/// so an answer can name what it read (#1437). A view the statement names that will not bind is its
+/// error rather than an absent table (#1678).
 fn define_offchain_views(
     session: &dyn Session,
     dir: &Path,
     wanted: Option<&std::collections::BTreeSet<String>>,
-) -> std::collections::BTreeMap<String, Vec<String>> {
+) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
     let mut defined = std::collections::BTreeMap::new();
     let Ok(catalogue) = crate::offchain::load(dir) else {
         tracing::warn!(
             "offchain provenance manifest is unreadable; no offchain views were defined"
         );
-        return defined;
+        return Ok(defined);
     };
     for (table, snapshots) in &catalogue.tables {
         let view = format!("offchain__{table}");
@@ -2862,6 +2915,7 @@ fn define_offchain_views(
             Ok(()) => {
                 defined.insert(view, present.iter().map(|(s, _)| s.hash.clone()).collect());
             }
+            Err(e) if wanted.is_some() => return Err(e.context(format!("{view} will not bind"))),
             Err(e) => tracing::warn!("offchain view {view} skipped: {e}"),
         }
     }
@@ -2877,7 +2931,7 @@ fn define_offchain_views(
             tracing::warn!("offchain status view {view} skipped: {e}");
         }
     }
-    defined
+    Ok(defined)
 }
 
 /// `stale` is true on a recorded failure, before any success, or past the declared cadence. Views
@@ -3028,8 +3082,8 @@ pub struct ViewIssue {
 /// If a query fails against a name DuckDB says doesn't exist, and that name is a nest-authored view
 /// that failed to build, replace the generic "does not exist" + fuzzy-match-on-an-unrelated-table
 /// message with the view's real build error (#539). A view that fails to build is reported as though
-/// it doesn't exist at all - `define_nest_views` loads views per-statement and swallows failures to
-/// `tracing::debug!` for fault isolation, so by the time a query dies at `/sql` there is no record of
+/// it doesn't exist at all - `define_nest_views` loads views per-statement and skips failures for
+/// fault isolation, so by the time a query dies at `/sql` its error carries nothing of
 /// *why* the name is missing, and `sql_errors::enrich`'s fuzzy match then points at an unrelated real
 /// table. This is the one place that record is reconstructed: on the query's error path only (never
 /// on a successful query), rebuild the same base surface `validate_nest_views` uses and replay the
@@ -3277,9 +3331,10 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
         // one pass; withholding it is a choice, and a bad one.
         let mut errors: Vec<String> = Vec::new();
         for stmt in split_sql_statements(&v.sql) {
-            if let Err(e) = session.execute(&stmt) {
-                errors.push(format!("{e}"));
-            }
+            let name = view_name(&stmt).unwrap_or_default();
+            let failed = session.execute(&stmt).err().map(|e| e.to_string());
+            note_view_failure(dir, &v.file, &name, failed.clone());
+            errors.extend(failed);
         }
         if errors.is_empty() {
             continue;
@@ -3855,6 +3910,67 @@ mod tests {
         );
     }
 
+    /// #1679: an entity's integer is an i128, and Burrmill's integer stops at DECIMAL(38,0). A value
+    /// past 10^38 - 1 is refused at load, naming the entity and the value, not at execution.
+    #[test]
+    fn an_entity_value_past_decimal_38_is_refused_at_load_by_name() {
+        use crate::entity_expr::Type;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['k']\nmax_rows=10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT k, sum(v) AS n FROM t GROUP BY k",
+        )
+        .unwrap();
+        crate::entities::load(dir.path()).unwrap();
+        super::hold_relation_types(
+            dir.path(),
+            "totals",
+            &["k".into(), "n".into()],
+            &[Some(Type::Str), Some(Type::Int)],
+        );
+        let run = |n: String| {
+            let row = serde_json::json!({"k": "a", "n": n});
+            let hot: super::HotRows = [("totals".to_string(), vec![row])].into_iter().collect();
+            let guard = super::QueryGuard {
+                timeout: std::time::Duration::from_secs(10),
+                max_rows: 10,
+            };
+            super::query_hot_cold(
+                dir.path(),
+                "SELECT n FROM totals",
+                guard,
+                &hot,
+                u64::MAX,
+                &[],
+            )
+        };
+        let largest = "9".repeat(38);
+        let out = run(largest.clone()).unwrap();
+        assert_eq!(
+            out.rows[0]["n"].to_string().trim_matches('"'),
+            largest,
+            "{:?}",
+            out.rows
+        );
+        for past in [
+            format!("1{}", "0".repeat(38)),
+            i128::MAX.to_string(),
+            format!("-1{}", "0".repeat(38)),
+        ] {
+            let err = format!("{:#}", run(past.clone()).unwrap_err());
+            assert!(
+                err.contains("entity totals") && err.contains(&past),
+                "{past} was not refused at load by entity and value: {err}"
+            );
+        }
+    }
+
     #[test]
     fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
         crate::engine::on_bare(
@@ -4160,6 +4276,44 @@ mod tests {
         let current = query_hot_cold(dir.path(), sql, guard, &hot, 0, &[]).unwrap();
         assert_eq!(current.rows[0]["symbol"], "GRT");
         assert!(current.offchain.unwrap().contains_key("offchain__prices"));
+    }
+
+    /// #1678: a table's snapshots are unioned by name, and Burrmill will not bind a column whose type
+    /// differs between them. A statement naming the view is told which column, not that it is absent.
+    #[test]
+    fn a_snapshot_view_that_will_not_bind_names_its_column() {
+        use arrow::array::{ArrayRef, Int32Array, Int64Array};
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, column: ArrayRef| {
+            let path = dir.path().join(name);
+            let batch = arrow::record_batch::RecordBatch::try_from_iter([("v", column)]).unwrap();
+            let file = std::fs::File::create(&path).unwrap();
+            let mut w = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            path
+        };
+        let narrow = write("a.parquet", Arc::new(Int32Array::from(vec![1, 2])));
+        let wide = write("b.parquet", Arc::new(Int64Array::from(vec![3])));
+        crate::offchain::drop_file(dir.path(), &narrow, "prices").unwrap();
+        crate::offchain::drop_file(dir.path(), &wide, "prices").unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 100,
+        };
+        let run = |sql: &str| query_hot_cold(dir.path(), sql, guard, &HotRows::new(), 0, &[]);
+        let err = format!(
+            "{:#}",
+            run("SELECT count(*) AS n FROM offchain__prices").unwrap_err()
+        );
+        assert!(
+            err.contains("offchain__prices")
+                && err.contains("'v'")
+                && err.contains("Int32")
+                && err.contains("Int64"),
+            "the view went without naming its column: {err}"
+        );
+        assert!(run("SELECT 1 AS one").is_ok(), "a statement not naming it");
     }
 
     #[test]

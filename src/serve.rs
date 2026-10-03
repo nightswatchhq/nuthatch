@@ -1966,6 +1966,11 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
             .then(|| now.saturating_sub(last_seal_progress)),
         "entities": entities,
         "entities_stalled": entities_stalled,
+        // A fact, not a verdict: one broken view must not take a serving nest out of rotation (#1653).
+        "views_failed": crate::analytics::view_failures(&s.dir)
+            .into_iter()
+            .map(|(file, view, error)| json!({ "file": file, "view": view, "error": error }))
+            .collect::<Vec<_>>(),
     });
     #[cfg(feature = "folds")]
     let body = {
@@ -6132,6 +6137,67 @@ mod tests {
             json!({"cid": "QmLegacy", "block": 48_000_020, "slot": 1, "declaration": null, "error": null, "at": null}),
             "{all}"
         );
+    }
+
+    /// #1653: an authored view the engine refuses at define time vanished from `/sql` with a debug
+    /// line. `/ready` names it, and stops once it builds.
+    #[tokio::test]
+    async fn ready_names_an_authored_view_that_will_not_build() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        let view = dir.path().join("views/10-whales.sql");
+        let broken = "CREATE VIEW whales AS SELECT 1 AS n WHERE 1 > 100000000000000000000;";
+        let ask = || {
+            let guard = crate::analytics::QueryGuard {
+                timeout: std::time::Duration::from_secs(5),
+                max_rows: 10,
+            };
+            let hot = crate::analytics::HotRows::new();
+            crate::analytics::query_hot_cold(
+                dir.path(),
+                "SELECT n FROM whales",
+                guard,
+                &hot,
+                0,
+                &[],
+            )
+        };
+        let failed = || async {
+            let router = router(SharedNest::new(test_state(dir.path(), 4)));
+            let (_, body) = get(router, "/ready").await;
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["views_failed"].clone()
+        };
+
+        let named = || async {
+            let named = failed().await;
+            assert_eq!(
+                (named[0]["file"].as_str(), named[0]["view"].as_str()),
+                (Some("10-whales.sql"), Some("whales")),
+                "the refused view is not on /ready: {named}"
+            );
+            assert!(named[0]["error"].is_string(), "{named}");
+        };
+
+        // At startup, before any statement asks for it.
+        std::fs::write(&view, broken).unwrap();
+        assert_eq!(
+            crate::analytics::validate_nest_views(dir.path(), &[]).len(),
+            1
+        );
+        named().await;
+
+        std::fs::write(&view, "CREATE VIEW whales AS SELECT 1 AS n;").unwrap();
+        assert!(ask().is_ok());
+        assert_eq!(
+            failed().await,
+            json!([]),
+            "a view that builds is not reported"
+        );
+
+        // And when a statement defines it.
+        std::fs::write(&view, broken).unwrap();
+        assert!(ask().is_err());
+        named().await;
     }
 
     /// #1399: `--ipfs-window-deadline` is on `/ready`, `0` for none and null before a nest records it.
