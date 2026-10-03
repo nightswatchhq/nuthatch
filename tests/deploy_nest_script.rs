@@ -170,6 +170,19 @@ fn a_ready_answer_with_spaced_json_is_read() {
     assert!(out.contains("last_block 42 -> 42"), "{out}");
 }
 
+/// The QoS nest listens on a tailnet address, not loopback. The port lookup matched only
+/// 127.0.0.1 and the empty match ended the script silently under `pipefail`.
+#[test]
+fn a_unit_listening_on_a_non_loopback_address_rolls() {
+    let b = a_box(false);
+    let unit = b.units.join("dips.service");
+    let raw = std::fs::read_to_string(&unit).unwrap();
+    std::fs::write(&unit, raw.replace("127.0.0.1:8104", "100.83.44.63:8124")).unwrap();
+    let (ok, out) = roll(&b);
+    assert!(ok, "the roll died on a non-loopback listen address:\n{out}");
+    assert!(running(&b).ends_with("nuthatch-4.1.1"), "{out}");
+}
+
 #[test]
 fn a_roll_without_a_drop_in_edits_the_unit_file() {
     let b = a_box(false);
