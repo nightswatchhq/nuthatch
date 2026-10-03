@@ -3842,6 +3842,8 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
             .is_some()
     {
         crate::metrics::SqlRejection::TooLarge
+    } else if crate::sql_errors::is_out_of_memory(&format!("{e:#}")) {
+        crate::metrics::SqlRejection::OutOfMemory
     } else {
         crate::metrics::SqlRejection::Invalid
     };
@@ -5193,6 +5195,43 @@ mod tests {
             nest_info: Arc::new(json!({ "name": "t" })),
             runtime_health: None,
         }
+    }
+
+    fn rejections(reason: &str) -> Option<u64> {
+        let needle = format!("nuthatch_sql_rejections_total{{reason=\"{reason}\"}} ");
+        crate::metrics::METRICS
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str())?.parse().ok())
+    }
+
+    /// #1714: the 4.1.1 hash-join OOM on Lodestar was counted as `invalid`, a caller mistake, so no
+    /// alert could tell the engine running out of memory from a typo.
+    #[test]
+    fn an_engine_out_of_memory_is_counted_as_its_own_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = test_state(dir.path(), 1);
+        let before = rejections("out_of_memory").unwrap_or(0);
+        let oom = anyhow::anyhow!(
+            "refused executing: substrate error: Out of Memory Error: Failed to allocate additional \
+             2012.3 KB for HashJoinInput[7] with 1973.3 KB already allocated for this reservation"
+        );
+        let _ = sql_error_response(&s, oom, "SELECT 1");
+        let after = rejections("out_of_memory").expect("an out_of_memory reason series");
+        assert!(
+            after > before,
+            "OOM must count as out_of_memory: {before} -> {after}"
+        );
+
+        let echo = anyhow::anyhow!(
+            r#"Binder Error: Referenced column "Out of Memory Error" not found in FROM clause!"#
+        );
+        let _ = sql_error_response(&s, echo, r#"SELECT "Out of Memory Error""#);
+        assert_eq!(
+            rejections("out_of_memory"),
+            Some(after),
+            "a binder echo of the phrase is the caller's text, not an OOM"
+        );
     }
 
     #[cfg(feature = "graph")]

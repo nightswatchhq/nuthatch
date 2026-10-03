@@ -817,8 +817,9 @@ job:
 and network table functions are refused, and `;`-stacking a second statement is rejected outright.
 Rejections surface as a `4xx` or `503` and count in the backward-compatible aggregate
 `nuthatch_sql_rejections_total`, and in `nuthatch_sql_rejections_total{reason=…}`. The fixed
-`reason` values distinguish `busy`, `too_large`, `invalid`, `bounded`, and declared-query
-`admission`; they are the useful series for separating saturation from a caller error. A declared
+`reason` values distinguish `busy`, `too_large`, `invalid`, `bounded`, declared-query
+`admission`, `timeout`, and `out_of_memory` (the engine ran out of its memory budget, still a `400`
+to the caller); they are the useful series for separating saturation from a caller error. A declared
 query refused by its scan bound answers `422` and also counts in
 `nuthatch_named_scan_refusals_total`; the bounds of those admitted are the
 `nuthatch_named_scan_bytes` histogram.
@@ -1007,6 +1008,7 @@ Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_scre
 | **Outbox backing up** | `nuthatch_alert_outbox_depth` rising | a webhook sink is down or slow |
 | **Memory near budget** | `nuthatch_rss_bytes` over ~75% of the cursor ceiling | usually the `/sql` hot-scan |
 | **Query rejections spiking** | `rate(nuthatch_sql_rejections_total{reason="busy"}[5m])` | the node is at its analytical concurrency or queue bound; inspect the aggregate too, but do not confuse caller mistakes with saturation |
+| **Queries out of memory** | `increase(nuthatch_sql_rejections_total{reason="out_of_memory"}[2m]) > 0` | a query did not fit the engine's memory budget; a release that regressed memory shows here first, as 4.1.1 would have |
 | **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
 | **Mirror behind** | `nuthatch_publish_lag_blocks` growing across several intervals, or `nuthatch_publish_dead_letter == 1` | the bucket is unreachable or refusing an object, and consumers of the mirror see stale history |
 
