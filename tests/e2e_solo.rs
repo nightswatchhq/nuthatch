@@ -1241,6 +1241,9 @@ impl nuthatch::store::HotStore for HotScanFails {
             .commit_window_blocking(entities, checkpoint, last_block)
             .await
     }
+    async fn settle_commits(&self) {
+        self.0.settle_commits().await
+    }
     fn rollback_to(&self, block: u64) -> anyhow::Result<u64> {
         self.0.rollback_to(block)
     }
