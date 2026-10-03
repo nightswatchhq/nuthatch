@@ -80,7 +80,8 @@ cursor and backfills inside it, so it is `live` while history is still arriving.
 `true` while it catches up, since readiness means serving and advancing.
 
 A second `POST` of the same name and NID is idempotent: `202` with the running job, or `200` once it is
-live. The same name with another NID is `409`; changing a live mount's nest is a move.
+live. The same name with another NID is `409`, whether that name is live, mounting or suspended;
+changing a live mount's nest is a move.
 
 `?wait=true` answers only when the mount has finished, with the synchronous statuses below. Use it from
 a script; a platform should poll.

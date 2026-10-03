@@ -2411,8 +2411,8 @@ pub fn lifecycle_routes(
             let same = job.nid == nid_str || nid_str.is_none();
             match (job.phase, same) {
                 (MountPhase::Live, true) => return (StatusCode::OK, Json(serde_json::json!(job))),
-                // A suspended name mounts again as its resume.
-                (MountPhase::Failed | MountPhase::Suspended, _) => {}
+                // A suspended name mounts again on its own NID as its resume.
+                (MountPhase::Failed, _) | (MountPhase::Suspended, true) => {}
                 (_, true) => return (StatusCode::ACCEPTED, Json(serde_json::json!(job))),
                 (_, false) => {
                     return (
@@ -2421,7 +2421,11 @@ pub fn lifecycle_routes(
                             "error": format!(
                                 "'{}' is already {} as nid {}; changing a mount's nest is `nest upgrade`",
                                 body.name,
-                                if job.phase == MountPhase::Live { "mounted" } else { "being mounted" },
+                                match job.phase {
+                                    MountPhase::Live => "mounted",
+                                    MountPhase::Suspended => "suspended",
+                                    _ => "being mounted",
+                                },
                                 job.nid.as_deref().unwrap_or("(unrecorded)")
                             )
                         })),
@@ -3011,6 +3015,8 @@ pub enum MountRefusal {
     CursorStopped { nest: String, chain: String },
     /// A name boot would refuse, so it may never be persisted.
     InvalidName(String),
+    /// The name is suspended on another NID. Resuming it is a mount of that NID (#1645).
+    Suspended { name: String, nid: String },
 }
 
 impl std::fmt::Display for MountRefusal {
@@ -3036,6 +3042,11 @@ impl std::fmt::Display for MountRefusal {
                  {ceiling_mb} MB ceiling - raise max_rss_mb, unmount something, or use another mounts"
             ),
             MountRefusal::InvalidName(why) => write!(f, "{why}"),
+            MountRefusal::Suspended { name, nid } => write!(
+                f,
+                "'{name}' is suspended as nid {nid}; resume it, or unmount it before mounting \
+                 another nid under its name"
+            ),
             MountRefusal::CursorStopped { nest, chain } => write!(
                 f,
                 "the cursor on {chain} has stopped; restart the runtime to mount '{nest}' onto it"
@@ -3056,6 +3067,7 @@ impl MountRefusal {
     pub fn status(&self) -> u16 {
         match self {
             MountRefusal::AlreadyMounted(_)
+            | MountRefusal::Suspended { .. }
             | MountRefusal::UndeclaredChain { .. }
             | MountRefusal::CursorStopped { .. } => 409,
             MountRefusal::OverBudget { .. } => 507,
@@ -3683,6 +3695,15 @@ impl RuntimeHandles {
         }
         if let Err(e) = refuse_reserved_mount(tenant, alias) {
             return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
+        }
+        if let (Some(held), Some(asked)) = (self.suspended.get(name), nid) {
+            if held != asked.as_str() {
+                return Err(MountRefusal::Suspended {
+                    name: name.to_string(),
+                    nid: held.clone(),
+                }
+                .into());
+            }
         }
         // The caller's `nid` wins over any existing record - it names the dataset to mount, not a
         // request to overwrite one. It falls back to a record from a prior mount/load only when the

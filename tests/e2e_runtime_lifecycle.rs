@@ -2021,6 +2021,52 @@ async fn suspend_and_resume_over_the_admin_api() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// #1645: a suspended name is still that NID's mount. Mounting another NID under it is a 409 on
+/// either route, and leaves the suspension and its record as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mounting_another_nid_over_a_suspended_name_is_refused() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6e".repeat(32);
+    let other = "6f".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    scaffold_nest(
+        &runtime::MountTable::data_dir(roost.path(), &other),
+        "usdc",
+        USDC,
+    );
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+    let body = format!(r#"{{"name":"usdc","nid":"{other}"}}"#);
+    for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+        let (status, answer) = call(&routes, "POST", uri, None, Some(&body)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "{uri} mounted another nid over a suspended name: {answer}"
+        );
+    }
+    let job = wait_for_phase(&routes, "usdc", "suspended").await;
+    assert_eq!(job["phase"], "suspended", "{job}");
+    assert_eq!(job["nid"], nid.as_str(), "{job}");
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert_eq!(file.runtime.suspended, vec!["usdc".to_string()]);
+    assert_eq!(file.mounts.len(), 1);
+    assert_eq!(
+        file.mounts[0].nid, nid,
+        "the suspended record was rewritten"
+    );
+    assert_eq!(
+        status_of(&handles).await,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
 /// #1642: a localhost runtime needs no token, so the only thing between a hostile page and the
 /// lifecycle routes is the browser. Over the real bind with `--cors '*'`, the page may neither have a
 /// preflight granted nor suspend a mount with a form POST, which is sent without one.
