@@ -1055,17 +1055,17 @@ impl Metrics {
         let pools = crate::analytics::engine().pools();
         s.push_str(&gauge(
             "nuthatch_analytics_pool_reserved_bytes",
-            "Bytes the statements in flight hold against the analytics engines' memory pools, summed over every live engine.",
+            "Bytes the statements in flight hold against the analytics engines' memory pools, each nest's shared pool counted once.",
             pools.total.reserved,
         ));
         s.push_str(&gauge(
             "nuthatch_analytics_pool_peak_bytes",
-            "The most any one analytics engine's memory pool has held since start.",
+            "The most any one analytics engine's statements have held since start.",
             pools.total.peak,
         ));
         s.push_str(&gauge(
             "nuthatch_analytics_engines",
-            "Live analytics engines. Each has its own memory pool, bounded by NUTHATCH_BURRMILL_MEMORY_LIMIT.",
+            "Live analytics engines. A nest's engines share one pool, bounded by NUTHATCH_BURRMILL_MEMORY_LIMIT.",
             pools.total.engines,
         ));
         #[cfg(all(target_os = "linux", not(target_env = "musl")))]
@@ -1366,13 +1366,13 @@ impl Metrics {
             );
             labelled(
                 "nuthatch_nest_analytics_pool_peak_bytes",
-                "The most any one analytics engine opened over this nest's dataset has held since start.",
+                "The most the statements of any one analytics engine opened over this nest's dataset have held since start.",
                 "gauge",
                 &|m| pool(m).peak,
             );
             labelled(
                 "nuthatch_nest_analytics_engines",
-                "Live analytics engines opened over this nest's dataset, each with its own pool.",
+                "Live analytics engines opened over this nest's dataset, all on its one pool.",
                 "gauge",
                 &|m| pool(m).engines,
             );

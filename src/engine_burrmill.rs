@@ -71,11 +71,16 @@ fn pools() -> Pools {
             e.memory_reserved() as u64
         });
         out.total.engines += 1;
-        out.total.reserved += reserved;
-        if let Some(dir) = dir {
-            let u = out.by_dir.entry(dir).or_default();
-            u.engines += 1;
-            u.reserved += reserved;
+        match dir {
+            Some(dir) => out.by_dir.entry(dir).or_default().engines += 1,
+            None => out.total.reserved += reserved,
+        }
+    }
+    // A nest's engines each report their shared pool's total, so the pool is read once (#1792).
+    for (dir, pool) in NEST_POOLS.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        if let Some(u) = out.by_dir.get_mut(dir) {
+            u.reserved = pool.reserved() as u64;
+            out.total.reserved += u.reserved;
         }
     }
     let peaks = PEAKS.lock().unwrap_or_else(|p| p.into_inner());
@@ -839,6 +844,43 @@ mod tests {
             after.peak > seen,
             "the larger sort's peak was lost with the session: {after:?}, {seen} before it"
         );
+    }
+
+    /// #1792: a nest's sessions share one pool, and each reports that pool's total as its own, so a
+    /// sum over them counts the pool once per session.
+    #[test]
+    fn two_sessions_of_one_nest_report_their_pool_once() {
+        use crate::engine::Session;
+        let dir = tempfile::tempdir().unwrap();
+        let s = sorting_session(dir.path(), &[("t", 20_000)]);
+        let idle = super::BurrmillSession::new(Some(dir.path())).unwrap();
+        let mut during = None;
+        s.for_each_row("SELECT n, block_number FROM t ORDER BY n", &mut |_| {
+            during.get_or_insert_with(|| {
+                let shared = super::nest_pool(dir.path(), 0).reserved() as u64;
+                let all = super::pools();
+                (
+                    all.by_dir.get(dir.path()).copied().unwrap_or_default(),
+                    shared,
+                    all.total.reserved,
+                )
+            });
+            Ok(())
+        })
+        .unwrap();
+        let (seen, shared, total) = during.expect("the sort returned rows");
+        assert!(shared > 0, "the sort holds part of the pool");
+        assert_eq!(seen.engines, 2);
+        assert_eq!(
+            seen.reserved, shared,
+            "two sessions on one pool of {shared} bytes reported {}",
+            seen.reserved
+        );
+        assert!(
+            total >= shared,
+            "the process total {total} left out the nest's {shared}"
+        );
+        drop(idle);
     }
 
     /// `/sql` collects, and a scrape must not wait behind it.
