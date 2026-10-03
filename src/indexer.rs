@@ -3467,6 +3467,23 @@ fn tail_hold(w_to: u64, final_pass_done: bool) -> u64 {
 /// the block it touched, and the segment's content address depends on that order.
 pub(crate) type SealRow = (u64, u64, String);
 
+/// Logs one seal-direct window may hold before it stops splitting and hands the rest of its range
+/// back (#1671). Ten times the controller's target, so only a window that overshot reaches it.
+const SEAL_DIRECT_WINDOW_LOGS: usize = 20_000;
+
+/// One pipelined seal-direct window, decoded. `w_to` falls short of `asked_to` when the window
+/// reached [`SEAL_DIRECT_WINDOW_LOGS`].
+struct FetchedWindow {
+    fetch_from: u64,
+    w_to: u64,
+    asked_to: u64,
+    final_pass: bool,
+    fetched: u64,
+    served_width: u64,
+    whole_width: u64,
+    json: Vec<SealRow>,
+}
+
 /// Merge one fetched window into the seal buffer (#1144).
 ///
 /// Rows whose `(block, log_index)` the buffer already holds are dropped - they are the refetched
@@ -4891,17 +4908,23 @@ fn suggested_split_point(err: &anyhow::Error, from: u64, to: u64) -> Option<u64>
 /// Implemented by threading a cell through the recursion rather than changing the return type,
 /// because the plain form has four call sites in tests that are about splitting behaviour and should
 /// stay as they are.
+///
+/// Stops splitting once `budget` logs are in hand and returns the last block it covered (#1671): the
+/// pieces of a refused range were all merged, so a window grown wide over an empty range held its whole
+/// width of dense history at once. The caller fetches the rest.
 async fn fetch_logs_splitting_tracked(
     source: &dyn Source,
     filter: &LogFilter,
     from: u64,
     to: u64,
-) -> Result<(Vec<crate::rpc::Log>, u64)> {
+    budget: usize,
+) -> Result<(Vec<crate::rpc::Log>, u64, u64)> {
     let widest = std::sync::atomic::AtomicU64::new(0);
-    let logs = fetch_logs_splitting_tracking(source, filter, from, to, true, &widest).await?;
+    let (logs, covered) =
+        fetch_logs_splitting_tracking(source, filter, from, to, true, budget, &widest).await?;
     // Nothing served means nothing was asked for; report the full width so the caller changes nothing.
     let w = widest.load(std::sync::atomic::Ordering::SeqCst);
-    Ok((logs, if w == 0 { to - from + 1 } else { w }))
+    Ok((logs, if w == 0 { to - from + 1 } else { w }, covered))
 }
 
 /// [`fetch_logs_splitting_tracked`] with the served width discarded. **Test-only**: production
@@ -4918,10 +4941,15 @@ async fn fetch_logs_splitting(
     from: u64,
     to: u64,
 ) -> Result<Vec<crate::rpc::Log>> {
-    fetch_logs_splitting_tracked(source, filter, from, to)
+    fetch_logs_splitting_tracked(source, filter, from, to, usize::MAX)
         .await
-        .map(|(logs, _)| logs)
+        .map(|(logs, _, _)| logs)
 }
+
+/// The logs, and the last block they cover.
+type SplitFetch<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(Vec<crate::rpc::Log>, u64)>> + Send + 'a>,
+>;
 
 /// The body of [`fetch_logs_splitting`], plus whether a *speculative* split is still allowed for an
 /// error we could not classify (RFC-0028 §3b).
@@ -4946,14 +4974,14 @@ fn fetch_logs_splitting_tracking<'a>(
     from: u64,
     to: u64,
     speculative: bool,
+    budget: usize,
     widest: &'a std::sync::atomic::AtomicU64,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::rpc::Log>>> + Send + 'a>>
-{
+) -> SplitFetch<'a> {
     Box::pin(async move {
         match source.logs(filter, from, to).await {
             Ok(logs) => {
                 widest.fetch_max(to - from + 1, std::sync::atomic::Ordering::SeqCst);
-                Ok(logs)
+                Ok((logs, to))
             }
             Err(e) if narrowing_can_help(&e, from, to) => {
                 if from >= to {
@@ -4965,14 +4993,25 @@ fn fetch_logs_splitting_tracking<'a>(
                 // (RFC-0028 §3c). Anything unusable falls back to the midpoint.
                 let split_at =
                     suggested_split_point(&e, from, to).unwrap_or(from + (to - from) / 2);
-                let mut left =
-                    fetch_logs_splitting_tracking(source, filter, from, split_at, true, widest)
-                        .await?;
-                let right =
-                    fetch_logs_splitting_tracking(source, filter, split_at + 1, to, true, widest)
-                        .await?;
+                let (mut left, covered) = fetch_logs_splitting_tracking(
+                    source, filter, from, split_at, true, budget, widest,
+                )
+                .await?;
+                if covered < split_at || left.len() >= budget {
+                    return Ok((left, covered));
+                }
+                let (right, covered) = fetch_logs_splitting_tracking(
+                    source,
+                    filter,
+                    split_at + 1,
+                    to,
+                    true,
+                    budget - left.len(),
+                    widest,
+                )
+                .await?;
                 left.extend(right);
-                Ok(left)
+                Ok((left, covered))
             }
             // Unclassifiable, but the window spans more than one block and we have a split to spend.
             // A classified throttle is not unclassifiable (#1297).
@@ -4982,21 +5021,47 @@ fn fetch_logs_splitting_tracking<'a>(
                     "getLogs {from}..={to} failed unclassifiably ({e:#}); splitting speculatively"
                 );
                 let left =
-                    fetch_logs_splitting_tracking(source, filter, from, mid, false, widest).await;
-                let right =
-                    fetch_logs_splitting_tracking(source, filter, mid + 1, to, false, widest).await;
-                match (left, right) {
-                    (Ok(mut l), Ok(r)) => {
+                    fetch_logs_splitting_tracking(source, filter, from, mid, false, budget, widest)
+                        .await;
+                let right_budget = match &left {
+                    Ok((l, covered)) if *covered < mid || l.len() >= budget => None,
+                    Ok((l, _)) => Some(budget - l.len()),
+                    Err(_) => Some(budget),
+                };
+                let right = match right_budget {
+                    Some(b) => Some(
+                        fetch_logs_splitting_tracking(
+                            source,
+                            filter,
+                            mid + 1,
+                            to,
+                            false,
+                            b,
+                            widest,
+                        )
+                        .await,
+                    ),
+                    None => None,
+                };
+                let joined = match (left, right) {
+                    (Ok(l), None) => Some(l),
+                    (Ok((mut l, _)), Some(Ok((r, covered)))) => {
+                        l.extend(r);
+                        Some((l, covered))
+                    }
+                    _ => None,
+                };
+                match joined {
+                    Some(logs) => {
                         tracing::info!(
                             "getLogs {from}..={to} succeeded when split - the provider was refusing \
                              the range without saying so; treating it as a cap"
                         );
-                        l.extend(r);
-                        Ok(l)
+                        Ok(logs)
                     }
                     // The split did not help, so the failure was never about size. Surface the
                     // *original* error - the halves' errors are the same fault seen twice.
-                    _ => Err(e).with_context(|| format!("getLogs {from}..={to}")),
+                    None => Err(e).with_context(|| format!("getLogs {from}..={to}")),
                 }
             }
             Err(e) => Err(e).with_context(|| format!("getLogs {from}..={to}")),
@@ -5264,9 +5329,18 @@ pub async fn backfill_direct_pipelined_with(
     // returning `None` is the contract-free nest that must not fetch at all (#432).
     let filter = LogFilter::new(addresses, topic0s);
     let filter = &filter;
+    // Shut while the consumer fetches the rest of a window cut short (#1671), so the windows already in
+    // flight finish without more being issued behind them.
+    let gate = std::sync::Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
     let windows = futures::stream::unfold(
-        (from, chunker.clone(), false),
-        move |(next, ch, final_done)| async move {
+        (from, chunker.clone(), gate.clone(), false),
+        move |(next, ch, gate, final_done)| async move {
+            while gate.0.load(std::sync::atomic::Ordering::SeqCst) {
+                gate.1.notified().await;
+            }
             if next > to {
                 if final_done {
                     return None;
@@ -5274,173 +5348,190 @@ pub async fn backfill_direct_pipelined_with(
                 // The last window has no window after it to refetch its tail (#1144): one more
                 // window over the range's last `FETCH_TAIL_OVERLAP` blocks, flagged so it is not
                 // widened again.
-                return Some(((overlap_from(to + 1, from), to, true), (to + 1, ch, true)));
+                return Some((
+                    (overlap_from(to + 1, from), to, true),
+                    (to + 1, ch, gate, true),
+                ));
             }
             let w = ch.lock().expect("window controller").window();
             let chunk_to = (next.saturating_add(w - 1)).min(to);
-            Some(((next, chunk_to, false), (chunk_to + 1, ch, final_done)))
+            Some((
+                (next, chunk_to, false),
+                (chunk_to + 1, ch, gate, final_done),
+            ))
         },
     );
 
     // Each window future fetches logs + timestamps and returns its decoded rows as JSON. Borrows
     // (`source`, `registry`, filters) are shared across the concurrent futures - fine, they run on
-    // one task; `buffered` yields them back in window order.
-    let stream = windows
-        .map(|(w_from, w_to, final_pass)| async move {
-            // Split-and-retry on a provider result cap instead of aborting the whole backfill (H2/H3),
-            // and retry the whole fetch on a transient all-endpoints failure (rate-limit / provider
-            // blip) so one bad window doesn't abort the run.
-            // Non-zero only when the splitter actually had to recover (#672): the width that came
-            // back, which is narrower than the one asked for. Zero means "no signal", and the last
-            // window of a run - truncated by the end of the range rather than by the provider - must
-            // produce no signal, or every run would cap itself on its final chunk.
-            let mut served_width = 0u64;
-            let mut whole_width = 0u64;
-            // The tail of the previous window is asked for again (#1144).
-            let fetch_from = if final_pass {
-                w_from
-            } else {
-                overlap_from(w_from, from)
-            };
-            let logs = match &filter {
-                // Nothing to match on either half means nothing to ask for - and asking anyway is
-                // asking for every log on the chain (#432). The window still flows through the rest
-                // of the pipeline, because a `blocks` nest derives its rows from the window itself.
-                None => Vec::new(),
-                Some(f) => {
-                    // Tracked, so the controller learns what actually worked (#672). Without it the
-                    // window grows on a success the splitter manufactured by cutting the range up.
-                    let (logs, served) = retry_transient(
-                        &format!("seal-direct getLogs {fetch_from}..={w_to}"),
-                        BACKFILL_RETRY_BASE,
-                        || fetch_logs_splitting_tracked(source, f, fetch_from, w_to),
-                    )
-                    .await?;
-                    if served < w_to - fetch_from + 1 {
-                        served_width = served;
-                    } else {
-                        whole_width = served;
-                    }
-                    logs
+    // one task; `buffered` yields them back in window order. A window that comes back short of
+    // `asked_to` (#1671) has its remainder fetched by the consumer, in order, before the next one.
+    let run_window = move |w_from: u64, asked_to: u64, final_pass: bool| async move {
+        // Split-and-retry on a provider result cap instead of aborting the whole backfill (H2/H3),
+        // and retry the whole fetch on a transient all-endpoints failure (rate-limit / provider
+        // blip) so one bad window doesn't abort the run.
+        // Non-zero only when the splitter actually had to recover (#672): the width that came
+        // back, which is narrower than the one asked for. Zero means "no signal", and the last
+        // window of a run - truncated by the end of the range rather than by the provider - must
+        // produce no signal, or every run would cap itself on its final chunk.
+        let mut served_width = 0u64;
+        let mut whole_width = 0u64;
+        // The tail of the previous window is asked for again (#1144).
+        let fetch_from = if final_pass {
+            w_from
+        } else {
+            overlap_from(w_from, from)
+        };
+        let (logs, w_to) = match &filter {
+            // Nothing to match on either half means nothing to ask for - and asking anyway is
+            // asking for every log on the chain (#432). The window still flows through the rest
+            // of the pipeline, because a `blocks` nest derives its rows from the window itself.
+            None => (Vec::new(), asked_to),
+            Some(f) => {
+                // Tracked, so the controller learns what actually worked (#672). Without it the
+                // window grows on a success the splitter manufactured by cutting the range up.
+                let (logs, served, covered) = retry_transient(
+                    &format!("seal-direct getLogs {fetch_from}..={asked_to}"),
+                    BACKFILL_RETRY_BASE,
+                    || {
+                        fetch_logs_splitting_tracked(
+                            source,
+                            f,
+                            fetch_from,
+                            asked_to,
+                            SEAL_DIRECT_WINDOW_LOGS,
+                        )
+                    },
+                )
+                .await?;
+                if served < asked_to - fetch_from + 1 {
+                    served_width = served;
+                } else {
+                    whole_width = served;
                 }
-            };
-            // **The controller is fed raw logs, not decoded rows.** It is sizing a *response*, and a
-            // log that matches no decoder still costs bytes on the wire and still counts against the
-            // provider's result cap. Feeding it `rows.len()` would make a nest with a narrow event
-            // allowlist - `events = ["Transfer"]` on a chatty contract - see almost every window as
-            // empty and grow to the ceiling against genuinely dense history, which is the one place an
-            // oversized window actually hurts.
-            let fetched = logs.len() as u64;
-            let mut rows: Vec<_> = logs
-                .iter()
-                .filter_map(|log| match registry.decode(log) {
-                    Ok(Some(r)) => Some(r),
-                    Ok(None) => None,
-                    Err(e) => {
-                        tracing::debug!("decode skipped: {e:#}");
-                        None
-                    }
-                })
-                .collect();
-            let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
-            // Include blocks sampled by [[calls]] so their timestamps are available for call rows.
-            if state_rpc.is_some() {
-                for d in calls {
-                    blocks.extend(d.blocks_in(w_from, w_to));
-                }
+                (logs, covered)
             }
-            blocks.sort_unstable();
-            blocks.dedup();
-            let block_data = retry_transient(
-                &format!("seal-direct block_timestamps {w_from}..={w_to}"),
-                BACKFILL_RETRY_BASE,
-                || {
-                    fetch_window_block_data(
-                        source,
-                        registry,
-                        &blocks,
-                        state_rpc.is_some() && calls.iter().any(|c| c.canonical),
-                    )
-                },
+        };
+        // **The controller is fed raw logs, not decoded rows.** It is sizing a *response*, and a
+        // log that matches no decoder still costs bytes on the wire and still counts against the
+        // provider's result cap. Feeding it `rows.len()` would make a nest with a narrow event
+        // allowlist - `events = ["Transfer"]` on a chatty contract - see almost every window as
+        // empty and grow to the ceiling against genuinely dense history, which is the one place an
+        // oversized window actually hurts.
+        let fetched = logs.len() as u64;
+        let mut rows: Vec<_> = logs
+            .iter()
+            .filter_map(|log| match registry.decode(log) {
+                Ok(Some(r)) => Some(r),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!("decode skipped: {e:#}");
+                    None
+                }
+            })
+            .collect();
+        let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
+        // Include blocks sampled by [[calls]] so their timestamps are available for call rows.
+        if state_rpc.is_some() {
+            for d in calls {
+                blocks.extend(d.blocks_in(w_from, w_to));
+            }
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+        let block_data = retry_transient(
+            &format!("seal-direct block_timestamps {w_from}..={w_to}"),
+            BACKFILL_RETRY_BASE,
+            || {
+                fetch_window_block_data(
+                    source,
+                    registry,
+                    &blocks,
+                    state_rpc.is_some() && calls.iter().any(|c| c.canonical),
+                )
+            },
+        )
+        .await?;
+        let ts = block_data.timestamps;
+        // Seal in canonical (block, log_index) order, not RPC-provider order, so a segment's bytes
+        // (and its content address) are identical across providers - see `backfill_direct`.
+        rows.sort_by_key(|r| (r.block_number, r.log_index));
+        for r in &mut rows {
+            r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
+        }
+        // RFC-0023 tier-3: resolve declared [[calls]] and merge so sealed segments match the hot path.
+        if let Some(rpc) = state_rpc {
+            let call_rows = resolve_calls_for_window(
+                source,
+                calls,
+                rpc,
+                chain_id,
+                &rows,
+                w_from,
+                w_to,
+                &ts,
+                registry.timestamps(),
+                block_data.headers.as_ref(),
             )
             .await?;
-            let ts = block_data.timestamps;
-            // Seal in canonical (block, log_index) order, not RPC-provider order, so a segment's bytes
-            // (and its content address) are identical across providers - see `backfill_direct`.
+            rows.extend(call_rows);
             rows.sort_by_key(|r| (r.block_number, r.log_index));
-            for r in &mut rows {
-                r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
-            }
-            // RFC-0023 tier-3: resolve declared [[calls]] and merge so sealed segments match the hot path.
-            if let Some(rpc) = state_rpc {
-                let call_rows = resolve_calls_for_window(
-                    source,
-                    calls,
-                    rpc,
-                    chain_id,
-                    &rows,
-                    w_from,
-                    w_to,
-                    &ts,
-                    registry.timestamps(),
-                    block_data.headers.as_ref(),
-                )
-                .await?;
-                rows.extend(call_rows);
-                rows.sort_by_key(|r| (r.block_number, r.log_index));
-            }
-            extras
-                .extend(
-                    source,
-                    addresses,
-                    &mut rows,
-                    fetch_from,
-                    w_to,
-                    registry.timestamps(),
-                )
-                .await?;
-            // Carry each row's block so the consumer can seal on a data-determined boundary
-            // (RFC-0028 §4) instead of at whichever window filled the buffer.
-            let mut json: Vec<SealRow> = rows
-                .iter()
-                .map(|r| (r.block_number, r.log_index, r.to_json().to_string()))
-                .collect();
-            // RFC-0036 §4.2: one row per block in the window. Enumerated from the **window**, not
-            // from `rows` - a blocks table has to cover blocks that emitted nothing, and OBIB case 3
-            // is 100,001 blocks with no contract in the nest at all.
-            if registry.blocks() {
-                let want: Vec<u64> = (w_from..=w_to).collect();
-                let headers = retry_transient(
-                    &format!("seal-direct block_headers {w_from}..={w_to}"),
-                    BACKFILL_RETRY_BASE,
-                    || source.block_headers(&want),
-                )
-                .await?;
-                let mut block_rows: Vec<_> = want
-                    .iter()
-                    .filter_map(|b| {
-                        headers
-                            .get(b)
-                            .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
-                    })
-                    .collect();
-                block_rows.sort_by_key(|r| r.block_number);
-                json.extend(
-                    block_rows
-                        .iter()
-                        .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
-                );
-            }
-            Ok::<(u64, u64, bool, u64, u64, u64, Vec<SealRow>), anyhow::Error>((
+        }
+        extras
+            .extend(
+                source,
+                addresses,
+                &mut rows,
                 fetch_from,
                 w_to,
-                final_pass,
-                fetched,
-                served_width,
-                whole_width,
-                json,
-            ))
+                registry.timestamps(),
+            )
+            .await?;
+        // Carry each row's block so the consumer can seal on a data-determined boundary
+        // (RFC-0028 §4) instead of at whichever window filled the buffer.
+        let mut json: Vec<SealRow> = rows
+            .iter()
+            .map(|r| (r.block_number, r.log_index, r.to_json().to_string()))
+            .collect();
+        // RFC-0036 §4.2: one row per block in the window. Enumerated from the **window**, not
+        // from `rows` - a blocks table has to cover blocks that emitted nothing, and OBIB case 3
+        // is 100,001 blocks with no contract in the nest at all.
+        if registry.blocks() {
+            let want: Vec<u64> = (w_from..=w_to).collect();
+            let headers = retry_transient(
+                &format!("seal-direct block_headers {w_from}..={w_to}"),
+                BACKFILL_RETRY_BASE,
+                || source.block_headers(&want),
+            )
+            .await?;
+            let mut block_rows: Vec<_> = want
+                .iter()
+                .filter_map(|b| {
+                    headers
+                        .get(b)
+                        .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                })
+                .collect();
+            block_rows.sort_by_key(|r| r.block_number);
+            json.extend(
+                block_rows
+                    .iter()
+                    .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
+            );
+        }
+        Ok::<_, anyhow::Error>(FetchedWindow {
+            fetch_from,
+            w_to,
+            asked_to,
+            final_pass,
+            fetched,
+            served_width,
+            whole_width,
+            json,
         })
+    };
+    let stream = windows
+        .map(move |(w_from, w_to, final_pass)| run_window(w_from, w_to, final_pass))
         .buffered(concurrency.max(1));
     // `unfold`'s generator future is not `Unpin` (it borrows `chunker` across an await), so the stream
     // has to be pinned before it can be polled in a loop.
@@ -5448,6 +5539,7 @@ pub async fn backfill_direct_pipelined_with(
 
     // `(block, json)` so a segment can end on a data-determined block boundary (RFC-0028 §4).
     let mut buf: Vec<SealRow> = Vec::new();
+    let mut ready = std::collections::VecDeque::new();
     let mut batch_from = from;
     let mut total = 0u64;
     // Nothing lands until a whole window is fetched, its documents included: a 6-way start on
@@ -5462,7 +5554,16 @@ pub async fn backfill_direct_pipelined_with(
     })
     .await;
     while let Some(res) = next.take() {
-        let (fetch_from, w_to, final_pass, fetched, served_width, whole_width, json) = res?;
+        let FetchedWindow {
+            fetch_from,
+            w_to,
+            asked_to,
+            final_pass,
+            fetched,
+            served_width,
+            whole_width,
+            json,
+        } = res?;
         // Feedback lags by up to `concurrency` windows - those are already in flight when this one
         // lands. That is fine and is not worth engineering away: the controller is damped to 4× per
         // step anyway, so a lag of a few windows costs a few steps of convergence, and the alternative
@@ -5496,7 +5597,7 @@ pub async fn backfill_direct_pipelined_with(
         // direct path: one seal per chunk makes segment identity depend on the operator's window.
         drain_all_sealable(
             &mut buf,
-            tail_hold(w_to, final_pass),
+            tail_hold(w_to, final_pass && w_to == asked_to),
             to,
             seal_span,
             |rows, seal_to| {
@@ -5506,7 +5607,26 @@ pub async fn backfill_direct_pipelined_with(
                 Ok(())
             },
         )?;
-        next = stream.next().await;
+        next = if w_to < asked_to {
+            // The in-flight windows keep being polled, or their requests would time out unread;
+            // with the gate shut, at most `concurrency` of them land in `ready`.
+            gate.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut rest = std::pin::pin!(run_window(w_to + 1, asked_to, final_pass));
+            let res = loop {
+                tokio::select! {
+                    biased;
+                    r = &mut rest => break r,
+                    Some(r) = stream.next() => ready.push_back(r),
+                }
+            };
+            gate.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            gate.1.notify_one();
+            Some(res)
+        } else if let Some(r) = ready.pop_front() {
+            Some(r)
+        } else {
+            stream.next().await
+        };
     }
     if !buf.is_empty() {
         seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
@@ -15748,6 +15868,140 @@ template = "pool"
             hashes(d_pipe.path()),
             "concurrency must not change the sealed bytes"
         );
+    }
+
+    /// A provider with a result cap: a range over `cap` logs is refused the way Alchemy refuses it.
+    struct ResultCapSource {
+        logs: Vec<crate::rpc::Log>,
+        cap: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for ResultCapSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let lo = self.logs.partition_point(|l| l.block_number < from);
+            let hi = self.logs.partition_point(|l| l.block_number <= to);
+            if hi - lo > self.cap {
+                anyhow::bail!("query returned more than 10000 results");
+            }
+            Ok(self.logs[lo..hi].to_vec())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// #1671: a window the controller grew over an empty range lands on dense history whole. The
+    /// provider's cap bounds one response, but the splitter used to merge every piece, so one
+    /// in-flight window held width x density rows however wide it had grown.
+    #[tokio::test]
+    async fn a_window_grown_over_an_empty_range_does_not_materialise_dense_history_whole() {
+        use crate::registry::{ContractSpec, DecodeRegistry};
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let addresses: Vec<String> = reg
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = reg
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+
+        // Empty to 200,000, then 15,000 blocks at three logs each. From a 1,000-block start the
+        // window reaches 100,000 by block 185,000, so one window spans the whole dense run.
+        let logs: Vec<_> = (200_001u64..=215_000)
+            .flat_map(|b| (0..3).map(move |li| transfer_log(b, li)))
+            .collect();
+        let source = ResultCapSource { logs, cap: 1_000 };
+
+        for concurrency in [1, 4] {
+            let d = tempfile::tempdir().unwrap();
+            let mut widest = 0u64;
+            let total = backfill_direct_pipelined(
+                &source,
+                &reg,
+                d.path(),
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                0,
+                0,
+                215_000,
+                1_000,
+                SPAN_OFF,
+                concurrency,
+                |_| Ok(()),
+                |_, n, _| widest = widest.max(n),
+            )
+            .await
+            .unwrap();
+            assert_eq!(total, 45_000, "{concurrency}-way: every row once");
+            assert!(
+                widest <= 21_000,
+                "{concurrency}-way: one window carried {widest} rows; the budget is 20,000 plus one \
+                 capped response"
+            );
+            let d_seq = tempfile::tempdir().unwrap();
+            backfill_direct(
+                &source,
+                &reg,
+                d_seq.path(),
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                0,
+                0,
+                215_000,
+                1_000,
+                SPAN_OFF,
+                true,
+            )
+            .await
+            .unwrap();
+            let hashes = |dir: &std::path::Path| -> Vec<(String, String)> {
+                let m = seal::load_manifest(dir).unwrap();
+                m.tables
+                    .iter()
+                    .flat_map(|(t, segs)| segs.iter().map(move |s| (t.clone(), s.hash.clone())))
+                    .collect()
+            };
+            assert_eq!(
+                hashes(d.path()),
+                hashes(d_seq.path()),
+                "{concurrency}-way: a cut window must seal the same bytes"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
