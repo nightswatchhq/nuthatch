@@ -67,6 +67,11 @@ name = "delegation_fold_corpus"
 path = "tests/delegation_fold_corpus.rs"
 required-features = ["graph"]
 
+[[test]]
+name = "crash_points"
+path = "tests/crash_points.rs"
+required-features = ["crash-points"]
+
 [dependencies]
 # graph-node's own pluralisation, so a generated root field name matches it by construction rather
 # than by a rule reimplemented here (`graph/src/data/graphql/ext.rs:360` calls `to_plural`).
@@ -174,6 +179,9 @@ counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
 graph = ["folds"]
 # RFC-0059: checkpointed folds. Off by default, and a default build refuses a nest that ships `folds/`.
 folds = []
+# #1717: named points where a test build aborts when `NUTHATCH_CRASH_AT` names them. Off by default,
+# and a default build compiles every point to nothing.
+crash-points = []
 
 [dev-dependencies]
 proptest = "1"

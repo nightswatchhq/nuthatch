@@ -341,7 +341,9 @@ pub fn seal_range_with_snapshot(
     }
 
     manifest.manifest_version = MANIFEST_VERSION;
+    crate::crash::point("seal:before-manifest");
     save_manifest(dir, &manifest)?;
+    crate::crash::point("seal:after-manifest");
     drop(publishing);
     // The new manifest no longer names these, but a reader holding a lease from before it was
     // installed may still be about to open one; see `retire`.
