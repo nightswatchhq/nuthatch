@@ -94,19 +94,17 @@ can show the row that differs. The canonical form decides what counts as the sam
   has none, since without one the order is the engine's choice. A window's or a subquery's `ORDER
   BY` sits inside parentheses and does not count. When it cannot tell (a comment, an unclosed quote,
   unbalanced parentheses) it sorts and says so; the baseline's `compared` column records which.
-- Two tags in the set, written by `collect/main.rs`, override that. `# ties: <id> <why>` compares a
-  statement sorted although it has an `ORDER BY`, because its key has ties the engine may order
-  either way. `# volatile: <id> <why>` holds a statement whose answer moves with the clock or the
-  tip to its row count only. So is a truncated answer without a top-level `ORDER BY`, which is an
-  arbitrary subset of the rows.
+- A statement whose answer moves without the binary changing is tagged in the set, `# volatile:
+  <id> <why>` (written by `collect/main.rs`), and held to its row count only. So is a truncated
+  answer without a top-level `ORDER BY`, which is an arbitrary subset of the rows.
 
 The tags come from gating production twice on one copy a minute apart and reading what moved. On
 2026-10-03 nothing in the set moved with the clock (its literals are pinned, and no view reads
 `now()`); four statements moved anyway. Two were a DOUBLE cast to text, now rounded as above. Two,
 `payments.accounts` and `delegation_events`, page with `ORDER BY ... LIMIT` on a key with ties, so
-the rows inside a tie came back in another order; they are tagged `ties`. If such a tie straddles
-the `LIMIT`, the page itself can differ, and the gate will say so with the row; the cure is a
-tiebreaker in kittiwake's statement. Re-run the double gate after refreshing the set.
+which tied rows fill the page is the engine's choice, and a second run returned a different page.
+They are tagged volatile; a tiebreaker in kittiwake's statements would let them be compared
+exactly. Re-run the double gate after refreshing the set.
 
 Answers only mean something against a baseline measured on the same copy, which is what the runner
 does. A baseline without the digest column (the committed `baseline-4.2.0.tsv`) is read as before,
@@ -117,7 +115,7 @@ its answers reported as not compared. A run writing a baseline and the run readi
 refused query fails and is named, an answered set passes and writes a baseline, a regression fails
 past the bound and passes inside it, and a candidate answering differently from its baseline (a view
 edited between the runs) fails with the first differing row, while rows reordered under no `ORDER
-BY` or under a `ties` tag, a float 1e-13 off (as a number or as text) and a volatile statement's new
+BY`, a float 1e-13 off (as a number or as text) and a volatile statement's new
 answer pass.
 
 ## Where it runs: the ThinkPad

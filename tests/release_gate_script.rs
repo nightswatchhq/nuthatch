@@ -466,17 +466,12 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
 }
 
 /// A statement tagged volatile in the set is held to its row count, so a different answer with
-/// the same number of rows passes; one tagged ties is compared sorted although it has an ORDER BY,
-/// so the same rows in another order pass. Untagged, both fail (the test above).
+/// the same number of rows passes; untagged, it fails (the test above).
 #[test]
-fn tagged_statements_that_answer_differently_pass_on_what_they_are_held_to() {
+fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
     let c = case();
     let set = c.set(&[
         ("changing", "SELECT block FROM gate_probe".to_string()),
-        (
-            "tied",
-            "SELECT third FROM gate_probe ORDER BY s".to_string(),
-        ),
         (
             "unordered",
             "SELECT k, label FROM gate_rows WHERE 'ORDER BY' <> ''".to_string(),
@@ -485,10 +480,7 @@ fn tagged_statements_that_answer_differently_pass_on_what_they_are_held_to() {
     let body = std::fs::read_to_string(&set).unwrap();
     std::fs::write(
         &set,
-        format!(
-            "# volatile: changing its answer moves with the clock\n\
-             # ties: tied its ORDER BY key has ties\n{body}"
-        ),
+        format!("# volatile: changing its answer moves with the clock\n{body}"),
     )
     .unwrap();
     let (out, text) = c.against_a_wrong_candidate(&set);
@@ -498,10 +490,9 @@ fn tagged_statements_that_answer_differently_pass_on_what_they_are_held_to() {
         changing.starts_with("ok ") && changing.contains("volatile, so compared on its row count"),
         "{changing}"
     );
-    assert!(line_for(&text, "tied").starts_with("ok "), "{text}");
     assert!(line_for(&text, "unordered").starts_with("ok "), "{text}");
     assert!(
-        text.contains("2 match, 0 differ, 1 compared on row count only"),
+        text.contains("1 match, 0 differ, 1 compared on row count only"),
         "{text}"
     );
 }

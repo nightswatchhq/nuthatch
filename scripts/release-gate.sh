@@ -24,8 +24,7 @@
 # With --baseline, also FAIL ("answer differs") on a statement whose answer is not the baseline's.
 # Each answer is kept canonical in <out>/answers/<id>.rows (keys sorted, floats to 12 significant
 # digits, rows sorted unless the statement has a top-level ORDER BY) and compared by its sha256.
-# A statement tagged `# volatile: <id> <why>` in the set is compared on its row count only, one
-# tagged `# ties: <id> <why>` sorted despite its ORDER BY.
+# A statement tagged `# volatile: <id> <why>` in the set is compared on its row count only.
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
 # Two runs against one copy wait for each other: the second `serve` could not open the redb.
 set -euo pipefail
@@ -59,7 +58,7 @@ while [ $# -gt 0 ]; do
     --passes) [ $# -ge 2 ] || die "--passes needs a number"; passes=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
     --timeout) [ $# -ge 2 ] || die "--timeout needs seconds"; timeout=$2; shift 2 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) break ;;
   esac
@@ -99,16 +98,14 @@ rm -rf "$out/answers"
 mkdir -p "$out/answers"
 
 # The set, loaded once: parallel arrays indexed by query number.
-ids=() consumers=() sqls=() volatile=" " ties=" "
+ids=() consumers=() sqls=() volatile=" "
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
-    '# volatile: '* | '# ties: '*)
-      v=${line#'# '}
-      tag=${v%%:*}
-      v=${v#*: }
+    '# volatile: '*)
+      v=${line#'# volatile: '}
       v=${v%% *}
-      [ -n "$v" ] || die "a $tag tag without an id in $set_file"
-      if [ "$tag" = volatile ]; then volatile="$volatile$v "; else ties="$ties$v "; fi
+      [ -n "$v" ] || die "a volatile tag without an id in $set_file"
+      volatile="$volatile$v "
       continue
       ;;
     ''|'#'*) continue ;;
@@ -162,24 +159,18 @@ order_of() {
     }'
 }
 
-# How each statement's answer is compared: volatile (row count only), sorted:ties (sorted despite
-# its ORDER BY, whose key has ties the engine may order either way) or its order_of.
+# How each statement's answer is compared: volatile (row count only) or its order_of.
 modes=()
 i=0
 while [ $i -lt "$n" ]; do
   case "$volatile" in
     *" ${ids[$i]} "*) modes+=(volatile) ;;
-    *)
-      case "$ties" in
-        *" ${ids[$i]} "*) modes+=(sorted:ties) ;;
-        *) modes+=("$(order_of "${sqls[$i]}")") ;;
-      esac
-      ;;
+    *) modes+=("$(order_of "${sqls[$i]}")") ;;
   esac
   i=$((i + 1))
 done
-for v in $volatile $ties; do
-  case " ${ids[*]} " in *" $v "*) ;; *) die "a tag names $v, which is not in $set_file" ;; esac
+for v in $volatile; do
+  case " ${ids[*]} " in *" $v "*) ;; *) die "volatile tag for $v, which is not in $set_file" ;; esac
 done
 
 # One row per line, keys sorted. A number written as an integer is kept exactly; any other is
