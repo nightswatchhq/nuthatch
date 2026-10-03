@@ -413,7 +413,14 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
             "SELECT k, label FROM gate_rows WHERE 'ORDER BY' <> ''".to_string(),
         ),
         ("float", "SELECT third FROM gate_probe".to_string()),
+        (
+            "volatile",
+            "SELECT block FROM gate_probe WHERE block < 10".to_string(),
+        ),
     ]);
+    // Volatile is held to its row count, and block 5 answered as 50 is a row fewer.
+    let body = std::fs::read_to_string(&set).unwrap();
+    std::fs::write(&set, format!("# volatile: volatile a row short\n{body}")).unwrap();
     let (out, text) = c.against_a_wrong_candidate(&set);
     assert_eq!(out.status.code(), Some(1), "{text}");
     let value = line_for(&text, "value");
@@ -440,8 +447,13 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
         line_for(&text, "float").starts_with("ok "),
         "equal to 12 significant digits:\n{text}"
     );
+    let volatile = line_for(&text, "volatile");
     assert!(
-        text.contains("RESULT: FAIL - answer differs: value, ordered"),
+        volatile.starts_with("FAIL ") && volatile.contains("answer differs: 7 rows against the baseline's 8"),
+        "{volatile}"
+    );
+    assert!(
+        text.contains("RESULT: FAIL - answer differs: value, ordered, volatile"),
         "{text}"
     );
 }
