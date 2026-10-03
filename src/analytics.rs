@@ -4278,11 +4278,12 @@ mod tests {
         assert!(current.offchain.unwrap().contains_key("offchain__prices"));
     }
 
-    /// #1678: a table's snapshots are unioned by name, and Burrmill will not bind a column whose type
-    /// differs between them. A statement naming the view is told which column, not that it is absent.
+    /// #1678: a table's snapshots are unioned by name. Two integer widths of one column widen to the
+    /// wider (burrmill #36); a column whose kind differs will not bind, and a statement naming the view
+    /// is told which column, not that it is absent.
     #[test]
     fn a_snapshot_view_that_will_not_bind_names_its_column() {
-        use arrow::array::{ArrayRef, Int32Array, Int64Array};
+        use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, column: ArrayRef| {
             let path = dir.path().join(name);
@@ -4302,15 +4303,17 @@ mod tests {
             max_rows: 100,
         };
         let run = |sql: &str| query_hot_cold(dir.path(), sql, guard, &HotRows::new(), 0, &[]);
+        let widened = run("SELECT count(*) AS n FROM offchain__prices").expect("two widths widen");
+        assert_eq!(widened.rows[0]["n"], serde_json::json!(3));
+
+        let text = write("c.parquet", Arc::new(StringArray::from(vec!["four"])));
+        crate::offchain::drop_file(dir.path(), &text, "prices").unwrap();
         let err = format!(
             "{:#}",
             run("SELECT count(*) AS n FROM offchain__prices").unwrap_err()
         );
         assert!(
-            err.contains("offchain__prices")
-                && err.contains("'v'")
-                && err.contains("Int32")
-                && err.contains("Int64"),
+            err.contains("offchain__prices") && err.contains("'v'") && err.contains("Utf8"),
             "the view went without naming its column: {err}"
         );
         assert!(run("SELECT 1 AS one").is_ok(), "a statement not naming it");
