@@ -108,7 +108,8 @@ before each run, through the `GATE_REFRESH` hook, `deploy/release-gate/refresh-f
   segments from the current copy. It swaps the new copy in only when the pulled `PROVENANCE` is the
   snapshot it asked for, the redb matches the staged sha256, and `sealed_through` has not gone
   backwards. The previous copy is kept as `alloc-nest.prev`. Any failure leaves the copy as it was
-  and fails the refresh, which `release-gate-run.sh` posts as `error`.
+  and fails the refresh, which `release-gate-run.sh` posts as `error`. It takes the copy's gate
+  lock, so a refresh run by hand waits for a gate that is serving the copy.
 
 A redb that passes those checks and that `serve` still refuses to open stops the gate at startup:
 `release-gate.sh` exits 2 when `serve` exits before answering `/health`, and the run posts `error`,
