@@ -360,5 +360,8 @@ fn a_peak_rss_over_the_budget_fails_a_set_that_answers() {
 
     let (out, text) = c.gate(&set, &[], &[]);
     assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(text.contains("peak RSS"), "the peak is reported on a pass too:\n{text}");
+    assert!(
+        text.contains("peak RSS"),
+        "the peak is reported on a pass too:\n{text}"
+    );
 }
