@@ -365,3 +365,326 @@ fn a_peak_rss_over_the_budget_fails_a_set_that_answers() {
         "the peak is reported on a pass too:\n{text}"
     );
 }
+
+/// Starts a gate script with its output in a file; `finish` kills it if it overruns, so a lock that
+/// deadlocks fails the test rather than hanging it.
+fn run_bounded(mut cmd: Command, dir: &Path, name: &str) -> Child {
+    let out = std::fs::File::create(dir.join(format!("{name}.out"))).unwrap();
+    let err = out.try_clone().unwrap();
+    cmd.stdout(out).stderr(err);
+    cmd.spawn().expect("spawn a gate script")
+}
+
+fn finish(mut child: Child, dir: &Path, name: &str, secs: u64) -> (Option<i32>, String) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{name} still running after {secs}s:\n{}",
+                std::fs::read_to_string(dir.join(format!("{name}.out"))).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let text = std::fs::read_to_string(dir.join(format!("{name}.out"))).unwrap();
+    (status.code(), text)
+}
+
+/// The calls `release-gate-run.sh` makes, answered from `$FAKE_GH_DIR`: `releases` (one
+/// `<tag> full|pre|draft` per line, newest first), `status-<sha>` (the state of the newest gate
+/// status on a commit; absent is none) and `bin-<tag>/nuthatch` (the binary a release ships). A
+/// tag's commit is `sha-<tag>`. Posted statuses are appended to `posted`, downloads to `downloaded`.
+const FAKE_GH: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+d=$FAKE_GH_DIR
+case "$1 $2" in
+  "api -X")
+    sha=${4##*/} state="" desc=""
+    shift 4
+    while [ $# -ge 2 ]; do
+      case "$2" in state=*) state=${2#state=} ;; description=*) desc=${2#description=} ;; esac
+      shift 2
+    done
+    echo "$sha $state $desc" >>"$d/posted" ;;
+  "api "*)
+    case "$2" in
+      */statuses) sha=${2%/statuses}; sha=${sha##*/}; cat "$d/status-$sha" 2>/dev/null || echo none ;;
+      */commits/*) echo "sha-${2##*/}" ;;
+      *) echo "fake gh: unexpected api call: $*" >&2; exit 3 ;;
+    esac ;;
+  "release list")
+    pre=1
+    for a in "$@"; do [ "$a" != --exclude-pre-releases ] || pre=0; done
+    while read -r t kind; do
+      [ "$kind" != draft ] || continue
+      [ "$kind" != pre ] || [ "$pre" -eq 1 ] || continue
+      echo "$t"
+    done <"$d/releases" ;;
+  "release download")
+    t=$3 out=""
+    while [ $# -gt 0 ]; do
+      if [ "$1" = -D ]; then out=$2; fi
+      shift
+    done
+    asset=nuthatch-x86_64-unknown-linux-gnu.tar.gz
+    echo "$t" >>"$d/downloaded"
+    tar -czf "$out/$asset" -C "$d/bin-$t" nuthatch
+    if command -v sha256sum >/dev/null; then
+      (cd "$out" && sha256sum "$asset" >"$asset.sha256")
+    else
+      (cd "$out" && shasum -a 256 "$asset" >"$asset.sha256")
+    fi ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 3 ;;
+esac
+"#;
+
+struct Releases {
+    dir: PathBuf,
+}
+
+/// Fake releases of the real binary. Each ships a wrapper that serves the real binary as its child
+/// after holding `pad` bytes itself, so the RSS the gate samples (the wrapper's) differs by release.
+fn releases(c: &Case, list: &[(&str, &str, usize)], gated: &[(&str, &str)]) -> Releases {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = c.dir.path().join("gh");
+    let fakes = dir.join("fakes");
+    std::fs::create_dir_all(&fakes).unwrap();
+    let gh = fakes.join("gh");
+    std::fs::write(&gh, FAKE_GH).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut listing = String::new();
+    for (tag, kind, pad) in list {
+        listing.push_str(&format!("{tag} {kind}\n"));
+        let bin_dir = dir.join(format!("bin-{tag}"));
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let real = env!("CARGO_BIN_EXE_nuthatch");
+        let wrapper = bin_dir.join("nuthatch");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/usr/bin/env bash\n\
+                 [ \"${{1:-}}\" = serve ] || exec '{real}' \"$@\"\n\
+                 pad=$(head -c {pad} /dev/zero | tr '\\0' x)\n\
+                 '{real}' \"$@\" &\n\
+                 child=$!\n\
+                 trap 'kill $child 2>/dev/null; wait $child; exit 0' TERM INT\n\
+                 wait $child\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(dir.join("releases"), listing).unwrap();
+    for (tag, state) in gated {
+        std::fs::write(dir.join(format!("status-sha-{tag}")), format!("{state}\n")).unwrap();
+    }
+    Releases { dir }
+}
+
+impl Releases {
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+
+    fn runner(
+        &self,
+        c: &Case,
+        set: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (Option<i32>, String) {
+        let mut cmd = Command::new(root().join("scripts/release-gate-run.sh"));
+        cmd.args(args)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.dir.join("fakes").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("FAKE_GH_DIR", &self.dir)
+            .env("GATE_STATE", c.dir.path().join("state"))
+            .env("GATE_NEST", &c.nest)
+            .env("GATE_SET", set)
+            .env("GATE_PASSES", "1")
+            .env("GATE_REPO", "test/nuthatch")
+            .env_remove("GATE_LOCK_HELD");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = run_bounded(cmd, c.dir.path(), "runner");
+        finish(child, c.dir.path(), "runner", 120)
+    }
+}
+
+/// On 2026-10-03 production peaked at 3324 MiB over the 2048 budget with every statement answered,
+/// and the runner posted error ("no baseline") without measuring the candidate, so nothing could be
+/// gated while production was over. Production's peak is reported; the verdict is the candidate's.
+#[test]
+fn production_over_its_rss_budget_is_still_a_baseline_for_the_candidate() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(
+        &c,
+        &[("v4.3.0-rc1", "pre", 0), ("v4.2.0", "full", 160_000_000)],
+        &[],
+    );
+    let (code, text) = r.runner(&c, &set, &["v4.3.0-rc1"], &[("GATE_MAX_RSS_MB", "100")]);
+    assert_eq!(code, Some(0), "{text}");
+    let posted = r.read("posted");
+    let verdict = posted.lines().last().unwrap_or_default();
+    assert!(
+        verdict.starts_with("sha-v4.3.0-rc1 success ") && verdict.contains("v4.2.0"),
+        "{posted}\n{text}"
+    );
+    assert!(
+        verdict.contains("MiB"),
+        "production's own peak belongs in the candidate's status: {verdict}"
+    );
+    assert!(text.contains("over the 100 MiB budget"), "{text}");
+}
+
+/// A statement production fails as well cannot be a regression, and the output says so, but the
+/// candidate is still failed for refusing it: its verdict is its own.
+#[test]
+fn a_statement_production_also_fails_still_fails_the_candidate_and_is_not_a_regression() {
+    let c = case();
+    let set = c.set(&[
+        ("answers", c.counts()),
+        ("refused", "SELECT a FROM no_such_table".to_string()),
+    ]);
+    let r = releases(&c, &[("v4.3.0-rc1", "pre", 0), ("v4.2.0", "full", 0)], &[]);
+    let (code, text) = r.runner(&c, &set, &["v4.3.0-rc1"], &[]);
+    assert_eq!(code, Some(1), "{text}");
+    let posted = r.read("posted");
+    let verdict = posted.lines().last().unwrap_or_default();
+    assert!(
+        verdict.starts_with("sha-v4.3.0-rc1 failure ") && verdict.contains("refused"),
+        "{posted}\n{text}"
+    );
+    assert!(
+        text.contains("production v4.2.0 fails refused itself, so it cannot regress"),
+        "{text}"
+    );
+}
+
+/// On 2026-10-03 `--poll` walked back through every past release without a status, posting error
+/// on v4.1.0 and then v4.0.2. Only a release newer than production is gated; a prerelease of
+/// production's own version is older than it.
+#[test]
+fn poll_never_gates_a_release_at_or_below_production() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(
+        &c,
+        &[
+            ("v4.2.0", "full", 0),
+            ("v4.2.0-rc1", "pre", 0),
+            ("v4.1.0", "full", 0),
+            ("v4.0.2", "full", 0),
+        ],
+        &[("v4.2.0", "success")],
+    );
+    let (code, text) = r.runner(&c, &set, &["--poll"], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(r.read("posted"), "", "nothing is gated:\n{text}");
+    assert_eq!(r.read("downloaded"), "", "nothing is fetched:\n{text}");
+    assert_eq!(text, "", "nothing to gate is quiet");
+}
+
+/// A prerelease of a newer version is gated, compared by number: v4.10 is newer than v4.9.
+#[test]
+fn poll_gates_a_prerelease_of_a_newer_version() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(
+        &c,
+        &[
+            ("v4.10.0-rc.1", "pre", 0),
+            ("v4.9.0", "full", 0),
+            ("v4.8.0", "full", 0),
+        ],
+        &[("v4.9.0", "success")],
+    );
+    let (code, text) = r.runner(&c, &set, &["--poll"], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    let posted = r.read("posted");
+    assert!(
+        posted
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .starts_with("sha-v4.10.0-rc.1 success "),
+        "{posted}\n{text}"
+    );
+    assert!(!posted.contains("sha-v4.8.0"), "{posted}");
+}
+
+/// A hand-run gate against the copy the runner was using made the runner's `serve` fail to start
+/// on the redb lock. Two gate runs against one copy wait for each other; both answer.
+#[test]
+fn two_gate_runs_against_one_copy_serialise() {
+    for portable in [false, true] {
+        let c = case();
+        let set = c.set(&[("answers", c.counts())]);
+        let start = |name: &str| {
+            let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+            cmd.args(["--passes", "2", "--out"])
+                .arg(c.dir.path().join(name))
+                .arg(env!("CARGO_BIN_EXE_nuthatch"))
+                .arg(&c.nest)
+                .arg(&set)
+                .env_remove("GATE_LOCK_HELD");
+            if portable {
+                cmd.env("GATE_LOCK_PORTABLE", "1");
+            }
+            run_bounded(cmd, c.dir.path(), name)
+        };
+        let a = start("first");
+        let b = start("second");
+        let (code_a, text_a) = finish(a, c.dir.path(), "first", 300);
+        let (code_b, text_b) = finish(b, c.dir.path(), "second", 300);
+        assert_eq!(code_a, Some(0), "portable={portable}:\n{text_a}");
+        assert_eq!(code_b, Some(0), "portable={portable}:\n{text_b}");
+        assert!(
+            format!("{text_a}{text_b}").contains("waiting"),
+            "one run waited for the other (portable={portable}):\n{text_a}\n{text_b}"
+        );
+        assert!(
+            !c.dir.path().join("nest.gate-lock.d").exists(),
+            "the lock is released on exit"
+        );
+    }
+}
+
+/// Nothing releases a mkdir lock for a holder that was killed, so a lock whose pid has gone is
+/// broken rather than waited on for ever.
+#[test]
+fn a_lock_left_by_a_killed_run_is_broken() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let mut gone = Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    let held = c.dir.path().join("nest.gate-lock.d");
+    std::fs::create_dir(&held).unwrap();
+    std::fs::write(held.join("pid"), format!("{pid}\n")).unwrap();
+    let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+    cmd.args(["--passes", "1", "--out"])
+        .arg(c.dir.path().join("out"))
+        .arg(env!("CARGO_BIN_EXE_nuthatch"))
+        .arg(&c.nest)
+        .arg(&set)
+        .env("GATE_LOCK_PORTABLE", "1")
+        .env_remove("GATE_LOCK_HELD");
+    let child = run_bounded(cmd, c.dir.path(), "gate");
+    let (code, text) = finish(child, c.dir.path(), "gate", 120);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("breaking"), "{text}");
+}

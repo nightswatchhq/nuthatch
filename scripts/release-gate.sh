@@ -22,6 +22,7 @@
 # Also FAIL on the serving process's peak RSS over the 2 GiB per-cursor budget (GATE_MAX_RSS_MB).
 # It is sampled every half second, so a spike shorter than that can pass unseen.
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
+# Two runs against one copy wait for each other: the second `serve` could not open the redb.
 set -euo pipefail
 
 # Production's budget: the environment the allocations nest runs under on the Lodestar box (unit
@@ -53,7 +54,7 @@ while [ $# -gt 0 ]; do
     --passes) [ $# -ge 2 ] || die "--passes needs a number"; passes=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
     --timeout) [ $# -ge 2 ] || die "--timeout needs seconds"; timeout=$2; shift 2 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) break ;;
   esac
@@ -68,6 +69,11 @@ case "$timeout" in ''|*[!0-9]*|0) die "--timeout must be a positive integer" ;; 
 [ -f "$set_file" ] || die "no query set at $set_file"
 [ -z "$baseline" ] || [ -f "$baseline" ] || die "no baseline at $baseline"
 command -v curl >/dev/null || die "curl is not on PATH"
+
+# shellcheck source=gate/lock.sh
+. "$(dirname "$0")/gate/lock.sh"
+trap gate_unlock EXIT
+gate_lock "$nest" || die "could not take the lock on $nest"
 
 if [ -z "$out" ]; then
   out=$(mktemp -d "${TMPDIR:-/tmp}/release-gate.XXXXXX")
@@ -113,7 +119,7 @@ stop_server() {
     server_pid=""
   fi
 }
-trap stop_server EXIT
+trap 'stop_server; gate_unlock' EXIT
 
 alive() { [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; }
 
@@ -125,7 +131,7 @@ start_server() {
     tries=$((tries + 1))
     port=$(( 20000 + (RANDOM % 20000) ))
     if curl -s -m 1 -o /dev/null "http://127.0.0.1:$port/health"; then continue; fi
-    env "${PROD_ENV[@]}" "$bin" serve --dir "$nest" --listen "127.0.0.1:$port" >"$log" 2>&1 &
+    env "${PROD_ENV[@]}" "$bin" serve --dir "$nest" --listen "127.0.0.1:$port" >"$log" 2>&1 9>&- &
     server_pid=$!
     sample_rss "$server_pid" "$out/rss-peak-kb" &
     sampler_pid=$!
