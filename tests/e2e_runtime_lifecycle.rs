@@ -1811,6 +1811,24 @@ async fn nest_health_series(live: &serve::LiveRuntime, nest: &str) -> Option<Str
         .map(str::to_string)
 }
 
+/// Every `/metrics` line labelled with `nest`.
+async fn series_naming(live: &serve::LiveRuntime, nest: &str) -> Vec<String> {
+    use tower::ServiceExt;
+    let req = axum::http::Request::get("/metrics")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = live.service().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let label = format!("nest=\"{nest}\"");
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|l| l.contains(&label))
+        .map(str::to_string)
+        .collect()
+}
+
 /// #1648: an unmounted mount leaves `nuthatch_nest_health`, whether it was an alias of a dataset
 /// another mount still indexes or the last mount of one. It used to read 1 for ever for the alias,
 /// and 0 for the other until restart, which reads as quarantined.
@@ -1875,6 +1893,12 @@ async fn an_unmounted_nest_leaves_the_health_series() {
     assert!(
         line.as_deref().is_some_and(|l| l.ends_with(" 1")),
         "the alias left on the dataset lost its health series: {line:?}"
+    );
+    // The dataset is still indexed, and the series it emits now carry the mount that is left.
+    let gone = series_naming(&handles.live, "usdc").await;
+    assert!(
+        gone.is_empty(),
+        "series still name the unmounted first mount: {gone:?}"
     );
     handles
         .unmount("mirror")
