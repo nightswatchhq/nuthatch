@@ -2183,6 +2183,49 @@ async fn a_suspended_mount_keeps_its_place_and_resumes_from_it() {
     assert_eq!(file.mounts.len(), 1);
 }
 
+/// #1764: a suspend returns once the store is closed. A request still running against the nest when
+/// its routes go holds the store, and a resume before it finishes would fail to open it, so the
+/// suspend waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspend_returns_only_once_an_in_flight_request_has_let_go_of_the_store() {
+    use tower::ServiceExt;
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "5b".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let mut in_flight = handles
+        .states
+        .iter()
+        .find(|(n, _)| n == "usdc")
+        .map(|(_, s)| s.clone());
+    let served = handles.live.service();
+    let routes_gone = || async {
+        loop {
+            let req = axum::http::Request::builder()
+                .uri("/usdc/health")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            if served.clone().oneshot(req).await.unwrap().status() != axum::http::StatusCode::OK {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    };
+
+    let suspend = handles.suspend("usdc");
+    tokio::pin!(suspend);
+    let suspended = loop {
+        tokio::select! {
+            biased;
+            r = &mut suspend => break r,
+            // The request finishes once the routes have gone, as a slow one would.
+            _ = routes_gone(), if in_flight.is_some() => in_flight = None,
+        }
+    };
+    suspended.expect("suspend");
+    let db = runtime::MountTable::data_dir(roost.path(), &nid).join("nuthatch.redb");
+    drop(Store::open(&db).expect("suspend returned while a request still held the store"));
+}
+
 /// #1548 over HTTP: suspend and resume by name, with the refusals a caller can hit, and an unmount
 /// of a suspended mount dropping its record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

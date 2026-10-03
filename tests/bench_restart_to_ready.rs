@@ -68,24 +68,6 @@ async fn spawn_named(
     .expect("spawn_nest")
 }
 
-/// Stop a nest and wait for it to actually be gone - redb is single-writer and refuses a second open
-/// while the aborted task's stack still holds the handle, so a respawn without this is a race rather
-/// than a restart.
-async fn shutdown(rt: indexer::NestRuntime) {
-    let indexer::NestRuntime {
-        state,
-        ingest,
-        alert_worker,
-    } = rt;
-    ingest.abort();
-    let _ = ingest.await;
-    if let Some(w) = alert_worker {
-        w.abort();
-        let _ = w.await;
-    }
-    drop(state);
-}
-
 async fn wait_indexed(store: &dyn nuthatch::store::HotStore, upto: u64) -> bool {
     let want = upto.to_string();
     wait_until(POLL_TIMEOUT, || {
@@ -167,7 +149,7 @@ async fn restart_to_ready_against_stored_size() {
                 "the view must hold balances to compare against"
             );
             cold.push(t.elapsed());
-            shutdown(rt).await;
+            rt.shutdown().await.expect("the nest stops");
 
             // **Warm**: same directory, now populated. The clock starts *before* `spawn_nest` and
             // stops when the view is rebuilt, because the reconstruction happens inside that call.
@@ -188,7 +170,7 @@ async fn restart_to_ready_against_stored_size() {
                 "the view took {settle:?} to settle after spawn returned; if that grows, the \
                  reconstruction has moved out of `spawn_nest` and this measurement needs re-reading"
             );
-            shutdown(rt).await;
+            rt.shutdown().await.expect("the nest stops");
         }
 
         let c = median(cold);
@@ -295,7 +277,7 @@ async fn restart_to_ready_against_segment_count() {
             "must reach block 11"
         );
         let want = balances_of(&rt);
-        shutdown(rt).await;
+        rt.shutdown().await.expect("the nest stops");
 
         // **Sealed once, then restarted REPEATS times.** Sealing inside the repeat loop would put
         // minutes of segment-writing inside a measurement of restarts, and would re-create a corpus
@@ -311,7 +293,7 @@ async fn restart_to_ready_against_segment_count() {
             let rt = spawn_named(dir.path(), tape_of(10), "bench").await;
             let _ = time_until_current(&rt, &want).await;
             warm.push(t.elapsed());
-            shutdown(rt).await;
+            rt.shutdown().await.expect("the nest stops");
         }
 
         let w = median(warm);

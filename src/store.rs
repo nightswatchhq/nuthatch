@@ -469,11 +469,39 @@ pub trait HotStore: Send + Sync {
     async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()>;
     fn outbox_len(&self) -> u64;
     fn outbox_trim(&self, max: u64) -> Result<u64>;
+
+    /// Resolves once every handle on this store's file has dropped and the file may be opened
+    /// again. Take it before dropping your own handle. A backend with no local file resolves at once.
+    fn released(&self) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// The open database and the signal its last handle sends by dropping.
+struct OpenDb {
+    db: Database,
+    // After `db`: fields drop in order, so the lock is gone before a waiter hears of it.
+    _released: tokio::sync::watch::Sender<()>,
+}
+
+impl OpenDb {
+    fn share(db: Database) -> (Arc<OpenDb>, tokio::sync::watch::Receiver<()>) {
+        let (tx, rx) = tokio::sync::watch::channel(());
+        (Arc::new(OpenDb { db, _released: tx }), rx)
+    }
+}
+
+impl std::ops::Deref for OpenDb {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        &self.db
+    }
 }
 
 #[derive(Clone)]
 pub struct Store {
-    db: Arc<Database>,
+    db: Arc<OpenDb>,
+    released: tokio::sync::watch::Receiver<()>,
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
     /// the same owner. `0` means unclaimed, which disables enforcement entirely.
     held: Arc<std::sync::atomic::AtomicU64>,
@@ -638,8 +666,10 @@ impl Store {
                 })?;
             }
         }
+        let (db, released) = OpenDb::share(db);
         Ok(Store {
-            db: Arc::new(db),
+            db,
+            released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             commit_gate: Arc::default(),
@@ -702,8 +732,10 @@ impl Store {
             }
         }
         wtx.commit()?;
+        let (db, released) = OpenDb::share(db);
         Ok(Store {
-            db: Arc::new(db),
+            db,
+            released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             commit_gate: Arc::default(),
@@ -1589,6 +1621,14 @@ impl Store {
 
 #[async_trait::async_trait]
 impl HotStore for Store {
+    fn released(&self) -> futures::future::BoxFuture<'static, ()> {
+        let mut rx = self.released.clone();
+        // Nothing is ever sent, so this returns only once the sender has dropped.
+        Box::pin(async move {
+            let _ = rx.changed().await;
+        })
+    }
+
     fn write_generation(&self) -> Option<u64> {
         // Odd means a commit is in flight: see `Store::commit`.
         let g = self.writes.load(std::sync::atomic::Ordering::SeqCst);
@@ -1870,6 +1910,9 @@ fn unix_now() -> i64 {
 /// behind an `Arc` by construction. Sharing a store is not a different capability from having one.
 #[async_trait::async_trait]
 impl<T: HotStore + ?Sized> HotStore for Arc<T> {
+    fn released(&self) -> futures::future::BoxFuture<'static, ()> {
+        (**self).released()
+    }
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
         (**self).put_entity(key, json)
     }

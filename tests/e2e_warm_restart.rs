@@ -81,27 +81,6 @@ async fn spawn_named(
     .expect("spawn_nest")
 }
 
-/// Stop a nest and, crucially, **wait for it to actually be gone**.
-///
-/// `abort()` only *requests* cancellation - the task's stack, which owns a `Store` handle, lives on
-/// until the runtime finishes unwinding it. redb is single-writer and refuses a second open, so
-/// respawning before that completes fails with "Database already open". Awaiting the aborted handle is
-/// what makes this a genuine restart rather than a race.
-async fn shutdown(rt: indexer::NestRuntime) {
-    let indexer::NestRuntime {
-        state,
-        ingest,
-        alert_worker,
-    } = rt;
-    ingest.abort();
-    let _ = ingest.await;
-    if let Some(w) = alert_worker {
-        w.abort();
-        let _ = w.await;
-    }
-    drop(state);
-}
-
 /// Balances as a sorted `(address, balance)` list - the comparable shape.
 fn balances_of(rt: &indexer::NestRuntime) -> Vec<(String, i128)> {
     rt.state.balances.flush();
@@ -141,8 +120,8 @@ async fn a_warm_restart_rebuilds_balances_identically_to_a_clean_replay() {
 
     let before = balances_of(&rt);
     assert!(!before.is_empty(), "the view must hold balances to compare");
-    shutdown(rt).await;
     drop(store);
+    rt.shutdown().await.expect("the nest stops");
 
     // Respawn on the SAME directory - the warm-restart path, with a real sealed/hot split on disk.
     let restarted = spawn(dir.path(), tape.clone()).await;
@@ -158,7 +137,8 @@ async fn a_warm_restart_rebuilds_balances_identically_to_a_clean_replay() {
     .await;
     assert!(caught_up, "restarted nest did not resume to the tip");
     let after = balances_of(&restarted);
-    shutdown(restarted).await;
+    drop(restarted_store);
+    restarted.shutdown().await.expect("the nest stops");
 
     // ---- The reference: a clean nest indexing the same chain from an empty directory. ----
     let clean_dir = tempfile::tempdir().unwrap();
@@ -174,7 +154,8 @@ async fn a_warm_restart_rebuilds_balances_identically_to_a_clean_replay() {
     .await;
     assert!(clean_caught_up, "clean nest did not reach the tip");
     let clean_balances = balances_of(&clean);
-    shutdown(clean).await;
+    drop(clean_store);
+    clean.shutdown().await.expect("the nest stops");
 
     // The property: a restart is invisible in the derived view.
     assert_eq!(
@@ -237,8 +218,8 @@ async fn a_crash_between_sealing_and_pruning_does_not_double_count() {
         wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 5).await,
         "range [1,5] did not seal in time"
     );
-    shutdown(rt).await;
     drop(store); // redb is single-writer: release our handle before reopening below
+    rt.shutdown().await.expect("the nest stops");
 
     // Reconstruct the crash: segments still hold [1,5] (untouched on disk), the hot rows come back,
     // and the watermark never advanced.
@@ -263,7 +244,7 @@ async fn a_crash_between_sealing_and_pruning_does_not_double_count() {
     // Restart into that state and let the rebuild run.
     let restarted = spawn(dir.path(), tape).await;
     let after = balances_of(&restarted);
-    shutdown(restarted).await;
+    restarted.shutdown().await.expect("the nest stops");
 
     let recipient = account(2).to_ascii_lowercase();
     let got = after
@@ -334,8 +315,8 @@ async fn a_restarted_nest_reports_its_sealed_watermark_before_it_seals_again() {
         "the sentinel must be what the store holds"
     );
 
-    shutdown(rt).await;
     drop(store);
+    rt.shutdown().await.expect("the nest stops");
 
     // **Zero the gauge to simulate what a real restart gives you: a fresh process.**
     //
@@ -367,7 +348,7 @@ async fn a_restarted_nest_reports_its_sealed_watermark_before_it_seals_again() {
          {durable}. An alert on this surface fires after every restart of a healthy nest, and an \
          alert that cries wolf gets muted (#918).\n\n{gauge}"
     );
-    shutdown(restarted).await;
+    restarted.shutdown().await.expect("the nest stops");
 }
 
 /// A restarted nest must report the cursor position its store holds, before it commits again. The
@@ -391,8 +372,8 @@ async fn a_restarted_nest_reports_its_cursor_position_before_it_commits_again() 
     store
         .set_meta("last_block", &SENTINEL.to_string())
         .expect("pin the sentinel position");
-    shutdown(rt).await;
     drop(store);
+    rt.shutdown().await.expect("the nest stops");
 
     let restarted = spawn_named(dir.path(), tape.clone(), NEST).await;
     let gauge = nuthatch::metrics::METRICS.render();
@@ -406,5 +387,5 @@ async fn a_restarted_nest_reports_its_cursor_position_before_it_commits_again() 
         reported, SENTINEL,
         "a restarted nest reported last_block={reported} while its store holds {SENTINEL}"
     );
-    shutdown(restarted).await;
+    restarted.shutdown().await.expect("the nest stops");
 }
