@@ -2314,6 +2314,13 @@ pub fn lifecycle_routes(
         )
     }
 
+    /// Whether a mount of `name` on `nid` is already live, which makes it idempotent (#1646).
+    fn repeats_live(h: &RuntimeHandles, name: &str, nid: Option<&str>) -> bool {
+        h.states
+            .iter()
+            .any(|(n, s)| n == name && (nid.is_none() || s.nid.as_deref() == nid))
+    }
+
     async fn mount_nest(
         State((handles, jobs, required)): State<Shared>,
         Query(q): Query<MountQuery>,
@@ -2348,7 +2355,23 @@ pub fn lifecycle_routes(
         let nid_str = nid.as_ref().map(|n| n.as_str().to_string());
 
         if q.dry_run {
-            let plan = match handles.lock().await.plan_mount(&body.name, nid.as_ref()) {
+            let plan = {
+                let h = handles.lock().await;
+                if repeats_live(&h, &body.name, nid_str.as_deref()) {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "name": body.name,
+                            "nid": nid_str,
+                            "mounted": true,
+                            "refusal": null,
+                            "refusal_status": null,
+                        })),
+                    );
+                }
+                h.plan_mount(&body.name, nid.as_ref())
+            };
+            let plan = match plan {
                 Ok(plan) => plan,
                 Err(e) => {
                     return (
@@ -2385,6 +2408,12 @@ pub fn lifecycle_routes(
 
         if q.wait {
             let mut h = handles.lock().await;
+            if repeats_live(&h, &body.name, nid_str.as_deref()) {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"mounted": body.name})),
+                );
+            }
             return match h.mount(&body.name, nid).await {
                 Ok(()) => {
                     if let Err(e) = jobs.put(MountJob::new(

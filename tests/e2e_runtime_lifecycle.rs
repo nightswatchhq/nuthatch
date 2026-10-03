@@ -1164,14 +1164,14 @@ async fn the_lifecycle_routes_demand_the_admin_token_before_they_act() {
     );
 
     // 3. Positive controls: with the credential the same two routes reach their handlers, so the 401s
-    //    above are the guard talking and not a broken route. `usdc` is already mounted, which is
-    //    RFC-0027 §3's AlreadyMounted refusal - it proves the mount logic ran.
+    //    above are the guard talking and not a broken route. `usdc` is already mounted on no nid, so
+    //    another nid under it is RFC-0027 §3's AlreadyMounted refusal - it proves the mount logic ran.
     let (status, body) = call(
         &routes,
         "POST",
         &format!("/_admin/nests?token={TOKEN}&wait=true"),
         None,
-        Some(r#"{"name":"usdc"}"#),
+        Some(&format!(r#"{{"name":"usdc","nid":"{}"}}"#, "0a".repeat(32))),
     )
     .await;
     assert_eq!(
@@ -1792,6 +1792,54 @@ async fn a_mount_is_accepted_at_once_and_read_until_it_is_live() {
     let other = format!(r#"{{"name":"usdc","nid":"{}"}}"#, "0a".repeat(32));
     let (status, _) = call(&routes, "POST", "/_admin/nests", None, Some(&other)).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
+}
+
+/// #1646: `?wait=true` is idempotent as the job route is. A repeat of a live mount's name and NID
+/// answers 200, and another NID under the name is still a 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waited_mount_repeated_is_idempotent() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "7a".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    for body in [
+        format!(r#"{{"name":"usdc","nid":"{nid}"}}"#),
+        r#"{"name":"usdc"}"#.to_string(),
+    ] {
+        for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+            let (status, answer) = call(&routes, "POST", uri, None, Some(&body)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "a repeat of a live mount on {uri} with {body}: {answer}"
+            );
+        }
+        let (_, dry) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?dry_run=true",
+            None,
+            Some(&body),
+        )
+        .await;
+        let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+        assert!(
+            dry["refusal_status"].is_null(),
+            "the dry run refuses what the mount answers 200: {dry}"
+        );
+    }
+    let other = format!(r#"{{"name":"usdc","nid":"{}"}}"#, "7b".repeat(32));
+    for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+        let (status, answer) = call(&routes, "POST", uri, None, Some(&other)).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{uri}: {answer}");
+    }
+    assert_eq!(handles.lock().await.states.len(), 1);
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
 }
 
 async fn status_of(
@@ -2431,6 +2479,7 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         let nid = "7c".repeat(32);
         let (mut handles, _tape, mut intake) = empty_runtime(roost.path(), &nid).await;
         let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+        let already_mounted = matches!(case, Case::AlreadyMounted);
         match case {
             Case::Admitted => {}
             Case::AlreadyMounted => handles
@@ -2453,7 +2502,13 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         let _ = intake.try_recv();
         let handles = Arc::new(tokio::sync::Mutex::new(handles));
         let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
-        let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+        // A repeat of the live mount on its own nid is idempotent, so the refusal is another nid.
+        let asked = if already_mounted {
+            "7d".repeat(32)
+        } else {
+            nid.clone()
+        };
+        let body = format!(r#"{{"name":"usdc","nid":"{asked}"}}"#);
 
         let (status, dry) = call(
             &routes,
