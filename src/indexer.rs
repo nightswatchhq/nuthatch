@@ -15875,7 +15875,7 @@ template = "pool"
     struct ResultCapSource {
         logs: Vec<crate::rpc::Log>,
         cap: usize,
-        asked: std::sync::atomic::AtomicUsize,
+        calls: std::sync::Mutex<Vec<(u64, u64)>>,
     }
 
     impl ResultCapSource {
@@ -15883,7 +15883,7 @@ template = "pool"
             Self {
                 logs,
                 cap,
-                asked: Default::default(),
+                calls: Default::default(),
             }
         }
     }
@@ -15903,11 +15903,17 @@ template = "pool"
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
             // A backfill that stops advancing never yields to a timeout, so it is stopped here.
-            let asked = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let asked = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push((from, to));
+                calls.len()
+            };
             assert!(
                 asked < 500,
                 "{asked} getLogs calls: the backfill is not advancing"
             );
+            // Pending once, as a request does, so windows in flight can land while another is fetched.
+            tokio::task::yield_now().await;
             let lo = self.logs.partition_point(|l| l.block_number < from);
             let hi = self.logs.partition_point(|l| l.block_number <= to);
             if hi - lo > self.cap {
@@ -16081,6 +16087,79 @@ template = "pool"
         let m = seal::load_manifest(d.path()).unwrap();
         let sealed: usize = m.tables.values().flatten().map(|s| s.rows).sum();
         assert_eq!(sealed, 40_000, "every row sealed once");
+    }
+
+    /// #1671: while the rest of a cut window is fetched, no further windows are issued, or every one
+    /// that lands meanwhile waits in memory behind it.
+    #[tokio::test]
+    async fn no_window_is_issued_while_the_rest_of_a_cut_window_is_fetched() {
+        use crate::registry::{ContractSpec, DecodeRegistry};
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let addresses: Vec<String> = reg
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s: Vec<String> = reg
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+        // The dense run of the test above, then a long empty tail for windows to run ahead into.
+        let logs: Vec<_> = (200_001u64..=215_000)
+            .flat_map(|b| (0..3).map(move |li| transfer_log(b, li)))
+            .collect();
+        let source = ResultCapSource::new(logs, 1_000);
+        let d = tempfile::tempdir().unwrap();
+        backfill_direct_pipelined(
+            &source,
+            &reg,
+            d.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            0,
+            400_000,
+            1_000,
+            SPAN_OFF,
+            4,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        let calls = source.calls.lock().unwrap().clone();
+        let dense = |&(f, t): &(u64, u64)| f <= 215_000 && t >= 200_001;
+        let last_dense = calls.iter().rposition(dense).unwrap();
+        let cut_to = calls
+            .iter()
+            .filter(|c| dense(c))
+            .map(|c| c.1)
+            .max()
+            .unwrap();
+        let ahead = calls[..last_dense]
+            .iter()
+            .filter(|&&(f, _)| f > cut_to)
+            .count();
+        assert!(
+            ahead <= 4,
+            "{ahead} windows past block {cut_to} were asked for before the dense run was fetched"
+        );
     }
 
     // ---------------------------------------------------------------------------------------------
