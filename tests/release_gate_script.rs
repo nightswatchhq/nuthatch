@@ -375,24 +375,25 @@ impl Case {
         .unwrap();
     }
 
-    /// Writes a baseline from the right answers, then gates the wrong ones against it.
-    fn against_a_wrong_candidate(&self, set: &Path) -> (Output, String) {
+    /// Writes a baseline from the right answers, then gates the wrong ones against it, both runs
+    /// with `extra`.
+    fn against_a_wrong_candidate(&self, set: &Path, extra: &[&str]) -> (Output, String) {
         let baseline = self.dir.path().join("baseline.tsv");
         let base_out = self.dir.path().join("baseline-out");
         self.probe(false);
-        let (out, text) = self.gate(
-            set,
-            &[
-                "--out",
-                base_out.to_str().unwrap(),
-                "--write-baseline",
-                baseline.to_str().unwrap(),
-            ],
-            &[],
-        );
+        let mut args = vec![
+            "--out",
+            base_out.to_str().unwrap(),
+            "--write-baseline",
+            baseline.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let (out, text) = self.gate(set, &args, &[]);
         assert_eq!(out.status.code(), Some(0), "the baseline run:\n{text}");
         self.probe(true);
-        self.gate(set, &["--baseline", baseline.to_str().unwrap()], &[])
+        let mut args = vec!["--baseline", baseline.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        self.gate(set, &args, &[])
     }
 }
 
@@ -427,7 +428,7 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
     // Volatile is held to its row count, and block 5 answered as 50 is a row fewer.
     let body = std::fs::read_to_string(&set).unwrap();
     std::fs::write(&set, format!("# volatile: volatile a row short\n{body}")).unwrap();
-    let (out, text) = c.against_a_wrong_candidate(&set);
+    let (out, text) = c.against_a_wrong_candidate(&set, &[]);
     assert_eq!(out.status.code(), Some(1), "{text}");
     let value = line_for(&text, "value");
     assert!(
@@ -483,7 +484,7 @@ fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
         format!("# volatile: changing its answer moves with the clock\n{body}"),
     )
     .unwrap();
-    let (out, text) = c.against_a_wrong_candidate(&set);
+    let (out, text) = c.against_a_wrong_candidate(&set, &[]);
     assert_eq!(out.status.code(), Some(0), "{text}");
     let changing = line_for(&text, "changing");
     assert!(
@@ -534,6 +535,75 @@ fn at_concurrency_two_a_pair_is_in_flight_together_and_both_are_recorded() {
     assert!(
         s0 < e1 && s1 < e0,
         "the pair ran one after the other, not together: {schedule}"
+    );
+}
+
+/// At `--concurrency 2` each statement's answer is still captured and compared as it is one at a
+/// time. Each pair holds one statement that differs and one that matches, so an answer recorded
+/// against its partner's id fails on both.
+#[test]
+fn at_concurrency_two_an_answer_that_differs_still_fails_and_is_named() {
+    let c = case();
+    let set = c.set(&[
+        (
+            "unordered",
+            "SELECT k, label FROM gate_rows WHERE 'ORDER BY' <> ''".to_string(),
+        ),
+        ("value", "SELECT block FROM gate_probe".to_string()),
+        (
+            "ordered",
+            "SELECT third FROM gate_probe ORDER BY s".to_string(),
+        ),
+        (
+            "float",
+            "SELECT third, CAST(third * CAST('1e22' AS DOUBLE) AS VARCHAR) AS text FROM gate_probe"
+                .to_string(),
+        ),
+    ]);
+    let (out, text) = c.against_a_wrong_candidate(&set, &["--concurrency", "2"]);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("concurrency 2"), "{text}");
+    let value = line_for(&text, "value");
+    assert!(
+        value.starts_with("FAIL ") && value.contains("answer differs"),
+        "{value}"
+    );
+    assert!(
+        text.contains("first differing row, row 5:")
+            && text.contains("candidate: {\"block\":50}")
+            && text.contains("baseline:  {\"block\":5}"),
+        "the first differing row of each side:\n{text}"
+    );
+    let ordered = line_for(&text, "ordered");
+    assert!(
+        ordered.starts_with("FAIL ") && ordered.contains("answer differs (rows compared in order)"),
+        "{ordered}"
+    );
+    assert!(line_for(&text, "unordered").starts_with("ok "), "{text}");
+    assert!(line_for(&text, "float").starts_with("ok "), "{text}");
+    assert!(
+        text.contains("2 match, 2 differ")
+            && text.contains("RESULT: FAIL - answer differs: value, ordered"),
+        "{text}"
+    );
+
+    let schedule = std::fs::read_to_string(c.dir.path().join("out/schedule-pass-1.tsv")).unwrap();
+    let groups: Vec<(&str, &str)> = schedule
+        .lines()
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0], f[1])
+        })
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            ("1", "unordered"),
+            ("1", "value"),
+            ("2", "ordered"),
+            ("2", "float")
+        ],
+        "{schedule}"
     );
 }
 

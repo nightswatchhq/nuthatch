@@ -69,9 +69,10 @@ its answer from the first pass that answered; an answer that moves between passe
 sends the set N statements at a time in its own order, waiting for a whole group before the next, so
 every pass pairs the same statements (#1773). The set lists each kittiwake call site's statements
 together, so a pair is mostly two statements one route sends at once. Each statement keeps its own
-time, and `schedule-pass-N.tsv` in the output directory records each statement's group, start and
-end. When the binary exports the analytics pool and jemalloc gauges (#1778), the run also reports
-what they read at the RSS peak and the largest single pool reservation.
+time and its own answer, compared as at concurrency 1, and `schedule-pass-N.tsv` in the output
+directory records each statement's group, start and end. When the binary exports the
+analytics pool and jemalloc gauges (#1778), the run also reports what they read at the RSS peak and
+the largest single pool reservation.
 
 It fails (exit 1) on:
 
