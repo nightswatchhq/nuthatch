@@ -1847,7 +1847,8 @@ async fn an_unmounted_nest_leaves_the_health_series() {
         "the unmounted nest is still reported"
     );
 
-    // The other order: the dataset keeps the first mount's name on its cursor until the last goes.
+    // The other order: the first mount goes while the alias still reads the dataset, and the
+    // alias takes the dataset's key on the cursor.
     for name in ["usdc", "mirror"] {
         handles
             .mount(name, Some(runtime::Nid::parse(&nid).unwrap()))
@@ -1865,6 +1866,16 @@ async fn an_unmounted_nest_leaves_the_health_series() {
         .unmount("usdc")
         .await
         .expect("unmount the first mount");
+    assert_eq!(
+        nest_health_series(&handles.live, "usdc").await,
+        None,
+        "the first mount is still reported after it was unmounted, while an alias remains"
+    );
+    let line = nest_health_series(&handles.live, "mirror").await;
+    assert!(
+        line.as_deref().is_some_and(|l| l.ends_with(" 1")),
+        "the alias left on the dataset lost its health series: {line:?}"
+    );
     handles
         .unmount("mirror")
         .await

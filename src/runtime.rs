@@ -4230,10 +4230,23 @@ impl RuntimeHandles {
             .enumerate()
             .any(|(i, (_, s))| i != idx && Arc::ptr_eq(&s.store, &self.states[idx].1.store));
         if still_held {
-            // The cursor key names the dataset the other mounts still read, so only an alias goes.
-            if name != cursor_key {
-                self.health.unregister(name);
+            // The dataset is known on its cursor by this name. One of the mounts left on it takes the
+            // key, as in a move, so its health and attribution follow a mount that exists (#1648).
+            if name == cursor_key {
+                let store = self.states[idx].1.store.clone();
+                let sharers = self.dataset_sharers(name, &store);
+                if let Some(holder) = sharers.first().cloned() {
+                    let tx = self
+                        .lifecycle
+                        .get(&chain)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("the {chain} cursor is gone"))?;
+                    swap_cursor_keys(&tx, &chain, name, None, Some(&holder)).await?;
+                    self.finish_rehome(&chain, name, &holder, &sharers);
+                    crate::metrics::METRICS.remove_nest(name);
+                }
             }
+            self.health.unregister(name);
             self.publishers.retain(|(n, _)| n != name);
             self.states.remove(idx);
             return self.recompose_after_unmount(name);
