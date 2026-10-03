@@ -74,17 +74,24 @@ impl BurrmillSession {
             .map(|(c, t)| format!("CAST({0} AS {t}) AS {0}", quote(c)))
             .collect();
         let mut engine = self.engine();
-        engine.register_rows(&raw, &rows).map_err(engine_err)?;
-        engine
-            .register_view(
-                table,
-                &format!(
-                    "SELECT {} FROM {} WHERE \"__present\" = 'true'",
-                    columns.join(", "),
-                    quote(&raw)
-                ),
-            )
-            .map_err(engine_err)?;
+        let registered = engine
+            .register_rows(&raw, &rows)
+            .and_then(|()| {
+                engine.register_view(
+                    table,
+                    &format!(
+                        "SELECT {} FROM {} WHERE \"__present\" = 'true'",
+                        columns.join(", "),
+                        quote(&raw)
+                    ),
+                )
+            })
+            .map_err(engine_err);
+        if let Err(e) = registered {
+            // As in `bind_facts`: a retry binds from the same rows.
+            self.restore_hot(table, staged);
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -717,6 +724,18 @@ mod tests {
             .unwrap());
         assert_eq!(count("r"), serde_json::json!(1000));
         assert_eq!(s.held_hot_rows("r"), 0, "the bound relation holds the rows");
+
+        // The declared-relation path puts the rows back on a failed bind too.
+        let bad_cols = [("n".to_string(), "NOT_A_TYPE")];
+        s.load_relation("q", &bad_cols, &refs).unwrap();
+        assert!(s
+            .bind_facts("q", &[], &[], true, FactWindow::default())
+            .is_err());
+        assert_eq!(
+            s.held_hot_rows("q"),
+            1000,
+            "a failed relation bind dropped the staged rows"
+        );
     }
 
     /// Burrmill #10: `__raw`, `__hot` and `__union` are not names a statement can reach.
