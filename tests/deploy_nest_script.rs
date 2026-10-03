@@ -38,7 +38,7 @@ bin=$(cat "$FAKE_STATE/running")
 # A restart that came back on the old process, as a no-op roll does.
 [ -f "$FAKE_STATE/stale" ] && bin=$(dirname "$bin")/nuthatch-4.1.0
 v=$("$bin" --version | awk '{print $2}')
-if [ -f "$FAKE_STATE/serve-only" ]; then printf '{"version":"%s","ready":true}' "$v"; else printf '{"version":"%s","ready":true,"last_block":42}' "$v"; fi
+if [ -f "$FAKE_STATE/spaced" ]; then printf '{ "version" : "%s", "ready" : true, "last_block" : 42 }' "$v"; elif [ -f "$FAKE_STATE/serve-only" ]; then printf '{"version":"%s","ready":true}' "$v"; else printf '{"version":"%s","ready":true,"last_block":42}' "$v"; fi
 "#;
 
 fn fake_binary(dir: &Path, version: &str) -> PathBuf {
@@ -157,6 +157,17 @@ fn a_serve_only_unit_with_no_last_block_still_rolls() {
     let (ok, out) = roll(&b);
     assert!(ok, "the roll died on a /ready with no last_block:\n{out}");
     assert!(running(&b).ends_with("nuthatch-4.1.1"), "{out}");
+}
+
+/// JSON may put whitespace around the colon; a field reader that cannot see past it would reject a
+/// healthy restart.
+#[test]
+fn a_ready_answer_with_spaced_json_is_read() {
+    let b = a_box(true);
+    std::fs::write(b.state.join("spaced"), "").unwrap();
+    let (ok, out) = roll(&b);
+    assert!(ok, "a spaced /ready answer was not read:\n{out}");
+    assert!(out.contains("last_block 42 -> 42"), "{out}");
 }
 
 #[test]

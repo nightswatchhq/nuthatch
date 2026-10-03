@@ -51,7 +51,10 @@ execstart_file() {
 }
 
 # A field /ready may not carry (a `serve`-only unit has no last_block) reads as empty, not as a failure.
-ready_field() { echo "$1" | grep -oE "\"$2\":(\"[^\"]*\"|[a-z0-9]+)" | head -1 | cut -d: -f2 | tr -d '"' || true; }
+ready_field() {
+  echo "$1" | grep -oE "\"$2\"[[:space:]]*:[[:space:]]*(\"[^\"]*\"|[a-z0-9]+)" | head -1 |
+    sed -E 's/^[^:]*:[[:space:]]*//; s/"//g' || true
+}
 
 cmd_roll() {
   local u=$1 want=$2
