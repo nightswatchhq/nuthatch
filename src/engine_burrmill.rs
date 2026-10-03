@@ -187,7 +187,14 @@ impl BurrmillSession {
         let spill = crate::spill::new_spill_dir()?;
         let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
         #[allow(unused_mut)]
-        let mut engine = burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?;
+        let mut engine = match dir {
+            Some(dir) => {
+                let pool = nest_pool(dir, budget.memory_bytes);
+                burrmill::Engine::open_empty_sharing(budget, &pool)
+            }
+            None => burrmill::Engine::open_empty_budgeted(budget),
+        }
+        .map_err(engine_err)?;
         #[cfg(feature = "graph")]
         crate::analytics_scalars::register(&mut engine);
         let engine = Arc::new(RwLock::new(engine));
@@ -227,6 +234,20 @@ impl Drop for BurrmillSession {
     fn drop(&mut self) {
         fold_peak(self.dir.as_deref(), self.reader().take_memory_peak() as u64);
     }
+}
+
+// A statement that finds the cached session busy opens another, so the limit has to bound the
+// nest's sessions together (#1792). The pool keeps the size its first session gave it.
+static NEST_POOLS: Mutex<std::collections::BTreeMap<PathBuf, burrmill::SharedPool>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn nest_pool(dir: &Path, memory_bytes: usize) -> burrmill::SharedPool {
+    NEST_POOLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(dir.to_path_buf())
+        .or_insert_with(|| burrmill::SharedPool::new(memory_bytes))
+        .clone()
 }
 
 /// The walls `analytics_budget` sets, as Burrmill's budget.
