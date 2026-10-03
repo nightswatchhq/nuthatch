@@ -4942,6 +4942,9 @@ fn fetch_logs_splitting_tracking<'a>(
 /// nothing, which is exactly how the gates in #913 became decorative.
 const NO_PROGRESS_LIMIT: usize = 64;
 
+/// A warning that can repeat every poll fires on the first and then every this many (#1666, #1667).
+const REPEAT_WARN_EVERY: u64 = 100;
+
 const BACKFILL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 const BACKFILL_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -6548,6 +6551,11 @@ impl NestIngest {
             Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(hash, *ts))),
             _ => None,
         };
+        let checkpoint_missed = match &record {
+            Ok(Some(_)) => None,
+            Ok(None) => Some("no block at that height".to_string()),
+            Err(e) => Some(format!("{e:#}")),
+        };
         if let Some((hash, _)) = record.as_ref().ok().and_then(|r| r.as_ref()) {
             if rows.iter().any(|r| {
                 r.block_number == to
@@ -6800,6 +6808,16 @@ impl NestIngest {
         {
             self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
             return Err(e);
+        }
+        if let Some(why) = checkpoint_missed {
+            let n = self.metrics.inc_checkpoints_missed();
+            if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
+                tracing::warn!(
+                    "blocks {next}..={to} committed with no reorg checkpoint: the source gave no hash \
+                     for block {to} ({why}). {n} window(s) so far; a fork above the last checkpoint \
+                     goes unseen until one is stored (nuthatch_nest_checkpoints_missed_total)."
+                );
+            }
         }
         #[cfg(test)]
         take_after_commit_failure()?;
@@ -7226,10 +7244,17 @@ async fn detect_reorg(
         if block >= checkpoint {
             continue;
         }
-        if let Some(canon) = source.block_hash(block).await? {
-            if canon == hash {
-                return Ok(Some(block));
-            }
+        // An unanswered checkpoint may be the ancestor or the seal pin, so walking past it can land
+        // below the watermark, or at 0 if none answers (#1668). A lagging replica clears by the next poll.
+        let Some(canon) = source.block_hash(block).await? else {
+            tracing::warn!(
+                "block {checkpoint} no longer matches its checkpoint, but the source has no hash for \
+                 checkpoint {block}; not rolling back until it answers"
+            );
+            return Ok(None);
+        };
+        if canon == hash {
+            return Ok(Some(block));
         }
     }
     // No checkpoint we hold is canonical, so the fork is deeper than our entire recorded history.
@@ -7335,9 +7360,26 @@ fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64
     match finality {
         Finality::Depth(d) => tip.saturating_sub(d),
         Finality::FinalizedTag { fallback_depth } => match finalized_tag {
-            Some(n) => n.min(tip),
+            Some(n) if n < tip => n,
+            Some(n) => {
+                warn_implausible_finalized(n, tip, fallback_depth);
+                tip.saturating_sub(fallback_depth)
+            }
             None => tip.saturating_sub(fallback_depth),
         },
+    }
+}
+
+/// A `finalized` tag at or past the tip is what an endpoint aliasing it to `latest` answers (#1667).
+/// It can also be a tip read a block or two before the tag, which costs one poll's seal advance.
+fn warn_implausible_finalized(finalized: u64, tip: u64, fallback_depth: u64) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
+        tracing::warn!(
+            "the endpoint's finalized block {finalized} is not below the tip {tip}, so it is not \
+             trusted: sealing falls back to {fallback_depth} blocks below the tip ({n} time(s) so far)"
+        );
     }
 }
 
@@ -7422,6 +7464,25 @@ fn held_pin_covers(store: &dyn crate::store::HotStore, from: u64, ceiling: u64) 
         && store.get_block_hash(block)?.as_deref() == Some(hash))
 }
 
+/// Checkpoint `block` with the source's hash before the watermark may move to it (#1665). `false`
+/// when the source could not answer; the watermark then stays where it is until a later poll.
+async fn pin_checkpoint(
+    store: &dyn crate::store::HotStore,
+    source: &dyn Source,
+    block: u64,
+) -> Result<bool> {
+    match source.block_hash(block).await {
+        Ok(Some(hash)) => {
+            store.set_block_hash(block, &hash)?;
+            Ok(true)
+        }
+        Ok(None) | Err(_) => {
+            tracing::debug!("no hash for block {block}; the sealed watermark waits for one");
+            Ok(false)
+        }
+    }
+}
+
 /// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
 /// chosen from the data. Rows short of the threshold stay in the hot store until the next call.
 ///
@@ -7482,8 +7543,8 @@ async fn maybe_seal(
         // older sparse checkpoint and trip the finality guard on a block it never touched (#461).
         if let Some(first) = scan.first {
             if first > from {
-                if let Ok(Some(hash)) = source.block_hash(first - 1).await {
-                    store.set_block_hash(first - 1, &hash)?;
+                if !pin_checkpoint(store, source, first - 1).await? {
+                    return Ok(());
                 }
                 store.set_meta(SEALED_THROUGH_KEY, &(first - 1).to_string())?;
                 metrics.set_sealed_through(first - 1);
@@ -7501,9 +7562,9 @@ async fn maybe_seal(
                 // Finalized range with no transfers - just advance the watermark. Pinning a
                 // checkpoint at the new watermark is what stops a later reorg from walking past it
                 // to an older surviving checkpoint and tripping the finality guard on a block the
-                // reorg never touched (#461). Best-effort: a source hiccup leaves the walk sparse.
-                if let Ok(Some(hash)) = source.block_hash(ceiling).await {
-                    store.set_block_hash(ceiling, &hash)?;
+                // reorg never touched (#461).
+                if !pin_checkpoint(store, source, ceiling).await? {
+                    return Ok(());
                 }
                 store.set_meta(SEALED_THROUGH_KEY, &ceiling.to_string())?;
                 metrics.set_sealed_through(ceiling);
@@ -7543,8 +7604,8 @@ async fn maybe_seal(
             Some(cut) => cut,
         };
 
-        if let Ok(Some(hash)) = source.block_hash(cut).await {
-            store.set_block_hash(cut, &hash)?;
+        if !pin_checkpoint(store, source, cut).await? {
+            return Ok(());
         }
 
         let to_seal = store.entities_in_range(from, cut)?;
@@ -9387,6 +9448,128 @@ mod tests {
         );
     }
 
+    /// Errs for every block at or below `fail_through`, as a provider hiccup during a seal does;
+    /// hashes change at and above `fork_from`.
+    struct HiccupSource {
+        fail_through: std::sync::atomic::AtomicU64,
+        fork_from: std::sync::atomic::AtomicU64,
+    }
+
+    impl HiccupSource {
+        fn hash(&self, n: u64) -> String {
+            let chain = u64::from(n >= self.fork_from.load(std::sync::atomic::Ordering::SeqCst));
+            format!("0x{n:060x}{chain:04x}")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for HiccupSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(0)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            if n <= self.fail_through.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("eth_getBlockByNumber timed out");
+            }
+            Ok(Some(self.hash(n)))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(vec![])
+        }
+    }
+
+    /// #1665. A seal whose pin failed advanced the watermark anyway, so a wide window's only
+    /// checkpoints were its own `to` and one below the watermark, and a shallow reorg above the
+    /// watermark walked to the older one and read as a finality violation.
+    #[tokio::test]
+    async fn a_failed_seal_pin_does_not_advance_the_watermark() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let src = HiccupSource {
+            fail_through: std::sync::atomic::AtomicU64::new(30),
+            fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+        };
+        let metrics = crate::metrics::NestMetrics::default();
+        store.set_block_hash(5, &src.hash(5)).unwrap();
+        let entities: Vec<(String, String)> = (6..=40)
+            .map(|i| (Store::entity_key(i, 0), entity_json(i, 0)))
+            .collect();
+        store
+            .commit_window(&entities, Some((40, src.hash(40).as_str())), 40)
+            .unwrap();
+        store.set_meta(SEALED_THROUGH_KEY, "5").unwrap();
+        let sealed_through = || -> u64 {
+            store
+                .get_meta(SEALED_THROUGH_KEY)
+                .unwrap()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+
+        maybe_seal(tmp.path(), &store, &src, 30, None, &metrics, 10)
+            .await
+            .unwrap();
+        src.fail_through.store(0, SeqCst);
+        src.fork_from.store(35, SeqCst);
+        let sealed = sealed_through();
+        let ancestor = detect_reorg(&src, &store, 40).await.unwrap().unwrap();
+        assert!(
+            ancestor >= sealed,
+            "a reorg at block 35 walked to {ancestor}, below the watermark {sealed} that advanced \
+             past a pin which failed: rollback_reorg raises the #461 TerminalFault"
+        );
+
+        maybe_seal(tmp.path(), &store, &src, 30, None, &metrics, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            sealed_through(),
+            25,
+            "once the source answers, the seal goes ahead"
+        );
+        assert!(store.get_block_hash(25).unwrap().is_some());
+    }
+
+    /// The two arms that advance without sealing, an empty range and an empty leading stretch, hold
+    /// the watermark on a failed pin too (#1665).
+    #[tokio::test]
+    async fn a_failed_pin_holds_the_watermark_over_rows_that_are_not_there() {
+        let src = HiccupSource {
+            fail_through: std::sync::atomic::AtomicU64::new(u64::MAX),
+            fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+        };
+        let metrics = crate::metrics::NestMetrics::default();
+        for first_row in [None, Some(20u64)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+            let entities: Vec<(String, String)> = first_row
+                .map(|f| (f..=40).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|i| (Store::entity_key(i, 0), entity_json(i, 0)))
+                .collect();
+            store
+                .commit_window(&entities, Some((40, "aa")), 40)
+                .unwrap();
+            store.set_meta(SEALED_THROUGH_KEY, "5").unwrap();
+            maybe_seal(tmp.path(), &store, &src, 30, None, &metrics, SPAN_REAL)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_meta(SEALED_THROUGH_KEY).unwrap().as_deref(),
+                Some("5"),
+                "first row {first_row:?}: the watermark moved to a block with no checkpoint"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn retry_transient_recovers_after_transient_failures() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10735,11 +10918,27 @@ template = "pool"
         let f = Finality::FinalizedTag {
             fallback_depth: 1800,
         };
-        // Tag present: seal up to it (clamped to tip).
+        // Tag present: seal up to it.
         assert_eq!(seal_ceiling(f, 10_000, Some(8_500)), 8_500);
-        assert_eq!(seal_ceiling(f, 10_000, Some(10_050)), 10_000);
         // Tag absent (endpoint doesn't serve it): fixed-depth fallback.
         assert_eq!(seal_ceiling(f, 10_000, None), 8_200);
+    }
+
+    /// #1667. A provider that maps `finalized` to `latest` answers the tip or past it, and sealing
+    /// there puts the next reorg below the watermark.
+    #[test]
+    fn a_finalized_tag_at_or_past_the_tip_falls_back_to_depth() {
+        let f = Finality::FinalizedTag {
+            fallback_depth: 1800,
+        };
+        for tag in [10_000, 10_050] {
+            assert_eq!(
+                seal_ceiling(f, 10_000, Some(tag)),
+                8_200,
+                "finalized {tag} at tip 10,000 was trusted and the tip block would seal"
+            );
+        }
+        assert_eq!(seal_ceiling(f, 10_000, Some(9_998)), 9_998);
     }
 
     #[test]
@@ -12541,6 +12740,60 @@ template = "pool"
             detect_reorg(&ForkedSource, &store, 300).await.unwrap(),
             Some(200),
             "the deepest surviving checkpoint below the fork"
+        );
+    }
+
+    /// #1668. The first call reached a node that has forked past 300 and the walk reached a lagging
+    /// replica that answers `None`. That is not a fork deeper than every checkpoint, and an answer of
+    /// 0 re-indexes an unsealed nest from origin and faults a sealed one.
+    #[tokio::test]
+    async fn a_walk_the_source_cannot_answer_is_not_a_fork_at_zero() {
+        /// Answers 300 with a forked hash, `None` for `unanswered`, and agrees everywhere else.
+        struct LaggingReplica {
+            unanswered: &'static [u64],
+        }
+        #[async_trait::async_trait]
+        impl Source for LaggingReplica {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1_000)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(match n {
+                    300 => Some("0xtheirs300".into()),
+                    n if self.unanswered.contains(&n) => None,
+                    n => Some(format!("0xours{n}")),
+                })
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _f: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        for b in [100u64, 200, 300] {
+            store.set_block_hash(b, &format!("0xours{b}")).unwrap();
+        }
+        let lagging = LaggingReplica {
+            unanswered: &[100, 200],
+        };
+        assert_eq!(
+            detect_reorg(&lagging, &store, 300).await.unwrap(),
+            None,
+            "every older checkpoint answered None: that is cannot-tell, not a fork at block 0"
+        );
+        // The unanswered checkpoint may be the seal pin at the watermark; walking past it to 100
+        // would read a lagging replica as a finality violation.
+        let gap = LaggingReplica { unanswered: &[200] };
+        assert_eq!(
+            detect_reorg(&gap, &store, 300).await.unwrap(),
+            None,
+            "the walk skipped an unanswered checkpoint and landed below it"
         );
     }
 
@@ -15210,6 +15463,57 @@ template = "pool"
         );
     }
 
+    /// A provider that serves logs and timestamps and cannot answer `eth_getBlockByNumber` for a hash.
+    struct NoBlockHash;
+
+    #[async_trait::async_trait]
+    impl Source for NoBlockHash {
+        async fn tip(&self) -> Result<u64> {
+            Ok(100)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            anyhow::bail!("eth_getBlockByNumber: method not available")
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// #1666. Windows kept committing with no checkpoint, so reorg detection answered None for ever,
+    /// and nothing said so above debug. Ingestion carries on; the miss is counted where an alert can
+    /// read it.
+    #[tokio::test]
+    async fn a_window_committed_without_a_checkpoint_is_counted() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        nest.metrics = Arc::new(crate::metrics::NestMetrics::default());
+        for b in [10u64, 11] {
+            let outcome = nest
+                .process_window(&NoBlockHash, &[transfer_log(b, 0)], b, b, 100)
+                .await
+                .unwrap();
+            assert!(outcome.is_some(), "a missing checkpoint stopped ingestion");
+        }
+        assert_eq!(nest.store.get_block_hash(11).unwrap(), None);
+        assert_eq!(
+            nest.metrics.checkpoints_missed(),
+            2,
+            "two windows committed with no reorg checkpoint and nothing counted them"
+        );
+    }
+
     /// RFC-0004 §3: the pipelined (concurrent-fetch) backfill produces **byte-identical** segments to
     /// the sequential path - concurrency overlaps latency without changing the output.
     #[tokio::test]
@@ -16256,7 +16560,7 @@ template="pool"
     #[async_trait::async_trait]
     impl Source for SealDirectSource {
         async fn tip(&self) -> Result<u64> {
-            Ok(5)
+            Ok(6)
         }
         async fn finalized(&self) -> Result<Option<u64>> {
             Ok(Some(5))
@@ -16318,9 +16622,9 @@ template="pool"
             w.abort();
         }
 
-        // `tip = 5`, `backfill = Some(4)` asks for blocks 1..=5 via seal-direct (`cold_start_block`);
+        // `tip = 6`, `backfill = Some(5)` asks for blocks 1..=5 via seal-direct (`cold_start_block`);
         // `every = 1` samples all five.
-        let result = nest.prepare(source.as_ref(), Some(4), true, 1, 100).await;
+        let result = nest.prepare(source.as_ref(), Some(5), true, 1, 100).await;
         assert!(
             result.is_ok(),
             "seal-direct with calls must succeed: {result:?}"
@@ -16386,9 +16690,9 @@ template="pool"
             w.abort();
         }
 
-        // `tip = 5`, `backfill = Some(4)` asks for blocks 1..=5 via seal-direct; `every = 1` samples
+        // `tip = 6`, `backfill = Some(5)` asks for blocks 1..=5 via seal-direct; `every = 1` samples
         // all five, so the sealed segment owes five `oracle_answer` rows.
-        let result = nest.prepare(source.as_ref(), Some(4), true, 1, 100).await;
+        let result = nest.prepare(source.as_ref(), Some(5), true, 1, 100).await;
         assert!(
             result.is_ok(),
             "seal-direct with calls must succeed: {result:?}"
