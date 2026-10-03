@@ -84,7 +84,9 @@ fails past the bound and passes inside it.
 
 The copy is about 700 MB and the gate wants a quiet box for its timings, so it does not fit a GitHub
 runner. It runs on the ThinkPad, which already runs the QoS nest; the gate is scheduled away from
-that nest's busy periods and takes a lock so only one gate runs at a time.
+that nest's busy periods. Every gate run against a copy, the timer's or one by hand with
+`release-gate.sh`, takes the same lock beside it (`alloc-nest.gate-lock`; flock on Linux, a mkdir
+lock elsewhere) and waits for any other: two `serve`s cannot open one redb.
 
 **The copy** lives at `~/release-gate/alloc-nest` and is refreshed from the Lodestar box in Helsinki
 before each run, through the `GATE_REFRESH` hook: rsync the allocations nest's `segments/` (sealed
@@ -96,7 +98,9 @@ startup check catch a copy `serve` will not open.
 **The trigger** is `scripts/release-gate-run.sh`:
 
 - `--poll`, from a systemd timer every 15 minutes: gates the newest published release or release
-  candidate whose commit carries no `release-gate/alloc-nest` status. A `-rc` tag runs the release
+  candidate that is newer than production, by the version in its tag, and whose commit carries no
+  `release-gate/alloc-nest` status. A release at or below production is never gated, and with
+  nothing newer it exits quietly. A `-rc` tag runs the release
   workflow like any `v*` tag and is published as a prerelease with its binaries, so tagging a
   candidate is enough to have it gated within the quarter hour.
 - `<tag>` by hand, to gate or re-gate one release.
@@ -110,6 +114,12 @@ therefore the same box, the same copy and the same day, so neither a refreshed c
 different machine reads as a regression. The committed `baseline-4.2.0.tsv` is the proof run's
 record, not what the ThinkPad compares against. Production defaults to the latest full release
 that is not the candidate; `--production <tag>` names it when that is wrong.
+
+Production failing its own gate is still the baseline, since it is what production does: over
+the RSS budget, or refusing statements of its own. Its peak and failures are named in the
+candidate's status and output. The candidate's verdict stays its own: it fails on its own
+refusals, its regressions against production's times and its own peak, and a statement production
+fails cannot regress. Only a production run that could not be measured (exit 2) posts `error`.
 
 **The result** reaches the release as a commit status on the candidate's commit, context
 `release-gate/alloc-nest`, posted with `gh api repos/nightswatchhq/nuthatch/statuses/<sha>`:
