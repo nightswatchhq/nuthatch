@@ -105,6 +105,19 @@ pub struct Probe {
     /// matched on a topic0 no event can produce and never met a result-count cap. `false` means the
     /// probe matched real logs (an address was given) and `max_window` reflects both limits.
     pub range_only: bool,
+    /// What the probe learnt about logs at the start of the chain, which a from-genesis backfill
+    /// reads first. See [`OldLogs`].
+    pub old_logs: OldLogs,
+}
+
+/// Only an answer with logs in it, or a refusal, is evidence about old logs: an empty answer looks
+/// the same whether they were pruned or never emitted (#1624).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldLogs {
+    Served,
+    NotEstablished,
+    Refused,
+    NotProbed,
 }
 
 impl Probe {
@@ -155,8 +168,11 @@ impl Probe {
             )),
             None => out.push_str("  JSON-RPC batch   FAILED - batching unusable\n"),
         }
-        out.push_str(if self.archive {
+        out.push_str(if self.archive && self.old_logs == OldLogs::Served {
             "  archive depth    yes - deep backfills and pinned eth_call work\n"
+        } else if self.archive {
+            "  archive depth    yes (state) - pinned eth_call works; old logs not established, so a \
+             from-genesis backfill is not proven\n"
         } else if self.archive_unknown {
             "  archive depth    UNKNOWN - refused (plan/quota), not answered; re-probe with credit\n"
         } else {
@@ -179,6 +195,7 @@ impl Probe {
             "max_batch": self.max_batch,
             "archive": self.archive,
             "archive_unknown": self.archive_unknown,
+            "old_logs": format!("{:?}", self.old_logs),
             "notes": self.notes,
         })
     }
@@ -336,6 +353,7 @@ pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
                 archive_unknown: true,
                 notes,
                 range_only: addresses.is_empty(),
+                old_logs: OldLogs::NotProbed,
             });
         }
     };
@@ -446,40 +464,39 @@ pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
     // State at depth is not logs at depth: eth.drpc.org answered the state probe and refused every
     // getLogs near USDC's deployment block (#1624). A refusal over the oldest blocks is evidence;
     // an empty answer is not, since pruned and never-emitted look the same, so it is said so.
-    let archive = archive
-        && {
-            let filter = crate::source::LogFilter::new(addresses, &[]).unwrap_or_else(|| {
-                crate::source::LogFilter::new(&[], &[NO_MATCH_TOPIC0.to_string()])
-                    .expect("a one-topic filter is non-empty")
-            });
-            match rpc.logs(&filter, 1, 10).await {
-                Ok(logs) => {
-                    if logs.is_empty() {
-                        notes.push(
-                        "old logs not established: eth_getLogs over blocks 1-10 answered, but empty, \
-                         and an empty answer cannot tell pruned logs from none"
-                            .to_string(),
-                    );
-                    }
-                    true
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    if refused(&msg) {
-                        archive_unknown = true;
-                        notes.push(format!(
+    let mut old_logs = OldLogs::NotProbed;
+    let archive = archive && {
+        let filter = crate::source::LogFilter::new(addresses, &[]).unwrap_or_else(|| {
+            crate::source::LogFilter::new(&[], &[NO_MATCH_TOPIC0.to_string()])
+                .expect("a one-topic filter is non-empty")
+        });
+        match rpc.logs(&filter, 1, 10).await {
+            Ok(logs) => {
+                old_logs = if logs.is_empty() {
+                    OldLogs::NotEstablished
+                } else {
+                    OldLogs::Served
+                };
+                true
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                old_logs = OldLogs::Refused;
+                if refused(&msg) {
+                    archive_unknown = true;
+                    notes.push(format!(
                         "archive depth UNKNOWN - eth_getLogs over blocks 1-10 was refused: {msg}"
                     ));
-                    } else {
-                        notes.push(format!(
+                } else {
+                    notes.push(format!(
                         "keeps state ~1M blocks back but refused eth_getLogs over blocks 1-10, so \
                          its old logs are pruned: {msg}"
                     ));
-                    }
-                    false
                 }
+                false
             }
-        };
+        }
+    };
 
     // This probe filters on a topic0 no event can produce (see above), so its response is empty at
     // every span and it can never meet a result-count cap - it only ever measures the provider's
@@ -503,6 +520,7 @@ pub async fn probe(url: &str, addresses: &[String]) -> Result<Probe> {
         archive_unknown,
         notes,
         range_only: addresses.is_empty(),
+        old_logs,
     })
 }
 
@@ -799,6 +817,7 @@ mod tests {
             archive_unknown: false,
             notes: Vec::new(),
             range_only: false,
+            old_logs: OldLogs::NotProbed,
         }
     }
 
@@ -879,6 +898,7 @@ mod tests {
             archive_unknown: true,
             notes: Vec::new(),
             range_only: false,
+            old_logs: OldLogs::NotProbed,
         };
         let r = refused.report();
         assert!(r.contains("UNKNOWN"), "{r}");
@@ -904,18 +924,21 @@ mod tests {
     fn a_range_only_measurement_is_capped_not_just_halved() {
         let unbounded = Probe {
             range_only: true,
+            old_logs: OldLogs::NotProbed,
             ..probe_of(Some(163_840), None, false)
         };
         assert_eq!(unbounded.recommended_window(), Some(RANGE_ONLY_WINDOW_CAP));
 
         let small = Probe {
             range_only: true,
+            old_logs: OldLogs::NotProbed,
             ..probe_of(Some(400), None, false)
         };
         assert_eq!(small.recommended_window(), Some(200));
 
         let filtered = Probe {
             range_only: false,
+            old_logs: OldLogs::NotProbed,
             ..probe_of(Some(163_840), None, false)
         };
         assert_eq!(filtered.recommended_window(), Some(81_920));
@@ -929,12 +952,11 @@ mod tests {
         let (url, server) = filter_capturing_rpc(seen, None).await;
         let p = probe(&url, &[]).await.unwrap();
         server.abort();
+        assert_eq!(p.old_logs, OldLogs::NotEstablished);
+        let report = p.report();
         assert!(
-            p.notes
-                .iter()
-                .any(|n| n.starts_with("old logs not established")),
-            "{:?}",
-            p.notes
+            report.contains("old logs not established") && !report.contains("deep backfills"),
+            "an endpoint whose old logs were never seen is reported as backfill-ready:\n{report}"
         );
     }
     /// #1624: an endpoint that keeps state far back but refuses old logs is not an archive for a
@@ -981,6 +1003,7 @@ mod tests {
             "pruned old logs reported as archive: {:?}",
             p.notes
         );
+        assert_eq!(p.old_logs, OldLogs::Refused);
         assert!(!p.archive_unknown);
         assert!(
             p.notes
