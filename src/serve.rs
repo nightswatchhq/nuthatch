@@ -35,6 +35,10 @@ use tokio::sync::Semaphore;
 /// identity and belongs in a gateway). The permit count is not an unconstrained config key.
 pub const SQL_MAX_CONCURRENCY: usize = 2;
 
+/// How long a connection may take to send a complete request head before it is closed (#1660). A
+/// real client sends it in one write; ten seconds covers a slow link and still frees a stalled socket.
+pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Hard ceiling on the override below.
 ///
 /// The permit count is a **memory** bound, not a throughput one (#1006, and the correction in
@@ -938,7 +942,7 @@ pub async fn bind_and_serve(
         Some(layer) => cors_outside_admin(app, layer),
         None => app,
     };
-    let listener = tokio::net::TcpListener::bind(listen)
+    let mut listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind {listen}"))?;
     tracing::info!("API live on http://{listen}  (try GET /  and  /metrics)");
@@ -951,12 +955,28 @@ pub async fn bind_and_serve(
              before exposing it publicly. See docs/operators.md."
         );
     }
-    // Graceful shutdown on SIGTERM/SIGINT: axum drains in-flight requests, then this returns so the
+    // Not `axum::serve`: it gives hyper no timer, so the header-read timeout never fires (#1660).
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    // Graceful shutdown on SIGTERM/SIGINT: in-flight requests drain, then this returns so the
     // caller can abort the ingest task(s) (progress is checkpointed, so a restart resumes cleanly).
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut shutdown = std::pin::pin!(shutdown_signal());
+    loop {
+        let (io, _) = tokio::select! {
+            conn = axum::serve::Listener::accept(&mut listener) => conn,
+            _ = &mut shutdown => break,
+        };
+        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        let conn = graceful.watch(http.serve_connection(hyper_util::rt::TokioIo::new(io), service));
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::trace!("connection ended: {e:#}");
+            }
+        });
+    }
+    graceful.shutdown().await;
     tracing::info!("shutdown signal received; API stopped");
     Ok(())
 }
@@ -2860,51 +2880,76 @@ async fn table(
         return not_found(&name);
     }
     let limit = q.limit.unwrap_or(100).min(1000);
-    let in_range = |v: &Value| {
-        let b = v.get("block_number").and_then(Value::as_u64).unwrap_or(0);
-        q.from_block.map(|f| b >= f).unwrap_or(true) && q.to_block.map(|t| b <= t).unwrap_or(true)
-    };
 
     // Hot rows (tip), newest first.
-    let mut items: Vec<Value> = s
-        .store
-        .recent_by_table(&name, limit)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|r| serde_json::from_str::<Value>(r).ok())
-        .filter(&in_range)
-        .collect();
+    let hot = if q.from_block.is_none() && q.to_block.is_none() {
+        s.store.recent_by_table(&name, limit).and_then(|rows| {
+            rows.iter()
+                .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
+                .collect()
+        })
+    } else {
+        hot_rows_in_window(
+            &*s.store,
+            &name,
+            limit,
+            q.from_block.unwrap_or(0),
+            q.to_block.unwrap_or(u64::MAX),
+        )
+    };
+    let mut items = match hot {
+        Ok(items) => items,
+        Err(e) => return error(format!("{e:#}")),
+    };
 
     // Fill from cold (sealed segments) if the hot store didn't satisfy the limit. This runs under
     // the same analytical admission gate as `/sql`; if it's saturated we serve the hot rows we
-    // already have rather than pile more scan-heavy work on. Cold is an enrichment of the hot result,
-    // so best-effort (`try_acquire`) is the right degradation - a point-read-ish endpoint shouldn't
-    // 503 just because the analytical surface is busy.
+    // already have rather than pile more scan-heavy work on - but say so, in `/sql`'s terms, so a
+    // hot-only answer is never read as the merged table (#1659).
+    let mut degraded_tables = std::collections::BTreeSet::new();
     if items.len() < limit {
-        if let Ok(permit) = Arc::clone(&s.sql_gate).try_acquire_owned() {
-            let need = limit - items.len();
-            let mut where_ = String::new();
-            if let Some(f) = q.from_block {
-                where_.push_str(&format!(" AND block_number >= {f}"));
+        let cold = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+            Err(_) => Err("the SQL gate is saturated".to_string()),
+            Ok(permit) => {
+                let need = limit - items.len();
+                let mut where_ = String::new();
+                if let Some(f) = q.from_block {
+                    where_.push_str(&format!(" AND block_number >= {f}"));
+                }
+                if let Some(t) = q.to_block {
+                    where_.push_str(&format!(" AND block_number <= {t}"));
+                }
+                let sql = format!(
+                    "SELECT * FROM \"{name}\" WHERE 1=1{where_} ORDER BY block_number DESC, log_index DESC LIMIT {need}"
+                );
+                let dir = s.dir.clone();
+                let declared = Arc::clone(&s.tables);
+                let guard = analytics::QueryGuard {
+                    timeout: SQL_TIMEOUT,
+                    max_rows: need,
+                };
+                match tokio::task::spawn_blocking(move || {
+                    let _permit = permit; // held for the whole blocking query
+                                          // Declared, so a table nothing has been sealed for yet reads empty, not failed.
+                    let hot = analytics::HotRows::new();
+                    analytics::query_hot_cold(&dir, &sql, guard, &hot, u64::MAX, &declared)
+                })
+                .await
+                {
+                    Ok(Ok(out)) => Ok(out),
+                    Ok(Err(e)) => Err(format!("{e:#}")),
+                    Err(e) => Err(format!("{e}")),
+                }
             }
-            if let Some(t) = q.to_block {
-                where_.push_str(&format!(" AND block_number <= {t}"));
-            }
-            let sql = format!(
-                "SELECT * FROM \"{name}\" WHERE 1=1{where_} ORDER BY block_number DESC, log_index DESC LIMIT {need}"
-            );
-            let dir = s.dir.clone();
-            let guard = analytics::QueryGuard {
-                timeout: SQL_TIMEOUT,
-                max_rows: need,
-            };
-            if let Ok(Ok(out)) = tokio::task::spawn_blocking(move || {
-                let _permit = permit; // held for the whole blocking query
-                analytics::query_guarded(&dir, &sql, guard)
-            })
-            .await
-            {
+        };
+        match cold {
+            Ok(out) => {
+                degraded_tables.extend(out.degraded_tables);
                 items.extend(out.rows);
+            }
+            Err(why) => {
+                tracing::warn!("/table/{name} served without its sealed rows: {why}");
+                degraded_tables.insert(name.clone());
             }
         }
     }
@@ -2919,7 +2964,47 @@ async fn table(
         seen.insert(id)
     });
     items.truncate(limit);
-    Json(json!({ "table": name, "count": items.len(), "items": items })).into_response()
+    Json(json!({
+        "table": name,
+        "count": items.len(),
+        "items": items,
+        "degraded": !degraded_tables.is_empty(),
+        "degraded_tables": degraded_tables,
+    }))
+    .into_response()
+}
+
+/// The newest `limit` hot rows of `table` with a block in `[from, to]`, newest first. The window is
+/// applied before the limit, or a window below the newest `limit` hot rows would find none (#1659).
+fn hot_rows_in_window(
+    store: &dyn crate::store::HotStore,
+    table: &str,
+    limit: usize,
+    from: u64,
+    to: u64,
+) -> Result<Vec<Value>> {
+    let mut newest = std::collections::VecDeque::with_capacity(limit.min(1024));
+    let mut unparseable = None;
+    store.scan_entities_in_range(from, to, &mut |_, raw| {
+        match serde_json::from_str::<Value>(raw) {
+            Ok(v) if v.get("table").and_then(Value::as_str) == Some(table) => {
+                newest.push_back(v);
+                if newest.len() > limit {
+                    newest.pop_front();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                unparseable = Some(e);
+                return false;
+            }
+        }
+        true
+    })?;
+    if let Some(e) = unparseable {
+        return Err(e).context("unparseable hot row");
+    }
+    Ok(newest.into_iter().rev().collect())
 }
 
 #[derive(Deserialize)]
@@ -6638,6 +6723,103 @@ mod tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(crate::analytics::entity_guarded_reads(), before + 1);
+    }
+
+    /// `table` sealed at `sealed`, hot at `hot`, one row per block, served through `router()`.
+    fn table_fixture(
+        dir: &std::path::Path,
+        sealed: std::ops::RangeInclusive<u64>,
+        hot: std::ops::RangeInclusive<u64>,
+    ) -> AppState {
+        let row = |b: u64| json!({"table":"t","block_number":b,"log_index":0,"v":"x"}).to_string();
+        let cold: Vec<String> = sealed.clone().map(row).collect();
+        crate::seal::seal_range(dir, &cold, *sealed.start(), *sealed.end()).unwrap();
+        let mut state = test_state(dir, 1);
+        for b in hot {
+            state
+                .store
+                .put_entity(&Store::entity_key(b, 0), &row(b))
+                .unwrap();
+        }
+        state.tables = Arc::new(vec![crate::registry::TableSchema {
+            table: "t".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "T".into(),
+            topic0: "0x".into(),
+            columns: crate::registry::implicit_columns(false),
+        }]);
+        state
+    }
+
+    async fn get_json(state: AppState, uri: &str) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router(SharedNest::new(state)).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// #1659: with the SQL gate saturated `/table` cannot read the sealed rows, and its answer must
+    /// say it is degraded rather than pass the hot rows off as the merged table.
+    #[tokio::test]
+    async fn a_table_answer_without_its_sealed_rows_says_it_is_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        let (status, body) = get_json(state.clone(), "/table/t?limit=10").await;
+        drop(held);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 2, "{body}");
+        assert_eq!(
+            body["degraded"], true,
+            "hot-only rows reported as the merged table: {body}"
+        );
+        assert_eq!(body["degraded_tables"], json!(["t"]), "{body}");
+
+        let (status, body) = get_json(state, "/table/t?limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 5, "hot and sealed merge: {body}");
+        assert_eq!(body["degraded"], false, "{body}");
+        assert_eq!(body["degraded_tables"], json!([]), "{body}");
+    }
+
+    /// A table nothing has been sealed for yet is complete in the hot store, not degraded.
+    #[tokio::test]
+    async fn a_table_with_nothing_sealed_is_not_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = table_fixture(tmp.path(), 1..=1, 4..=5);
+        state.dir = tmp.path().join("young");
+        std::fs::create_dir_all(&state.dir).unwrap();
+        let (status, body) = get_json(state, "/table/t?limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 2, "{body}");
+        assert_eq!(body["degraded"], false, "{body}");
+    }
+
+    /// #1659: a block window is applied to the hot rows before the limit, so a window older than
+    /// the newest `limit` hot rows still finds the rows inside it.
+    #[tokio::test]
+    async fn a_table_window_below_the_newest_hot_rows_finds_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=9);
+        let (status, body) = get_json(state, "/table/t?limit=2&from_block=4&to_block=5").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let blocks: Vec<u64> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["block_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(blocks, vec![5, 4], "{body}");
     }
 
     /// The case the wait exists for: a permit freed while the caller is queued admits it, where

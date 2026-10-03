@@ -426,6 +426,35 @@ jobs:
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
+  # #1717. Kills the real binary at named instants in the seal path and restarts it on the same
+  # directory. The points exist only under `--features crash-points`, so no other job reaches them.
+  crash-points:
+    name: crash points (seal path)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: record start time
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - name: clippy (crash-points)
+        run: cargo clippy --features crash-points --all-targets -- -D warnings
+      - name: kill, restart, count
+        run: cargo test --locked --features crash-points --test crash_points
+      - name: distinguish an expired timeout from a cancel or supersede
+        if: always() && cancelled()
+        run: |
+          if [ -z "${JOB_START_EPOCH:-}" ]; then
+            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 60m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
+            exit 0
+          fi
+          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
+          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 60m timeout-minutes ceiling. Close to 60m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
+
   # #1343. RFC-0052 S1's closed acceptance asked for a reconciler proof "over FsStore and S3 (MinIO
   # in CI)" - MinIO itself was withdrawn upstream in 2026 (#1492), so the server is now versitygw, but #1335 shipped the S3 mirror with every sync test run against `memory://` and no job
   # here ever started a real object store - S3 publishing had never touched one. This job does.

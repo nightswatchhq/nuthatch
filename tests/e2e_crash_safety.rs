@@ -3,6 +3,8 @@
 //! not add a duplicate segment or double-count rows. The pipeline's `maybe_seal` is private, so this
 //! targets its content-addressed core, `seal::seal_range`, exercised twice against the SAME dir (the
 //! inline seal tests only ever seal into two DIFFERENT dirs, so this same-dir re-seal is new coverage).
+//!
+//! No process dies here. `tests/crash_points.rs` kills the binary at those instants (#1717).
 
 use nuthatch::seal;
 

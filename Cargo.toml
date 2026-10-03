@@ -67,6 +67,11 @@ name = "delegation_fold_corpus"
 path = "tests/delegation_fold_corpus.rs"
 required-features = ["graph"]
 
+[[test]]
+name = "crash_points"
+path = "tests/crash_points.rs"
+required-features = ["crash-points"]
+
 [dependencies]
 # graph-node's own pluralisation, so a generated root field name matches it by construction rather
 # than by a rule reimplemented here (`graph/src/data/graphql/ext.rs:360` calls `to_plural`).
@@ -106,7 +111,7 @@ bytes = "1"
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 # The analytical engine (RFC-0044 Amendment 2), pinned by rev. Its arrow is not ours, so no batch
 # crosses; rows cross as JSON, and Arrow results as IPC.
-burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "c911fd1180c61a7843904ae066da70a24507a65c", default-features = false, features = ["datafusion"] }
+burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "3e7b9f54f158678aa4130ceaa00844eb89183c9e", default-features = false, features = ["datafusion"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
 # satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via
@@ -124,6 +129,9 @@ ed25519-dalek = "2"
 getrandom = "0.3"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
+# Already in the tree via axum; named so `bind_and_serve` can give hyper a timer (#1660).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-graceful", "service"] }
 # `cors` only. Already in the tree via reqwest, so this adds a feature rather than a crate, and CORS
 # is not worth hand-rolling: getting `Vary: Origin` wrong poisons a shared cache (#1318).
 tower-http = { version = "0.6", features = ["cors"] }
@@ -174,6 +182,9 @@ counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
 graph = ["folds"]
 # RFC-0059: checkpointed folds. Off by default, and a default build refuses a nest that ships `folds/`.
 folds = []
+# #1717: named points where a test build aborts when `NUTHATCH_CRASH_AT` names them. Off by default,
+# and a default build compiles every point to nothing.
+crash-points = []
 
 [dev-dependencies]
 proptest = "1"
