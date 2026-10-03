@@ -21,6 +21,10 @@
 # Both conditions must hold, so a 40 ms query taking 90 ms is noise, not a regression.
 # Also FAIL on the serving process's peak RSS over the 2 GiB per-cursor budget (GATE_MAX_RSS_MB).
 # It is sampled every half second, so a spike shorter than that can pass unseen.
+# With --baseline, also FAIL ("answer differs") on a statement whose answer is not the baseline's.
+# Each answer is kept canonical in <out>/answers/<id>.rows (keys sorted, floats to 12 significant
+# digits, rows sorted unless the statement has a top-level ORDER BY) and compared by its sha256.
+# A statement tagged `# volatile: <id> <why>` in the set is compared on its row count only.
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
 # Two runs against one copy wait for each other: the second `serve` could not open the redb.
 set -euo pipefail
@@ -54,7 +58,7 @@ while [ $# -gt 0 ]; do
     --passes) [ $# -ge 2 ] || die "--passes needs a number"; passes=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
     --timeout) [ $# -ge 2 ] || die "--timeout needs seconds"; timeout=$2; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) break ;;
   esac
@@ -69,6 +73,14 @@ case "$timeout" in ''|*[!0-9]*|0) die "--timeout must be a positive integer" ;; 
 [ -f "$set_file" ] || die "no query set at $set_file"
 [ -z "$baseline" ] || [ -f "$baseline" ] || die "no baseline at $baseline"
 command -v curl >/dev/null || die "curl is not on PATH"
+command -v jq >/dev/null || die "jq is not on PATH"
+if command -v sha256sum >/dev/null; then
+  sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null; then
+  sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+  die "neither sha256sum nor shasum is on PATH"
+fi
 
 # shellcheck source=gate/lock.sh
 . "$(dirname "$0")/gate/lock.sh"
@@ -80,11 +92,24 @@ if [ -z "$out" ]; then
 else
   mkdir -p "$out"
 fi
+# Absolute, because a baseline names its answers directory for the run that compares against it.
+out=$(cd "$out" && pwd)
+rm -rf "$out/answers"
+mkdir -p "$out/answers"
 
 # The set, loaded once: parallel arrays indexed by query number.
-ids=() consumers=() sqls=()
+ids=() consumers=() sqls=() volatile=" "
 while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in ''|'#'*) continue ;; esac
+  case "$line" in
+    '# volatile: '*)
+      v=${line#'# volatile: '}
+      v=${v%% *}
+      [ -n "$v" ] || die "a volatile tag without an id in $set_file"
+      volatile="$volatile$v "
+      continue
+      ;;
+    ''|'#'*) continue ;;
+  esac
   id=$(printf '%s' "$line" | cut -f1)
   consumer=$(printf '%s' "$line" | cut -f2)
   q=$(printf '%s' "$line" | cut -f4-)
@@ -96,6 +121,89 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$set_file"
 n=${#ids[@]}
 [ "$n" -gt 0 ] || die "no queries in $set_file"
+
+# ordered: a top-level ORDER BY, so row order is part of the answer. sorted: none, so rows are
+# compared as a set. sorted:unsure: a comment, a stray quote or unbalanced parentheses, so it could
+# not tell, and sorts. Parentheses hide a window's or a subquery's ORDER BY; quotes hide literals.
+order_of() {
+  printf '%s\n' "$1" | awk '
+    { s = s $0 " " }
+    END {
+      n = length(s); depth = 0; top = ""; unsure = 0; i = 1
+      while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == "\047" || c == "\"") {
+          j = i + 1; closed = 0
+          while (j <= n) {
+            if (substr(s, j, 1) == c) {
+              if (substr(s, j + 1, 1) == c) { j += 2; continue }
+              closed = 1; break
+            }
+            j++
+          }
+          if (!closed) unsure = 1
+          i = j + 1; top = top " "; continue
+        }
+        if (c == "-" && substr(s, i + 1, 1) == "-") unsure = 1
+        if (c == "/" && substr(s, i + 1, 1) == "*") unsure = 1
+        if (c == "(") depth++
+        else if (c == ")") { depth--; if (depth < 0) unsure = 1 }
+        else if (depth == 0) top = top toupper(c)
+        i++
+      }
+      if (depth != 0) unsure = 1
+      gsub(/[ \t\r\n]+/, " ", top)
+      if (unsure) print "sorted:unsure"
+      else if (top ~ /(^|[^A-Z0-9_])ORDER BY([^A-Z0-9_]|$)/) print "ordered"
+      else print "sorted"
+    }'
+}
+
+# How each statement's answer is compared: volatile (row count only) or its order_of.
+modes=()
+i=0
+while [ $i -lt "$n" ]; do
+  case "$volatile" in
+    *" ${ids[$i]} "*) modes+=(volatile) ;;
+    *) modes+=("$(order_of "${sqls[$i]}")") ;;
+  esac
+  i=$((i + 1))
+done
+for v in $volatile; do
+  case " ${ids[*]} " in *" $v "*) ;; *) die "volatile tag for $v, which is not in $set_file" ;; esac
+done
+
+# One row per line, keys sorted. A number written as an integer is kept exactly; any other is
+# rounded to 12 significant digits, so a float summed in another order still compares equal. So is
+# a string in exponent form: a DOUBLE cast to VARCHAR, which no integer or DECIMAL renders as.
+CANON_JQ='
+def canon_float:
+  if . == 0 then 0
+  else
+    (if . < 0 then -1 else 1 end) as $sign
+    | fabs as $a
+    | ($a | log10 | floor) as $e
+    | (if $e >= 11 then $a / pow(10; $e - 11) else $a * pow(10; 11 - $e) end | round) as $m
+    | [$m, $e - 11]
+    | until(.[0] % 10 != 0; [.[0] / 10, .[1] + 1])
+    | (if .[1] >= 0 then .[0] * pow(10; .[1]) else .[0] / pow(10; -.[1]) end) * $sign
+  end;
+.rows[] | walk(
+  if type == "number" and (tojson | test("^-?[0-9]+$") | not) then canon_float
+  elif type == "string" and test("^-?[0-9]+(\\.[0-9]+)?[eE][-+]?[0-9]+$") then tonumber | canon_float | tostring
+  else . end)'
+
+# canon_answer <body> <mode> <dest>: writes the canonical rows to dest and prints their sha256.
+canon_answer() {
+  jq -c -S "$CANON_JQ" "$1" >"$3.tmp" || return 1
+  if [ "$2" = ordered ]; then
+    mv "$3.tmp" "$3" || return 1
+  else
+    LC_ALL=C sort "$3.tmp" >"$3" || return 1
+    rm -f "$3.tmp"
+  fi
+  sha256_of "$3"
+}
 
 server_pid=""
 sampler_pid=""
@@ -161,20 +269,21 @@ start_server() {
 
 ms_of() { awk -v s="$1" 'BEGIN { printf "%d", s * 1000 + 0.5 }'; }
 
-# One query against the running server. Prints: status<TAB>rows<TAB>ms<TAB>truncated<TAB>detail
+# One query against the running server, its answer kept canonical in <rows-file>. Prints:
+# status<TAB>rows<TAB>ms<TAB>truncated<TAB>digest<TAB>detail
 run_query() {
-  local q=$1 body=$out/body.json code_time rc=0 code secs ms detail
+  local q=$1 mode=$2 rows_file=$3 body=$out/body.json code_time rc=0 code secs ms detail digest
   code_time=$(curl -sS -m "$timeout" -o "$body" -w '%{http_code} %{time_total}' \
     --get "http://127.0.0.1:$port/sql" --data-urlencode "q=$q" 2>"$out/curl.err") || rc=$?
   if [ $rc -ne 0 ]; then
     if alive; then
       if [ $rc -eq 28 ]; then
-        printf 'timeout\t-\t%s\t-\tno answer within %ss\n' "$((timeout * 1000))" "$timeout"
+        printf 'timeout\t-\t%s\t-\t-\tno answer within %ss\n' "$((timeout * 1000))" "$timeout"
       else
-        printf 'transport\t-\t-\t-\tcurl exit %s: %s\n' "$rc" "$(head -c 160 "$out/curl.err" | tr '\n' ' ')"
+        printf 'transport\t-\t-\t-\t-\tcurl exit %s: %s\n' "$rc" "$(head -c 160 "$out/curl.err" | tr '\n' ' ')"
       fi
     else
-      printf 'died\t-\t-\t-\tthe server exited under this query (out of memory or a crash; see its log)\n'
+      printf 'died\t-\t-\t-\t-\tthe server exited under this query (out of memory or a crash; see its log)\n'
     fi
     return 0
   fi
@@ -188,11 +297,16 @@ run_query() {
     rows=$(head -c 64 "$body" | sed -n 's/^{"count":\([0-9]*\).*/\1/p')
     grep -q '"truncated":true' "$body" && truncated=true
     if grep -q '"degraded":true' "$body"; then
-      printf 'degraded\t%s\t%s\t%s\tthe answer is degraded: %s\n' "$rows" "$ms" "$truncated" \
+      printf 'degraded\t%s\t%s\t%s\t-\tthe answer is degraded: %s\n' "$rows" "$ms" "$truncated" \
         "$(grep -o '"degraded_tables":\[[^]]*\]' "$body" | head -c 160)"
       return 0
     fi
-    printf 'ok\t%s\t%s\t%s\t\n' "${rows:-0}" "$ms" "$truncated"
+    if ! digest=$(canon_answer "$body" "$mode" "$rows_file" 2>"$out/canon.err"); then
+      printf 'error\t%s\t%s\t%s\t-\tthe answer could not be canonicalised: %s\n' "${rows:-0}" "$ms" "$truncated" \
+        "$(head -c 160 "$out/canon.err" | tr '\n' ' ')"
+      return 0
+    fi
+    printf 'ok\t%s\t%s\t%s\t%s\t\n' "${rows:-0}" "$ms" "$truncated" "$digest"
     return 0
   fi
   detail=$(sed -n 's/^{"error":"\(.*\)"}$/\1/p' "$body" | head -c 400)
@@ -204,7 +318,7 @@ run_query() {
   elif [ "$code" = 503 ] || [ "$code" = 429 ] || printf '%s' "$detail" | grep -qiE 'refus|busy|budget'; then
     status=refused
   fi
-  printf '%s\t-\t%s\t-\thttp %s: %s\n' "$status" "$ms" "$code" "$detail"
+  printf '%s\t-\t%s\t-\t-\thttp %s: %s\n' "$status" "$ms" "$code" "$detail"
 }
 
 version=$("$bin" --version 2>/dev/null | head -n 1) || version="unknown"
@@ -212,12 +326,13 @@ echo "release-gate: $version against $nest"
 echo "release-gate: $n queries from $set_file, $passes pass(es), results in $out"
 echo "release-gate: budget ${PROD_ENV[*]}"
 
-rm -f "$out/rss-peak-kb"
+rm -f "$out/rss-peak-kb" "$out/died-after" "$out/unstable"
 # Each pass on a fresh server: the nest memoises answers by statement text, so a second ask of the
 # same statement on one server would time the memo.
 pass=1
 while [ "$pass" -le "$passes" ]; do
   : >"$out/pass-$pass.tsv"
+  mkdir -p "$out/answers/pass-$pass"
   start_server "$out/serve-pass-$pass.log"
   if [ "$pass" -eq 1 ]; then
     prov=$(curl -s -m 30 --get "http://127.0.0.1:$port/sql" --data-urlencode "q=SELECT 1 AS one" \
@@ -232,7 +347,7 @@ while [ "$pass" -le "$passes" ]; do
       stop_server
       start_server "$out/serve-pass-$pass-restart-$i.log"
     fi
-    r=$(run_query "${sqls[$i]}")
+    r=$(run_query "${sqls[$i]}" "${modes[$i]}" "$out/answers/pass-$pass/${ids[$i]}.rows")
     printf '%s\t%s\n' "${ids[$i]}" "$r" >>"$out/pass-$pass.tsv"
     i=$((i + 1))
   done
@@ -246,7 +361,7 @@ results=$out/results.tsv
 i=0
 while [ $i -lt "$n" ]; do
   id=${ids[$i]}
-  status=ok rows=- truncated=- detail="" times=""
+  status=ok rows=- truncated=- detail="" times="" digest=-
   pass=1
   while [ "$pass" -le "$passes" ]; do
     row=$(awk -F'\t' -v id="$id" '$1 == id' "$out/pass-$pass.tsv")
@@ -255,9 +370,16 @@ while [ $i -lt "$n" ]; do
       [ "$rows" != - ] || rows=$(printf '%s' "$row" | cut -f3)
       truncated=$(printf '%s' "$row" | cut -f5)
       times="$times $(printf '%s' "$row" | cut -f4)"
+      d=$(printf '%s' "$row" | cut -f6)
+      if [ "$digest" = - ]; then
+        digest=$d
+        cp "$out/answers/pass-$pass/$id.rows" "$out/answers/$id.rows"
+      elif [ "$d" != "$digest" ]; then
+        printf '%s\t%s\n' "$id" "$pass" >>"$out/unstable"
+      fi
     elif [ "$status" = ok ]; then
       status=$s
-      detail=$(printf '%s' "$row" | cut -f6-)
+      detail=$(printf '%s' "$row" | cut -f7-)
       [ "$(printf '%s' "$row" | cut -f3)" = - ] || rows=$(printf '%s' "$row" | cut -f3)
     fi
     pass=$((pass + 1))
@@ -269,10 +391,12 @@ while [ $i -lt "$n" ]; do
   med=-
   if [ "$status" = ok ]; then
     med=$(printf '%s\n' $times | sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
+  else
+    digest=-
   fi
   # No field may be empty but the last: `read` with a tab IFS folds empty fields away.
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "${consumers[$i]:--}" "$status" "${rows:--}" "$med" \
-    "${truncated:--}" "$detail" >>"$results"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "${consumers[$i]:--}" "$status" "${rows:--}" "$med" \
+    "${truncated:--}" "${digest:--}" "${modes[$i]}" "$detail" >>"$results"
   i=$((i + 1))
 done
 
@@ -283,11 +407,26 @@ p99_of() {
 
 base_val() { awk -F'\t' -v id="$1" -v col="$2" '!/^#/ && $1 == id { print $col }' "$baseline"; }
 
-failures=0 regressions=0
+# first_diff <a> <b>: the first row at which two canonical answers differ, as n<TAB>a's<TAB>b's,
+# "(no row)" standing in for the shorter side.
+first_diff() {
+  awk -v A="$1" '
+    FILENAME == A { a[FNR] = $0; na = FNR; next }
+    { nb = FNR
+      if (!done && (FNR > na || a[FNR] != $0)) {
+        printf "%d\t%s\t%s\n", FNR, (FNR > na ? "(no row)" : a[FNR]), $0; done = 1
+      } }
+    END { if (!done) { r = nb + 1; printf "%d\t%s\t%s\n", r, (r > na ? "(no row)" : a[r]), "(no row)" } }' "$1" "$2"
+}
+
+b_answers=""
+[ -z "$baseline" ] || b_answers=$(sed -n 's/^# answers: //p' "$baseline" | head -n 1)
+
+failures=0 regressions=0 differs=0 matched=0 counted=0 uncompared=0 differ_ids=""
 echo
 printf '%-9s %-36s %9s %9s  %s\n' STATUS QUERY ROWS MS DETAIL
-while IFS=$'\t' read -r id consumer status rows med truncated detail; do
-  note="" verdict=ok
+while IFS=$'\t' read -r id consumer status rows med truncated digest mode detail; do
+  note="" verdict=ok shown=""
   if [ "$status" != ok ]; then
     verdict=FAIL
     failures=$((failures + 1))
@@ -299,12 +438,18 @@ while IFS=$'\t' read -r id consumer status rows med truncated detail; do
     note="$status (${consumer}; reads ${reads:-?}): ${detail:0:170}"
   else
     [ "$truncated" = true ] && note="truncated at the row cap"
+    if [ -f "$out/unstable" ] && cut -f1 "$out/unstable" | grep -qxF "$id"; then
+      note="${note:+$note; }its answer differed between passes"
+    fi
     if [ -n "$baseline" ]; then
       b_status=$(base_val "$id" 3)
       b_ms=$(base_val "$id" 5)
       b_rows=$(base_val "$id" 4)
+      b_truncated=$(base_val "$id" 6)
+      b_digest=$(base_val "$id" 7)
       if [ -z "$b_status" ]; then
         note="${note:+$note; }not in the baseline"
+        uncompared=$((uncompared + 1))
       elif [ "$b_status" = ok ]; then
         if awk -v m="$med" -v b="$b_ms" -v f="$QUERY_FACTOR" -v s="$QUERY_SLACK_MS" \
           'BEGIN { exit !(m > b * f && m > b + s) }'; then
@@ -314,13 +459,55 @@ while IFS=$'\t' read -r id consumer status rows med truncated detail; do
         else
           note="${note:+$note; }baseline ${b_ms} ms"
         fi
-        [ "$b_rows" = "$rows" ] || note="$note; rows ${rows} against the baseline's ${b_rows}"
+        # A truncated answer without a top-level ORDER BY is an arbitrary subset of the rows, so
+        # like a volatile one it is held to its row count only.
+        how=""
+        if ! printf '%s' "$b_digest" | grep -Eq '^[0-9a-f]{64}$'; then
+          uncompared=$((uncompared + 1))
+          note="$note; answer not compared: the baseline records no digest"
+        elif [ "$mode" = volatile ] || { [ "$mode" != ordered ] && { [ "$truncated" = true ] || [ "$b_truncated" = true ]; }; }; then
+          if [ "$mode" = volatile ]; then how=volatile; else how="truncated without a top-level ORDER BY"; fi
+          if [ "$rows" = "$b_rows" ]; then
+            counted=$((counted + 1))
+            note="$note; $how, so compared on its row count"
+          else
+            verdict=FAIL
+            differs=$((differs + 1))
+            differ_ids="$differ_ids${differ_ids:+, }$id"
+            note="$note; answer differs: ${rows} rows against the baseline's ${b_rows} ($how, so compared on its row count)"
+          fi
+        elif [ "$digest" = "$b_digest" ]; then
+          matched=$((matched + 1))
+        else
+          verdict=FAIL
+          differs=$((differs + 1))
+          differ_ids="$differ_ids${differ_ids:+, }$id"
+          case "$mode" in
+            ordered) how="in order" ;;
+            sorted) how="sorted, having no top-level ORDER BY" ;;
+            *) how="sorted, as it could not tell whether an ORDER BY is top-level" ;;
+          esac
+          note="$note; answer differs (rows compared $how)"
+          if [ -n "$b_answers" ] && [ -f "$b_answers/$id.rows" ]; then
+            shown=$(first_diff "$out/answers/$id.rows" "$b_answers/$id.rows" | awk -F'\t' '{
+              printf "          first differing row, row %d:\n", $1
+              printf "            candidate: %s\n", substr($2, 1, 400)
+              printf "            baseline:  %s", substr($3, 1, 400) }')
+          else
+            shown="          the baseline kept no rows to show; this run's are in $out/answers/$id.rows"
+          fi
+        fi
+        if [ "$b_rows" != "$rows" ]; then
+          case "$note" in *"rows against"*) ;; *) note="$note; rows ${rows} against the baseline's ${b_rows}" ;; esac
+        fi
       else
         note="${note:+$note; }the baseline failed this query"
+        uncompared=$((uncompared + 1))
       fi
     fi
   fi
   printf '%-9s %-36s %9s %9s  %s\n' "$verdict" "$id" "$rows" "$med" "$note"
+  [ -z "$shown" ] || printf '%s\n' "$shown"
 done <"$results"
 
 p99=$(p99_of "$results")
@@ -341,7 +528,8 @@ if [ -n "$write_baseline" ]; then
     echo "# release-gate baseline: $version, $(date -u +%Y-%m-%dT%H:%M:%SZ), $passes pass(es)"
     echo "# nest: $nest ${prov:-}"
     echo "# set: $set_file"
-    echo "# id<TAB>consumer<TAB>status<TAB>rows<TAB>median ms<TAB>truncated<TAB>detail"
+    echo "# answers: $out/answers"
+    echo "# id<TAB>consumer<TAB>status<TAB>rows<TAB>median ms<TAB>truncated<TAB>answer sha256<TAB>compared<TAB>detail"
     cat "$results"
   } >"$write_baseline"
   echo
@@ -353,12 +541,21 @@ peak_mb=$(( $(cat "$out/rss-peak-kb" 2>/dev/null || echo 0) / 1024 ))
 rss_failed=0
 rss_line="peak RSS ${peak_mb} MiB, budget ${MAX_RSS_MB} MiB"
 if [ "$peak_mb" -gt "$MAX_RSS_MB" ]; then rss_failed=1; rss_line="$rss_line: OVER"; fi
-echo "release-gate: $((n - failures)) of $n answered, $failures failed, $regressions regressed; $p99_line"
+differ_line=""
+if [ -n "$baseline" ]; then
+  if [ "$differs" -eq 1 ]; then differ_line=", 1 answer differs"; else differ_line=", $differs answers differ"; fi
+fi
+echo "release-gate: $((n - failures)) of $n answered, $failures failed, $regressions regressed$differ_line; $p99_line"
+if [ -n "$baseline" ]; then
+  echo "release-gate: answers against the baseline: $matched match, $differs differ, $counted compared on row count only, $uncompared not compared"
+fi
 echo "release-gate: $rss_line"
-if [ "$failures" -gt 0 ] || [ "$regressions" -gt 0 ] || [ "$p99_failed" -gt 0 ] || [ "$rss_failed" -gt 0 ]; then
+if [ "$failures" -gt 0 ] || [ "$regressions" -gt 0 ] || [ "$differs" -gt 0 ] || [ "$p99_failed" -gt 0 ] || [ "$rss_failed" -gt 0 ]; then
   failed_ids=$(awk -F'\t' '$3 != "ok" { printf "%s%s", sep, $1; sep = ", " }' "$results")
   [ "$rss_failed" -eq 0 ] || failed_ids="${failed_ids:+$failed_ids, }peak RSS"
-  echo "RESULT: FAIL${failed_ids:+ - failed: $failed_ids}"
+  named=${failed_ids:+failed: $failed_ids}
+  [ -z "$differ_ids" ] || named="${named:+$named; }answer differs: $differ_ids"
+  echo "RESULT: FAIL${named:+ - $named}"
   exit 1
 fi
 echo "RESULT: PASS"
