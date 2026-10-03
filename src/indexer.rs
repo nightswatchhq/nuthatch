@@ -16050,12 +16050,13 @@ template = "pool"
             .iter()
             .map(|t| format!("0x{}", hex::encode(t)))
             .collect();
-        // Block 10 alone fills the budget, and the provider will not serve 10..=11 together.
+        // Each block alone fills the budget, and the provider will not serve 10..=11 together. Block 11
+        // is already buffered when the final pass is cut at 10, so it must not seal before the rest.
         let logs: Vec<_> = (0..20_000)
             .map(|li| transfer_log(10, li))
-            .chain((0..5).map(|li| transfer_log(11, li)))
+            .chain((0..20_000).map(|li| transfer_log(11, li)))
             .collect();
-        let source = ResultCapSource::new(logs, 20_000);
+        let source = ResultCapSource::new(logs, 30_000);
         let d = tempfile::tempdir().unwrap();
         let total = backfill_direct_pipelined(
             &source,
@@ -16076,10 +16077,10 @@ template = "pool"
         )
         .await
         .unwrap();
-        assert_eq!(total, 20_005, "every row once");
+        assert_eq!(total, 40_000, "every row once");
         let m = seal::load_manifest(d.path()).unwrap();
         let sealed: usize = m.tables.values().flatten().map(|s| s.rows).sum();
-        assert_eq!(sealed, 20_005, "every row sealed once");
+        assert_eq!(sealed, 40_000, "every row sealed once");
     }
 
     // ---------------------------------------------------------------------------------------------
