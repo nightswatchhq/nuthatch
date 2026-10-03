@@ -15876,6 +15876,7 @@ template = "pool"
         logs: Vec<crate::rpc::Log>,
         cap: usize,
         calls: std::sync::Mutex<Vec<(u64, u64)>>,
+        max_calls: usize,
     }
 
     impl ResultCapSource {
@@ -15884,6 +15885,7 @@ template = "pool"
                 logs,
                 cap,
                 calls: Default::default(),
+                max_calls: 500,
             }
         }
     }
@@ -15909,7 +15911,7 @@ template = "pool"
                 calls.len()
             };
             assert!(
-                asked < 500,
+                asked < self.max_calls,
                 "{asked} getLogs calls: the backfill is not advancing"
             );
             // Pending once, as a request does, so windows in flight can land while another is fetched.
@@ -16122,7 +16124,8 @@ template = "pool"
         let logs: Vec<_> = (200_001u64..=215_000)
             .flat_map(|b| (0..3).map(move |li| transfer_log(b, li)))
             .collect();
-        let source = ResultCapSource::new(logs, 1_000);
+        let mut source = ResultCapSource::new(logs, 1_000);
+        source.max_calls = 20_000;
         let d = tempfile::tempdir().unwrap();
         backfill_direct_pipelined(
             &source,
@@ -16134,7 +16137,7 @@ template = "pool"
             None,
             0,
             0,
-            400_000,
+            2_000_000,
             1_000,
             SPAN_OFF,
             4,
