@@ -1,5 +1,6 @@
 //! #1749 - `scripts/release-gate.sh` must fail a binary that refuses one of the recorded queries,
-//! pass one that answers them all, and fail a time regression past its stated bound.
+//! pass one that answers them all, and fail a time regression past its stated bound or an answer
+//! that differs from its baseline's (#1772).
 //!
 //! A tiny nest is sealed once from the fixture chain by the real binary, then each case runs the
 //! real script against a copy of it with a query set of its own: the gate serves the copy with
@@ -398,7 +399,8 @@ impl Case {
 /// #1772: a statement that answers, but not what production answered, fails and is named, with
 /// the first row at which the two differ. Row order is part of the answer only under a top-level
 /// ORDER BY: a statement without one passes with its rows reversed (the quoted ORDER BY is a
-/// literal, not a clause), and a float 1e-13 off is equal to 12 significant digits.
+/// literal, not a clause), and a float 1e-13 off is equal to 12 significant digits, as a number or
+/// cast to text.
 #[test]
 fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row() {
     let c = case();
@@ -412,7 +414,11 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
             "unordered",
             "SELECT k, label FROM gate_rows WHERE 'ORDER BY' <> ''".to_string(),
         ),
-        ("float", "SELECT third FROM gate_probe".to_string()),
+        (
+            "float",
+            "SELECT third, CAST(third * CAST('1e22' AS DOUBLE) AS VARCHAR) AS text FROM gate_probe"
+                .to_string(),
+        ),
         (
             "volatile",
             "SELECT block FROM gate_probe WHERE block < 10".to_string(),
@@ -449,7 +455,8 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
     );
     let volatile = line_for(&text, "volatile");
     assert!(
-        volatile.starts_with("FAIL ") && volatile.contains("answer differs: 7 rows against the baseline's 8"),
+        volatile.starts_with("FAIL ")
+            && volatile.contains("answer differs: 7 rows against the baseline's 8"),
         "{volatile}"
     );
     assert!(
@@ -459,12 +466,17 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
 }
 
 /// A statement tagged volatile in the set is held to its row count, so a different answer with
-/// the same number of rows passes; an untagged one in the same run would not.
+/// the same number of rows passes; one tagged ties is compared sorted although it has an ORDER BY,
+/// so the same rows in another order pass. Untagged, both fail (the test above).
 #[test]
-fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
+fn tagged_statements_that_answer_differently_pass_on_what_they_are_held_to() {
     let c = case();
     let set = c.set(&[
         ("changing", "SELECT block FROM gate_probe".to_string()),
+        (
+            "tied",
+            "SELECT third FROM gate_probe ORDER BY s".to_string(),
+        ),
         (
             "unordered",
             "SELECT k, label FROM gate_rows WHERE 'ORDER BY' <> ''".to_string(),
@@ -473,7 +485,10 @@ fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
     let body = std::fs::read_to_string(&set).unwrap();
     std::fs::write(
         &set,
-        format!("# volatile: changing its answer moves with the clock\n{body}"),
+        format!(
+            "# volatile: changing its answer moves with the clock\n\
+             # ties: tied its ORDER BY key has ties\n{body}"
+        ),
     )
     .unwrap();
     let (out, text) = c.against_a_wrong_candidate(&set);
@@ -483,9 +498,10 @@ fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
         changing.starts_with("ok ") && changing.contains("volatile, so compared on its row count"),
         "{changing}"
     );
+    assert!(line_for(&text, "tied").starts_with("ok "), "{text}");
     assert!(line_for(&text, "unordered").starts_with("ok "), "{text}");
     assert!(
-        text.contains("1 match, 0 differ, 1 compared on row count only"),
+        text.contains("2 match, 0 differ, 1 compared on row count only"),
         "{text}"
     );
 }

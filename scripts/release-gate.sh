@@ -98,14 +98,16 @@ rm -rf "$out/answers"
 mkdir -p "$out/answers"
 
 # The set, loaded once: parallel arrays indexed by query number.
-ids=() consumers=() sqls=() volatile=" "
+ids=() consumers=() sqls=() volatile=" " ties=" "
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
-    '# volatile: '*)
-      v=${line#'# volatile: '}
+    '# volatile: '* | '# ties: '*)
+      v=${line#'# '}
+      tag=${v%%:*}
+      v=${v#*: }
       v=${v%% *}
-      [ -n "$v" ] || die "a volatile tag without an id in $set_file"
-      volatile="$volatile$v "
+      [ -n "$v" ] || die "a $tag tag without an id in $set_file"
+      if [ "$tag" = volatile ]; then volatile="$volatile$v "; else ties="$ties$v "; fi
       continue
       ;;
     ''|'#'*) continue ;;
@@ -159,22 +161,29 @@ order_of() {
     }'
 }
 
-# How each statement's answer is compared: volatile (row count only) or its order_of.
+# How each statement's answer is compared: volatile (row count only), sorted:ties (sorted despite
+# its ORDER BY, whose key has ties the engine may order either way) or its order_of.
 modes=()
 i=0
 while [ $i -lt "$n" ]; do
   case "$volatile" in
     *" ${ids[$i]} "*) modes+=(volatile) ;;
-    *) modes+=("$(order_of "${sqls[$i]}")") ;;
+    *)
+      case "$ties" in
+        *" ${ids[$i]} "*) modes+=(sorted:ties) ;;
+        *) modes+=("$(order_of "${sqls[$i]}")") ;;
+      esac
+      ;;
   esac
   i=$((i + 1))
 done
-for v in $volatile; do
-  case " ${ids[*]} " in *" $v "*) ;; *) die "volatile tag for $v, which is not in $set_file" ;; esac
+for v in $volatile $ties; do
+  case " ${ids[*]} " in *" $v "*) ;; *) die "a tag names $v, which is not in $set_file" ;; esac
 done
 
 # One row per line, keys sorted. A number written as an integer is kept exactly; any other is
-# rounded to 12 significant digits, so a float summed in another order still compares equal.
+# rounded to 12 significant digits, so a float summed in another order still compares equal. So is
+# a string in exponent form: a DOUBLE cast to VARCHAR, which no integer or DECIMAL renders as.
 CANON_JQ='
 def canon_float:
   if . == 0 then 0
@@ -187,7 +196,10 @@ def canon_float:
     | until(.[0] % 10 != 0; [.[0] / 10, .[1] + 1])
     | (if .[1] >= 0 then .[0] * pow(10; .[1]) else .[0] / pow(10; -.[1]) end) * $sign
   end;
-.rows[] | walk(if type == "number" and (tojson | test("^-?[0-9]+$") | not) then canon_float else . end)'
+.rows[] | walk(
+  if type == "number" and (tojson | test("^-?[0-9]+$") | not) then canon_float
+  elif type == "string" and test("^-?[0-9]+(\\.[0-9]+)?[eE][-+]?[0-9]+$") then tonumber | canon_float | tostring
+  else . end)'
 
 # canon_answer <body> <mode> <dest>: writes the canonical rows to dest and prints their sha256.
 canon_answer() {

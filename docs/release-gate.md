@@ -62,7 +62,8 @@ Lodestar box (port 8107):
 
 When that unit's environment changes, change `PROD_ENV` with it, or the gate tests a budget nobody
 runs. Each pass starts a fresh server, because of the memo; a query's status is its worst pass and
-its time the median of its passes. For each query it records status, rows and time.
+its time the median of its passes. For each query it records status, rows, time and the digest of
+its answer from the first pass that answered; an answer that moves between passes is noted.
 
 It fails (exit 1) on:
 
@@ -71,14 +72,40 @@ It fails (exit 1) on:
 - with `--baseline`, a query slower than **2x its baseline and more than 1000 ms slower**, or the
   set's p99 slower than **1.5x the baseline's and more than 1000 ms slower**. Both halves must hold,
   so a 40 ms query taking 90 ms is noise. The bounds are `GATE_QUERY_FACTOR`, `GATE_QUERY_SLACK_MS`,
-  `GATE_P99_FACTOR` and `GATE_P99_SLACK_MS`.
+  `GATE_P99_FACTOR` and `GATE_P99_SLACK_MS`;
+- with `--baseline`, a statement both runs answered whose answer differs: `answer differs`, with the
+  first differing row of each side printed under it (#1772).
 
-Row counts are reported against the baseline but never fail: a refreshed copy holds more rows. Exit
-2 is a broken rig (no redb, a port, a binary that will not start), not a verdict on the binary.
+Exit 2 is a broken rig (no redb, a port, a binary that will not start), not a verdict on the binary.
+
+### Comparing answers
+
+Each answer is kept canonical in `<out>/answers/<id>.rows`, one row per line as JSON with its keys
+sorted, and the baseline records its sha256 and where its rows are (`# answers:`), so a candidate run
+can show the row that differs. The canonical form decides what counts as the same answer:
+
+- A number written as an integer, and any string (a `CAST(... AS VARCHAR)` decimal or a uint256
+  among them), compares exactly. Any other number is rounded to **12 significant digits**, so a
+  float summed in another order compares equal; a type change from integer to float of the same
+  value does too.
+- Rows are compared in order when the statement has a top-level `ORDER BY`, and sorted first when it
+  has none, since without one the order is the engine's choice. A window's or a subquery's `ORDER
+  BY` sits inside parentheses and does not count. When it cannot tell (a comment, an unclosed quote,
+  unbalanced parentheses) it sorts and says so; the baseline's `compared` column records which.
+- A statement whose answer legitimately moves with the clock or the tip is tagged in the set,
+  `# volatile: <id> <why>`, and held to its row count only. So is a truncated answer without a
+  top-level `ORDER BY`, which is an arbitrary subset of the rows.
+
+Answers only mean something against a baseline measured on the same copy, which is what the runner
+does. A baseline without the digest column (the committed `baseline-4.2.0.tsv`) is read as before,
+its answers reported as not compared. A run writing a baseline and the run reading it need separate
+`--out` directories, since each starts its `answers/` afresh.
 
 `tests/release_gate_script.rs` runs the script against a nest sealed from the fixture chain: a
-refused query fails and is named, an answered set passes and writes a baseline, and a regression
-fails past the bound and passes inside it.
+refused query fails and is named, an answered set passes and writes a baseline, a regression fails
+past the bound and passes inside it, and a candidate answering differently from its baseline (a view
+edited between the runs) fails with the first differing row, while rows reordered under no `ORDER
+BY`, a float 1e-13 off and a volatile statement's new answer pass.
 
 ## Where it runs: the ThinkPad
 
@@ -118,8 +145,8 @@ that is not the candidate; `--production <tag>` names it when that is wrong.
 Production failing its own gate is still the baseline, since it is what production does: over
 the RSS budget, or refusing statements of its own. Its peak and failures are named in the
 candidate's status and output. The candidate's verdict stays its own: it fails on its own
-refusals, its regressions against production's times and its own peak, and a statement production
-fails cannot regress. Only a production run that could not be measured (exit 2) posts `error`.
+refusals, its regressions against production's times, answers that differ from production's and
+its own peak, and a statement production fails can neither regress nor differ. Only a production run that could not be measured (exit 2) posts `error`.
 
 **The result** reaches the release as a commit status on the candidate's commit, context
 `release-gate/alloc-nest`, posted with `gh api repos/nightswatchhq/nuthatch/statuses/<sha>`:

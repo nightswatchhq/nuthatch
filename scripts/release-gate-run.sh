@@ -14,7 +14,7 @@
 # The candidate is compared with the production version measured on the same box, the same copy
 # and the same day, so neither a refreshed copy nor a different machine reads as a regression.
 # Production over its own budget, or failing statements itself, is still the baseline: the
-# candidate is judged on its own refusals, regressions and peak.
+# candidate is judged on its own refusals, regressions, differing answers and peak.
 # The status never blocks the tag: the tag exists before the gate runs, and the context is not a
 # required check anywhere. A red status stops the roll (deploy-nest.sh), not the release.
 #
