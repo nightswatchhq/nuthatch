@@ -384,6 +384,8 @@ pub fn router(backing: SharedNest) -> Router {
         r.route("/_admin", get(admin_index))
             .route("/_admin/", get(admin_index))
             .route("/_admin/events", get(admin_events))
+            .route("/_admin/config", get(admin_config))
+            .route("/_admin/storage", get(admin_storage))
     };
     admin(graph_facade(
         Router::new()
@@ -2093,6 +2095,220 @@ async fn admin_events(
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+/// The files a nest is authored in, as the admin UI's Config tab shows them. `views/*.sql` beside.
+const ADMIN_CONFIG_FILES: &[&str] = &[
+    "nuthatch.toml",
+    "semantic.toml",
+    "entities.toml",
+    crate::allowlist::CEILING_FILE,
+];
+
+/// Config text with credentials taken out: every URL cut to `scheme://host`, and the value of any
+/// `secret`/`token`/`password`/`api_key` key replaced. On the text rather than the parsed config so
+/// comments survive, and so a URL in a comment is cut too.
+fn redact_config_text(text: &str) -> String {
+    const SECRET_KEYS: &[&str] = &["secret", "token", "password", "api_key", "apikey"];
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let ending = &line[body.len()..];
+        let key = body.split_once('=').map(|(k, _)| k.trim().to_lowercase());
+        let secret_key = key.is_some_and(|k| {
+            !k.starts_with('#') && SECRET_KEYS.iter().any(|needle| k.contains(needle))
+        });
+        if secret_key {
+            let (k, _) = body.split_once('=').expect("a key was found");
+            out.push_str(k);
+            out.push_str("= \"<redacted>\"");
+        } else {
+            out.push_str(&redact_urls(body));
+        }
+        out.push_str(ending);
+    }
+    out
+}
+
+fn redact_urls(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("://") {
+        let scheme_start = rest[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
+            .map_or(0, |i| i + 1);
+        let after = &rest[at + 3..];
+        let end = after
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ')' | ']' | '>')
+            })
+            .unwrap_or(after.len());
+        let authority_end = after[..end].find(['/', '?', '#']).unwrap_or(end);
+        let authority = &after[..authority_end];
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        out.push_str(&rest[..scheme_start]);
+        out.push_str(&rest[scheme_start..at + 3]);
+        out.push_str(host);
+        if authority_end + 1 < end {
+            out.push_str("/…");
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `GET /_admin/config` - what this nest was authored as and is running with, for the admin UI.
+/// Gated like the page. File text is read per request, so an edit shows before the restart that
+/// applies it; `running` is this process.
+async fn admin_config(
+    State(s): State<AppState>,
+    Query(q): Query<AdminQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !s.admin_enabled {
+        return (StatusCode::NOT_FOUND, "admin UI disabled").into_response();
+    }
+    if !admin_authorized(&s, &q, &headers) {
+        return (StatusCode::UNAUTHORIZED, "admin token required").into_response();
+    }
+    let dir = s.dir.clone();
+    let files = tokio::task::spawn_blocking(move || {
+        let mut names: Vec<String> = ADMIN_CONFIG_FILES.iter().map(|f| f.to_string()).collect();
+        if let Ok(entries) = std::fs::read_dir(dir.join("views")) {
+            let mut views: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.ends_with(".sql"))
+                .map(|n| format!("views/{n}"))
+                .collect();
+            views.sort();
+            names.extend(views);
+        }
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let text = std::fs::read_to_string(dir.join(&name)).ok()?;
+                Some(json!({ "name": name, "text": redact_config_text(&text) }))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!({
+        "files": files,
+        "running": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "chain": s.chain,
+            "cursorless": s.cursorless,
+            "seal_span": s.seal_span,
+            "seal_table_floor": crate::seal::SEAL_TABLE_FLOOR,
+            "sql": {
+                "max_concurrency": SQL_MAX_CONCURRENCY,
+                "max_queued": SQL_MAX_QUEUED,
+                "max_rows": SQL_MAX_ROWS,
+                "max_query_len": SQL_MAX_QUERY_LEN,
+                "max_hot_rows": s.sql_max_hot_rows,
+                "max_hot_bytes": s.sql_max_hot_bytes,
+                "max_named_scan_bytes": s.sql_max_named_scan_bytes,
+            },
+        },
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct AdminStorageQuery {
+    token: Option<String>,
+    table: Option<String>,
+}
+
+/// `GET /_admin/storage` - the sealed catalogue per table: segment count, rows, bytes on disk and
+/// block range. `?table=` adds that table's segments, newest first. Gated like the page.
+async fn admin_storage(
+    State(s): State<AppState>,
+    Query(q): Query<AdminStorageQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !s.admin_enabled {
+        return (StatusCode::NOT_FOUND, "admin UI disabled").into_response();
+    }
+    let auth = AdminQuery { token: q.token };
+    if !admin_authorized(&s, &auth, &headers) {
+        return (StatusCode::UNAUTHORIZED, "admin token required").into_response();
+    }
+    let dir = s.dir.clone();
+    let wanted = q.table;
+    let built = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let manifest = crate::seal::load_manifest(&dir)?;
+        let size = |seg: &crate::seal::Segment| {
+            std::fs::metadata(crate::seal::segment_path(&dir, &seg.file, &seg.hash))
+                .map(|m| m.len())
+                .ok()
+        };
+        let mut tables = Vec::with_capacity(manifest.tables.len());
+        let mut detail = Value::Null;
+        for (table, segments) in &manifest.tables {
+            let mut bytes = 0u64;
+            // A file the catalogue names and the disk does not hold is the finding, so count it.
+            let mut missing = 0usize;
+            let sizes: Vec<Option<u64>> = segments.iter().map(size).collect();
+            for size in &sizes {
+                match size {
+                    Some(n) => bytes += n,
+                    None => missing += 1,
+                }
+            }
+            tables.push(json!({
+                "table": table,
+                "segments": segments.len(),
+                "provisional": segments.iter().filter(|seg| seg.provisional).count(),
+                "rows": segments.iter().map(|seg| seg.rows as u64).sum::<u64>(),
+                "bytes": bytes,
+                "missing_files": missing,
+                "from_block": segments.iter().map(|seg| seg.from_block).min(),
+                "to_block": segments.iter().map(|seg| seg.to_block).max(),
+            }));
+            if wanted.as_deref() == Some(table.as_str()) {
+                let mut rows: Vec<Value> = segments
+                    .iter()
+                    .zip(&sizes)
+                    .map(|(seg, size)| {
+                        json!({
+                            "hash": seg.hash,
+                            "from_block": seg.from_block,
+                            "to_block": seg.to_block,
+                            "rows": seg.rows,
+                            "bytes": size,
+                            "provisional": seg.provisional,
+                            "writer_profile": seg.writer_profile,
+                        })
+                    })
+                    .collect();
+                rows.reverse();
+                detail = json!({ "table": table, "segments": rows });
+            }
+        }
+        Ok(json!({
+            "manifest_version": manifest.manifest_version,
+            "tables": tables,
+            "detail": detail,
+        }))
+    })
+    .await;
+    match built {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// List every table and its columns (the decoded data model).
@@ -7893,6 +8109,118 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn config_text_is_shown_without_its_credentials() {
+        let text = concat!(
+            "rpc_urls = [\"https://arb-mainnet.g.alchemy.com/v2/KEYKEYKEY\"] # see https://u:p@docs.example/x?k=1\n",
+            "url = \"https://hooks.slack.com/services/T00/B00/XXXX\"\n",
+            "secret = \"hunter2\"\n",
+            "api_key=\"abc\"\n",
+            "key = [\"indexer\"]\n",
+            "plain = \"https://rpc.example\"\n",
+        );
+        assert_eq!(
+            redact_config_text(text),
+            concat!(
+                "rpc_urls = [\"https://arb-mainnet.g.alchemy.com/…\"] # see https://docs.example/…\n",
+                "url = \"https://hooks.slack.com/…\"\n",
+                "secret = \"<redacted>\"\n",
+                "api_key= \"<redacted>\"\n",
+                "key = [\"indexer\"]\n",
+                "plain = \"https://rpc.example\"\n",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_config_and_storage_are_gated_and_report_the_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("nuthatch.toml"),
+            "rpc_urls = [\"https://rpc.example/v2/KEYKEYKEY\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("views")).unwrap();
+        std::fs::write(tmp.path().join("views/10-a.sql"), "SELECT 1").unwrap();
+        let segments = tmp.path().join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&segments).unwrap();
+        std::fs::write(segments.join("a.parquet"), [0u8; 7]).unwrap();
+        let seg = |file: &str, from: u64, to: u64, rows: usize| json!({ "hash": file, "from_block": from, "to_block": to, "rows": rows, "file": file });
+        std::fs::write(
+            segments.join(crate::seal::MANIFEST_FILE),
+            json!({ "tables": { "t__e": [seg("a.parquet", 5, 9, 3), seg("gone.parquet", 10, 12, 4)] } })
+                .to_string(),
+        )
+        .unwrap();
+
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.admin_token = Some("s3cret".into());
+        let body = |resp: axum::response::Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let config = |s: AppState, token: Option<&str>| {
+            let q = Query(AdminQuery {
+                token: token.map(str::to_string),
+            });
+            async move {
+                admin_config(State(s), q, axum::http::HeaderMap::new())
+                    .await
+                    .into_response()
+            }
+        };
+        let storage = |s: AppState, token: Option<&str>, table: Option<&str>| {
+            let q = Query(AdminStorageQuery {
+                token: token.map(str::to_string),
+                table: table.map(str::to_string),
+            });
+            async move {
+                admin_storage(State(s), q, axum::http::HeaderMap::new())
+                    .await
+                    .into_response()
+            }
+        };
+
+        assert_eq!(
+            config(state.clone(), None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            storage(state.clone(), None, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let v = body(config(state.clone(), Some("s3cret")).await).await;
+        let files = v["files"].as_array().unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["nuthatch.toml", "views/10-a.sql"]);
+        assert_eq!(files[0]["text"], "rpc_urls = [\"https://rpc.example/…\"]\n");
+        assert_eq!(v["running"]["sql"]["max_rows"], SQL_MAX_ROWS);
+
+        let v = body(storage(state.clone(), Some("s3cret"), Some("t__e")).await).await;
+        assert_eq!(
+            v["tables"],
+            json!([{ "table": "t__e", "segments": 2, "provisional": 0, "rows": 7, "bytes": 7,
+                     "missing_files": 1, "from_block": 5, "to_block": 12 }])
+        );
+        let detail = v["detail"]["segments"].as_array().unwrap();
+        assert_eq!(detail[0]["hash"], "gone.parquet", "newest first");
+        assert_eq!(detail[0]["bytes"], Value::Null);
+        assert_eq!(detail[1]["bytes"], 7);
+
+        state.admin_enabled = false;
+        assert_eq!(
+            config(state.clone(), Some("s3cret")).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            storage(state, Some("s3cret"), None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
     #[tokio::test]
     async fn admin_token_enforced_off_localhost() {
         // SEC-5: with a required token set (off-localhost), the route must actually CHECK it per
@@ -7990,6 +8318,11 @@ mod tests {
         assert!(
             ADMIN_HTML.contains("startPolling"),
             "admin UI keeps a polling fallback"
+        );
+        // Root-relative fetches answer from whatever sits at a proxy's root: another nest's data.
+        assert!(
+            !ADMIN_HTML.contains("fetch('/") && !ADMIN_HTML.contains("api('/"),
+            "admin UI fetches relative to its own path"
         );
         // The #435 caveat, pinned the same way and for the same reason as the three above: substring,
         // no render. Of the four surfaces carrying the reduced-cold-data signal this is the only one

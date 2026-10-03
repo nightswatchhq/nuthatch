@@ -6,18 +6,19 @@
 <title>nuthatch</title>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --line: #21262d; --line2: #30363d;
-    --fg: #e6edf3; --muted: #8b949e; --dim: #6e7681;
-    --accent: #d2a8ff; --accent2: #79c0ff; --good: #3fb950; --warn: #d29922; --bad: #f85149;
+    --bg: #14110f; --panel: #1b1815; --panel2: #221e1a; --line: #2e2924; --line2: #413a33;
+    --fg: #ece5da; --muted: #a2988a; --dim: #766d61;
+    --accent: #d0704a; --accent2: #8fa7c4; --good: #7fb069; --warn: #d9a441; --bad: #e0604c;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; }
   a { color: var(--accent2); text-decoration: none; }
   header {
-    display: flex; align-items: baseline; gap: 14px; padding: 14px 20px;
-    border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 12px; padding: 10px 20px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 6;
   }
   header .logo { font-weight: 700; letter-spacing: .3px; }
   header .logo b { color: var(--accent); }
@@ -28,217 +29,767 @@
     border: 1px solid var(--line2); border-radius: 999px; padding: 2px 9px; white-space: nowrap;
   }
   .pill b { color: var(--fg); font-weight: 600; }
-  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; background: var(--dim); }
-  .dot.live { background: var(--good); box-shadow: 0 0 6px var(--good); }
-  nav { display: flex; gap: 2px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .state { font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .6px; padding: 3px 10px; border-radius: 4px; background: var(--line); color: var(--muted); }
+  .state.live { background: rgba(127,176,105,.16); color: var(--good); }
+  .state.warn { background: rgba(217,164,65,.16); color: var(--warn); }
+  .state.bad { background: rgba(224,96,76,.18); color: var(--bad); }
+  nav { display: flex; gap: 2px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); overflow-x: auto; position: sticky; top: 45px; z-index: 5; }
   nav button {
     background: none; border: none; color: var(--muted); font: inherit; padding: 10px 14px;
-    cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
   }
   nav button:hover { color: var(--fg); }
   nav button.on { color: var(--fg); border-bottom-color: var(--accent); }
-  main { padding: 20px; max-width: 1200px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
-  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
-  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
-  .stat .v { font-family: var(--mono); font-size: 20px; margin-top: 4px; }
-  .row { display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .card h3 { margin: 0; padding: 10px 14px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); text-transform: uppercase; letter-spacing: .4px; font-weight: 600; }
-  .list { list-style: none; margin: 0; padding: 6px; max-height: 70vh; overflow: auto; min-width: 220px; }
-  .list li { padding: 6px 10px; border-radius: 6px; cursor: pointer; font-family: var(--mono); font-size: 12.5px; color: var(--fg); display: flex; justify-content: space-between; gap: 10px; }
+  main { padding: 20px; }
+  h2 { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .8px; text-transform: uppercase; color: var(--muted); margin: 22px 0 10px; }
+  h2:first-child { margin-top: 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; min-width: 0; }
+  .stat .k { color: var(--muted); font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px; }
+  .stat .v { font-family: var(--mono); font-size: 18px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stat .s { color: var(--dim); font-family: var(--mono); font-size: 11px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stat svg { display: block; width: 100%; height: 28px; margin-top: 6px; }
+  .stat.good .v { color: var(--good); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+  .cols { display: flex; gap: 16px; align-items: flex-start; }
+  .side { width: 290px; flex: none; position: sticky; top: 100px; }
+  .rest { flex: 1; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-bottom: 14px; }
+  .card > h3 { margin: 0; padding: 8px 12px; font-family: var(--mono); font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--line); text-transform: uppercase; letter-spacing: .6px; font-weight: 600; display: flex; gap: 10px; align-items: center; }
+  .card > h3 .grow { flex: 1; }
+  .card .pad { padding: 12px; }
+  .list { list-style: none; margin: 0; padding: 4px; max-height: calc(100vh - 210px); overflow: auto; }
+  .list li { padding: 4px 10px; border-radius: 4px; cursor: pointer; font-family: var(--mono); font-size: 12px; display: flex; justify-content: space-between; gap: 10px; }
   .list li:hover { background: var(--line); }
   .list li.on { background: var(--line2); }
-  .list li .n { color: var(--dim); }
+  .list li .n { color: var(--dim); white-space: nowrap; }
+  .list li.group { color: var(--accent2); cursor: default; padding-top: 9px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  .list li.group:hover { background: none; }
+  .list li span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12px; }
-  .scroll { overflow: auto; max-height: 74vh; border: 1px solid var(--line); border-radius: 8px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; z-index: 1; }
-  td { color: var(--fg); }
-  tr:hover td { background: rgba(255,255,255,.02); }
-  textarea {
-    width: 100%; min-height: 96px; background: #010409; color: var(--fg); border: 1px solid var(--line2);
-    border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 13px; resize: vertical;
+  .scroll { overflow: auto; max-height: 62vh; }
+  th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+  th { position: sticky; top: 0; background: var(--panel2); color: var(--muted); font-weight: 600; z-index: 1; cursor: pointer; user-select: none; }
+  td.num, th.num { text-align: right; }
+  tr:hover td { background: rgba(255,255,255,.025); }
+  tr.click { cursor: pointer; }
+  td.wrap { white-space: pre-wrap; max-width: none; word-break: break-all; }
+  input[type=text], textarea, select {
+    background: #0e0c0a; color: var(--fg); border: 1px solid var(--line2); border-radius: 5px;
+    padding: 7px 10px; font-family: var(--mono); font-size: 12.5px;
   }
-  .btn { background: var(--accent); color: #0d1117; border: none; border-radius: 6px; padding: 8px 16px; font: inherit; font-weight: 600; cursor: pointer; }
-  .btn:hover { filter: brightness(1.08); }
-  .toolbar { display: flex; gap: 10px; align-items: center; margin: 10px 0; color: var(--muted); font-size: 12px; }
-  .muted { color: var(--muted); }
-  .err { color: var(--bad); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; padding: 10px; }
-  .hint { color: var(--dim); font-size: 12px; margin: 8px 0 16px; }
-  code { font-family: var(--mono); background: var(--line); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  .empty { color: var(--dim); padding: 24px; text-align: center; }
+  input[type=text]:focus, textarea:focus { outline: 1px solid var(--accent2); }
+  textarea { width: 100%; min-height: 150px; resize: vertical; line-height: 1.45; tab-size: 2; }
+  .btn { background: var(--accent); color: #14110f; border: none; border-radius: 5px; padding: 7px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+  .btn:hover { filter: brightness(1.1); }
+  .btn.ghost { background: none; color: var(--fg); border: 1px solid var(--line2); font-weight: 400; }
+  .btn.ghost:hover { background: var(--line); }
+  .btn.small { padding: 3px 9px; font-size: 12px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin: 8px 0; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+  .muted { color: var(--muted); } .dim { color: var(--dim); }
+  .err { color: var(--bad); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; padding: 10px 12px; }
+  .note { color: var(--warn); font-family: var(--mono); font-size: 12px; padding: 6px 12px; }
+  .hint { color: var(--dim); font-size: 12px; margin: 6px 0 12px; }
+  code, pre { font-family: var(--mono); font-size: 12px; }
+  code { background: var(--line); padding: 1px 5px; border-radius: 3px; }
+  pre { margin: 0; padding: 12px; overflow: auto; max-height: 70vh; line-height: 1.5; white-space: pre; }
+  .empty { color: var(--dim); padding: 22px; text-align: center; font-size: 12.5px; }
+  .tag { font-family: var(--mono); font-size: 10.5px; border: 1px solid var(--line2); border-radius: 3px; padding: 0 5px; color: var(--muted); }
+  .tag.good { color: var(--good); border-color: rgba(127,176,105,.4); }
+  .tag.bad { color: var(--bad); border-color: rgba(224,96,76,.4); }
+  .tag.warn { color: var(--warn); border-color: rgba(217,164,65,.4); }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; font-family: var(--mono); font-size: 12px; padding: 12px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .kv div:nth-child(even) { word-break: break-all; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .bar i { display: block; height: 100%; background: var(--accent2); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-family: var(--mono); font-size: 11.5px; border: 1px solid var(--line2); border-radius: 4px; padding: 2px 8px; cursor: pointer; color: var(--muted); background: none; }
+  .chip:hover, .chip.on { color: var(--fg); background: var(--line); }
+  @media (max-width: 900px) {
+    .cols { flex-direction: column; } .side { width: 100%; position: static; } .list { max-height: 240px; }
+    header, nav { position: static; } header { padding: 10px 12px; gap: 8px; } main { padding: 12px; }
+    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stat .v { font-size: 15px; }
+    .kv { grid-template-columns: 1fr; gap: 0; } .kv div:nth-child(even) { margin-bottom: 8px; }
+    nav button { padding: 10px 11px; } textarea, input[type=text] { font-size: 16px; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <span class="logo">🐦 <b>nuthatch</b></span>
-  <span class="nest" id="nest">-</span>
+  <span class="logo"><b>nuthatch</b></span>
+  <span class="state" id="state">CONNECTING</span>
+  <span class="nest" id="nest"></span>
   <span class="grow"></span>
-  <span class="pill"><span class="dot" id="dot"></span><span id="tip">tip -</span></span>
-  <span class="pill">sealed <b id="sealed">-</b></span>
-  <span class="pill" id="lagpill">lag <b id="lag">-</b></span>
+  <span class="pill">tip <b id="p-tip">-</b></span>
+  <span class="pill">indexed <b id="p-idx">-</b></span>
+  <span class="pill">sealed <b id="p-sealed">-</b></span>
+  <span class="pill">lag <b id="p-lag">-</b></span>
+  <span class="pill" id="p-ver">-</span>
 </header>
-<nav>
-  <button data-tab="status" class="on">Status</button>
+<nav id="nav">
+  <button data-tab="overview" class="on">Overview</button>
   <button data-tab="tables">Tables</button>
   <button data-tab="sql">SQL</button>
-  <button data-tab="nest">Nest</button>
+  <button data-tab="entities">Entities</button>
+  <button data-tab="storage">Storage</button>
+  <button data-tab="rpc">RPC &amp; ingest</button>
+  <button data-tab="config">Config</button>
+  <button data-tab="raw">Raw</button>
 </nav>
 <main>
-  <section id="tab-status">
-    <div class="grid" id="stats"></div>
-    <p class="hint">Read-only. The CLI and files mutate; this observes. Polls every 2s while this tab is visible.</p>
-  </section>
+  <section id="tab-overview"></section>
 
   <section id="tab-tables" hidden>
-    <div class="row">
-      <div class="card"><h3>Tables</h3><ul class="list" id="tablist"><li class="empty">loading…</li></ul></div>
-      <div style="flex:1; min-width: 340px;">
-        <div class="toolbar"><span id="tabletitle" class="muted">pick a table</span></div>
-        <div class="scroll" id="tablerows"><div class="empty">select a table on the left</div></div>
+    <div class="cols">
+      <div class="side card">
+        <h3>Tables <span class="grow"></span><span id="tcount" class="dim"></span></h3>
+        <div class="pad" style="padding:8px"><input type="text" id="tfilter" placeholder="filter" style="width:100%"></div>
+        <ul class="list" id="tablist"><li class="empty">loading</li></ul>
       </div>
+      <div class="rest" id="tabledetail"><div class="empty">Pick a table.</div></div>
     </div>
   </section>
 
   <section id="tab-sql" hidden>
-    <textarea id="q" spellcheck="false" placeholder='SELECT * FROM "usdc__transfer" LIMIT 20'></textarea>
-    <div class="toolbar"><button class="btn" id="run">Run</button><span class="muted" id="sqlmeta"></span></div>
-    <p class="hint">Read-only, over sealed (finalized) data. SELECT/WITH only, quote table names. Ctrl/⌘-Enter to run.</p>
-    <div class="scroll" id="sqlrows"></div>
+    <div class="cols">
+      <div class="rest">
+        <textarea id="q" spellcheck="false" placeholder='SELECT * FROM "alias__event" ORDER BY block_number DESC LIMIT 20'></textarea>
+        <div class="toolbar">
+          <button class="btn" id="run">Run</button>
+          <button class="btn ghost" id="explain">Check</button>
+          <button class="btn ghost" id="save">Save</button>
+          <span class="muted" id="sqlmeta"></span>
+          <span class="grow" style="flex:1"></span>
+          <button class="btn ghost small" id="csv" hidden>CSV</button>
+          <button class="btn ghost small" id="jsonl" hidden>JSON</button>
+        </div>
+        <div id="sqlaccess"></div>
+        <div class="card"><div class="scroll" id="sqlrows"><div class="empty">Read-only. Ctrl or Cmd + Enter runs. Quote table names; big-int columns have a <code>_dec</code> companion for arithmetic.</div></div></div>
+        <div class="card" id="provcard" hidden><h3>Provenance</h3><div class="kv" id="prov"></div></div>
+      </div>
+      <div class="side">
+        <div class="card"><h3>Named queries</h3><ul class="list" id="named" style="max-height:180px"></ul></div>
+        <div class="card"><h3>Saved here</h3><ul class="list" id="saved" style="max-height:180px"></ul></div>
+        <div class="card"><h3>History</h3><ul class="list" id="hist" style="max-height:220px"></ul></div>
+        <div class="card"><h3>Schema</h3>
+          <div class="pad" style="padding:8px"><input type="text" id="sfilter" placeholder="filter tables" style="width:100%"></div>
+          <ul class="list" id="schemalist" style="max-height:300px"></ul></div>
+      </div>
+    </div>
   </section>
 
-  <section id="tab-nest" hidden>
-    <div id="nestbody"><div class="empty">loading…</div></div>
-  </section>
+  <section id="tab-entities" hidden></section>
+  <section id="tab-storage" hidden></section>
+  <section id="tab-rpc" hidden></section>
+  <section id="tab-config" hidden></section>
+  <section id="tab-raw" hidden></section>
 </main>
 
 <script>
 const $ = s => document.querySelector(s);
-const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-async function api(p){ const r = await fetch(p); if(!r.ok && r.status!==400) throw new Error(p+' → '+r.status); return r.json(); }
-function fmt(n){ return (n===null||n===undefined) ? '-' : (typeof n==='number' ? n.toLocaleString() : n); }
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// Everything is fetched relative to where this page is served, so a nest under a runtime prefix
+// or behind a proxy path talks to itself and not to whatever answers at the proxy's root.
+const BASE = location.pathname.replace(/_admin\/?$/, '');
+const TOKEN = new URLSearchParams(location.search).get('token');
+const withToken = p => TOKEN && p.startsWith('_admin') ? p + (p.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN) : p;
+async function raw(p){ return fetch(BASE + withToken(p)); }
+// A nest answers some states with a JSON body and a non-200 (a stalled /ready is a 503), so the
+// body is read whatever the status.
+async function api(p){
+  const r = await raw(p);
+  const text = await r.text();
+  try { const j = JSON.parse(text); if (j && typeof j === 'object') j.__status = r.status; return j; }
+  catch (_) { throw new Error(p + ' answered ' + r.status + (text ? ': ' + text.slice(0, 200) : '')); }
+}
+const num = n => (n === null || n === undefined || n === '') ? '-' : (isFinite(+n) ? (+n).toLocaleString('en-US') : String(n));
+function bytes(n){
+  if (n === null || n === undefined || !isFinite(+n)) return '-';
+  n = +n; const u = ['B','KiB','MiB','GiB','TiB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(n >= 100 ? 0 : 1)) + ' ' + u[i];
+}
+function span(secs){
+  if (secs === null || secs === undefined || !isFinite(+secs)) return '-';
+  secs = Math.round(+secs);
+  if (secs < 90) return secs + 's';
+  if (secs < 5400) return Math.round(secs / 60) + 'm';
+  if (secs < 129600) return (secs / 3600).toFixed(1) + 'h';
+  return (secs / 86400).toFixed(1) + 'd';
+}
+const short = (s, n = 10) => { s = String(s ?? ''); return s.length > 2 * n + 3 ? s.slice(0, n) + '…' + s.slice(-n) : s; };
+const store = {
+  get(k, d){ try { return JSON.parse(localStorage.getItem('nuthatch:' + BASE + ':' + k)) ?? d; } catch (_) { return d; } },
+  set(k, v){ try { localStorage.setItem('nuthatch:' + BASE + ':' + k, JSON.stringify(v)); } catch (_) {} },
+};
 
-let tab = 'status';
-document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
-  tab = b.dataset.tab;
-  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x===b));
-  ['status','tables','sql','nest'].forEach(t => $('#tab-'+t).hidden = t!==tab);
-  if(tab==='tables') loadTables();
-  if(tab==='nest') loadNest();
+// ---- state shared by the tabs ----
+const S = { ready: null, summary: null, metrics: null, nest: null, tables: null, storage: null, queries: null, samples: [] };
+let tab = 'overview';
+const TABS = ['overview','tables','sql','entities','storage','rpc','config','raw'];
+function show(t){
+  tab = t;
+  document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
+  TABS.forEach(x => $('#tab-' + x).hidden = x !== t);
+  if (location.hash.slice(1).split('/')[0] !== t) history.replaceState(null, '', '#' + t);
+  ({ overview: renderOverview, tables: loadTables, sql: loadSql, entities: loadEntities, storage: loadStorage, rpc: renderRpc, config: loadConfig, raw: loadRaw })[t]();
+}
+document.querySelectorAll('#nav button').forEach(b => b.onclick = () => show(b.dataset.tab));
+
+// ---- prometheus text ----
+function parseMetrics(text){
+  const m = {};
+  for (const line of text.split('\n')) {
+    if (!line || line[0] === '#') continue;
+    const sp = line.lastIndexOf(' ');
+    const head = line.slice(0, sp), value = parseFloat(line.slice(sp + 1));
+    const brace = head.indexOf('{');
+    const name = brace < 0 ? head : head.slice(0, brace);
+    const labels = {};
+    if (brace >= 0) for (const part of head.slice(brace + 1, -1).matchAll(/([a-zA-Z_]+)="((?:[^"\\]|\\.)*)"/g)) labels[part[1]] = part[2];
+    (m[name] ||= []).push({ labels, value });
+  }
+  return m;
+}
+const mv = name => { const v = S.metrics && S.metrics[name]; return v && v.length ? v.find(x => !Object.keys(x.labels).length)?.value ?? v[0].value : null; };
+const ml = name => (S.metrics && S.metrics[name]) || [];
+
+// ---- polling ----
+async function tick(pushed){
+  try {
+    const [ready, summary, mtext] = await Promise.all([api('ready'), pushed || api(''), raw('metrics').then(r => r.text())]);
+    S.ready = ready; S.summary = summary; S.metrics = parseMetrics(mtext);
+    S.samples.push({
+      t: Date.now() / 1000, block: +ready.last_block || 0,
+      rpc: mv('nuthatch_rpc_requests_total') || 0, rows: mv('nuthatch_rows_decoded_total') || 0,
+      http: mv('nuthatch_http_requests_total') || 0, sqlq: mv('nuthatch_sql_queries_total') || 0,
+      cpu: mv('nuthatch_process_cpu_seconds_total') || 0, rss: mv('nuthatch_rss_bytes') || 0,
+    });
+    if (S.samples.length > 180) S.samples.shift();
+    S.down = null;
+  } catch (e) { S.down = e.message; }
+  renderHeader();
+  if (tab === 'overview') renderOverview();
+  if (tab === 'rpc') renderRpc();
+}
+function nestState(){
+  const r = S.ready;
+  if (S.down || !r) return ['STALE', 'bad'];
+  if (r.wedged) return ['WEDGED', 'bad'];
+  if (r.stalled || r.seal_direct_stalled || r.tip_seal_stalled || r.entities_stalled) return ['ATTENTION', 'warn'];
+  if (r.seal_direct_active) return ['BACKFILL', 'warn'];
+  if (r.cursorless) return ['SERVING', 'live'];
+  return r.ready ? ['LIVE', 'live'] : ['NOT READY', 'warn'];
+}
+function renderHeader(){
+  const [label, cls] = nestState();
+  const st = $('#state'); st.textContent = label; st.className = 'state ' + cls;
+  const r = S.ready || {}, s = S.summary || {};
+  const name = (S.nest && S.nest.name) || s.name || '';
+  $('#nest').textContent = [name, s.chain].filter(Boolean).join(' · ');
+  if (name) document.title = name + ' · nuthatch';
+  $('#p-tip').textContent = num(r.tip);
+  $('#p-idx').textContent = num(r.last_block);
+  $('#p-sealed').textContent = num(r.sealed_through);
+  $('#p-lag').textContent = r.lag_blocks === null || r.lag_blocks === undefined ? '-' : num(r.lag_blocks) + ' blk';
+  $('#p-ver').textContent = r.version ? 'v' + r.version : '-';
+}
+
+// rate of a counter over the last `window` seconds of samples
+function rate(key, windowSecs = 60){
+  const a = S.samples; if (a.length < 2) return null;
+  const last = a[a.length - 1]; let first = a[0];
+  for (const s of a) if (last.t - s.t <= windowSecs) { first = s; break; }
+  const dt = last.t - first.t; if (dt <= 0) return null;
+  const d = last[key] - first[key];
+  return d < 0 ? null : d / dt;
+}
+function spark(key, delta = true){
+  const a = S.samples; if (a.length < 3) return '';
+  const pts = [];
+  for (let i = 1; i < a.length; i++) pts.push(delta ? Math.max(0, a[i][key] - a[i - 1][key]) : a[i][key]);
+  const max = Math.max(...pts, 1e-9), w = 100, h = 28, step = w / Math.max(1, pts.length - 1);
+  const d = pts.map((p, i) => (i ? 'L' : 'M') + (i * step).toFixed(1) + ' ' + (h - 2 - (p / max) * (h - 4)).toFixed(1)).join(' ');
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path d="${d}" fill="none" stroke="var(--accent2)" stroke-width="1.2" vector-effect="non-scaling-stroke"/></svg>`;
+}
+const stat = (k, v, sub = '', cls = '', extra = '') =>
+  `<div class="stat ${cls}"><div class="k">${esc(k)}</div><div class="v" title="${esc(v)}">${esc(v)}</div>${sub ? `<div class="s" title="${esc(sub)}">${esc(sub)}</div>` : ''}${extra}</div>`;
+const fixed = (n, d = 1) => n === null ? '-' : n.toFixed(n >= 100 ? 0 : d);
+
+// ---- overview ----
+function renderOverview(){
+  const el = $('#tab-overview');
+  if (S.down && !S.ready) { el.innerHTML = `<div class="err">The nest is not answering: ${esc(S.down)}</div>`; return; }
+  const r = S.ready, s = S.summary;
+  if (!r || !s) { el.innerHTML = '<div class="empty">loading</div>'; return; }
+  const [label, cls] = nestState();
+  const f = r.freshness || {};
+  let h = S.down ? `<div class="err">Last poll failed (${esc(S.down)}). Figures below are the last received.</div>` : '';
+  const flags = [['stalled', r.stalled], ['wedged', r.wedged], ['initial poll failed', r.initial_poll_failed], ['backfill stalled', r.seal_direct_stalled], ['tip seal stalled', r.tip_seal_stalled], ['entities stalled', r.entities_stalled]].filter(x => x[1]).map(x => x[0]);
+  h += '<h2>Health</h2><div class="grid">';
+  h += stat('state', label, flags.join(', ') || (r.cursorless ? 'serves, does not index' : 'no faults reported'), cls === 'live' ? 'good' : cls);
+  h += stat('tip', num(r.tip), r.cursorless ? 'no cursor' : 'chain head seen');
+  h += stat('indexed', num(r.last_block), r.lag_blocks == null ? '' : num(r.lag_blocks) + ' blocks behind', '', spark('block'));
+  h += stat('sealed through', num(r.sealed_through), r.seal_lag_blocks == null ? '' : num(r.seal_lag_blocks) + ' blocks hot');
+  h += stat('last poll', r.seconds_since_poll == null ? '-' : span(r.seconds_since_poll) + ' ago', f.poll_interval_secs ? 'every ' + span(f.poll_interval_secs) + ' (' + (f.poll_interval_source || '') + ')' : '');
+  h += stat('freshness', f.mode || '-', r.seconds_since_seal_progress == null ? '' : 'seal progress ' + span(r.seconds_since_seal_progress) + ' ago');
+  h += stat('reorgs', num(mv('nuthatch_reorgs_total')), 'since start');
+  h += '</div>';
+
+  if (r.seal_direct_active || r.seal_direct_target) {
+    const done = +r.seal_direct_completed || 0, origin = +r.seal_direct_origin || 0, target = +r.seal_direct_target || 0;
+    const pct = target > origin ? Math.min(100, Math.max(0, (done - origin) / (target - origin) * 100)) : 0;
+    const c = r.seal_direct_concurrency || {};
+    h += `<h2>Backfill</h2><div class="card"><div class="pad"><div class="muted" style="font-family:var(--mono);font-size:12px">${r.seal_direct_active ? 'running' : 'finished'} · ${num(origin)} to ${num(target)} · sealed to ${num(done)} · fetched to ${num(r.seal_direct_fetched)} · ${pct.toFixed(1)}% · concurrency ${num(c.effective)} of ${num(c.requested)}${c.capped_by ? ' (' + esc(c.capped_by) + ')' : ''}</div><div class="bar"><i style="width:${pct}%"></i></div></div></div>`;
+  }
+
+  const sealedRows = mv('nuthatch_rows_sealed_total'), decoded = mv('nuthatch_rows_decoded_total');
+  h += '<h2>Data</h2><div class="grid">';
+  h += stat('tables', num(s.tables));
+  h += stat('hot rows', num(s.entities), 'unsealed, in the hot store');
+  h += stat('decoded', num(decoded), 'rows since start · ' + fixed(rate('rows')) + '/s', '', spark('rows'));
+  h += stat('sealed', num(sealedRows), 'rows since start');
+  h += stat('hot store', bytes(mv('nuthatch_hot_store_bytes')), 'on disk');
+  h += stat('segments', bytes(mv('nuthatch_sealed_segments_bytes')), 'sealed, on disk');
+  h += stat('alert outbox', num(s.alert_outbox), 'undelivered');
+  h += '</div>';
+
+  const cpu = rate('cpu');
+  const q = mv('nuthatch_sql_queries_total'), rej = mv('nuthatch_sql_rejections_total');
+  const durC = mv('nuthatch_rpc_request_duration_seconds_count') ?? ml('nuthatch_rpc_request_duration_seconds_count').reduce((a, x) => a + x.value, 0);
+  const durS = mv('nuthatch_rpc_request_duration_seconds_sum') ?? ml('nuthatch_rpc_request_duration_seconds_sum').reduce((a, x) => a + x.value, 0);
+  h += '<h2>Process</h2><div class="grid">';
+  h += stat('memory rss', bytes(mv('nuthatch_rss_bytes')), 'budget 2 GiB per cursor', (mv('nuthatch_rss_bytes') || 0) > 2 * 1024 ** 3 ? 'warn' : '', spark('rss', false));
+  h += stat('cpu', cpu === null ? 'warming' : (cpu * 100).toFixed(1) + '%', 'of one core', '', spark('cpu'));
+  h += stat('rpc requests', num(mv('nuthatch_rpc_requests_total')), fixed(rate('rpc')) + ' req/s · avg ' + (durC ? Math.round(durS / durC * 1000) + ' ms' : '-'), '', spark('rpc'));
+  h += stat('http served', num(mv('nuthatch_http_requests_total')), fixed(rate('http')) + ' req/s', '', spark('http'));
+  h += stat('sql queries', num(q), num(rej) + ' refused', rej ? '' : '', spark('sqlq'));
+  h += stat('sql memo', num(mv('nuthatch_sql_memo_hits_total')) + ' hits', num(mv('nuthatch_sql_memo_misses_total')) + ' misses · ' + bytes(mv('nuthatch_sql_memo_bytes')));
+  h += '</div>';
+
+  h += '<h2>Derivation</h2><div class="grid">';
+  for (const v of s.views || []) h += stat('view', v);
+  h += stat('holders', num(s.holders), 'balances view');
+  h += stat('exposure', num(s.exposure_entries), 'entries');
+  h += stat('velocity', num(s.velocity_buckets), 'buckets');
+  for (const e of r.entities || []) h += stat('entity', e.name || JSON.stringify(e), e.applied_through != null ? 'through ' + num(e.applied_through) : '');
+  h += '</div>';
+
+  if (s.publish) {
+    const p = s.publish;
+    const last = p.last_success_unixtime ? span(Math.max(0, Date.now() / 1000 - p.last_success_unixtime)) + ' ago' : 'never';
+    h += '<h2>Publish</h2><div class="grid">' + stat('target', p.target, 'last success ' + last) + stat('publish lag', p.dead_letter ? 'dead-lettered' : num(p.lag_blocks) + ' blk', 'sealed through ' + num(p.sealed_through), p.dead_letter ? 'bad' : '') + '</div>';
+  }
+  h += '<h2>Identity</h2><div class="card"><div class="kv">'
+    + `<div>nid</div><div>${esc(s.nid ?? '-')}</div><div>data identity</div><div>${esc(s.data_identity ?? '-')}</div>`
+    + (S.nest ? `<div>registry hash</div><div>${esc(S.nest.registry_hash ?? '-')}</div><div>chain id</div><div>${esc(S.nest.chain_id ?? '-')}</div>` : '')
+    + '</div></div>';
+  el.innerHTML = h;
+}
+
+// ---- generic sortable grid ----
+function grid(cols, rows, opts = {}){
+  if (!rows || !rows.length) return `<div class="empty">${esc(opts.empty || 'no rows')}</div>`;
+  const id = 'g' + Math.random().toString(36).slice(2);
+  grid.reg[id] = { cols, rows, opts, sort: null, dir: 1 };
+  return `<table id="${id}">${gridInner(id)}</table>`;
+}
+grid.reg = {};
+function gridInner(id){
+  const g = grid.reg[id];
+  let rows = g.rows;
+  if (g.sort !== null) {
+    const c = g.cols[g.sort];
+    rows = rows.slice().sort((a, b) => {
+      const x = cellRaw(c, a), y = cellRaw(c, b);
+      const nx = parseFloat(x), ny = parseFloat(y);
+      const both = isFinite(nx) && isFinite(ny) && String(x).trim() !== '' && String(y).trim() !== '';
+      return (both ? nx - ny : String(x ?? '').localeCompare(String(y ?? ''))) * g.dir;
+    });
+  }
+  const head = '<tr>' + g.cols.map((c, i) => `<th class="${c.num ? 'num' : ''}" data-i="${i}">${esc(c.label ?? c.key)}${g.sort === i ? (g.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('') + '</tr>';
+  const body = rows.map((r, ri) => `<tr${g.opts.click ? ` class="click" data-k="${esc(g.opts.click.key(r))}"` : ''}>` + g.cols.map(c => {
+    const v = c.fmt ? c.fmt(cellRaw(c, r), r) : cellRaw(c, r);
+    const text = v === null || v === undefined ? '' : (typeof v === 'object' && !v.html ? JSON.stringify(v) : v);
+    return text && text.html ? `<td class="${c.num ? 'num' : ''}">${text.html}</td>` : `<td class="${c.num ? 'num' : ''}" title="${esc(text)}">${esc(text)}</td>`;
+  }).join('') + '</tr>').join('');
+  return `<thead>${head}</thead><tbody>${body}</tbody>`;
+}
+const cellRaw = (c, r) => r[c.key];
+document.addEventListener('click', e => {
+  const th = e.target.closest('th[data-i]');
+  if (th) {
+    const t = th.closest('table'), g = grid.reg[t.id]; if (!g) return;
+    const i = +th.dataset.i;
+    if (g.sort === i) g.dir = -g.dir; else { g.sort = i; g.dir = 1; }
+    t.innerHTML = gridInner(t.id);
+    return;
+  }
+  const tr = e.target.closest('tr.click');
+  if (tr) { const g = grid.reg[tr.closest('table').id]; if (g && g.opts.click) g.opts.click.go(tr.dataset.k); }
 });
-
-// ---- status (live via SSE, falling back to polling) ----
-const STAT_KEYS = [
-  ['entities','hot rows'], ['tables','tables'], ['holders','holders'],
-  ['exposure_entries','exposure'], ['velocity_buckets','velocity'], ['alert_outbox','alert outbox'],
-];
-function render(s){
-  $('#nest').textContent = (s.name||'nest') + ' · ' + (s.chain||'');
-  $('#tip').textContent = 'tip ' + fmt(s.last_block);
-  $('#sealed').textContent = fmt(s.sealed_through);
-  $('#dot').classList.add('live');
-  const lag = (s.last_block && s.sealed_through) ? (s.last_block - s.sealed_through) : null;
-  $('#lag').textContent = lag===null ? '-' : fmt(lag)+' blk';
-  const g = STAT_KEYS.filter(([k]) => k in s).map(([k,label]) =>
-    `<div class="stat"><div class="k">${label}</div><div class="v">${fmt(s[k])}</div></div>`).join('');
-  $('#stats').innerHTML = g + `<div class="stat"><div class="k">views</div><div class="v" style="font-size:12px">${(s.views||[]).join('<br>')||'-'}</div></div>` + publishStat(s.publish);
-}
-// RFC-0052: only a nest that mirrors itself carries `publish`.
-function publishStat(p){
-  if(!p) return '';
-  const last = p.last_success_unixtime ? fmt(Math.max(0, Math.round(Date.now()/1000 - p.last_success_unixtime)))+'s ago' : 'never';
-  const lag = p.dead_letter ? `<span style="color:var(--bad)">dead-lettered</span>` : `lag ${fmt(p.lag_blocks)} blk`;
-  return `<div class="stat" style="grid-column: span 2"><div class="k">publish</div><div class="v" style="font-size:12px">${esc(p.target)}<br>${lag}<br>last success ${last}</div></div>`;
-}
-async function poll(){
-  try { render(await api('/')); } catch(e){ $('#dot').classList.remove('live'); }
-}
-// Prefer a server-pushed stream; degrade to 2s polling if EventSource can't connect. The events URL is
-// derived from this page's own path, so it's correct whether served solo (/_admin/) or under a roost
-// prefix (/<nest>/_admin/); the ?token carries through for off-localhost admin auth.
-let polling = null;
-function startPolling(){
-  if(polling) return;
-  polling = setInterval(() => { if(tab==='status' && !document.hidden) poll(); }, 2000);
-  poll();
-}
-(function startLive(){
-  if(!('EventSource' in window)){ startPolling(); return; }
-  const base = location.pathname.replace(/_admin\/?$/, '');
-  let es;
-  try { es = new EventSource(base + '_admin/events' + location.search); }
-  catch(_){ startPolling(); return; }
-  es.onmessage = (e) => { try { render(JSON.parse(e.data)); } catch(_){} };
-  es.onerror = () => { es.close(); startPolling(); };
-})();
+const colsOf = items => [...new Set(items.flatMap(r => Object.keys(r)))].map(k => ({ key: k }));
 
 // ---- tables ----
 let curTable = null;
+async function ensureTables(){
+  if (!S.tables) S.tables = (await api('tables')).tables || [];
+  if (!S.storage) { try { const st = await api('_admin/storage'); S.storage = st.tables ? st : { tables: [] }; } catch (_) { S.storage = { tables: [] }; } }
+  return S.tables;
+}
+const sealedOf = t => (S.storage?.tables || []).find(x => x.table === t);
+function tableList(target, filter, onpick, current){
+  const f = filter.trim().toLowerCase();
+  const groups = {};
+  for (const t of S.tables) {
+    if (f && !t.table.toLowerCase().includes(f)) continue;
+    (groups[t.alias || 'other'] ||= []).push(t);
+  }
+  let h = '';
+  for (const [alias, ts] of Object.entries(groups)) {
+    h += `<li class="group"><span>${esc(alias)}</span><span class="n">${ts.length}</span></li>`;
+    for (const t of ts) {
+      const st = sealedOf(t.table);
+      const label = t.table.startsWith(alias + '__') ? t.table.slice(alias.length + 2) : t.table;
+      h += `<li data-t="${esc(t.table)}" class="${t.table === current ? 'on' : ''}"><span>${esc(label)}</span><span class="n">${st ? num(st.rows) : ''}</span></li>`;
+    }
+  }
+  target.innerHTML = h || '<li class="empty">no tables match</li>';
+  target.querySelectorAll('li[data-t]').forEach(li => li.onclick = () => onpick(li.dataset.t));
+}
 async function loadTables(){
-  const d = await api('/tables');
-  $('#tablist').innerHTML = d.tables.map(t =>
-    `<li data-t="${esc(t.table)}"><span>${esc(t.table)}</span><span class="n">${t.columns.length}c</span></li>`).join('')
-    || '<li class="empty">no tables</li>';
-  $('#tablist').querySelectorAll('li[data-t]').forEach(li => li.onclick = () => openTable(li.dataset.t, li));
+  await ensureTables();
+  $('#tcount').textContent = S.tables.length;
+  const draw = () => tableList($('#tablist'), $('#tfilter').value, openTable, curTable);
+  $('#tfilter').oninput = draw; draw();
+  const want = location.hash.split('/')[1];
+  if (want && want !== curTable) openTable(decodeURIComponent(want));
 }
-async function openTable(name, li){
+async function openTable(name){
   curTable = name;
-  $('#tablist').querySelectorAll('li').forEach(x => x.classList.toggle('on', x===li));
-  $('#tabletitle').textContent = name + ' - newest 100 (hot + sealed)';
-  $('#tablerows').innerHTML = '<div class="empty">loading…</div>';
-  const d = await api('/table/'+encodeURIComponent(name)+'?limit=100');
-  $('#tablerows').innerHTML = rowsTable(d.items);
-}
-function rowsTable(items){
-  if(!items || !items.length) return '<div class="empty">no rows</div>';
-  const cols = [...new Set(items.flatMap(r => Object.keys(r)))];
-  const head = '<tr>'+cols.map(c=>`<th>${esc(c)}</th>`).join('')+'</tr>';
-  const body = items.map(r => '<tr>'+cols.map(c=>`<td>${r[c]===undefined?'':esc(r[c])}</td>`).join('')+'</tr>').join('');
-  return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  history.replaceState(null, '', '#tables/' + encodeURIComponent(name));
+  tableList($('#tablist'), $('#tfilter').value, openTable, curTable);
+  const t = S.tables.find(x => x.table === name);
+  const el = $('#tabledetail');
+  if (!t) { el.innerHTML = '<div class="empty">No such table on this nest.</div>'; return; }
+  const st = sealedOf(name);
+  let h = `<div class="toolbar"><b style="font-family:var(--mono);color:var(--fg);font-size:14px">${esc(name)}</b><span class="grow" style="flex:1"></span><button class="btn ghost small" id="t-query">Query in SQL</button><button class="btn ghost small" id="t-count">Count rows</button><button class="btn ghost small" id="t-reload">Reload</button></div>`;
+  h += `<div class="hint" style="font-family:var(--mono)">${esc(t.event || '')}${t.topic0 ? ' · topic0 ' + esc(short(t.topic0, 8)) : ''}</div>`;
+  h += '<div class="grid" style="margin-bottom:14px">'
+    + stat('sealed rows', st ? num(st.rows) : '0', st ? num(st.segments) + ' segments' + (st.provisional ? ', ' + st.provisional + ' provisional' : '') : 'nothing sealed yet')
+    + stat('sealed bytes', st ? bytes(st.bytes) : '-', st && st.rows ? Math.round(st.bytes / st.rows) + ' B per row' : '')
+    + stat('sealed range', st ? num(st.from_block) : '-', st ? 'to ' + num(st.to_block) : '')
+    + `<div class="stat" id="t-total"><div class="k">total rows</div><div class="v">-</div><div class="s">press Count rows</div></div>`
+    + '</div>';
+  if (st && st.missing_files) h += `<div class="err">${st.missing_files} segment file(s) named in the catalogue are not on disk.</div>`;
+  h += `<div class="card"><h3>Columns <span class="grow"></span><span class="dim">${t.columns.length}</span></h3><div class="scroll" style="max-height:260px">`
+    + grid([{ key: 'name' }, { key: 'sol_type', label: 'solidity' }, { key: 'storage' }, { key: 'indexed', fmt: v => v ? 'indexed' : '' }], t.columns) + '</div></div>';
+  h += `<div class="card"><h3>Newest rows <span class="grow"></span><span class="dim" id="t-rowsmeta"></span></h3><div class="scroll" id="t-rows"><div class="empty">loading</div></div></div>`;
+  h += `<div class="card"><h3>Segments <span class="grow"></span><span class="dim" id="t-segmeta"></span></h3><div class="scroll" id="t-segs" style="max-height:300px"><div class="empty">loading</div></div></div>`;
+  el.innerHTML = h;
+  const q = `SELECT * FROM "${name}" ORDER BY block_number DESC LIMIT 100`;
+  $('#t-query').onclick = () => { $('#q').value = q; show('sql'); };
+  $('#t-reload').onclick = () => openTable(name);
+  $('#t-count').onclick = async () => {
+    const box = $('#t-total'); box.querySelector('.v').textContent = '…';
+    try {
+      const d = await api('sql?q=' + encodeURIComponent(`SELECT count(*) AS n, min(block_number) AS lo, max(block_number) AS hi FROM "${name}"`));
+      if (d.error) throw new Error(d.error);
+      const row = d.rows[0] || {};
+      box.querySelector('.v').textContent = num(row.n);
+      box.querySelector('.s').textContent = row.lo == null ? 'hot and sealed' : 'blocks ' + num(row.lo) + ' to ' + num(row.hi);
+    } catch (e) { box.querySelector('.v').textContent = 'failed'; box.querySelector('.s').textContent = e.message; }
+  };
+  api('table/' + encodeURIComponent(name) + '?limit=100').then(d => {
+    if (curTable !== name) return;
+    const items = d.items || [];
+    $('#t-rowsmeta').textContent = d.error ? '' : items.length + ' shown, hot and sealed';
+    $('#t-rows').innerHTML = d.error ? `<div class="err">${esc(d.error)}</div>` : grid(colsOf(items), items);
+  }).catch(e => { $('#t-rows').innerHTML = `<div class="err">${esc(e.message)}</div>`; });
+  api('_admin/storage?table=' + encodeURIComponent(name)).then(d => {
+    if (curTable !== name) return;
+    const segs = d.detail?.segments || [];
+    $('#t-segmeta').textContent = segs.length ? segs.length + ', newest first' : '';
+    $('#t-segs').innerHTML = grid([
+      { key: 'from_block', label: 'from', num: 1, fmt: num }, { key: 'to_block', label: 'to', num: 1, fmt: num },
+      { key: 'rows', num: 1, fmt: num }, { key: 'bytes', num: 1, fmt: v => v == null ? 'missing' : bytes(v) },
+      { key: 'provisional', fmt: v => v ? 'provisional' : '' }, { key: 'writer_profile', label: 'writer' }, { key: 'hash', fmt: v => short(v, 8) },
+    ], segs, { empty: 'nothing sealed for this table yet' });
+  }).catch(e => { $('#t-segs').innerHTML = `<div class="err">${esc(e.message)}</div>`; });
 }
 
 // ---- sql ----
+let lastResult = null, sqlReady = false;
+async function loadSql(){
+  await ensureTables();
+  if (!S.queries) { try { S.queries = await api('queries'); } catch (_) { S.queries = { queries: [] }; } }
+  const qs = S.queries;
+  $('#sqlaccess').innerHTML = qs.free_form === false ? '<div class="note">This nest has closed free-form SQL. Only its named queries run.</div>' : '';
+  $('#named').innerHTML = (qs.queries || []).map(q => `<li data-n="${esc(q.name)}"><span>${esc(q.name)}</span><span class="n">${esc((q.params || []).join(', '))}</span></li>`).join('') || '<li class="empty">none declared</li>';
+  $('#named').querySelectorAll('li[data-n]').forEach(li => li.onclick = () => runNamed((qs.queries || []).find(q => q.name === li.dataset.n)));
+  const drawSchema = () => tableList($('#schemalist'), $('#sfilter').value, name => {
+    const t = S.tables.find(x => x.table === name);
+    insert(`SELECT ${t.columns.filter(c => c.sol_type !== 'implicit').map(c => '"' + c.name + '"').join(', ') || '*'}, block_number\nFROM "${name}"\nORDER BY block_number DESC\nLIMIT 50`, true);
+  }, null);
+  $('#sfilter').oninput = drawSchema; drawSchema();
+  drawSaved(); drawHist();
+  if (sqlReady) return; sqlReady = true;
+  $('#q').value = $('#q').value || store.get('draft', '');
+  $('#q').addEventListener('input', () => store.set('draft', $('#q').value));
+  $('#q').addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runSql(); } });
+  $('#run').onclick = runSql;
+  $('#explain').onclick = checkSql;
+  $('#save').onclick = () => {
+    const q = $('#q').value.trim(); if (!q) return;
+    const name = prompt('Name this query'); if (!name) return;
+    const saved = store.get('saved', []).filter(x => x.name !== name); saved.unshift({ name, q });
+    store.set('saved', saved); drawSaved();
+  };
+  $('#csv').onclick = () => download('csv');
+  $('#jsonl').onclick = () => download('json');
+}
+function insert(text, replace){ const q = $('#q'); q.value = replace || !q.value.trim() ? text : q.value + '\n' + text; store.set('draft', q.value); q.focus(); }
+function drawSaved(){
+  const saved = store.get('saved', []);
+  $('#saved').innerHTML = saved.map((s, i) => `<li data-i="${i}"><span>${esc(s.name)}</span><span class="n" data-del="${i}">remove</span></li>`).join('') || '<li class="empty">nothing saved in this browser</li>';
+  $('#saved').querySelectorAll('li[data-i]').forEach(li => li.onclick = e => {
+    if (e.target.dataset.del !== undefined) { saved.splice(+e.target.dataset.del, 1); store.set('saved', saved); drawSaved(); return; }
+    insert(saved[+li.dataset.i].q, true);
+  });
+}
+function drawHist(){
+  const hist = store.get('hist', []);
+  $('#hist').innerHTML = hist.map((q, i) => `<li data-i="${i}" title="${esc(q)}"><span>${esc(q.replace(/\s+/g, ' '))}</span></li>`).join('') || '<li class="empty">nothing run yet</li>';
+  $('#hist').querySelectorAll('li[data-i]').forEach(li => li.onclick = () => insert(hist[+li.dataset.i], true));
+}
+function showResult(d, ms, what){
+  $('#provcard').hidden = true; $('#csv').hidden = $('#jsonl').hidden = true; lastResult = null;
+  if (d.error) {
+    $('#sqlrows').innerHTML = `<div class="err">${esc(d.error)}${d.hint ? '\n\n' + esc(d.hint) : ''}</div>`;
+    $('#sqlmeta').textContent = what + ' refused (' + d.__status + ') in ' + ms + ' ms'; return;
+  }
+  const rows = d.rows || d.items || [];
+  // The degraded and tip caveats ride in the same line as the count (#435, #472): without them a
+  // reduced answer reads as a complete small one. The flag is nest-wide, so tables are named and
+  // no claim is made about these particular rows.
+  const deg = d.degraded_tables || [];
+  $('#sqlmeta').textContent = `${num(d.count ?? rows.length)} row(s) in ${ms} ms` + (d.truncated ? ', truncated at the row cap' : '') + (d.cached ? ', from the memo' : '')
+    + (d.tip_unavailable ? ' - the hot tip could not be scanned, sealed history only' : '')
+    + (deg.length ? ` - INCOMPLETE cold data in this nest for ${deg.join(', ')}` : '');
+  const cols = d.columns ? d.columns.map(k => ({ key: k })) : colsOf(rows);
+  $('#sqlrows').innerHTML = grid(cols, rows);
+  lastResult = { cols: cols.map(c => c.key), rows };
+  $('#csv').hidden = $('#jsonl').hidden = !rows.length;
+  if (d.provenance) {
+    $('#provcard').hidden = false;
+    $('#prov').innerHTML = Object.entries(d.provenance).map(([k, v]) => `<div>${esc(k)}</div><div>${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</div>`).join('');
+  }
+}
 async function runSql(){
-  const q = $('#q').value.trim(); if(!q) return;
-  $('#sqlmeta').textContent = 'running…'; $('#sqlrows').innerHTML='';
+  const q = $('#q').value.trim(); if (!q) return;
+  $('#sqlmeta').textContent = 'running'; $('#sqlrows').innerHTML = '<div class="empty">running</div>';
+  const hist = store.get('hist', []).filter(x => x !== q); hist.unshift(q); store.set('hist', hist.slice(0, 40)); drawHist();
+  const t0 = performance.now();
+  try { showResult(await api('sql?q=' + encodeURIComponent(q)), Math.round(performance.now() - t0), 'query'); }
+  catch (e) { $('#sqlrows').innerHTML = `<div class="err">${esc(e.message)}</div>`; $('#sqlmeta').textContent = ''; }
+}
+async function checkSql(){
+  const q = $('#q').value.trim(); if (!q) return;
+  $('#sqlmeta').textContent = 'checking';
   try {
-    const d = await api('/sql?q='+encodeURIComponent(q));
-    if(d.error){ $('#sqlrows').innerHTML = `<div class="err">${esc(d.error)}</div>`; $('#sqlmeta').textContent=''; return; }
-    // The degraded caveat rides in the same meta line as truncation (#435). Without it a reduced
-    // table renders here as a perfectly healthy small one, and the operator reads a wrong total off
-    // their own admin page. `textContent`, so a table name is never markup.
-    //
-    // Named tables, and no claim about *these* rows: the flag is nest-wide, so this result may well
-    // be complete. Nor about the cause - an undefinable view is in the set with its segments intact.
-    const deg = d.degraded_tables || [];
-    // Tip failure, not per-table (#472): the whole unsealed tip was dropped, so this answer is sealed
-    // history only regardless of what `degraded_tables` says. Separate clause, same reasoning as above.
-    $('#sqlmeta').textContent = `${fmt(d.count)} row(s)` + (d.truncated?' (truncated)':'')
-      + (d.tip_unavailable?' - the hot tip could not be scanned, sealed history only':'')
-      + (deg.length?` - INCOMPLETE cold data in this nest for ${deg.join(', ')}`:'');
-    $('#sqlrows').innerHTML = rowsTable(d.rows);
-  } catch(e){ $('#sqlrows').innerHTML = `<div class="err">${esc(e.message)}</div>`; $('#sqlmeta').textContent=''; }
+    const d = await api('explain?q=' + encodeURIComponent(q));
+    $('#sqlmeta').textContent = d.valid ? 'binds: ' + (d.note || 'ok') : (d.valid === false ? 'does not bind' : 'could not be checked');
+    if (d.error) $('#sqlrows').innerHTML = `<div class="err">${esc(d.error)}${d.hint ? '\n\n' + esc(d.hint) : ''}</div>`;
+    else if (d.plan) $('#sqlrows').innerHTML = `<pre>${esc(typeof d.plan === 'string' ? d.plan : JSON.stringify(d.plan, null, 2))}</pre>`;
+  } catch (e) { $('#sqlmeta').textContent = e.message; }
 }
-$('#run').onclick = runSql;
-$('#q').addEventListener('keydown', e => { if((e.metaKey||e.ctrlKey) && e.key==='Enter') runSql(); });
+async function runNamed(q){
+  if (!q) return;
+  const params = [];
+  for (const p of q.params || []) { const v = prompt(`${q.name}: value for ${p}`); if (v === null) return; params.push(encodeURIComponent(p) + '=' + encodeURIComponent(v)); }
+  $('#sqlmeta').textContent = 'running ' + q.name;
+  const t0 = performance.now();
+  try { showResult(await api('q/' + encodeURIComponent(q.name) + (params.length ? '?' + params.join('&') : '')), Math.round(performance.now() - t0), q.name); }
+  catch (e) { $('#sqlrows').innerHTML = `<div class="err">${esc(e.message)}</div>`; $('#sqlmeta').textContent = ''; }
+}
+function download(kind){
+  if (!lastResult) return;
+  const { cols, rows } = lastResult;
+  const cell = v => { const s = v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const text = kind === 'csv' ? [cols.join(','), ...rows.map(r => cols.map(c => cell(r[c])).join(','))].join('\n') : JSON.stringify(rows, null, 2);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: kind === 'csv' ? 'text/csv' : 'application/json' }));
+  a.download = 'nuthatch-result.' + kind; a.click(); URL.revokeObjectURL(a.href);
+}
 
-// ---- nest ----
-async function loadNest(){
-  const n = await api('/nest');
-  const tbl = (title, rows, cols) => rows.length ? `<div class="card" style="margin-bottom:16px"><h3>${title}</h3><div class="scroll" style="max-height:none">${rowsTable(rows.map(r=>Object.fromEntries(cols.map(c=>[c,r[c]]))))}</div></div>` : '';
-  let h = `<div class="grid" style="margin-bottom:16px">
-    <div class="stat"><div class="k">nest</div><div class="v" style="font-size:14px">${esc(n.name)}</div></div>
-    <div class="stat"><div class="k">chain</div><div class="v" style="font-size:14px">${esc(n.chain)} (${n.chain_id})</div></div>
-    <div class="stat"><div class="k">registry hash</div><div class="v" style="font-size:11px">${esc((n.registry_hash||'').slice(0,18))}…</div></div>
-    <div class="stat"><div class="k">tables</div><div class="v">${fmt(n.table_count)}</div></div>
-  </div>`;
-  h += tbl('Contracts', n.contracts||[], ['alias','address']);
-  if((n.templates||[]).length) h += tbl('Templates (RFC-0009)', n.templates, ['name','abi']);
-  if((n.factories||[]).length) h += tbl('Factories', n.factories, ['watch','event','child_param','template']);
-  if((n.webhooks||[]).length) h += tbl('Webhooks', n.webhooks, ['name','table','url','finality']);
-  $('#nestbody').innerHTML = h;
+// ---- entities ----
+async function loadEntities(){
+  const el = $('#tab-entities');
+  el.innerHTML = '<div class="empty">loading</div>';
+  try {
+    const [d, flags, shape] = await Promise.all([api('derived'), api('flags').catch(() => null), api('shape').catch(() => null)]);
+    let h = `<h2>Authored incremental entities</h2><div class="card"><div class="scroll">` + grid([
+      { key: 'name' }, { key: 'rows', num: 1, fmt: num }, { key: 'applied_through', label: 'applied through', num: 1, fmt: num },
+      { key: 'current', fmt: v => ({ html: v ? '<span class="tag good">current</span>' : '<span class="tag warn">behind</span>' }) },
+      { key: 'available', fmt: v => ({ html: v ? '<span class="tag good">available</span>' : '<span class="tag bad">unavailable</span>' }) },
+    ], d.entities || [], { empty: 'This nest declares no entities (entities.toml). Head is ' + num(d.head) + '.', click: { key: r => r.name, go: openEntity } }) + '</div></div><div id="entityrows"></div>';
+    h += '<h2>Built-in views</h2><div class="grid">' + (S.summary?.views || []).map(v => stat('view', v)).join('')
+      + (shape ? stat('transfers shape', shape.transfers ? 'yes' : 'no', 'balances apply') + stat('compliance', shape.compliance ? 'yes' : 'no', 'screening pack') : '') + '</div>';
+    if (flags) {
+      h += '<h2>Flags</h2><div class="grid">';
+      for (const [k, v] of Object.entries(flags)) if (v && typeof v === 'object') h += stat(k, v.configured == null ? 'not configured' : String(v.configured), (v.flags || []).length + ' raised');
+      h += '</div>';
+    }
+    el.innerHTML = h;
+  } catch (e) { el.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 }
+async function openEntity(name){
+  const box = $('#entityrows');
+  box.innerHTML = '<div class="empty">loading</div>';
+  try {
+    const d = await api('derived/' + encodeURIComponent(name) + '?limit=200');
+    if (d.error) { box.innerHTML = `<div class="err">${esc(d.error)}${d.reason ? ': ' + esc(d.reason) : ''}</div>`; return; }
+    const items = (d.items || []).map(it => ({ key: (it.key || []).join(' | '), row: (it.row || []).join(' | ') }));
+    box.innerHTML = `<div class="card"><h3>${esc(name)} <span class="grow"></span><span class="dim">${num(d.returned)} of ${num(d.rows)}</span></h3><div class="scroll">${grid([{ key: 'key' }, { key: 'row' }], items)}</div></div>`;
+  } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+// ---- storage ----
+async function loadStorage(){
+  const el = $('#tab-storage');
+  el.innerHTML = '<div class="empty">loading</div>';
+  try {
+    const d = await api('_admin/storage');
+    if (d.error) throw new Error(d.error);
+    S.storage = d;
+    const ts = d.tables || [];
+    const sum = k => ts.reduce((a, t) => a + (+t[k] || 0), 0);
+    const small = ts.filter(t => t.segments).reduce((a, t) => a + t.provisional, 0);
+    let h = '<h2>Sealed catalogue</h2><div class="grid">'
+      + stat('tables sealed', num(ts.filter(t => t.segments).length), 'of ' + num(S.summary?.tables))
+      + stat('segments', num(sum('segments')), small + ' provisional')
+      + stat('sealed rows', num(sum('rows')))
+      + stat('sealed bytes', bytes(sum('bytes')), sum('rows') ? Math.round(sum('bytes') / sum('rows')) + ' B per row' : '')
+      + stat('hot store', bytes(mv('nuthatch_hot_store_bytes')), num(S.summary?.entities) + ' hot rows')
+      + stat('missing files', num(sum('missing_files')), 'named in the catalogue, not on disk', sum('missing_files') ? 'bad' : 'good')
+      + stat('catalogue', 'v' + d.manifest_version)
+      + '</div>';
+    h += '<h2>Per table</h2><div class="card"><div class="scroll" style="max-height:none">' + grid([
+      { key: 'table' }, { key: 'segments', num: 1, fmt: num }, { key: 'provisional', num: 1, fmt: v => v || '' },
+      { key: 'rows', num: 1, fmt: num }, { key: 'bytes', num: 1, fmt: bytes },
+      { key: 'from_block', label: 'from', num: 1, fmt: num }, { key: 'to_block', label: 'to', num: 1, fmt: num },
+      { key: 'missing_files', label: 'missing', num: 1, fmt: v => v || '' },
+    ], ts, { empty: 'Nothing has sealed yet. Rows seal once they are past finality.', click: { key: r => r.table, go: t => { location.hash = '#tables/' + encodeURIComponent(t); show('tables'); } } }) + '</div></div>';
+    el.innerHTML = h;
+  } catch (e) { el.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+// ---- rpc & ingest ----
+function renderRpc(){
+  const el = $('#tab-rpc');
+  if (!S.metrics) { el.innerHTML = '<div class="empty">loading</div>'; return; }
+  const r = S.ready || {};
+  const by = (name, label) => Object.fromEntries(ml(name).filter(x => x.labels[label]).map(x => [x.labels[label], x.value]));
+  const req = by('nuthatch_rpc_endpoint_requests_total', 'endpoint'), fail = by('nuthatch_rpc_endpoint_failures_total', 'endpoint'), retry = by('nuthatch_rpc_endpoint_retries_total', 'endpoint');
+  const dc = by('nuthatch_rpc_request_duration_seconds_count', 'endpoint'), ds = by('nuthatch_rpc_request_duration_seconds_sum', 'endpoint');
+  const eps = [...new Set([...Object.keys(req), ...Object.keys(fail), ...Object.keys(retry)])].map(e => ({
+    endpoint: e, requests: req[e] || 0, failures: fail[e] || 0, retries: retry[e] || 0,
+    failure_rate: req[e] ? ((fail[e] || 0) / req[e] * 100).toFixed(2) + '%' : '-', avg_ms: dc[e] ? Math.round(ds[e] / dc[e] * 1000) : null,
+  }));
+  const methods = ml('nuthatch_rpc_methods_total').map(x => ({ method: x.labels.method || Object.values(x.labels).join(' '), calls: x.value }));
+  const buckets = ml('nuthatch_rpc_request_duration_seconds_bucket');
+  const c = r.seal_direct_concurrency || {};
+  let h = '<h2>Outbound RPC</h2><div class="grid">'
+    + stat('requests', num(mv('nuthatch_rpc_requests_total')), fixed(rate('rpc')) + ' req/s over the last minute', '', spark('rpc'))
+    + stat('fetch window', num(r.fetch_window_blocks ?? mv('nuthatch_fetch_window_blocks')), 'blocks per getLogs')
+    + stat('concurrency', num(c.effective) + ' of ' + num(c.requested), c.capped_by || 'not capped')
+    + stat('indexed blocks', fixed(rate('block')) + '/s', 'over the last minute', '', spark('block'))
+    + '</div>';
+  h += '<h2>Endpoints</h2><div class="card"><div class="scroll">' + grid([
+    { key: 'endpoint' }, { key: 'requests', num: 1, fmt: num }, { key: 'failures', num: 1, fmt: num }, { key: 'retries', num: 1, fmt: num },
+    { key: 'failure_rate', label: 'failure rate', num: 1 }, { key: 'avg_ms', label: 'avg ms', num: 1, fmt: num },
+  ], eps, { empty: 'no endpoint has been called yet' }) + '</div></div>';
+  h += '<h2>Methods</h2><div class="card"><div class="scroll">' + grid([{ key: 'method' }, { key: 'calls', num: 1, fmt: num }], methods, { empty: 'no calls yet' }) + '</div></div>';
+  if (buckets.length) {
+    let prev = 0;
+    const rows = buckets.filter(b => !b.labels.endpoint || Object.keys(dc).length <= 1 || true).reduce((acc, b) => { const k = b.labels.le; (acc[k] ||= 0); acc[k] += b.value; return acc; }, {});
+    const hist = Object.entries(rows).sort((a, b) => (a[0] === '+Inf' ? Infinity : +a[0]) - (b[0] === '+Inf' ? Infinity : +b[0])).map(([le, cum]) => { const n = cum - prev; prev = cum; return { up_to: le === '+Inf' ? 'slower' : le + ' s', requests: n }; });
+    h += '<h2>Latency</h2><div class="card"><div class="scroll">' + grid([{ key: 'up_to', label: 'up to' }, { key: 'requests', num: 1, fmt: num }], hist) + '</div></div>';
+  }
+  const rej = ml('nuthatch_sql_rejections_total').filter(x => Object.keys(x.labels).length).map(x => ({ reason: Object.values(x.labels).join(' '), refused: x.value }));
+  h += '<h2>SQL refusals</h2><div class="card"><div class="scroll">' + grid([{ key: 'reason' }, { key: 'refused', num: 1, fmt: num }], rej, { empty: 'none' }) + '</div></div>';
+  const ipfs = Object.keys(S.metrics).filter(k => k.startsWith('nuthatch_ipfs_')).map(k => ({ counter: k.replace('nuthatch_ipfs_', '').replace('_total', ''), value: mv(k) }));
+  if (ipfs.some(x => x.value)) h += '<h2>IPFS</h2><div class="card"><div class="scroll">' + grid([{ key: 'counter' }, { key: 'value', num: 1, fmt: num }], ipfs) + '</div></div>';
+  el.innerHTML = h;
+}
+
+// ---- config ----
+let curFile = 0;
+async function loadConfig(){
+  const el = $('#tab-config');
+  el.innerHTML = '<div class="empty">loading</div>';
+  try {
+    const [cfg, nest] = await Promise.all([api('_admin/config'), S.nest ? S.nest : api('nest')]);
+    S.nest = nest;
+    const r = S.ready || {}, f = r.freshness || {}, run = cfg.running || {}, sql = run.sql || {};
+    let h = '<h2>Running with</h2><div class="card"><div class="kv">'
+      + [['version', run.version], ['chain', run.chain + (nest.chain_id ? ' (' + nest.chain_id + ')' : '')], ['role', run.cursorless ? 'serve only, no cursor' : 'indexing'],
+         ['freshness', (f.mode || '-') + (f.poll_interval_secs ? ', poll every ' + span(f.poll_interval_secs) + ' (' + f.poll_interval_source + ')' : '')],
+         ['fetch window', num(r.fetch_window_blocks) + ' blocks'], ['seal span', num(run.seal_span) + ' blocks'], ['seal table floor', num(run.seal_table_floor) + ' rows'],
+         ['sql concurrency', num(sql.max_concurrency) + ' running, ' + num(sql.max_queued) + ' queued'], ['sql row cap', num(sql.max_rows) + ' rows returned'],
+         ['sql hot scan cap', num(sql.max_hot_rows) + ' rows or ' + bytes(sql.max_hot_bytes)], ['named scan cap', bytes(sql.max_named_scan_bytes)], ['query length cap', bytes(sql.max_query_len)],
+         ['free-form sql', S.queries ? (S.queries.free_form ? 'open' : 'closed') : '-'],
+        ].map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v ?? '-')}</div>`).join('') + '</div></div>';
+    const tbl = (title, rows, cols) => rows && rows.length ? `<h2>${title}</h2><div class="card"><div class="scroll">${grid(cols.map(k => ({ key: k })), rows)}</div></div>` : '';
+    h += tbl('Contracts', nest.contracts, ['alias', 'address']);
+    h += tbl('Templates', nest.templates, ['name', 'abi']);
+    h += tbl('Factories', nest.factories, ['watch', 'event', 'child_param', 'template']);
+    h += tbl('Webhooks', nest.webhooks, ['name', 'table', 'target', 'finality']);
+    const files = cfg.files || [];
+    if (curFile >= files.length) curFile = 0;
+    h += '<h2>Authored files</h2>';
+    if (!files.length) h += '<div class="empty">No authored files could be read from the nest directory.</div>';
+    else h += `<div class="chips" style="margin-bottom:8px">${files.map((x, i) => `<button class="chip ${i === curFile ? 'on' : ''}" data-f="${i}">${esc(x.name)}</button>`).join('')}</div><div class="card"><pre id="filetext">${esc(files[curFile].text)}</pre></div><p class="hint">Read from disk now, so an edit shows here before the restart that applies it. URLs are cut to their host and secrets are withheld. This page does not write; edit the files and restart the nest.</p>`;
+    el.innerHTML = h;
+    el.querySelectorAll('.chip[data-f]').forEach(b => b.onclick = () => { curFile = +b.dataset.f; loadConfig(); });
+  } catch (e) { el.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+// ---- raw ----
+let rawWhat = 'ready';
+async function loadRaw(){
+  const el = $('#tab-raw');
+  const what = ['ready', 'summary', 'nest', 'schema', 'metrics', 'queries', 'derived', 'shape', 'flags'];
+  const path = { summary: '' }[rawWhat] ?? rawWhat;
+  el.innerHTML = `<div class="chips" style="margin-bottom:8px">${what.map(w => `<button class="chip ${w === rawWhat ? 'on' : ''}" data-w="${w}">${w === 'summary' ? '/' : '/' + w}</button>`).join('')}</div><div class="card"><pre id="rawtext">loading</pre></div>`;
+  el.querySelectorAll('.chip').forEach(b => b.onclick = () => { rawWhat = b.dataset.w; loadRaw(); });
+  try {
+    const r = await raw(path); const text = await r.text();
+    let out = text; try { out = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+    $('#rawtext').textContent = out;
+  } catch (e) { $('#rawtext').textContent = e.message; }
+}
+
+// ---- start ----
+api('nest').then(n => { S.nest = n; renderHeader(); }).catch(() => {});
+const first = location.hash.slice(1).split('/')[0];
+show(TABS.includes(first) ? first : 'overview');
+// The summary is server-pushed, and each frame is the cue to read the rest. If the stream cannot
+// connect (a proxy that buffers, a browser without EventSource) the page polls instead.
+let polling = null;
+function startPolling(){
+  if (polling) return;
+  polling = setInterval(() => { if (!document.hidden) tick(); }, 2000);
+  tick();
+}
+(function startLive(){
+  if (!('EventSource' in window)) { startPolling(); return; }
+  let es;
+  try { es = new EventSource(BASE + withToken('_admin/events')); } catch (_) { startPolling(); return; }
+  es.onmessage = e => { if (document.hidden) return; try { tick(JSON.parse(e.data)); } catch (_) {} };
+  es.onerror = () => { es.close(); startPolling(); };
+  tick();
+})();
 </script>
 </body>
 </html>
