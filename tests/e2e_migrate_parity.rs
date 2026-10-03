@@ -146,7 +146,7 @@ async fn migrating_preserves_every_sealed_byte() {
     );
 
     // Stop the cursor before moving files out from under it.
-    cursor.shutdown().await;
+    cursor.shutdown().await.expect("the cursor stops");
 
     // --- The migration. ---
     migrate::run(root, false, false).expect("migrate");

@@ -105,7 +105,7 @@ fn last_block(store: &std::sync::Arc<dyn nuthatch::store::HotStore>) -> Option<S
 }
 
 async fn shutdown(cursor: indexer::ChainCursor) {
-    cursor.shutdown().await;
+    cursor.shutdown().await.expect("the cursor stops");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
