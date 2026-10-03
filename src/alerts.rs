@@ -189,13 +189,13 @@ pub async fn deliver_pending(
                     Ok(resp) => {
                         tracing::warn!(
                             "{}",
-                            retry_line(&url, &format!("returned {}", resp.status()))
+                            retry_line(url, &format!("returned {}", resp.status()))
                         );
                         (seq, Outcome::Retry)
                     }
                     Err(e) => {
                         let e = e.without_url();
-                        tracing::warn!("{}", retry_line(&url, &format!("delivery failed: {e}")));
+                        tracing::warn!("{}", retry_line(url, &format!("delivery failed: {e}")));
                         (seq, Outcome::Retry)
                     }
                 }
