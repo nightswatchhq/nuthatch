@@ -248,6 +248,28 @@ fn a_head_disagreement_pages_as_well() {
     );
 }
 
+/// A known difference printed before the real one must not be what the page names.
+#[test]
+fn the_page_names_the_disagreement_not_a_known_difference() {
+    let r = rig();
+    exits(&r, "sealed", "1");
+    out(
+        &r,
+        "sealed",
+        "    9 nest-only rows are self-collections (payer == collector) KNOWN-DIFF (#1114)\n  deposits nest=4 subgraph=5 matched=4 DIFF\n",
+    );
+    let (code, text) = run(&r);
+    assert_eq!(code, 1, "{text}");
+    let p = posts(&r);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(
+        p[0].contains("deposits nest=4 subgraph=5 matched=4 DIFF"),
+        "{}",
+        p[0]
+    );
+    assert!(!p[0].contains("KNOWN-DIFF"), "{}", p[0]);
+}
+
 /// An exit the script does not define is not a pass and not a known difference.
 #[test]
 fn an_undefined_exit_status_pages() {
