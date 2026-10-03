@@ -20693,8 +20693,6 @@ rpc_urls = ["https://rpc.example"]
         );
     }
 
-    /// A factory set with one rule, so `factory_tables()` yields exactly one announcing table.
-
     /// #1637: a child two factories announce is kept from its earliest announcement on a rebuild,
     /// as the live path keeps it. Folding table by table took whichever table the factory map
     /// yielded first, which changes with every process, so this repeats over fresh maps.
@@ -20766,6 +20764,7 @@ template="early"
             );
         }
     }
+    /// A factory set with one rule, so `factory_tables()` yields exactly one announcing table.
     fn one_rule_factory_set() -> (FactorySet, String) {
         let config: Config = toml::from_str(
             r#"
