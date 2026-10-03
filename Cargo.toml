@@ -129,6 +129,9 @@ ed25519-dalek = "2"
 getrandom = "0.3"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
+# Already in the tree via axum; named so `bind_and_serve` can give hyper a timer (#1660).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-graceful", "service"] }
 # `cors` only. Already in the tree via reqwest, so this adds a feature rather than a crate, and CORS
 # is not worth hand-rolling: getting `Vary: Origin` wrong poisons a shared cache (#1318).
 tower-http = { version = "0.6", features = ["cors"] }
