@@ -1549,7 +1549,7 @@ dependencies = [
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nightswatchhq/burrmill?rev=3e7b9f54f158678aa4130ceaa00844eb89183c9e#3e7b9f54f158678aa4130ceaa00844eb89183c9e"
+source = "git+https://github.com/nightswatchhq/burrmill?rev=4490919c57aea7e296f6ddbba4524362c6056bde#4490919c57aea7e296f6ddbba4524362c6056bde"
 dependencies = [
  "arrow 59.3.0",
  "arrow-schema 59.3.0",
@@ -4925,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "nuthatch"
-version = "4.1.1"
+version = "4.2.0"
 dependencies = [
  "Inflector",
  "alloy-dyn-abi",
