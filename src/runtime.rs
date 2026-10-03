@@ -3175,14 +3175,6 @@ async fn swap_cursor_keys(
     Err(e)
 }
 
-/// The alert delivery task holds a `Store` clone. Dropping its `JoinHandle` detaches it, so a
-/// mount that never publishes routes has to abort the task or redb keeps the file (#1535).
-fn abort_alert_worker(worker: &mut Option<tokio::task::JoinHandle<()>>) {
-    if let Some(w) = worker.take() {
-        w.abort();
-    }
-}
-
 /// `name` is a route key: `<alias>` single-tenant, `<tenant>/<alias>` multi-tenant. Split so a record
 /// lookup works either way, rather than missing every multi-tenant mount and falling through to the
 /// pre-2.0 directory - which would come up empty and re-backfill.
@@ -3943,7 +3935,7 @@ impl RuntimeHandles {
                             .find(|(_, s)| s.chain == chain)
                             .map(|(_, s)| Arc::clone(&s.sql_gate))
                             .unwrap_or_else(crate::serve::new_sql_gate);
-                        let (nest, mut state, mut worker, next) = indexer::build_and_prepare_nest(
+                        let (nest, mut state, worker, next) = indexer::build_and_prepare_nest(
                             &source,
                             prepared,
                             &config,
@@ -3969,10 +3961,8 @@ impl RuntimeHandles {
                         overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
 
                         // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
-                        // The delivery task holds its own store clone. Dropping the `JoinHandle` does not
-                        // stop it, so a rejected mount has to abort the task or the file stays locked (#1535).
                         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                        if lifecycle
+                        let refused = if lifecycle
                             .send(indexer::CursorCommand::Mount {
                                 nest: Box::new(nest),
                                 next,
@@ -3980,26 +3970,25 @@ impl RuntimeHandles {
                             })
                             .is_err()
                         {
-                            abort_alert_worker(&mut worker);
-                            return Err(anyhow::anyhow!(
+                            Some(anyhow::anyhow!(
                                 "cursor on {chain} is gone; cannot mount '{name}'"
-                            ));
-                        }
-                        match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => {
-                                abort_alert_worker(&mut worker);
-                                return Err(anyhow::anyhow!(
+                            ))
+                        } else {
+                            match tokio::time::timeout(UNMOUNT_ACK_TIMEOUT, ack_rx).await {
+                                Ok(Ok(())) => None,
+                                Ok(Err(_)) => Some(anyhow::anyhow!(
                                     "cursor on {chain} stopped while mounting '{name}'"
-                                ));
+                                )),
+                                Err(_) => Some(anyhow::anyhow!(
+                                    "cursor on {chain} did not acknowledge mounting '{name}' within {}s",
+                                    UNMOUNT_ACK_TIMEOUT.as_secs()
+                                )),
                             }
-                            Err(_) => {
-                                abort_alert_worker(&mut worker);
-                                return Err(anyhow::anyhow!(
-                            "cursor on {chain} did not acknowledge mounting '{name}' within {}s",
-                            UNMOUNT_ACK_TIMEOUT.as_secs()
-                        ));
-                            }
+                        };
+                        if let Some(e) = refused {
+                            // Neither the worker's `JoinHandle` nor its abort stops a delivery already on the
+                            // blocking pool, and a retry cannot open the store until that lets go (#1535, #1768).
+                            return Err(indexer::release_refused(e, state, worker).await);
                         }
                         tracing::info!(
                             "nest '{name}' mounted onto the {chain} cursor at block {next}"
@@ -6820,5 +6809,117 @@ mod tests {
             (MountPhase::Accepted, None),
             "the old move worker wrote its outcome onto a claim that is not its own"
         );
+    }
+
+    /// #1768: a refused mount returns only once its store is closed. The alert worker it aborts may
+    /// have a delivery on the blocking pool, holding a store clone, and a retry would hit the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mount_refused_mid_delivery_can_be_retried_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        write_nest_dir(root.path(), "usdc", "ethereum", 1);
+        let dir = MountTable::nest_dir(root.path(), "usdc");
+        let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            config + "\n[[alerts]]\nkinds = [\"sanction_hit\"]\nurl = \"http://127.0.0.1:9/\"\n",
+        )
+        .unwrap();
+        let db = dir.join(crate::config::DB_FILE);
+        {
+            // Indexed already, so preparing asks the source nothing; one undeliverable entry, which
+            // the worker removes without a network call.
+            let store = crate::store::Store::open(&db).unwrap();
+            store.set_meta("last_block", "5").unwrap();
+            store.outbox_push("not json").unwrap();
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::store::outbox_holds()
+            .lock()
+            .unwrap()
+            .insert(db.clone(), (entered_tx, release_rx));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cursor = tokio::spawn(async move {
+            let Some(indexer::CursorCommand::Mount { nest, ack, .. }) = rx.recv().await else {
+                panic!("the first mount reaches the cursor");
+            };
+            tokio::task::spawn_blocking(move || entered_rx.recv())
+                .await
+                .unwrap()
+                .expect("the delivery parks on the blocking pool");
+            drop((nest, ack));
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = release_tx.send(());
+            });
+            let Some(indexer::CursorCommand::Mount { ack, .. }) = rx.recv().await else {
+                panic!("the retry reaches the cursor");
+            };
+            let _ = ack.expect("a live mount waits for its ack").send(());
+        });
+
+        let mut handles = idle_handles(root.path());
+        let source: Arc<dyn Source> = Arc::new(crate::source::UnpolledSource);
+        handles
+            .mount_ctx
+            .sources
+            .insert("ethereum".to_string(), source);
+        handles.lifecycle.insert("ethereum".to_string(), tx);
+
+        let err = handles
+            .mount_dataset("usdc", None, "usdc", None, dir.clone())
+            .await
+            .expect_err("the cursor refused it");
+        assert!(
+            format!("{err:#}").contains("stopped while mounting"),
+            "{err:#}"
+        );
+        handles
+            .mount_dataset("usdc", None, "usdc", None, dir.clone())
+            .await
+            .expect("a retry straight after the refusal opens the store");
+        cursor.await.unwrap();
+        for (_, w) in std::mem::take(&mut handles.alert_workers) {
+            w.abort();
+            let _ = w.await;
+        }
+    }
+
+    /// #1768: a mount that fails to catch up stops its alert worker too. It used to detach it, and
+    /// the worker kept the store open until the process exited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mount_that_fails_to_prepare_leaves_its_store_closed() {
+        let root = tempfile::tempdir().unwrap();
+        write_nest_dir(root.path(), "usdc", "ethereum", 1);
+        let dir = MountTable::nest_dir(root.path(), "usdc");
+        let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            config + "\n[[alerts]]\nkinds = [\"sanction_hit\"]\nurl = \"http://127.0.0.1:9/\"\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handles = idle_handles(root.path());
+        // Never indexed, so preparing asks for the tip, which this source refuses.
+        let source: Arc<dyn Source> = Arc::new(crate::source::UnpolledSource);
+        handles
+            .mount_ctx
+            .sources
+            .insert("ethereum".to_string(), source);
+        handles.lifecycle.insert("ethereum".to_string(), tx);
+
+        let err = handles
+            .mount_dataset("usdc", None, "usdc", None, dir.clone())
+            .await
+            .expect_err("a cold start with no tip cannot be prepared");
+        assert!(format!("{err:#}").contains("tip lookup failed"), "{err:#}");
+        crate::store::Store::open(&dir.join(crate::config::DB_FILE))
+            .expect("the refused mount let go of its store");
     }
 }
