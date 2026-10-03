@@ -188,13 +188,14 @@ pub async fn deliver_pending(
                     Ok(resp) if resp.status().is_success() => (seq, Outcome::Delivered),
                     Ok(resp) => {
                         tracing::warn!(
-                            "alert webhook {url} returned {} - will retry",
-                            resp.status()
+                            "{}",
+                            retry_line(&url, &format!("returned {}", resp.status()))
                         );
                         (seq, Outcome::Retry)
                     }
                     Err(e) => {
-                        tracing::warn!("alert webhook {url} delivery failed: {e} - will retry");
+                        let e = e.without_url();
+                        tracing::warn!("{}", retry_line(&url, &format!("delivery failed: {e}")));
                         (seq, Outcome::Retry)
                     }
                 }
@@ -259,6 +260,15 @@ pub async fn run_delivery_worker(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// A webhook path routinely carries its secret (Slack, Discord, a bearer in the path), so a log line
+/// names the endpoint by scheme and host only (#1663).
+fn retry_line(url: &str, detail: &str) -> String {
+    format!(
+        "alert webhook {} {detail} - will retry",
+        crate::rpc::redact_url(url)
+    )
 }
 
 #[cfg(test)]
@@ -626,6 +636,18 @@ mod tests {
             store.outbox_len(),
             1,
             "a failed delivery is retained, not dropped"
+        );
+    }
+
+    #[test]
+    fn a_retry_line_names_the_endpoint_without_its_secret_path() {
+        let line = super::retry_line(
+            "https://hooks.slack.com/services/T000/B000/SECRETTOKEN",
+            "returned 500",
+        );
+        assert_eq!(
+            line,
+            "alert webhook https://hooks.slack.com returned 500 - will retry"
         );
     }
 }

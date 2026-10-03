@@ -77,7 +77,7 @@ pub fn init_cursors(store: &dyn HotStore, webhooks: &[Webhook], tip: u64) -> Res
         tracing::info!(
             "webhook '{}' registered at block {start} → {}",
             w.name,
-            w.url
+            crate::rpc::redact_url(&w.url)
         );
     }
     Ok(())
