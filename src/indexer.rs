@@ -7244,10 +7244,17 @@ async fn detect_reorg(
         if block >= checkpoint {
             continue;
         }
-        if let Some(canon) = source.block_hash(block).await? {
-            if canon == hash {
-                return Ok(Some(block));
-            }
+        // An unanswered checkpoint may be the ancestor or the seal pin, so walking past it can land
+        // below the watermark, or at 0 if none answers (#1668). A lagging replica clears by the next poll.
+        let Some(canon) = source.block_hash(block).await? else {
+            tracing::warn!(
+                "block {checkpoint} no longer matches its checkpoint, but the source has no hash for \
+                 checkpoint {block}; not rolling back until it answers"
+            );
+            return Ok(None);
+        };
+        if canon == hash {
+            return Ok(Some(block));
         }
     }
     // No checkpoint we hold is canonical, so the fork is deeper than our entire recorded history.
@@ -12700,6 +12707,60 @@ template = "pool"
             detect_reorg(&ForkedSource, &store, 300).await.unwrap(),
             Some(200),
             "the deepest surviving checkpoint below the fork"
+        );
+    }
+
+    /// #1668. The first call reached a node that has forked past 300 and the walk reached a lagging
+    /// replica that answers `None`. That is not a fork deeper than every checkpoint, and an answer of
+    /// 0 re-indexes an unsealed nest from origin and faults a sealed one.
+    #[tokio::test]
+    async fn a_walk_the_source_cannot_answer_is_not_a_fork_at_zero() {
+        /// Answers 300 with a forked hash, `None` for `unanswered`, and agrees everywhere else.
+        struct LaggingReplica {
+            unanswered: &'static [u64],
+        }
+        #[async_trait::async_trait]
+        impl Source for LaggingReplica {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1_000)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(match n {
+                    300 => Some("0xtheirs300".into()),
+                    n if self.unanswered.contains(&n) => None,
+                    n => Some(format!("0xours{n}")),
+                })
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _f: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        for b in [100u64, 200, 300] {
+            store.set_block_hash(b, &format!("0xours{b}")).unwrap();
+        }
+        let lagging = LaggingReplica {
+            unanswered: &[100, 200],
+        };
+        assert_eq!(
+            detect_reorg(&lagging, &store, 300).await.unwrap(),
+            None,
+            "every older checkpoint answered None: that is cannot-tell, not a fork at block 0"
+        );
+        // The unanswered checkpoint may be the seal pin at the watermark; walking past it to 100
+        // would read a lagging replica as a finality violation.
+        let gap = LaggingReplica { unanswered: &[200] };
+        assert_eq!(
+            detect_reorg(&gap, &store, 300).await.unwrap(),
+            None,
+            "the walk skipped an unanswered checkpoint and landed below it"
         );
     }
 
