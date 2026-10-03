@@ -111,6 +111,8 @@ mod fold_cli_stdout;
 mod folds_absent;
 #[path = "gate_audit_cases.rs"]
 mod gate_audit_cases;
+#[path = "gate_refresh_script.rs"]
+mod gate_refresh_script;
 #[cfg(feature = "graph")]
 #[path = "graph_over_indexed_data.rs"]
 mod graph_over_indexed_data;

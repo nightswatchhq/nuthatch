@@ -89,11 +89,33 @@ that nest's busy periods. Every gate run against a copy, the timer's or one by h
 lock elsewhere) and waits for any other: two `serve`s cannot open one redb.
 
 **The copy** lives at `~/release-gate/alloc-nest` and is refreshed from the Lodestar box in Helsinki
-before each run, through the `GATE_REFRESH` hook: rsync the allocations nest's `segments/` (sealed
-segments are immutable and content-addressed, so rsync only adds new ones and drops pruned ones),
-its `nuthatch.toml`, `views/` and `semantic.toml`, and a copy of its `nuthatch.redb`. The redb is
-written while the unit runs, so copy it the way the 2026-10-03 copy was taken and let the gate's
-startup check catch a copy `serve` will not open.
+before each run, through the `GATE_REFRESH` hook, `deploy/release-gate/refresh-from-helsinki.sh`
+(#1774). It has two halves:
+
+- On Helsinki, `deploy/release-gate/helsinki/gate-export.sh` is the forced command of the
+  ThinkPad's key (`~/.ssh/nuthatch-gate`) in root's `authorized_keys`, accepted from the ThinkPad's
+  tailnet address only. It answers `snapshot` and a read-only rsync of its stage
+  (`/var/lib/nuthatch-gate/stage`), and refuses anything else.
+- `snapshot` stages the nest directory: sealed segments hardlinked (they are immutable), the
+  config and views copied, and a copy of `nuthatch.redb`. The redb is open in the unit and redb has
+  no online backup, but a store nothing is writing is a byte image of its last commit, because every
+  commit is fsynced. The nest writes only during an ingest cycle, so the copy is checked rather than
+  timed: the redb and `segments/manifest.json` are hashed before and after, the copy is hashed, and
+  `/ready`'s `last_block` is read on both sides. Any difference means a commit or a seal landed
+  during the copy, and the copy is taken again, up to ten times. It ends with a `PROVENANCE` file
+  carrying the version, `last_block`, `sealed_through` and the sha256s of the redb and manifest.
+  Nothing is stopped.
+- The ThinkPad pulls the stage with rsync into `alloc-nest.incoming`, hardlinking unchanged
+  segments from the current copy. It swaps the new copy in only when the pulled `PROVENANCE` is the
+  snapshot it asked for, the redb and the manifest match their staged sha256s, and
+  `sealed_through` has not gone backwards. The previous copy is kept as `alloc-nest.prev`. Any failure leaves the copy as it was
+  and fails the refresh, which `release-gate-run.sh` posts as `error`. It takes the copy's gate
+  lock, so a refresh run by hand waits for a gate that is serving the copy.
+
+A redb that passes those checks and that `serve` still refuses to open stops the gate at startup:
+`release-gate.sh` exits 2 when `serve` exits before answering `/health`, and the run posts `error`,
+not a verdict. The provenance line of each run (`as_of`, `sealed_through`) shows how fresh the copy
+was.
 
 **The trigger** is `scripts/release-gate-run.sh`:
 
@@ -133,4 +155,4 @@ candidate does not go to production.
 
 A run that has posted any final status is not repeated by `--poll`; re-gate by hand with the tag.
 
-The timer is `deploy/release-gate/release-gate.{service,timer}`, a systemd user unit running `--poll` every 15 minutes from `~/nuthatch-ops`, a worktree of the repo on `main`; the unit file carries the install lines. The copy at `~/release-gate/alloc-nest` is static until a `GATE_REFRESH` hook from Helsinki is set.
+The timer is `deploy/release-gate/release-gate.{service,timer}`, a systemd user unit running `--poll` every 15 minutes from `~/nuthatch-ops`, a worktree of the repo on `main`; the unit file carries the install lines. The unit sets `GATE_REFRESH` to the refresh script, so the Helsinki half must be installed before the unit file is copied over; the install lines are in `gate-export.sh`.
