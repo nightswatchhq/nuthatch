@@ -2787,8 +2787,9 @@ fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
 /// filename order (so `10-foo.sql` can build on nothing and `20-bar.sql` can build on foo). Run
 /// after the per-event table views (§4 of RFC-0002), so views may reference `{alias}__{event}`
 /// tables. Best-effort: a view over a table with no sealed segment yet - or a bad statement - is
-/// skipped with a debug log rather than failing the whole query. Nest SQL is authored by the nest
-/// you chose to consume; it runs read-only in this ephemeral in-memory DuckDB, same trust as `/sql`.
+/// skipped rather than failing the whole query, warned once and named on `/ready` (#1653). Nest SQL
+/// is authored by the nest you chose to consume; it runs read-only in this ephemeral in-memory
+/// DuckDB, same trust as `/sql`.
 ///
 /// `wanted` is the same reachability set `define_views` narrows by (#896): only a view whose name is
 /// in it is (re)defined, and `None` defines every view as before. **The narrowing has to reach here
@@ -2823,11 +2824,60 @@ fn define_nest_views(
                     continue;
                 }
             }
-            if let Err(e) = session.execute(&with_or_replace_view(&stmt)) {
-                tracing::debug!("nest view {} statement skipped: {e}", v.file);
+            let name = view_name(&stmt).unwrap_or_default();
+            let failed = session
+                .execute(&with_or_replace_view(&stmt))
+                .err()
+                .map(|e| e.to_string());
+            let new = note_view_failure(dir, &v.file, &name, failed.clone());
+            // Warned once per fault, since every statement reaching the view defines it again.
+            match failed {
+                Some(e) if new => tracing::warn!("nest view {name} in {} skipped: {e}", v.file),
+                Some(e) => tracing::debug!("nest view {name} in {} skipped: {e}", v.file),
+                None => {}
             }
         }
     }
+}
+
+type ViewFailures =
+    Mutex<std::collections::HashMap<PathBuf, std::collections::BTreeMap<(String, String), String>>>;
+
+fn view_failure_record() -> &'static ViewFailures {
+    static FAILED: OnceLock<ViewFailures> = OnceLock::new();
+    FAILED.get_or_init(Default::default)
+}
+
+/// Record whether one authored view in `dir` last failed to build. True when `error` is a fault
+/// not already recorded for it.
+fn note_view_failure(dir: &Path, file: &str, view: &str, error: Option<String>) -> bool {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut all = view_failure_record()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = (file.to_string(), view.to_string());
+    match error {
+        Some(e) => all.entry(dir).or_default().insert(key, e.clone()) != Some(e),
+        None => {
+            if let Some(failed) = all.get_mut(&dir) {
+                failed.remove(&key);
+            }
+            false
+        }
+    }
+}
+
+/// `(file, view, error)` for each authored view in `dir` whose last build failed, for `/ready`.
+pub(crate) fn view_failures(dir: &Path) -> Vec<(String, String, String)> {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    view_failure_record()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&dir)
+        .into_iter()
+        .flatten()
+        .map(|((file, view), error)| (file.clone(), view.clone(), error.clone()))
+        .collect()
 }
 
 /// Bind immutable offchain snapshots beneath an explicit namespace. They deliberately have no hot
@@ -3032,8 +3082,8 @@ pub struct ViewIssue {
 /// If a query fails against a name DuckDB says doesn't exist, and that name is a nest-authored view
 /// that failed to build, replace the generic "does not exist" + fuzzy-match-on-an-unrelated-table
 /// message with the view's real build error (#539). A view that fails to build is reported as though
-/// it doesn't exist at all - `define_nest_views` loads views per-statement and swallows failures to
-/// `tracing::debug!` for fault isolation, so by the time a query dies at `/sql` there is no record of
+/// it doesn't exist at all - `define_nest_views` loads views per-statement and skips failures for
+/// fault isolation, so by the time a query dies at `/sql` its error carries nothing of
 /// *why* the name is missing, and `sql_errors::enrich`'s fuzzy match then points at an unrelated real
 /// table. This is the one place that record is reconstructed: on the query's error path only (never
 /// on a successful query), rebuild the same base surface `validate_nest_views` uses and replay the
@@ -3281,9 +3331,10 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
         // one pass; withholding it is a choice, and a bad one.
         let mut errors: Vec<String> = Vec::new();
         for stmt in split_sql_statements(&v.sql) {
-            if let Err(e) = session.execute(&stmt) {
-                errors.push(format!("{e}"));
-            }
+            let name = view_name(&stmt).unwrap_or_default();
+            let failed = session.execute(&stmt).err().map(|e| e.to_string());
+            note_view_failure(dir, &v.file, &name, failed.clone());
+            errors.extend(failed);
         }
         if errors.is_empty() {
             continue;
