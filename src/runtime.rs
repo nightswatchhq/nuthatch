@@ -3959,6 +3959,7 @@ impl RuntimeHandles {
                         .await
                         .with_context(|| format!("preparing nest '{name}' for mount"))?;
                         state.runtime_health = Some((name.to_string(), self.health.clone()));
+                        self.health.register(name, &chain);
                         // `/sql` provenance names the dataset that answered (RFC-0035 §3, src/serve.rs:1161-1172), and
                         // this is the only place that knows it at mount time: `nid` above is already the resolved
                         // identity (the caller's, or the record's for a remount), the same one `dir` was derived from
@@ -4229,12 +4230,18 @@ impl RuntimeHandles {
             .enumerate()
             .any(|(i, (_, s))| i != idx && Arc::ptr_eq(&s.store, &self.states[idx].1.store));
         if still_held {
+            // The cursor key names the dataset the other mounts still read, so only an alias goes.
+            if name != cursor_key {
+                self.health.unregister(name);
+            }
             self.publishers.retain(|(n, _)| n != name);
             self.states.remove(idx);
             return self.recompose_after_unmount(name);
         }
 
         self.drain_cursor_nest(&chain, &cursor_key, name).await?;
+        self.health.unregister(name);
+        self.health.unregister(&cursor_key);
         self.publishers.retain(|(n, _)| n != name);
 
         // 3. Drop the serving state - the third - and re-compose without it. Requests already in

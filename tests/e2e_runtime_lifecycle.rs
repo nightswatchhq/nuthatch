@@ -1794,6 +1794,90 @@ async fn a_mount_is_accepted_at_once_and_read_until_it_is_live() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
 }
 
+/// The `nuthatch_nest_health` value the runtime's `/metrics` reports for `nest`, if any.
+async fn nest_health_series(live: &serve::LiveRuntime, nest: &str) -> Option<String> {
+    use tower::ServiceExt;
+    let req = axum::http::Request::get("/metrics")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = live.service().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let prefix = format!("nuthatch_nest_health{{nest=\"{nest}\",");
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .map(str::to_string)
+}
+
+/// #1648: an unmounted mount leaves `nuthatch_nest_health`, whether it was an alias of a dataset
+/// another mount still indexes or the last mount of one. It used to read 1 for ever for the alias,
+/// and 0 for the other until restart, which reads as quarantined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unmounted_nest_leaves_the_health_series() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "7d".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    handles
+        .mount("mirror", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("a second mount of the dataset");
+    for nest in ["usdc", "mirror"] {
+        let line = nest_health_series(&handles.live, nest).await;
+        assert!(
+            line.as_deref().is_some_and(|l| l.ends_with(" 1")),
+            "premise: {nest} is reported indexing: {line:?}"
+        );
+    }
+
+    handles.unmount("mirror").await.expect("unmount the alias");
+    assert_eq!(
+        nest_health_series(&handles.live, "mirror").await,
+        None,
+        "the unmounted alias is still reported"
+    );
+    handles
+        .unmount("usdc")
+        .await
+        .expect("unmount the last mount");
+    assert_eq!(
+        nest_health_series(&handles.live, "usdc").await,
+        None,
+        "the unmounted nest is still reported"
+    );
+
+    // The other order: the dataset keeps the first mount's name on its cursor until the last goes.
+    for name in ["usdc", "mirror"] {
+        handles
+            .mount(name, Some(runtime::Nid::parse(&nid).unwrap()))
+            .await
+            .expect("remount");
+    }
+    for nest in ["usdc", "mirror"] {
+        let line = nest_health_series(&handles.live, nest).await;
+        assert!(
+            line.as_deref().is_some_and(|l| l.ends_with(" 1")),
+            "a remount onto the running cursor is not reported: {nest} {line:?}"
+        );
+    }
+    handles
+        .unmount("usdc")
+        .await
+        .expect("unmount the first mount");
+    handles
+        .unmount("mirror")
+        .await
+        .expect("unmount the last mount");
+    for nest in ["usdc", "mirror"] {
+        assert_eq!(
+            nest_health_series(&handles.live, nest).await,
+            None,
+            "{nest} is still reported once the dataset has no mount"
+        );
+    }
+}
+
 /// #1673: `/_admin/…` belongs to the lifecycle routes, so a mount whose route would start there is
 /// refused over the API, and boot refuses a record that names one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
