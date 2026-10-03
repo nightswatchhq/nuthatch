@@ -116,9 +116,13 @@ fetch() {
 
 commit_of() { gh api "repos/$repo/commits/$1" --jq .sha; }
 
+# The newest status for the context decides. A pending one older than GATE_STALE_SECS is a run that
+# died before posting its verdict, so the release is gated again rather than left pending forever.
 has_status() {
-  gh api "repos/$repo/commits/$1/statuses" --jq "map(select(.context == \"$CONTEXT\")) | length" \
-    | grep -qv '^0$'
+  gh api "repos/$repo/commits/$1/statuses" --jq "[.[] | select(.context == \"$CONTEXT\")] | first
+    | if . == null then \"none\"
+      elif .state == \"pending\" and (now - (.updated_at | fromdate)) > ${GATE_STALE_SECS:-7200} then \"stale\"
+      else .state end" | grep -qvE '^(none|stale)$'
 }
 
 if [ "$poll" -eq 1 ]; then
