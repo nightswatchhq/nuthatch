@@ -43,6 +43,25 @@ pub(crate) trait Engine: Send + Sync {
     /// An unbounded session with no nest behind it, for binding authored SQL to see whether it
     /// parses and validates. Nothing untrusted runs on one.
     fn open_bare(&self) -> Result<Box<dyn Session>>;
+    /// What the live sessions hold against their memory pools, read without their locks (#1778).
+    fn pools(&self) -> Pools;
+}
+
+/// Memory pool use across the engine's live sessions. Each session has a pool of its own, so two
+/// concurrent statements can each reserve up to the configured limit.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Pools {
+    pub total: PoolUse,
+    /// The sessions opened over a nest directory, by that directory.
+    pub by_dir: std::collections::HashMap<PathBuf, PoolUse>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolUse {
+    pub engines: u64,
+    pub reserved: u64,
+    /// The most any one of these sessions' pools has held since start.
+    pub peak: u64,
 }
 
 /// Cancels a running statement from another thread.

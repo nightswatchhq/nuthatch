@@ -144,6 +144,27 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Where the RSS is: pools and allocator",
+      "description": "Pool reserved is what /sql statements hold now; jemalloc allocated is what the program holds, resident what jemalloc keeps in RAM. RSS above resident is outside jemalloc. The jemalloc series exist on Linux glibc builds only.",
+      "gridPos": {"x": 0, "y": 28, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "nuthatch_rss_bytes{unit=~\"$unit\"}", "legendFormat": "{{unit}} rss"},
+        {"refId": "B", "expr": "nuthatch_jemalloc_resident_bytes{unit=~\"$unit\"}", "legendFormat": "{{unit}} jemalloc resident"},
+        {"refId": "C", "expr": "nuthatch_jemalloc_allocated_bytes{unit=~\"$unit\"}", "legendFormat": "{{unit}} jemalloc allocated"},
+        {"refId": "D", "expr": "nuthatch_analytics_pool_reserved_bytes{unit=~\"$unit\"}", "legendFormat": "{{unit}} pool reserved"},
+        {"refId": "E", "expr": "nuthatch_analytics_engines{unit=~\"$unit\"}", "legendFormat": "{{unit}} analytics engines"}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "bytes", "min": 0},
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": ".*analytics engines"}, "properties": [{"id": "unit", "value": "short"}, {"id": "custom.axisPlacement", "value": "right"}]}
+        ]
+      }
     }
   ]
 }

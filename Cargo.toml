@@ -54,6 +54,10 @@ name = "e2e_warm_restart"
 path = "tests/e2e_warm_restart.rs"
 
 [[test]]
+name = "memory_gauges_are_published"
+path = "tests/memory_gauges_are_published.rs"
+
+[[test]]
 name = "skill_refs"
 path = "tests/skill_refs.rs"
 
@@ -206,3 +210,4 @@ strip = true
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }

@@ -3,27 +3,92 @@
 //! A session is one `burrmill::Engine` opened empty, with the tables the policy code binds registered
 //! as it binds them: the segment list, the hot rows, the declared columns and the window.
 
-use crate::engine::{Collected, Died, Engine, FactWindow, Interrupt, Session};
+use crate::engine::{Collected, Died, Engine, FactWindow, Interrupt, Pools, Session};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, TryLockError, Weak};
 
 pub(crate) struct BurrmillEngine;
 
 impl Engine for BurrmillEngine {
-    fn open(&self, _dir: &Path) -> Result<Box<dyn Session>> {
-        Ok(Box::new(BurrmillSession::new()?))
+    fn open(&self, dir: &Path) -> Result<Box<dyn Session>> {
+        Ok(Box::new(BurrmillSession::new(Some(dir))?))
     }
 
     fn open_bare(&self) -> Result<Box<dyn Session>> {
-        Ok(Box::new(BurrmillSession::new()?))
+        Ok(Box::new(BurrmillSession::new(None)?))
+    }
+
+    fn pools(&self) -> Pools {
+        pools()
     }
 }
 
+// Every live session's engine, so a scrape reads the pools without waiting out a statement (#1778).
+static LIVE: Mutex<Vec<(Option<PathBuf>, Weak<RwLock<burrmill::Engine>>)>> = Mutex::new(Vec::new());
+
+struct Peaks {
+    all: u64,
+    by_dir: std::collections::BTreeMap<PathBuf, u64>,
+}
+
+// Burrmill's peak resets when it is read, so every read is folded in here.
+static PEAKS: Mutex<Peaks> = Mutex::new(Peaks {
+    all: 0,
+    by_dir: std::collections::BTreeMap::new(),
+});
+
+fn fold_peak(dir: Option<&Path>, peak: u64) {
+    let mut peaks = PEAKS.lock().unwrap_or_else(|p| p.into_inner());
+    peaks.all = peaks.all.max(peak);
+    if let Some(dir) = dir {
+        let at = peaks.by_dir.entry(dir.to_path_buf()).or_default();
+        *at = (*at).max(peak);
+    }
+}
+
+fn pools() -> Pools {
+    let live: Vec<_> = {
+        let mut live = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+        live.retain(|(_, e)| e.strong_count() > 0);
+        live.iter()
+            .filter_map(|(dir, e)| Some((dir.clone(), e.upgrade()?)))
+            .collect()
+    };
+    let mut out = Pools::default();
+    for (dir, engine) in live {
+        // Held exclusively only while tables are bound, which reserves nothing.
+        let reserved = match engine.try_read() {
+            Ok(e) => Some(e),
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+        .map_or(0, |e| {
+            fold_peak(dir.as_deref(), e.take_memory_peak() as u64);
+            e.memory_reserved() as u64
+        });
+        out.total.engines += 1;
+        out.total.reserved += reserved;
+        if let Some(dir) = dir {
+            let u = out.by_dir.entry(dir).or_default();
+            u.engines += 1;
+            u.reserved += reserved;
+        }
+    }
+    let peaks = PEAKS.lock().unwrap_or_else(|p| p.into_inner());
+    out.total.peak = peaks.all;
+    for (dir, peak) in &peaks.by_dir {
+        out.by_dir.entry(dir.clone()).or_default().peak = *peak;
+    }
+    out
+}
+
 pub(crate) struct BurrmillSession {
-    engine: Mutex<burrmill::Engine>,
+    // Statements take it shared, so a scrape can read the pool while one runs.
+    engine: Arc<RwLock<burrmill::Engine>>,
+    dir: Option<PathBuf>,
     /// Hot rows staged by `load_hot` and how many, the rows taken by the `bind_facts` that binds them.
     hot: Mutex<HashMap<String, (Vec<Value>, usize)>>,
     /// Held for the session's life; removed on drop and swept by pid after a crash.
@@ -117,15 +182,21 @@ impl BurrmillSession {
         }
     }
 
-    fn new() -> Result<Self> {
+    fn new(dir: Option<&Path>) -> Result<Self> {
         let spill = crate::spill::new_spill_dir()?;
         let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
         #[allow(unused_mut)]
         let mut engine = burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?;
         #[cfg(feature = "graph")]
         crate::analytics_scalars::register(&mut engine);
+        let engine = Arc::new(RwLock::new(engine));
+        let dir = dir.map(Path::to_path_buf);
+        LIVE.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((dir.clone(), Arc::downgrade(&engine)));
         Ok(Self {
-            engine: Mutex::new(engine),
+            engine,
+            dir,
             hot: Mutex::new(HashMap::new()),
             _spill: spill,
             views: Mutex::new(std::collections::BTreeMap::new()),
@@ -133,8 +204,12 @@ impl BurrmillSession {
         })
     }
 
-    fn engine(&self) -> std::sync::MutexGuard<'_, burrmill::Engine> {
-        self.engine.lock().unwrap_or_else(|p| p.into_inner())
+    fn engine(&self) -> std::sync::RwLockWriteGuard<'_, burrmill::Engine> {
+        self.engine.write().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn reader(&self) -> std::sync::RwLockReadGuard<'_, burrmill::Engine> {
+        self.engine.read().unwrap_or_else(|p| p.into_inner())
     }
 
     #[cfg(test)]
@@ -144,6 +219,12 @@ impl BurrmillSession {
             .unwrap_or_else(|p| p.into_inner())
             .get(table)
             .map_or(0, |(rows, _)| rows.len())
+    }
+}
+
+impl Drop for BurrmillSession {
+    fn drop(&mut self) {
+        fold_peak(self.dir.as_deref(), self.reader().take_memory_peak() as u64);
     }
 }
 
@@ -284,7 +365,7 @@ impl Session for BurrmillSession {
     }
 
     fn write_parquet(&self, table: &str, path: &Path) -> Result<()> {
-        self.engine()
+        self.reader()
             .write_parquet(&format!("SELECT * FROM \"{table}\" ORDER BY ALL"), path)
             .map_err(engine_err)?;
         Ok(())
@@ -307,7 +388,7 @@ impl Session for BurrmillSession {
         let mut out = Vec::new();
         let mut over = false;
         let mut columns: Vec<String> = Vec::new();
-        let engine = self.engine();
+        let engine = self.reader();
         let r = engine.sql_for_each(sql, |batch| {
             if columns.is_empty() {
                 columns = batch
@@ -370,7 +451,7 @@ impl Session for BurrmillSession {
     }
 
     fn for_each_row(&self, sql: &str, f: &mut dyn FnMut(&[Value]) -> Result<()>) -> Result<()> {
-        let engine = self.engine();
+        let engine = self.reader();
         let mut failed: Option<anyhow::Error> = None;
         let r = engine.sql_for_each(sql, |batch| {
             let names: Vec<String> = batch
@@ -409,7 +490,7 @@ impl Session for BurrmillSession {
 
     /// Through Arrow IPC, because Burrmill's arrow is not nuthatch's.
     fn query_arrow(&self, sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
-        let ipc = self.engine().sql_ipc(sql).map_err(engine_err)?;
+        let ipc = self.reader().sql_ipc(sql).map_err(engine_err)?;
         let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)?;
         Ok(reader.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -417,7 +498,7 @@ impl Session for BurrmillSession {
     /// From the plan: a result with no rows has no batch to read.
     fn column_names(&self, sql: &str) -> Result<Vec<String>> {
         Ok(self
-            .engine()
+            .reader()
             .describe(sql)
             .map_err(engine_err)?
             .into_iter()
@@ -426,16 +507,16 @@ impl Session for BurrmillSession {
     }
 
     fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
-        self.engine().describe(sql).map_err(engine_err)
+        self.reader().describe(sql).map_err(engine_err)
     }
 
     fn has_relation(&self, name: &str) -> bool {
-        self.engine().has_table(name)
+        self.reader().has_table(name)
     }
 
     fn relations(&self) -> Result<BTreeSet<String>> {
         Ok(self
-            .engine()
+            .reader()
             .visible_tables()
             .into_iter()
             .map(|t| t.to_ascii_lowercase())
@@ -473,11 +554,11 @@ impl Session for BurrmillSession {
     }
 
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
-        Arc::new(Cancel(self.engine().cancel_token()))
+        Arc::new(Cancel(self.reader().cancel_token()))
     }
 
     fn cold_scan_operators(&self, sql: &str) -> Result<u64> {
-        self.engine()
+        self.reader()
             .parquet_scans(sql)
             .map_err(|e| crate::analytics::unboundable(e.to_string()))
     }
@@ -666,13 +747,13 @@ mod tests {
         assert_eq!(budget.memory_bytes, 512 << 20);
         assert_eq!(budget.threads, 2);
         assert_eq!(budget.spill, Some((spill.0.clone(), 2 << 30)));
-        assert!(super::BurrmillSession::new().is_ok());
+        assert!(super::BurrmillSession::new(None).is_ok());
     }
 
     #[test]
     fn burrmill_keys_derivations_by_its_own_parse_and_build() {
         use crate::engine::Session;
-        let s = super::BurrmillSession::new().unwrap();
+        let s = super::BurrmillSession::new(None).unwrap();
         let a = s.canonical_plan("SELECT a.x FROM t a -- c\nWHERE a.y > 1");
         assert!(a.is_some());
         assert_eq!(a, s.canonical_plan("select b.x from t b where b.y > 1"));
@@ -680,11 +761,57 @@ mod tests {
         assert!(s.engine_version().starts_with("burrmill "));
     }
 
+    /// #1778: a scrape during a statement reads what it holds, not a peak and not a value held
+    /// behind the statement's lock.
+    #[test]
+    fn a_running_statement_shows_in_its_pool_and_its_peak_outlives_the_session() {
+        use crate::engine::{FactWindow, Session};
+        let dir = tempfile::tempdir().unwrap();
+        let s = super::BurrmillSession::new(Some(dir.path())).unwrap();
+        let rows: Vec<serde_json::Value> = (1..=5000)
+            .map(|b| serde_json::json!({ "block_number": b, "n": format!("{:08}", 7919 * b % 5003) }))
+            .collect();
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        s.load_hot("t", &refs).unwrap();
+        assert!(s
+            .bind_facts("t", &[], &[], true, FactWindow::default())
+            .unwrap());
+        let mine = || {
+            super::pools()
+                .by_dir
+                .get(dir.path())
+                .copied()
+                .unwrap_or_default()
+        };
+
+        let mut during = None;
+        s.for_each_row("SELECT n, block_number FROM t ORDER BY n", &mut |_| {
+            during.get_or_insert_with(mine);
+            Ok(())
+        })
+        .unwrap();
+        let during = during.expect("the sort returned rows");
+        assert_eq!(during.engines, 1);
+        assert!(
+            during.reserved > 0,
+            "the sort was emitting and its pool read {during:?}"
+        );
+        assert_eq!(mine().reserved, 0, "the statement is done");
+
+        drop(s);
+        let after = mine();
+        assert_eq!(after.engines, 0);
+        assert!(
+            after.peak >= during.reserved,
+            "the peak was folded in when the session dropped: {after:?} against {during:?}"
+        );
+    }
+
     /// #1677: a cached session held its hot rows twice, as the staged JSON and as the bound table.
     #[test]
     fn binding_releases_the_staged_hot_rows() {
         use crate::engine::{FactWindow, Session};
-        let s = super::BurrmillSession::new().unwrap();
+        let s = super::BurrmillSession::new(None).unwrap();
         let rows: Vec<serde_json::Value> = (1..=1000)
             .map(|b| serde_json::json!({ "block_number": b, "n": b.to_string() }))
             .collect();
@@ -742,7 +869,7 @@ mod tests {
     #[test]
     fn a_hidden_registration_name_is_refused() {
         use crate::engine::Session;
-        let s = super::BurrmillSession::new().unwrap();
+        let s = super::BurrmillSession::new(None).unwrap();
         let err = s
             .reach("SELECT max(block_number) FROM t__union")
             .unwrap()

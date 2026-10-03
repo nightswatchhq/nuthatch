@@ -1052,6 +1052,33 @@ impl Metrics {
             "Resident set size of this process, in bytes.",
             rss,
         ));
+        let pools = crate::analytics::engine().pools();
+        s.push_str(&gauge(
+            "nuthatch_analytics_pool_reserved_bytes",
+            "Bytes the statements in flight hold against the analytics engines' memory pools, summed over every live engine.",
+            pools.total.reserved,
+        ));
+        s.push_str(&gauge(
+            "nuthatch_analytics_pool_peak_bytes",
+            "The most any one analytics engine's memory pool has held since start.",
+            pools.total.peak,
+        ));
+        s.push_str(&gauge(
+            "nuthatch_analytics_engines",
+            "Live analytics engines. Each has its own memory pool, bounded by NUTHATCH_BURRMILL_MEMORY_LIMIT.",
+            pools.total.engines,
+        ));
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+        if let Some(stats) = jemalloc_stats() {
+            for (name, help, v) in [
+                ("nuthatch_jemalloc_allocated_bytes", "Bytes the program holds allocated through jemalloc (stats.allocated).", stats.allocated),
+                ("nuthatch_jemalloc_active_bytes", "Bytes in pages jemalloc has handed out to allocations (stats.active).", stats.active),
+                ("nuthatch_jemalloc_resident_bytes", "Bytes in pages jemalloc has resident, its metadata included (stats.resident).", stats.resident),
+                ("nuthatch_jemalloc_retained_bytes", "Bytes jemalloc keeps mapped but has returned to the OS, so not in RSS (stats.retained).", stats.retained),
+            ] {
+                s.push_str(&gauge(name, help, v));
+            }
+        }
         if !multi_nest {
             s.push_str(&gauge(
                 "nuthatch_last_poll_unixtime",
@@ -1323,6 +1350,32 @@ impl Metrics {
                 "gauge",
                 &|m| m.dataset_storage_bytes().1,
             );
+            let pool = |m: &NestMetrics| {
+                m.dataset
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|d| pools.by_dir.get(d).copied())
+                    .unwrap_or_default()
+            };
+            labelled(
+                "nuthatch_nest_analytics_pool_reserved_bytes",
+                "Bytes statements in flight hold against the pools of the analytics engines opened over this nest's dataset.",
+                "gauge",
+                &|m| pool(m).reserved,
+            );
+            labelled(
+                "nuthatch_nest_analytics_pool_peak_bytes",
+                "The most any one analytics engine opened over this nest's dataset has held since start.",
+                "gauge",
+                &|m| pool(m).peak,
+            );
+            labelled(
+                "nuthatch_nest_analytics_engines",
+                "Live analytics engines opened over this nest's dataset, each with its own pool.",
+                "gauge",
+                &|m| pool(m).engines,
+            );
             labelled(
                 "nuthatch_nest_tip_height",
                 "Latest source block height, per nest and therefore per chain.",
@@ -1548,6 +1601,27 @@ pub fn rss_bytes() -> u64 {
         }
     }
     0
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+struct JemallocStats {
+    allocated: u64,
+    active: u64,
+    resident: u64,
+    retained: u64,
+}
+
+/// jemalloc's counters, refreshed now: they hold still until the epoch advances.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+fn jemalloc_stats() -> Option<JemallocStats> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok()?;
+    Some(JemallocStats {
+        allocated: stats::allocated::read().ok()? as u64,
+        active: stats::active::read().ok()? as u64,
+        resident: stats::resident::read().ok()? as u64,
+        retained: stats::retained::read().ok()? as u64,
+    })
 }
 
 /// Host[:port] of an RPC URL, never a scheme or path. An API key in a metric label is a
