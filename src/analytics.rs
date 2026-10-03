@@ -1146,7 +1146,7 @@ fn attempt(
         // this - they only touch the raw per-event tables.
         define_nest_views(session, dir, wanted.as_ref());
         let offchain = if as_of.is_none() {
-            define_offchain_views(session, dir, wanted.as_ref())
+            define_offchain_views(session, dir, wanted.as_ref())?
         } else {
             Default::default()
         };
@@ -2833,18 +2833,19 @@ fn define_nest_views(
 /// Bind immutable offchain snapshots beneath an explicit namespace. They deliberately have no hot
 /// half, no watermark, and no path back into chain replay: they are query inputs only.
 /// Returns each view it defined and the content hashes of the snapshots behind it, in append order,
-/// so an answer can name what it read (#1437).
+/// so an answer can name what it read (#1437). A view the statement names that will not bind is its
+/// error rather than an absent table (#1678).
 fn define_offchain_views(
     session: &dyn Session,
     dir: &Path,
     wanted: Option<&std::collections::BTreeSet<String>>,
-) -> std::collections::BTreeMap<String, Vec<String>> {
+) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
     let mut defined = std::collections::BTreeMap::new();
     let Ok(catalogue) = crate::offchain::load(dir) else {
         tracing::warn!(
             "offchain provenance manifest is unreadable; no offchain views were defined"
         );
-        return defined;
+        return Ok(defined);
     };
     for (table, snapshots) in &catalogue.tables {
         let view = format!("offchain__{table}");
@@ -2864,6 +2865,7 @@ fn define_offchain_views(
             Ok(()) => {
                 defined.insert(view, present.iter().map(|(s, _)| s.hash.clone()).collect());
             }
+            Err(e) if wanted.is_some() => return Err(e.context(format!("{view} will not bind"))),
             Err(e) => tracing::warn!("offchain view {view} skipped: {e}"),
         }
     }
@@ -2879,7 +2881,7 @@ fn define_offchain_views(
             tracing::warn!("offchain status view {view} skipped: {e}");
         }
     }
-    defined
+    Ok(defined)
 }
 
 /// `stale` is true on a recorded failure, before any success, or past the declared cadence. Views
@@ -4223,6 +4225,44 @@ mod tests {
         let current = query_hot_cold(dir.path(), sql, guard, &hot, 0, &[]).unwrap();
         assert_eq!(current.rows[0]["symbol"], "GRT");
         assert!(current.offchain.unwrap().contains_key("offchain__prices"));
+    }
+
+    /// #1678: a table's snapshots are unioned by name, and Burrmill will not bind a column whose type
+    /// differs between them. A statement naming the view is told which column, not that it is absent.
+    #[test]
+    fn a_snapshot_view_that_will_not_bind_names_its_column() {
+        use arrow::array::{ArrayRef, Int32Array, Int64Array};
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, column: ArrayRef| {
+            let path = dir.path().join(name);
+            let batch = arrow::record_batch::RecordBatch::try_from_iter([("v", column)]).unwrap();
+            let file = std::fs::File::create(&path).unwrap();
+            let mut w = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            path
+        };
+        let narrow = write("a.parquet", Arc::new(Int32Array::from(vec![1, 2])));
+        let wide = write("b.parquet", Arc::new(Int64Array::from(vec![3])));
+        crate::offchain::drop_file(dir.path(), &narrow, "prices").unwrap();
+        crate::offchain::drop_file(dir.path(), &wide, "prices").unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 100,
+        };
+        let run = |sql: &str| query_hot_cold(dir.path(), sql, guard, &HotRows::new(), 0, &[]);
+        let err = format!(
+            "{:#}",
+            run("SELECT count(*) AS n FROM offchain__prices").unwrap_err()
+        );
+        assert!(
+            err.contains("offchain__prices")
+                && err.contains("'v'")
+                && err.contains("Int32")
+                && err.contains("Int64"),
+            "the view went without naming its column: {err}"
+        );
+        assert!(run("SELECT 1 AS one").is_ok(), "a statement not naming it");
     }
 
     #[test]
