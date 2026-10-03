@@ -125,7 +125,7 @@ fn init_nest(nest: &Path, rpc_port: u16) {
         .arg("--abi")
         .arg(&abi)
         .arg("--dir")
-        .arg(&nest)
+        .arg(nest)
         .output()
         .expect("run init");
     assert!(
