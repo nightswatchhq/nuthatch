@@ -16177,6 +16177,42 @@ template = "pool"
         let m = seal::load_manifest(d.path()).unwrap();
         let sealed: usize = m.tables.values().flatten().map(|s| s.rows).sum();
         assert_eq!(sealed, 30_000, "every row sealed once");
+
+        // A right half whose first block alone is over what is left keeps that block whole: the
+        // budget plus at most one block.
+        let logs: Vec<_> = (10u64..=11)
+            .flat_map(|b| (0..15_000).map(move |li| transfer_log(b, li)))
+            .collect();
+        let source = ResultCapSource::new(logs, 15_000);
+        let d = tempfile::tempdir().unwrap();
+        let mut widest = 0u64;
+        let total = backfill_direct_pipelined(
+            &source,
+            &reg,
+            d.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            11,
+            1_000,
+            SPAN_OFF,
+            1,
+            |_| Ok(()),
+            |_, n, _| widest = widest.max(n),
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 30_000, "an oversized block is kept, not dropped");
+        assert!(
+            widest <= 35_000,
+            "{widest} rows: more than the budget plus one block"
+        );
+        let m = seal::load_manifest(d.path()).unwrap();
+        let sealed: usize = m.tables.values().flatten().map(|s| s.rows).sum();
+        assert_eq!(sealed, 30_000);
     }
 
     /// #1671: while the rest of a cut window is fetched, no further windows are issued, or every one
