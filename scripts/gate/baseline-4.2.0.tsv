@@ -1,6 +1,6 @@
 # release-gate baseline: nuthatch 4.2.0, 2026-10-03T11:19:45Z, 3 pass(es)
-# nest: /Users/pepe/corpus/alloc-nest-copy-20261003 "as_of":511249726,"sealed_through":511198017
-# set: /Users/pepe/Projects/nuthatch/.claude/worktrees/agent-a9c95726c50586c1d/scripts/gate/alloc-queries.tsv
+# nest: <copy>/alloc-nest-copy-20261003 "as_of":511249726,"sealed_through":511198017
+# set: scripts/gate/alloc-queries.tsv
 # id<TAB>consumer<TAB>status<TAB>rows<TAB>median ms<TAB>truncated<TAB>detail
 indexers	lodestar	ok	97	1871	false	
 curators	lodestar	ok	41	23	false	
