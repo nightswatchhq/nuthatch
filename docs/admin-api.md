@@ -55,9 +55,10 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 changes on a restart, whatever else is mounted. A name is one or two parts, `alias` or `tenant/alias`,
 each of letters, digits, `_` and `-` and at most 64 characters; an alias may not end in `__moving`,
 which a move reserves, and the default tenant is never spelled out (`usdc`, not `default/usdc`, nor
-`acme/usdc` when `[runtime] default_tenant = "acme"`). Any
-other name is refused with `400` before anything is recorded. `/<name>/ready` answers for the nest
-itself, and `GET /nests` lists the roster.
+`acme/usdc` when `[runtime] default_tenant = "acme"`). Neither part may be `health`, `nests` or `_admin`,
+which are the runtime's own routes; boot refuses those too. Any other name is refused with `400`
+before anything is recorded. `/<name>/ready` answers for the nest itself, and `GET /nests` lists the
+roster.
 
 ### Mounts are jobs
 
@@ -80,10 +81,11 @@ cursor and backfills inside it, so it is `live` while history is still arriving.
 `true` while it catches up, since readiness means serving and advancing.
 
 A second `POST` of the same name and NID is idempotent: `202` with the running job, or `200` once it is
-live. The same name with another NID is `409`; changing a live mount's nest is a move.
+live. The same name with another NID is `409`, whether that name is live, mounting or suspended;
+changing a live mount's nest is a move.
 
-`?wait=true` answers only when the mount has finished, with the synchronous statuses below. Use it from
-a script; a platform should poll.
+`?wait=true` answers only when the mount has finished, with the synchronous statuses below, and a repeat
+of a live mount is `200` there too. Use it from a script; a platform should poll.
 
 ### Refusals
 
@@ -114,10 +116,11 @@ NID has to be fetched it is fetched and verified, and stays installed.
 }
 ```
 
-`refusal_status` is the status a real mount would answer. `tip` is known only for a chain whose cursor
-is running; a dry run dials nothing. `per_block_rpc` lists extraction that costs calls per block beyond
-the shared `eth_getLogs`, which is what makes a nest expensive to index. `shares` names a mount that
-already indexes this dataset, in which case the mount costs nothing further.
+`refusal_status` is the status a real mount would answer; a mount already live on that NID reads
+`"mounted": true` with no refusal, as its repeat answers `200`. `tip` is known only for a chain whose
+cursor is running; a dry run dials nothing. `per_block_rpc` lists extraction that costs calls per block
+beyond the shared `eth_getLogs`, which is what makes a nest expensive to index. `shares` names a mount
+that already indexes this dataset, in which case the mount costs nothing further.
 
 ### Suspend and resume
 
@@ -136,7 +139,7 @@ error between. The old nest is then taken off its cursor. A move keeps its chain
 
 Unmounting keeps the dataset, so a remount is free. `?reclaim=true` on the unmount, or
 `DELETE /_admin/datasets/<nid>` later, removes it once no mount names it; a dataset another mount still
-uses is kept and the answer says by whom:
+uses, or a mount still in progress is fetching or joining, is kept and the answer says by whom:
 
 ```json
 {"outcome": "kept", "nid": "9f2c…", "mounted_by": ["acme/usdc"]}

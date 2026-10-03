@@ -984,7 +984,8 @@ rows, so neither the document nor any row was written),
 `nuthatch_nest_ipfs_retries_total` (failed document fetches tried again, each also a warn line naming
 the CID, block, attempt, error and the wait before the next; a window paused on a gateway shows here),
 `nuthatch_nest_seal_direct_fetched`,
-`nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_health` (1 indexing / 0 quarantined),
+`nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_health` (1 indexing / 0 quarantined; an unmounted or
+suspended mount has no series),
 `nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
 
 A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:

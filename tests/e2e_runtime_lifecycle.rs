@@ -1164,14 +1164,14 @@ async fn the_lifecycle_routes_demand_the_admin_token_before_they_act() {
     );
 
     // 3. Positive controls: with the credential the same two routes reach their handlers, so the 401s
-    //    above are the guard talking and not a broken route. `usdc` is already mounted, which is
-    //    RFC-0027 §3's AlreadyMounted refusal - it proves the mount logic ran.
+    //    above are the guard talking and not a broken route. `usdc` is already mounted on no nid, so
+    //    another nid under it is RFC-0027 §3's AlreadyMounted refusal - it proves the mount logic ran.
     let (status, body) = call(
         &routes,
         "POST",
         &format!("/_admin/nests?token={TOKEN}&wait=true"),
         None,
-        Some(r#"{"name":"usdc"}"#),
+        Some(&format!(r#"{{"name":"usdc","nid":"{}"}}"#, "0a".repeat(32))),
     )
     .await;
     assert_eq!(
@@ -1794,6 +1794,218 @@ async fn a_mount_is_accepted_at_once_and_read_until_it_is_live() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
 }
 
+/// The `nuthatch_nest_health` value the runtime's `/metrics` reports for `nest`, if any.
+async fn nest_health_series(live: &serve::LiveRuntime, nest: &str) -> Option<String> {
+    use tower::ServiceExt;
+    let req = axum::http::Request::get("/metrics")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = live.service().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let prefix = format!("nuthatch_nest_health{{nest=\"{nest}\",");
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .map(str::to_string)
+}
+
+/// Every `/metrics` line labelled with `nest`.
+async fn series_naming(live: &serve::LiveRuntime, nest: &str) -> Vec<String> {
+    use tower::ServiceExt;
+    let req = axum::http::Request::get("/metrics")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = live.service().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let label = format!("nest=\"{nest}\"");
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|l| l.contains(&label))
+        .map(str::to_string)
+        .collect()
+}
+
+/// #1648: an unmounted mount leaves `nuthatch_nest_health`, whether it was an alias of a dataset
+/// another mount still indexes or the last mount of one. It used to read 1 for ever for the alias,
+/// and 0 for the other until restart, which reads as quarantined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unmounted_nest_leaves_the_health_series() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "7d".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    handles
+        .mount("mirror", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("a second mount of the dataset");
+    for nest in ["usdc", "mirror"] {
+        let line = nest_health_series(&handles.live, nest).await;
+        assert!(
+            line.as_deref().is_some_and(|l| l.ends_with(" 1")),
+            "premise: {nest} is reported indexing: {line:?}"
+        );
+    }
+
+    handles.unmount("mirror").await.expect("unmount the alias");
+    assert_eq!(
+        nest_health_series(&handles.live, "mirror").await,
+        None,
+        "the unmounted alias is still reported"
+    );
+    handles
+        .unmount("usdc")
+        .await
+        .expect("unmount the last mount");
+    assert_eq!(
+        nest_health_series(&handles.live, "usdc").await,
+        None,
+        "the unmounted nest is still reported"
+    );
+
+    // The other order: the first mount goes while the alias still reads the dataset, and the
+    // alias takes the dataset's key on the cursor.
+    for name in ["usdc", "mirror"] {
+        handles
+            .mount(name, Some(runtime::Nid::parse(&nid).unwrap()))
+            .await
+            .expect("remount");
+    }
+    for nest in ["usdc", "mirror"] {
+        let line = nest_health_series(&handles.live, nest).await;
+        assert!(
+            line.as_deref().is_some_and(|l| l.ends_with(" 1")),
+            "a remount onto the running cursor is not reported: {nest} {line:?}"
+        );
+    }
+    handles
+        .unmount("usdc")
+        .await
+        .expect("unmount the first mount");
+    assert_eq!(
+        nest_health_series(&handles.live, "usdc").await,
+        None,
+        "the first mount is still reported after it was unmounted, while an alias remains"
+    );
+    let line = nest_health_series(&handles.live, "mirror").await;
+    assert!(
+        line.as_deref().is_some_and(|l| l.ends_with(" 1")),
+        "the alias left on the dataset lost its health series: {line:?}"
+    );
+    // The dataset is still indexed, and the series it emits now carry the mount that is left.
+    let gone = series_naming(&handles.live, "usdc").await;
+    assert!(
+        gone.is_empty(),
+        "series still name the unmounted first mount: {gone:?}"
+    );
+    handles
+        .unmount("mirror")
+        .await
+        .expect("unmount the last mount");
+    for nest in ["usdc", "mirror"] {
+        assert_eq!(
+            nest_health_series(&handles.live, nest).await,
+            None,
+            "{nest} is still reported once the dataset has no mount"
+        );
+    }
+}
+
+/// #1673: `/_admin/…` belongs to the lifecycle routes, so a mount whose route would start there is
+/// refused over the API, and boot refuses a record that names one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_named_admin_is_refused_over_the_api_and_at_boot() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "7c".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+
+    for name in ["_admin", "_admin/suspend", "_admin/mounts", "acme/_admin"] {
+        let body = format!(r#"{{"name":"{name}","nid":"{nid}"}}"#);
+        for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+            let (status, answer) = call(&routes, "POST", uri, None, Some(&body)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{uri} accepted '{name}': {answer}"
+            );
+            assert!(answer.contains("reserved"), "{name}: {answer}");
+        }
+        assert!(jobs.get(name).is_none(), "'{name}' was recorded as a job");
+    }
+    assert_eq!(handles.lock().await.states.len(), 1);
+
+    for (tenant, alias) in [("default", "_admin"), ("_admin", "usdc")] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(runtime::MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+                 chain_id = 42161\nrpc_urls = []\n\n[[mounts]]\ntenant = \"{tenant}\"\n\
+                 alias = \"{alias}\"\nnid = \"{nid}\"\n"
+            ),
+        )
+        .unwrap();
+        let err = runtime::MountTable::load(dir.path())
+            .expect_err("boot loaded a mount routed under /_admin");
+        assert!(format!("{err:#}").contains("reserved"), "{err:#}");
+    }
+}
+
+/// #1646: `?wait=true` is idempotent as the job route is. A repeat of a live mount's name and NID
+/// answers 200, and another NID under the name is still a 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waited_mount_repeated_is_idempotent() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "7a".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+
+    for body in [
+        format!(r#"{{"name":"usdc","nid":"{nid}"}}"#),
+        r#"{"name":"usdc"}"#.to_string(),
+    ] {
+        for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+            let (status, answer) = call(&routes, "POST", uri, None, Some(&body)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "a repeat of a live mount on {uri} with {body}: {answer}"
+            );
+        }
+        let (_, dry) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?dry_run=true",
+            None,
+            Some(&body),
+        )
+        .await;
+        let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+        assert!(
+            dry["refusal_status"].is_null(),
+            "the dry run refuses what the mount answers 200: {dry}"
+        );
+    }
+    let other = format!(r#"{{"name":"usdc","nid":"{}"}}"#, "7b".repeat(32));
+    for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+        let (status, answer) = call(&routes, "POST", uri, None, Some(&other)).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{uri}: {answer}");
+    }
+    assert_eq!(handles.lock().await.states.len(), 1);
+    assert_eq!(status_of(&handles).await, axum::http::StatusCode::OK);
+}
+
 async fn status_of(
     handles: &Arc<tokio::sync::Mutex<runtime::RuntimeHandles>>,
 ) -> axum::http::StatusCode {
@@ -2019,6 +2231,52 @@ async fn suspend_and_resume_over_the_admin_api() {
     assert!(body.contains("\"was_mounted\":false"), "{body}");
     let (status, body) = call(&routes, "DELETE", "/_admin/nests/a/b/c", None, None).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// #1645: a suspended name is still that NID's mount. Mounting another NID under it is a 409 on
+/// either route, and leaves the suspension and its record as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mounting_another_nid_over_a_suspended_name_is_refused() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6e".repeat(32);
+    let other = "6f".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    scaffold_nest(
+        &runtime::MountTable::data_dir(roost.path(), &other),
+        "usdc",
+        USDC,
+    );
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+    let body = format!(r#"{{"name":"usdc","nid":"{other}"}}"#);
+    for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+        let (status, answer) = call(&routes, "POST", uri, None, Some(&body)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "{uri} mounted another nid over a suspended name: {answer}"
+        );
+    }
+    let job = wait_for_phase(&routes, "usdc", "suspended").await;
+    assert_eq!(job["phase"], "suspended", "{job}");
+    assert_eq!(job["nid"], nid.as_str(), "{job}");
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    assert_eq!(file.runtime.suspended, vec!["usdc".to_string()]);
+    assert_eq!(file.mounts.len(), 1);
+    assert_eq!(
+        file.mounts[0].nid, nid,
+        "the suspended record was rewritten"
+    );
+    assert_eq!(
+        status_of(&handles).await,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 /// #1642: a localhost runtime needs no token, so the only thing between a hostile page and the
@@ -2385,6 +2643,7 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         let nid = "7c".repeat(32);
         let (mut handles, _tape, mut intake) = empty_runtime(roost.path(), &nid).await;
         let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+        let already_mounted = matches!(case, Case::AlreadyMounted);
         match case {
             Case::Admitted => {}
             Case::AlreadyMounted => handles
@@ -2407,7 +2666,13 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         let _ = intake.try_recv();
         let handles = Arc::new(tokio::sync::Mutex::new(handles));
         let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
-        let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
+        // A repeat of the live mount on its own nid is idempotent, so the refusal is another nid.
+        let asked = if already_mounted {
+            "7d".repeat(32)
+        } else {
+            nid.clone()
+        };
+        let body = format!(r#"{{"name":"usdc","nid":"{asked}"}}"#);
 
         let (status, dry) = call(
             &routes,

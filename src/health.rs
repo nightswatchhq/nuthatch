@@ -85,6 +85,12 @@ impl RuntimeHealth {
             .insert(alias.to_string(), canonical.to_string());
     }
 
+    /// Forget a mount that is gone, so `/metrics` stops describing it (#1648).
+    pub fn unregister(&self, nest: &str) {
+        self.chain_of.write().unwrap().remove(nest);
+        self.shares.write().unwrap().remove(nest);
+    }
+
     /// Make a former alias the mount its shared dataset is known by (#1549): a move took the old
     /// canonical name off the dataset, and this mount indexes it now.
     pub fn make_canonical(&self, nest: &str, chain: &str) {
