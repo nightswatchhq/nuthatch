@@ -497,15 +497,20 @@ async fn await_catchup_probe(
     }
 }
 
-/// Abort `handle` and wait until the task is actually gone. `JoinHandle::abort` only requests
-/// cancellation (#1314).
+/// Abort `handle`, wait until the task is actually gone (#1314), then until `store` has no commit
+/// still running on the blocking pool, which an abort does not stop (#1767).
 pub async fn quiesce_ingest(
     handle: &mut tokio::task::JoinHandle<Result<()>>,
+    store: &dyn crate::store::HotStore,
     join_for: std::time::Duration,
 ) -> Result<()> {
     handle.abort();
-    match tokio::time::timeout(join_for, &mut *handle).await {
-        Ok(_) => Ok(()),
+    let stopped = async {
+        let _ = (&mut *handle).await;
+        store.settle_commits().await;
+    };
+    match tokio::time::timeout(join_for, stopped).await {
+        Ok(()) => Ok(()),
         Err(_) => anyhow::bail!("old ingest did not stop within {join_for:?}"),
     }
 }
@@ -590,6 +595,7 @@ fn abandon_or_head(
 /// A stall must not call quiesce: the old writer is still the live backing.
 async fn wait_live_then_quiesce(
     ingest_old: &mut tokio::task::JoinHandle<Result<()>>,
+    old_store: &dyn crate::store::HotStore,
     probe: impl FnMut() -> Result<Option<u64>>,
     snapshot: Option<u64>,
     poll: std::time::Duration,
@@ -598,10 +604,12 @@ async fn wait_live_then_quiesce(
 ) -> Result<Option<u64>, UpgradeAbandon> {
     let wait = wait_until_caught_up_probe(probe, snapshot, poll, stall).await;
     let head = abandon_or_head(wait, false)?;
-    quiesce_ingest(ingest_old, quiesce_for).await.map_err(|e| {
-        tracing::warn!(error = %e, "old ingest did not stop after abort");
-        UpgradeAbandon::QuiesceTimeout
-    })?;
+    quiesce_ingest(ingest_old, old_store, quiesce_for)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "old ingest did not stop after abort");
+            UpgradeAbandon::QuiesceTimeout
+        })?;
     Ok(head)
 }
 
@@ -621,6 +629,7 @@ async fn prove_and_quiesce_for_flip(
     })?;
     wait_live_then_quiesce(
         ingest_old,
+        old_store,
         || new_store.indexed_head(),
         snapshot,
         poll,
@@ -12001,6 +12010,8 @@ template = "pool"
                 self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("hot.redb")).unwrap();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut handle = tokio::spawn({
@@ -12019,12 +12030,43 @@ template = "pool"
         while !started.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
-        quiesce_ingest(&mut handle, std::time::Duration::from_secs(2))
+        quiesce_ingest(&mut handle, &store, std::time::Duration::from_secs(2))
             .await
             .expect("quiesce");
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "Drop must have run: abort without awaiting leaves the writer alive"
+        );
+    }
+
+    /// #1767. Aborting ingest mid-commit leaves the commit running on the blocking pool, so the
+    /// head read after quiesce must already include it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiesce_waits_for_a_commit_left_on_the_blocking_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("hot.redb")).unwrap();
+        store.commit_window(&[], None, 5).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *store.commit_hold.lock().unwrap() = Some((entered_tx, release_rx));
+        let mut handle = tokio::spawn({
+            let store = store.clone();
+            async move { store.commit_window_blocking(Vec::new(), None, 10).await }
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = release_tx.send(());
+        });
+        quiesce_ingest(&mut handle, &store, std::time::Duration::from_secs(5))
+            .await
+            .expect("quiesce");
+        assert_eq!(
+            store.indexed_head().unwrap(),
+            Some(10),
+            "the head read after quiesce missed a window that was still committing"
         );
     }
 
@@ -12072,6 +12114,8 @@ template = "pool"
     /// A stall against the live snapshot must not quiesce: the old writer stays the live backing.
     #[tokio::test]
     async fn a_stall_before_quiesce_leaves_the_old_writer_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("hot.redb")).unwrap();
         let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut old = tokio::spawn({
             let started = started.clone();
@@ -12089,6 +12133,7 @@ template = "pool"
         }
         let abandon = wait_live_then_quiesce(
             &mut old,
+            &store,
             || Ok(Some(3)),
             Some(5),
             std::time::Duration::from_millis(5),
@@ -12107,6 +12152,8 @@ template = "pool"
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_timed_out_quiesce_fails_the_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("hot.redb")).unwrap();
         let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut old = tokio::spawn({
             let started = started.clone();
@@ -12121,6 +12168,7 @@ template = "pool"
         }
         let abandon = wait_live_then_quiesce(
             &mut old,
+            &store,
             || Ok(Some(5)),
             Some(5),
             std::time::Duration::from_millis(5),
@@ -12171,7 +12219,7 @@ template = "pool"
         let store = nest.store.clone();
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
         let mut ingest = spawn_ingest(source.clone(), nest, None, false, 1, 5);
-        quiesce_ingest(&mut ingest, std::time::Duration::from_secs(2))
+        quiesce_ingest(&mut ingest, &store, std::time::Duration::from_secs(2))
             .await
             .expect("quiesce");
         assert!(ingest.is_finished(), "premise: the old task has gone");

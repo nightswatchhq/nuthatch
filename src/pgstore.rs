@@ -742,6 +742,9 @@ impl HotStore for PgStore {
         self.commit_window(&entities, cp, last_block)
     }
 
+    /// The commit above runs inside the caller's poll, so it cannot outlive an abort.
+    async fn settle_commits(&self) {}
+
     fn rollback_to(&self, block: u64) -> Result<u64> {
         let schema = self.schema.clone();
         let held = self.held_fence();

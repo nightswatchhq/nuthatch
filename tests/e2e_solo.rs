@@ -400,9 +400,13 @@ async fn compatible_hot_upgrade_flips_backing_after_catchup() {
     .expect("catch-up timed out")
     .expect("catch-up");
 
-    indexer::quiesce_ingest(&mut old_rt.ingest, Duration::from_secs(2))
-        .await
-        .expect("quiesce old writer");
+    indexer::quiesce_ingest(
+        &mut old_rt.ingest,
+        old_store.as_ref(),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("quiesce old writer");
     let frozen = old_store.indexed_head().unwrap();
     assert_eq!(frozen, Some(5), "old version was at the tip before quiesce");
 
@@ -1240,6 +1244,9 @@ impl nuthatch::store::HotStore for HotScanFails {
         self.0
             .commit_window_blocking(entities, checkpoint, last_block)
             .await
+    }
+    async fn settle_commits(&self) {
+        self.0.settle_commits().await
     }
     fn rollback_to(&self, block: u64) -> anyhow::Result<u64> {
         self.0.rollback_to(block)
