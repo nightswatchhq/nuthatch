@@ -252,6 +252,18 @@ fn main() {
          ORDER BY c.block_timestamp, c.tx_hash, c.log_index LIMIT 10000", NOW - DAY)));
     q.add("qos.allocation_shares_all", k, &format!("{ingest}/qos_score.rs"), s(sql::ALLOCATION_SHARES_ALL_SQL));
 
+    // How release-gate.sh compares an answer when its text alone would mislead (#1772): `ties` is
+    // compared sorted, its ORDER BY key having ties the engine orders either way; `volatile` on
+    // its row count, its answer moving with the clock or the tip. Found by gating production twice
+    // on one copy a minute apart; re-run that after a refresh.
+    let tags: &[(&str, &str, &str)] = &[
+        ("ties", "payments.accounts", "ORDER BY SUM(mv.d) DESC: equal balances tie"),
+        ("ties", "delegation_events", "ORDER BY ts DESC: events in one block share a timestamp"),
+    ];
+    for (tag, id, why) in tags {
+        assert!(q.rows.iter().any(|r| r.0 == *id), "{id}: tagged {tag} but not in the set");
+        println!("# {tag}: {id} {why}");
+    }
     for (id, consumer, site, sql) in &q.rows {
         println!("{id}\t{consumer}\t{site}\t{sql}");
     }
