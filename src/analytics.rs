@@ -7670,9 +7670,11 @@ template="pool"
             let _env = crate::analytics_budget::tests::env_lock()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            std::env::set_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE, "4MB");
-            std::env::set_var(crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT, "4MB");
-            let r = query_hot_cold(
+            let _vars = crate::analytics_budget::tests::EnvVars::set(&[
+                (crate::analytics_budget::ENV_MAX_TEMP_SIZE, "4MB"),
+                (crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT, "4MB"),
+            ]);
+            query_hot_cold(
                 dir.path(),
                 "SELECT a.i FROM range(5000000) a(i), range(120) b(j) \
                  ORDER BY (a.i * 2654435761) % 1000003, b.j",
@@ -7680,10 +7682,7 @@ template="pool"
                 &HotRows::new(),
                 0,
                 &[],
-            );
-            std::env::remove_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE);
-            std::env::remove_var(crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT);
-            r
+            )
         };
         let err = result.expect_err("the cross join must not run to completion");
         let cut = err

@@ -336,6 +336,35 @@ pub(crate) mod tests {
         L.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    /// Sets each variable for the guard's lifetime and puts back what was there on drop, panic
+    /// included, so a test holding `env_lock` never hands its values to the next one.
+    pub(crate) struct EnvVars(Vec<(&'static str, Option<String>)>);
+
+    impl EnvVars {
+        pub(crate) fn set(vars: &[(&'static str, &str)]) -> EnvVars {
+            EnvVars(
+                vars.iter()
+                    .map(|&(k, v)| {
+                        let prev = std::env::var(k).ok();
+                        std::env::set_var(k, v);
+                        (k, prev)
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvVars {
+        fn drop(&mut self) {
+            for (k, prev) in &self.0 {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     struct EnvRestore {
         prev: Option<String>,
     }
