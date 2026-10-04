@@ -4,6 +4,11 @@ Draft. Refresh every number against the [README](../../README.md) at post time (
 number traces to a reproducible artifact). Post one channel per day; this is the Phase 2 artifact from
 [RFC-0007](../rfcs/0007-launch-and-validation.md).
 
+> **Note, 2026-10-05.** This copy predates 4.1. DuckDB is no longer in the binary: SQL runs on
+> Burrmill, on DataFusion, over the same sealed Parquet. The DuckDB lines below, including the
+> single-writer design and the 67 MB binary breakdown, describe the 3.x architecture and must be
+> rewritten before this is posted.
+
 ---
 
 ## Title (pick one at post time)

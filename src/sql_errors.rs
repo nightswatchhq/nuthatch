@@ -19,9 +19,11 @@ pub fn is_out_of_memory(raw: &str) -> bool {
         && !raw.contains("Catalog Error")
 }
 
-/// Classify a DuckDB error for `query` against the nest `schema`, returning an actionable hint if the
+/// Classify an engine error for `query` against the nest `schema`, returning an actionable hint if the
 /// failure matches a known class (`None` otherwise - an unrecognised error is relayed raw, unadorned).
-/// The classes mirror the RFC-0016 §4 table; each is matched off DuckDB's real message text.
+/// The classes mirror the RFC-0016 §4 table. Burrmill opens each DataFusion error it recognises with
+/// the first line DuckDB gave the same fault and keeps DataFusion's text below it (burrmill's
+/// `df/errors.rs`), so the classes key on that line. `through_burrmill` drives each fault for real.
 pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> {
     // Unknown table: `Catalog Error: Table with name <X> does not exist!`
     if let Some(name) = between(raw, "Table with name ", " does not exist") {
@@ -68,9 +70,9 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
             .iter()
             .flat_map(|t| derive_footguns(t).big_ints)
             .collect();
-        // DuckDB names the columns in scope; a hint drawn from every table's columns can name one this
-        // query cannot see, so every suggestion below is held to that scope, or not made.
-        let in_scope = candidate_bindings(raw);
+        // The engine lists the fields in scope; a hint drawn from every table's columns can name one
+        // this query cannot see, so every suggestion below is held to that scope, or not made.
+        let in_scope = fields_in_scope(raw);
         if big_ints.iter().any(|b| format!("{b}_dec") == col)
             && !all_cols.contains(&col.to_string())
             && in_scope.iter().any(|c| c == col.trim_end_matches("_dec"))
@@ -104,8 +106,8 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
     }
 
     // Reserved word: `Parser Error: syntax error at or near …` when a reserved-word column appears
-    // unquoted in the query. DuckDB reports the *next* token, not the column, so we detect via the
-    // schema: a reserved-word column mentioned bare is the culprit.
+    // unquoted in the query. The token the parser names is not reliably the column, so we detect via
+    // the schema: a reserved-word column mentioned bare is the culprit.
     if raw.contains("syntax error") {
         for t in schema {
             for rc in derive_footguns(t).reserved_words {
@@ -147,7 +149,7 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
     // function requiring a uniform type across its arguments does not:
     //   `Binder Error: Cannot mix values of type VARCHAR and BOOLEAN in COALESCE operator - an
     //    explicit cast is required` (COALESCE, CASE, UNION - order of the two types in the message
-    //    varies by which side DuckDB names first, so check both), or
+    //    varies with the construct, CASE naming its ELSE type first, so check both), or
     //   `Binder Error: No function matches the given name and argument types 'bool_and(VARCHAR)'`
     //    (an aggregate that only accepts BOOLEAN, e.g. bool_and/bool_or).
     let mixed_types = raw.contains("Cannot mix values of type")
@@ -171,23 +173,6 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
         }
     }
 
-    // #433: a sealed segment whose *data region* is corrupt but whose Parquet footer is intact binds
-    // cleanly and then fails at execution, taking the whole query with it. The engine names nothing -
-    // the observed message is `Invalid Error: don't know what type: ` - so an operator cannot tell a
-    // bad file from a bad query. Worse, the two corruption classes read as unrelated problems: a
-    // footer-corrupt segment fails `prepare`, so #430 drops it and quietly reduces the table, while
-    // this one binds and dies at execution pointing nowhere.
-    //
-    // **Matched last, and on the engine-prefixed form only.** DuckDB echoes the caller's own text
-    // back in binder errors, so a bare substring test against `raw` is a test against attacker input:
-    // `SELECT "don't know what type: " FROM t` produces a `Binder Error` carrying the phrase, and an
-    // eager match here would tell an operator their healthy nest holds a corrupt file *and* shadow
-    // the "no column" hint that query actually wanted. Running after the precise classifiers means
-    // the specific hint always wins; requiring `Invalid Error:` means the phrase alone is not enough.
-    //
-    // Deliberately without an integrity scan. Hashing the nest's segments would name the exact file,
-    // but it would put an unbounded, caller-triggered sweep on the query path - the cost bound #476
-    // and #478 are already about, reachable by anyone who can send a query.
     // RFC-0047 C4: a query that cannot run in its budget names the keys. Ingestion is not degraded.
     if is_out_of_memory(raw) {
         if raw.contains("max_temp_directory_size") {
@@ -209,8 +194,17 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
         );
     }
 
-    if raw.contains("Invalid Error: don't know what type:") {
-        // Case-folded, like the sibling `mentions_unquoted`: DuckDB resolves unquoted identifiers
+    // #433: a sealed segment whose *data region* is corrupt but whose Parquet footer is intact binds
+    // cleanly and then fails at execution, with a Parquet decode error that names no file, so an
+    // operator cannot tell a bad file from a bad query. Matched last, so a precise hint always wins,
+    // and only on the engine's own text (see `parquet_read_failure`): a match on caller input would
+    // tell an operator their healthy nest holds a corrupt file.
+    //
+    // Deliberately without an integrity scan. Hashing the nest's segments would name the exact file,
+    // but it would put an unbounded, caller-triggered sweep on the query path - the cost bound #476
+    // and #478 are already about, reachable by anyone who can send a query.
+    if parquet_read_failure(raw) {
+        // Case-folded, like the sibling `mentions_unquoted`: Burrmill resolves unquoted identifiers
         // case-insensitively, so `FROM USDC__Transfer` is a valid way to name `usdc__transfer`, and
         // failing to fold here would drop the table name - the exact "names nothing" complaint #433
         // was filed about.
@@ -248,20 +242,34 @@ fn between<'a>(s: &'a str, a: &str, b: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// The text inside the first pair of double-quotes that appears after `marker`.
-/// The columns DuckDB lists as in scope, from `Candidate bindings: "a", "t.b"`, unqualified.
-fn candidate_bindings(raw: &str) -> Vec<String> {
-    let Some(at) = raw.find("Candidate bindings:") else {
+/// A Parquet decode failure in the engine's own words. Caller text reaches an error only as a name
+/// or inside quotes, so the phrase must not follow a quote, nor sit in a binder, parser or catalog
+/// error.
+fn parquet_read_failure(raw: &str) -> bool {
+    raw.find("Parquet error:")
+        .is_some_and(|at| !raw[..at].contains(['"', '\'']))
+        && !raw.contains("Binder Error")
+        && !raw.contains("Parser Error")
+        && !raw.contains("Catalog Error")
+}
+
+/// The columns DataFusion lists as in scope, from `Valid fields are t.a, t.b.`, unqualified.
+fn fields_in_scope(raw: &str) -> Vec<String> {
+    let Some(at) = raw.find("Valid fields are ") else {
         return Vec::new();
     };
-    let line = raw[at..].lines().next().unwrap_or("");
-    line.split('"')
-        .skip(1)
-        .step_by(2)
-        .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+    let line = raw[at + "Valid fields are ".len()..]
+        .lines()
+        .next()
+        .unwrap_or("");
+    line.trim_end_matches('.')
+        .split(", ")
+        .map(|f| f.rsplit('.').next().unwrap_or(f).trim_matches('"').to_string())
+        .filter(|f| !f.is_empty())
         .collect()
 }
 
+/// The text inside the first pair of double-quotes that appears after `marker`.
 fn quoted_after(s: &str, marker: &str) -> Option<String> {
     let after = &s[s.find(marker)? + marker.len()..];
     let open = after.find('"')? + 1;
@@ -376,7 +384,7 @@ mod tests {
     use super::*;
     use crate::registry::{ColumnSchema, TableSchema};
 
-    fn schema() -> Vec<TableSchema> {
+    pub(super) fn schema() -> Vec<TableSchema> {
         vec![TableSchema {
             table: "usdc__transfer".into(),
             alias: "usdc".into(),
@@ -425,12 +433,15 @@ mod tests {
         }]
     }
 
-    /// #433: the page-corrupt-segment failure. Reproduced there by overwriting a sealed segment's
-    /// data region and leaving its footer intact, which yields exactly this message - `prepare`
-    /// succeeds, `CREATE VIEW` succeeds, and execution dies naming nothing.
+    /// Burrmill's message for a segment whose pages were overwritten and footer left intact
+    /// (`through_burrmill::a_segment_corrupt_past_its_footer`): it binds, and the read names nothing.
+    const CORRUPT: &str = "query failed: substrate error: Parquet error: External: Parquet argument \
+                           error: Parquet error: Unexpected struct field type 15";
+
+    /// #433: the page-corrupt-segment failure.
     #[test]
     fn a_page_corrupt_segment_is_named_as_a_bad_file_not_a_bad_query() {
-        let raw = "Invalid Error: don't know what type: : Error code 1: Unknown error code";
+        let raw = CORRUPT;
         let hint = enrich(raw, "SELECT count(*) FROM usdc__transfer", &schema()).unwrap();
         // Names the table whose segments to suspect.
         assert!(
@@ -461,16 +472,15 @@ mod tests {
         );
     }
 
-    /// The classifier must not fire on the caller's own text. DuckDB echoes query text back in binder
-    /// errors, so a bare substring match would let anyone who can send a query make a healthy nest
-    /// report a corrupt file - and would shadow the hint the query actually needed.
+    /// The classifier must not fire on the caller's own text. The engine echoes query text back in
+    /// binder errors, so a bare substring match would let anyone who can send a query make a healthy
+    /// nest report a corrupt file - and would shadow the hint the query actually needed.
     #[test]
     fn a_query_echoing_the_phrase_is_not_reported_as_a_corrupt_file() {
-        let raw =
-            r#"Binder Error: Referenced column "don't know what type: " not found in FROM clause!"#;
+        let raw = r#"Binder Error: Referenced column "Parquet error: x" not found in FROM clause!"#;
         let hint = enrich(
             raw,
-            r#"SELECT "don't know what type: " FROM usdc__transfer"#,
+            r#"SELECT "Parquet error: x" FROM usdc__transfer"#,
             &schema(),
         )
         .unwrap();
@@ -484,18 +494,16 @@ mod tests {
         );
     }
 
-    /// The prefix itself is load-bearing, not just the ordering.
+    /// The quote rule itself is load-bearing, not just the ordering.
     ///
     /// `a_query_echoing_the_phrase_is_not_reported_as_a_corrupt_file` uses a `Binder Error`, which an
-    /// earlier classifier claims - so it passes whether or not this branch requires the engine prefix,
-    /// and a bare `raw.contains("don't know what type:")` survives it. Found by mutation.
-    ///
-    /// This one carries the phrase in a message no earlier classifier matches, so it reaches the
-    /// corrupt-file branch and can only be turned away by the prefix. Drop `Invalid Error: ` from the
-    /// test at line ~119 and this goes red.
+    /// earlier classifier claims - so it passes whether or not this branch looks at quotes. This one
+    /// carries the phrase in a message no earlier classifier matches (Burrmill's own text for the
+    /// cast), so it reaches the corrupt-file branch and only the quote before the phrase turns it away.
     #[test]
     fn the_corrupt_file_classifier_requires_the_engine_prefix_not_just_the_phrase() {
-        let raw = "Conversion Error: could not convert string \'don\'t know what type: \' to INT32";
+        let raw = "substrate error: Execution error: Conversion Error: Could not convert string \
+                   'Parquet error: x' to INT32";
         let hint = enrich(raw, "SELECT CAST(x AS INT) FROM usdc__transfer", &schema());
         assert!(
             !hint
@@ -507,10 +515,10 @@ mod tests {
         );
     }
 
-    /// DuckDB resolves unquoted identifiers case-insensitively, so the table must still be named.
+    /// Burrmill resolves unquoted identifiers case-insensitively, so the table must still be named.
     #[test]
     fn the_corrupt_segment_hint_names_the_table_whatever_its_casing() {
-        let raw = "Invalid Error: don't know what type: ";
+        let raw = CORRUPT;
         let hint = enrich(raw, "SELECT count(*) FROM USDC__Transfer", &schema()).unwrap();
         assert!(
             hint.contains("`usdc__transfer`"),
@@ -521,7 +529,7 @@ mod tests {
     /// A query naming no known table still gets the class, without inventing a table name.
     #[test]
     fn a_page_corrupt_segment_hint_survives_an_unrecognised_query() {
-        let raw = "Invalid Error: don't know what type: ";
+        let raw = CORRUPT;
         let hint = enrich(raw, "SELECT 1", &schema()).unwrap();
         assert!(
             hint.contains("a sealed segment behind this query"),
@@ -566,9 +574,10 @@ mod tests {
 
     #[test]
     fn unknown_column_suggests_the_closest_real_column() {
-        // As DuckDB words it: the columns in scope follow on the next line.
+        // As Burrmill words it: DataFusion's own text, with the fields in scope, follows.
         let raw = "Binder Error: Referenced column \"valu\" not found in FROM clause!\n\
-                   Candidate bindings: \"from\", \"to\", \"value\"";
+                   Schema error: No field named valu. Did you mean 'usdc__transfer.value'?\n\
+                   Valid fields are usdc__transfer.from, usdc__transfer.to, usdc__transfer.value.";
         let hint = enrich(raw, "SELECT valu FROM usdc__transfer", &schema()).unwrap();
         assert!(hint.contains("no column `valu`"));
         assert!(hint.contains("value"), "suggests value");
@@ -577,13 +586,15 @@ mod tests {
     /// The hint suggested `amount`, from another table, for a query on one without it.
     #[test]
     fn unknown_column_suggests_only_a_column_in_scope() {
-        let raw = "Binder Error: Referenced column \"tox\" not found in FROM clause!\nCandidate bindings: \"value\", \"x.address\"";
+        let raw = "Binder Error: Referenced column \"tox\" not found in FROM clause!\n\
+                   Valid fields are x.value, x.address.";
         let hint = enrich(raw, "SELECT tox FROM x", &schema()).unwrap();
         assert!(
             !hint.contains("`to`"),
             "suggested a column out of scope: {hint}"
         );
-        let raw = "Binder Error: Referenced column \"valeu\" not found in FROM clause!\nCandidate bindings: \"value\", \"x.address\"";
+        let raw = "Binder Error: Referenced column \"valeu\" not found in FROM clause!\n\
+                   Valid fields are x.value, x.address.";
         let hint = enrich(raw, "SELECT valeu FROM x", &schema()).unwrap();
         assert!(hint.contains("the closest is `value`"), "{hint}");
         // With no scope to go on, no column is suggested at all, rather than one from any table.
@@ -592,7 +603,7 @@ mod tests {
         assert!(!hint.contains("closest"), "{hint}");
         // Nor is a `_dec` column's base named as present when this query cannot see it.
         let raw = "Binder Error: Referenced column \"value_dec\" not found in FROM clause!\n\
-                   Candidate bindings: \"owner\", \"spender\"";
+                   Valid fields are x.owner, x.spender.";
         let hint = enrich(raw, "SELECT value_dec FROM x", &schema()).unwrap();
         assert!(!hint.contains("exists as"), "{hint}");
     }
@@ -617,8 +628,8 @@ mod tests {
         );
     }
 
-    /// #539: the issue's own repro, `COALESCE(enabled, false)`, against DuckDB's real message -
-    /// captured by actually running the query, not guessed.
+    /// #539: the issue's own repro, `COALESCE(enabled, false)`. Burrmill restates it in this wording,
+    /// and `through_burrmill` runs the query to prove it.
     #[test]
     fn bool_column_in_coalesce_is_explained_not_left_as_a_raw_type_error() {
         let raw = "Binder Error: Cannot mix values of type VARCHAR and BOOLEAN in COALESCE \
@@ -770,5 +781,121 @@ mod tests {
         let hint = enrich(raw, "SELECT * FROM zzzzzzzzzz", &schema()).unwrap();
         assert!(hint.contains("no table"));
         assert!(!hint.contains("usdc__transfer"), "too far to suggest");
+    }
+}
+
+/// Each class, from the error Burrmill actually raises for the fault rather than a remembered string.
+#[cfg(test)]
+mod through_burrmill {
+    use super::enrich;
+    use crate::engine::{Died, Engine, FactWindow, Session};
+
+    fn session() -> Box<dyn Session> {
+        let s = crate::engine_burrmill::BurrmillEngine.open_bare().unwrap();
+        let rows = [
+            serde_json::json!({"block_number": 1, "from": "0xa", "to": "0xb", "value": "5", "enabled": "true"}),
+            serde_json::json!({"block_number": 2, "from": "0xc", "to": "0xd", "value": "7", "enabled": "false"}),
+        ];
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        s.load_hot("usdc__transfer", &refs).unwrap();
+        assert!(s
+            .bind_facts("usdc__transfer", &[], &[], true, FactWindow::default())
+            .unwrap());
+        s
+    }
+
+    fn fails(s: &dyn Session, sql: &str) -> String {
+        match s.collect(sql, Some(10)) {
+            Ok(_) => panic!("`{sql}` answered"),
+            Err(Died::Binding(e) | Died::Executing(e)) => format!("{e:#}"),
+        }
+    }
+
+    fn hint(sql: &str) -> String {
+        let s = session();
+        let raw = fails(s.as_ref(), sql);
+        enrich(&raw, sql, &super::tests::schema()).unwrap_or_else(|| panic!("no hint for: {raw}"))
+    }
+
+    #[test]
+    fn an_unknown_table() {
+        let h = hint("SELECT count(*) FROM transfers");
+        assert!(h.contains("the closest is `usdc__transfer`"), "{h}");
+    }
+
+    #[test]
+    fn an_unknown_column_is_matched_against_the_fields_in_scope() {
+        let h = hint("SELECT valu FROM usdc__transfer");
+        assert!(h.contains("the closest is `value`"), "{h}");
+    }
+
+    #[test]
+    fn a_dec_column_whose_base_is_in_scope() {
+        let h = hint("SELECT \"from\" FROM usdc__transfer WHERE value_dec > 1");
+        assert!(h.contains("derived on the fly"), "{h}");
+    }
+
+    #[test]
+    fn a_bare_reserved_word() {
+        let h = hint("SELECT from FROM usdc__transfer");
+        assert!(h.contains("reserved word"), "{h}");
+    }
+
+    #[test]
+    fn a_big_integer_summed_as_text() {
+        let h = hint("SELECT sum(value) FROM usdc__transfer");
+        assert!(h.contains("value_dec"), "{h}");
+    }
+
+    #[test]
+    fn a_text_bool_in_coalesce_case_and_bool_and() {
+        for sql in [
+            "SELECT COALESCE(enabled, false) FROM usdc__transfer",
+            "SELECT CASE WHEN true THEN enabled ELSE false END FROM usdc__transfer",
+            "SELECT bool_and(enabled) FROM usdc__transfer",
+            "SELECT bool_or(enabled) FROM usdc__transfer",
+        ] {
+            let h = hint(sql);
+            assert!(h.contains("Solidity bool"), "{sql}: {h}");
+        }
+    }
+
+    /// #433 through the engine: pages destroyed, footer intact, so the segment binds and the read fails.
+    #[test]
+    fn a_segment_corrupt_past_its_footer() {
+        let s = session();
+        let dir = tempfile::tempdir().unwrap();
+        let seg = dir.path().join("seg.parquet");
+        s.write_parquet("usdc__transfer", &seg).unwrap();
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let len = bytes.len();
+        let footer = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        bytes[4..len - 8 - footer].fill(0xFF);
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let c = crate::engine_burrmill::BurrmillEngine.open_bare().unwrap();
+        c.load_hot("usdc__transfer", &[]).unwrap();
+        assert!(c
+            .bind_facts("usdc__transfer", &[], &[seg], false, FactWindow::default())
+            .unwrap());
+        let sql = "SELECT max(value) FROM usdc__transfer";
+        let raw = fails(c.as_ref(), sql);
+        let h = enrich(&raw, sql, &super::tests::schema()).unwrap_or_default();
+        assert!(h.contains("corrupt file on disk"), "{raw}");
+        assert!(h.contains("`usdc__transfer`"), "{h}");
+    }
+
+    /// The phrase quoted back from the caller's own text is not a corrupt file.
+    #[test]
+    fn the_phrase_in_caller_text_is_not_a_corrupt_file() {
+        let s = session();
+        for sql in [
+            "SELECT CAST('Parquet error: x' AS INTEGER) FROM usdc__transfer",
+            "SELECT \"Parquet error: x\" FROM usdc__transfer",
+        ] {
+            let raw = fails(s.as_ref(), sql);
+            let h = enrich(&raw, sql, &super::tests::schema()).unwrap_or_default();
+            assert!(!h.contains("corrupt file"), "{sql}: {h}");
+        }
     }
 }
