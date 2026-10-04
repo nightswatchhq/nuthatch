@@ -10,6 +10,8 @@
 #   2  parity NOT CLEAN - every gated comparison agreed, known differences remain (#1116, #1114)
 #   1  anything else, including a genuine disagreement and any failure to compare
 #   3  head mode only: the subgraph could not be asked at the nest's head, so nothing was compared
+#   4  the subgraph side did not answer (auth or GraphQL error, HTTP error, timeout, malformed
+#      answer, or behind a sealed pin), so nothing was compared; the reason is the NOT RUN line (#1818)
 # 0 is the only status that means parity. 2 exists so "agrees" is distinguishable from
 # "agrees on the parts we check", which is the distinction the epoch fields cost us.
 #
@@ -197,7 +199,7 @@ export ALLOC_N EPOCH_N DISPUTE_N ESCROW_N BLOCK NETWORK_SG GATEWAY GRAPH_API_KEY
 export PARITY_MODE=$MODE
 cmp_rc=0
 python3 - << 'PY' || cmp_rc=$?
-import json, os, sys, urllib.parse, urllib.request
+import http.client, json, os, sys, urllib.parse, urllib.request
 
 key = os.environ["GRAPH_API_KEY"]
 block = int(os.environ["BLOCK"])
@@ -207,6 +209,13 @@ head_mode = os.environ["PARITY_MODE"] == "head"
 def not_measured(why):
     print("NOT MEASURED at head %s: %s" % (block, why), file=sys.stderr)
     raise SystemExit(3)
+
+
+def rig_fault(why):
+    # A disagreement already printed outranks the gateway failing afterwards.
+    why = why.replace("/api/%s/" % key, "/api/<GRAPH_API_KEY>/")
+    print("NOT RUN %s" % why, file=sys.stderr)
+    raise SystemExit(1 if failed else 4)
 
 
 sg = os.environ["NETWORK_SG"]
@@ -227,17 +236,28 @@ def gql(query):
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
+            status = getattr(r, "status", None)
             body = r.read().decode()
     except urllib.error.HTTPError as e:
-        raise SystemExit("subgraph HTTP %s: %s" % (e.code, e.read()[:300].decode(errors="replace")))
-    d = json.loads(body)
+        rig_fault("subgraph HTTP %s: %s" % (e.code, e.read()[:300].decode(errors="replace")))
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        rig_fault("subgraph did not answer: %s" % e)
+    # file:// answers carry no status; the tests use it as a gateway.
+    if status not in (None, 200):
+        rig_fault("subgraph HTTP %s: %s" % (status, body[:300]))
+    try:
+        d = json.loads(body)
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        rig_fault("subgraph returned a malformed answer: %s" % body[:300])
     if d.get("errors"):
         # The gateway may answer `_meta` from one indexer and a pinned query from another behind it.
         if head_mode and "indexed up to block" in json.dumps(d["errors"]):
             not_measured("an indexer behind the gateway is short of the pin: %s" % d["errors"])
-        raise SystemExit("subgraph graphql error: %s" % d["errors"])
-    if not d.get("data"):
-        raise SystemExit("subgraph returned no data: %s" % body[:300])
+        rig_fault("subgraph graphql error: %s" % d["errors"])
+    if not isinstance(d.get("data"), dict) or not d["data"]:
+        rig_fault("subgraph returned no data: %s" % body[:300])
     return d["data"]
 
 def nest_sql(q):
@@ -291,15 +311,15 @@ def page_count(entity, extra_where=""):
     return len(page_ids(entity, extra_where))
 
 meta = gql("{ _meta { block { number } } }")
-sg_block = (meta.get("_meta") or {}).get("block", {}).get("number")
-if sg_block is None:
-    raise SystemExit("subgraph _meta.block.number missing, so the pin cannot be checked")
-sg_block = int(sg_block)
+try:
+    sg_block = int(meta["_meta"]["block"]["number"])
+except (KeyError, TypeError, ValueError):
+    rig_fault("subgraph _meta.block.number missing, so the pin cannot be checked: %s" % meta)
 print("subgraph _meta.block.number=%s pin=%s" % (sg_block, block))
 if sg_block < block and head_mode:
     not_measured("the subgraph's head %s is below the nest's" % sg_block)
 if sg_block < block:
-    raise SystemExit(
+    rig_fault(
         "subgraph head %s is below pin %s: a match here would not be a comparison at that block"
         % (sg_block, block)
     )
@@ -865,6 +885,10 @@ PY
 if [ "$cmp_rc" -eq 3 ] && [ "$MODE" = head ]; then
   echo "parity NOT MEASURED at head $BLOCK: the two sides could not be brought to the same head"
   exit 3
+fi
+if [ "$cmp_rc" -eq 4 ]; then
+  echo "parity NOT RUN at block $BLOCK ($MODE): the subgraph side did not answer, so nothing was compared"
+  exit 4
 fi
 [ "$cmp_rc" -eq 0 ] || die "subgraph comparison failed"
 

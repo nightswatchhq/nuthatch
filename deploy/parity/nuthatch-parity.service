@@ -17,6 +17,7 @@ After=network-online.target
 Type=oneshot
 ExecStart=/usr/local/bin/nuthatch-parity
 # 2 is known differences only and 3 a head that could not be reached: recorded, not failures.
+# 4, a subgraph that would not answer, is left out on purpose: nothing was compared, so the unit fails.
 SuccessExitStatus=2 3
 TimeoutStartSec=3h
 Nice=10

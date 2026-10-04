@@ -2,12 +2,13 @@
 # nuthatch-parity - the daily Lodestar parity run on Helsinki (#1713, #1718), started by
 # nuthatch-parity.timer. Runs scripts/lodestar-parity.sh pinned at sealed_through, then at the
 # nest's head, keeps each run's output and exit status under PARITY_LOG_DIR, and posts one Discord
-# line for any run that exits 1.
+# line for any run that exits 1 or 4.
 #
 #   0  every mode ran clean
 #   1  a disagreement, a failure to compare, or a precondition this wrapper could not meet; posted
 #   2  known differences only (#1114, #1116); logged, not posted
 #   3  the head mode could not bring the two sides to one head on any attempt; logged, not posted
+#   4  the subgraph side did not answer, so nothing was compared (#1818); posted as NOT RUN
 #
 # Environment (all optional):
 #   PARITY_SCRIPT          (default /usr/local/lib/nuthatch-parity/lodestar-parity.sh)
@@ -120,7 +121,12 @@ run_mode() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$stamp" "$mode" "$rc" "${pin:--}" "${version:--}" \
     "$attempt" "$log" >>"$runs"
   say "$mode attempt $attempt: exit $rc, pin ${pin:-unknown}, version ${version:-unknown}, log $log"
-  if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && ! { [ "$mode" = head ] && [ "$rc" -eq 3 ]; }; then
+  if [ "$rc" -eq 4 ]; then
+    local why
+    why=$(sed -n 's/^NOT RUN //p' "$log" | tail -n 1)
+    page "PARITY NOT RUN ($mode): ${why:-the subgraph side did not answer} - pin ${pin:-unknown} on ${version:-unknown}, $log on $(hostname)" \
+      || true
+  elif [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && ! { [ "$mode" = head ] && [ "$rc" -eq 3 ]; }; then
     local what
     what=$(failing_line "$log")
     [ "$rc" -eq 1 ] || what="exit $rc, which lodestar-parity.sh does not define; ${what}"
@@ -146,10 +152,12 @@ for mode in $modes; do
   if [ "$mode" = head ] && [ "$last_rc" -eq 3 ]; then
     say "head: the nest and the subgraph could not be brought to the same head in $attempt attempt(s)"
   fi
-  # 1 outranks 3 outranks 2: a failure, then a comparison that did not happen, then known differences.
+  # 1 outranks 4 outranks 3 outranks 2: a disagreement, a subgraph that would not answer, a head that
+  # could not be reached, then known differences.
   case "$last_rc" in
     1) worst=1 ;;
-    3) [ "$worst" -eq 1 ] || worst=3 ;;
+    4) [ "$worst" -eq 1 ] || worst=4 ;;
+    3) [ "$worst" -eq 1 ] || [ "$worst" -eq 4 ] || worst=3 ;;
     2) [ "$worst" -ne 0 ] || worst=2 ;;
   esac
 done
