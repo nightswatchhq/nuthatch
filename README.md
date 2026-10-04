@@ -56,6 +56,8 @@ chain, no telemetry, no account. The built-in MCP server lets Claude or any MCP 
 
 - **[Lodestar](https://www.lodestar-dashboard.com)**, an analytics dashboard for The Graph Protocol on
   Arbitrum One, serves live panels from self-hosted nests instead of The Graph gateway.
+- **[GraphOps](https://graphops.xyz)**, an indexer and core developer on The Graph, is a design
+  partner. Its feedback is what led to maintained entities ([RFC-0041](docs/rfcs/0041-authored-incremental-entities.md)).
 
 An earlier example, now finished: **[Arcaidia](https://arcaidia.io)**, a speed layer over Circle's
 CCTP built at ETHOnline 2026, read its indexed state from two nests on Ethereum Sepolia and Arc
