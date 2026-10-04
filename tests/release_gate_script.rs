@@ -1239,11 +1239,20 @@ fn every_nest_in_the_config_is_gated_and_posts_its_own_status() {
     assert!(qos[0].contains("against the qos-nest copy"), "{posted}");
     // Each nest ran under its own environment file, at its own concurrency.
     let qos_env = c.dir.path().join("qos-nest.env");
+    let from = format!("(from {})", qos_env.display());
     assert!(
-        text.lines().any(|l| l.starts_with("[qos-nest] ")
-            && l.contains(&format!("(from {})", qos_env.display()))),
-        "{text}"
+        text.lines()
+            .any(|l| l.starts_with("[qos-nest] ") && l.contains(&from)),
+        "the candidate's run:\n{text}"
     );
+    let runs = c.dir.path().join("state/runs");
+    let production = std::fs::read_dir(&runs)
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().contains("-qos-nest-"))
+        .map(|e| std::fs::read_to_string(e.path().join("production.txt")).unwrap())
+        .unwrap_or_default();
+    assert!(production.contains(&from), "production's run:\n{production}");
     assert!(
         text.contains("[qos-nest] release-gate: concurrency 1"),
         "{text}"
@@ -1322,7 +1331,7 @@ fn a_malformed_nests_config_gates_nothing() {
     let answers = [("answers", c.counts())];
     let conf = nests_conf(&c, &[("alloc-nest", &answers, ENV_TWO, "none")]);
     let mut body = std::fs::read_to_string(&conf).unwrap();
-    body.push_str("qos-nest /nowhere /nowhere.tsv\n");
+    body.push_str("qos-nest /nowhere /nowhere.tsv /nowhere.env none stray\n");
     std::fs::write(&conf, body).unwrap();
     let r = releases(&c, &[("v4.3.0-rc1", "pre", 0), ("v4.2.0", "full", 0)], &[]);
     let set = c.set(&[("unused", c.counts())]);
