@@ -4568,6 +4568,10 @@ template="pool"
 
     /// A runaway query is interrupted by the watchdog and surfaced as a timeout, not left to hang:
     /// both a recursion that emits no batch until it ends and a join that reads no Parquet.
+    ///
+    /// Either one, left to finish, would answer `Ok`, so the guard's own `QueryBudgetExceeded` is the
+    /// assertion. No elapsed-time bound: on a loaded box the interrupt took over 6 s to land in the
+    /// join, with the guard's decision right every time (#1816).
     #[test]
     fn guarded_query_times_out_on_a_runaway() {
         let dir = tempfile::tempdir().unwrap();
@@ -4575,20 +4579,19 @@ template="pool"
             timeout: Duration::from_millis(250),
             max_rows: 1000,
         };
+        // Which guard fires is the assertion, so no other test's spill cap may be in the environment.
+        let _env = crate::analytics_budget::tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for runaway in [
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000000000) SELECT count(*) FROM t",
             "SELECT count(*) FROM range(1000000) a, range(1000000) b WHERE a.range + b.range = -1",
         ] {
-            let started = Instant::now();
             let err = query_guarded(dir.path(), runaway, guard).unwrap_err();
-            assert!(
-                format!("{err:#}").contains("time budget"),
-                "expected a timeout error, got: {err:#}"
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "{runaway}: stopped after {:?}",
-                started.elapsed()
+            assert_eq!(
+                err.downcast_ref::<QueryBudgetExceeded>(),
+                Some(&QueryBudgetExceeded { secs: 0 }),
+                "{runaway}: expected the watchdog's timeout, got: {err:#}"
             );
         }
     }
@@ -7655,19 +7658,20 @@ template="pool"
     /// room regardless of load.
     #[test]
     fn a_query_spilling_past_its_cap_is_stopped_by_the_guard() {
-        // A sort of 600 million rows, far past the memory limit, so it spills at once.
+        // A sort of 600 million rows, far past the memory limit, so it spills at once. A 4 MB pool and
+        // cap trip in a few megabytes of work; at 64 MB a loaded box took 50 s and met the deadline
+        // (#1816). The deadline is only the backstop for a guard that never fires.
         let dir = tempfile::tempdir().unwrap();
         let guard = QueryGuard {
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(300),
             max_rows: 10,
         };
-        let started = Instant::now();
         let result = {
             let _env = crate::analytics_budget::tests::env_lock()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            std::env::set_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE, "64MB");
-            std::env::set_var(crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT, "64MB");
+            std::env::set_var(crate::analytics_budget::ENV_MAX_TEMP_SIZE, "4MB");
+            std::env::set_var(crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT, "4MB");
             let r = query_hot_cold(
                 dir.path(),
                 "SELECT a.i FROM range(5000000) a(i), range(120) b(j) \
@@ -7685,12 +7689,7 @@ template="pool"
         let cut = err
             .downcast_ref::<QuerySpillExceeded>()
             .unwrap_or_else(|| panic!("stopped for the wrong reason: {err:#}"));
-        assert_eq!(cut.cap_bytes, 64 * 1024 * 1024);
-        assert!(
-            started.elapsed() < Duration::from_secs(45),
-            "stopped by the deadline, not the spill: {:?}",
-            started.elapsed()
-        );
+        assert_eq!(cut.cap_bytes, 4 * 1024 * 1024);
     }
 
     #[test]
