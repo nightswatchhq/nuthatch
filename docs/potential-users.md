@@ -30,15 +30,23 @@ chains belongs to a team whose app or dashboard lost its data path, and they are
 manifest (`--from-subgraph`, with `port-report` saying what ports and what does not), and a nest needs
 nothing from The Graph to run.
 
-**Chains removed from Studio, from `graphprotocol/networks-registry` commit history:**
+**Chains removed from Studio in 2026, from `graphprotocol/networks-registry` commit history** (EVM only;
+August rows **verified** 2026-10-04, the rest reported by the scan below):
 
-| Date | Chains | Check |
-|---|---|---|
-| 2026-04-13 | Abstract, Metis, Manta, Fraxtal, others | reported |
-| 2026-05-21 | Berachain, Ink, MegaETH, ApeChain, Cronos | reported |
-| 2026-05-28 | Katana, Ronin | reported |
-| 2026-08-13 | Fantom, Monad, polygon-zkevm, Rootstock | **verified** 2026-10-04 |
-| 2026-08-18 | Moonbeam, Moonriver, mbase | **verified** 2026-10-04 |
+| Date | Studio and gateway both gone (fully stranded) |
+|---|---|
+| 01-27 | blast-mainnet, lens |
+| 02-09 | mint |
+| 04-13 | abstract, corn, hashkeychain, iotex, lumia, manta, metis, swellchain, vana |
+| 05-21 | apechain, autonomys, berachain, cronos, ink, megaeth |
+| 05-28 | katana, ronin |
+| 08-13 | fantom, monad, polygon-zkevm |
+| 08-18 | moonbeam, moonriver |
+| 09-09 | botanix, arbitrum-nova |
+
+**Frozen rather than down:** fuse, fraxtal, rootstock and boba lost Studio but on 2026-09-22 gained a
+gateway entry and an InfraDAO indexing backstop. Published versions keep being served; no new version
+can be deployed through Studio. That still strands any team that needs to ship a change.
 
 **At risk this week:** on **8 October 2026** the Studio staging environment is deprecated for BNB Smart
 Chain and Polygon (The Graph Foundation, [forum topic 7084](https://forum.thegraph.com/t/bringing-subgraph-studio-traffic-to-the-graph-network/7084),
@@ -62,9 +70,42 @@ prices and other accumulated state have to be redeclared as SQL views or increme
    network rather than competing with its migration. Asked publicly in the graphprotocol Discord
    `#subgraph-development` on 2026-10-04; no answer yet.
 
-### Scan results
+### Scan results (2026-10-04)
 
-*Pending: the scan was started on 2026-10-04 and its ranked list will be added here.*
+GitHub code search for `subgraph.yaml` naming a stranded network returned roughly 30 to 390 repositories
+per chain, most of it noise. About 250 had a manifest or config hit, 68 of those had a commit in 2026,
+and after removing config-only matches, forks, scaffolds, hackathon builds and subgraphs hosted
+somewhere other than Studio, **12 active products** remain. The counts are lower bounds: GitHub's code
+search is sparse, and Berachain, Katana and Ronin certainly have more Studio users than it surfaced.
+
+Several large projects are active on stranded chains but already deploy elsewhere (Uniswap v4, GMX,
+Balancer, Teller, Dolomite, Metrom, Fuul), so they are not stranded.
+
+**The three to start with:**
+
+1. **Rootstock Collective** ([rootstock-collective-subgraphs](https://github.com/RootstockCollective/rootstock-collective-subgraphs), rootstock).
+   Three Studio deploys failed on 2026-09-16 with `network not supported by registrar: no network
+   rootstock found on chain ethereum` (**verified** in their Actions logs). They were shipping new
+   gauge reward indexing a month after Studio dropped the chain. A real DAO, and the hardest port of
+   the three: seven data sources, a Gauge template, 52 events, and reward cycles accumulated in the
+   mappings. Offer the event tables first and the SQL views second.
+2. **Request Network** ([payments-subgraph](https://github.com/RequestNetwork/payments-subgraph): fantom, moonbeam, fuse, boba).
+   Their CI still deploys all four to Studio, and Fantom and Moonbeam have no gateway at all now.
+   The easiest real port found: append-only `Payment` rows from proxy events, one `.bind(`, no
+   templates.
+3. **adexto** ([0xcuy/adexto](https://github.com/0xcuy/adexto), monad). The most active repository
+   in the set. The author noted that Monad subgraphs are not served and now runs their own graph-node
+   with a 100-block `eth_getLogs` cap. No `.bind()` calls, two factories feeding curve templates. The
+   pitch here is replacing a self-run graph-node, not rescuing a dead endpoint.
+
+Runner-up: Snapshot (blast-mainnet, fantom), trivial to port but low stakes for them. Ranks 5 to 10
+(WOOFi, Orbs dTWAP, Aave, DODO, a timelock manager, a monitor) are heavier ports, already self-hosting,
+or have moved on.
+
+Caveats: portability verdicts come from reading manifests, not trial ports. Only Rootstock has
+CI-log proof of the break. Studio itself is not visible to us, so publish status and query volume come
+from READMEs. The full ranked report, with contract addresses, start blocks and contact routes, is kept
+privately in nightswatchhq/nightswatch-misc.
 
 ---
 
