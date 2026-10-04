@@ -42,6 +42,18 @@ Summarise the hits and flags in a block range (markdown or `--json`)
 - `--to <TO>` - Last block of the range (inclusive)
 - `--json` - Emit JSON instead of markdown
 
+## `nuthatch audit sealed`
+
+Re-fetch a sample of sealed ranges from a second endpoint and compare them row by row
+
+- `--dir <DIR>` - Nest directory
+- `--rpc <RPC>` - The endpoint to compare against. One the nest indexes from is refused
+- `--samples <SAMPLES>` - Ranges to sample
+- `--seed <SEED>` - The same seed over the same segments picks the same ranges. Defaults to the current unix time, which is printed
+- `--span <SPAN>` - Blocks in each sampled range
+- `--from <FROM>` - Audit exactly `--from..=--to` instead of sampling, to re-check a reported range
+- `--to <TO>` - 
+
 ## `nuthatch bench`
 
 Benchmark the indexing pipeline (measure first, optimise second - RFC-0004)
@@ -118,6 +130,10 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--publish-target <PUBLISH_TARGET>` - Mirror sealed segments to this prefix as they seal (RFC-0052): a directory, or `s3://bucket/prefix` with the usual `AWS_*` env. Absent, nothing is published and no client is built. A flag rather than a `nuthatch.toml` field, because a target is not the nest's identity
 - `--publish-interval <PUBLISH_INTERVAL>` - How often the mirror reconciles when no seal has woken it
 - `--publish-parallelism <PUBLISH_PARALLELISM>` - Objects the mirror uploads at once
+- `--audit-rpc <AUDIT_RPC>` - Audit sealed history against this endpoint in the background (#1786): re-fetch sampled sealed ranges, compare them row by row, and report a difference on `/metrics` and in the log. Off when absent. One the nest indexes from is refused. A flag, since a keyed URL does not belong in the nest
+- `--audit-per-day <AUDIT_PER_DAY>` - Ranges the background audit samples a day, spread evenly
+- `--audit-span <AUDIT_SPAN>` - Blocks in each range the background audit samples
+- `--audit-seed <AUDIT_SEED>` - Seed for the background audit's samples. Defaults to the start time; it is logged with every sample, as is the range, which `nuthatch audit sealed --from --to` re-checks
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN` to be set AND each request to present it as `?token=…` (or it self-disables with a log line)
 - `--registry <REGISTRY>` - A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`
 
