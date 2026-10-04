@@ -82,7 +82,7 @@ const FIELDS: [(&str, &str); 6] = [
     ("curator_query_fees", "curatorQueryFees"),
 ];
 
-/// Each epoch sits on one side of a measured boundary (1105 signal, 1195 rewards, 1302 fees); 1392
+/// Each epoch sits on one side of a measured boundary (1105 signal and fees, 1195 rewards); 1392
 /// is the open epoch.
 const EPOCHS: [u32; 11] = [
     1104, 1105, 1106, 1194, 1195, 1301, 1302, 1380, 1390, 1391, 1392,
@@ -109,8 +109,8 @@ impl Fixture {
         deltas.insert((1104, "signalled_tokens"), 3);
         deltas.insert((1105, "signalled_tokens"), 7);
         deltas.insert((1106, "signalled_tokens"), -7);
-        deltas.insert((1301, "query_fees_collected"), 1);
-        deltas.insert((1301, "curator_query_fees"), 1);
+        deltas.insert((1104, "query_fees_collected"), 1);
+        deltas.insert((1104, "curator_query_fees"), 1);
         Fixture {
             deltas,
             source_1391: "observed",
@@ -265,7 +265,7 @@ fn the_fixture_without_a_shift_is_known_differences_only() {
     let (code, text) = Fixture::new().run();
     assert_eq!(code, 2, "{text}");
     assert!(
-        text.contains("query_fees_collected 4/4 epochs agree from 1302 OK"),
+        text.contains("query_fees_collected 9/9 epochs agree from 1105 OK"),
         "{text}"
     );
     assert!(!text.contains("boundary shift"), "{text}");
@@ -278,7 +278,7 @@ fn a_shifted_pair_is_a_known_difference_naming_the_epochs() {
     let (code, text) = Fixture::new().shift(60, 6).run();
     assert_eq!(code, 2, "{text}");
     assert!(
-        text.contains("query_fees_collected 2/4 epochs agree from 1302 KNOWN-DIFF (#1819)"),
+        text.contains("query_fees_collected 7/9 epochs agree from 1105 KNOWN-DIFF (#1819)"),
         "{text}"
     );
     assert!(
@@ -302,7 +302,7 @@ fn a_shifted_pair_plus_a_real_discrepancy_fails() {
         .run();
     assert_eq!(code, 1, "{text}");
     assert!(
-        text.contains("query_fees_collected 1/4 epochs agree from 1302 DIFF"),
+        text.contains("query_fees_collected 6/9 epochs agree from 1105 DIFF"),
         "{text}"
     );
     assert!(text.contains("epoch 1380 nest=1000005"), "{text}");
@@ -318,7 +318,7 @@ fn a_pair_that_nets_out_but_is_not_in_the_window_fails() {
     let (code, text) = Fixture::new().shift(50, 6).run();
     assert_eq!(code, 1, "{text}");
     assert!(
-        text.contains("query_fees_collected 2/4 epochs agree from 1302 DIFF"),
+        text.contains("query_fees_collected 7/9 epochs agree from 1105 DIFF"),
         "{text}"
     );
     assert!(!text.contains("boundary shift"), "{text}");
@@ -333,7 +333,7 @@ fn a_pair_that_traces_but_does_not_net_to_zero_fails() {
         .run();
     assert_eq!(code, 1, "{text}");
     assert!(
-        text.contains("query_fees_collected 2/4 epochs agree from 1302 DIFF"),
+        text.contains("query_fees_collected 7/9 epochs agree from 1105 DIFF"),
         "{text}"
     );
 }
@@ -362,4 +362,30 @@ fn no_shift_is_excused_across_an_exact_boundary() {
     let (code, text) = f.run();
     assert_eq!(code, 1, "{text}");
     assert!(!text.contains("boundary shift"), "{text}");
+}
+
+/// Fees that also agree at 1104 make 1105 too high: the constant would exclude comparable data.
+#[test]
+fn a_fee_boundary_set_too_high_fails_the_self_check() {
+    let (code, text) = Fixture::new().delta(1104, "query_fees_collected", 0).run();
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains(
+            "BOUNDARY query_fees_collected: the lowest epoch at which the property holds is 1104, not the configured 1105 - the constant is too high"
+        ),
+        "{text}"
+    );
+}
+
+/// Fees that still disagree at 1105 make 1105 too low: it claims more than it can show.
+#[test]
+fn a_fee_boundary_set_too_low_fails_the_self_check() {
+    let (code, text) = Fixture::new().delta(1105, "curator_query_fees", 1).run();
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains(
+            "BOUNDARY curator_query_fees: the lowest epoch at which the property holds is 1106, not the configured 1105 - the constant is too low"
+        ),
+        "{text}"
+    );
 }
