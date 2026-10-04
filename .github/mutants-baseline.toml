@@ -47,6 +47,26 @@ file = "src/seal.rs"
 mutation = "replace > with >= in verify_and_quarantine"
 reason = "Only gates the summary error line; the returned count and the quarantine moves are unchanged."
 
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace match guard e.kind() == std::io::ErrorKind::NotFound with false in verify_and_quarantine"
+reason = """
+A missing segment then takes the "unreadable" arm, whose rename fails on the absent file and is
+logged; the count and every segment are unchanged. The one other trace is an empty `quarantine/`.
+"""
+
+# --- Equivalent. ---------------------------------------------------------------------------------
+
+[[survivor]]
+file = "src/chunker.rs"
+mutation = "replace > with >= in AdaptiveWindow::served_whole"
+reason = """
+`self.max > l` after a doubling. Recovery runs only while `max` is under the configured cap, and there
+`max >= learned` always holds: a refusal takes `learned` to at most the new `max`, `set_max` sets
+`max` to `learned` unless the cap is lower (and then there is no recovery), and a doubling raises
+`learned` to `max`. A doubling strictly raises `max`, so after it `max > l` and `>=` agree.
+"""
+
 # --- Timeouts (#853). ---------------------------------------------------------------------------
 #
 # These two are not slow builds. Each inverts a signal the adaptive window controller steers by,
