@@ -654,4 +654,53 @@ mod tests {
         }
         assert_eq!(w.ceiling(), 5_000);
     }
+
+    /// The runtime loop re-applies its cap every iteration, so what recovery earns has to survive
+    /// that, both part of the way up and all of it.
+    #[test]
+    fn a_recovered_ceiling_survives_the_cap_being_reapplied() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(10);
+        for _ in 0..RECOVERY_STREAK {
+            w.served_whole(10);
+        }
+        assert_eq!(w.ceiling(), 20);
+        w.set_max(100_000);
+        assert_eq!(
+            w.ceiling(),
+            20,
+            "re-applying the cap threw away a doubling recovery had earned"
+        );
+
+        let mut v = AdaptiveWindow::new(1_000, 2_000, 1, 40);
+        v.served_by_splitting(10);
+        for _ in 0..(RECOVERY_STREAK * 2) {
+            v.served_whole(v.ceiling());
+        }
+        assert_eq!(v.ceiling(), 40);
+        v.set_max(100_000);
+        assert_eq!(
+            v.ceiling(),
+            100_000,
+            "recovery reached the configured cap, so the refusal is spent and a lifted cap binds"
+        );
+    }
+
+    #[test]
+    fn windows_served_at_a_cap_below_the_lesson_are_not_recovery_evidence() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(10);
+        w.set_max(5);
+        for _ in 0..(RECOVERY_STREAK - 1) {
+            w.served_whole(5);
+        }
+        w.set_max(100_000);
+        assert_eq!(w.ceiling(), 10);
+        w.served_whole(10);
+        assert_eq!(
+            w.ceiling(),
+            10,
+            "one window at the learnt ceiling doubled it: the ones at the lower cap were counted"
+        );
+    }
 }
