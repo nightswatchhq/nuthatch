@@ -21,9 +21,35 @@ this is the window controller #672 took five attempts to get right, and its boun
 exactly where that went wrong.
 """
 
+# --- Log-only (#1757). ---------------------------------------------------------------------------
+#
+# Each of these changes whether a log line is written and nothing else: no return value, file or
+# state differs. A positive log assertion is unreliable in this binary, because `tracing` caches
+# callsite interest process-wide (#482, `CapturedLogs` in analytics.rs).
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace != with == in remove_retired"
+reason = "Only decides whether a failed unlink of a retired file is warned about; the function returns nothing."
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with == in verify_and_quarantine"
+reason = "Only gates the summary error line; the returned count and the quarantine moves are unchanged."
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with < in verify_and_quarantine"
+reason = "Only gates the summary error line; the returned count and the quarantine moves are unchanged."
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with >= in verify_and_quarantine"
+reason = "Only gates the summary error line; the returned count and the quarantine moves are unchanged."
+
 # --- Timeouts (#853). ---------------------------------------------------------------------------
 #
-# These three are not slow builds. Each inverts a signal the adaptive window controller steers by,
+# These two are not slow builds. Each inverts a signal the adaptive window controller steers by,
 # the controller then stops advancing, and a **named test waits for it forever** rather than failing.
 # Recovered from the per-mutant logs of the 2026-08-24 run, each of which reports its test as "has
 # been running for over 60 seconds" before the sweep is killed.
@@ -44,15 +70,6 @@ A window of zero blocks means a loop that advances by `window` never advances. T
 `indexer::tests::a_contract_free_nest_issues_no_getlogs_on_any_backfill_path`,
 `a_timestamp_free_nest_backfills_without_a_single_timestamp_call`, and
 `both_tip_loops_still_fetch_logs_for_a_nest_with_contracts`.
-"""
-
-[[survivor]]
-file = "src/chunker.rs"
-mutation = "replace == with != in AdaptiveWindow::observed"
-reason = """
-Inverts the controller's growth signal, so the request count never converges.
-`indexer::tests::the_cost_of_a_first_run_behind_a_capped_provider_is_a_fixed_number` hangs - which is
-the test whose whole point is that the number is fixed.
 """
 
 [[survivor]]
