@@ -33,6 +33,21 @@ run = ["cargo test"]
 sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
 watch = ["src/**/*.rs", "tests/**/*.rs"]
 
+[tasks.components]
+desc = "fmt, clippy and unit tests for the standalone guest components (host target)"
+run = [
+  "cargo fmt --check --manifest-path components/large-transfers/Cargo.toml",
+  "cargo fmt --check --manifest-path components/recurrence/Cargo.toml",
+  "cargo fmt --check --manifest-path components/screen/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path components/large-transfers/Cargo.toml -- -D warnings",
+  "cargo clippy --locked --all-targets --manifest-path components/recurrence/Cargo.toml -- -D warnings",
+  "cargo clippy --locked --all-targets --manifest-path components/screen/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path components/large-transfers/Cargo.toml",
+  "cargo test --locked --manifest-path components/recurrence/Cargo.toml",
+  "cargo test --locked --manifest-path components/screen/Cargo.toml",
+]
+sources = ["components/*/src/**/*.rs", "components/*/Cargo.toml", "components/*/Cargo.lock", "wit/**"]
+
 [tasks.deny]
 desc = "cargo-deny: licences, bans, advisories, sources"
 run = ["cargo deny check"]
@@ -57,6 +72,6 @@ no_cache = true
 allow_failure = true
 
 [tasks.ci]
-desc = "What CI runs: fmt-check, lint, test, deny"
-depends = ["fmt-check", "lint", "test", "deny"]
+desc = "What CI runs: fmt-check, lint, test, components, deny"
+depends = ["fmt-check", "lint", "test", "components", "deny"]
 run = []

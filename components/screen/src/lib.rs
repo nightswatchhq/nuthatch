@@ -129,3 +129,147 @@ fn str_col<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a StringArray, String
 }
 
 export!(Component);
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::ArrayRef;
+
+    use super::exports::nuthatch::transform::screen::Guest;
+    use super::*;
+
+    const BAD: &str = "0x1111111111111111111111111111111111111111";
+    const A: &str = "0x00000000000000000000000000000000000000aa";
+    const B: &str = "0x00000000000000000000000000000000000000bb";
+
+    // (block_number, log_index, from, to, value)
+    type Transfer = (u64, u64, &'static str, &'static str, &'static str);
+
+    fn transfers(rows: &[Transfer]) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("log_index", DataType::UInt64, false),
+            Field::new("from", DataType::Utf8, false),
+            Field::new("to", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.0))),
+            Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.1))),
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.2))),
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.3))),
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.4))),
+        ];
+        write_batch(&RecordBatch::try_new(schema, cols).unwrap()).unwrap()
+    }
+
+    fn list(addrs: &[&str]) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "address",
+            DataType::Utf8,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(StringArray::from_iter_values(addrs.iter().copied()));
+        write_batch(&RecordBatch::try_new(schema, vec![col]).unwrap()).unwrap()
+    }
+
+    // (block_number, log_index, address, side, counterparty, value)
+    type Hit = (u64, u64, String, String, String, String);
+
+    fn hits(out: &[u8]) -> Vec<Hit> {
+        let b = read_batch(out).unwrap();
+        assert_eq!(b.schema(), hits_schema());
+        let blk = u64_col(&b, "block_number").unwrap();
+        let log = u64_col(&b, "log_index").unwrap();
+        let s = |n| str_col(&b, n).unwrap();
+        (0..b.num_rows())
+            .map(|i| {
+                (
+                    blk.value(i),
+                    log.value(i),
+                    s("address").value(i).to_string(),
+                    s("side").value(i).to_string(),
+                    s("counterparty").value(i).to_string(),
+                    s("value").value(i).to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn hit(block: u64, log: u64, address: &str, side: &str, cp: &str, value: &str) -> Hit {
+        (
+            block,
+            log,
+            address.into(),
+            side.into(),
+            cp.into(),
+            value.into(),
+        )
+    }
+
+    #[test]
+    fn emits_one_hit_per_sanctioned_side_in_input_order() {
+        let out = Component::run(
+            transfers(&[
+                (10, 0, A, BAD, "100"),
+                (10, 1, BAD, B, "250"),
+                (11, 0, A, B, "7"),
+            ]),
+            list(&[BAD]),
+        )
+        .unwrap();
+        assert_eq!(
+            hits(&out),
+            vec![
+                hit(10, 0, BAD, "to", A, "100"),
+                hit(10, 1, BAD, "from", B, "250"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_transfer_between_two_sanctioned_addresses_hits_sender_before_recipient() {
+        let other = "0x2222222222222222222222222222222222222222";
+        let out =
+            Component::run(transfers(&[(5, 3, BAD, other, "9")]), list(&[BAD, other])).unwrap();
+        assert_eq!(
+            hits(&out),
+            vec![
+                hit(5, 3, BAD, "from", other, "9"),
+                hit(5, 3, other, "to", BAD, "9"),
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_ignores_address_case() {
+        let upper = "0x1111111111111111111111111111111111111111".to_uppercase();
+        let mixed = "0xAAaa000000000000000000000000000000000000";
+        let out = Component::run(
+            transfers(&[(1, 0, mixed, BAD, "1")]),
+            list(&[upper.as_str()]),
+        )
+        .unwrap();
+        assert_eq!(
+            hits(&out),
+            vec![hit(1, 0, BAD, "to", &mixed.to_ascii_lowercase(), "1")]
+        );
+    }
+
+    #[test]
+    fn an_empty_sanctioned_list_yields_no_hits() {
+        let out = Component::run(transfers(&[(1, 0, A, B, "1")]), list(&[])).unwrap();
+        assert!(hits(&out).is_empty());
+    }
+
+    #[test]
+    fn an_empty_transfer_batch_yields_no_hits() {
+        let out = Component::run(transfers(&[]), list(&[BAD])).unwrap();
+        assert!(hits(&out).is_empty());
+    }
+
+    #[test]
+    fn a_missing_column_is_refused() {
+        let err = Component::run(transfers(&[(1, 0, A, B, "1")]), transfers(&[])).unwrap_err();
+        assert_eq!(err, "column address missing or not utf8");
+    }
+}
