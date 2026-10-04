@@ -58,30 +58,53 @@ fn pools() -> Pools {
             .filter_map(|(dir, e)| Some((dir.clone(), e.upgrade()?)))
             .collect()
     };
-    let mut out = Pools::default();
-    for (dir, engine) in live {
-        // Held exclusively only while tables are bound, which reserves nothing.
-        let reserved = match engine.try_read() {
-            Ok(e) => Some(e),
-            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        }
-        .map_or(0, |e| {
-            fold_peak(dir.as_deref(), e.take_memory_peak() as u64);
-            e.memory_reserved() as u64
-        });
-        out.total.engines += 1;
-        out.total.reserved += reserved;
-        if let Some(dir) = dir {
-            let u = out.by_dir.entry(dir).or_default();
-            u.engines += 1;
-            u.reserved += reserved;
-        }
-    }
+    let engines: Vec<_> = live
+        .into_iter()
+        .map(|(dir, engine)| {
+            // Held exclusively only while tables are bound, which reserves nothing.
+            let reserved = match engine.try_read() {
+                Ok(e) => Some(e),
+                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            }
+            .map_or(0, |e| {
+                fold_peak(dir.as_deref(), e.take_memory_peak() as u64);
+                e.memory_reserved() as u64
+            });
+            (dir, reserved)
+        })
+        .collect();
+    let nest_pools: Vec<_> = NEST_POOLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(dir, pool)| (dir.clone(), pool.reserved() as u64))
+        .collect();
+    let mut out = tally(engines, &nest_pools);
     let peaks = PEAKS.lock().unwrap_or_else(|p| p.into_inner());
     out.total.peak = peaks.all;
     for (dir, peak) in &peaks.by_dir {
         out.by_dir.entry(dir.clone()).or_default().peak = *peak;
+    }
+    out
+}
+
+/// Each engine's reading by the directory it was opened over, and each nest pool's total. A
+/// nest's engines each read their shared pool's total, so a nest's is the pool's, once (#1792).
+fn tally(engines: Vec<(Option<PathBuf>, u64)>, nest_pools: &[(PathBuf, u64)]) -> Pools {
+    let mut out = Pools::default();
+    for (dir, reserved) in engines {
+        out.total.engines += 1;
+        match dir {
+            Some(dir) => out.by_dir.entry(dir).or_default().engines += 1,
+            None => out.total.reserved += reserved,
+        }
+    }
+    for (dir, reserved) in nest_pools {
+        if let Some(u) = out.by_dir.get_mut(dir) {
+            u.reserved = *reserved;
+            out.total.reserved += reserved;
+        }
     }
     out
 }
@@ -187,7 +210,14 @@ impl BurrmillSession {
         let spill = crate::spill::new_spill_dir()?;
         let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
         #[allow(unused_mut)]
-        let mut engine = burrmill::Engine::open_empty_budgeted(budget).map_err(engine_err)?;
+        let mut engine = match dir {
+            Some(dir) => {
+                let pool = nest_pool(dir, budget.memory_bytes);
+                burrmill::Engine::open_empty_sharing(budget, &pool)
+            }
+            None => burrmill::Engine::open_empty_budgeted(budget),
+        }
+        .map_err(engine_err)?;
         #[cfg(feature = "graph")]
         crate::analytics_scalars::register(&mut engine);
         let engine = Arc::new(RwLock::new(engine));
@@ -227,6 +257,20 @@ impl Drop for BurrmillSession {
     fn drop(&mut self) {
         fold_peak(self.dir.as_deref(), self.reader().take_memory_peak() as u64);
     }
+}
+
+// A statement that finds the cached session busy opens another, so the limit has to bound the
+// nest's sessions together (#1792). The pool keeps the size its first session gave it.
+static NEST_POOLS: Mutex<std::collections::BTreeMap<PathBuf, burrmill::SharedPool>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn nest_pool(dir: &Path, memory_bytes: usize) -> burrmill::SharedPool {
+    NEST_POOLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(dir.to_path_buf())
+        .or_insert_with(|| burrmill::SharedPool::new(memory_bytes))
+        .clone()
 }
 
 /// The walls `analytics_budget` sets, as Burrmill's budget.
@@ -820,6 +864,30 @@ mod tests {
         );
     }
 
+    /// #1792: a nest's sessions share one pool and each reads that pool's total as its own, so a
+    /// sum over them counts the pool once per session.
+    #[test]
+    fn two_sessions_of_one_nest_report_their_pool_once() {
+        use std::path::PathBuf;
+        let nest = PathBuf::from("/nests/a");
+        let engines = vec![
+            (Some(nest.clone()), 400),
+            (Some(nest.clone()), 400),
+            (Some(PathBuf::from("/nests/b")), 30),
+            (None, 7),
+        ];
+        let pools = [(nest.clone(), 400), (PathBuf::from("/nests/b"), 30)];
+        let out = super::tally(engines, &pools);
+        let a = out.by_dir[&nest];
+        assert_eq!((a.engines, a.reserved), (2, 400), "{out:?}");
+        assert_eq!(out.by_dir[&PathBuf::from("/nests/b")].reserved, 30);
+        assert_eq!(
+            (out.total.engines, out.total.reserved),
+            (4, 437),
+            "each pool once, plus the bare session's own: {out:?}"
+        );
+    }
+
     /// `/sql` collects, and a scrape must not wait behind it.
     #[test]
     fn a_scrape_reads_the_pool_while_a_collect_runs() {
@@ -841,6 +909,89 @@ mod tests {
             watcher.join().unwrap()
         });
         assert!(seen > 0, "no scrape saw the sort's reservation");
+    }
+
+    /// Sessions over `dirs` under a 64 MB limit and no room to spill, each holding a table `t` its
+    /// sort needs a large share of that limit for.
+    fn bounded_sessions(dirs: &[&std::path::Path]) -> Vec<Box<dyn crate::engine::Session>> {
+        use crate::analytics_budget::{ENV_BURRMILL_MEMORY_LIMIT, ENV_MAX_TEMP_SIZE};
+        use crate::engine::{Engine as _, FactWindow};
+        let sessions: Vec<_> = {
+            let _env = crate::analytics_budget::tests::env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(ENV_BURRMILL_MEMORY_LIMIT, "64MB");
+            std::env::set_var(ENV_MAX_TEMP_SIZE, "0MB");
+            let opened = dirs
+                .iter()
+                .map(|d| super::BurrmillEngine.open(d).unwrap())
+                .collect();
+            std::env::remove_var(ENV_BURRMILL_MEMORY_LIMIT);
+            std::env::remove_var(ENV_MAX_TEMP_SIZE);
+            opened
+        };
+        let rows: Vec<serde_json::Value> = (1..=100_000u64)
+            .map(|b| serde_json::json!({ "block_number": b, "k": format!("{:0180}", b * 7919 % 100_003) }))
+            .collect();
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        for s in &sessions {
+            s.load_hot("t", &refs).unwrap();
+            assert!(s
+                .bind_facts("t", &[], &[], true, FactWindow::default())
+                .unwrap());
+        }
+        sessions
+    }
+
+    const SORT: &str = "SELECT k, block_number FROM t ORDER BY k";
+
+    /// Runs `SORT` on `first` and, while its first row is out, on `second`; hands `first` back with
+    /// how the second statement ended.
+    fn overlapped(
+        first: Box<dyn crate::engine::Session>,
+        second: &dyn crate::engine::Session,
+    ) -> (Box<dyn crate::engine::Session>, anyhow::Result<()>) {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let a = s.spawn(move || {
+                let mut sent = false;
+                first
+                    .for_each_row(SORT, &mut |_| {
+                        if !sent {
+                            sent = true;
+                            out_tx.send(()).unwrap();
+                            done_rx.recv().unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                first
+            });
+            out_rx.recv().unwrap();
+            let r = second.for_each_row(SORT, &mut |_| Ok(()));
+            done_tx.send(()).unwrap();
+            (a.join().unwrap(), r)
+        })
+    }
+
+    /// #1792: NUTHATCH_BURRMILL_MEMORY_LIMIT bounds a nest, so a second session of it competes for
+    /// what the first holds instead of reserving a limit of its own beside it.
+    #[test]
+    fn two_sessions_of_one_nest_share_its_memory_limit() {
+        let (nest, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut s = bounded_sessions(&[nest.path(), nest.path(), other.path()]);
+        let (c, b, a) = (s.pop().unwrap(), s.pop().unwrap(), s.pop().unwrap());
+        b.for_each_row(SORT, &mut |_| Ok(()))
+            .expect("the sort fits the limit alone");
+
+        let (a, second) = overlapped(a, b.as_ref());
+        assert!(
+            second.is_err(),
+            "a second session of the nest sorted beside the first, past one limit"
+        );
+        let (_, elsewhere) = overlapped(a, c.as_ref());
+        elsewhere.expect("another nest's session has a limit of its own");
     }
 
     /// #1677: a cached session held its hot rows twice, as the staged JSON and as the bound table.
