@@ -82,7 +82,7 @@ respond @metrics 404
 
 ## The rules
 
-`rules/nuthatch.yml`. The nine original conditions in `docs/operators.md` "What to alert on", then:
+`rules/nuthatch.yml`. The conditions in `docs/operators.md` "What to alert on", then:
 
 | Alert | Fires when |
 |---|---|
@@ -92,7 +92,7 @@ respond @metrics 404
 | `TargetDown` | a scrape target has not answered for 2 minutes |
 | `Watchdog` | always; read by `helsinki/deadman.sh` |
 
-Three things differ from the page they come from, deliberately:
+Four things differ from the page they come from, deliberately:
 
 - **A single-nest `dev`, every unit today, exports no `nuthatch_nest_health`,
   `nuthatch_cursor_live` or `nuthatch_nest_quarantine_total`.** Those are a multi-nest runtime's
@@ -102,6 +102,9 @@ Three things differ from the page they come from, deliberately:
   poll reaches 300 s on every healthy cycle.
 - **`MemoryNearBudget` is 75% of 2 GiB**, the per-cursor budget, whatever `NUTHATCH_MAX_RSS` a unit
   was given.
+- **`SealedHistoryDisagrees` and `AuditNotRunning` need a unit started with `--audit-rpc`** (#1786),
+  the only kind that exports the audit series. No unit is today, so neither can fire yet.
+  `AuditNotRunning` looks back six hours, which assumes the default 24 samples a day.
 
 `reason="out_of_memory"` exists from the first release carrying it (nuthatch #1714). Until a unit
 runs one, an out-of-memory failure is counted as `invalid` and `SqlOutOfMemory` cannot fire for

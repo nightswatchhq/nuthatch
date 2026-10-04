@@ -1,4 +1,4 @@
-# The nine conditions in docs/operators.md "What to alert on", then what production added.
+# The conditions in docs/operators.md "What to alert on", then what production added.
 # Every nest target carries `unit`, `box` and `role` from targets/nests.yml; role="archive" is a
 # frozen `serve` nest with no cursor and is left out of the ingest and readiness rules on purpose.
 #
@@ -76,6 +76,23 @@ groups:
         labels: {severity: warn}
         annotations:
           summary: "{{ $labels.unit }}: the publish mirror is behind or has a dead letter"
+
+      # The audit series exist only on a unit started with --audit-rpc (#1786), at 0 from start and
+      # first sampled an interval later. Held for a day so a 3am mismatch is still up in the morning.
+      - alert: SealedHistoryDisagrees
+        expr: increase(nuthatch_audit_mismatches_total[1d]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.unit }}: a second endpoint served different logs for a sealed range; the unit's log names the range and rows"
+
+      # Six hours holds six samples at the default 24 a day; a unit run with --audit-per-day under 4
+      # would fire this by design.
+      - alert: AuditNotRunning
+        expr: increase(nuthatch_audit_ranges_total[6h]) == 0
+        for: 2h
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $labels.unit }}: the sealed-history audit has compared nothing in six hours; nuthatch_audit_errors_total and the log say why"
 
   - name: nuthatch-production
     rules:

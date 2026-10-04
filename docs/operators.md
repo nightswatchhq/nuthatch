@@ -1021,7 +1021,7 @@ Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_scre
 | **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
 | **Mirror behind** | `nuthatch_publish_lag_blocks` growing across several intervals, or `nuthatch_publish_dead_letter == 1` | the bucket is unreachable or refusing an object, and consumers of the mirror see stale history |
 | **Sealed history disagrees** | `increase(nuthatch_audit_mismatches_total[1d]) > 0` | a second endpoint served different logs for a sealed range; one of the two providers is wrong (below) |
-| **Audit not running** | `increase(nuthatch_audit_ranges_total[1d]) == 0` where `--audit-rpc` is set | the audit endpoint is unreachable or on the wrong chain; `nuthatch_audit_errors_total` and the log say which |
+| **Audit not running** | `increase(nuthatch_audit_ranges_total[6h]) == 0` for 2h (the series exists only where `--audit-rpc` is set; six hours assumes the default 24 samples a day) | the audit endpoint is unreachable or on the wrong chain; `nuthatch_audit_errors_total` and the log say which |
 
 ### Auditing sealed history against a second endpoint
 
