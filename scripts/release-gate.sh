@@ -31,8 +31,10 @@
 #   p99 of the set: slower than 1.5x the baseline's AND more than 1000 ms (GATE_P99_FACTOR/_SLACK_MS)
 # Both conditions must hold, so a 40 ms query taking 90 ms is noise, not a regression.
 # Also FAIL on the serving process's peak RSS over the 2 GiB per-cursor budget (GATE_MAX_RSS_MB).
-# It is sampled every half second, so a spike shorter than that can pass unseen. At each new peak
-# the binary's /metrics is read too, so a binary that exports the analytics pool and jemalloc gauges
+# On Linux the peak is the kernel's high-water mark, VmHWM in /proc/<pid>/status (GATE_PROC_ROOT),
+# read as each server is stopped, the largest kept. RSS is also sampled every half second, which is
+# all macOS has and can miss a spike between samples; that figure is reported alongside. At each new
+# sampled peak the binary's /metrics is read too, so a binary that exports the analytics pool and jemalloc gauges
 # (#1778) reports where the peak sat.
 # With --baseline, also FAIL ("answer differs") on a statement whose answer is not the baseline's.
 # Each answer is kept canonical in <out>/answers/<id>.rows (keys sorted, floats to 12 significant
@@ -47,6 +49,7 @@ QUERY_SLACK_MS=${GATE_QUERY_SLACK_MS:-1000}
 P99_FACTOR=${GATE_P99_FACTOR:-1.5}
 P99_SLACK_MS=${GATE_P99_SLACK_MS:-1000}
 MAX_RSS_MB=${GATE_MAX_RSS_MB:-2048}
+PROC_ROOT=${GATE_PROC_ROOT:-/proc}
 
 die() { echo "release-gate: $*" >&2; exit 2; }
 trap 'rc=$?; echo "release-gate: internal error at line $LINENO (exit $rc)" >&2; exit 2' ERR
@@ -119,8 +122,21 @@ sample_rss() {
 }
 metrics_now() { curl -s -m 1 "http://127.0.0.1:$port/metrics" 2>/dev/null || true; }
 port=""
+# Keeps the largest VmHWM (KiB) in $out/hwm-peak-kb. Where /proc exists but a server's status has no
+# VmHWM (it exited before it was stopped), the server is listed in $out/hwm-unread instead.
+read_hwm() {
+  local hwm p
+  [ -d "$PROC_ROOT" ] || return 0
+  hwm=$(awk '$1 == "VmHWM:" { print $2 }' "$PROC_ROOT/$1/status" 2>/dev/null || true)
+  case "$hwm" in
+    ''|*[!0-9]*) echo "$1" >>"$out/hwm-unread"; return 0 ;;
+  esac
+  p=$(cat "$out/hwm-peak-kb" 2>/dev/null || echo 0)
+  if [ "$hwm" -gt "$p" ]; then echo "$hwm" >"$out/hwm-peak-kb"; fi
+}
 stop_server() {
   if [ -n "$server_pid" ]; then
+    read_hwm "$server_pid"
     # Since start, so read before the server goes; the largest over every server is kept.
     local pool p
     pool=$(metrics_now | awk '$1 == "nuthatch_analytics_pool_peak_bytes" { print $2 }')
@@ -235,7 +251,7 @@ echo "release-gate: $n queries from $set_file, $passes pass(es), results in $out
 echo "release-gate: budget ${PROD_ENV[*]:-the defaults}${env_file:+ (from $env_file)}"
 echo "release-gate: concurrency $concurrency (the set's statements sent $concurrency at a time, in order)"
 
-rm -f "$out/rss-peak-kb" "$out/died-after" "$out/unstable" "$out/rss-peak-gauges" "$out/pool-peak-bytes"
+rm -f "$out/rss-peak-kb" "$out/hwm-peak-kb" "$out/hwm-unread" "$out/died-after" "$out/unstable" "$out/rss-peak-gauges" "$out/pool-peak-bytes"
 # Each pass on a fresh server: the nest memoises answers by statement text, so a second ask of the
 # same statement on one server would time the memo.
 pass=1
@@ -453,10 +469,24 @@ if [ -n "$write_baseline" ]; then
 fi
 
 echo
-peak_kb=$(cat "$out/rss-peak-kb" 2>/dev/null || true)
-peak_mb=$(( ${peak_kb:-0} / 1024 ))
+sampled_kb=$(cat "$out/rss-peak-kb" 2>/dev/null || true)
+sampled_kb=${sampled_kb:-0}
+hwm_kb=$(cat "$out/hwm-peak-kb" 2>/dev/null || true)
+hwm_kb=${hwm_kb:-0}
+# A server whose VmHWM went unread still has its samples, so the verdict takes the larger.
+peak_kb=$hwm_kb
+[ "$sampled_kb" -le "$peak_kb" ] || peak_kb=$sampled_kb
+peak_mb=$(( peak_kb / 1024 ))
 rss_failed=0
 rss_line="peak RSS ${peak_mb} MiB, budget ${MAX_RSS_MB} MiB"
+if [ "$hwm_kb" -gt 0 ]; then
+  rss_how="the kernel's high-water mark (VmHWM) $(( hwm_kb / 1024 )) MiB; sampled every 0.5 s, $(( sampled_kb / 1024 )) MiB"
+else
+  rss_how="sampled every 0.5 s, $(( sampled_kb / 1024 )) MiB; no VmHWM read from $PROC_ROOT"
+fi
+if [ -s "$out/hwm-unread" ]; then
+  rss_how="$rss_how; VmHWM unread for $(wc -l <"$out/hwm-unread" | tr -d ' ') server(s) that exited before they were stopped"
+fi
 if [ "$peak_mb" -gt "$MAX_RSS_MB" ]; then rss_failed=1; rss_line="$rss_line: OVER"; fi
 differ_line=""
 if [ -n "$baseline" ]; then
@@ -467,6 +497,7 @@ if [ -n "$baseline" ]; then
   echo "release-gate: answers against the baseline: $matched match, $differs differ, $counted compared on row count only, $uncompared not compared"
 fi
 echo "release-gate: $rss_line"
+echo "release-gate: peak RSS from $rss_how"
 if [ -s "$out/rss-peak-gauges" ]; then
   mib() { awk -v k="$1" '$1 == k { printf "%d", $2 / 1048576; f = 1 } END { if (!f) printf "-" }' "$out/rss-peak-gauges"; }
   engines=$(awk '$1 == "nuthatch_analytics_engines" { print $2 }' "$out/rss-peak-gauges")

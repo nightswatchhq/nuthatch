@@ -638,6 +638,130 @@ fn a_peak_rss_over_the_budget_fails_a_set_that_answers() {
     );
 }
 
+/// A `serve` wrapper that writes a fake `<proc>/<its pid>/status`, the next VmHWM from `hwm_kb` on
+/// each start, and serves the real binary as its child. Like the real one, the status is gone once
+/// the wrapper is stopped, so a read after the kill finds nothing (#1833).
+fn hwm_wrapper(c: &Case, hwm_kb: &[u64]) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let proc_root = c.dir.path().join("proc");
+    std::fs::create_dir_all(&proc_root).unwrap();
+    let list = hwm_kb.iter().map(u64::to_string).collect::<Vec<_>>();
+    let wrapper = c.dir.path().join("nuthatch-hwm");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env bash\n\
+             set -eu\n\
+             [ \"${{1:-}}\" = serve ] || exec '{real}' \"$@\"\n\
+             n=$(cat '{proc}/starts' 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) >'{proc}/starts'\n\
+             hwm=$(echo '{list}' | cut -d' ' -f$((n + 1)))\n\
+             mkdir -p '{proc}/'$$\n\
+             printf 'Name:\\tnuthatch\\nVmPeak:\\t 9999999 kB\\nVmHWM:\\t %s kB\\nVmRSS:\\t 1 kB\\n' \"$hwm\" >'{proc}/'$$/status\n\
+             '{real}' \"$@\" &\n\
+             child=$!\n\
+             trap 'rm -rf \"{proc}/'$$'\"; kill $child 2>/dev/null; wait $child; exit 0' TERM INT\n\
+             wait $child\n",
+            real = env!("CARGO_BIN_EXE_nuthatch"),
+            proc = proc_root.display(),
+            list = list.join(" "),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (wrapper, proc_root)
+}
+
+fn gate_with(
+    c: &Case,
+    bin: &Path,
+    set: &Path,
+    passes: &str,
+    env: &[(&str, &str)],
+) -> (Output, String) {
+    let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+    cmd.args(["--passes", passes, "--out"])
+        .arg(c.dir.path().join("out"))
+        .arg(bin)
+        .arg(&c.nest)
+        .arg(set);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run release-gate.sh");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out, text)
+}
+
+/// The half-second sampler missed a spike by ~180 MiB (#1833). The kernel's high-water mark, read as
+/// each server stops, is the peak and decides the verdict, the largest over every server kept. The
+/// middle of three passes holds it, so keeping the first or the last would pass.
+#[test]
+fn the_kernel_high_water_mark_over_every_server_is_the_peak_and_the_verdict() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let (bin, proc_root) = hwm_wrapper(&c, &[1_000_000, 3_000_000, 1_500_000]);
+    let proc_env = proc_root.to_str().unwrap();
+    let (out, text) = gate_with(&c, &bin, &set, "3", &[("GATE_PROC_ROOT", proc_env)]);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(line_for(&text, "answers").starts_with("ok "), "{text}");
+    assert!(
+        text.contains("release-gate: peak RSS 2929 MiB, budget 2048 MiB: OVER\n"),
+        "{text}"
+    );
+    assert!(text.contains("RESULT: FAIL - failed: peak RSS"), "{text}");
+    let from = text
+        .lines()
+        .find(|l| l.starts_with("release-gate: peak RSS from "))
+        .unwrap_or_else(|| panic!("no line naming where the peak came from:\n{text}"));
+    assert!(from.contains("(VmHWM) 2929 MiB"), "{from}");
+    let sampled: u64 = from
+        .split("sampled every 0.5 s, ")
+        .nth(1)
+        .and_then(|s| s.split(" MiB").next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("the sampled figure belongs alongside: {from}"));
+    assert!(sampled < 2048, "{from}");
+
+    let (bin, proc_root) = hwm_wrapper(&c, &[1_000_000]);
+    std::fs::remove_file(proc_root.join("starts")).unwrap();
+    let (out, text) = gate_with(
+        &c,
+        &bin,
+        &set,
+        "1",
+        &[("GATE_PROC_ROOT", proc_root.to_str().unwrap())],
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("release-gate: peak RSS 976 MiB, budget 2048 MiB\n"),
+        "{text}"
+    );
+}
+
+/// Where /proc exists but a server's status is gone, the run says so rather than reporting a
+/// high-water mark that covers fewer servers than it ran.
+#[test]
+fn a_server_whose_status_is_gone_is_counted_as_unread() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let proc_root = c.dir.path().join("empty-proc");
+    std::fs::create_dir_all(&proc_root).unwrap();
+    let (out, text) = gate_with(
+        &c,
+        Path::new(env!("CARGO_BIN_EXE_nuthatch")),
+        &set,
+        "1",
+        &[("GATE_PROC_ROOT", proc_root.to_str().unwrap())],
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("VmHWM unread for 1 server(s)"), "{text}");
+}
+
 /// Starts a gate script with its output in a file; `finish` kills it if it overruns, so a lock that
 /// deadlocks fails the test rather than hanging it.
 fn run_bounded(mut cmd: Command, dir: &Path, name: &str) -> Child {
