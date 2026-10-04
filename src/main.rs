@@ -18,6 +18,13 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// With transparent huge pages on (Debian's default), pages jemalloc purged stayed resident inside
+// their huge pages: the allocations nest peaked at 2435 MiB with jemalloc holding 1527 (#1773).
+// `_RJEM_MALLOC_CONF` still overrides any of these.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[export_name = "_rjem_malloc_conf"]
+static MALLOC_CONF: &u8 = &b"thp:never,narenas:8,dirty_decay_ms:1000,background_thread:true\0"[0];
+
 use nuthatch::{
     analytics, audit, bench, blob, check, cli, config, distribution, doctor, help, indexer, labels,
     lists, mcp, offchain, pack, project, publish, runtime, screen, store, transform,
@@ -970,6 +977,21 @@ fn hostname_or_bail() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    #[test]
+    fn jemalloc_keeps_huge_pages_off_its_heap() {
+        let thp = unsafe {
+            std::ffi::CStr::from_ptr(
+                tikv_jemalloc_ctl::raw::read::<*const std::ffi::c_char>(b"opt.thp\0").unwrap(),
+            )
+        };
+        assert_eq!(thp.to_str().unwrap(), "never");
+        assert_eq!(tikv_jemalloc_ctl::opt::narenas::read().unwrap(), 8);
+        assert!(tikv_jemalloc_ctl::opt::background_thread::read().unwrap());
+        let dirty = unsafe { tikv_jemalloc_ctl::raw::read::<isize>(b"opt.dirty_decay_ms\0") };
+        assert_eq!(dirty.unwrap(), 1000);
+    }
 
     #[test]
     fn an_offline_query_of_an_entity_says_it_needs_the_node() {
