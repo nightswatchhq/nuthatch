@@ -1834,14 +1834,18 @@ async fn series_naming(live: &serve::LiveRuntime, nest: &str) -> Vec<String> {
 /// and 0 for the other until restart, which reads as quarantined.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unmounted_nest_leaves_the_health_series() {
+    // Per-nest series live in the process-wide METRICS, keyed by mount name, so a neighbour test
+    // mounting `usdc` puts its own `nest="usdc"` lines in this test's /metrics (#1776).
+    const FIRST: &str = "health-first";
+    const ALIAS: &str = "health-alias";
     let roost = tempfile::tempdir().unwrap();
     let nid = "7d".repeat(32);
-    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let (mut handles, _tape) = one_live_mount_as(roost.path(), &nid, FIRST).await;
     handles
-        .mount("mirror", Some(runtime::Nid::parse(&nid).unwrap()))
+        .mount(ALIAS, Some(runtime::Nid::parse(&nid).unwrap()))
         .await
         .expect("a second mount of the dataset");
-    for nest in ["usdc", "mirror"] {
+    for nest in [FIRST, ALIAS] {
         let line = nest_health_series(&handles.live, nest).await;
         assert!(
             line.as_deref().is_some_and(|l| l.ends_with(" 1")),
@@ -1849,31 +1853,31 @@ async fn an_unmounted_nest_leaves_the_health_series() {
         );
     }
 
-    handles.unmount("mirror").await.expect("unmount the alias");
+    handles.unmount(ALIAS).await.expect("unmount the alias");
     assert_eq!(
-        nest_health_series(&handles.live, "mirror").await,
+        nest_health_series(&handles.live, ALIAS).await,
         None,
         "the unmounted alias is still reported"
     );
     handles
-        .unmount("usdc")
+        .unmount(FIRST)
         .await
         .expect("unmount the last mount");
     assert_eq!(
-        nest_health_series(&handles.live, "usdc").await,
+        nest_health_series(&handles.live, FIRST).await,
         None,
         "the unmounted nest is still reported"
     );
 
     // The other order: the first mount goes while the alias still reads the dataset, and the
     // alias takes the dataset's key on the cursor.
-    for name in ["usdc", "mirror"] {
+    for name in [FIRST, ALIAS] {
         handles
             .mount(name, Some(runtime::Nid::parse(&nid).unwrap()))
             .await
             .expect("remount");
     }
-    for nest in ["usdc", "mirror"] {
+    for nest in [FIRST, ALIAS] {
         let line = nest_health_series(&handles.live, nest).await;
         assert!(
             line.as_deref().is_some_and(|l| l.ends_with(" 1")),
@@ -1881,30 +1885,30 @@ async fn an_unmounted_nest_leaves_the_health_series() {
         );
     }
     handles
-        .unmount("usdc")
+        .unmount(FIRST)
         .await
         .expect("unmount the first mount");
     assert_eq!(
-        nest_health_series(&handles.live, "usdc").await,
+        nest_health_series(&handles.live, FIRST).await,
         None,
         "the first mount is still reported after it was unmounted, while an alias remains"
     );
-    let line = nest_health_series(&handles.live, "mirror").await;
+    let line = nest_health_series(&handles.live, ALIAS).await;
     assert!(
         line.as_deref().is_some_and(|l| l.ends_with(" 1")),
         "the alias left on the dataset lost its health series: {line:?}"
     );
     // The dataset is still indexed, and the series it emits now carry the mount that is left.
-    let gone = series_naming(&handles.live, "usdc").await;
+    let gone = series_naming(&handles.live, FIRST).await;
     assert!(
         gone.is_empty(),
         "series still name the unmounted first mount: {gone:?}"
     );
     handles
-        .unmount("mirror")
+        .unmount(ALIAS)
         .await
         .expect("unmount the last mount");
-    for nest in ["usdc", "mirror"] {
+    for nest in [FIRST, ALIAS] {
         assert_eq!(
             nest_health_series(&handles.live, nest).await,
             None,
@@ -2088,6 +2092,15 @@ async fn one_live_mount(
     roost: &std::path::Path,
     nid: &str,
 ) -> (runtime::RuntimeHandles, Arc<TapeSource>) {
+    one_live_mount_as(roost, nid, "usdc").await
+}
+
+/// [`one_live_mount`] under another name.
+async fn one_live_mount_as(
+    roost: &std::path::Path,
+    nid: &str,
+    name: &str,
+) -> (runtime::RuntimeHandles, Arc<TapeSource>) {
     std::fs::write(
         roost.join(runtime::MOUNTS_FILE),
         "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
@@ -2095,22 +2108,26 @@ async fn one_live_mount(
     .unwrap();
     let (mut handles, tape, _intake) = empty_runtime(roost, nid).await;
     handles
-        .mount("usdc", Some(runtime::Nid::parse(nid).unwrap()))
+        .mount(name, Some(runtime::Nid::parse(nid).unwrap()))
         .await
         .expect("mount");
     assert!(
-        wait_until(POLL_TIMEOUT, || usdc_last_block(&handles).as_deref()
+        wait_until(POLL_TIMEOUT, || last_block(&handles, name).as_deref()
             == Some("3"))
         .await,
-        "premise: usdc indexes to the tip"
+        "premise: {name} indexes to the tip"
     );
     (handles, tape)
 }
 
 fn usdc_last_block(h: &runtime::RuntimeHandles) -> Option<String> {
+    last_block(h, "usdc")
+}
+
+fn last_block(h: &runtime::RuntimeHandles, name: &str) -> Option<String> {
     h.states
         .iter()
-        .find(|(n, _)| n == "usdc")
+        .find(|(n, _)| n == name)
         .and_then(|(_, s)| s.store.get_meta("last_block").ok().flatten())
 }
 
