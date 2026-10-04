@@ -53,6 +53,11 @@ pub struct AdaptiveWindow {
     /// Consecutive windows served whole *at the lowered ceiling* (#1170). The evidence that the
     /// ceiling is too low now, whatever it was when a refusal set it.
     whole_streak: u32,
+    /// The streak the next doubling needs: [`RECOVERY_STREAK`], doubled each time a recovered
+    /// ceiling is refused again (#1787), up to [`MAX_RECOVERY_STREAK`].
+    streak_needed: u32,
+    /// The ceiling was last moved by a doubling that has not yet held for a streak of its own.
+    probing: bool,
 }
 
 /// How many consecutive windows must be served whole at a lowered ceiling before it doubles (#1170).
@@ -64,6 +69,10 @@ pub struct AdaptiveWindow {
 /// with no path back up the backfill ran a hundred times slower for the next three hours until an
 /// operator restarted it. This is that path.
 pub const RECOVERY_STREAK: u32 = 4;
+
+/// The longest streak a ceiling waits for after its recoveries keep being refused (#1787). A provider
+/// whose cap sits just under a doubling is then asked past it once every 64 windows, not every 5.
+pub const MAX_RECOVERY_STREAK: u32 = RECOVERY_STREAK * 16;
 
 impl AdaptiveWindow {
     /// Start from `initial` (typically the chain's default window), targeting `target` logs/response.
@@ -77,6 +86,8 @@ impl AdaptiveWindow {
             hard_max: max,
             learned: None,
             whole_streak: 0,
+            streak_needed: RECOVERY_STREAK,
+            probing: false,
         }
     }
 
@@ -140,7 +151,12 @@ impl AdaptiveWindow {
         self.served_whole = self.served_whole.max(width);
         if self.max < self.hard_max && width == self.max {
             self.whole_streak += 1;
-            if self.whole_streak >= RECOVERY_STREAK {
+            if self.whole_streak >= self.streak_needed {
+                // A doubled ceiling that held for a full streak has proved itself; the wait resets.
+                if self.probing {
+                    self.streak_needed = RECOVERY_STREAK;
+                }
+                self.probing = true;
                 self.max = self.max.saturating_mul(2).min(self.hard_max);
                 // The lesson moves only when recovery has climbed *past* it. Under a cap that sits
                 // below the remembered width, reaching the cap says nothing about the refusal
@@ -205,6 +221,11 @@ impl AdaptiveWindow {
         self.learned = Some(self.learned.map_or(w, |l| l.min(w)));
         // A refusal is fresh evidence the ceiling is real; the recovery count starts again (#1170).
         self.whole_streak = 0;
+        // Refused at a width recovery climbed to: the next attempt waits twice as long (#1787).
+        if self.probing {
+            self.streak_needed = (self.streak_needed * 2).min(MAX_RECOVERY_STREAK);
+            self.probing = false;
+        }
     }
 
     /// The provider rejected the range as too large - halve hard and (the caller) retry the range.
@@ -532,6 +553,65 @@ mod tests {
             w.served_whole(w.ceiling());
         }
         assert_eq!(w.ceiling(), 100_000);
+    }
+
+    /// #1787: a provider that refuses every recovery past 300 blocks. Without a growing wait it is
+    /// asked past its cap every fifth window for as long as the backfill runs.
+    #[test]
+    fn a_recovery_refused_again_waits_longer_before_the_next() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(250);
+        let mut refusals = 0;
+        for _ in 0..1_000 {
+            let width = w.window();
+            if width > 300 {
+                refusals += 1;
+                w.served_by_splitting(width / 2);
+            } else {
+                w.served_whole(width);
+                w.observed(0);
+            }
+        }
+        assert_eq!(w.streak_needed, MAX_RECOVERY_STREAK);
+        // Waits of 4, 8, 16 and 32 windows, then 64 for the rest: 18 refusals. A fixed wait is 200.
+        assert_eq!(refusals, 18);
+    }
+
+    /// The wait returns to [`RECOVERY_STREAK`] once a doubled ceiling holds for a streak of its own.
+    #[test]
+    fn a_recovered_ceiling_that_holds_ends_the_longer_wait() {
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(250);
+        for _ in 0..RECOVERY_STREAK {
+            w.served_whole(250);
+        }
+        assert_eq!(w.ceiling(), 500);
+        w.served_by_splitting(250);
+        assert_eq!(w.ceiling(), 250);
+        for _ in 0..RECOVERY_STREAK {
+            w.served_whole(250);
+        }
+        assert_eq!(
+            w.ceiling(),
+            250,
+            "a refused recovery must wait longer than the first"
+        );
+        for _ in 0..RECOVERY_STREAK {
+            w.served_whole(250);
+        }
+        assert_eq!(w.ceiling(), 500);
+        for _ in 0..(RECOVERY_STREAK * 2) {
+            w.served_whole(500);
+        }
+        assert_eq!(w.ceiling(), 1_000, "500 held for the longer streak");
+        for _ in 0..RECOVERY_STREAK {
+            w.served_whole(1_000);
+        }
+        assert_eq!(
+            w.ceiling(),
+            2_000,
+            "and the wait is back to {RECOVERY_STREAK}"
+        );
     }
 
     /// The pipelined path keeps `concurrency` windows in flight, so when a refusal lowers the ceiling
