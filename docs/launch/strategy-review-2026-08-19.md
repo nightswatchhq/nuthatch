@@ -1,5 +1,9 @@
 # Launch and chain-expansion review - 2026-08-19
 
+> **2026-10-04: nuthatch takes no grants.** The grant items below (NLnet, EF ESP, Gitcoin) are withdrawn
+> and the drafts under `docs/grants/` are deleted. nuthatch is a self-funded public good, maintained by
+> one person; everything is open source. The rest of the memo stands as written.
+
 - Status: **opinion, not a decision.** A prioritisation memo, not an RFC. Supersedes nothing.
 - Author: Pete (cargopete), with Jenny
 - Date: 2026-08-19
@@ -7,7 +11,7 @@
   repo at `6196b08` (`v2.5.0`)
 - Related: [RFC-0007](../rfcs/0007-launch-and-validation.md) (launch and validation),
   [show-hn.md](show-hn.md), [home-turf.md](home-turf.md), [community.md](community.md),
-  [docs/grants](../grants), [benchmarks.md](../benchmarks.md)
+  [benchmarks.md](../benchmarks.md)
 - Revised: 2026-08-19 - port loop to P0, NLnet to the back burner (§1)
 
 ## Why this document exists
@@ -65,7 +69,7 @@ number.
 | **P3** | IPFS (RFC-0037) or tier-3 executor (RFC-0023) | whichever P0/P1 proves blocking | Deliberately unresolved. See point 4. |
 | **P4** | EF ESP against a named wishlist item | after the post | Now the lead grant, and gated on having something to point at - which P0 and P1 produce. |
 | **P5** | HyperEVM, compliance positioning note | opportunistic | Neither has a user asking. |
-| **-** | **NLnet** | **back burner** (decision, 2026-08-19) | Window verified (3 Sept - 3 Nov 2026, 12:00 CEST), [nlnet.md](../grants/nlnet.md) drafted at €38,400. Recorded, not scheduled. The P0/P1 work is exactly the evidence it would want if it comes forward. |
+| **-** | **NLnet** | **back burner** (decision, 2026-08-19) | Window verified (3 Sept - 3 Nov 2026, 12:00 CEST), `nlnet.md` drafted at €38,400. Recorded, not scheduled. The P0/P1 work is exactly the evidence it would want if it comes forward. |
 | **-** | **Solana** | **not now** | See §2. |
 
 **Done since this document was first written:** the subgraph-fallback forum post is live on The Graph
@@ -256,7 +260,7 @@ Everything sourced from the external report is web research this repo has not co
 of 2026-08-19 and safe to plan against: the NLnet window, the EuroRust dates and venue. Everything
 else - ESP's restructuring and figures, Sovereign Tech's cohort, Gitcoin's calendar, the competitive
 state of Solana indexing, the HyperEVM S3 bucket, every dollar and euro figure not in
-[docs/grants](../grants) - is unconfirmed and must be re-checked against the live page before it is
+`docs/grants` (since deleted) - is unconfirmed and must be re-checked against the live page before it is
 allowed to move a date or a decision.
 
 The report's own caveat applies with force: many of the sharpest claims about Solana indexing pain and

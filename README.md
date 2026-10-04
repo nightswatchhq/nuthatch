@@ -609,8 +609,9 @@ the findings we closed as *not ours to fix* and why, is in
   [index](docs/rfcs/README.md)); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
-- **Governance:** a grant-funded public good (NLnet / EF-ESP). No hosted service, no token, no
-  phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing design brief [`CLAUDE.md`](CLAUDE.md).
+- **Governance:** a self-funded public good, maintained by one person; everything is open source. No
+  hosted service, no token, no phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing
+  design brief [`CLAUDE.md`](CLAUDE.md).
 - **Out of scope:** a hosted/metered service, non-EVM chains, or any deployment
   story beyond binary + compose.
 
