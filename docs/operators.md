@@ -1041,8 +1041,9 @@ nuthatch audit sealed --dir . --rpc https://another-provider.example/KEY --from 
 nuthatch dev --dir . --audit-rpc https://another-provider.example/KEY
 ```
 
-- **Sampling.** Each sample is `--span` (`--audit-span`) blocks, 1,000 by default, inside the sealed
-  range. Even-numbered samples land in a segment picked in proportion to its rows, where an omission
+- **Sampling.** Each sample is `--span` (`--audit-span`) blocks, 1,000 by default, inside the range
+  the compared tables have sealed (a blocks or calls table sealed further does not widen it).
+  Even-numbered samples land in a segment picked in proportion to its rows, where an omission
   has something to omit; odd-numbered samples are uniform over the sealed blocks, so a range the first
   endpoint called empty is still asked about. The same seed over the same segments picks the same
   ranges. `--seed` defaults to the current time and is printed; the background audit logs its seed
