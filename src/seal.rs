@@ -2084,18 +2084,26 @@ mod tests {
         test_set_sweep_registration_barrier(dir.path(), 4);
 
         let barrier = Arc::new(std::sync::Barrier::new(4));
-        let handles: Vec<_> = (0..4)
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..4 {
+            let dir = dir.path().to_path_buf();
+            let tables = usdc();
+            let barrier = Arc::clone(&barrier);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let _ = tx.send(segments_failing_verification(&dir, &tables, None));
+            });
+        }
+        drop(tx);
+        // A follower that is never woken waits forever with no deadline; that has to fail here
+        // rather than hang the test binary (#1757).
+        let results: Vec<_> = (0..4)
             .map(|_| {
-                let dir = dir.path().to_path_buf();
-                let tables = usdc();
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    segments_failing_verification(&dir, &tables, None)
-                })
+                rx.recv_timeout(Duration::from_secs(60))
+                    .expect("a coalesced caller never returned: its leader did not wake it")
             })
             .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         test_clear_sweep_registration_barrier(dir.path());
 
         for r in &results {
