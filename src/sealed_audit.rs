@@ -63,10 +63,6 @@ impl Auditor {
             filter,
         })
     }
-
-    fn audits(&self, table: &str) -> bool {
-        self.schema.iter().any(|t| t.table == table)
-    }
 }
 
 /// One audited range and how the two sides differ.
@@ -168,10 +164,9 @@ pub async fn audit_range(
 
     let mut served: BTreeMap<RowKey, String> = BTreeMap::new();
     for log in &logs {
+        // `decode` matches contract decoders only, never a factory child's template.
         if let Ok(Some(row)) = auditor.registry.decode(log) {
-            if auditor.audits(&row.table) {
-                served.insert((row.block_number, row.log_index), canonical(&row));
-            }
+            served.insert((row.block_number, row.log_index), canonical(&row));
         }
     }
     drop(logs);
@@ -559,10 +554,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_row_sealed_twice_is_reported_as_sealed_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+    fn nest(d: &Path, extra: &str) -> Auditor {
         std::fs::create_dir_all(d.join("abis")).unwrap();
         std::fs::write(
             d.join("abis/erc20.json"),
@@ -571,7 +563,8 @@ mod tests {
         .unwrap();
         std::fs::write(
             d.join(crate::config::CONFIG_FILE),
-            r#"
+            format!(
+                r#"
 [nest]
 name = "usdc"
 chain = "mainnet"
@@ -583,11 +576,29 @@ alias = "usdc"
 address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 abi = "abis/erc20.json"
 events = ["Transfer"]
-"#,
+{extra}"#
+            ),
         )
         .unwrap();
         let config = crate::config::Config::load(d).unwrap();
-        let auditor = Auditor::new(d, &config).unwrap();
+        Auditor::new(d, &config).unwrap()
+    }
+
+    #[test]
+    fn a_blocks_table_is_neither_compared_nor_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let auditor = nest(dir.path(), "\n[extract]\nblocks = true\n");
+        assert!(auditor.registry.schema().len() > 1);
+        let tables: Vec<&str> = auditor.schema.iter().map(|t| t.table.as_str()).collect();
+        assert_eq!(tables, ["usdc__transfer"]);
+        assert_eq!(auditor.filter.topic0s(), [auditor.schema[0].topic0.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_row_sealed_twice_is_reported_as_sealed_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let auditor = nest(d, "");
         let word = |n: u64| format!("0x{n:064x}");
         let log = crate::rpc::Log {
             address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
