@@ -267,7 +267,6 @@ impl Catalogue {
             .iter()
             .filter_map(|t| manifest.tables.get(&t.table))
             .flatten()
-            .filter(|s| s.rows > 0)
             .map(|s| (s.from_block, s.to_block, s.rows as u64))
             .collect();
         weighted.sort_unstable();
