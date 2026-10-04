@@ -612,7 +612,7 @@ the findings we closed as *not ours to fix* and why, is in
 - **Governance:** a self-funded public good, maintained by one person; everything is open source. No
   hosted service, no token, no phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing
   design brief [`CLAUDE.md`](CLAUDE.md).
-- **Out of scope:** a hosted/metered service, non-EVM chains, or any deployment
+- **Out of scope:** a hosted/metered service, non-EVM chains before EVM is airtight, or any deployment
   story beyond binary + compose.
 
 ## License
