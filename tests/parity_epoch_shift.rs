@@ -3,7 +3,7 @@
 //!
 //! One HTTP server plays both the nest and the gateway for a whole sealed run. The fixture is built so
 //! that every other comparison passes and every measured boundary holds, so the exit status turns on
-//! the fee fields alone.
+//! the epoch value fields alone.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -96,7 +96,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Every boundary disagrees just below itself and nowhere above, and signal carries one pair.
+    /// Every boundary disagrees just below itself and nowhere above.
     fn new() -> Self {
         let mut deltas = BTreeMap::new();
         for f in [
@@ -107,8 +107,6 @@ impl Fixture {
             deltas.insert((1194, f), 1);
         }
         deltas.insert((1104, "signalled_tokens"), 3);
-        deltas.insert((1105, "signalled_tokens"), 7);
-        deltas.insert((1106, "signalled_tokens"), -7);
         deltas.insert((1104, "query_fees_collected"), 1);
         deltas.insert((1104, "curator_query_fees"), 1);
         Fixture {
@@ -259,13 +257,18 @@ impl Fixture {
     }
 }
 
-/// The fixture itself, with nothing shifted, must reach the end of the run.
+/// The fixture itself, with nothing shifted, must reach the end of the run, clean.
 #[test]
-fn the_fixture_without_a_shift_is_known_differences_only() {
+fn the_fixture_without_a_shift_is_clean() {
     let (code, text) = Fixture::new().run();
-    assert_eq!(code, 2, "{text}");
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("parity CLEAN at block 900"), "{text}");
     assert!(
         text.contains("query_fees_collected 9/9 epochs agree from 1105 OK"),
+        "{text}"
+    );
+    assert!(
+        text.contains("signalled_tokens 9/9 epochs agree from 1105 OK"),
         "{text}"
     );
     assert!(!text.contains("boundary shift"), "{text}");
@@ -388,4 +391,19 @@ fn a_fee_boundary_set_too_low_fails_the_self_check() {
         ),
         "{text}"
     );
+}
+
+/// Signal is a gate now that the epoch starts are exact: a pair that once read as boundary drift fails.
+#[test]
+fn a_signalled_tokens_adjacent_pair_fails() {
+    let (code, text) = Fixture::new()
+        .delta(1105, "signalled_tokens", 7)
+        .delta(1106, "signalled_tokens", -7)
+        .run();
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("signalled_tokens 7/9 epochs agree from 1105 DIFF"),
+        "{text}"
+    );
+    assert!(text.contains("epoch 1105 nest=1000007"), "{text}");
 }
