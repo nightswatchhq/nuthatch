@@ -1448,3 +1448,433 @@ fn an_unset_gate_set_is_a_setup_fault_that_names_it() {
     assert!(!dir.path().join("posted").exists(), "{text}");
     assert!(!dir.path().join("downloaded").exists(), "{text}");
 }
+
+/// Stands in for burrmill-bench's `gate-duck` (#1796): copies the answers a case wrote into
+/// `$STUB_ANSWERS` to the output directory, and lists the pin's segments beside them, so the
+/// script's comparison is tested without building DuckDB.
+const STUB_DUCK: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = gate-duck ] || { echo "stub: not gate-duck: $*" >&2; exit 3; }
+mkdir -p "$4"
+cp "$STUB_ANSWERS"/* "$4"/ 2>/dev/null || true
+ls "$2/segments" >"$STUB_ANSWERS/../pin-segments"
+"#;
+
+impl Case {
+    /// The answers the stub gives as DuckDB's: `<id>.json` a body, `<id>.err` a refusal,
+    /// `views.err` a view DuckDB would not define.
+    fn duck(&self, answers: &[(&str, &str)]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.dir.path().join("duck-answers");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, body) in answers {
+            std::fs::write(dir.join(file), body).unwrap();
+        }
+        let stub = self.dir.path().join("gate-duck");
+        std::fs::write(&stub, STUB_DUCK).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stub
+    }
+
+    fn reference(&self, set: &Path, extra: &[&str], duck: Option<&Path>) -> (Output, String) {
+        let mut cmd = Command::new(root().join("scripts/gate/reference.sh"));
+        cmd.arg("--out")
+            .arg(self.dir.path().join("ref-out"))
+            .args(extra)
+            .arg(env!("CARGO_BIN_EXE_nuthatch"))
+            .arg(&self.nest)
+            .arg(set)
+            .env("STUB_ANSWERS", self.dir.path().join("duck-answers"))
+            .env_remove("GATE_LOCK_HELD");
+        match duck {
+            Some(d) => cmd.env("GATE_DUCK", d),
+            None => cmd.env_remove("GATE_DUCK"),
+        };
+        let out = cmd.output().expect("run reference.sh");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out, text)
+    }
+
+    fn pin_at_finalized(&self) {
+        std::fs::write(
+            self.nest.join("PROVENANCE"),
+            format!("sealed_through={FINALIZED}\n"),
+        )
+        .unwrap();
+    }
+}
+
+fn count_body(n: u64) -> String {
+    format!(r#"{{"count":1,"rows":[{{"n":{n}}}]}}"#)
+}
+
+/// #1796: the binary's answer is compared with DuckDB's, not with a previous release's, in the
+/// gate's canonical form. A different value fails with the first differing row. Under a top-level
+/// ORDER BY the same rows in another order fail as an order that differs, naming the first row out
+/// of place; a float 1e-13 off is equal; a volatile statement is held to its row count, reordered
+/// or not.
+#[test]
+fn an_answer_that_differs_from_duckdbs_fails_and_is_named() {
+    let c = case();
+    let set = c.set(&[
+        ("count", c.counts()),
+        ("wrong", c.counts()),
+        (
+            "ordered",
+            "SELECT k FROM (VALUES (1), (2), (3)) AS v(k) ORDER BY k".to_string(),
+        ),
+        (
+            "ordered_wrong",
+            "SELECT k FROM (VALUES (1), (2), (3)) AS v(k) ORDER BY k DESC".to_string(),
+        ),
+        (
+            "unordered",
+            "SELECT k FROM (VALUES (2), (3), (1)) AS v(k)".to_string(),
+        ),
+        ("float", "SELECT CAST(1 AS DOUBLE) / 3 AS x".to_string()),
+        (
+            "volatile",
+            "SELECT k FROM (VALUES (1), (2)) AS v(k)".to_string(),
+        ),
+        (
+            "volatile_ordered",
+            "SELECT k FROM (VALUES (1), (2)) AS v(k) ORDER BY k".to_string(),
+        ),
+    ]);
+    let body = std::fs::read_to_string(&set).unwrap();
+    std::fs::write(&set, format!(
+            "# volatile: volatile ties\n# volatile: volatile_ordered ties under its ORDER BY\n{body}"
+        )).unwrap();
+    c.pin_at_finalized();
+    let duck = c.duck(&[
+        ("count.json", &count_body(TRANSFERS)),
+        ("wrong.json", &count_body(TRANSFERS - 1)),
+        (
+            "ordered.json",
+            r#"{"count":3,"rows":[{"k":3},{"k":2},{"k":1}]}"#,
+        ),
+        (
+            "ordered_wrong.json",
+            r#"{"count":3,"rows":[{"k":3},{"k":2},{"k":4}]}"#,
+        ),
+        (
+            "unordered.json",
+            r#"{"count":3,"rows":[{"k":3},{"k":2},{"k":1}]}"#,
+        ),
+        (
+            "float.json",
+            r#"{"count":1,"rows":[{"x":0.3333333333334333}]}"#,
+        ),
+        ("volatile.json", r#"{"count":2,"rows":[{"k":7},{"k":8}]}"#),
+        (
+            "volatile_ordered.json",
+            r#"{"count":2,"rows":[{"k":2},{"k":1}]}"#,
+        ),
+    ]);
+    let (out, text) = c.reference(&set, &[], Some(&duck));
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(line_for(&text, "count").starts_with("ok "), "{text}");
+    let wrong = line_for(&text, "wrong");
+    assert!(
+        wrong.starts_with("FAIL ") && wrong.contains("differs from DuckDB"),
+        "{wrong}"
+    );
+    assert!(
+        text.contains(&format!("burrmill: {{\"n\":{TRANSFERS}}}"))
+            && text.contains(&format!("duckdb:   {{\"n\":{}}}", TRANSFERS - 1)),
+        "the first differing row of each side:\n{text}"
+    );
+    assert!(
+        line_for(&text, "ordered_wrong").contains("differs from DuckDB (rows compared in order)"),
+        "{text}"
+    );
+    assert!(
+        line_for(&text, "ordered").starts_with("FAIL ")
+            && line_for(&text, "ordered").contains("order differs from DuckDB"),
+        "{text}"
+    );
+    assert!(
+        text.contains("first row out of place, row 1:")
+            && text.contains("burrmill: {\"k\":1}")
+            && text.contains("duckdb:   {\"k\":3}"),
+        "the first row out of place:\n{text}"
+    );
+    assert!(
+        line_for(&text, "volatile_ordered").starts_with("ok "),
+        "a volatile statement reordered under its ORDER BY passes on its count:\n{text}"
+    );
+    assert!(line_for(&text, "unordered").starts_with("ok "), "{text}");
+    assert!(line_for(&text, "float").starts_with("ok "), "{text}");
+    assert!(
+        line_for(&text, "volatile").contains("volatile, so compared on its row count"),
+        "{text}"
+    );
+    assert!(
+        text.contains("3 match DuckDB, 2 compared on row count only, 3 differ"),
+        "{text}"
+    );
+    assert!(
+        text.contains("RESULT: FAIL - differs from DuckDB: wrong, ordered, ordered_wrong"),
+        "{text}"
+    );
+}
+
+/// A statement DuckDB will not run is listed with its reason and not compared; one the binary does
+/// not answer fails. A reason that is a view DuckDB would not define names the view.
+#[test]
+fn a_statement_duckdb_will_not_run_is_listed_and_one_the_binary_refuses_fails() {
+    let c = case();
+    let set = c.set(&[
+        ("count", c.counts()),
+        ("dialect", "SELECT 1 AS one".to_string()),
+        (
+            "viewed",
+            format!(
+                "SELECT count(*) AS n FROM \"{}\" AS gate_only_here",
+                c.table
+            ),
+        ),
+    ]);
+    c.pin_at_finalized();
+    let duck = c.duck(&[
+        ("count.json", &count_body(TRANSFERS)),
+        (
+            "dialect.err",
+            "Parser Error: syntax error at or near \"one\"\n",
+        ),
+        (
+            "viewed.err",
+            "Catalog Error: Table with name gate_only_here does not exist!\n",
+        ),
+        (
+            "views.err",
+            "gate_only_here\t90-x.sql\tBinder Error: no such function\n",
+        ),
+    ]);
+    let (out, text) = c.reference(&set, &[], Some(&duck));
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let dialect = line_for(&text, "dialect");
+    assert!(
+        dialect.starts_with("skip ") && dialect.contains("Parser Error"),
+        "{dialect}"
+    );
+    assert!(
+        line_for(&text, "viewed").contains(
+            "it reads gate_only_here (90-x.sql), which DuckDB will not define: Binder Error"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("2 not compared"), "{text}");
+    assert!(text.contains("RESULT: PASS"), "{text}");
+
+    let set = c.set(&[
+        ("count", c.counts()),
+        ("refused", "SELECT a FROM no_such_table".to_string()),
+    ]);
+    let duck = c.duck(&[
+        ("count.json", &count_body(TRANSFERS)),
+        ("refused.json", r#"{"count":1,"rows":[{"a":1}]}"#),
+    ]);
+    let (out, text) = c.reference(&set, &[], Some(&duck));
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    let refused = line_for(&text, "refused");
+    assert!(
+        refused.starts_with("FAIL ")
+            && refused.contains("the binary did not answer")
+            && refused.contains("no_such_table"),
+        "{refused}"
+    );
+    assert!(
+        text.contains("RESULT: FAIL - not answered: refused"),
+        "{text}"
+    );
+}
+
+/// The pin holds only segments sealed at or below it, so a segment past it reaches neither engine:
+/// the one sealed segment is listed a second time as a block past the pin, and the binary still
+/// counts every transfer once. A pin below every segment is a setup fault.
+#[test]
+fn only_segments_at_or_below_the_sealed_pin_are_read() {
+    let c = case();
+    let manifest_path = c.nest.join("segments/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let segs = manifest["tables"][&c.table].as_array_mut().unwrap();
+    let mut past = segs[0].clone();
+    let file = past["file"].as_str().unwrap().to_string();
+    let copy = file.replace(".parquet", "-past.parquet");
+    std::fs::copy(
+        c.nest.join("segments").join(&file),
+        c.nest.join("segments").join(&copy),
+    )
+    .unwrap();
+    past["file"] = copy.clone().into();
+    past["from_block"] = (FINALIZED + 1).into();
+    past["to_block"] = (FINALIZED + 1).into();
+    segs.push(past);
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let set = c.set(&[("count", c.counts())]);
+    let duck = c.duck(&[("count.json", &count_body(TRANSFERS))]);
+    let pin = FINALIZED.to_string();
+    let (out, text) = c.reference(&set, &["--sealed-through", &pin], Some(&duck));
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(line_for(&text, "count").starts_with("ok "), "{text}");
+    let pinned = std::fs::read_to_string(c.dir.path().join("pin-segments")).unwrap();
+    assert!(
+        pinned.contains(&file) && !pinned.contains(&copy),
+        "the pin's segments: {pinned}"
+    );
+
+    // Pinned past it, it is read and the count doubles: the case above does not pass by accident.
+    let past = (FINALIZED + 1).to_string();
+    let (out, text) = c.reference(&set, &["--sealed-through", &past], Some(&duck));
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("burrmill: {{\"n\":{}}}", 2 * TRANSFERS)),
+        "{text}"
+    );
+
+    let (out, text) = c.reference(&set, &["--sealed-through", "0"], Some(&duck));
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("no sealed segment at or below block 0"),
+        "{text}"
+    );
+}
+
+/// Without a pin or a DuckDB to compare with there is no verdict to give: exit 2, never a pass.
+#[test]
+fn no_pin_or_no_duckdb_is_a_setup_fault() {
+    let c = case();
+    let set = c.set(&[("count", c.counts())]);
+    let duck = c.duck(&[("count.json", &count_body(TRANSFERS))]);
+    let (out, text) = c.reference(&set, &[], Some(&duck));
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("no PROVENANCE with sealed_through="),
+        "{text}"
+    );
+    c.pin_at_finalized();
+    let (out, text) = c.reference(&set, &[], None);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("GATE_DUCK is not set"), "{text}");
+}
+
+/// With GATE_DUCK set the runner checks the candidate against DuckDB after the gate and posts that
+/// verdict as its own status, so a wrong answer production shares still turns something red.
+#[test]
+fn the_runner_posts_the_duckdb_reference_as_its_own_status() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    std::fs::write(
+        c.nest.join("PROVENANCE"),
+        format!("version=4.2.0\nsealed_through={FINALIZED}\n"),
+    )
+    .unwrap();
+    let r = releases(&c, &[("v4.3.0", "full", 0), ("v4.2.0", "full", 0)], &[]);
+    let duck = c.duck(&[("answers.json", &count_body(TRANSFERS + 1))]);
+    let stub_answers = c.dir.path().join("duck-answers");
+    let (code, text) = r.runner(
+        &c,
+        &set,
+        &["v4.3.0"],
+        &[
+            ("GATE_DUCK", duck.to_str().unwrap()),
+            ("STUB_ANSWERS", stub_answers.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, Some(1), "{text}");
+    let posted = r.read("posted-ctx");
+    assert!(
+        posted_for(&posted, "release-gate/alloc-nest")
+            .iter()
+            .any(|l| l.contains("sha-v4.3.0 success 1 of 1 answered")),
+        "the relative gate still passes:\n{posted}"
+    );
+    let duck = posted_for(&posted, "release-gate/duckdb");
+    assert!(
+        duck.last()
+            .is_some_and(|l| l.contains("sha-v4.3.0 failure differs from DuckDB: answers")),
+        "{posted}\n{text}"
+    );
+}
+
+/// With GATE_NESTS each nest is checked against DuckDB on its own copy and set, under its own
+/// environment, and posts release-gate/duckdb-<name>, so a red one names its nest. A copy with no
+/// sealed pin in its PROVENANCE is said to have none and posts nothing.
+#[test]
+fn each_nest_posts_its_own_duckdb_reference() {
+    let c = case();
+    let alloc = [("answers", c.counts())];
+    let qos = [("qos_count", c.counts())];
+    let dips = [("dips_count", c.counts())];
+    let conf = nests_conf(
+        &c,
+        &[
+            ("alloc-nest", &alloc, ENV_TWO, "none"),
+            ("qos-nest", &qos, ENV_ONE, "none"),
+            ("dips-nest", &dips, ENV_ONE, "none"),
+        ],
+    );
+    for n in ["alloc-nest", "qos-nest"] {
+        std::fs::write(
+            c.dir.path().join(n).join("PROVENANCE"),
+            format!("version=4.2.0\nsealed_through={FINALIZED}\n"),
+        )
+        .unwrap();
+    }
+    let r = releases(&c, &[("v4.3.0", "full", 0), ("v4.2.0", "full", 0)], &[]);
+    let duck = c.duck(&[
+        ("answers.json", &count_body(TRANSFERS)),
+        ("qos_count.json", &count_body(TRANSFERS + 1)),
+        ("dips_count.json", &count_body(TRANSFERS)),
+    ]);
+    let stub_answers = c.dir.path().join("duck-answers");
+    let set = c.set(&[("unused", c.counts())]);
+    let (code, text) = r.runner(
+        &c,
+        &set,
+        &["v4.3.0"],
+        &[
+            ("GATE_NESTS", conf.to_str().unwrap()),
+            ("GATE_DUCK", duck.to_str().unwrap()),
+            ("STUB_ANSWERS", stub_answers.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, Some(1), "{text}");
+    let posted = r.read("posted-ctx");
+    let alloc = posted_for(&posted, "release-gate/duckdb-alloc-nest");
+    assert!(
+        alloc.last().is_some_and(|l| l.contains(" success ")),
+        "{posted}\n{text}"
+    );
+    let qos = posted_for(&posted, "release-gate/duckdb-qos-nest");
+    assert!(
+        qos.last()
+            .is_some_and(|l| l.contains(" failure differs from DuckDB: qos_count")),
+        "{posted}\n{text}"
+    );
+    assert!(
+        posted_for(&posted, "release-gate/duckdb-dips-nest").is_empty()
+            && posted_for(&posted, "release-gate/duckdb").is_empty(),
+        "{posted}"
+    );
+    assert!(
+        text.contains("[dips-nest] release-gate-run: dips-nest: no sealed_through in"),
+        "{text}"
+    );
+    let qos_env = c.dir.path().join("qos-nest.env");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("[qos-nest] reference: budget")
+                && l.contains("NUTHATCH_SQL_MAX_CONCURRENCY=1")),
+        "the reference runs under the nest's environment, {}:\n{text}",
+        qos_env.display()
+    );
+}
