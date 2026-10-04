@@ -1028,6 +1028,43 @@ async fn the_metrics_endpoint_carries_the_entity_series() {
     rt.shutdown().await.expect("the nest stops");
 }
 
+/// #1834: the circuit's own state size, sampled on its thread. The first sample follows the first
+/// applied batch, so a nest that has folded anything reports a size; zero would mean nothing was
+/// measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_metrics_endpoint_carries_the_entity_state_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape, CHAIN_LEN).await;
+    rt.state.entities[0].flush();
+
+    let (status, body) = get_json(&rt, "/metrics").await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let text = body["raw"].as_str().expect("/metrics is plain text");
+    assert!(
+        text.contains("# TYPE nuthatch_entity_state_bytes gauge"),
+        "nuthatch_entity_state_bytes needs a TYPE line:\n{text}"
+    );
+    let bytes: u64 = text
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("nuthatch_entity_state_bytes{nest=\"usdc\",entity=\"received\"} ")
+        })
+        .unwrap_or_else(|| panic!("no state size for the entity:\n{text}"))
+        .parse()
+        .expect("a byte count");
+    assert!(
+        bytes > 0,
+        "an entity that has folded rows holds state:\n{text}"
+    );
+
+    rt.shutdown().await.expect("the nest stops");
+}
+
 /// **#822 criterion 6.** *"A query returning every maintained row still pays for those output rows
 /// and remains bounded by existing guards. Documentation does not imply IVM repeals I/O."*
 ///
