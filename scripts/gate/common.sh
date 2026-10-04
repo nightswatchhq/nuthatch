@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Sourced by release-gate.sh and gate/reference.sh: production's budget, how a query set is read,
-# and the canonical form answers are compared in, so the two cannot compare differently.
+# Sourced by release-gate.sh: production's budget, how a query set is read, and the canonical
+# form answers are compared in.
 # The caller defines die.
 
 # Production's budget: the environment the allocations nest runs under on the Lodestar box (unit

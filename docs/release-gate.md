@@ -15,8 +15,7 @@ budget). Every CI gate had passed: the footprint jobs index synthetic data and r
 |---|---|
 | `nuthatch-gate/alloc-queries.tsv` in kittiwake | The query set: one statement per line, each with its consumer and call site. Private; see below. |
 | `scripts/release-gate.sh` | Serves a nest copy with one binary, runs the set, gives the verdict. |
-| `scripts/gate/common.sh` | Production's budget, how a set is read and the canonical answer form, for both gate scripts. |
-| `scripts/gate/reference.sh` | Checks one binary's answers against DuckDB's at the copy's sealed pin (#1796). |
+| `scripts/gate/common.sh` | Production's budget, how a set is read and the canonical answer form. |
 | `scripts/gate/baseline-4.2.0.tsv` | The proof run's baseline: 4.2.0 on the 2026-10-03 copy, on a MacBook. |
 | `scripts/release-gate-run.sh` | The ThinkPad's job: fetch the candidate, gate it, post the status. |
 
@@ -119,56 +118,11 @@ edited between the runs) fails with the first differing row, while rows reordere
 BY`, a float 1e-13 off (as a number or as text) and a volatile statement's new
 answer pass.
 
-## Against DuckDB, at the sealed pin
+## What it does not catch
 
-The comparison above is with the previous release, so a wrong answer two releases share passes it.
-4.3.0's NULL urls (#1790) were caught only because 4.2.1 had them right. `scripts/gate/reference.sh`
-compares one binary with DuckDB instead (#1796):
-
-    GATE_DUCK=<burrmill-bench> scripts/gate/reference.sh [--out DIR] [--sealed-through N] <binary> <nest-copy> <set>
-
-- **The pin.** It builds a directory from the copy: its config, ABIs and views, and the sealed
-  segments at or below `sealed_through` (from `PROVENANCE`, or `--sealed-through`), with a manifest
-  of only those and no redb. Neither engine sees a hot row, so both answer the same finalized data.
-- **The binary** answers each statement with `nuthatch check --update` on that directory under
-  `PROD_ENV`. `check` runs a statement through the same path as `/sql`, cold-only, without `/sql`'s
-  row cap, so a truncated answer never arises.
-- **DuckDB** answers through `gate-duck`, a subcommand of burrmill's bench (burrmill
-  `crates/burrmill-bench`, where the DuckDB oracles live). It sets the nest up as nuthatch set it up
-  before Burrmill (each table `read_parquet` over its files, `_dec` by `TRY_CAST`, the views in file
-  order) and writes each answer as nuthatch's `/sql` body, in nuthatch's encoding.
-- **The comparison** is the gate's canonical form above. Under a top-level `ORDER BY` the rows must
-  match in order; the same rows in another order fail as `order differs`, naming the first row out
-  of place. Two engines may order tied rows differently, so a statement whose `ORDER BY` ties needs
-  a unique tiebreaker in its SQL, or a volatile tag in the set, which holds it to its row count.
-
-It fails (exit 1) on an answer that differs from DuckDB's and on a statement the binary does not
-answer. A statement DuckDB will not run is not compared, and is listed with DuckDB's reason, naming
-the view when the reason is a view DuckDB would not define. Exit 2 is a broken rig: no pin, no
-`GATE_DUCK`, or `gate-duck` failing.
-
-`GATE_DUCK` is built once from burrmill (`cargo build --release --locked -p burrmill-bench`, about
-six minutes on the ThinkPad); DuckDB's answers depend only on the copy, never on the binary under test.
-
-**Where it runs:** as a stage of `release-gate-run.sh`, when the unit sets `GATE_DUCK`. After the
-gate has posted its verdict, the runner checks the candidate against DuckDB on the same refreshed copy
-under the same lock, and posts the result as its own status, `release-gate/duckdb`. A red one stops
-the roll like the gate's. It is a stage of the gate rather than a nightly job because the gate is
-where a roll is decided: a nightly check would judge production after the roll, and a copy refreshed
-at another time would answer for different data. It adds about three minutes to a gate run.
-
-With `GATE_NESTS`, every nest is checked on its own copy and set, under its own environment file
-(`reference.sh --env`), and posts `release-gate/duckdb-<name>`, so a red status names the nest it is
-for; one status covering every nest would not. A copy whose `PROVENANCE` records no `sealed_through`
-has no pin: the run says so for that nest and posts no DuckDB status for it. The single-nest path
-keeps `release-gate/duckdb`.
-
-`tests/release_gate_script.rs` drives it with a stand-in for `gate-duck` that serves fixed answers:
-a different value fails with its first differing row, rows reordered under an `ORDER BY` fail as an
-order that differs, a float 1e-13 off passes, a volatile statement is held to its count even
-reordered, a statement DuckDB refuses is listed, one the binary refuses fails, a segment past the pin
-reaches neither engine, the runner posts the second status, and with `GATE_NESTS` each nest posts its
-own under its own environment while a nest without a pin posts none.
+The comparison is with the release production runs, so a wrong answer both releases share passes
+it. On the allocations nest, daily parity against the Network Subgraph (`deploy/parity`) is what
+sees those. A per-nest DuckDB reference stage (#1796) also did, and was removed on 2026-10-04.
 
 ## Where it runs: the ThinkPad
 
