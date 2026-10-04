@@ -8048,7 +8048,7 @@ struct DerivedViews<'a> {
 /// The views are derived state, not durable state: rather than persist them (and risk drift from the
 /// canonical store) we reconstruct them from the facts that *are* durable, through the same circuits
 /// that maintain them live. All three are built the same way. Cold (sealed, immutable) segments fold
-/// to one pre-summed row per key directly in DuckDB - no need to replay millions of transfers - and
+/// to one pre-summed row per key directly in Burrmill - no need to replay millions of transfers - and
 /// only the small un-sealed hot tail is replayed transfer by transfer. Hot and cold are disjoint
 /// (sealed rows are pruned from hot), so nothing is double-counted, and the result is identical to
 /// views grown from genesis.
@@ -8104,9 +8104,9 @@ fn rebuild_views(
     let mut exposure_batch: exposure::ExposureBatch = Vec::new();
     let mut velocity_batch: velocity::VelocityBatch = Vec::new();
 
-    // Cold seed. Three different aggregations over the same segments, so this stays three DuckDB
+    // Cold seed. Three different aggregations over the same segments, so this stays three Burrmill
     // queries per table - they are pre-summed server-side and cheap, and it is the hot store, not
-    // DuckDB, that #294 was about. A table with no sealed segment yet has no view; that just means it
+    // the analytical engine, that #294 was about. A table with no sealed segment yet has no view; that just means it
     // has nothing cold to seed, so an error here is a debug line, not a failure.
     let mut cold_balances = 0usize;
     let mut cold_exposure = 0usize;
@@ -8319,12 +8319,12 @@ fn decode_window(
 /// set of contracts the nest indexes; a rebuild that quietly yields *fewer* children than were
 /// discovered does not fail, it silently stops indexing them, and the nest goes on looking healthy
 /// with a hole in its data. That is the worst shape a fault can take in this codebase and it is the
-/// one this function used to have three times over: a DuckDB failure was `if let Ok(cold)`, a hot
+/// one this function used to have three times over: a Burrmill failure was `if let Ok(cold)`, a hot
 /// store failure was `.unwrap_or_default()`, and an unparseable stored row was `if let Ok(v)`.
 ///
 /// The cold read is the only genuinely-expected absence, and it is now decided from the **segment
 /// catalogue** rather than inferred from an error. That distinction is the whole fix: "this table
-/// has never been sealed" and "DuckDB could not read this table" both arrived as `Err` and were
+/// has never been sealed" and "Burrmill could not read this table" both arrived as `Err` and were
 /// discarded together, so the benign case was hiding the fatal one.
 fn rebuild_children(
     dir: &std::path::Path,
@@ -8339,7 +8339,7 @@ fn rebuild_children(
     // discovery of a child two rules announce wins as it does live (#1637).
     let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
     for table in factory.factory_tables() {
-        // Cold (sealed) rows via DuckDB - but only where the catalogue says a segment exists, so an
+        // Cold (sealed) rows via Burrmill - but only where the catalogue says a segment exists, so an
         // unsealed table is skipped rather than queried-and-forgiven.
         if manifest.tables.get(&table).is_some_and(|s| !s.is_empty()) {
             rows.extend(

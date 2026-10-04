@@ -6,7 +6,7 @@
 //! **content-addressed snapshot** (`labels/<sha256>.json`) whose hash is a stable, reproducible name
 //! for exactly that set of (address, label) pairs. Loading merges every snapshot in the directory, so
 //! imports are append-only. A snapshot is a plain JSON array of `{address, label}` - the flat shape
-//! DuckDB reads directly, so `/sql` can query `labels` (see `analytics::define_views`). No screening
+//! Burrmill reads directly, so `/sql` can query `labels` (see `analytics::define_views`). No screening
 //! API, no phone-home: importing is a host-side, out-of-band act; the data path only ever reads.
 
 use anyhow::{bail, Context, Result};

@@ -6,7 +6,7 @@
 //!   `nuthatch sql "SELECT …"`               -> query the live tip + sealed history, as a table
 //!
 //! Generalised event decode over many contracts, content-addressed Parquet sealing past finality with
-//! DuckDB analytics (hot ∪ cold SQL), DBSP incremental views, factories, a compliance pack, webhooks,
+//! Burrmill analytics (hot ∪ cold SQL), DBSP incremental views, factories, a compliance pack, webhooks,
 //! a built-in admin UI, an MCP server, and multi-nest roosts - all from one static binary. This file is
 //! just the CLI front door; the engine lives in the library crate.
 

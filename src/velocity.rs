@@ -63,7 +63,7 @@ pub fn velocity_deltas(
     }]
 }
 
-/// Seed a pre-summed velocity aggregate on restart (from a cold DuckDB fold): `count` transfers
+/// Seed a pre-summed velocity aggregate on restart (from a cold Burrmill fold): `count` transfers
 /// totalling `volume` for `key`.
 pub fn seed_item(key: String, volume: i128, count: i128) -> VelItem {
     VelItem {

@@ -1,4 +1,4 @@
-//! Embedded hot store: redb. This is the tip layer for entity point-reads; Parquet sealing + DuckDB
+//! Embedded hot store: redb. This is the tip layer for entity point-reads; Parquet sealing + Burrmill
 //! analytics live in `seal`/`analytics`.
 //!
 //! **Writers (audit F-C3 - this used to say "single writer", which was wrong).** Two tasks write here:
@@ -240,7 +240,7 @@ impl std::fmt::Display for HotScanTooLarge {
 impl std::error::Error for HotScanTooLarge {}
 
 /// One consistent hot-store read for an analytical query. `source_bytes` is the length of the
-/// serialized redb values that will be parsed into DuckDB, not a JSON re-encoding or a resident-RAM
+/// serialized redb values that will be parsed into Burrmill, not a JSON re-encoding or a resident-RAM
 /// estimate (RFC-0048 S2).
 #[derive(Debug, Default)]
 pub struct HotRowsSnapshot {
@@ -1508,7 +1508,7 @@ impl Store {
     /// Prune sealed entities from the hot store: remove entity rows whose block is in `[from, to]`.
     /// Returns the number of rows removed. Called once every table in the range has been sealed to
     /// its own Parquet segment (the whole range is safe to drop; the data survives in Parquet and is
-    /// reachable via the DuckDB point-read fallback).
+    /// reachable via the Burrmill point-read fallback).
     pub fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
         let lo = format!("{from:012}-000000");
         let hi = format!("{to:012}-999999");

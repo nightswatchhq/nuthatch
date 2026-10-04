@@ -366,7 +366,7 @@ impl LiveScreener {
     }
 }
 
-/// Read sealed transfers in `[from, to]` from the analytical (DuckDB) surface, as [`TransferRow`]s -
+/// Read sealed transfers in `[from, to]` from the analytical (Burrmill) surface, as [`TransferRow`]s -
 /// the backfill screening input. `transfer_tables` gives each transfer table with its (from, to,
 /// value) column names (registry-derived; they vary by token), so the query is never user text.
 pub fn read_sealed_transfers(

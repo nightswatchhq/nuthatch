@@ -52,7 +52,7 @@ pub struct NestSemantic {
 }
 
 /// What one authored SQL view (`views/*.sql`) computes (RFC-0018 §1). The view's *shape* (columns) is
-/// introspected from DuckDB at query time - the author only has to say what it *means*.
+/// introspected from Burrmill at query time - the author only has to say what it *means*.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ViewSemantic {
     #[serde(default)]

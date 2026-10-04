@@ -395,7 +395,7 @@ pub const DEFAULT_MAX_RSS_MB: u64 = 2048;
 // workload with a single very-high-rate nest will underrun the projection and one with many
 // very-high-rate nests may overrun it. The per-cursor RAM budget job (CI) measures actual RSS
 // against a ceiling and is the primary guard; this projection is the pre-mount admission check.
-pub const RUNTIME_BASE_RSS_MB: u64 = 120; // serving + async runtime + on-demand DuckDB, paid once
+pub const RUNTIME_BASE_RSS_MB: u64 = 120; // serving + async runtime + on-demand Burrmill, paid once
 const NEST_BASE_RSS_MB: u64 = 5; // fitted: ~1 MB/nest observed, 5x margin (see comment above)
 const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity view, or child registry
 
