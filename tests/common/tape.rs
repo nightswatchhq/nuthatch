@@ -265,6 +265,10 @@ pub struct TapeSource {
     /// cannot answer `eth_getLogs` either, and a knob that darkened only the tip poll would leave
     /// the test asserting against a chain state no provider outage produces.
     dark: std::sync::atomic::AtomicBool,
+    /// `l1BlockNumber` by block hash, so a reorged block can report a different one.
+    l1_by_hash: Mutex<HashMap<String, u64>>,
+    /// Every block number `block_headers` was asked for.
+    headers_asked: Mutex<Vec<u64>>,
 }
 
 impl Default for TapeSource {
@@ -284,7 +288,19 @@ impl TapeSource {
             logs_calls: std::sync::atomic::AtomicUsize::new(0),
             logs_windows: std::sync::Mutex::new(Vec::new()),
             dark: std::sync::atomic::AtomicBool::new(false),
+            l1_by_hash: Mutex::new(HashMap::new()),
+            headers_asked: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Have the header of the block with `hash` report `l1BlockNumber = l1`, as Arbitrum's do.
+    pub fn set_l1_block_number(&self, hash: &str, l1: u64) {
+        self.l1_by_hash.lock().unwrap().insert(hash.to_string(), l1);
+    }
+
+    /// Every block number a `block_headers` call has asked for, in order.
+    pub fn headers_asked(&self) -> Vec<u64> {
+        self.headers_asked.lock().unwrap().clone()
     }
 
     /// How many `logs` calls have been made against this tape.
@@ -396,6 +412,28 @@ impl Source for TapeSource {
         Ok(blocks
             .iter()
             .filter_map(|b| t.blocks.get(b).map(|f| (*b, f.timestamp)))
+            .collect())
+    }
+
+    async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
+        self.online()?;
+        self.headers_asked.lock().unwrap().extend_from_slice(blocks);
+        let t = self.inner.lock().unwrap();
+        let l1 = self.l1_by_hash.lock().unwrap();
+        Ok(blocks
+            .iter()
+            .filter_map(|b| {
+                let f = t.blocks.get(b)?;
+                let mut h = serde_json::json!({
+                    "number": format!("0x{b:x}"),
+                    "hash": f.hash,
+                    "timestamp": format!("0x{:x}", f.timestamp),
+                });
+                if let Some(n) = l1.get(&f.hash) {
+                    h["l1BlockNumber"] = serde_json::json!(format!("0x{n:x}"));
+                }
+                Some((*b, h))
+            })
             .collect())
     }
 

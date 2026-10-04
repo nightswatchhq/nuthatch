@@ -234,6 +234,11 @@ pub const BLOCK_COLUMNS: &[(&str, &str, StorageKind)] = &[
 /// rather than to any one contract in the nest.
 pub const BLOCKS_TABLE: &str = "blocks";
 
+/// The `[extract] l1_blocks` table (#1839): one row per block that carries this nest's logs, holding
+/// that block's `l1_block_number`. A side table rather than a column on every event table, so a nest
+/// that leaves the setting off keeps its event schemas and segment bytes exactly as they were.
+pub const L1_BLOCKS_TABLE: &str = "l1_blocks";
+
 /// The `log_index` a **block row** is stored under (#642).
 ///
 /// Rows are keyed `(block, log_index)` by `Store::entity_key`, which assumes every row descends from
@@ -565,6 +570,31 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
     })
 }
 
+/// Build the `l1_blocks` row for one header, keyed like a block row. `None` when the header has no
+/// hash or no `l1BlockNumber`: unlike `blocks`, a 0 here would be sealed as a wrong answer rather than
+/// an absent field, so the caller refuses the window instead.
+pub fn l1_block_row(number: u64, header: &Json, timestamps: bool) -> Option<DecodedRow> {
+    let hex = |k: &str| -> Option<u64> {
+        header
+            .get(k)
+            .and_then(Json::as_str)
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    };
+    let hash = header.get("hash").and_then(Json::as_str)?.to_string();
+    let l1 = hex("l1BlockNumber")?;
+    Some(DecodedRow {
+        table: L1_BLOCKS_TABLE.to_string(),
+        params: vec![("l1_block_number".to_string(), Value::U64(l1))],
+        block_number: number,
+        block_hash: hash.clone(),
+        block_timestamp: hex("timestamp").unwrap_or(0),
+        timestamps,
+        log_index: BLOCK_ROW_LOG_INDEX,
+        tx_hash: hash,
+        address: String::new(),
+    })
+}
+
 /// One decoded log row.
 ///
 /// `PartialEq` so a reconstruction can be compared to the original **field by field, with its values
@@ -817,6 +847,8 @@ pub struct DecodeRegistry {
     /// mixing a table-set flag into it would invalidate every existing nest's snapshots to describe
     /// something the content-addressed segment bytes already distinguish.
     blocks: bool,
+    /// Whether this nest declares `[extract] l1_blocks` (#1839). Not in the hash, as above.
+    l1_blocks: bool,
 }
 
 /// Event parameter names that would collide with a column nuthatch adds itself.
@@ -920,6 +952,16 @@ impl DecodeRegistry {
         self.blocks
     }
 
+    pub fn with_l1_blocks(mut self, l1_blocks: bool) -> DecodeRegistry {
+        self.l1_blocks = l1_blocks;
+        self
+    }
+
+    /// Does this nest declare an `l1_blocks` table?
+    pub fn l1_blocks(&self) -> bool {
+        self.l1_blocks
+    }
+
     pub fn with_timestamps(mut self, timestamps: bool) -> DecodeRegistry {
         self.timestamps = timestamps;
         self
@@ -1014,6 +1056,7 @@ impl DecodeRegistry {
             skipped_anonymous,
             timestamps: true,
             blocks: false,
+            l1_blocks: false,
         })
     }
 
@@ -1109,6 +1152,27 @@ impl DecodeRegistry {
                 table: BLOCKS_TABLE.to_string(),
                 // No contract owns it, and an empty alias would read as "unset" rather than
                 // "deliberately none", so it names the chain layer it comes from.
+                alias: "chain".to_string(),
+                kind: TableKind::Block,
+                event: String::new(),
+                topic0: String::new(),
+                function: String::new(),
+                selector: String::new(),
+                columns,
+            });
+            out.sort_by(|a, b| a.table.cmp(&b.table));
+        }
+        if self.l1_blocks {
+            let mut columns = implicit_columns(self.timestamps);
+            columns.push(ColumnSchema {
+                name: "l1_block_number".to_string(),
+                sol_type: "uint64".to_string(),
+                storage: StorageKind::U64.as_str().to_string(),
+                indexed: false,
+                components: Vec::new(),
+            });
+            out.push(TableSchema {
+                table: L1_BLOCKS_TABLE.to_string(),
                 alias: "chain".to_string(),
                 kind: TableKind::Block,
                 event: String::new(),

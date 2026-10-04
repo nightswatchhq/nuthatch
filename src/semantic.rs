@@ -252,6 +252,12 @@ pub fn generate(schema: &[TableSchema], nest_name: &str, chain: &str) -> Semanti
                 ),
                 "one row per sampled block this declaration fires at".to_string(),
             ),
+            crate::registry::TableKind::Block if t.table == crate::registry::L1_BLOCKS_TABLE => (
+                format!(
+                    "The L1 block each block carrying this nest's logs was sequenced against. {SEEDED}"
+                ),
+                "one row per block that carries a row in another table".to_string(),
+            ),
             crate::registry::TableKind::Block => (
                 format!("One row per block on this nest. {SEEDED}"),
                 "one row per block".to_string(),
@@ -642,6 +648,9 @@ fn describe_table(t: &TableSchema, ts: Option<&TableSemantic>) -> String {
         _ => match t.kind {
             crate::registry::TableKind::Call => {
                 format!("result of the `{}` call", t.table)
+            }
+            crate::registry::TableKind::Block if t.table == crate::registry::L1_BLOCKS_TABLE => {
+                "the L1 block of each block carrying this nest's logs".into()
             }
             crate::registry::TableKind::Block => "one row per block".into(),
             crate::registry::TableKind::State => format!("storage writes for `{}`", t.alias),

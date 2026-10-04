@@ -755,6 +755,37 @@ Three things to know, measured on 2026-09-04:
   blocks on a busy token sits under the endpoint's 10,000-log result cap with room; on a busier one
   the chunker narrows from the refusal, which the endpoint states in words.
 
+### Arbitrum's L1 block: `[extract] l1_blocks`
+
+Every Arbitrum Nitro header (Arbitrum One, Robinhood Chain) carries `l1BlockNumber`, the Ethereum
+block the L2 block was sequenced against. A contract that counts in L1 blocks, the Graph's
+`EpochManager` being the case that asked for this (#1839), needs it to place an event, and the log
+does not carry it.
+
+```toml
+[extract]
+l1_blocks = true
+```
+
+This adds one table, `l1_blocks`: a row per block that carries a row of this nest, with
+`block_number`, `block_hash`, `block_timestamp` (when the nest has timestamps) and `l1_block_number`.
+A view joins it on `block_number` and `block_hash`:
+
+```sql
+SELECT e.*, l.l1_block_number
+FROM staking__allocation_created e
+JOIN l1_blocks l USING (block_number, block_hash);
+```
+
+It costs one header per block that carries a row, the header the timestamp comes from when the logs
+do not carry one, and nothing for the blocks in between. `[extract] blocks` keeps the same column on
+every block, at a header for every block in the window, and the two are refused together: if a nest
+already has `blocks`, read `blocks.l1_block_number`. Off by default, and off changes nothing: no
+table, no header, the same segments. It is refused on a registered chain that does not report the
+field, and on an unlisted chain a header without it refuses the window rather than storing 0. Like
+`blocks`, turning it on for a nest that has already indexed is refused at startup, because the
+history it would cover has no rows; index a new nest instead.
+
 ---
 
 ## The service surface
