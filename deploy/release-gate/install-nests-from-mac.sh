@@ -106,8 +106,11 @@ header qos-nest qos-reo-nest "this box"
 pid=$(systemctl show -p MainPID --value qos-reo-nest)
 sudo -n cat /proc/$pid/environ | tr "\0" "\n" | grep -E "^($KEYS)=" >> ~/release-gate/env/qos-nest.env || true
 printf "NEST=qos-nest %s http://%s\n" "$qos_dir" "$qos_listen" > ~/release-gate/export-local.env
+for f in ~/release-gate/env/*.env; do
+  grep -q "^NUTHATCH_" "$f" || echo "# none: the unit sets no NUTHATCH_* settings" >> "$f"
+done
 cp $ops/deploy/release-gate/nests.conf.example ~/release-gate/nests.conf
-for f in ~/release-gate/env/*.env; do echo "--- $f"; grep -v "^#" "$f"; done
+for f in ~/release-gate/env/*.env; do echo "--- $f"; grep -v "^#" "$f" || echo "(no budget settings)"; done
 
 cd $ops
 for n in alloc-nest gns-nest dips-nest data-services-nest staking-archive-nest; do
