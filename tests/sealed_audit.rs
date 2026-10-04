@@ -73,7 +73,7 @@ async fn audit(first: TapeSource, second: TapeSource) -> Vec<RangeReport> {
     let cfg = seal_from(dir.path(), &first).await;
     let auditor = Auditor::new(dir.path(), &cfg).expect("auditor");
     // A span wider than the sealed range clamps to all of it, so every sample covers block 30.
-    let ranges = sample_ranges(dir.path(), &auditor, 7, 0..2, 1_000)
+    let ranges = sample_ranges(dir.path(), &auditor, None, 7, 0..2, 1_000)
         .unwrap()
         .expect("something sealed");
     let mut reports = Vec::new();

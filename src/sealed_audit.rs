@@ -33,6 +33,7 @@ pub struct Auditor {
     registry: DecodeRegistry,
     schema: Vec<TableSchema>,
     filter: LogFilter,
+    start_block: Option<u64>,
 }
 
 impl Auditor {
@@ -61,6 +62,7 @@ impl Auditor {
             registry,
             schema,
             filter,
+            start_block: config.contracts.iter().filter_map(|c| c.start_block).min(),
         })
     }
 }
@@ -253,10 +255,12 @@ struct Catalogue {
 }
 
 impl Catalogue {
-    fn load(dir: &Path, auditor: &Auditor) -> Result<Option<Self>> {
+    /// From the earliest block an audited table covers to the nest's `sealed_through`: the indexer
+    /// cuts every table at that one boundary, so a stretch past the last event segment was sealed
+    /// empty, which is where an omitted log hides. Without the stored watermark, the furthest
+    /// segment of any table the indexer cuts stands in for it, which can only fall short of it.
+    fn load(dir: &Path, auditor: &Auditor, watermark: Option<u64>) -> Result<Option<Self>> {
         let manifest = crate::seal::load_manifest(dir)?;
-        // Bounds from the audited tables alone: a blocks or calls table sealed further would put
-        // samples where no compared row could have been sealed.
         let mut weighted: Vec<(u64, u64, u64)> = auditor
             .schema
             .iter()
@@ -265,12 +269,26 @@ impl Catalogue {
             .map(|s| (s.from_block, s.to_block, s.rows as u64))
             .collect();
         weighted.sort_unstable();
-        let (Some(lo), Some(hi)) = (
-            weighted.iter().map(|w| w.0).min(),
-            weighted.iter().map(|w| w.1).max(),
-        ) else {
+        let cut = manifest
+            .tables
+            .iter()
+            .filter(|(table, _)| !OWN_BOUNDARY.contains(&table.as_str()))
+            .flat_map(|(_, segments)| segments);
+        let lo = weighted
+            .iter()
+            .map(|w| w.0)
+            .min()
+            .or(auditor.start_block)
+            .or_else(|| cut.clone().map(|s| s.from_block).min());
+        let hi = watermark
+            .filter(|&w| w > 0)
+            .or_else(|| cut.map(|s| s.to_block).max());
+        let (Some(lo), Some(hi)) = (lo, hi) else {
             return Ok(None);
         };
+        if hi < lo {
+            return Ok(None);
+        }
         let rows = weighted.iter().map(|w| w.2).sum();
         Ok(Some(Self {
             lo,
@@ -312,6 +330,9 @@ impl Catalogue {
     }
 }
 
+/// Tables sealed outside the indexer's cut: `nuthatch screen` seals hits over a range the operator names.
+const OWN_BOUNDARY: &[&str] = &["sanction_hit"];
+
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// SplitMix64, written out so a seed picks the same ranges on every build.
@@ -324,14 +345,17 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 /// The ranges samples `indices` audit under `seed`, or `None` when nothing has sealed yet.
+/// `watermark` is the nest's `sealed_through` when it can be read; see [`Catalogue::load`].
 pub fn sample_ranges(
     dir: &Path,
     auditor: &Auditor,
+    watermark: Option<u64>,
     seed: u64,
     indices: std::ops::Range<u64>,
     span: u64,
 ) -> Result<Option<Vec<(u64, u64)>>> {
-    Ok(Catalogue::load(dir, auditor)?.map(|c| indices.map(|i| c.pick(seed, i, span)).collect()))
+    Ok(Catalogue::load(dir, auditor, watermark)?
+        .map(|c| indices.map(|i| c.pick(seed, i, span)).collect()))
 }
 
 /// Refuse an audit endpoint the nest indexes from: an omission it made once it would make again.
@@ -374,10 +398,20 @@ pub async fn run_cli(args: crate::cli::AuditSealedArgs) -> Result<()> {
     let rpc = crate::rpc::RpcClient::new(vec![args.rpc.clone()])?;
     rpc.verify_chain_ids(config.nest.chain_id).await?;
     let endpoint = crate::rpc::redact_url(&args.rpc);
+    // A running nest holds the store's lock; the catalogue then stands in for its watermark.
+    let watermark = match crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE)) {
+        Ok(store) => Some(store.sealed_through()),
+        Err(_) => {
+            println!(
+                "the hot store is in use or absent; sampling up to the furthest sealed segment"
+            );
+            None
+        }
+    };
 
     let ranges = match (args.from, args.to) {
         (Some(from), Some(to)) => {
-            let Some(c) = Catalogue::load(&dir, &auditor)? else {
+            let Some(c) = Catalogue::load(&dir, &auditor, watermark)? else {
                 bail!("nothing in {} has sealed yet", dir.display());
             };
             if from > to || from < c.lo || to > c.hi {
@@ -392,7 +426,7 @@ pub async fn run_cli(args: crate::cli::AuditSealedArgs) -> Result<()> {
         _ => {
             let seed = args.seed.unwrap_or_else(unix_now);
             println!("seed {seed}");
-            sample_ranges(&dir, &auditor, seed, 0..args.samples, args.span)?
+            sample_ranges(&dir, &auditor, watermark, seed, 0..args.samples, args.span)?
                 .with_context(|| format!("nothing in {} has sealed yet", dir.display()))?
         }
     };
@@ -451,7 +485,10 @@ pub fn spawn(
                     rpc.verify_chain_ids(chain_id).await?;
                     chain_verified = true;
                 }
-                let Some(ranges) = sample_ranges(&dir, &auditor, seed, index..index + 1, span)?
+                // The seal path's copy of the store's watermark, seeded from it at start (#918).
+                let watermark = Some(crate::metrics::METRICS.sealed_through_val());
+                let Some(ranges) =
+                    sample_ranges(&dir, &auditor, watermark, seed, index..index + 1, span)?
                 else {
                     return Ok(None);
                 };
@@ -595,37 +632,99 @@ events = ["Transfer"]
         assert_eq!(auditor.filter.topic0s(), [auditor.schema[0].topic0.clone()]);
     }
 
-    #[test]
-    fn samples_stay_inside_the_audited_tables_sealed_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        let auditor = nest(d, "\n[extract]\nblocks = true\n");
+    fn transfer_at(auditor: &Auditor, block: u64) -> crate::rpc::Log {
         let word = |n: u64| format!("0x{n:064x}");
-        let log = crate::rpc::Log {
+        crate::rpc::Log {
             address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
             topics: vec![auditor.schema[0].topic0.clone(), word(1), word(2)],
             data: word(5),
-            block_number: 10,
-            block_hash: word(10),
-            tx_hash: word(99),
+            block_number: block,
+            block_hash: word(block),
+            tx_hash: word(block << 20),
             log_index: 0,
-        };
-        let event = auditor.registry.decode(&log).unwrap().unwrap();
-        crate::seal::test_set_table_floor(d, 0);
-        crate::seal::seal_range(d, &[event.to_json().to_string()], 1, 20).unwrap();
-        let block = serde_json::json!({
-            "table": crate::registry::BLOCKS_TABLE,
-            "block_number": 900,
-            "log_index": 0,
-        });
-        crate::seal::seal_range(d, &[block.to_string()], 21, 1_000).unwrap();
-
-        for (from, to) in sample_ranges(d, &auditor, 5, 0..200, 5).unwrap().unwrap() {
-            assert!(
-                from >= 1 && to <= 20,
-                "sampled {from}..={to}, outside 1..=20"
-            );
         }
+    }
+
+    /// Transfers sealed with rows only at block 10, in the cut 1..=20; the cut 21..=1000 held only a
+    /// blocks row, so the event table sealed it empty; `nuthatch screen` sealed a hit over 21..=5000.
+    fn empty_tail(d: &Path) -> Auditor {
+        let auditor = nest(d, "\n[extract]\nblocks = true\n");
+        let event = auditor.registry.decode(&transfer_at(&auditor, 10)).unwrap();
+        crate::seal::test_set_table_floor(d, 0);
+        crate::seal::seal_range(d, &[event.unwrap().to_json().to_string()], 1, 20).unwrap();
+        let row = |table: &str, block: u64| {
+            serde_json::json!({"table": table, "block_number": block, "log_index": 0}).to_string()
+        };
+        crate::seal::seal_range(d, &[row(crate::registry::BLOCKS_TABLE, 900)], 21, 1_000).unwrap();
+        crate::seal::seal_range(d, &[row("sanction_hit", 3_000)], 21, 5_000).unwrap();
+        auditor
+    }
+
+    #[test]
+    fn samples_reach_the_common_watermark_and_not_a_screen_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let auditor = empty_tail(dir.path());
+        let picks = |watermark| {
+            sample_ranges(dir.path(), &auditor, watermark, 5, 0..200, 5)
+                .unwrap()
+                .unwrap()
+        };
+        let inferred = picks(None);
+        assert!(
+            inferred.iter().all(|&(from, to)| from >= 1 && to <= 1_000),
+            "{inferred:?}"
+        );
+        assert!(
+            inferred.iter().any(|&(from, _)| from > 20),
+            "the empty stretch went unsampled"
+        );
+        let stored = picks(Some(800));
+        assert!(stored.iter().all(|&(_, to)| to <= 800), "{stored:?}");
+        assert!(stored.iter().any(|&(from, _)| from > 20));
+        // Zero is a gauge not yet seeded, not a watermark.
+        assert_eq!(picks(Some(0)), inferred);
+    }
+
+    #[test]
+    fn an_event_table_that_never_sealed_a_row_is_still_sampled() {
+        // `extra` lands inside the one [[contracts]] table.
+        let sealed_blocks_only = |extra: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let auditor = nest(dir.path(), extra);
+            crate::seal::test_set_table_floor(dir.path(), 0);
+            let row = serde_json::json!({
+                "table": crate::registry::BLOCKS_TABLE, "block_number": 900, "log_index": 0,
+            });
+            crate::seal::seal_range(dir.path(), &[row.to_string()], 1, 1_000).unwrap();
+            sample_ranges(dir.path(), &auditor, None, 3, 0..50, 5)
+                .unwrap()
+                .expect("blocks sealed, so the event table sealed empty")
+        };
+        let from_start = sealed_blocks_only("start_block = 300\n");
+        assert!(
+            from_start
+                .iter()
+                .all(|&(from, to)| from >= 300 && to <= 1_000),
+            "{from_start:?}"
+        );
+        let from_cut = sealed_blocks_only("");
+        assert!(from_cut.iter().any(|&(from, _)| from < 300), "{from_cut:?}");
+    }
+
+    #[tokio::test]
+    async fn a_log_omitted_from_an_empty_sealed_stretch_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let auditor = empty_tail(d);
+        let ranges = sample_ranges(d, &auditor, None, 1, 0..1, 5_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranges, [(1, 1_000)]);
+        let served = Serves(vec![transfer_at(&auditor, 10), transfer_at(&auditor, 500)]);
+        let r = audit_range(d, &auditor, &served, 1, 1_000).await.unwrap();
+        assert_eq!(r.endpoint_only.len(), 1, "{r:?}");
+        assert!(r.endpoint_only[0].contains("\"block_number\":500"), "{r:?}");
+        assert!(r.sealed_only.is_empty() && r.differing.is_empty(), "{r:?}");
     }
 
     #[tokio::test]
