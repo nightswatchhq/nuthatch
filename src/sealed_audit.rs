@@ -543,4 +543,60 @@ mod tests {
         assert!(!format!("{err:#}").contains("KEY"), "{err:#}");
         refuse_indexing_endpoint("https://other.example/v2/KEY", &pool).unwrap();
     }
+
+    #[test]
+    fn a_row_sealed_twice_is_returned_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("abis")).unwrap();
+        std::fs::write(
+            d.join("abis/erc20.json"),
+            include_str!("../tests/fixtures/erc20.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "usdc"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = []
+
+[[contracts]]
+alias = "usdc"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/erc20.json"
+events = ["Transfer"]
+"#,
+        )
+        .unwrap();
+        let config = crate::config::Config::load(d).unwrap();
+        let auditor = Auditor::new(d, &config).unwrap();
+        let word = |n: u64| format!("0x{n:064x}");
+        let log = crate::rpc::Log {
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            topics: vec![auditor.schema[0].topic0.clone(), word(1), word(2)],
+            data: word(5),
+            block_number: 10,
+            block_hash: word(10),
+            tx_hash: word(99),
+            log_index: 0,
+        };
+        let row = auditor.registry.decode(&log).unwrap().unwrap();
+        let next = crate::rpc::Log {
+            block_number: 11,
+            block_hash: word(11),
+            ..log.clone()
+        };
+        let next = auditor.registry.decode(&next).unwrap().unwrap();
+        let json = |r: &DecodedRow| r.to_json().to_string();
+        crate::seal::test_set_table_floor(d, 0);
+        crate::seal::seal_range(d, &[json(&row)], 10, 10).unwrap();
+        crate::seal::seal_range(d, &[json(&row), json(&next)], 10, 11).unwrap();
+
+        let (rows, duplicates) = sealed_rows(d, &auditor.schema, 0, 20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(duplicates, vec![canonical(&row)]);
+    }
 }
