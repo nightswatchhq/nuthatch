@@ -2457,6 +2457,9 @@ pub async fn spawn_runtime(
     // this call *is* the cursor, and every nest built below shares the budget rather than each
     // getting its own copy of it.
     let sql_gate = serve::new_sql_gate();
+    let datasets: std::collections::BTreeSet<&PathBuf> =
+        nests.iter().map(|(_, dir, _)| dir).collect();
+    crate::analytics_budget::validate_cursor_budget(datasets.len())?;
     for (name, dir, mut config) in nests {
         config.route = Some(name.clone());
         let (nest, state, worker, w) = match build_nest(
@@ -2713,7 +2716,7 @@ async fn build_nest(
     Option<tokio::task::JoinHandle<()>>,
     u64,
 )> {
-    crate::analytics_budget::validate_cursor_budget()?;
+    crate::analytics_budget::validate_cursor_budget(1)?;
     // RFC-0014 extraction is configured but not yet sourceable. Refuse rather than start, because the
     // failure mode of starting is the worse one: `traces`/`state_diffs` would exist, answer queries,
     // and return nothing - and an empty table is indistinguishable from "no matching rows" to whoever

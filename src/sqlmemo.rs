@@ -315,6 +315,11 @@ impl Memo {
     pub fn entries(&self) -> usize {
         self.state().entries.len()
     }
+    /// Whether `key` is remembered, without counting a hit or a miss.
+    #[cfg(test)]
+    pub fn contains(&self, key: &Key) -> bool {
+        self.state().entries.contains_key(key)
+    }
     pub fn hits(&self) -> u64 {
         self.hits.load(Relaxed)
     }
@@ -351,6 +356,10 @@ pub fn bytes() -> usize {
 }
 pub fn entries() -> usize {
     GLOBAL.entries()
+}
+#[cfg(test)]
+pub fn contains(key: &Key) -> bool {
+    GLOBAL.contains(key)
 }
 pub fn hits() -> u64 {
     GLOBAL.hits()
