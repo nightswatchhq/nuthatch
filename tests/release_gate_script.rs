@@ -820,6 +820,9 @@ fn production_over_its_rss_budget_is_still_a_baseline_for_the_candidate() {
         "production's own peak belongs in the candidate's status: {verdict}"
     );
     assert!(text.contains("over the 100 MiB budget"), "{text}");
+    // The copy has no PROVENANCE, so production is a guess, and the status says so.
+    assert!(verdict.contains("no PROVENANCE"), "{verdict}");
+    assert!(text.contains("has no PROVENANCE"), "{text}");
 }
 
 /// A statement production fails as well cannot be a regression, and the output says so, but the
@@ -970,4 +973,158 @@ fn a_lock_left_by_a_killed_run_is_broken() {
     let (code, text) = finish(child, c.dir.path(), "gate", 120);
     assert_eq!(code, Some(0), "{text}");
     assert!(text.contains("breaking"), "{text}");
+}
+
+/// On 2026-10-04 v4.3.1 was gated against v4.3.0, the latest release, while the allocations nest
+/// ran 4.2.1, so the statements 4.3.1 fixed read as answers that differ. Production is the version
+/// the refreshed copy's PROVENANCE records.
+#[test]
+fn production_is_the_version_the_refreshed_copy_records_not_the_latest_release() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(
+        &c,
+        &[
+            ("v4.3.1", "full", 0),
+            ("v4.3.0", "full", 0),
+            ("v4.2.1", "full", 0),
+        ],
+        &[],
+    );
+    let provenance = c.nest.join("PROVENANCE");
+    assert!(
+        !provenance.exists(),
+        "the refresh writes it, not the fixture"
+    );
+    let refresh = format!(
+        "printf 'taken_at=2026-10-04T00:00:00Z\\nversion=4.2.1\\nsealed_through=8\\n' >'{}'",
+        provenance.display()
+    );
+    let (code, text) = r.runner(&c, &set, &["v4.3.1"], &[("GATE_REFRESH", &refresh)]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(r.read("downloaded"), "v4.2.1\nv4.3.1\n", "{text}");
+    let posted = r.read("posted");
+    assert!(
+        posted.lines().all(|l| !l.contains("v4.3.0")),
+        "{posted}\n{text}"
+    );
+    let verdict = posted.lines().last().unwrap_or_default();
+    assert!(
+        verdict.starts_with("sha-v4.3.1 success ") && verdict.contains("(against v4.2.1)"),
+        "{posted}\n{text}"
+    );
+    assert!(text.contains("PROVENANCE records"), "{text}");
+}
+
+/// `--poll`'s "newer than production" uses the same production: a candidate at or below what the
+/// copy records production running is not gated, though it is newer than the latest full release.
+#[test]
+fn poll_measures_newer_against_the_production_the_copy_records() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(
+        &c,
+        &[
+            ("v4.3.0-rc.2", "pre", 0),
+            ("v4.3.0-rc.1", "pre", 0),
+            ("v4.2.1", "full", 0),
+        ],
+        &[],
+    );
+    std::fs::write(c.nest.join("PROVENANCE"), "version=4.3.0-rc.2\n").unwrap();
+    let (code, text) = r.runner(&c, &set, &["--poll"], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(r.read("posted"), "", "nothing is gated:\n{text}");
+    assert_eq!(r.read("downloaded"), "", "nothing is fetched:\n{text}");
+    assert_eq!(text, "", "nothing to gate is quiet");
+}
+
+/// Production rolled to the candidate between the poll and the refresh: the refreshed copy names
+/// the candidate itself, so there is nothing to gate and nothing is posted.
+#[test]
+fn poll_leaves_a_candidate_production_was_rolled_to_during_the_refresh() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(&c, &[("v4.3.0-rc.2", "pre", 0), ("v4.2.1", "full", 0)], &[]);
+    let provenance = c.nest.join("PROVENANCE");
+    std::fs::write(&provenance, "version=4.2.1\n").unwrap();
+    let refresh = format!("printf 'version=4.3.0-rc.2\\n' >'{}'", provenance.display());
+    let (code, text) = r.runner(&c, &set, &["--poll"], &[("GATE_REFRESH", &refresh)]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(r.read("posted"), "", "nothing is gated:\n{text}");
+    assert_eq!(r.read("downloaded"), "", "nothing is fetched:\n{text}");
+    assert!(text.contains("no longer newer"), "{text}");
+}
+
+/// `--production` still overrides the copy's PROVENANCE.
+#[test]
+fn production_flag_overrides_the_copys_provenance() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(
+        &c,
+        &[
+            ("v4.3.1", "full", 0),
+            ("v4.3.0", "full", 0),
+            ("v4.2.1", "full", 0),
+        ],
+        &[],
+    );
+    std::fs::write(c.nest.join("PROVENANCE"), "version=4.2.1\n").unwrap();
+    let (code, text) = r.runner(&c, &set, &["v4.3.1", "--production", "v4.3.0"], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(r.read("downloaded"), "v4.3.0\nv4.3.1\n", "{text}");
+}
+
+/// A PROVENANCE whose version is not a release version is not guessed around: the run exits 2 and
+/// posts one error status on the candidate naming the version, by tag or after a poll's refresh.
+#[test]
+fn a_provenance_version_that_is_not_a_release_posts_one_error_naming_it() {
+    for poll in [false, true] {
+        let c = case();
+        let set = c.set(&[("answers", c.counts())]);
+        let r = releases(&c, &[("v4.3.1", "full", 0), ("v4.2.1", "full", 0)], &[]);
+        let provenance = c.nest.join("PROVENANCE");
+        let (args, refresh): (&[&str], String) = if poll {
+            std::fs::write(&provenance, "version=4.2.1\n").unwrap();
+            let refresh = format!(
+                "printf 'version=dirty-build\\n' >'{}'",
+                provenance.display()
+            );
+            (&["--poll"], refresh)
+        } else {
+            std::fs::write(&provenance, "version=dirty-build\n").unwrap();
+            (&["v4.3.1"], String::new())
+        };
+        let env: &[(&str, &str)] = if poll {
+            &[("GATE_REFRESH", &refresh)]
+        } else {
+            &[]
+        };
+        let (code, text) = r.runner(&c, &set, args, env);
+        assert_eq!(code, Some(2), "poll={poll}: {text}");
+        let posted = r.read("posted");
+        assert_eq!(posted.lines().count(), 1, "poll={poll}: {posted}\n{text}");
+        assert!(
+            posted.starts_with("sha-v4.3.1 error ") && posted.contains("dirty-build"),
+            "poll={poll}: {posted}\n{text}"
+        );
+        assert_eq!(r.read("downloaded"), "", "poll={poll}: {text}");
+    }
+}
+
+/// Before a poll has chosen a candidate there is no commit to post on: the run exits 2 and says so.
+#[test]
+fn a_bad_provenance_before_a_poll_chooses_exits_loud_with_no_status() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(&c, &[("v4.3.1", "full", 0), ("v4.2.1", "full", 0)], &[]);
+    std::fs::write(c.nest.join("PROVENANCE"), "version=dirty-build\n").unwrap();
+    let (code, text) = r.runner(&c, &set, &["--poll"], &[]);
+    assert_eq!(code, Some(2), "{text}");
+    assert_eq!(r.read("posted"), "", "{text}");
+    assert!(
+        text.contains("dirty-build") && text.contains("no candidate is chosen yet"),
+        "{text}"
+    );
 }
