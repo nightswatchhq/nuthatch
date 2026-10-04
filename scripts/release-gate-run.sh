@@ -29,7 +29,8 @@
 #   GATE_STATE    working directory: binaries and run logs             (default ~/release-gate)
 #   GATE_NEST     the allocations nest copy, segments plus redb        (default $GATE_STATE/alloc-nest)
 #   GATE_NAME     the nest's name, as in its status context            (default alloc-nest)
-#   GATE_SET      the query set                  (default scripts/gate/alloc-queries.tsv beside this)
+#   GATE_SET      the query set, required for one nest: kittiwake's nuthatch-gate/alloc-queries.tsv
+#                 (private); with GATE_NESTS each nest's set comes from the config
 #   GATE_ENV      production's environment for the nest, read from its unit (release-gate.sh --env);
 #                 unset means release-gate.sh's PROD_ENV, the allocations nest's
 #   GATE_REFRESH  a command run before the gate to refresh GATE_NEST, e.g. the rsync from Helsinki;
@@ -48,7 +49,7 @@ CONTEXT=release-gate/$name
 here=$(cd "$(dirname "$0")" && pwd)
 state=${GATE_STATE:-$HOME/release-gate}
 nest=${GATE_NEST:-$state/alloc-nest}
-set_file=${GATE_SET:-$here/gate/alloc-queries.tsv}
+set_file=${GATE_SET:-}
 repo=${GATE_REPO:-nightswatchhq/nuthatch}
 target=${GATE_TARGET:-x86_64-unknown-linux-gnu}
 passes=${GATE_PASSES:-3}
@@ -67,7 +68,7 @@ while [ $# -gt 0 ]; do
     --sha) [ $# -ge 2 ] || die "--sha needs a commit"; sha=$2; shift 2 ;;
     --production) [ $# -ge 2 ] || die "--production needs a tag"; production_flag=$2; shift 2 ;;
     --no-status) post=0; shift ;;
-    -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) [ -z "$tag" ] || die "one tag at a time"; tag=$1; shift ;;
   esac
@@ -133,7 +134,8 @@ if [ -n "${GATE_NESTS:-}" ]; then
   exit "$worst"
 fi
 
-[ -f "$set_file" ] || die "no query set at $set_file"
+[ -n "$set_file" ] || die "GATE_SET is not set: point it at a kittiwake checkout's nuthatch-gate/alloc-queries.tsv"
+[ -f "$set_file" ] || die "no query set at $set_file (GATE_SET)"
 env_args=()
 if [ -n "${GATE_ENV:-}" ]; then
   [ -f "$GATE_ENV" ] || die "no environment file at $GATE_ENV (GATE_ENV)"

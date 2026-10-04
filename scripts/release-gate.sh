@@ -22,7 +22,8 @@
 #
 # The copy needs its sealed segments *and* its nuthatch.redb: without the redb it serves no sealed
 # history. `serve` never writes either. The query set is a TSV, one statement per line:
-# id<TAB>consumer<TAB>call site<TAB>sql, `#` for comments (scripts/gate/alloc-queries.tsv).
+# id<TAB>consumer<TAB>call site<TAB>sql, `#` for comments. The allocations nest's set is in the
+# private kittiwake repo, nuthatch-gate/alloc-queries.tsv.
 #
 # FAIL, exit 1, on any of: an error or refusal from /sql, an out-of-memory, a degraded answer, the
 # server dying, and with --baseline a time regression past these bounds (medians over the passes):
@@ -72,7 +73,7 @@ while [ $# -gt 0 ]; do
     --passes) [ $# -ge 2 ] || die "--passes needs a number"; passes=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
     --timeout) [ $# -ge 2 ] || die "--timeout needs seconds"; timeout=$2; shift 2 ;;
-    -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) break ;;
   esac

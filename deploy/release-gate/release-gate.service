@@ -5,6 +5,9 @@
 # GATE_NESTS is the nests' config (#1794, nests.conf.example), with a copy, a query set, an
 # environment file and a refresh per nest; install-nests-from-mac.sh writes it, and the Helsinki
 # export allowlist its refreshes need. Until it exists, every poll exits 2 and gates nothing.
+# The query sets are in the private kittiwake repo: the box needs a clone at ~/kittiwake (gh auth as
+# cargopete reaches it). `git -C ~/kittiwake pull` before a gate picks up a new set.
+# Without GATE_NESTS the runner gates one nest and needs GATE_SET (and GATE_REFRESH to refresh it).
 [Unit]
 Description=nuthatch release gate: gate the newest ungated release against every production nest's copy
 
