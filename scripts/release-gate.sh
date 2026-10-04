@@ -224,9 +224,9 @@ sample_rss() {
   local pid=$1 file=$2 k p
   while kill -0 "$pid" 2>/dev/null; do
     k=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-    p=$(cat "$file" 2>/dev/null || echo 0)
+    p=$(cat "$file" 2>/dev/null || true); p=${p:-0}
     if [ -n "$k" ] && [ "$k" -gt "$p" ]; then
-      echo "$k" >"$file"
+      echo "$k" >"$file.tmp" && mv "$file.tmp" "$file"
       metrics_now | awk '$1 ~ /^nuthatch_(analytics_pool_reserved_bytes|analytics_engines|jemalloc_allocated_bytes|jemalloc_resident_bytes)$/' \
         >"$out/rss-peak-gauges.tmp" || true
       mv "$out/rss-peak-gauges.tmp" "$out/rss-peak-gauges"
@@ -243,7 +243,8 @@ stop_server() {
     pool=$(metrics_now | awk '$1 == "nuthatch_analytics_pool_peak_bytes" { print $2 }')
     p=$(cat "$out/pool-peak-bytes" 2>/dev/null || echo 0)
     if [ -n "$pool" ] && [ "$pool" -gt "$p" ]; then echo "$pool" >"$out/pool-peak-bytes"; fi
-    [ -z "$sampler_pid" ] || kill "$sampler_pid" 2>/dev/null || true
+    # Waited for, so it cannot be killed half way through replacing the peak file.
+    [ -z "$sampler_pid" ] || { kill "$sampler_pid" 2>/dev/null; wait "$sampler_pid" 2>/dev/null; } || true
     sampler_pid=""
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
@@ -581,7 +582,8 @@ if [ -n "$write_baseline" ]; then
 fi
 
 echo
-peak_mb=$(( $(cat "$out/rss-peak-kb" 2>/dev/null || echo 0) / 1024 ))
+peak_kb=$(cat "$out/rss-peak-kb" 2>/dev/null || true)
+peak_mb=$(( ${peak_kb:-0} / 1024 ))
 rss_failed=0
 rss_line="peak RSS ${peak_mb} MiB, budget ${MAX_RSS_MB} MiB"
 if [ "$peak_mb" -gt "$MAX_RSS_MB" ]; then rss_failed=1; rss_line="$rss_line: OVER"; fi
