@@ -558,7 +558,18 @@ pub fn degraded_tables(
 pub fn query(dir: &Path, sql: &str) -> Result<Vec<Value>> {
     #[cfg(test)]
     QUERIES.with(|n| n.set(n.get() + 1));
-    Ok(run(dir, sql, None, &HotRows::new(), u64::MAX, &[], None, None)?.rows)
+    Ok(run(
+        dir,
+        sql,
+        None,
+        &HotRows::new(),
+        u64::MAX,
+        &[],
+        None,
+        None,
+        Want::Rows,
+    )?
+    .rows)
 }
 
 // How many trusted queries this thread has run, so a test can hold a point read to its count (#1574).
@@ -584,6 +595,7 @@ fn query_cold(dir: &Path, sql: &str, sealed_through: u64) -> Result<Vec<Value>> 
         &[],
         None,
         None,
+        Want::Rows,
     )?
     .rows)
 }
@@ -601,6 +613,7 @@ pub fn query_guarded(dir: &Path, sql: &str, guard: QueryGuard) -> Result<QueryOu
         &[],
         None,
         None,
+        Want::Rows,
     )
 }
 
@@ -628,7 +641,39 @@ pub fn query_hot_cold(
         declared,
         None,
         None,
+        Want::Rows,
     )
+}
+
+/// [`query_hot_cold`]'s relations and checks, but the statement is planned and not run: `/explain`.
+/// The statement is planned as written, because wrapping it in a derived table re-binds its columns
+/// and refuses some that `/sql` answers (#1775).
+pub fn plan_hot_cold(
+    dir: &Path,
+    sql: &str,
+    guard: QueryGuard,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+) -> Result<QueryOutput> {
+    run(
+        dir,
+        sql,
+        Some(guard),
+        hot,
+        sealed_through,
+        declared,
+        None,
+        None,
+        Want::Plan,
+    )
+}
+
+/// Whether a statement is run for its rows or only planned.
+#[derive(Clone, Copy)]
+enum Want {
+    Rows,
+    Plan,
 }
 
 /// Historical evaluation filters stored facts before authored views aggregate them. Filtering the
@@ -652,6 +697,7 @@ pub fn query_hot_cold_at(
         declared,
         None,
         Some(block),
+        Want::Rows,
     )
 }
 
@@ -675,6 +721,7 @@ pub fn query_named(
         declared,
         Some(admission),
         None,
+        Want::Rows,
     )
 }
 
@@ -871,6 +918,7 @@ fn run(
     declared: &[crate::registry::TableSchema],
     named: Option<&NamedAdmission>,
     as_of: Option<u64>,
+    want: Want,
 ) -> Result<QueryOutput> {
     // One deadline for the whole call, computed once - not a fresh `guard.timeout` handed to each
     // `attempt` (#476). Before this, the watchdog only ever bounded a single `attempt`: the first
@@ -894,6 +942,7 @@ fn run(
         declared,
         named,
         as_of,
+        want,
     );
     // A segment the plan named was gone by execution (#1162). Nothing is corrupt and nothing is
     // missing: a seal replaced the file under the query, and planning again reads the manifest as it
@@ -924,6 +973,7 @@ fn run(
             declared,
             named,
             as_of,
+            want,
         )? {
             Attempt::Ok(out) => Ok(out),
             Attempt::DiedExecuting { error, .. } => Err(error),
@@ -995,6 +1045,7 @@ fn run(
         declared,
         named,
         as_of,
+        want,
     )? {
         Attempt::Ok(out) => Ok(out),
         Attempt::DiedExecuting { error, .. } => Err(error),
@@ -1024,6 +1075,7 @@ fn attempt(
     declared: &[crate::registry::TableSchema],
     named: Option<&NamedAdmission>,
     as_of: Option<u64>,
+    want: Want,
 ) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. DuckDB gets the original text.
@@ -1250,7 +1302,17 @@ fn attempt(
         }
         let cap = guard.map(|g| g.max_rows);
         let _live = LiveQuery::register(dir, session.interrupt_handle());
-        let outcome = evaluate.then(|| session.collect(sql, cap));
+        let outcome = evaluate.then(|| match want {
+            Want::Rows => session.collect(sql, cap),
+            Want::Plan => session
+                .describe(sql)
+                .map(|columns| Collected {
+                    rows: Vec::new(),
+                    columns: columns.into_iter().map(|(name, _)| name).collect(),
+                    truncated: false,
+                })
+                .map_err(Died::Binding),
+        });
 
         // Stop the watchdog before interpreting the result: a value arriving before the deadline makes
         // `recv_timeout` return `Ok`, so it won't interrupt; then join so it can't fire late.
