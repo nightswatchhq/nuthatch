@@ -39,6 +39,7 @@ grep -q "if False else" /tmp/parity-broken.sh || { echo "the break did not apply
 chmod 755 /tmp/parity-broken.sh
 rc=0; PARITY_SCRIPT=/tmp/parity-broken.sh PARITY_MODES=sealed nuthatch-parity || rc=$?; echo "exit $rc"
 rm -f /tmp/parity-broken.sh
+[ "$rc" -ne 4 ] || { echo "the deliberate failure exited 4: the subgraph side did not answer, so check GRAPH_API_KEY in /etc/nuthatch/parity.env" >&2; exit 1; }
 [ "$rc" -eq 1 ] || { echo "the deliberate failure exited $rc, not 1: the timer would not page on a real one" >&2; exit 1; }'
 
 ssh "$host" 'systemctl start --no-block nuthatch-parity.service && systemctl enable --now nuthatch-parity.timer && systemctl list-timers nuthatch-parity.timer --no-pager | head -2'

@@ -494,11 +494,13 @@ fn head_mode_with_an_indexer_short_of_the_pin_is_not_measured() {
     assert_eq!(code, 3, "{text}");
 }
 
-/// The sealed pin is hours old, so a subgraph short of it is a fault, as it always was.
+/// The sealed pin is hours old, so a subgraph short of it is a fault that pages, but it compared
+/// nothing, so it is not run rather than a disagreement (#1818).
 #[test]
-fn sealed_mode_with_the_subgraph_behind_still_fails() {
+fn sealed_mode_with_the_subgraph_behind_is_not_run() {
     let (code, text) = parity(None, &meta(850), &[]);
-    assert_eq!(code, 1, "{text}");
+    assert_eq!(code, 4, "{text}");
+    assert!(text.contains("NOT RUN"), "{text}");
     assert!(text.contains("below pin 900"), "{text}");
 }
 
@@ -524,4 +526,194 @@ fn an_unknown_mode_is_refused() {
     let (code, text) = parity(Some("tip"), &meta(2000), &[]);
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("PARITY_MODE"), "{text}");
+}
+
+// --- #1818: the subgraph side failing to answer is a rig fault, not a disagreement ---
+
+/// The wrapper names the reason and says the run did not happen; it does not say the sides disagree.
+#[test]
+fn a_rig_fault_pages_not_run_with_the_reason() {
+    let r = rig();
+    exits(&r, "sealed", "4");
+    out(
+        &r,
+        "sealed",
+        "subgraph _meta.block.number=950 pin=900\nNOT RUN subgraph graphql error: [{'message': 'auth error: API key not found'}]\nFAIL later noise\n",
+    );
+    let (code, text) = run(&r);
+    assert_eq!(code, 4, "{text}");
+    let p = posts(&r);
+    assert_eq!(p.len(), 1, "{p:?}\n{text}");
+    assert!(p[0].contains("PARITY NOT RUN (sealed): "), "{}", p[0]);
+    assert!(p[0].contains("auth error: API key not found"), "{}", p[0]);
+    assert!(!p[0].contains("PARITY FAIL"), "{}", p[0]);
+    assert!(
+        runs_tsv(&r).contains("\tsealed\t4\t900"),
+        "{}",
+        runs_tsv(&r)
+    );
+}
+
+/// A head-mode rig fault pages too, and is not retried as a head that could not be reached.
+#[test]
+fn a_head_rig_fault_pages_and_is_not_retried() {
+    let r = rig();
+    exits(&r, "head", "4 0");
+    out(&r, "head", "NOT RUN subgraph HTTP 500: upstream exploded\n");
+    let (code, text) = run(&r);
+    assert_eq!(code, 4, "{text}");
+    let p = posts(&r);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].contains("PARITY NOT RUN (head): "), "{}", p[0]);
+    assert!(p[0].contains("HTTP 500"), "{}", p[0]);
+    assert_eq!(
+        runs_tsv(&r).matches("\thead\t").count(),
+        1,
+        "{}",
+        runs_tsv(&r)
+    );
+}
+
+/// A disagreement in one mode outranks a rig fault in the other.
+#[test]
+fn a_disagreement_outranks_a_rig_fault() {
+    let r = rig();
+    exits(&r, "sealed", "1");
+    out(
+        &r,
+        "sealed",
+        "lodestar_allocations nest=10 subgraph_isLegacy_false=11 DIFF\n",
+    );
+    exits(&r, "head", "4");
+    out(&r, "head", "NOT RUN subgraph HTTP 502: bad gateway\n");
+    let (code, text) = run(&r);
+    assert_eq!(code, 1, "{text}");
+    let p = posts(&r);
+    assert_eq!(p.len(), 2, "{p:?}");
+    assert!(p[0].contains("PARITY FAIL (sealed)"), "{}", p[0]);
+    assert!(!p[0].contains("NOT RUN"), "{}", p[0]);
+    assert!(p[1].contains("PARITY NOT RUN (head)"), "{}", p[1]);
+}
+
+/// Answers each request with the first route whose needle appears in its request line, headers or
+/// body; anything unmatched is a 404.
+fn serve(routes: Vec<(&'static str, u16, String)>) -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut reader = BufReader::new(stream);
+            let mut req = String::new();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                req.push_str(&line);
+            }
+            let mut body = vec![0u8; len];
+            let _ = reader.read_exact(&mut body);
+            req.push_str(&String::from_utf8_lossy(&body));
+            let (status, answer) = routes
+                .iter()
+                .find(|(needle, _, _)| req.contains(needle))
+                .map(|(_, s, b)| (*s, b.clone()))
+                .unwrap_or((404, "no route".into()));
+            let mut stream = reader.into_inner();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn an_auth_error_is_a_rig_fault_not_a_disagreement() {
+    let body = r#"{"errors":[{"message":"auth error: API key not found"}]}"#;
+    for mode in [None, Some("head")] {
+        let (code, text) = parity(mode, body, &[]);
+        assert_eq!(code, 4, "{mode:?}: {text}");
+        assert!(text.contains("NOT RUN"), "{mode:?}: {text}");
+        assert!(
+            text.contains("auth error: API key not found"),
+            "{mode:?}: {text}"
+        );
+        assert!(
+            !text.contains("subgraph comparison failed"),
+            "{mode:?}: {text}"
+        );
+    }
+}
+
+#[test]
+fn an_http_500_from_the_gateway_is_a_rig_fault() {
+    let gw = serve(vec![("", 500, "upstream exploded".into())]);
+    let (code, text) = parity(None, "", &[("GRAPH_GATEWAY", &gw)]);
+    assert_eq!(code, 4, "{text}");
+    assert!(text.contains("NOT RUN"), "{text}");
+    assert!(text.contains("HTTP 500"), "{text}");
+}
+
+#[test]
+fn a_gateway_that_does_not_answer_is_a_rig_fault() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let gw = format!("http://127.0.0.1:{port}");
+    let (code, text) = parity(None, "", &[("GRAPH_GATEWAY", &gw)]);
+    assert_eq!(code, 4, "{text}");
+    assert!(text.contains("NOT RUN"), "{text}");
+}
+
+#[test]
+fn a_malformed_answer_is_a_rig_fault() {
+    let (code, text) = parity(None, "<html>502 Bad Gateway</html>", &[]);
+    assert_eq!(code, 4, "{text}");
+    assert!(text.contains("NOT RUN"), "{text}");
+    assert!(text.contains("malformed"), "{text}");
+}
+
+/// The file gateway only answers for the key `k`, so another key's error names the path it missed.
+#[test]
+fn the_key_never_reaches_a_rig_fault_reason() {
+    let (code, text) = parity(None, &meta(2000), &[("GRAPH_API_KEY", "s3cretkey")]);
+    assert_eq!(code, 4, "{text}");
+    assert!(text.contains("NOT RUN"), "{text}");
+    assert!(!text.contains("s3cretkey"), "{text}");
+}
+
+/// A disagreement already seen stays a disagreement when the gateway fails later in the run.
+#[test]
+fn a_real_disagreement_still_fails_even_if_the_gateway_then_fails() {
+    let gw = serve(vec![
+        ("_meta", 200, meta(2000)),
+        (
+            "allocations(",
+            200,
+            r#"{"data":{"allocations":[{"id":"0x1"}]}}"#.into(),
+        ),
+        (
+            "lodestar_disputes",
+            200,
+            r#"{"columns":["id"],"rows":[]}"#.into(),
+        ),
+        ("", 500, "upstream exploded".into()),
+    ]);
+    let (code, text) = parity(None, "", &[("GRAPH_GATEWAY", &gw), ("NEST_URL", &gw)]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("lodestar_allocations nest=5 subgraph_isLegacy_false=1 DIFF"),
+        "{text}"
+    );
 }
