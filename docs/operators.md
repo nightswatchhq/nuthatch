@@ -1041,9 +1041,14 @@ nuthatch audit sealed --dir . --rpc https://another-provider.example/KEY --from 
 nuthatch dev --dir . --audit-rpc https://another-provider.example/KEY
 ```
 
-- **Sampling.** Each sample is `--span` (`--audit-span`) blocks, 1,000 by default, inside the range
-  the compared tables have sealed (a blocks or calls table sealed further does not widen it).
-  Even-numbered samples land in a segment picked in proportion to its rows, where an omission
+- **Sampling.** Each sample is `--span` (`--audit-span`) blocks, 1,000 by default, between the
+  first block a compared table covers (or the contracts' `start_block`) and the nest's
+  `sealed_through`, the one boundary the indexer cuts every table at. A stretch past the last
+  event segment was sealed empty, and is sampled like any other. `sanction_hit`, which `nuthatch
+  screen` seals over a range of your choosing, does not move the boundary. The background audit
+  reads `sealed_through` from the running nest; `nuthatch audit sealed` reads it from the hot
+  store when the nest is stopped, and otherwise uses the furthest sealed segment, which can only
+  fall short of it. Even-numbered samples land in a segment picked in proportion to its rows, where an omission
   has something to omit; odd-numbered samples are uniform over the sealed blocks, so a range the first
   endpoint called empty is still asked about. The same seed over the same segments picks the same
   ranges. `--seed` defaults to the current time and is printed; the background audit logs its seed
