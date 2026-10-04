@@ -436,6 +436,7 @@ pub fn spawn(
     let interval = Duration::from_secs((86_400 / settings.per_day.max(1)).max(1));
     let seed = settings.seed.unwrap_or_else(unix_now);
     let span = settings.span;
+    crate::metrics::METRICS.set_audit_on();
     tracing::info!(
         "sealed audit on: {} range(s) of {span} blocks a day against {endpoint}, seed {seed}",
         settings.per_day
