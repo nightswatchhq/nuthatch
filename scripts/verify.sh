@@ -9,6 +9,9 @@
 #   ./scripts/verify.sh 5          # scaled mode (needs docker compose)
 #   ./scripts/verify.sh all
 #
+# This is an acceptance runbook for a running binary, nest or fleet. It is not a git hook and not a
+# pre-push gate: it needs something to point at, and level 5 needs docker. `yatr ci` is the local gate.
+#
 # Configuration, all optional:
 #   NUTHATCH        path to the binary            (default: nuthatch on PATH)
 #   NUTHATCH_URL    a running nest's API          (default: http://127.0.0.1:8288)
