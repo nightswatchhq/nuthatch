@@ -309,10 +309,12 @@ projected footprint exceeds `max_rss_mb` (default 2048). It also refuses to star
 analytical split itself fits that ceiling (RFC-0047 C4):
 
 ```
-(sql_permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB
+(pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB
 ```
 
-`sql_permits` is cursor-wide (the same gate every nest on the cursor shares), default 2. The
+`pools` is the smaller of `sql_permits` and the number of nest datasets on the cursor, since a
+dataset's sessions share one pool however many permits it has (#1825). `sql_permits` is
+cursor-wide (the same gate every nest on the cursor shares), default 2. The
 analytics knobs are **runtime**, not nest identity: they live in the environment, never in
 `nuthatch.toml`, so two operators with different RAM still share a nest content address.
 
@@ -323,14 +325,15 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 | `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | Linux: `$XDG_CACHE_HOME/nuthatch` or `~/.cache/nuthatch`; elsewhere the process temp dir | parent of per-session spill dirs (`nuthatch-spill-{pid}-{seq}`; do not point two processes at one directory). Not `/tmp` on Linux by default, because that is often a tmpfs, where spill is RAM outside the per-cursor budget; do not point this at one |
 | `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | 2GB | spill per analytics session. A `/sql` query that spills past it is stopped and answered `507`. On disk it does not buy room in the equation above; on a tmpfs it is RAM |
 | `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest, and **raise-only**: 1024 is the remainder of today's 2 GiB split after 2 × 512 MB of analytics, **not** a measured ingest RSS high-water (RFC-0047 §6). A lower value is refused at startup, because nothing caps ingest at this figure - writing a smaller number would not shrink ingest, only hand analytics headroom against a reservation no code enforces |
-| the engine's limit | `NUTHATCH_BURRMILL_MEMORY_LIMIT` | `analytics.memory_limit` | takes the place of `analytics.memory_limit` where set, shared the same way, and is what a permit counts at in the split, which over-counts now that permits share it. Kept from the releases that carried two engines |
+| the engine's limit | `NUTHATCH_BURRMILL_MEMORY_LIMIT` | `analytics.memory_limit` | takes the place of `analytics.memory_limit` where set, shared the same way, and is what each pool counts at in the split. Kept from the releases that carried two engines |
 | the wall | `NUTHATCH_MAX_RSS` | 2048MB | the ceiling the split is held to, for a process given more than 2 GiB. **Raise-only**, and a statement by the operator, not a measurement: the footprint job measures the default and nothing above it |
 | `runtime_headroom` | (not settable) | 0 | unmeasured. Named in the inequality so the term is visible; counted as zero until someone measures it on the box that enforces the budget |
 
 Sizes accept `512`, `512MB`, `1GB`, `2GiB`. `NUTHATCH_SQL_MAX_CONCURRENCY` remains the permit
 count, still capped at 16, and is **not** an unconstrained config key. `analytics.threads` shares
-that ceiling. Raising permits without lowering `analytics.memory_limit` is refused at startup:
-four permits at 512 MB each plus the derived ingest floor is 3072 MB.
+that ceiling. Raising permits on a one-nest cursor costs no memory in the split, since its
+statements share one pool; two datasets at 1024 MB each plus the derived ingest floor is 3072 MB,
+and is refused at startup.
 
 `ingestion_reservation` may be raised and not lowered, which is what makes the inequality worth
 having. The consequence is the property to hold onto: **no configuration this gate accepts gives
@@ -808,7 +811,7 @@ job:
 | max result rows | 50,000 | the Rust-side result buffer, outside the engine's own memory limit |
 | max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
 | max queued queries | 256 per nest | the bound that makes the wait above safe: it caps how *many* requests may be parked waiting, where the 250 ms caps how *long* each one waits. Without it a burst parks arrival-rate × 250 ms requests before any time out. Past the cap a request is refused immediately, as every over-limit request was before the wait existed. A parked request holds only its query string (≤ 16 KiB), so the worst case is roughly 4 MB per nest |
-| engine memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Product of memory with the permit count is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
+| engine memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Memory times the pools (the smaller of the permit count and the cursor's datasets) is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially |
 | declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |

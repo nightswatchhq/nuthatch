@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use common::tape::*;
 use nuthatch::analytics_budget::{
-    AnalyticsConfig, ENV_INGESTION_RESERVATION, ENV_MEMORY_LIMIT, ENV_TEMP_DIRECTORY, ENV_THREADS,
+    AnalyticsConfig, ENV_BURRMILL_MEMORY_LIMIT, ENV_INGESTION_RESERVATION, ENV_MEMORY_LIMIT,
+    ENV_TEMP_DIRECTORY, ENV_THREADS,
 };
 use nuthatch::indexer;
 use nuthatch::serve::SQL_MAX_CONCURRENCY;
@@ -114,19 +115,67 @@ async fn over_budget_memory_is_refused_by_spawn_nest() {
     );
 }
 
+/// A nest's sessions share one pool (#1825), so its permits do not multiply the limit.
 #[tokio::test(flavor = "multi_thread")]
-async fn raising_permits_at_default_memory_is_refused_by_spawn_nest() {
+async fn a_limit_that_fits_once_starts_a_nest_with_two_permits() {
     let _g = env_lock().lock().await;
     let _a = install(ENV_MEMORY_LIMIT, None);
-    let _b = install("NUTHATCH_SQL_MAX_CONCURRENCY", Some("4"));
+    let _b = install(ENV_BURRMILL_MEMORY_LIMIT, Some("1024MB"));
+    let _c = install("NUTHATCH_SQL_MAX_CONCURRENCY", None);
 
     let dir = tempfile::tempdir().unwrap();
-    let err = match spawn_under(dir.path()).await {
-        Ok(_) => panic!("4 × 512 MB plus the derived ingest floor must not start"),
+    let rt = spawn_under(dir.path())
+        .await
+        .expect("one pool of 1024 plus the 1024 floor must start");
+    assert_eq!(rt.state.sql_gate.available_permits(), 2);
+    let ingest = rt.ingest;
+    ingest.abort();
+    let _ = ingest.await;
+}
+
+/// Two datasets on one cursor can each have a statement running, so each pool counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_datasets_on_one_cursor_count_two_pools() {
+    let _g = env_lock().lock().await;
+    let _a = install(ENV_MEMORY_LIMIT, None);
+    let _b = install(ENV_BURRMILL_MEMORY_LIMIT, Some("1024MB"));
+    let _c = install("NUTHATCH_SQL_MAX_CONCURRENCY", None);
+
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let tape = Arc::new(TapeSource::new());
+    tape.insert_block(1, empty_block(1, 0, 1_700_000_000));
+    tape.advance_tip_to(1);
+    let nests = vec![
+        (
+            "a".to_string(),
+            a.path().to_path_buf(),
+            scaffold_nest(a.path(), "a", USDC),
+        ),
+        (
+            "b".to_string(),
+            b.path().to_path_buf(),
+            scaffold_nest(b.path(), "b", ARB),
+        ),
+    ];
+    let health = Arc::new(nuthatch::health::RuntimeHealth::new());
+    let err = match indexer::spawn_runtime(
+        tape,
+        nests,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+        health,
+        false,
+    )
+    .await
+    {
+        Ok(_) => panic!("two pools of 1024 plus the 1024 floor must not start"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains("NUTHATCH_SQL_MAX_CONCURRENCY"), "{err}");
-    assert!(err.contains("analytics.memory_limit"), "{err}");
+    assert!(err.contains("(2 × 1024 MB)"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
