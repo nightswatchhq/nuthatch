@@ -89,6 +89,11 @@ one per unit and one statement per line, in the private kittiwake repo under `nu
 because they carry its statements; `deploy/roll-helsinki-from-mac.sh` reads them from `SMOKE_DIR`
 (default `~/Projects/kittiwake/nuthatch-gate/smoke`) and copies each unit's file to the box.
 
+Before it touches a unit, `deploy/roll-helsinki-from-mac.sh` reads the release tag's commit statuses
+and refuses unless every rolled unit's `release-gate/<nest>` status is `success`. It names each red,
+pending or missing status with its description and link. `--override '<reason>'` rolls anyway and
+prints the reason at the top of the roll's output.
+
 When a statement fails, the roll puts the unit back on its previous binary and runs the failing
 statements there. If the previous binary answers any of them, the new one is worse: the unit stays
 reverted. If the previous binary refuses all of them too, the failure is pre-existing, not a

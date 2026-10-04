@@ -154,6 +154,8 @@ mod required_checks;
 mod required_contexts_script;
 #[path = "rfc_index_status.rs"]
 mod rfc_index_status;
+#[path = "roll_helsinki_script.rs"]
+mod roll_helsinki_script;
 #[path = "scheduled_workflow_failure_is_reported.rs"]
 mod scheduled_workflow_failure_is_reported;
 #[path = "seal_batching_asymmetry.rs"]

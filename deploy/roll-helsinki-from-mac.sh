@@ -3,19 +3,64 @@
 # `ssh root@<host>`. Uses the deploy scripts from the release's own tag, checksums the Linux release,
 # installs it, and rolls each unit with its smoke file, the allocations nest first. A smoke failure
 # stops here: a regression reverts that unit, a failure the previous release shares keeps it (exit 3).
-#   deploy/roll-helsinki-from-mac.sh <version> [unit ...]
+#   deploy/roll-helsinki-from-mac.sh <version> [--override '<reason>'] [unit ...]
 #   deploy/roll-helsinki-from-mac.sh 4.3.1                         every unit
 #   deploy/roll-helsinki-from-mac.sh 4.3.1 graph-allocations-nest-next
+# Before touching a unit, the tag's commit must carry success on release-gate/<nest> for every rolled
+# unit (#1848); a red, pending or missing status refuses, and --override '<reason>' rolls anyway.
 # The smoke files carry kittiwake's statements, so they live in the private kittiwake repo:
 # SMOKE_DIR (default ~/Projects/kittiwake/nuthatch-gate/smoke) holds <unit without -next>.sql.
 set -euo pipefail
-v=${1:?usage: roll-helsinki-from-mac.sh <version> [unit ...]}; shift
+v=${1:?usage: roll-helsinki-from-mac.sh <version> [--override '<reason>'] [unit ...]}; shift
 host=${ROLL_HOST:-root@89.167.109.4}
+repo=${ROLL_REPO:-nightswatchhq/nuthatch}
 smoke_dir=${SMOKE_DIR:-$HOME/Projects/kittiwake/nuthatch-gate/smoke}
-units=("$@")
+override="" units=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --override) [ -n "${2:-}" ] || { echo "--override needs a reason" >&2; exit 2; }
+      override=$2; shift 2 ;;
+    *) units+=("$1"); shift ;;
+  esac
+done
+# Each unit in roll order, with the release-gate nest whose status vouches for it.
+gates=(graph-allocations-nest-next=alloc-nest data-services-nest=data-services-nest
+  graph-gns-nest-next=gns-nest nuthatch-dips=dips-nest graph-staking-legacy-readonly=staking-archive-nest)
+gate_of() { local g; for g in "${gates[@]}"; do [ "${g%%=*}" != "$1" ] || echo "${g#*=}"; done; }
 [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "not a version: $v" >&2; exit 2; }
-[ ${#units[@]} -gt 0 ] || units=(graph-allocations-nest-next data-services-nest graph-gns-nest-next nuthatch-dips graph-staking-legacy-readonly)
+if [ ${#units[@]} -eq 0 ]; then for g in "${gates[@]}"; do units+=("${g%%=*}"); done; fi
 for u in "${units[@]}"; do [[ $u =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "not a unit name: $u" >&2; exit 2; }; done
+
+# The combined status endpoint answers the newest status per context.
+refusals=()
+if sha=$(gh api "repos/$repo/commits/v$v" --jq .sha) &&
+  statuses=$(gh api "repos/$repo/commits/$sha/status?per_page=100" \
+    --jq '.statuses[] | [.context, .state, .description // "", .target_url // ""] | @tsv'); then
+  for u in "${units[@]}"; do
+    nest=$(gate_of "$u")
+    if [ -z "$nest" ]; then refusals+=("$u: no release gate covers this unit"); continue; fi
+    ctx=release-gate/$nest
+    state=$(printf '%s\n' "$statuses" | awk -F'\t' -v c="$ctx" '$1 == c { print $2; exit }')
+    detail=$(printf '%s\n' "$statuses" | awk -F'\t' -v c="$ctx" '$1 == c { print "\"" $3 "\" " $4; exit }')
+    case "$state" in
+      success) ;;
+      "") refusals+=("$ctx ($u): no status on v$v ($sha)") ;;
+      pending) refusals+=("$ctx ($u): still running, $detail") ;;
+      *) refusals+=("$ctx ($u): $state, $detail") ;;
+    esac
+  done
+else
+  refusals+=("could not read the statuses of v$v from $repo")
+fi
+for r in ${refusals[@]+"${refusals[@]}"}; do echo "gate: $r" >&2; done
+if [ ${#refusals[@]} -gt 0 ] && [ -z "$override" ]; then
+  echo "refusing to roll v$v: its release gates did not pass; --override '<reason>' rolls anyway" >&2
+  exit 1
+fi
+if [ -n "$override" ]; then
+  printf '\n*** OVERRIDE: rolling v%s past its release gates ***\n*** reason: %s ***\n\n' "$v" "$override"
+fi
+
 [ -d "$smoke_dir" ] || { echo "no smoke directory at $smoke_dir: clone nightswatchhq/kittiwake or set SMOKE_DIR" >&2; exit 2; }
 smokes=()
 for u in "${units[@]}"; do
