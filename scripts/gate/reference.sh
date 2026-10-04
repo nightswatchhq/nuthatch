@@ -3,10 +3,11 @@
 # copy's sealed pin (#1796). The gate's own comparison is with the previous release, so a wrong
 # answer two releases share passes it; this one is with an engine that is not nuthatch's.
 #
-#   scripts/gate/reference.sh [--out DIR] [--sealed-through N] <nuthatch-binary> <nest-copy> <query-set>
+#   scripts/gate/reference.sh [--out DIR] [--sealed-through N] [--env FILE] <nuthatch-binary> <nest-copy> <query-set>
 #
 #   --out DIR             keep the pin, both engines' answers and logs here (default: a temp dir)
 #   --sealed-through N    the pin (default: sealed_through= in the copy's PROVENANCE)
+#   --env FILE            the nest's production environment, as release-gate.sh --env (default PROD_ENV)
 #
 # GATE_DUCK is a burrmill-bench binary with `gate-duck` (burrmill crates/burrmill-bench), which runs
 # each statement through DuckDB over the nest set up as nuthatch set it up before Burrmill, `_dec`
@@ -31,22 +32,24 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=common.sh
 . "$here/common.sh"
 
-out="" pin_at=""
+out="" pin_at="" env_file=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
     --sealed-through) [ $# -ge 2 ] || die "--sealed-through needs a block"; pin_at=$2; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --env) [ $# -ge 2 ] || die "--env needs a file"; env_file=$2; shift 2 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) break ;;
   esac
 done
-[ $# -eq 3 ] || die "usage: reference.sh [--out DIR] [--sealed-through N] <nuthatch-binary> <nest-copy> <query-set>"
+[ $# -eq 3 ] || die "usage: reference.sh [--out DIR] [--sealed-through N] [--env FILE] <nuthatch-binary> <nest-copy> <query-set>"
 bin=$1 nest=$2 set_file=$3
 [ -x "$bin" ] || die "not an executable: $bin"
 [ -f "$nest/nuthatch.toml" ] || die "no nuthatch.toml in $nest"
 [ -f "$nest/segments/manifest.json" ] || die "no segments/manifest.json in $nest"
 [ -f "$set_file" ] || die "no query set at $set_file"
+[ -z "$env_file" ] || gate_load_env "$env_file"
 [ -n "${GATE_DUCK:-}" ] || die "GATE_DUCK is not set: it names the burrmill-bench binary that runs gate-duck"
 [ -x "$GATE_DUCK" ] || die "GATE_DUCK is not an executable: $GATE_DUCK"
 command -v jq >/dev/null || die "jq is not on PATH"

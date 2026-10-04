@@ -1,0 +1,20 @@
+# The release gate's nests (#1794): what release-gate-run.sh gates when GATE_NESTS names this file.
+# The ThinkPad holds the real one at ~/release-gate/nests.conf, written by install-nests-from-mac.sh.
+# One nest per line, whitespace between columns; ~ is $HOME, and a relative path is relative to this
+# file. Each nest posts its own status, release-gate/<name>.
+#
+#   name      the nest's name, its status context, and its name on Helsinki's export allowlist
+#   copy      the copy the gate serves: sealed segments plus a nuthatch.redb
+#   set       its query set, in the private kittiwake repo (nuthatch-gate/<set>-queries.tsv)
+#   env       production's environment for the nest: the NUTHATCH_* budget settings read from the
+#             running unit's own environment (/proc/<pid>/environ), one KEY=VALUE per line
+#   refresh   helsinki: refresh-from-helsinki.sh <name>; local: refresh-from-helsinki.sh --local
+#             <name>, from a nest on this box; none: the copy is used as it stands
+#
+# name                copy                               set                                                   env                                   refresh
+alloc-nest            ~/release-gate/alloc-nest          ~/kittiwake/nuthatch-gate/alloc-queries.tsv           ~/release-gate/env/alloc-nest.env     helsinki
+qos-nest              ~/release-gate/qos-nest            ~/kittiwake/nuthatch-gate/qos-queries.tsv             ~/release-gate/env/qos-nest.env       local
+gns-nest              ~/release-gate/gns-nest            ~/kittiwake/nuthatch-gate/gns-queries.tsv             ~/release-gate/env/gns-nest.env       helsinki
+dips-nest             ~/release-gate/dips-nest           ~/kittiwake/nuthatch-gate/dips-queries.tsv            ~/release-gate/env/dips-nest.env      helsinki
+data-services-nest    ~/release-gate/data-services-nest  ~/kittiwake/nuthatch-gate/data-services-queries.tsv   ~/release-gate/env/data-services-nest.env  helsinki
+staking-archive-nest  ~/release-gate/staking-archive-nest ~/kittiwake/nuthatch-gate/staking-archive-queries.tsv ~/release-gate/env/staking-archive-nest.env helsinki

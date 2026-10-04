@@ -25,7 +25,7 @@ history that earned it. Deferred means deferred and recorded, in the sense of
 | [0003](0003-reth-exex-tip-mode.md) | reth ExEx tip mode: wiring and latency measurement | - (parallel to 0001/0002) | **Deferred 2026-09-08 (Chief).** Accepted - groundwork landed; ExEx mode deferred |
 | [0004](0004-backfill-throughput.md) | Backfill throughput: measurement and optimization | 0001 | **Implemented** |
 | [0005](0005-release-engineering-v0.1.0.md) | Release engineering: v0.1.0 | 0001, 0002 | **Implemented** (v0.3.0 shipped) |
-| [0006](0006-grant-funding.md) | Grant funding: NLnet and EF ESP applications | 0002 (demo), 0003-0005 (roadmap) | Accepted - drafts + governance shipped; process ongoing |
+| [0006](0006-grant-funding.md) | Grant funding: NLnet and EF ESP applications | 0002 (demo), 0003-0005 (roadmap) | **Withdrawn 2026-10-04: nuthatch takes no grants.** Never applied for; the drafts in `docs/grants/` are deleted |
 | [0007](0007-launch-and-validation.md) | Launch and validation | 0005 | Accepted - launch kit shipped; launch ongoing |
 | [0008](0008-compliance-pack.md) | Compliance pack (screening, flags, exposure, audit) | P0 (i128), slice 4, 0006 M1 | **Implemented** |
 | [0009](0009-factory-and-dynamic-contract-discovery.md) | Factory and dynamic contract discovery | 0001, 0004 | **Implemented** |

@@ -1,5 +1,9 @@
 # RFC-0006: Sustainability - grants (NLnet/NGI, EF ESP) alongside operator revshare
 
+> **Withdrawn 2026-10-04: nuthatch takes no grants.** None was ever applied for or received. nuthatch
+> is a self-funded public good, maintained by one person; everything is open source. The text below is
+> kept as the record of a plan that was dropped, and the drafts it names under `docs/grants/` are deleted.
+
 > **Amendment (2026-07-28): the core was relicensed from AGPL-3.0 to `MIT OR Apache-2.0`.** The
 > neutrality argument below is unchanged in substance - no exclusivity, no private forks, no
 > partner-only features, no roadmap veto - but one supporting claim is not: copyleft no longer forbids
@@ -8,7 +12,7 @@
 > holds rights over it that others lack; what it no longer guarantees is that every downstream fork
 > stays open. Recorded here rather than quietly edited, because funders were told the original.
 
-- Status: Accepted (2026-07-18) - grant drafts + governance shipped; submission/decision process ongoing
+- Status: Withdrawn (2026-10-04) - nuthatch takes no grants. First adopted 2026-07-18; nothing was ever submitted
 - Author: Pete (cargopete)
 - Date: 2026-07-16 (v1: 2026-07-14)
 - Depends on: RFC-0002 (working demo - satisfied), RFC-0005 (roadmap milestones)

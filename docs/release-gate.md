@@ -13,8 +13,7 @@ budget). Every CI gate had passed: the footprint jobs index synthetic data and r
 
 | File | What it is |
 |---|---|
-| `scripts/gate/alloc-queries.tsv` | The query set: 74 statements, one per line, each with its consumer and call site. |
-| `scripts/gate/collect-queries.sh`, `scripts/gate/collect/main.rs` | How the set is generated from kittiwake's source. |
+| `nuthatch-gate/alloc-queries.tsv` in kittiwake | The query set: one statement per line, each with its consumer and call site. Private; see below. |
 | `scripts/release-gate.sh` | Serves a nest copy with one binary, runs the set, gives the verdict. |
 | `scripts/gate/common.sh` | Production's budget, how a set is read and the canonical answer form, for both gate scripts. |
 | `scripts/gate/reference.sh` | Checks one binary's answers against DuckDB's at the copy's sealed pin (#1796). |
@@ -30,25 +29,15 @@ route and `kittiwake` where it is one of kittiwake's own jobs (the directory ref
 crons, the live feed, RAV collection, QoS scoring). 57 are Lodestar's, 15 kittiwake's, and 2 are
 asked by both.
 
-Parameters are representative literals pinned to 2026-10-03, so the set is the same file however
-often it runs. Addresses and deployments are the heaviest on the nest (the largest indexer on every
-axis, which kittiwake's own tests use as the worst case); windows and page sizes are the edge
-handlers' defaults and the warmer's. Each statement appears once: the nest memoises answers by
-statement text, so a duplicate would time the memo.
+The set carries kittiwake's statements, and kittiwake is private while this repo is public, so it
+lives in the kittiwake repo, under `nuthatch-gate/`, beside the generator that compiles it from
+kittiwake's own source and a CI check that fails when it goes stale. Nothing here holds a copy:
+`release-gate.sh` takes the set as an argument, and `release-gate-run.sh` refuses to start unless
+`GATE_SET` names it. `nuthatch-gate/README.md` there says how to regenerate it.
 
-It is refreshed on purpose, not by drift:
-
-    scripts/gate/collect-queries.sh ~/Projects/kittiwake > scripts/gate/alloc-queries.tsv
-    git diff scripts/gate/alloc-queries.tsv
-
-`collect-queries.sh` compiles `collect/main.rs` against a copy of kittiwake's
-`crates/read/src/sql.rs` with plain `rustc`, so every statement built there regenerates itself. The
-handful written inline at a call site are copied in `main.rs` and marked `inline`; on a refresh,
-re-read those call sites and any new ones:
-
-    grep -rn 'NestId::Alloc' ~/Projects/kittiwake/crates --include='*.rs' | grep -v /tests/
-
-Other consumers may join later; the set is Lodestar's and kittiwake's first.
+Parameters are representative literals pinned to one day, so the set is the same file however often
+it runs. Each statement appears once: the nest memoises answers by statement text, so a duplicate
+would time the memo.
 
 ## Running the gate
 
@@ -63,7 +52,8 @@ Lodestar box (port 8107):
     NUTHATCH_BURRMILL_MEMORY_LIMIT=2GB  NUTHATCH_ANALYTICS_THREADS=8  NUTHATCH_MAX_RSS=6GB
 
 When that unit's environment changes, change `PROD_ENV` with it, or the gate tests a budget nobody
-runs. Each pass starts a fresh server, because of the memo; a query's status is its worst pass and
+runs. `--env FILE` replaces `PROD_ENV` with another nest's, `NUTHATCH_*=VALUE` lines, and serves the
+copy under that file's settings alone: a `NUTHATCH_*` variable the caller carries is dropped. Each pass starts a fresh server, because of the memo; a query's status is its worst pass and
 its time the median of its passes. For each query it records status, rows, time and the digest of
 its answer from the first pass that answered; an answer that moves between passes is noted.
 
@@ -167,12 +157,18 @@ the roll like the gate's. It is a stage of the gate rather than a nightly job be
 where a roll is decided: a nightly check would judge production after the roll, and a copy refreshed
 at another time would answer for different data. It adds about three minutes to a gate run.
 
+With `GATE_NESTS`, every nest is checked on its own copy and set, under its own environment file
+(`reference.sh --env`), and posts `release-gate/duckdb-<name>`, so a red status names the nest it is
+for; one status covering every nest would not. A copy whose `PROVENANCE` records no `sealed_through`
+has no pin: the run says so for that nest and posts no DuckDB status for it. The single-nest path
+keeps `release-gate/duckdb`.
+
 `tests/release_gate_script.rs` drives it with a stand-in for `gate-duck` that serves fixed answers:
 a different value fails with its first differing row, rows reordered under an `ORDER BY` fail as an
 order that differs, a float 1e-13 off passes, a volatile statement is held to its count even
-reordered, a statement DuckDB
-refuses is listed, one the binary refuses fails, a segment past the pin reaches neither engine, and
-the runner posts the second status.
+reordered, a statement DuckDB refuses is listed, one the binary refuses fails, a segment past the pin
+reaches neither engine, the runner posts the second status, and with `GATE_NESTS` each nest posts its
+own under its own environment while a nest without a pin posts none.
 
 ## Where it runs: the ThinkPad
 
@@ -265,4 +261,62 @@ candidate does not go to production.
 
 A run that has posted any final status is not repeated by `--poll`; re-gate by hand with the tag.
 
-The timer is `deploy/release-gate/release-gate.{service,timer}`, a systemd user unit running `--poll` every 15 minutes from `~/nuthatch-ops`, a worktree of the repo on `main`; the unit file carries the install lines. The unit sets `GATE_REFRESH` to the refresh script, so the Helsinki half must be installed before the unit file is copied over; the install lines are in `gate-export.sh`.
+## Every production nest (#1794)
+
+On 2026-10-03 the QoS nest refused its daily views all day on 4.2.1 and 4.3.0 (#1781), and the
+gate, which ran the allocations nest alone, never saw it. So the runner gates every nest named in a
+config file, `GATE_NESTS`, which the ThinkPad holds at `~/release-gate/nests.conf`
+(`deploy/release-gate/nests.conf.example` is the shape). Each line is one nest:
+
+    <name> <copy> <query set> <env file> <refresh: helsinki | local | none>
+
+| Nest | Unit | Copy refreshed |
+|---|---|---|
+| `alloc-nest` | graph-allocations-nest-next, Helsinki | from Helsinki |
+| `qos-nest` | qos-reo-nest, the ThinkPad | locally, from `/opt/nuthatch/qos-reo-nest` |
+| `gns-nest` | graph-gns-nest-next, Helsinki | from Helsinki |
+| `dips-nest` | nuthatch-dips, Helsinki | from Helsinki |
+| `data-services-nest` | data-services-nest, Helsinki | from Helsinki |
+| `staking-archive-nest` | graph-staking-legacy-readonly (serve-only), Helsinki | from Helsinki |
+
+The runner reads the whole file first, so a bad line gates nothing, then runs itself once per nest
+with that nest's copy, set, environment and refresh. Each nest is gated exactly as the allocations
+nest is above, under its own copy lock, against the production version its own copy's
+`PROVENANCE` records, and posts its own status, `release-gate/<name>`; a `--poll` gates, per nest,
+the newest release newer than that nest's production with no status of that nest's context. The
+run's exit is the worst of the nests'. The output carries each nest's lines prefixed `[<name>]`, and
+a nest with nothing to gate stays quiet.
+
+**The query sets** are kittiwake's statements for each nest's `NestId`, so they live in the private
+kittiwake repo with the allocations nest's, as `nuthatch-gate/<set>-queries.tsv`, generated by its
+`nuthatch-gate/collect/collect-queries.sh` and checked stale in its CI. Nothing in this repo holds
+them. The QoS set asks one closed day, as production does, never a count over the whole history.
+
+**The environment** of each nest is its unit's, not this script's guess: the env file holds the
+`NUTHATCH_*` budget settings (concurrency, memory limits, engine, threads, the RSS cap, the memo and
+cache sizes) read from the running process's own environment, `/proc/<pid>/environ`, so drop-ins and
+environment files count. Tokens, RPC URLs and paths into the unit's directory stay on the box. The
+file is passed as `release-gate.sh --env`, and its `NUTHATCH_SQL_MAX_CONCURRENCY`, when set, is the
+concurrency the set is sent at. Production's RSS budget, 2 GiB per cursor, applies to every nest.
+
+**The refresh** of a Helsinki nest is `refresh-from-helsinki.sh <name>`: it asks the export for
+`snapshot <name>` and pulls `/var/lib/nuthatch-gate/nests/<name>/`. The export answers only names
+its configuration allowlists, one `NEST=<name> <dir> <url>` line each in
+`/etc/nuthatch/gate-export.env`, and a pull only of the bare stage or an allowlisted nest's; anything
+else is refused, as before. A bare `snapshot` still means the allocations nest. The QoS nest is on
+the ThinkPad, so `refresh-from-helsinki.sh --local qos-nest` runs the same export here, as root with
+`sudo -n` (the unit's directory is its own), against `~/release-gate/export-local.env`, and copies
+the stage with a local rsync that hands the copy to the gate's user. The consistency check and the
+swap are the same, and no ssh is involved.
+
+**Installing it** is one command from Chief's Mac, after this is on `main` and kittiwake's sets are
+on its `main`:
+
+    deploy/release-gate/install-nests-from-mac.sh
+
+It installs the export on Helsinki and rewrites its allowlist from the five running units, snapshots
+each once, checks from the ThinkPad that the key is refused anything off the allowlist, then on the
+ThinkPad pulls `~/nuthatch-ops` and `~/kittiwake`, writes `nests.conf`, the six env files and the
+local export config, refreshes every copy and installs the unit, which sets `GATE_NESTS`.
+
+The timer is `deploy/release-gate/release-gate.{service,timer}`, a systemd user unit running `--poll` every 15 minutes from `~/nuthatch-ops`, a worktree of the repo on `main`; the unit file carries the install lines. The unit sets `GATE_NESTS` to `~/release-gate/nests.conf`, so `install-nests-from-mac.sh` copies it over only after writing the config and refreshing every copy. The config names the sets under `~/kittiwake/nuthatch-gate/`, so the ThinkPad needs a clone of the private kittiwake repo at `~/kittiwake` (its `gh` is authenticated as cargopete, which can read it); pull it when a set changes. Without `GATE_NESTS` the runner gates one nest, from `GATE_SET` (required) and `GATE_REFRESH`.

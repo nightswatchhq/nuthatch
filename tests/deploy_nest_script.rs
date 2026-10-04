@@ -8,7 +8,10 @@
 //!
 //! #1750 - with `--smoke <file>` the roll then runs each statement against `/sql`, and on any refusal
 //! puts the unit back on its previous binary. The fake answers `/sql` from `sql-<version>` in the
-//! state directory: `<substring> <mode>` fails any statement containing the substring.
+//! state directory: each `<substring> <mode>` line fails any statement containing the substring.
+//!
+//! #1795 - a refusal is first asked of the previous binary. On 2026-10-03 the QoS roll reverted to a
+//! binary that refused the same statements; a failure both share keeps the new version and exits 3.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,11 +48,12 @@ for a in "$@"; do
 done
 case "$url" in */sql*)
   v=$("$bin" --version | awk '{print $2}')
-  printf '%s\n' "$q" >> "$FAKE_STATE/sql-log"
+  printf '%s %s\n' "$v" "$q" >> "$FAKE_STATE/sql-log"
   mode=ok
   if [ -f "$FAKE_STATE/sql-$v" ]; then
-    read -r pat m < "$FAKE_STATE/sql-$v"
-    case "$q" in *"$pat"*) mode=$m ;; esac
+    while read -r pat m; do
+      case "$q" in *"$pat"*) mode=$m ;; esac
+    done < "$FAKE_STATE/sql-$v"
   fi
   case "$mode" in
     ok) printf '{"columns":["count"],"rows":[[7]]}\n200' ;;
@@ -135,6 +139,11 @@ fn roll(b: &Rig) -> (bool, String) {
 }
 
 fn roll_with(b: &Rig, extra: &[&str]) -> (bool, String) {
+    let (code, text) = roll_exit(b, extra);
+    (code == Some(0), text)
+}
+
+fn roll_exit(b: &Rig, extra: &[&str]) -> (Option<i32>, String) {
     let out = Command::new("bash")
         .arg(script())
         .args(["roll", "dips", "4.1.1"])
@@ -151,7 +160,7 @@ fn roll_with(b: &Rig, extra: &[&str]) -> (bool, String) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    (out.status.success(), text)
+    (out.status.code(), text)
 }
 
 fn running(b: &Rig) -> String {
@@ -265,8 +274,8 @@ fn a_smoke_that_passes_runs_every_statement_and_keeps_the_roll() {
     assert_eq!(
         sql_log(&b),
         [
-            "SELECT count(*) FROM lodestar_indexer_daily",
-            "SELECT count(*) FROM lodestar_epochs"
+            "4.1.1 SELECT count(*) FROM lodestar_indexer_daily",
+            "4.1.1 SELECT count(*) FROM lodestar_epochs"
         ],
         "comments and blank lines are not statements, and every statement runs:\n{out}"
     );
@@ -328,4 +337,84 @@ fn a_smoke_file_with_no_statements_is_refused_before_the_unit_is_touched() {
     let (ok, out) = roll_with(&b, &["--smoke", &p.display().to_string()]);
     assert!(!ok && out.contains("no statements"), "{out}");
     assert!(running(&b).ends_with("nuthatch-4.1.0"), "{out}");
+}
+
+/// Each `<substring> <mode>` line fails, on `version`, any statement containing the substring.
+fn refuses(b: &Rig, version: &str, lines: &[&str]) {
+    std::fs::write(
+        b.state.join(format!("sql-{version}")),
+        lines.join("\n") + "\n",
+    )
+    .unwrap();
+}
+
+fn asked(b: &Rig, version: &str, statement: &str) -> bool {
+    sql_log(b).contains(&format!("{version} {statement}"))
+}
+
+fn assert_kept_new_version(b: &Rig, out: &str) {
+    assert!(
+        running(b).ends_with("nuthatch-4.1.1"),
+        "a failure the previous binary shares must leave the unit on the new one, it is on {}:\n{out}",
+        running(b)
+    );
+    let drop_in =
+        std::fs::read_to_string(b.units.join("dips.service.d/rpc-graphops.conf")).unwrap();
+    assert!(
+        drop_in.contains("nuthatch-4.1.1 dev") && !drop_in.contains("4.1.0"),
+        "the file systemd runs must name the new binary again:\n{drop_in}"
+    );
+}
+
+#[test]
+fn a_failure_only_the_new_binary_has_reverts_after_asking_the_previous_one() {
+    let b = a_box(true);
+    let smoke = smoke_file(&b);
+    refuses(&b, "4.1.1", &["lodestar_epochs error"]);
+    let (code, out) = roll_exit(&b, &["--smoke", &smoke]);
+    assert_eq!(code, Some(1), "a regression exits 1:\n{out}");
+    assert_rolled_back(&b, false, &out, "Catalog Error");
+    assert!(
+        asked(&b, "4.1.0", "SELECT count(*) FROM lodestar_epochs"),
+        "the previous binary was never asked the failing statement: {:?}\n{out}",
+        sql_log(&b)
+    );
+    assert!(!out.contains("pre-existing"), "{out}");
+}
+
+#[test]
+fn a_failure_the_previous_binary_shares_keeps_the_new_version_and_exits_3() {
+    let b = a_box(true);
+    let smoke = smoke_file(&b);
+    refuses(&b, "4.1.1", &["lodestar_epochs error"]);
+    refuses(&b, "4.1.0", &["lodestar_epochs error"]);
+    let (code, out) = roll_exit(&b, &["--smoke", &smoke]);
+    assert_eq!(code, Some(3), "a shared failure exits 3:\n{out}");
+    assert!(
+        out.contains("pre-existing failure, not a regression")
+            && out.contains("SELECT count(*) FROM lodestar_epochs"),
+        "the report must say pre-existing and name the statement:\n{out}"
+    );
+    assert!(
+        asked(&b, "4.1.0", "SELECT count(*) FROM lodestar_epochs"),
+        "{:?}\n{out}",
+        sql_log(&b)
+    );
+    assert_kept_new_version(&b, &out);
+}
+
+/// A shared failure in the first statement must not hide a regression in the next one.
+#[test]
+fn a_shared_failure_does_not_hide_a_regression_in_another_statement() {
+    let b = a_box(true);
+    let smoke = smoke_file(&b);
+    refuses(
+        &b,
+        "4.1.1",
+        &["lodestar_indexer_daily error", "lodestar_epochs error"],
+    );
+    refuses(&b, "4.1.0", &["lodestar_indexer_daily error"]);
+    let (code, out) = roll_exit(&b, &["--smoke", &smoke]);
+    assert_eq!(code, Some(1), "{out}");
+    assert_rolled_back(&b, false, &out, "Catalog Error");
 }

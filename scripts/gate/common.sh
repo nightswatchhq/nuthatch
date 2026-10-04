@@ -5,7 +5,7 @@
 
 # Production's budget: the environment the allocations nest runs under on the Lodestar box (unit
 # nuthatch-alloc, port 8107), copied from its systemd unit on 2026-10-03. Change it here when the
-# unit changes, or the gate tests a budget nobody runs.
+# unit changes, or the gate tests a budget nobody runs. --env replaces it with another nest's.
 # shellcheck disable=SC2034
 PROD_ENV=(
   NUTHATCH_SQL_MAX_CONCURRENCY=2
@@ -15,6 +15,25 @@ PROD_ENV=(
   NUTHATCH_ANALYTICS_THREADS=8
   NUTHATCH_MAX_RSS=6GB
 )
+
+# gate_load_env <file>: PROD_ENV from a nest's NUTHATCH_*=VALUE lines, read from its unit.
+gate_load_env() {
+  local env_file=$1 line v
+  [ -f "$env_file" ] || die "no environment file at $env_file"
+  PROD_ENV=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | '#'*) continue ;; esac
+    printf '%s\n' "$line" | grep -Eq '^NUTHATCH_[A-Z0-9_]+=[^[:space:]]*$' \
+      || die "not a NUTHATCH_*=VALUE line in $env_file: ${line:0:80}"
+    PROD_ENV+=("$line")
+  done <"$env_file"
+  [ ${#PROD_ENV[@]} -gt 0 ] || die "no NUTHATCH_* settings in $env_file"
+  # Production's environment is the file's alone: a NUTHATCH_* setting of the caller's own would
+  # serve the copy under a budget nobody runs.
+  for v in $(compgen -e); do
+    case "$v" in NUTHATCH_*) unset "$v" ;; esac
+  done
+}
 
 if command -v sha256sum >/dev/null; then
   sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
