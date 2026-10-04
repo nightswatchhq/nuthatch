@@ -4373,6 +4373,25 @@ mod rfc0036_tests {
         hc.abort();
     }
 
+    /// The batch path's verdict also speaks for the endpoint it left to cool: once the throttled one
+    /// rests, the pruned one alone must not report that no endpoint keeps the history.
+    #[tokio::test]
+    async fn a_batch_left_to_a_pruned_endpoint_still_reports_the_throttle() {
+        let (pruned, hp, _) = answering(200, DRPC_PRUNED).await;
+        let (throttled, ht, _) = answering(429, NODIES_THROTTLED).await;
+        let c = RpcClient::new(vec![pruned, throttled]).unwrap();
+        let batch = serde_json::json!([{"jsonrpc": "2.0", "id": 0, "method": "eth_blockNumber"}]);
+        for _ in 0..3 {
+            let err = c.raw_batch(&batch).await.unwrap_err();
+            assert!(
+                matches!(class_of(&err), Some(FailureClass::RateLimited { .. })),
+                "{err:#}"
+            );
+        }
+        hp.abort();
+        ht.abort();
+    }
+
     /// A pool that is all resting waits for the soonest, and an hour's `Retry-After` is held to the cap.
     #[tokio::test]
     async fn a_pool_resting_on_a_long_retry_after_waits_no_longer_than_the_cap() {
