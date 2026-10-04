@@ -1,0 +1,365 @@
+//! #1819 - a fee collection in the unobserved window before an epoch's first observed event is filed
+//! one epoch early by the nest. `scripts/lodestar-parity.sh` excuses that shift only when it is exact.
+//!
+//! One HTTP server plays both the nest and the gateway for a whole sealed run. The fixture is built so
+//! that every other comparison passes and every measured boundary holds, so the exit status turns on
+//! the fee fields alone.
+
+use std::collections::BTreeMap;
+use std::process::Command;
+
+use serde_json::{json, Value};
+
+fn decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 2;
+                } else {
+                    out.push(b'%');
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Answers each request with the first route whose needle appears in the decoded request line or
+/// body; anything unmatched is a 404.
+fn serve(routes: Vec<(&'static str, String)>) -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut reader = BufReader::new(stream);
+            let mut req = String::new();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                req.push_str(&decode(&line));
+            }
+            let mut body = vec![0u8; len];
+            let _ = reader.read_exact(&mut body);
+            req.push_str(&String::from_utf8_lossy(&body));
+            let (status, answer) = routes
+                .iter()
+                .find(|(needle, _)| req.contains(needle))
+                .map(|(_, b)| (200, b.clone()))
+                .unwrap_or((404, format!("no route for {req}")));
+            let mut stream = reader.into_inner();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+        }
+    });
+    format!("http://{addr}")
+}
+
+const FIELDS: [(&str, &str); 6] = [
+    ("total_rewards", "totalRewards"),
+    ("total_indexer_rewards", "totalIndexerRewards"),
+    ("total_delegator_rewards", "totalDelegatorRewards"),
+    ("signalled_tokens", "signalledTokens"),
+    ("query_fees_collected", "queryFeesCollected"),
+    ("curator_query_fees", "curatorQueryFees"),
+];
+
+/// Each epoch sits on one side of a measured boundary (1105 signal, 1195 rewards, 1302 fees); 1392
+/// is the open epoch.
+const EPOCHS: [u32; 11] = [
+    1104, 1105, 1106, 1194, 1195, 1301, 1302, 1380, 1390, 1391, 1392,
+];
+
+struct Fixture {
+    /// (epoch, nest column) -> nest minus subgraph.
+    deltas: BTreeMap<(u32, &'static str), i64>,
+    /// The source of epoch 1391's start.
+    source_1391: &'static str,
+}
+
+impl Fixture {
+    /// Every boundary disagrees just below itself and nowhere above, and signal carries one pair.
+    fn new() -> Self {
+        let mut deltas = BTreeMap::new();
+        for f in [
+            "total_rewards",
+            "total_indexer_rewards",
+            "total_delegator_rewards",
+        ] {
+            deltas.insert((1194, f), 1);
+        }
+        deltas.insert((1104, "signalled_tokens"), 3);
+        deltas.insert((1105, "signalled_tokens"), 7);
+        deltas.insert((1106, "signalled_tokens"), -7);
+        deltas.insert((1301, "query_fees_collected"), 1);
+        deltas.insert((1301, "curator_query_fees"), 1);
+        Fixture {
+            deltas,
+            source_1391: "observed",
+        }
+    }
+
+    /// `net` and `curators` of epoch 1391's collections filed in 1390 instead.
+    fn shift(mut self, net: i64, curators: i64) -> Self {
+        self.deltas.insert((1390, "query_fees_collected"), net);
+        self.deltas.insert((1391, "query_fees_collected"), -net);
+        self.deltas.insert((1390, "curator_query_fees"), curators);
+        self.deltas.insert((1391, "curator_query_fees"), -curators);
+        self
+    }
+
+    fn delta(mut self, epoch: u32, col: &'static str, d: i64) -> Self {
+        self.deltas.insert((epoch, col), d);
+        self
+    }
+
+    fn run(&self) -> (i32, String) {
+        let base = 1_000_000i64;
+        let nest_epochs: Vec<Value> = EPOCHS
+            .iter()
+            .map(|&e| {
+                let mut row = json!({"id": e.to_string(), "start_block": 0, "end_block": 0});
+                for (col, _) in FIELDS {
+                    let d = self.deltas.get(&(e, col)).copied().unwrap_or(0);
+                    row[col] = json!((base + d).to_string());
+                }
+                row
+            })
+            .collect();
+        let sg_epochs: Vec<Value> = EPOCHS
+            .iter()
+            .map(|&e| {
+                let mut row = json!({"id": e.to_string()});
+                for (_, field) in FIELDS {
+                    row[field] = json!(base.to_string());
+                }
+                row
+            })
+            .collect();
+        let rows = |v: Value| json!({"rows": v}).to_string();
+        let data = |k: &str, v: Value| json!({"data": {k: v}}).to_string();
+        let n = |n: usize| rows(json!([{"n": n}]));
+        let tx_a = format!("0x{}", "aa".repeat(32));
+        let tx_b = format!("0x{}", "bb".repeat(32));
+        let srv = serve(vec![
+            (
+                "GET /ready",
+                json!({"ready": true, "version": "4.3.1", "last_block": 1000, "sealed_through": 900})
+                    .to_string(),
+            ),
+            ("SELECT count(*) AS n FROM lodestar_allocations", n(2)),
+            ("SELECT count(*) AS n FROM lodestar_epochs", n(EPOCHS.len())),
+            ("SELECT count(*) AS n FROM lodestar_disputes", n(1)),
+            ("SELECT count(*) AS n FROM lodestar_escrow_transactions", n(2)),
+            ("SELECT id FROM lodestar_disputes", rows(json!([{"id": "0xd1"}]))),
+            ("SELECT * FROM lodestar_epochs", rows(json!(nest_epochs))),
+            (
+                "FROM epoch_boundaries",
+                rows(json!([
+                    {"epoch": "1390", "start_block": 500, "last_seen": 590, "boundary_source": "observed"},
+                    {"epoch": "1391", "start_block": 600, "last_seen": 690, "boundary_source": self.source_1391},
+                ])),
+            ),
+            // Only the exact window, (1390's last_seen, 1391's start) at the pin, has an answer.
+            (
+                "block_number > 590 AND block_number < 600 AND block_number <= 900",
+                rows(json!([
+                    {"block_number": 595, "net": "40", "curators": "4"},
+                    {"block_number": 598, "net": "60", "curators": "6"},
+                ])),
+            ),
+            (
+                "SELECT type, count(*)",
+                rows(json!([{"type": "Deposit", "n": 1}, {"type": "EscrowCollected", "n": 1}])),
+            ),
+            (
+                "AS n FROM escrow__escrow_collected",
+                rows(json!([{"lo": 100, "hi": 100, "n": 1}])),
+            ),
+            (
+                "collector FROM escrow__escrow_collected",
+                rows(
+                    json!([{"tx_hash": tx_a, "log_index": 5, "payer": "0x01", "collector": "0x02"}]),
+                ),
+            ),
+            (
+                "AS n FROM escrow__deposit",
+                rows(json!([{"lo": 100, "hi": 100, "n": 1}])),
+            ),
+            (
+                "collector FROM escrow__deposit",
+                rows(
+                    json!([{"tx_hash": tx_b, "log_index": 3, "payer": "0x01", "collector": "0x02"}]),
+                ),
+            ),
+            (
+                "_meta",
+                data("_meta", json!({"block": {"number": 2000}})),
+            ),
+            (
+                "allocations(",
+                data("allocations", json!([{"id": "0x1"}, {"id": "0x2"}])),
+            ),
+            (
+                "disputes(",
+                data(
+                    "disputes",
+                    json!([{"id": "0xd1", "type": "Query", "isLegacy": false}]),
+                ),
+            ),
+            ("epoches(", data("epoches", json!(sg_epochs))),
+            (
+                "paymentsEscrowTransactions(",
+                data(
+                    "paymentsEscrowTransactions",
+                    json!([
+                        {"id": format!("{tx_b}03000000"), "type": "deposit"},
+                        {"id": format!("{tx_a}06000000"), "type": "redeem"},
+                    ]),
+                ),
+            ),
+        ]);
+        let o = Command::new("bash")
+            .arg(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("scripts/lodestar-parity.sh"),
+            )
+            .env("NEST_URL", &srv)
+            .env("GRAPH_GATEWAY", &srv)
+            .env("GRAPH_API_KEY", "k")
+            .env_remove("PINNED_BLOCK")
+            .env_remove("PARITY_MODE")
+            .env_remove("EPOCH_PARITY_FROM")
+            .output()
+            .expect("run lodestar-parity.sh");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        (o.status.code().unwrap_or(-1), text)
+    }
+}
+
+/// The fixture itself, with nothing shifted, must reach the end of the run.
+#[test]
+fn the_fixture_without_a_shift_is_known_differences_only() {
+    let (code, text) = Fixture::new().run();
+    assert_eq!(code, 2, "{text}");
+    assert!(
+        text.contains("query_fees_collected 4/4 epochs agree from 1302 OK"),
+        "{text}"
+    );
+    assert!(!text.contains("boundary shift"), "{text}");
+}
+
+/// 60 net and 6 to curators of epoch 1391 were collected from block 598, inside the window between
+/// 1390's last observation (590) and 1391's observed start (600).
+#[test]
+fn a_shifted_pair_is_a_known_difference_naming_the_epochs() {
+    let (code, text) = Fixture::new().shift(60, 6).run();
+    assert_eq!(code, 2, "{text}");
+    assert!(
+        text.contains("query_fees_collected 2/4 epochs agree from 1302 KNOWN-DIFF (#1819)"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "epochs 1390-1391 are a boundary shift netting to 0: 60 of epoch 1391 filed in 1390, collections from block 598"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("curator_query_fees@1390-1391"),
+        "the summary does not name the epochs: {text}"
+    );
+    assert!(!text.contains("BOUNDARY"), "{text}");
+}
+
+#[test]
+fn a_shifted_pair_plus_a_real_discrepancy_fails() {
+    let (code, text) = Fixture::new()
+        .shift(60, 6)
+        .delta(1380, "query_fees_collected", 5)
+        .run();
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("query_fees_collected 1/4 epochs agree from 1302 DIFF"),
+        "{text}"
+    );
+    assert!(text.contains("epoch 1380 nest=1000005"), "{text}");
+    assert!(
+        text.contains("epochs 1390-1391 are a boundary shift"),
+        "{text}"
+    );
+}
+
+/// Netting to zero is not enough: 50 is no tail of the window's collections (60 or 100).
+#[test]
+fn a_pair_that_nets_out_but_is_not_in_the_window_fails() {
+    let (code, text) = Fixture::new().shift(50, 6).run();
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("query_fees_collected 2/4 epochs agree from 1302 DIFF"),
+        "{text}"
+    );
+    assert!(!text.contains("boundary shift"), "{text}");
+}
+
+/// Each boundary traces, but 1390 is 60 high and 1391 only 59 low: one wei is nobody's.
+#[test]
+fn a_pair_that_traces_but_does_not_net_to_zero_fails() {
+    let (code, text) = Fixture::new()
+        .shift(60, 6)
+        .delta(1391, "query_fees_collected", -59)
+        .run();
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("query_fees_collected 2/4 epochs agree from 1302 DIFF"),
+        "{text}"
+    );
+}
+
+/// 100 net is the tail from block 595 and 6 to curators the tail from 598: no one block moved both.
+#[test]
+fn the_two_fee_fields_must_agree_on_where_the_boundary_fell() {
+    let (code, text) = Fixture::new().shift(100, 6).run();
+    assert_eq!(code, 1, "{text}");
+    assert!(!text.contains("boundary shift"), "{text}");
+}
+
+/// The nest files a window's collections early, never late.
+#[test]
+fn a_shift_into_the_later_epoch_fails() {
+    let (code, text) = Fixture::new().shift(-60, -6).run();
+    assert_eq!(code, 1, "{text}");
+    assert!(!text.contains("boundary shift"), "{text}");
+}
+
+/// An exact start leaves no window, so nothing can have been filed early across it.
+#[test]
+fn no_shift_is_excused_across_an_exact_boundary() {
+    let mut f = Fixture::new().shift(60, 6);
+    f.source_1391 = "l1-exact";
+    let (code, text) = f.run();
+    assert_eq!(code, 1, "{text}");
+    assert!(!text.contains("boundary shift"), "{text}");
+}
