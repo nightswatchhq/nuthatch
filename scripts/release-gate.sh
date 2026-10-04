@@ -146,7 +146,7 @@ start_server() {
     tries=$((tries + 1))
     port=$(( 20000 + (RANDOM % 20000) ))
     if curl -s -m 1 -o /dev/null "http://127.0.0.1:$port/health"; then continue; fi
-    env "${PROD_ENV[@]}" "$bin" serve --dir "$nest" --listen "127.0.0.1:$port" >"$log" 2>&1 9>&- &
+    env ${PROD_ENV[@]+"${PROD_ENV[@]}"} "$bin" serve --dir "$nest" --listen "127.0.0.1:$port" >"$log" 2>&1 9>&- &
     server_pid=$!
     sample_rss "$server_pid" "$out/rss-peak-kb" &
     sampler_pid=$!
@@ -232,7 +232,7 @@ run_query() {
 version=$("$bin" --version 2>/dev/null | head -n 1) || version="unknown"
 echo "release-gate: $version against $nest"
 echo "release-gate: $n queries from $set_file, $passes pass(es), results in $out"
-echo "release-gate: budget ${PROD_ENV[*]}${env_file:+ (from $env_file)}"
+echo "release-gate: budget ${PROD_ENV[*]:-the defaults}${env_file:+ (from $env_file)}"
 echo "release-gate: concurrency $concurrency (the set's statements sent $concurrency at a time, in order)"
 
 rm -f "$out/rss-peak-kb" "$out/died-after" "$out/unstable" "$out/rss-peak-gauges" "$out/pool-peak-bytes"

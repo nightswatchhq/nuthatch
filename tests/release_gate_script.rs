@@ -1412,6 +1412,17 @@ fn a_nests_environment_file_replaces_the_callers() {
     let (code, text) = gate(&[]);
     assert_eq!(code, Some(2), "{text}");
     assert!(text.contains("not a NUTHATCH_*=VALUE line"), "{text}");
+
+    // An empty read is a fault; a unit that sets nothing says so, and serves on the defaults.
+    std::fs::write(&env, "# read from the unit\n").unwrap();
+    let (code, text) = gate(&[]);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("no NUTHATCH_* settings"), "{text}");
+
+    std::fs::write(&env, "# read from the unit\n# none: the unit sets no NUTHATCH_* settings\n").unwrap();
+    let (code, text) = gate(&[("NUTHATCH_MAX_RSS", "1GB")]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), "", "{text}");
 }
 
 /// The set lives in the private kittiwake repo, so the runner has no default to fall back on: an

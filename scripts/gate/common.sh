@@ -18,16 +18,20 @@ PROD_ENV=(
 
 # gate_load_env <file>: PROD_ENV from a nest's NUTHATCH_*=VALUE lines, read from its unit.
 gate_load_env() {
-  local env_file=$1 line v
+  local env_file=$1 line v none=
   [ -f "$env_file" ] || die "no environment file at $env_file"
   PROD_ENV=()
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in '' | '#'*) continue ;; esac
+    case "$line" in
+      "# none: the unit sets no NUTHATCH_* settings") none=1 && continue ;;
+      '' | '#'*) continue ;;
+    esac
     printf '%s\n' "$line" | grep -Eq '^NUTHATCH_[A-Z0-9_]+=[^[:space:]]*$' \
       || die "not a NUTHATCH_*=VALUE line in $env_file: ${line:0:80}"
     PROD_ENV+=("$line")
   done <"$env_file"
-  [ ${#PROD_ENV[@]} -gt 0 ] || die "no NUTHATCH_* settings in $env_file"
+  # An empty read is a fault; a unit that sets nothing says so, in the installer's "none" line.
+  [ ${#PROD_ENV[@]} -gt 0 ] || [ -n "$none" ] || die "no NUTHATCH_* settings in $env_file"
   # Production's environment is the file's alone: a NUTHATCH_* setting of the caller's own would
   # serve the copy under a budget nobody runs.
   for v in $(compgen -e); do

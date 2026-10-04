@@ -112,10 +112,10 @@ done
 version=$("$bin" --version 2>/dev/null | head -n 1) || version="unknown"
 echo "reference: $version against DuckDB, on $nest pinned at sealed_through $pin_at"
 echo "reference: $kept of $listed sealed segments at or below the pin, no hot rows; $n statements from $set_file"
-echo "reference: budget ${PROD_ENV[*]}"
+echo "reference: budget ${PROD_ENV[*]:-the defaults}"
 
 # The binary first, then DuckDB, so the two never contend for the box.
-env "${PROD_ENV[@]}" "$bin" check --update --dir "$pin" >"$out/burrmill.log" 2>&1 || true
+env ${PROD_ENV[@]+"${PROD_ENV[@]}"} "$bin" check --update --dir "$pin" >"$out/burrmill.log" 2>&1 || true
 "$GATE_DUCK" gate-duck "$pin" "$set_file" "$out/duckdb" >"$out/duckdb.log" 2>&1 \
   || { tail -n 20 "$out/duckdb.log" >&2; die "gate-duck failed; log: $out/duckdb.log"; }
 
