@@ -1,6 +1,6 @@
 [package]
 name = "nuthatch"
-version = "4.3.1"
+version = "4.4.0"
 edition = "2021"
 autotests = false
 # **Measured, not asserted.** `cargo +1.85.0 check` fails outright - `cranelift-assembler-x64` needs
@@ -115,7 +115,7 @@ bytes = "1"
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 # The analytical engine (RFC-0044 Amendment 2), pinned by rev. Its arrow is not ours, so no batch
 # crosses; rows cross as JSON, and Arrow results as IPC.
-burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "23ed5b1f5369f1c5686b24f13a0b76909d630180", default-features = false, features = ["datafusion"] }
+burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "a7dd260db440d92a3763e92a88bd95898bde83bb", default-features = false, features = ["datafusion"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
 # satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via
