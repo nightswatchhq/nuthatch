@@ -235,6 +235,9 @@ async fn main() -> Result<()> {
             cli::PublishWhat::Status(a) => {
                 publish::run_status(std::path::Path::new(&a.dir), &a.target).await
             }
+            cli::PublishWhat::Finalise(a) => {
+                publish::run_finalise(std::path::Path::new(&a.dir), a.yes)
+            }
         },
         cli::Command::Mcp(args) => {
             if args.print_config {

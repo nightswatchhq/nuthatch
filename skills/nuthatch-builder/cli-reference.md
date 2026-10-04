@@ -340,6 +340,13 @@ Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5)
 Mirror sealed segments to an object-store prefix (RFC-0052)
 
 
+## `nuthatch publish finalise`
+
+Mark each table's provisional tail final, so the mirror can carry it (#1851)
+
+- `--dir <DIR>` - Nest directory. The nest must be stopped
+- `--yes` - Mark the listed segments final. Without it, only lists them
+
 ## `nuthatch publish status`
 
 Where this nest publishes, how far each side is sealed, and what is still to upload. Writes nothing

@@ -75,6 +75,15 @@ async fn the_published_layout_and_envelope_match_the_page() {
     nuthatch::seal::seal_range(nest.path(), &rows(1), 1, 100)
         .unwrap()
         .expect("sealed");
+    // A provisional tail, which the page says the mirrored catalogue leaves out.
+    nuthatch::seal::seal_range(
+        nest.path(),
+        &[r#"{"table":"usdc__transfer","from":"0xaaaa","to":"0xbbbb","value":"9","block_number":101,"tx_hash":"0xee","log_index":0}"#.to_string()],
+        101,
+        101,
+    )
+    .unwrap()
+    .expect("sealed");
     let target = tempfile::tempdir().unwrap();
 
     let report = nuthatch::publish::sync(nest.path(), target.path().to_str().unwrap(), false)
@@ -95,10 +104,20 @@ async fn the_published_layout_and_envelope_match_the_page() {
     // Resolution rule 0: every catalogued segment is `<dataset>/<table>/<hash>.parquet`.
     assert!(PAGE.contains("`<dataset>/<t>/<h>.parquet`"));
     let manifest_bytes = std::fs::read(dataset.join("manifest.json")).unwrap();
-    let local = std::fs::read(nest.path().join("segments/manifest.json")).unwrap();
+    assert!(PAGE.contains("less its provisional entries"));
+    let mut local = nuthatch::seal::load_manifest(nest.path()).unwrap();
+    assert!(
+        local.tables.values().flatten().any(|s| s.provisional),
+        "premise: the nest has a provisional tail"
+    );
+    for segs in local.tables.values_mut() {
+        segs.retain(|s| !s.provisional);
+    }
+    let published: nuthatch::seal::Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
     assert_eq!(
-        manifest_bytes, local,
-        "the page promises a byte-identical catalogue"
+        serde_json::to_value(&published).unwrap(),
+        serde_json::to_value(&local).unwrap(),
+        "the page promises the local catalogue less its provisional entries"
     );
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
     let mut objects = 0;

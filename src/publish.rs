@@ -527,6 +527,19 @@ fn read_local(dir: &Path) -> Result<(Vec<u8>, Manifest)> {
     Ok((local_bytes, local))
 }
 
+/// The catalogue the mirror publishes: the local one less its provisional entries, which are never
+/// uploaded (#1851). The local bytes verbatim when there are none.
+fn published_catalogue(local_bytes: &[u8], local: &Manifest) -> Result<Vec<u8>> {
+    if !local.tables.values().flatten().any(|s| s.provisional) {
+        return Ok(local_bytes.to_vec());
+    }
+    let mut published = local.clone();
+    for segs in published.tables.values_mut() {
+        segs.retain(|s| !s.provisional);
+    }
+    Ok(serde_json::to_string_pretty(&published)?.into_bytes())
+}
+
 /// The entries of `want` a pass would upload, and how many it would skip.
 async fn missing_entries<'a>(
     mirror: &dyn Mirror,
@@ -591,6 +604,7 @@ pub async fn sync_with(
     metrics: Option<&crate::metrics::NestMetrics>,
 ) -> Result<SyncReport> {
     let (local_bytes, local) = read_local(dir)?;
+    let catalogue = published_catalogue(&local_bytes, &local)?;
     let (data_identity, nid, bundle_hash, chain_id) = identity_of(dir)?;
     let mirror = open_mirror(target)?;
     let prefix = |k: &str| format!("{data_identity}/{k}");
@@ -677,9 +691,9 @@ pub async fn sync_with(
     }
 
     let cat_key = prefix(MANIFEST_FILE);
-    if remote_bytes.as_deref() != Some(local_bytes.as_slice()) {
+    if remote_bytes.as_deref() != Some(catalogue.as_slice()) {
         mirror
-            .put_if(&cat_key, &local_bytes, remote_bytes.as_deref())
+            .put_if(&cat_key, &catalogue, remote_bytes.as_deref())
             .await?;
         uploaded.push(MANIFEST_FILE.into());
     }
@@ -699,7 +713,7 @@ pub async fn sync_with(
         bundle_hash,
         sealed_through,
         published_at: rfc3339_utc(now),
-        catalogue_sha256: sha256_hex(&local_bytes),
+        catalogue_sha256: sha256_hex(&catalogue),
         schema_sha256: schema_sha,
         tables,
     };
@@ -720,7 +734,6 @@ pub async fn sync_with(
 /// store's ETags content MD5s, its ETag with the local segment. Returns how many were checked. `deep`
 /// downloads and re-hashes instead, ignoring `etag_md5`.
 pub async fn verify(dir: &Path, target: &str, deep: bool, etag_md5: bool) -> Result<usize> {
-    let local = seal::load_manifest(dir)?;
     let (data_identity, nid, bundle_hash, chain_id) = identity_of(dir)?;
     let mirror = open_mirror(target)?;
     let prefix = |k: &str| format!("{data_identity}/{k}");
@@ -730,8 +743,11 @@ pub async fn verify(dir: &Path, target: &str, deep: bool, etag_md5: bool) -> Res
         .context("remote catalogue missing")?;
     let local_bytes = std::fs::read(dir.join(seal::SEGMENTS_DIR).join(MANIFEST_FILE))
         .context("reading local catalogue")?;
-    if remote_bytes != local_bytes {
-        bail!("remote catalogue is not byte-identical to local");
+    let local: Manifest =
+        serde_json::from_slice(&local_bytes).context("corrupt local catalogue")?;
+    let catalogue = published_catalogue(&local_bytes, &local)?;
+    if remote_bytes != catalogue {
+        bail!("remote catalogue is not the local one less its provisional entries");
     }
     let env_bytes = mirror
         .get(&prefix("publish.json"))
@@ -766,7 +782,7 @@ pub async fn verify(dir: &Path, target: &str, deep: bool, etag_md5: bool) -> Res
     if env.tables != tables {
         bail!("publish.json tables do not match the local catalogue");
     }
-    let cat_sha = sha256_hex(&local_bytes);
+    let cat_sha = sha256_hex(&catalogue);
     if env.catalogue_sha256 != cat_sha {
         bail!("publish.json catalogue_sha256 does not match the catalogue");
     }
@@ -942,6 +958,57 @@ pub async fn run_sync(dir: &Path, target: &str, dry_run: bool) -> Result<()> {
         report.uploaded.len(),
         report.skipped
     );
+    Ok(())
+}
+
+/// `dir`'s provisional tails, marked final when `apply` (#1851). The mirror withholds a provisional
+/// segment until its table's next seal folds it, which on a finished chain never comes; this is the
+/// operator saying it will not.
+pub fn finalise(dir: &Path, apply: bool) -> Result<Vec<(String, Segment)>> {
+    if !apply {
+        let local = seal::load_manifest(dir)?;
+        return Ok(local
+            .tables
+            .into_iter()
+            .flat_map(|(t, segs)| segs.into_iter().map(move |s| (t.clone(), s)))
+            .filter(|(_, s)| s.provisional)
+            .collect());
+    }
+    // Held across the rewrite: a seal racing it would install a catalogue from before the flip.
+    let db = dir.join(crate::config::DB_FILE);
+    let _writer = if db.exists() {
+        Some(crate::store::Store::open_existing(&db).with_context(|| {
+            format!(
+                "cannot hold {}: stop the nest before finalising its tails",
+                db.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    seal::finalise_provisional(dir)
+}
+
+/// `nuthatch publish finalise`.
+pub fn run_finalise(dir: &Path, yes: bool) -> Result<()> {
+    let tails = finalise(dir, yes)?;
+    for (table, s) in &tails {
+        println!(
+            "{table}  blocks {}..{}  {} row(s)  {}",
+            s.from_block, s.to_block, s.rows, s.hash
+        );
+    }
+    match (tails.is_empty(), yes) {
+        (true, _) => println!("no provisional segments"),
+        (false, true) => println!(
+            "finalised {} segment(s); the next `publish sync` uploads them",
+            tails.len()
+        ),
+        (false, false) => println!(
+            "{} provisional segment(s); run again with --yes to mark them final",
+            tails.len()
+        ),
+    }
     Ok(())
 }
 
@@ -1789,6 +1856,105 @@ abi = "abis/usdc.json"
         verify(dir.path(), mirror.path().to_str().unwrap(), false, false)
             .await
             .unwrap();
+    }
+
+    /// One final segment of two rows, then a provisional one-row tail, at a floor of two.
+    fn nest_with_a_provisional_tail() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_nest(dir.path());
+        test_set_table_floor(dir.path(), 2);
+        seal_range(dir.path(), &[row(1, 1), row(2, 2)], 1, 2)
+            .unwrap()
+            .expect("sealed");
+        seal_range(dir.path(), &[row(3, 3)], 3, 3)
+            .unwrap()
+            .expect("sealed");
+        let segs = &seal::load_manifest(dir.path()).unwrap().tables["usdc__transfer"];
+        assert_eq!(
+            segs.iter().map(|s| s.provisional).collect::<Vec<_>>(),
+            [false, true],
+            "premise: a final segment and a provisional tail"
+        );
+        dir
+    }
+
+    fn published_entries(dataset: &Path) -> Vec<(String, Segment)> {
+        let m: Manifest =
+            serde_json::from_slice(&std::fs::read(dataset.join(MANIFEST_FILE)).unwrap()).unwrap();
+        m.tables
+            .into_iter()
+            .flat_map(|(t, segs)| segs.into_iter().map(move |s| (t.clone(), s)))
+            .collect()
+    }
+
+    /// #1851: the mirror withheld the provisional object but its catalogue still named it.
+    #[tokio::test]
+    async fn every_published_catalogue_entry_is_an_object_the_mirror_holds() {
+        let nest = nest_with_a_provisional_tail();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        let report = sync(nest.path(), target, false).await.unwrap();
+        let dataset = mirror.path().join(&report.dataset);
+        let entries = published_entries(&dataset);
+        assert_eq!(entries.len(), 1, "only the final segment: {entries:?}");
+        for (table, seg) in &entries {
+            assert!(!seg.provisional);
+            assert!(
+                dataset.join(parquet_key(table, &seg.hash)).is_file(),
+                "the published catalogue names {table}/{} and the mirror does not hold it",
+                seg.hash
+            );
+        }
+        verify(nest.path(), target, false, false).await.unwrap();
+        let second = sync(nest.path(), target, false).await.unwrap();
+        assert_eq!(second.uploaded, vec!["publish.json".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn after_finalise_every_catalogued_row_is_fetchable_from_the_mirror() {
+        let nest = nest_with_a_provisional_tail();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        sync(nest.path(), target, false).await.unwrap();
+
+        let finalised = finalise(nest.path(), true).unwrap();
+        assert_eq!(finalised.len(), 1, "one provisional tail: {finalised:?}");
+        let report = sync(nest.path(), target, false).await.unwrap();
+        let dataset = mirror.path().join(&report.dataset);
+
+        let local = seal::load_manifest(nest.path()).unwrap();
+        let local_rows: usize = local.tables.values().flatten().map(|s| s.rows).sum();
+        let entries = published_entries(&dataset);
+        let published_rows: usize = entries.iter().map(|(_, s)| s.rows).sum();
+        assert_eq!((local_rows, published_rows), (3, 3));
+        for (table, seg) in &entries {
+            assert!(dataset.join(parquet_key(table, &seg.hash)).is_file());
+        }
+        assert_eq!(
+            parquet_rows(&dataset),
+            3,
+            "every catalogued row is in the mirror"
+        );
+        assert_eq!(report.sealed_through, Some(3));
+        verify(nest.path(), target, false, false).await.unwrap();
+    }
+
+    #[test]
+    fn finalise_lists_without_yes_and_refuses_while_the_nest_is_held() {
+        let nest = nest_with_a_provisional_tail();
+        let before =
+            std::fs::read(nest.path().join(seal::SEGMENTS_DIR).join(MANIFEST_FILE)).unwrap();
+        assert_eq!(finalise(nest.path(), false).unwrap().len(), 1);
+        let held = crate::store::Store::open(&nest.path().join(crate::config::DB_FILE)).unwrap();
+        let err = finalise(nest.path(), true).unwrap_err();
+        assert!(format!("{err:#}").contains("stop the nest"), "{err:#}");
+        assert_eq!(
+            std::fs::read(nest.path().join(seal::SEGMENTS_DIR).join(MANIFEST_FILE)).unwrap(),
+            before,
+            "neither the listing nor the refused run may touch the catalogue"
+        );
+        drop(held);
+        assert_eq!(finalise(nest.path(), true).unwrap().len(), 1);
     }
 
     #[tokio::test]

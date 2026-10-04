@@ -15,7 +15,7 @@ two disagree, the build fails.
 <target>/
   <dataset>/                  64 lowercase hex characters: the nest's data identity
     publish.json              the provenance envelope, below
-    manifest.json             the catalogue, byte-identical to the nest's segments/manifest.json
+    manifest.json             the nest's segments/manifest.json less its provisional entries
     schema.json               present when the nest has one
     <table>/
       <hash>.parquet          one object per catalogued, non-provisional segment
@@ -28,7 +28,15 @@ two disagree, the build fails.
 
 Resolution rule 0, before the two rules in `reading-segments.md`: on a published prefix, a catalogue
 entry for table `t` with hash `h` is the object `<dataset>/<t>/<h>.parquet`. The entry's `file` field
-is not used. Provisional entries are never published, so a mirrored catalogue has none.
+is not used. Provisional segments are never published and the mirrored catalogue leaves their entries
+out, so every entry it names is an object under the prefix. When the nest has no provisional entries,
+`manifest.json` is byte-identical to its local catalogue.
+
+A provisional segment is a table's last few hundred rows, waiting to fold into its next segment. On a
+live nest that happens within a seal or two. On a table that has gone quiet, or a nest whose contract
+is finished, it never does, so the mirror stops short of those rows until the operator runs `nuthatch
+publish finalise` (see [operators](operators.md)). `sealed_through` does not tell you this: it is the
+highest block a published segment reaches, and a quiet table's withheld tail can sit below it.
 
 ## Globbing is allowed here, and only here
 
@@ -55,7 +63,7 @@ silently wrong.
 | `data_identity` | the `<dataset>` directory name |
 | `nid` | the nest's content address when it last published |
 | `bundle_hash` | the nest bundle's hash when it last published |
-| `sealed_through` | the mirror is complete through this block |
+| `sealed_through` | the highest block any published segment reaches; a table's provisional tail may sit below it, unpublished |
 | `published_at` | RFC 3339 UTC time of the publish; the only non-deterministic field |
 | `catalogue_sha256` | SHA-256 of the `manifest.json` this envelope describes |
 | `schema_sha256` | SHA-256 of `schema.json`; absent when the nest has none |
