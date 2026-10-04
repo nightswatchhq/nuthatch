@@ -119,21 +119,27 @@ pub fn from_env() -> AnalyticsConfig {
     }
 }
 
-/// Refuses a DuckDB split that breaches
-/// `(sql_permits × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB`,
+/// Refuses a split that breaches
+/// `(pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB`,
 /// an `ingestion_reservation` below [`derived_ingestion_reservation_mb`], and a thread count above
 /// [`THREADS_CEILING`]. Does not cap ingest, DBSP, redb, or result materialisation - which is
 /// exactly why the reservation may only be raised. 2 GiB is the footprint CI job / process RSS
 /// wall; this is the arithmetic that keeps a config from being allowed to breach it quietly.
-pub fn validate_cursor_budget() -> Result<()> {
-    validate_against(&from_env(), crate::serve::sql_max_concurrency())
+pub fn validate_cursor_budget(datasets: usize) -> Result<()> {
+    validate_on_cursor(&from_env(), crate::serve::sql_max_concurrency(), datasets)
+}
+
+/// A dataset's sessions share one pool (#1792), so no more pools reserve at once than the cursor
+/// has datasets, nor more than it has permits.
+pub fn validate_on_cursor(cfg: &AnalyticsConfig, permits: usize, datasets: usize) -> Result<()> {
+    validate_against(cfg, permits.min(datasets))
 }
 
 /// Same check against an explicit config, so a test can drive the inequality without the process
-/// environment. `permits` is clamped to the gate's ceiling, the same bound the live gate uses. A
-/// permit holds one session, at Burrmill's limit where one is set.
-pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
-    let permits = permits.clamp(1, crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
+/// environment. `pools` is how many nest pools can reserve at once, clamped to the gate's ceiling;
+/// each counts at Burrmill's limit where one is set.
+pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
+    let pools = pools.clamp(1, crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
     if cfg.memory_limit_mb == 0 {
         bail!(
             "analytics.memory_limit must be greater than zero (set {ENV_MEMORY_LIMIT}, default \
@@ -163,7 +169,7 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
             crate::runtime::DEFAULT_MAX_RSS_MB
         );
     }
-    let duck = permits.saturating_mul(cfg.burrmill_limit_mb());
+    let duck = pools.saturating_mul(cfg.burrmill_limit_mb());
     let reservation = cfg.reservation_mb();
     let floor = derived_ingestion_reservation_mb();
     if reservation < floor {
@@ -181,14 +187,15 @@ pub fn validate_against(cfg: &AnalyticsConfig, permits: usize) -> Result<()> {
     let total = duck.saturating_add(reservation).saturating_add(headroom);
     if total > ceiling {
         bail!(
-            "the analytics split does not leave the named ingest floor: (sql_permits × \
-             analytics.memory_limit) + ingestion_reservation + runtime_headroom = ({permits} × \
+            "the analytics split does not leave the named ingest floor: (pools × \
+             analytics.memory_limit) + ingestion_reservation + runtime_headroom = ({pools} × \
              {} MB) + {reservation} MB + {headroom} MB = {total} MB, which is above \
-             {ceiling} MB. {ENV_BURRMILL_MEMORY_LIMIT} takes the place of analytics.memory_limit \
-             where it is set. {ENV_MAX_RSS} raises the wall where the process has been given more. \
-             This gate refuses that split; it does not cap ingest, DBSP, redb, or result \
-             materialisation. The 2 GiB cursor budget is the footprint CI job / process RSS wall, \
-             not this arithmetic. Lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
+             {ceiling} MB. pools is the smaller of sql_permits and the cursor's nest datasets, \
+             since a dataset's sessions share one pool. {ENV_BURRMILL_MEMORY_LIMIT} takes the place \
+             of analytics.memory_limit where it is set. {ENV_MAX_RSS} raises the wall where the \
+             process has been given more. This gate refuses that split; it does not cap ingest, \
+             DBSP, redb, or result materialisation. The 2 GiB cursor budget is the footprint CI job / \
+             process RSS wall, not this arithmetic. Lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
              NUTHATCH_SQL_MAX_CONCURRENCY, or ingestion_reservation ({ENV_INGESTION_RESERVATION}). \
              analytics.max_temp_size is disk and does not buy RAM. A query that cannot run in its \
              budget fails; it never degrades block processing.",
@@ -410,6 +417,23 @@ pub(crate) mod tests {
         };
         let err = validate_against(&lowered, 1).unwrap_err().to_string();
         assert!(err.contains("may only be raised"), "{err}");
+    }
+
+    #[test]
+    fn a_limit_that_fits_once_starts_at_two_permits_on_one_dataset() {
+        let cfg = AnalyticsConfig {
+            burrmill_memory_limit_mb: Some(1024),
+            ..AnalyticsConfig::default()
+        };
+        validate_on_cursor(&cfg, 2, 1).expect("one pool: 1024 + 1024 = 2048");
+        assert!(
+            validate_on_cursor(&cfg, 2, 2).is_err(),
+            "two datasets, two pools"
+        );
+        assert!(
+            validate_on_cursor(&cfg, 1, 2).is_ok(),
+            "one permit, one pool at a time"
+        );
     }
 
     #[test]
