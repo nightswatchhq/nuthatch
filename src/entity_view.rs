@@ -22,8 +22,9 @@
 //! is the shape this project keeps finding in its own instruments.
 
 use anyhow::{anyhow, Context, Result};
-use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
-use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError, Sender, SyncSender};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::entity_bind::Binding;
 use crate::entity_circuit::EntityCircuit;
@@ -72,6 +73,33 @@ enum Msg {
     /// so its state is released.
     Stop,
     Flush(SyncSender<()>),
+    /// Sample the state size now and answer with it and what it cost (#1834).
+    SampleState(SyncSender<Result<(u64, Duration)>>),
+}
+
+/// How often an entity's state size may be sampled: `NUTHATCH_ENTITY_STATE_SAMPLE_SECS`, default 300,
+/// `0` for never. A sample walks every trace (#1834), so it is rationed rather than taken per scrape.
+fn state_sample_interval() -> Option<Duration> {
+    static INTERVAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        let secs = match std::env::var("NUTHATCH_ENTITY_STATE_SAMPLE_SECS") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    "NUTHATCH_ENTITY_STATE_SAMPLE_SECS={v} is not a number of seconds; using 300"
+                );
+                300
+            }),
+            Err(_) => 300,
+        };
+        (secs > 0).then(|| Duration::from_secs(secs))
+    })
+}
+
+fn sample_state(circuit: &mut EntityCircuit, into: &Mutex<Option<u64>>) -> Result<(u64, Duration)> {
+    let started = Instant::now();
+    let bytes = circuit.state_bytes()?;
+    *into.lock().unwrap() = Some(bytes);
+    Ok((bytes, started.elapsed()))
 }
 
 const REBUILD_ORDER: &str =
@@ -203,6 +231,8 @@ pub struct EntityView {
     /// [`Self::admit_offchain`].
     held: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
     max_rows: u64,
+    /// The circuit's state size at its last sample, `None` until the first (#1834).
+    state_bytes: Arc<Mutex<Option<u64>>>,
 }
 
 impl EntityView {
@@ -269,6 +299,8 @@ impl EntityView {
         let plan = plan.clone();
         let label = name.to_string();
         let thread_label = label.clone();
+        let state_bytes = Arc::new(Mutex::new(None::<u64>));
+        let sampled = state_bytes.clone();
 
         std::thread::Builder::new()
             .name(format!("nuthatch-entity-{name}"))
@@ -315,7 +347,40 @@ impl EntityView {
                         published.progress_at = crate::metrics::now_unix();
                     }
                 };
-                while let Ok(msg) = rx.recv() {
+                // State size (#1834): sampled after the circuit changes, at most once per interval, and
+                // never while it sits idle, since an idle circuit's size has not moved.
+                let interval = state_sample_interval();
+                let mut changed = false;
+                let mut due = Instant::now();
+                loop {
+                    if let Some(every) = interval.filter(|_| changed && Instant::now() >= due) {
+                        match sample_state(&mut circuit, &sampled) {
+                            Ok((_, took)) => {
+                                tracing::debug!("entity `{thread_label}` state sampled in {took:?}")
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "entity `{thread_label}` state size not sampled: {e:#}"
+                                )
+                            }
+                        }
+                        changed = false;
+                        due = Instant::now() + every;
+                    }
+                    let msg = match interval {
+                        Some(_) if changed => {
+                            match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                                Ok(msg) => msg,
+                                Err(RecvTimeoutError::Timeout) => continue,
+                                Err(RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        _ => match rx.recv() {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        },
+                    };
+                    changed |= !matches!(msg, Msg::Flush(_) | Msg::SampleState(_));
                     match msg {
                         Msg::Batch(batch, through, should_publish) => {
                             // The write lock is held across the fold, so no reader ever sees the
@@ -415,6 +480,9 @@ impl EntityView {
                             }
                             let _ = ack.send(());
                         }
+                        Msg::SampleState(ack) => {
+                            let _ = ack.send(sample_state(&mut circuit, &sampled));
+                        }
                     }
                 }
             })
@@ -431,11 +499,17 @@ impl EntityView {
             fed: Default::default(),
             held: Default::default(),
             max_rows: max_rows as u64,
+            state_bytes,
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Bytes the circuit held at its last sample; `None` before the first or with sampling off.
+    pub fn state_bytes(&self) -> Option<u64> {
+        *self.state_bytes.lock().unwrap()
     }
 
     /// The output columns' names - key columns first, then aggregates.
@@ -781,6 +855,17 @@ impl EntityView {
         if self.tx.send(Msg::Flush(ack)).is_ok() {
             let _ = wait.recv();
         }
+    }
+
+    /// Sample the state size now, on the circuit's thread, after every batch sent before it; returns
+    /// the bytes and what the sample cost. The periodic sample runs the same walk.
+    pub fn sample_state(&self) -> Result<(u64, Duration)> {
+        let (ack, wait) = sync_channel(0);
+        self.tx
+            .send(Msg::SampleState(ack))
+            .map_err(|_| anyhow!("entity `{}` has stopped", self.name))?;
+        wait.recv()
+            .map_err(|_| anyhow!("entity `{}` stopped before sampling", self.name))?
     }
 
     /// The maintained relation as of the last folded batch.

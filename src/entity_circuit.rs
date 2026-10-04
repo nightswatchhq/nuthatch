@@ -413,6 +413,16 @@ impl EntityCircuit {
         self.len
     }
 
+    /// Bytes the circuit's operators hold in memory, from DBSP's profile (#1834). The profile sizes
+    /// every trace deep, so this costs time in proportion to the state: call it rarely.
+    pub fn state_bytes(&mut self) -> Result<u64> {
+        let profile = self.handle.retrieve_profile()?;
+        let bytes = profile.total_used_bytes().map_err(|item| {
+            anyhow!("DBSP profile carried a non-byte used_memory_bytes: {item:?}")
+        })?;
+        Ok(bytes.bytes)
+    }
+
     /// Why this entity stopped, if it has. `None` is a live entity.
     pub fn fault(&self) -> Option<&str> {
         self.faulted.as_deref()

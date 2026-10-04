@@ -108,6 +108,18 @@ fn seed_cost_against_a_real_nest() {
     );
     let out = view.rows_as_json();
     println!("groups: {}", out.len());
+    // #1834: what one state-size sample costs at this size, as the periodic sample takes it.
+    let mut took: Vec<_> = (0..10)
+        .map(|_| view.sample_state().expect("a live circuit samples"))
+        .collect();
+    took.sort_by_key(|(_, d)| *d);
+    println!(
+        "state : {} bytes; a sample takes p50 {:?}, max {:?} over {} samples",
+        took[0].0,
+        took[took.len() / 2].1,
+        took[took.len() - 1].1,
+        took.len()
+    );
     match (base, after) {
         (Some(b), Some(a)) => {
             let delta_kb = a.saturating_sub(b);

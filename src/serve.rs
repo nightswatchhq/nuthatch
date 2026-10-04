@@ -1211,6 +1211,10 @@ pub const ENTITY_SERIES: &[(&str, &str)] = &[
         "nuthatch_entity_seconds_since_progress",
         "Seconds since this relation's watermark last moved.",
     ),
+    (
+        "nuthatch_entity_state_bytes",
+        "Bytes the entity's DBSP circuit held at its last sample.",
+    ),
 ];
 
 fn entity_metrics(s: &AppState) -> String {
@@ -1302,6 +1306,20 @@ fn entity_metrics(s: &AppState) -> String {
                 now.saturating_sub(progress)
             }
         ));
+    }
+    // Sampled on the circuit's thread at most every NUTHATCH_ENTITY_STATE_SAMPLE_SECS (#1834); an
+    // entity not yet sampled has no line rather than a zero.
+    out.push_str(
+        "# HELP nuthatch_entity_state_bytes Bytes the entity's DBSP circuit held at its last sample.\n\
+         # TYPE nuthatch_entity_state_bytes gauge\n",
+    );
+    for e in s.entities.iter() {
+        if let Some(bytes) = e.state_bytes() {
+            out.push_str(&format!(
+                "nuthatch_entity_state_bytes{{nest=\"{nest}\",entity=\"{}\"}} {bytes}\n",
+                e.name()
+            ));
+        }
     }
     out
 }
