@@ -101,6 +101,19 @@ smoke_one() {
   case "$body" in *"Out of Memory"*) echo "${body:0:400}"; return 1 ;; esac
 }
 
+# Points the ExecStart in $2 at the VERSIONED path $3, whatever it named before, so `systemctl show`
+# can answer "which version is this" (#1060), and refuses unless that is what systemd would now run.
+point_unit() {
+  local u=$1 f=$2 target=$3
+  # `-i.bak` then remove it: the one spelling GNU and BSD sed both read as in-place.
+  sed -i.bak -E "s#^ExecStart=([^ ]*/)?nuthatch(-[0-9][0-9A-Za-z.+-]*)?#ExecStart=$target#" "$f"
+  rm -f "$f.bak"
+  systemctl daemon-reload
+  # What systemd will run, not what this script wrote: the two differ when another file wins.
+  [ "$(unit_binary "$u")" = "$target" ] \
+    || die "$u: systemd would still run $(unit_binary "$u") after editing $f"
+}
+
 ROLL_SAVED=""
 trap '[ -z "$ROLL_SAVED" ] || rm -f "$ROLL_SAVED"' EXIT
 
@@ -139,15 +152,7 @@ cmd_roll() {
     cp "$f" "$ROLL_SAVED"
   fi
 
-  # Point the unit at the VERSIONED path, whatever it named before, so `systemctl show` can answer
-  # "which version is this" (#1060).
-  # `-i.bak` then remove it: the one spelling GNU and BSD sed both read as in-place.
-  sed -i.bak -E "s#^ExecStart=([^ ]*/)?nuthatch(-[0-9][0-9A-Za-z.+-]*)?#ExecStart=$target#" "$f"
-  rm -f "$f.bak"
-  systemctl daemon-reload
-  # What systemd will run, not what this script wrote: the two differ when another file wins.
-  [ "$(unit_binary "$u")" = "$target" ] \
-    || die "$u: systemd would still run $(unit_binary "$u") after editing $f"
+  point_unit "$u" "$f" "$target"
   systemctl restart "$u"
 
   # Readiness flips false to true across any restart, a no-op roll included. The version /ready
@@ -161,16 +166,17 @@ cmd_roll() {
   [ "$v" = "$want" ] || die "$u reports version ${v:-none} on /ready, not $want"
   [ "$r" = true ] || die "$u is on $want but not ready: $s"
 
-  local why=""
+  # Every statement, not up to the first refusal: a failure the previous binary shares must not hide
+  # a regression in a later statement.
+  local failed=() why
   if [ -n "$smoke" ]; then
     for q in "${stmts[@]}"; do
       why=$(smoke_one "$port" "$q") && continue
-      why="$q -> $why"
-      break
+      printf '\033[31mFAIL\033[0m %s: smoke on %s: %s -> %s\n' "$u" "$want" "$q" "$why" >&2
+      failed+=("$q")
     done
   fi
-  if [ -n "$why" ]; then
-    printf '\033[31mFAIL\033[0m %s: smoke on %s: %s\n' "$u" "$want" "$why" >&2
+  if [ "${#failed[@]}" -gt 0 ]; then
     cat "$ROLL_SAVED" >"$f"
     systemctl daemon-reload
     [ "$(unit_binary "$u")" = "$prev" ] \
@@ -178,7 +184,22 @@ cmd_roll() {
     systemctl restart "$u"
     await_version "$port" "$prev_v" \
       || die "$u: smoke failed and the rollback to $prev_v did not come back ready: $READY_BODY"
-    die "$u rolled back to $prev_v after its smoke failed on: $why"
+    # On 2026-10-03 the QoS roll reverted to a binary that refused the same statements (#1795).
+    for q in "${failed[@]}"; do
+      smoke_one "$port" "$q" >/dev/null || continue
+      die "$u rolled back to $prev_v after its smoke failed on: $q ($prev_v answers it)"
+    done
+    for q in "${failed[@]}"; do
+      printf '\033[33mWARN\033[0m %s: pre-existing failure, not a regression: %s also refuses: %s\n' \
+        "$u" "$prev_v" "$q" >&2
+    done
+    point_unit "$u" "$f" "$target"
+    systemctl restart "$u"
+    await_version "$port" "$want" \
+      || die "$u: its smoke failures are pre-existing, and the re-roll to $want did not come back ready: $READY_BODY"
+    printf '\033[33mFAIL\033[0m %s kept on %s: %d smoke statement(s) fail on %s too, so nothing was reverted\n' \
+      "$u" "$want" "${#failed[@]}" "$prev_v" >&2
+    exit 3
   fi
   ok "$u -> $want via $(basename "$f")   last_block ${before:-n/a} -> $(ready_field "$s" last_block)"
   [ -z "$smoke" ] || ok "$u answered all ${#stmts[@]} statement(s) in $(basename "$smoke")"
@@ -262,9 +283,15 @@ usage:
   deploy-nest.sh install <path-to-binary> <version>   install and verify it reports that version
   deploy-nest.sh roll    <unit> <version> [--smoke <file>]
                                                       point the unit at the versioned path, restart, verify;
-                                                      then run each statement in <file> against /sql and
-                                                      roll back to the previous binary on any refusal
+                                                      then run each statement in <file> against /sql; on a
+                                                      refusal, roll back and ask the previous binary the
+                                                      same statements. Stay rolled back if it answers any
+                                                      (exit 1); if it refuses them all, the failure is
+                                                      pre-existing: roll forward again and exit 3
   deploy-nest.sh check                                what is every unit actually running
+
+exit: 0 ok, 1 failed (a smoke regression leaves the previous version), 2 usage,
+      3 smoke failures the previous binary shares (the new version is kept)
 USAGE
      exit 2 ;;
 esac

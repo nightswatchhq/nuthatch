@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Rolls a published release onto the Helsinki units, run from a workstation that can
 # `ssh root@<host>`. Uses the deploy scripts from the release's own tag, checksums the Linux release,
-# installs it, rolls the allocations nest first with its smoke file (a failed smoke reverts that
-# unit and stops here), then the rest.
+# installs it, and rolls each unit with its smoke file, the allocations nest first. A smoke failure
+# stops here: a regression reverts that unit, a failure the previous release shares keeps it (exit 3).
 #   deploy/roll-helsinki-from-mac.sh <version> [unit ...]
 #   deploy/roll-helsinki-from-mac.sh 4.3.1                         every unit
 #   deploy/roll-helsinki-from-mac.sh 4.3.1 graph-allocations-nest-next

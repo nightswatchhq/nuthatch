@@ -79,6 +79,28 @@ sudo systemctl daemon-reload && sudo systemctl enable --now nuthatch
 journalctl -u nuthatch -f          # a clean progress line during backfill, then quiet tip-following
 ```
 
+#### Rolling a unit onto a new version
+
+`scripts/deploy-nest.sh install <binary> <version>` puts the binary at
+`/usr/local/bin/nuthatch-<version>`; `scripts/deploy-nest.sh roll <unit> <version> --smoke <file>`
+points the unit at it, restarts, and waits until `/ready` reports that version. It then runs every
+statement in the smoke file against `/sql`. `scripts/smoke/<unit>.sql` holds the statements each
+production unit's real consumers send, one per line.
+
+When a statement fails, the roll puts the unit back on its previous binary and runs the failing
+statements there. If the previous binary answers any of them, the new one is worse: the unit stays
+reverted. If the previous binary refuses all of them too, the failure is pre-existing, not a
+regression: the roll says so, naming each statement, and moves the unit back onto the new version.
+
+| Exit | Meaning | Unit left on |
+|---|---|---|
+| 0 | rolled, and every smoke statement answered | the new version |
+| 1 | any failure, including a smoke failure the previous binary does not share | the previous version, after a smoke failure |
+| 2 | usage | untouched |
+| 3 | smoke failures the previous binary shares | the new version |
+
+Exit 3 is non-zero on purpose, so a loop over several units stops on it.
+
 ### Docker
 
 A container image is published per release:
