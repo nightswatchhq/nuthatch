@@ -7,7 +7,7 @@ pub use nuthatch_decode::rpc::Log;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// How many times a whole `block_timestamps` batch is retried before it's returned as an error rather
@@ -258,6 +258,9 @@ fn escalate_pool_wide_rate_limit(
 #[derive(Default)]
 struct PoolFailures {
     other: Option<anyhow::Error>,
+    /// A 429 is about our pacing at that endpoint, so another endpoint's answer outranks it (#1853):
+    /// as the last error it hid a healthy endpoint's range cap, and the window never narrowed.
+    limited: Option<anyhow::Error>,
     pruned: Vec<String>,
     last_pruned: Option<anyhow::Error>,
 }
@@ -267,15 +270,23 @@ impl PoolFailures {
         if matches!(class_of(&e), Some(FailureClass::HistoryUnavailable)) {
             self.pruned.push(redact_url(url));
             self.last_pruned = Some(e);
+        } else if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
+            self.limited = Some(e);
         } else {
             self.other = Some(e);
+        }
+    }
+
+    fn rested(&mut self, resting: Option<anyhow::Error>) {
+        if self.limited.is_none() {
+            self.limited = resting;
         }
     }
 
     fn verdict(self, attempts: usize, rate_limited: usize) -> anyhow::Error {
         let remedy = "supply an archive-capable RPC with `--rpc` or `rpc_urls`";
         let pruned = self.pruned.join(", ");
-        match (self.other, self.last_pruned) {
+        match (self.other.or(self.limited), self.last_pruned) {
             (None, Some(e)) => anyhow::Error::new(ClassifiedError {
                 class: FailureClass::HistoryUnavailable,
                 detail: format!(
@@ -757,6 +768,12 @@ pub struct RpcClient {
     /// (`0` = healthy). Set on a failed call, cleared on a successful one. Endpoints past their cooldown
     /// are tried first; still-unhealthy ones are the fallback of last resort (soonest-to-recover first).
     health: Vec<AtomicU64>,
+    /// Millis-since-epoch until which an endpoint that answered 429 with a retry hint is not asked at
+    /// all (#1853). `0` = no hint in force.
+    limited: Vec<AtomicU64>,
+    /// The endpoint's cooldown is for a 429, so it is asked only when no other endpoint is left, not
+    /// as the last resort after a healthy one fails (#1853).
+    throttled: Vec<AtomicBool>,
     /// The highest block each endpoint has reported from `eth_blockNumber`, so a lower bound on its
     /// head. Pool members' heads differ by a block or two, and one behind refuses a `toBlock` it lacks.
     heads: Vec<AtomicU64>,
@@ -792,12 +809,16 @@ impl RpcClient {
             .map_or(MAX_TIMESTAMP_BATCH, |cap| cap.clamp(1, MAX_TIMESTAMP_BATCH));
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         let heads = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        let limited = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        let throttled = urls.iter().map(|_| AtomicBool::new(false)).collect();
         Ok(Self {
             http,
             urls,
             cursor: AtomicUsize::new(0),
             primaries: n,
             health,
+            limited,
+            throttled,
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
@@ -869,24 +890,86 @@ impl RpcClient {
         let now = now_millis();
         let mut healthy = Vec::with_capacity(n);
         let mut cooling = Vec::with_capacity(n);
+        let mut throttled = Vec::new();
         for i in 0..n {
             let j = if i < p { (start + i) % p } else { i };
+            if self.limited[j].load(Ordering::Relaxed) > now {
+                continue;
+            }
             let until = self.health[j].load(Ordering::Relaxed);
             if until <= now {
                 healthy.push(j);
+            } else if self.throttled[j].load(Ordering::Relaxed) {
+                throttled.push((until, j));
             } else {
                 cooling.push((until, j));
             }
         }
         cooling.sort_by_key(|(until, _)| *until);
-        healthy
+        throttled.sort_by_key(|(until, _)| *until);
+        let order: Vec<usize> = healthy
             .into_iter()
             .chain(cooling.into_iter().map(|(_, j)| j))
-            .collect()
+            .collect();
+        if order.is_empty() {
+            return throttled.into_iter().map(|(_, j)| j).collect();
+        }
+        order
     }
 
     fn mark_healthy(&self, j: usize) {
         self.health[j].store(0, Ordering::Relaxed);
+        self.limited[j].store(0, Ordering::Relaxed);
+        self.throttled[j].store(false, Ordering::Relaxed);
+    }
+
+    /// A 429 cools the endpoint like any failure. One that said when to come back is not asked again
+    /// before then, within [`clamp_retry_hint`]'s cap; without a hint the caller's pacing stands.
+    fn mark_rate_limited(&self, j: usize, retry_after: Option<Duration>) {
+        self.mark_unhealthy(j);
+        self.throttled[j].store(true, Ordering::Relaxed);
+        let Some(hint) = retry_after else {
+            return;
+        };
+        let rest = clamp_retry_hint(hint, Duration::ZERO);
+        self.limited[j].store(now_millis() + rest.as_millis() as u64, Ordering::Relaxed);
+        tracing::debug!(
+            "rpc {} rate-limited us; not asking it again for {rest:?}",
+            redact_url(&self.urls[j])
+        );
+    }
+
+    /// The endpoints a call left out of `asked` because they are resting after a 429, as one failure,
+    /// so a verdict drawn from the rest does not speak for the whole pool.
+    fn resting(&self, asked: &[usize]) -> Option<anyhow::Error> {
+        let resting: Vec<String> = (0..self.urls.len())
+            .filter(|j| !asked.contains(j))
+            .map(|j| redact_url(&self.urls[j]))
+            .collect();
+        (!resting.is_empty()).then(|| {
+            anyhow::Error::new(ClassifiedError {
+                class: FailureClass::RateLimited { retry_after: None },
+                detail: format!("not asked while rate-limiting us: {}", resting.join(", ")),
+            })
+        })
+    }
+
+    /// Every endpoint is resting on a retry hint: wait for the soonest, then try them soonest first.
+    /// The wait is bounded by [`MAX_RETRY_HINT`], so a throttled pool slows the run and never spins.
+    async fn wait_out_rate_limits(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.urls.len()).collect();
+        order.sort_by_key(|&j| self.limited[j].load(Ordering::Relaxed));
+        let wait = self.limited[order[0]]
+            .load(Ordering::Relaxed)
+            .saturating_sub(now_millis());
+        let wait = Duration::from_millis(wait).min(MAX_RETRY_HINT);
+        tracing::warn!(
+            "every RPC endpoint ({}) is rate-limiting us; waiting {wait:?} as asked before trying \
+             again",
+            self.urls.len()
+        );
+        retry_pause(wait).await;
+        order
     }
 
     fn mark_unhealthy(&self, j: usize) {
@@ -911,8 +994,12 @@ impl RpcClient {
     /// Route a failed call to the right cooldown, per its classification. An unclassified error
     /// (nothing downcasts) is treated as transient, which is the pre-RFC-0028 behaviour.
     fn record_failure(&self, j: usize, method: &str, err: &anyhow::Error) {
+        self.throttled[j].store(false, Ordering::Relaxed);
         match class_of(err) {
             Some(FailureClass::Terminal) => self.mark_terminal(j, method, &err.to_string()),
+            Some(FailureClass::RateLimited { retry_after }) => {
+                self.mark_rate_limited(j, retry_after)
+            }
             _ => {
                 self.mark_unhealthy(j);
                 tracing::debug!(
@@ -956,7 +1043,11 @@ impl RpcClient {
         let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
-        for j in self.endpoint_order_holding(need) {
+        let mut order = self.endpoint_order_holding(need);
+        if order.is_empty() {
+            order = self.wait_out_rate_limits().await;
+        }
+        for &j in &order {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
@@ -989,6 +1080,7 @@ impl RpcClient {
                 }
             }
         }
+        failures.rested(self.resting(&order));
         Err(failures.verdict(attempts, rate_limited))
     }
 
@@ -998,7 +1090,11 @@ impl RpcClient {
         let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
-        for j in self.endpoint_order() {
+        let mut order = self.endpoint_order();
+        if order.is_empty() {
+            order = self.wait_out_rate_limits().await;
+        }
+        for &j in &order {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
@@ -1049,6 +1145,7 @@ impl RpcClient {
                 }
             }
         }
+        failures.rested(self.resting(&order));
         Err(failures.verdict(attempts, rate_limited))
     }
 
@@ -2032,10 +2129,17 @@ fn parse_hex_u64(s: &str) -> Result<u64> {
 /// Wall-clock millis since the epoch - used only for endpoint-health cooldowns (a coarse "try again
 /// after" timer), never for anything in the deterministic data path.
 fn now_millis() -> u64 {
-    std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    // A recorded pause stands in for a sleep, so the clock that rests endpoints must see it pass.
+    #[cfg(test)]
+    let now = now
+        + RETRY_PAUSES
+            .try_with(|p| p.borrow().iter().sum::<Duration>().as_millis() as u64)
+            .unwrap_or(0);
+    now
 }
 
 /// Reduce an RPC URL to `scheme://host[:port]` for logging - provider endpoints routinely carry the API
@@ -4214,7 +4318,8 @@ mod rfc0036_tests {
             }
         }
         assert!(pruned_hits.load(Ordering::Relaxed) >= 6);
-        assert!(throttled_hits.load(Ordering::Relaxed) >= 6);
+        // Once per client: a 429 is left to cool while another endpoint can still be asked (#1853).
+        assert_eq!(throttled_hits.load(Ordering::Relaxed), 2);
         hp.abort();
         ht.abort();
     }

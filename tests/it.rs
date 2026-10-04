@@ -158,6 +158,8 @@ mod required_contexts_script;
 mod rfc_index_status;
 #[path = "roll_helsinki_script.rs"]
 mod roll_helsinki_script;
+#[path = "rpc_pool_rate_limit.rs"]
+mod rpc_pool_rate_limit;
 #[path = "scheduled_workflow_failure_is_reported.rs"]
 mod scheduled_workflow_failure_is_reported;
 #[path = "seal_batching_asymmetry.rs"]
@@ -181,5 +183,7 @@ mod tip_gauges_are_published_per_nest;
 mod upgrade_golden;
 #[path = "verification_non_claims.rs"]
 mod verification_non_claims;
+#[path = "window_is_a_ceiling.rs"]
+mod window_is_a_ceiling;
 #[path = "workflow_permission_keys.rs"]
 mod workflow_permission_keys;

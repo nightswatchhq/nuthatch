@@ -2176,6 +2176,11 @@ async fn runtime_index_loop(
         nests.iter().flatten().any(|n| n.ipfs_gate.is_some()),
         nests.iter().flatten().any(|n| n.registry.blocks()),
         window,
+        nests
+            .iter()
+            .flatten()
+            .filter_map(|n| n.window_ceiling)
+            .min(),
     );
     let mut poll_failures = 0u32;
     // One dial per cursor (RFC-0040). Every nest on it was mounted by the same operator flags, so
@@ -2340,6 +2345,10 @@ async fn runtime_index_loop(
         } else {
             crate::chunker::MAX_WINDOW
         };
+        let window_cap = live
+            .iter()
+            .filter_map(|&i| live_ref(&nests, i).window_ceiling)
+            .fold(window_cap, u64::min);
         chunker.set_max(window_cap);
         let to = (global_next + chunker.window() - 1).min(ceiling);
         for &i in &live {
@@ -3183,6 +3192,7 @@ async fn build_nest(
             config.ipfs_gateways.clone()
         },
         ipfs_window_deadline: config.ipfs_window_deadline,
+        window_ceiling: window_override.filter(|&w| w > 0),
         top_level_calls: config.extract.top_level_calls,
         call_registry: call_registry.clone(),
         chain_id: config.nest.chain_id,
@@ -4163,6 +4173,8 @@ pub struct DirectExtras<'a> {
     pub ipfs_policy: crate::ipfs_resolve::Policy,
     /// Where each document given up on is recorded (#1410); `None` records nothing, as a bench does.
     pub store: Option<&'a dyn crate::store::HotStore>,
+    /// An explicit `--window`, which the adaptive window never grows past.
+    pub window_ceiling: Option<u64>,
 }
 
 impl Default for DirectExtras<'_> {
@@ -4174,6 +4186,7 @@ impl Default for DirectExtras<'_> {
             metrics: None,
             ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
             store: None,
+            window_ceiling: None,
         }
     }
 }
@@ -4296,9 +4309,10 @@ fn documents_backlogged(pending: u64) -> bool {
     pending >= MAX_OUTSTANDING_DOCUMENTS
 }
 
-/// The window controller for a tip loop, by the same rule the backfill paths use. A document nest's
-/// rows stay hot until its window commits and seals, so its window is capped however few logs it sees.
-fn tip_window(documents: bool, headers: bool, window: u64) -> AdaptiveWindow {
+/// The window controller for the tip loops and the seal-direct backfills. A document nest's rows stay
+/// hot until its window commits and seals, so its window is capped however few logs it sees.
+/// `ceiling` is an explicit `--window`, which the window may shrink below but never grows past.
+fn tip_window(documents: bool, headers: bool, window: u64, ceiling: Option<u64>) -> AdaptiveWindow {
     if documents {
         AdaptiveWindow::for_window_with_documents(window)
     } else if headers {
@@ -4306,6 +4320,7 @@ fn tip_window(documents: bool, headers: bool, window: u64) -> AdaptiveWindow {
     } else {
         AdaptiveWindow::for_window(window)
     }
+    .capped_at(ceiling)
 }
 
 /// Blocks of full bodies held at once while decoding top-level calls.
@@ -5412,13 +5427,12 @@ pub async fn backfill_direct_pipelined_with(
     // A blocks nest pays one header request per *block*, so its window ceiling is set by header cost
     // rather than log density (RFC-0036). Without this the zero-log ranges grow widest and demand the
     // most headers - which is how OBIB case 3 rate-limited itself into partial responses.
-    let chunker = std::sync::Arc::new(std::sync::Mutex::new(if extras.ipfs.is_some() {
-        AdaptiveWindow::for_window_with_documents(window)
-    } else if registry.blocks() {
-        AdaptiveWindow::for_window_with_headers(window)
-    } else {
-        AdaptiveWindow::for_window(window)
-    }));
+    let chunker = std::sync::Arc::new(std::sync::Mutex::new(tip_window(
+        extras.ipfs.is_some(),
+        registry.blocks(),
+        window,
+        extras.window_ceiling,
+    )));
     // The generator *owns* a handle rather than borrowing one. Borrowing across the generator's await
     // makes the whole backfill future carry a higher-ranked lifetime that `tokio::spawn` cannot
     // satisfy - which shows up far from here, as a "one type is more general than the other" error on
@@ -5859,13 +5873,12 @@ pub async fn backfill_direct_factory_with(
     let mut total = 0u64;
     let mut flipped_logged = false;
     // A blocks nest pays per *block*, not per log, so its window ceiling is different (RFC-0036).
-    let mut chunker = if extras.ipfs.is_some() {
-        AdaptiveWindow::for_window_with_documents(window)
-    } else if registry.blocks() {
-        AdaptiveWindow::for_window_with_headers(window)
-    } else {
-        AdaptiveWindow::for_window(window)
-    };
+    let mut chunker = tip_window(
+        extras.ipfs.is_some(),
+        registry.blocks(),
+        window,
+        extras.window_ceiling,
+    );
     // Labelled because the two-pass body below has to be able to restart the *chunk* from inside the
     // pass-2 fixpoint loop when the provider refuses an over-large response.
     // See `backfill_direct`: the range's last `FETCH_TAIL_OVERLAP` blocks are fetched once more as
@@ -6201,6 +6214,8 @@ pub struct NestIngest {
     /// The chain's `seal_span` (#1199): the longest block span a finalized range may be held
     /// unsealed before it is cut regardless of row count. See `chains::Chain::seal_span`.
     seal_span: u64,
+    /// An explicit `--window`: where the adaptive window starts, and the widest it may grow (#1853).
+    window_ceiling: Option<u64>,
     /// Per-nest metrics handle (SEC-9): nest-scoped updates go here, which also feed the process-global
     /// aggregates. In a runtime each nest gets its own, keyed by name.
     metrics: Arc<crate::metrics::NestMetrics>,
@@ -6368,6 +6383,7 @@ impl NestIngest {
                     metrics: Some(&self.metrics),
                     ipfs_policy: self.seal_direct_policy(),
                     store: Some(self.store.as_ref()),
+                    window_ceiling: self.window_ceiling,
                 };
                 let deadline = match (&self.ipfs_gate, extras.ipfs_policy.deadline) {
                     (None, _) => String::new(),
@@ -7324,7 +7340,12 @@ async fn index_loop(
     // hundred thousand headers in one window - trading a getLogs pathology for the header fan-out
     // pathology RFC-0036 exists to prevent. Capped, `observed(0)` settles at `HEADER_WINDOW_CAP`, which
     // is the intended steady state for a nest whose windows are all zero-log by construction.
-    let mut chunker = tip_window(nest.ipfs_gate.is_some(), nest.registry.blocks(), window);
+    let mut chunker = tip_window(
+        nest.ipfs_gate.is_some(),
+        nest.registry.blocks(),
+        window,
+        nest.window_ceiling,
+    );
     // Live catch-up feedback (RFC-0015 slice 3): a single progress line while the hot loop chases
     // the tip for the *first* time, ending on a crisp "caught up". `None` until there's actually a
     // backlog to report; `caught_up` latches after the first catch-up so steady-state tip-following
@@ -13518,7 +13539,7 @@ template = "pool"
     #[test]
     fn a_document_nests_tip_window_is_capped_however_few_logs_it_sees() {
         let widest = |documents: bool, headers: bool| {
-            let mut w = tip_window(documents, headers, 20_000);
+            let mut w = tip_window(documents, headers, 20_000, None);
             let mut most = w.window();
             for _ in 0..32 {
                 w.observed(0);
@@ -13692,6 +13713,7 @@ template = "pool"
                 metrics: None,
                 ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
                 store: None,
+                window_ceiling: None,
             },
             |_| Ok(()),
             |reached, _, _| {
@@ -13750,6 +13772,7 @@ template = "pool"
                 metrics: None,
                 ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
                 store: None,
+                window_ceiling: None,
             },
             |_| Ok(()),
             |_, _, _| {},
@@ -14262,6 +14285,7 @@ template = "pool"
                 metrics: None,
                 ipfs_policy: one_quick_attempt(),
                 store: Some(&store as &dyn crate::store::HotStore),
+                window_ceiling: None,
             };
             let mut rows = Vec::new();
             extras
@@ -14339,6 +14363,7 @@ template = "pool"
                     metrics: None,
                     ipfs_policy: one_quick_attempt(),
                     store: record.then_some(&store as &dyn crate::store::HotStore),
+                    window_ceiling: None,
                 },
                 |_| Ok(()),
                 |_, _, _| {},
