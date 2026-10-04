@@ -31,7 +31,7 @@ for u in "${units[@]}"; do
   dir=$(printf '%s' "$line" | grep -oE -- "--dir [^ ]+" | cut -d' ' -f2)
   "$bin" dev --help | grep -q -- --audit-rpc \
     || { echo "STOP: $u runs $bin, which has no --audit-rpc; roll 4.5.0 first. Nothing was changed" >&2; exit 1; }
-  if printf '%s' "$line" | grep -qF "$ah" || grep -qF "$ah" "$dir/nuthatch.toml"; then
+  if [[ $line == *"$ah"* ]] || grep -qF "$ah" "$dir/nuthatch.toml"; then
     echo "STOP: $u indexes or sealed from $ah (its unit or $dir/nuthatch.toml); nothing was changed" >&2; exit 1
   fi
   file[$u]=$f
