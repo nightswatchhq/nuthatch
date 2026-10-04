@@ -133,7 +133,7 @@ Seven series on `/metrics`, labelled by nest and entity:
 | `nuthatch_entity_unavailable` | it holds no answer and is not being served |
 | `nuthatch_entity_applied_through` | how far it has folded |
 | `nuthatch_entity_rows` | how big it has become - watch it against `max_rows` |
-| `nuthatch_entity_state_bytes` | what its circuit holds in memory, sampled at most every five minutes (`NUTHATCH_ENTITY_STATE_SAMPLE_SECS`) |
+| `nuthatch_entity_state_bytes` | what its circuit holds in memory, sampled at most once a minute (`NUTHATCH_ENTITY_STATE_SAMPLE_SECS`) |
 
 A fault also pushes an `entity_fault` alert if a `[[alerts]]` sink watches that kind, so you find out
 without polling. `faulted` and `unavailable` are separate because the response differs: one is dead,

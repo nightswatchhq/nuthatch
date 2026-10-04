@@ -77,7 +77,7 @@ enum Msg {
     SampleState(SyncSender<Result<(u64, Duration)>>),
 }
 
-/// How often an entity's state size may be sampled: `NUTHATCH_ENTITY_STATE_SAMPLE_SECS`, default 300,
+/// How often an entity's state size may be sampled: `NUTHATCH_ENTITY_STATE_SAMPLE_SECS`, default 60,
 /// `0` for never. A sample walks every trace (#1834), so it is rationed rather than taken per scrape.
 fn state_sample_interval() -> Option<Duration> {
     static INTERVAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
@@ -85,11 +85,11 @@ fn state_sample_interval() -> Option<Duration> {
         let secs = match std::env::var("NUTHATCH_ENTITY_STATE_SAMPLE_SECS") {
             Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
                 tracing::warn!(
-                    "NUTHATCH_ENTITY_STATE_SAMPLE_SECS={v} is not a number of seconds; using 300"
+                    "NUTHATCH_ENTITY_STATE_SAMPLE_SECS={v} is not a number of seconds; using 60"
                 );
-                300
+                60
             }),
-            Err(_) => 300,
+            Err(_) => 60,
         };
         (secs > 0).then(|| Duration::from_secs(secs))
     })
