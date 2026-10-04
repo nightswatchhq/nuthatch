@@ -4103,8 +4103,8 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
 }
 
 /// `GET /explain?q=…` - validate a query without executing it (RFC-0016 §3): bind it (catching
-/// unknown tables/columns/type errors, with the same enriched hints as `/sql`) but scan nothing, by
-/// wrapping it as `SELECT * FROM (<q>) LIMIT 0`. An agent checks a query's shape before spending a
+/// unknown tables/columns/type errors, with the same enriched hints as `/sql`) but scan nothing: the
+/// statement is planned and not run. An agent checks a query's shape before spending a
 /// concurrency slot on the real thing. Returns `{valid:true}` or the enriched error.
 async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoResponse {
     use crate::metrics::METRICS;
@@ -4132,9 +4132,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         }
     };
     let dir = s.dir.clone();
-    // Bind-only: the LIMIT 0 wrapper forces the planner to resolve every table/column/type without
-    // materialising rows. A CTE (`WITH …`) is legal inside the subquery, so this covers both shapes.
-    let probe = format!("SELECT * FROM ({}) AS _explain LIMIT 0", q.q);
+    let query = q.q.clone();
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
     let sql_max_hot_bytes = s.sql_max_hot_bytes;
@@ -4142,7 +4140,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     let declared_entities = s.entities.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        // The `LIMIT 0` probe stops DuckDB materialising result rows, but the tip is still parsed
+        // Planning materialises no result rows, but the tip is still parsed
         // into temp tables first - so `/explain` carries the full scan cost. Without the same
         // ceiling `/sql` enforces, an endpoint reachable by anyone who can reach `/sql` could push
         // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
@@ -4186,9 +4184,9 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
             hot.insert(entity.name().to_string(), entity.rows_as_json());
         }
         let sealed_through = store.sealed_through();
-        let mut out = analytics::query_hot_cold(
+        let mut out = analytics::plan_hot_cold(
             &dir,
-            &probe,
+            &query,
             analytics::QueryGuard {
                 timeout: SQL_TIMEOUT,
                 max_rows: 1,
@@ -7931,8 +7929,8 @@ mod tests {
 
     /// No request handler may reach the tip through the unbounded scan (#293).
     ///
-    /// `/sql` has always been bounded; `/explain` was not, and because the `LIMIT 0` probe hides
-    /// the cost — no rows come back — the gap was invisible from the outside while still parsing
+    /// `/sql` has always been bounded; `/explain` was not, and because it returns no rows
+    /// the gap was invisible from the outside while still parsing
     /// the whole tip into temp tables. The cap itself is 2,000,000 rows, far too many to
     /// materialise in a test, so the invariant is checked where it is actually expressible: no
     /// handler in this file calls the unbounded variant at all.
@@ -8117,6 +8115,63 @@ mod tests {
             v.get("valid").is_none(),
             "/explain must omit `valid` on refusal: {v}"
         );
+    }
+
+    /// #1775: `/explain` plans the statement `/sql` runs. It used to wrap it in a derived table,
+    /// where an ORDER BY on a column its own alias shadows binds as ambiguous: the allocations
+    /// nest's `indexer.delegators_page`, reduced.
+    #[tokio::test]
+    async fn explain_plans_what_sql_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state
+            .store
+            .put_entity(
+                "k1",
+                &json!({"table": "t", "block_number": 1, "who": "a", "n": "5"}).to_string(),
+            )
+            .unwrap();
+        let statement = "SELECT p.who, CAST(p.n AS VARCHAR) AS n FROM t p ORDER BY p.n DESC, p.who";
+        let q = || {
+            Query(SqlQuery {
+                q: statement.into(),
+                max_rows: None,
+            })
+        };
+        // What /sql runs, called below the handler: its memo is process-global, and an answer left
+        // there breaks a neighbour that counts the entries.
+        let hot = state.store.hot_rows_by_table_bounded(10).unwrap();
+        let guard = crate::analytics::QueryGuard {
+            timeout: SQL_TIMEOUT,
+            max_rows: SQL_MAX_ROWS,
+        };
+        crate::analytics::query_hot_cold(tmp.path(), statement, guard, &hot, 0, &[])
+            .expect("premise: /sql answers it");
+
+        let resp = explain(State(state.clone()), q()).await.into_response();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "/explain body: {v}");
+        assert_eq!(v["valid"], json!(true), "{v}");
+
+        // Planned, not run: a statement that binds and fails only on its rows is valid.
+        let dies = || {
+            Query(SqlQuery {
+                q: "SELECT CAST(who AS INTEGER) AS n FROM t".into(),
+                max_rows: None,
+            })
+        };
+        let resp = sql(State(state.clone()), dies()).await.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "premise: it dies running"
+        );
+        let resp = explain(State(state), dies()).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "/explain ran the statement");
     }
 
     /// RFC-0010 Part A: the admin UI serves when enabled and 404s when disabled (`--no-admin` or a
