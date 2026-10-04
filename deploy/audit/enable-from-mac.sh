@@ -41,9 +41,14 @@ done
 for u in ${todo[@]+"${todo[@]}"}; do
   f=${file[$u]} p=${port[$u]}
   cp "$f" "$f.bak-audit"
-  sed -i -E "/^ExecStart=\//s#\$# $flags#" "$f"
-  systemctl daemon-reload
-  systemctl restart "$u"
+  # Rewritten in bash, so the endpoint never passes through sed's replacement syntax.
+  tmp=$(mktemp)
+  while IFS= read -r l || [ -n "$l" ]; do
+    case $l in ExecStart=/*) printf '%s %s\n' "$l" "$flags" ;; *) printf '%s\n' "$l" ;; esac
+  done <"$f" >"$tmp"
+  cat "$tmp" >"$f"; rm -f "$tmp"
+  systemctl daemon-reload || true
+  systemctl restart "$u" || true
   ready=""
   for i in $(seq 1 60); do
     if curl -sf -m 3 "http://127.0.0.1:$p/ready" | grep -q '"ready":true'; then ready=1; break; fi
