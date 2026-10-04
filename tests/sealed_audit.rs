@@ -183,3 +183,15 @@ async fn a_range_over_the_log_budget_is_compared_only_as_far_as_it_was_fetched()
     assert_eq!(r.mismatches(), 0, "{r:?}");
     assert_eq!(r.sealed_rows as u64, held * 400);
 }
+
+#[tokio::test]
+async fn a_range_inside_one_segment_compares_only_its_own_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = seal_from(dir.path(), &tape(false, 0)).await;
+    let auditor = Auditor::new(dir.path(), &cfg).unwrap();
+    let r = audit_range(dir.path(), &auditor, &tape(false, 0), 10, 19)
+        .await
+        .unwrap();
+    assert_eq!((r.sealed_rows, r.endpoint_rows), (20, 20), "{r:?}");
+    assert_eq!(r.mismatches(), 0, "{r:?}");
+}

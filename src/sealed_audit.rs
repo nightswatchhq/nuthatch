@@ -167,10 +167,7 @@ pub async fn audit_range(
     let to = covered.min(to);
 
     let mut served: BTreeMap<RowKey, String> = BTreeMap::new();
-    for log in logs
-        .iter()
-        .filter(|l| (from..=to).contains(&l.block_number))
-    {
+    for log in &logs {
         if let Ok(Some(row)) = auditor.registry.decode(log) {
             if auditor.audits(&row.table) {
                 served.insert((row.block_number, row.log_index), canonical(&row));
