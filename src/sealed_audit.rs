@@ -18,7 +18,7 @@ use std::time::Duration;
 pub const DEFAULT_SPAN: u64 = 1_000;
 /// Ranges the background audit samples a day.
 pub const DEFAULT_PER_DAY: u64 = 24;
-/// Logs held for one sample. A denser range is audited up to the block where the budget ran out.
+/// Rows held on each side for one sample. A denser range is audited up to where it ran out.
 pub const SAMPLE_LOG_BUDGET: usize = 20_000;
 /// Rows of each kind a mismatch report names; the counts are always complete.
 const NAMED_ROWS: usize = 10;
@@ -71,8 +71,8 @@ impl Auditor {
 #[derive(Debug)]
 pub struct RangeReport {
     pub from: u64,
-    /// The last block compared. Below `requested_to` when the range held more than
-    /// [`SAMPLE_LOG_BUDGET`] logs.
+    /// The last block compared. Below `requested_to` when either side held more than
+    /// [`SAMPLE_LOG_BUDGET`] rows.
     pub to: u64,
     pub requested_to: u64,
     pub endpoint_rows: usize,
@@ -93,8 +93,17 @@ impl RangeReport {
     /// The lines an operator reads: one summary, then up to [`NAMED_ROWS`] rows of each kind.
     pub fn describe(&self, endpoint: &str) -> Vec<String> {
         let truncated = if self.to < self.requested_to {
+            let whole = if self.sealed_rows.max(self.endpoint_rows) > SAMPLE_LOG_BUDGET {
+                format!(
+                    "; block {} alone holds more and was compared whole",
+                    self.to
+                )
+            } else {
+                String::new()
+            };
             format!(
-                " (stopped at {} of {}: the range held more than {SAMPLE_LOG_BUDGET} logs)",
+                " (stopped at {} of {}: the range held more than {SAMPLE_LOG_BUDGET} rows on one \
+                 side{whole})",
                 self.to, self.requested_to
             )
         } else {
@@ -179,12 +188,15 @@ pub async fn audit_range(
         // A sweep in another process may fold a provisional segment away between reading the
         // catalogue and opening the file; the second read sees the catalogue that replaced it.
         move || {
-            sealed_rows(&dir, &schema, from, to).or_else(|_| sealed_rows(&dir, &schema, from, to))
+            sealed_rows(&dir, &schema, from, to, SAMPLE_LOG_BUDGET)
+                .or_else(|_| sealed_rows(&dir, &schema, from, to, SAMPLE_LOG_BUDGET))
         }
     };
-    let (sealed, duplicates) = tokio::task::spawn_blocking(read)
+    let (sealed, duplicates, to) = tokio::task::spawn_blocking(read)
         .await
         .context("the sealed read panicked")??;
+    // A sealed side cut short is compared only as far as it reached.
+    served.split_off(&(to + 1, 0));
 
     let mut report = RangeReport {
         from,
@@ -213,18 +225,23 @@ pub async fn audit_range(
     Ok(report)
 }
 
-/// The audited tables' sealed rows in `from..=to`, read one segment at a time. A second sealed row
-/// for one log is returned apart, since no endpoint can serve it twice.
+/// The audited tables' sealed rows in `from..=to`, and the last block they cover. Held to `budget`
+/// rows in whole blocks the way the endpoint's answer is: past it, the range ends at the last
+/// block that fits, or at the first block when that block alone is over, which is kept whole. A
+/// second sealed row for one log is returned apart, since no endpoint can serve it twice.
 fn sealed_rows(
     dir: &Path,
     schema: &[TableSchema],
     from: u64,
     to: u64,
-) -> Result<(BTreeMap<RowKey, String>, Vec<String>)> {
+    budget: usize,
+) -> Result<(BTreeMap<RowKey, String>, Vec<String>, u64)> {
     let _lease = crate::seal::read_lease(dir);
     let manifest = crate::seal::load_manifest(dir)?;
-    let mut rows = BTreeMap::new();
-    let mut duplicates = Vec::new();
+    let mut rows: BTreeMap<RowKey, String> = BTreeMap::new();
+    let mut duplicates: Vec<(u64, String)> = Vec::new();
+    let end = std::cell::Cell::new(to);
+    let want = |block: u64| block >= from && block <= end.get();
     for table in schema {
         let Some(segments) = manifest.tables.get(&table.table) else {
             continue;
@@ -233,15 +250,29 @@ fn sealed_rows(
             .iter()
             .filter(|s| s.from_block <= to && s.to_block >= from)
         {
-            for row in crate::seal::read_segment_decoded_in(dir, segment, table, from..=to)? {
+            crate::seal::visit_segment_rows(dir, segment, table, Some(&want), &mut |row| {
                 let key = (row.block_number, row.log_index);
                 if let Some(earlier) = rows.insert(key, canonical(&row)) {
-                    duplicates.push(earlier);
+                    duplicates.push((key.0, earlier));
                 }
-            }
+                let first = rows.keys().next().map_or(key.0, |k| k.0);
+                let newest = rows.keys().next_back().map_or(key.0, |k| k.0);
+                // One block on its own is never cut, so there is nothing to look for until a second.
+                if rows.len() + duplicates.len() > budget && first < newest {
+                    let over = rows.keys().nth(budget).map_or(key.0, |k| k.0);
+                    let last = if first < over { over - 1 } else { over };
+                    if last < end.get() {
+                        rows.split_off(&(last + 1, 0));
+                        duplicates.retain(|(block, _)| *block <= last);
+                        end.set(last);
+                    }
+                }
+                Ok(())
+            })?;
         }
     }
-    Ok((rows, duplicates))
+    let duplicates = duplicates.into_iter().map(|(_, row)| row).collect();
+    Ok((rows, duplicates, end.get()))
 }
 
 /// The sealed block range, and the audited tables' segments with their row counts.
@@ -658,28 +689,91 @@ events = ["Transfer"]
         auditor
     }
 
-    #[test]
-    fn a_small_sample_of_a_large_segment_decodes_only_its_own_rows() {
+    /// One segment holding `per_block[i]` transfers in block `1 + i`.
+    fn seal_dense(d: &Path, auditor: &Auditor, per_block: &[u64]) {
+        let mut rows = Vec::new();
+        for (i, &n) in per_block.iter().enumerate() {
+            for log_index in 0..n {
+                let log = crate::rpc::Log {
+                    log_index,
+                    ..transfer_at(auditor, 1 + i as u64)
+                };
+                rows.push(
+                    auditor
+                        .registry
+                        .decode(&log)
+                        .unwrap()
+                        .unwrap()
+                        .to_json()
+                        .to_string(),
+                );
+            }
+        }
+        crate::seal::seal_range(d, &rows, 1, per_block.len() as u64).unwrap();
+        let segments = crate::seal::load_manifest(d).unwrap().tables;
+        assert_eq!(segments.values().flatten().count(), 1, "one large segment");
+    }
+
+    #[tokio::test]
+    async fn a_small_sample_of_a_large_segment_decodes_only_its_own_rows() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let auditor = nest(d, "");
-        let rows: Vec<String> = (0..100_000u64)
-            .map(|i| {
-                let log = crate::rpc::Log {
-                    log_index: i % 10,
-                    ..transfer_at(&auditor, 1 + i / 10)
-                };
-                let row = auditor.registry.decode(&log).unwrap().unwrap();
-                row.to_json().to_string()
-            })
-            .collect();
-        crate::seal::seal_range(d, &rows, 1, 10_000).unwrap();
-        let segments = crate::seal::load_manifest(d).unwrap().tables;
-        assert_eq!(segments.values().flatten().count(), 1, "one large segment");
-
-        let (sealed, _) = sealed_rows(d, &auditor.schema, 5_000, 5_009).unwrap();
-        assert_eq!(sealed.len(), 100);
+        seal_dense(d, &auditor, &[10; 10_000]);
+        let r = audit_range(d, &auditor, &Serves(vec![]), 5_000, 5_009)
+            .await
+            .unwrap();
+        assert_eq!(r.sealed_rows, 100);
         assert_eq!(crate::seal::test_rows_materialised(d), 100);
+    }
+
+    #[tokio::test]
+    async fn a_silent_endpoint_over_a_dense_range_holds_the_budget_and_says_it_was_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let auditor = nest(d, "");
+        seal_dense(d, &auditor, &[100; 1_000]);
+        let r = audit_range(d, &auditor, &Serves(vec![]), 1, 1_000)
+            .await
+            .unwrap();
+        let held = SAMPLE_LOG_BUDGET as u64 / 100;
+        assert_eq!(
+            (r.to, r.requested_to),
+            (held, 1_000),
+            "{}",
+            r.describe("x")[0]
+        );
+        assert_eq!(r.sealed_rows, SAMPLE_LOG_BUDGET);
+        assert_eq!(r.sealed_only.len(), SAMPLE_LOG_BUDGET);
+        assert!(r.endpoint_only.is_empty() && r.differing.is_empty());
+        assert!(crate::seal::test_rows_materialised(d) <= SAMPLE_LOG_BUDGET + 100);
+        let line = &r.describe("x")[0];
+        assert!(
+            line.contains(&format!("stopped at {held} of 1000")),
+            "{line}"
+        );
+        assert!(!line.contains("alone"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_block_over_the_budget_on_its_own_is_compared_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let auditor = nest(d, "");
+        let big = SAMPLE_LOG_BUDGET as u64 + 5_000;
+        seal_dense(d, &auditor, &[big, 10, 10]);
+        let r = audit_range(d, &auditor, &Serves(vec![]), 1, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.to, r.sealed_rows),
+            (1, big as usize),
+            "{}",
+            r.describe("x")[0]
+        );
+        let line = &r.describe("x")[0];
+        assert!(line.contains("stopped at 1 of 3"), "{line}");
+        assert!(line.contains("block 1 alone"), "{line}");
     }
 
     #[test]
@@ -782,7 +876,8 @@ events = ["Transfer"]
         crate::seal::seal_range(d, &[json(&row)], 10, 10).unwrap();
         crate::seal::seal_range(d, &[json(&row), json(&next)], 10, 11).unwrap();
 
-        let (rows, duplicates) = sealed_rows(d, &auditor.schema, 0, 20).unwrap();
+        let (rows, duplicates, _) =
+            sealed_rows(d, &auditor.schema, 0, 20, SAMPLE_LOG_BUDGET).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(duplicates, vec![canonical(&row)]);
 

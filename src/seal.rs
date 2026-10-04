@@ -771,31 +771,27 @@ pub fn read_segment_decoded(
     segment: &Segment,
     schema: &crate::registry::TableSchema,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
-    read_segment_filtered(dir, segment, schema, None)
+    let mut out = Vec::new();
+    visit_segment_rows(dir, segment, schema, None, &mut |row| {
+        out.push(row);
+        Ok(())
+    })?;
+    Ok(out)
 }
 
-/// [`read_segment_decoded`], keeping only rows whose block is in `blocks`. Each record batch is
-/// filtered before its rows are decoded, so a sample inside a large segment holds its own rows and
-/// one batch, not the segment. Row groups are not pruned: a segment is one row group below the
-/// writer's 1,048,576-row default, which no seal cut reaches.
-pub fn read_segment_decoded_in(
+/// Hand `visit` one segment's rows, one at a time, decoding only those whose block `want` accepts.
+/// `want` is asked per row, so a caller may narrow it as it goes, and a sample inside a large
+/// segment holds only what it keeps. Row groups are not pruned: a segment is one row group below
+/// the writer's 1,048,576-row default, which no seal cut reaches.
+pub fn visit_segment_rows(
     dir: &Path,
     segment: &Segment,
     schema: &crate::registry::TableSchema,
-    blocks: std::ops::RangeInclusive<u64>,
-) -> Result<Vec<crate::registry::DecodedRow>> {
-    read_segment_filtered(dir, segment, schema, Some(blocks))
-}
-
-fn read_segment_filtered(
-    dir: &Path,
-    segment: &Segment,
-    schema: &crate::registry::TableSchema,
-    blocks: Option<std::ops::RangeInclusive<u64>>,
-) -> Result<Vec<crate::registry::DecodedRow>> {
+    want: Option<&dyn Fn(u64) -> bool>,
+    visit: &mut dyn FnMut(crate::registry::DecodedRow) -> Result<()>,
+) -> Result<()> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let mut out = Vec::new();
     let path = segment_path(dir, &segment.file, &segment.hash);
     let file = std::fs::File::open(&path)
         .with_context(|| format!("opening sealed segment {}", path.display()))?;
@@ -805,7 +801,7 @@ fn read_segment_filtered(
         .with_context(|| format!("reading sealed segment {}", path.display()))?;
     for batch in reader {
         let batch = batch.with_context(|| format!("decoding sealed segment {}", path.display()))?;
-        let block_numbers = match &blocks {
+        let block_numbers = match want {
             Some(_) => Some(
                 batch
                     .column_by_name("block_number")
@@ -817,8 +813,8 @@ fn read_segment_filtered(
             None => None,
         };
         for row in 0..batch.num_rows() {
-            if let (Some(range), Some(numbers)) = (&blocks, block_numbers) {
-                if !range.contains(&numbers.value(row)) {
+            if let (Some(want), Some(numbers)) = (want, block_numbers) {
+                if !want(numbers.value(row)) {
                     continue;
                 }
             }
@@ -853,15 +849,15 @@ fn read_segment_filtered(
                 };
                 stored.insert(field.name().clone(), value);
             }
-            out.push(
-                crate::registry::DecodedRow::from_stored(&Value::Object(stored), schema)
-                    .with_context(|| format!("row {row} of sealed segment {}", path.display()))?,
-            );
             #[cfg(test)]
             note_materialised(dir);
+            visit(
+                crate::registry::DecodedRow::from_stored(&Value::Object(stored), schema)
+                    .with_context(|| format!("row {row} of sealed segment {}", path.display()))?,
+            )?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
