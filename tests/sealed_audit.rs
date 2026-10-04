@@ -153,3 +153,33 @@ async fn a_log_that_decodes_differently_is_reported_as_differing() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_range_over_the_log_budget_is_compared_only_as_far_as_it_was_fetched() {
+    let dense = || {
+        let tape = TapeSource::new();
+        let (a1, a2) = (account(1), account(2));
+        for b in 1..=60u64 {
+            let transfers: Vec<(&str, &str, u128)> = (0..400)
+                .map(|i| (a1.as_str(), a2.as_str(), (1_000 * b + i) as u128))
+                .collect();
+            tape.insert_block(
+                b,
+                transfers_block(b, 0, 1_700_000_000 + b, USDC, &transfers),
+            );
+        }
+        tape.advance_tip_to(60);
+        tape.advance_finalized_to(60);
+        tape
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = seal_from(dir.path(), &dense()).await;
+    let auditor = Auditor::new(dir.path(), &cfg).unwrap();
+    let r = audit_range(dir.path(), &auditor, &dense(), 1, 60)
+        .await
+        .unwrap();
+    let held = nuthatch::sealed_audit::SAMPLE_LOG_BUDGET as u64 / 400;
+    assert_eq!((r.from, r.to, r.requested_to), (1, held, 60), "{r:?}");
+    assert_eq!(r.mismatches(), 0, "{r:?}");
+    assert_eq!(r.sealed_rows as u64, held * 400);
+}
