@@ -919,8 +919,6 @@ impl RpcClient {
 
     fn mark_healthy(&self, j: usize) {
         self.health[j].store(0, Ordering::Relaxed);
-        self.limited[j].store(0, Ordering::Relaxed);
-        self.throttled[j].store(false, Ordering::Relaxed);
     }
 
     /// A 429 cools the endpoint like any failure. One that said when to come back is not asked again
@@ -955,14 +953,15 @@ impl RpcClient {
     }
 
     /// Every endpoint is resting on a retry hint: wait for the soonest, then try them soonest first.
-    /// The wait is bounded by [`MAX_RETRY_HINT`], so a throttled pool slows the run and never spins.
+    /// A rest is clamped to [`MAX_RETRY_HINT`] when set, so a throttled pool slows the run and never
+    /// spins, nor stops.
     async fn wait_out_rate_limits(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.urls.len()).collect();
         order.sort_by_key(|&j| self.limited[j].load(Ordering::Relaxed));
         let wait = self.limited[order[0]]
             .load(Ordering::Relaxed)
             .saturating_sub(now_millis());
-        let wait = Duration::from_millis(wait).min(MAX_RETRY_HINT);
+        let wait = Duration::from_millis(wait);
         tracing::warn!(
             "every RPC endpoint ({}) is rate-limiting us; waiting {wait:?} as asked before trying \
              again",
@@ -4348,6 +4347,59 @@ mod rfc0036_tests {
         }
         hp.abort();
         hc.abort();
+    }
+
+    /// #1853: a 429 tried after the capped endpoint used to be the verdict, so the window never
+    /// narrowed and the same range went round for as long as the run lasted.
+    #[tokio::test]
+    async fn a_throttled_endpoint_does_not_hide_another_endpoints_cap() {
+        let (throttled, ht, _) = answering(429, NODIES_THROTTLED).await;
+        let (capped, hc, _) = answering(200, NODIES_CAPPED).await;
+        for urls in [
+            vec![throttled.clone(), capped.clone()],
+            vec![capped.clone(), throttled.clone()],
+        ] {
+            let err = RpcClient::new(urls)
+                .unwrap()
+                .get_logs(&["0xa0b8".into()], &[], 6_082_525, 6_082_604)
+                .await
+                .unwrap_err();
+            assert!(
+                crate::chunker::is_result_too_large(&err),
+                "the cap was lost: {err:#}"
+            );
+        }
+        ht.abort();
+        hc.abort();
+    }
+
+    /// A pool that is all resting waits for the soonest, and an hour's `Retry-After` is held to the cap.
+    #[tokio::test]
+    async fn a_pool_resting_on_a_long_retry_after_waits_no_longer_than_the_cap() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+        async fn hour() -> impl IntoResponse {
+            (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "3600")], "")
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().route("/", post(hour))).await;
+        });
+        let c = RpcClient::new(vec![format!("http://{addr}/")]).unwrap();
+        let pauses = RETRY_PAUSES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                assert!(c.block_number().await.is_err());
+                assert!(c.block_number().await.is_err());
+                RETRY_PAUSES.with(|p| p.borrow().clone())
+            })
+            .await;
+        server.abort();
+        assert_eq!(c.request_count(), 2);
+        assert_eq!(pauses.len(), 1, "{pauses:?}");
+        assert!(
+            pauses[0] <= MAX_RETRY_HINT && pauses[0] > MAX_RETRY_HINT - Duration::from_secs(5),
+            "{pauses:?}"
+        );
     }
 
     /// When every endpoint is pruned no retry can help, so the verdict says so, names them all, and
