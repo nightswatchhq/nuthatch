@@ -1168,6 +1168,38 @@ mod tests {
         assert!(!v.is_current(101), "it has not folded 101");
     }
 
+    /// #1834: the walk runs once per interval, not per batch, so the second window leaves the reading
+    /// where the first put it until an explicit sample takes a new one.
+    #[test]
+    fn the_state_size_is_sampled_once_per_interval_not_per_batch() {
+        let reg = registry();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 1_000, false).unwrap();
+        assert_eq!(v.state_bytes(), None, "nothing folded, nothing sampled");
+
+        let first = decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 100, 0)]);
+        v.apply_window(&first, 1, 100).unwrap();
+        v.flush();
+        let after_first = v.state_bytes().expect("the first change is sampled");
+
+        let more: Vec<Log> = (0..200)
+            .map(|i| log(TRANSFER_TOPIC0, ALICE, BOB, "1", 101, i))
+            .collect();
+        v.apply_window(&decode(&reg, &more), 1, 101).unwrap();
+        v.flush();
+        assert_eq!(
+            v.state_bytes(),
+            Some(after_first),
+            "resampled inside the interval"
+        );
+
+        let (now, _) = v.sample_state().unwrap();
+        assert!(
+            now > after_first,
+            "200 more facts in the trace: {now} vs {after_first}"
+        );
+        assert_eq!(v.state_bytes(), Some(now));
+    }
+
     #[test]
     fn a_reorg_retracts_at_minus_one_and_converges_on_the_replacement() {
         // §5.2: removed rows are fed at -1 before deletion, replacements arrive at +1.
