@@ -342,9 +342,9 @@ pub struct TableScan {
 /// The source-byte bound a declared query was admitted against (RFC-0048 §3 Phase 0).
 ///
 /// Taken from the physical plan of the connection that runs the statement, after its hot rows are
-/// loaded, so it describes the plan that executes. DuckDB names each Parquet scan but not the files
-/// behind it, so every scan is charged the widest reachable table: a self-join pays twice, and no
-/// scan can be charged less than the table it might be reading.
+/// loaded, so it describes the plan that executes. The plan is read for how many cold scans it has,
+/// not which files each reads, so every scan is charged the widest reachable table: a self-join pays
+/// twice, and no scan can be charged less than the table it might be reading.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ScanBound {
     /// sha256 of the `manifest.json` bytes the views were built from; `None` before any seal.
@@ -742,7 +742,7 @@ enum Attempt {
     DiedExecuting {
         error: anyhow::Error,
         /// The base tables the query named, lowercased - the reachability bound on the sweep. `None`
-        /// when DuckDB could not serialize the statement, i.e. when we do not know what it reached;
+        /// when the statement would not parse for its tables, i.e. when we do not know what it reached;
         /// see `run` for why that skips the sweep rather than widening it.
         tables: Option<std::collections::BTreeSet<String>>,
     },
@@ -765,7 +765,7 @@ fn test_first_attempt_delays() -> &'static Mutex<HashMap<PathBuf, u64>> {
     DELAYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// #1162 reproduction: a segment file to remove *after* the plan has named it and *before* DuckDB
+/// #1162 reproduction: a segment file to remove *after* the plan has named it and *before* the engine
 /// executes - the window a seal's fold cleanup lands in on a live nest.
 #[cfg(test)]
 fn test_remove_after_define() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
@@ -804,13 +804,6 @@ pub(crate) fn test_set_remove_after_define(dir: &Path, file: Option<PathBuf>) {
     }
 }
 
-/// The plan named a segment file that was gone by the time DuckDB opened it. On a live nest that is a
-/// seal folding a provisional segment: the new file is written, the manifest installed, the old file
-/// removed - and a query that planned against the old manifest a moment earlier is still holding the
-/// old name (#1162, three of ~40 queries during one backfill). DuckDB reports it at prepare
-/// ("No files found that match the pattern") or at execution ("Cannot open file"), always naming a
-/// path under the segments directory; nothing else on this surface produces either wording with that
-/// path in it.
 /// Interrupt handles of the Burrmill statements running now, so a shutdown can stop them rather than
 /// drain behind them.
 type LiveHandles = Mutex<Vec<(u64, PathBuf, Arc<dyn Interrupt>)>>;
@@ -884,16 +877,18 @@ impl std::fmt::Display for SegmentSetChanged {
 
 impl std::error::Error for SegmentSetChanged {}
 
+/// The plan named a segment file that was gone by the time the engine opened it. On a live nest that
+/// is a seal folding a provisional segment: the new file is written, the manifest installed, the old
+/// file removed - and a query that planned against the old manifest a moment earlier is still holding
+/// the old name (#1162, three of ~40 queries during one backfill). Burrmill reports it as the object
+/// store's `not found: No such file or directory`, naming a path under the segments directory.
 fn segment_vanished(e: &anyhow::Error) -> bool {
     if e.chain().any(|c| c.is::<SegmentSetChanged>()) {
         return true;
     }
     let text = format!("{e:#}");
     let marker = format!("/{}/", crate::seal::SEGMENTS_DIR);
-    text.contains(&marker)
-        && (text.contains("No files found that match the pattern")
-            || text.contains("Cannot open file")
-            || text.contains("No such file or directory"))
+    text.contains(&marker) && text.contains("No such file or directory")
 }
 
 #[cfg(test)]
@@ -995,10 +990,10 @@ fn run(
             std::thread::sleep(Duration::from_millis(ms));
         }
     }
-    // **A segment that binds but will not read takes the whole query down** (#433). `read_parquet`
-    // validates the footer while the view is being created, which is where #430's reduction hooks in;
-    // corruption that leaves the footer intact and destroys the data region passes that probe and
-    // fails at execution instead, with `Invalid Error: don't know what type: ` and nothing named.
+    // **A segment that binds but will not read takes the whole query down** (#433). Binding a
+    // segment reads its footer, which is where #430's reduction hooks in; corruption that leaves the
+    // footer intact and destroys the data region passes that and fails at execution instead, with a
+    // Parquet decode error that names no file.
     //
     // The principle #430 established is that a bad segment *reduces* its table rather than deleting
     // it, and it should not stop holding just because the corruption is deeper in the file. So: ask
@@ -1011,8 +1006,8 @@ fn run(
     // reachability rather than by a cache is what keeps this affordable without anything that can go
     // stale (a memo keyed on mtime was tried here and was wrong; see `segments_failing_verification`).
     let Some(tables) = tables else {
-        // DuckDB would not serialize the statement, so we do not know what it reached. Sweeping
-        // everything on the strength of not knowing is how the unbounded version comes back in
+        // The statement would not parse for table references, so we do not know what it reached.
+        // Sweeping everything on the strength of not knowing is how the unbounded version comes back in
         // through the fallback; the query fails with its own error instead, which is what it did
         // before any of this existed. Loud and bounded beats quiet and expensive.
         tracing::warn!(
@@ -1078,7 +1073,7 @@ fn attempt(
     want: Want,
 ) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
-    // that opens with `-- note` or `/* … */` is still a SELECT. DuckDB gets the original text.
+    // that opens with `-- note` or `/* … */` is still a SELECT. The engine gets the original text.
     let head = strip_leading_sql_comments(sql).to_ascii_lowercase();
     if !(head.starts_with("select") || head.starts_with("with")) {
         bail!("only SELECT/WITH queries are allowed on the read-only SQL surface");
@@ -1092,20 +1087,18 @@ fn attempt(
     //   1. this leading-keyword gate rejects a *statement* that opens with INSERT/UPDATE/DELETE/COPY/
     //      ATTACH/PRAGMA/…;
     //   2. `reject_with_prefixed_dml` refuses `WITH cte AS (…) INSERT/UPDATE/DELETE/COPY …`. The
-    //      leading gate accepts any `WITH`. The previous comment claimed DuckDB would not parse
-    //      DML after a CTE list; that is DuckDB's choice, not ours, and it is the same class of
-    //      claim as "`conn.prepare` is single-statement", which was false;
-    //   3. `reject_statement_stacking` refuses a `;`-stacked second statement. This used to say
-    //      "`conn.prepare` is single-statement" - it is NOT (the bundled duckdb-rs prepares AND runs
-    //      `SELECT 1; INSERT …`), which made a stacked `COPY … TO` an arbitrary file write. See that
-    //      function's docs;
-    //   4. the connection is a fresh in-memory instance whose only tables are read-only views over
-    //      Parquet plus an ephemeral hot temp table, so even a hypothetical write has no durable target.
+    //      leading gate accepts any `WITH`. Whether the engine would parse DML after a CTE list is
+    //      the engine's choice, not ours;
+    //   3. `reject_statement_stacking` refuses a `;`-stacked second statement. The DuckDB binding
+    //      nuthatch once bundled ran `SELECT 1; INSERT …` in one prepare, which made a stacked
+    //      `COPY … TO` an arbitrary file write. See that function's docs;
+    //   4. the session is a fresh in-memory engine whose only tables are read-only views over
+    //      Parquet plus ephemeral hot rows, and Burrmill refuses DDL, DML and COPY before planning.
     // `COPY … TO` (a file write) must *lead* the statement or follow a CTE list, which (1) and (2) block.
-    // SEC-2: refuse DuckDB filesystem/network table functions (`read_text`, `glob`, …) - they read
-    // files from inside a plain SELECT, past the keyword gate, and would otherwise leak any file the
-    // process can read (e.g. `nuthatch.toml`'s secrets). This is the primary control; the
-    // `allowed_directories` lockdown below is defense-in-depth and, as of #289, actually enforced.
+    // SEC-2: refuse filesystem/network table functions (`read_text`, `glob`, …, by DuckDB's names) -
+    // they read files from inside a plain SELECT, past the keyword gate, and would otherwise leak any
+    // file the process can read (e.g. `nuthatch.toml`'s secrets). Burrmill implements none of them and
+    // refuses table functions it does not know; this denylist does not rely on that.
     reject_with_prefixed_dml(sql)?;
     reject_statement_stacking(sql)?;
     reject_file_access(sql)?;
@@ -1113,26 +1106,23 @@ fn attempt(
 
     // **The allowlist, and the control that is meant to outlive the others** (audit finding 5).
     //
-    // Everything above enumerates what is *forbidden*, over a vocabulary DuckDB grows every release.
-    // That approach has now been wrong twice: about spelling (`"read_csv"(…)` slipped past a check
-    // that expected `(` after whitespace) and about coverage (`read_xlsx`, `st_read`, `iceberg_scan`
-    // and friends were never listed and are inert only because those extensions are not bundled).
-    // Both failures are silent, and the feedback loop is "someone exploits it".
+    // Everything above enumerates what is *forbidden*, over a vocabulary an engine grows every
+    // release. Against DuckDB that approach was wrong twice: about spelling (`"read_csv"(…)` slipped
+    // past a check that expected `(` after whitespace) and about coverage (`read_xlsx`, `st_read`,
+    // `iceberg_scan` and friends were never listed). Both failures are silent, and the feedback loop
+    // is "someone exploits it".
     //
-    // So this asks DuckDB's own parser what the query actually references and permits only what we
+    // So this asks the parser what the query actually references and permits only what we
     // recognise. A new file-reading function added upstream tomorrow is refused by default, because it
     // is not on the list of things we allow - which is the property the denylist can never have.
     //
     // Kept *beside* the denylist rather than replacing it: two independent controls that must both
     // pass, so a gap in either is covered while this one earns trust.
-    // Open with `enable_external_access=false` first (#289): `allowed_directories` is an *addition*
-    // to the allow-list when external access is on, and a restriction only when it is off. That is
-    // DuckDB's own docs, and it is why the lockdown was inert until this flag went in at startup.
     //
-    // #295: reuse the connection when the nest, watermark and exclusion set match. Hot rows still
+    // #295: reuse the session when the nest, watermark and exclusion set match. Hot rows still
     // reload below (`define_views`); new sealed segments change `sealed_through` and miss the cache.
     // Taken out of the slot for the query so an interrupt can drop it without fighting the mutex
-    // borrow; put back only if DuckDB was not cancelled underneath us.
+    // borrow; put back only if the statement was not cancelled underneath us.
     let inputs = cache_inputs(dir);
     let mut slot = session_cache_lock().remove(dir);
     let reusable = slot.as_ref().is_some_and(|c| {
@@ -1168,8 +1158,8 @@ fn attempt(
         let referenced = walked.map(|(r, _)| r);
         // Define views only for what this statement can reach (#896). `None` - an unparsed statement
         // or a shape `reachable_tables` will not vouch for - defines everything, as before.
-        // A statement that reaches into a catalogue schema, or calls one of DuckDB's own
-        // enumerating table functions, is asking *what tables exist* - so every view has to exist
+        // A statement that reaches into a catalogue schema, or calls an enumerating table function
+        // such as DuckDB's `duckdb_tables()`, is asking *what tables exist* - so every view has to exist
         // for it to answer. Those keep the old whole-nest definition; everything else is narrowed.
         let wanted = if surveys {
             None
@@ -1360,14 +1350,12 @@ fn attempt(
         truncated: over_cap,
     } = match outcome {
         Ok(v) => v,
-        // #529: the watchdog's `interrupt()` cancels whatever DuckDB phase is currently running, not
-        // just an in-flight execute - a query that gets no further than `conn.prepare` before the
-        // deadline fires still dies to it, and did so leaking DuckDB's raw "Interrupted!" text here
-        // (`Died::Binding` never checked `interrupted`, only `Died::Executing` did). Invisible under
-        // light load, where `prepare()` finishes in microseconds long before any real deadline; a
-        // heavily contended box can stall `prepare()` itself past the budget, at which point the
-        // untrusted `/sql` surface was supposed to say "query exceeded budget" and instead surfaced an
-        // internal DuckDB error string - the same class of bug this guard exists to prevent.
+        // #529: the watchdog's `interrupt()` stops whatever phase is running, not just an in-flight
+        // execute - a query that gets no further than planning before the deadline fires still dies
+        // to it, and under DuckDB did so leaking the raw "Interrupted!" text here (`Died::Binding`
+        // never checked `interrupted`, only `Died::Executing` did). Invisible under light load; a
+        // heavily contended box can stall planning past the budget, at which point the untrusted
+        // `/sql` surface must say "query exceeded budget" rather than an internal engine string.
         Err(Died::Binding(e)) => {
             if interrupted.load(Ordering::SeqCst) {
                 return Err(stopped(guard, &spilled));
@@ -1429,8 +1417,9 @@ fn strip_leading_sql_comments(sql: &str) -> &str {
     }
 }
 
-/// DuckDB table functions that read the filesystem or network - usable inside a plain SELECT, so the
-/// read-only keyword gate doesn't stop them (SEC-2). Legit `/sql` hits the per-table views, never these.
+/// Table functions that read the filesystem or network, by DuckDB's names, which is where these
+/// findings were made - usable inside a plain SELECT, so the read-only keyword gate doesn't stop them
+/// (SEC-2). Legit `/sql` hits the per-table views, never these.
 const FORBIDDEN_FNS: &[&str] = &[
     "read_text",
     "read_blob",
@@ -1448,10 +1437,9 @@ const FORBIDDEN_FNS: &[&str] = &[
     "csv_scan",
     "glob",
     "sniff_csv",
-    // **Audit finding 4**: extension-gated readers. Inert today only because those extensions are not
-    // in the bundled build - i.e. safe by build configuration rather than by policy. Bundling one, or
-    // DuckDB promoting one to core, would turn each into a live file read with no change on our side.
-    // The AST allowlist already refuses them; listing them keeps the two controls agreeing.
+    // **Audit finding 4**: extension-gated readers, which were inert under DuckDB only because their
+    // extensions were not bundled - safe by build configuration rather than by policy. The AST
+    // allowlist already refuses them; listing them keeps the two controls agreeing.
     "read_xlsx",
     "st_read",
     "st_readosm",
@@ -1462,10 +1450,10 @@ const FORBIDDEN_FNS: &[&str] = &[
     "sqlite_scan",
     "mysql_scan",
     "mysql_query",
-    // **Audit finding 2**: environment disclosure. Measured on an untrusted `/sql`, these return the
-    // absolute `secret_directory` (which embeds the OS username), the temp and extension directories,
-    // and the exact state of the sandbox. Not a file read - free reconnaissance for someone looking
-    // for one, and there is no legitimate reason a nest query needs them.
+    // **Audit finding 2**: environment disclosure. Measured on an untrusted `/sql` under DuckDB, these
+    // returned the absolute `secret_directory` (which embeds the OS username), the temp and extension
+    // directories, and the exact state of the sandbox. Not a file read - free reconnaissance for
+    // someone looking for one, and there is no legitimate reason a nest query needs them.
     "duckdb_settings",
     "duckdb_extensions",
     "duckdb_secrets",
@@ -1508,13 +1496,13 @@ fn strip_all_sql_comments(sql: &str) -> String {
 ///
 /// The leading-keyword gate accepts any statement that opens with `WITH`. A CTE list is only
 /// prefix; the actual statement follows the last `AS (subquery)`. That statement must be SELECT
-/// (or VALUES / TABLE, which DuckDB treats as a query). Anything else is DML or DDL riding a
+/// (or VALUES / TABLE, which SQL treats as a query). Anything else is DML or DDL riding a
 /// prefix the keyword gate already blessed.
 ///
 /// String-literal and identifier aware, same as [`reject_statement_stacking`]: `WITH t AS
 /// (SELECT 'INSERT') SELECT 1` is a query, `WITH t AS (SELECT 1) INSERT INTO t SELECT 1` is not.
 /// Comments are stripped first. A CTE list we cannot parse is refused rather than handed to
-/// DuckDB - fail closed, the same direction as a `;` inside an unparsed `$$` block.
+/// the engine - fail closed, the same direction as a `;` inside an unparsed `$$` block.
 fn reject_with_prefixed_dml(sql: &str) -> Result<()> {
     let cleaned = strip_all_sql_comments(sql);
     let head = cleaned.trim_start();
@@ -1551,7 +1539,8 @@ fn sql_keyword_at(s: &str, kw: &str) -> bool {
 }
 
 fn sql_ident_cont(c: char) -> bool {
-    // DuckDB takes unquoted non-ASCII identifiers (`abéé`), so this must too.
+    // The DuckDB dialect the engine parses takes unquoted non-ASCII identifiers (`abéé`), so this
+    // must too.
     c.is_alphanumeric() || c == '_'
 }
 
@@ -1654,8 +1643,8 @@ fn skip_balanced_parens(s: &str) -> Option<&str> {
 ///
 /// The read-only story used to rest on three layers, and the second one did not exist:
 ///   1. the leading-keyword gate inspects only the FIRST statement, so `SELECT 1; COPY …` sails past it;
-///   2. `conn.prepare` was documented as single-statement. **It is not.** The bundled duckdb-rs prepares
-///      `SELECT 1; INSERT INTO t VALUES (99)` happily and *executes the INSERT*;
+///   2. `conn.prepare` was documented as single-statement. **It was not.** The duckdb-rs bundled then
+///      prepared `SELECT 1; INSERT INTO t VALUES (99)` happily and *executed the INSERT*;
 ///   3. the in-memory connection has no durable tables - but `COPY … TO 'path'` and `ATTACH 'path'`
 ///      write to the filesystem regardless of what the connection holds.
 ///
@@ -1663,9 +1652,10 @@ fn skip_balanced_parens(s: &str) -> Option<&str> {
 /// `SELECT 1; COPY (SELECT 1) TO '/home/user/.zshrc'` wrote the file. Verified end-to-end through
 /// `query` before this guard existed.
 ///
-/// So statement stacking is now rejected here, in our own code, rather than delegated to a DuckDB
-/// behaviour we do not control. A trailing `;` (with only whitespace after it) is fine - that is how
-/// people habitually end a query - but anything following one is refused.
+/// So statement stacking is rejected here, in our own code, rather than delegated to an engine
+/// behaviour we do not control; Burrmill also refuses a second statement, and this does not rely on
+/// it. A trailing `;` (with only whitespace after it) is fine - that is how people habitually end a
+/// query - but anything following one is refused.
 ///
 /// String-literal aware, because `SELECT ';'` is a perfectly legal query. Single quotes with `''`
 /// escaping and double-quoted identifiers are both tracked. Dollar-quoting is NOT parsed: a `;` inside
@@ -1711,22 +1701,21 @@ fn reject_statement_stacking(sql: &str) -> Result<()> {
 /// file, open a socket, or leak the environment.
 pub(crate) const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unnest"];
 
-/// Ask DuckDB's parser what the statement references, and refuse anything unrecognised.
-///
-/// Two rules, both derived from what the AST actually looks like (measured, not assumed):
+/// Ask the engine's parser what the statement references, and refuse anything unrecognised
+/// (Burrmill's `inspect::reach`, which carries these rules).
 ///
 /// - A **table function** must be in [`ALLOWED_TABLE_FNS`]. Quoting collapses here for free:
-///   `read_csv(…)` and `"read_csv"(…)` both parse to `TABLE_FUNCTION` with the same name, so the
-///   evasion that defeated the textual denylist is not expressible.
-/// - A **base table** must be named like an identifier. A DuckDB *replacement scan* - `FROM
-///   '/x.parquet'` - parses as a `BASE_TABLE` whose name is the path, so the AST alone does not
-///   distinguish it; requiring `[A-Za-z0-9_]` does, and no legitimate view of ours is named otherwise.
+///   `read_csv(…)` and `"read_csv"(…)` parse to the same name, so the evasion that defeated the
+///   textual denylist is not expressible.
+/// - A **base table** must be named like an identifier. A path in table position (`FROM
+///   '/x.parquet'`, a DuckDB replacement scan) is a table name to a parser; requiring `[A-Za-z0-9_]`
+///   refuses it, and no legitimate view of ours is named otherwise.
 ///
-/// Fails **open** if the parse is unavailable: `json_serialize_sql` is a DuckDB feature and this is the
-/// newer of two controls. A parse failure must not take down `/sql` while the denylist - which has
-/// guarded this surface since RFC-0008 - is still in front of it.
+/// Fails **open** if the statement will not parse: this is the newer of two controls, and a parse
+/// failure must not take down `/sql` while the denylist - which has guarded this surface since
+/// RFC-0008 - is still in front of it.
 ///
-/// Returns the **base tables the statement referenced**, lowercased (DuckDB matches identifiers
+/// Returns the **base tables the statement referenced**, lowercased (identifiers match
 /// case-insensitively), or `None` where the parse was unavailable and the answer is therefore not
 /// known. That set is the integrity sweep's reachability bound (see [`Attempt`]), and it comes from
 /// this walk rather than a second one so the two can never disagree about what a query reaches. CTE
@@ -1758,7 +1747,7 @@ fn reject_unknown_table_refs(
 ///
 /// Best-effort by design. A view whose definition cannot be re-parsed is skipped rather than treated
 /// as "could be anything" - the cost of a miss is a lost reduction on that one query (loud: the query
-/// fails with DuckDB's own error), and the cost of the other choice is the unbounded sweep coming
+/// fails with the engine's own error), and the cost of the other choice is the unbounded sweep coming
 /// back in through a fallback, which is the defect this whole change exists to remove.
 fn expand_through_views(
     session: &dyn Session,
@@ -1798,9 +1787,8 @@ fn expand_through_views(
     out
 }
 
-/// The `SELECT` inside a stored `CREATE VIEW … AS …`, which is all `json_serialize_sql` will accept
-/// (it answers `Only SELECT statements can be serialized to json!` for the whole statement - measured
-/// in the DuckDB CLI, not assumed). `None` when the text is not that shape, which skips the view.
+/// The `SELECT` inside a stored `CREATE VIEW … AS …`, the body Burrmill's `register_view` takes.
+/// `None` when the text is not that shape, which skips the view.
 pub(crate) fn view_body(create_view_sql: &str) -> Option<&str> {
     let lower = create_view_sql.to_ascii_lowercase();
     let (view, view_end) = find_keyword(&lower, "view", 0)?;
@@ -1857,14 +1845,14 @@ pub(crate) fn view_name(create_view_sql: &str) -> Option<String> {
 /// Which tables a statement can actually reach - the names it uses in table position, widened
 /// through any **authored view** among them to the base tables that view reads.
 ///
-/// This is what lets `define_views` skip the rest. Defining a view costs DuckDB a parse of SQL text
-/// carrying every one of that table's sealed segment paths, and it was being paid for all 34 tables
-/// of a nest on every request: `SELECT 1` cost 2,465 ms on a 38,428-segment nest against 263 ms on a
-/// 2,985-segment one, about 62 µs per segment, for tables the query never named (#896).
+/// This is what lets `define_views` skip the rest. Under DuckDB, defining a view cost a parse of SQL
+/// text carrying every one of that table's sealed segment paths, and it was being paid for all 34
+/// tables of a nest on every request: `SELECT 1` cost 2,465 ms on a 38,428-segment nest against
+/// 263 ms on a 2,985-segment one, about 62 µs per segment, for tables the query never named (#896).
 ///
-/// Read from `views/*.sql` **on disk** rather than from `duckdb_views()`, unlike
+/// Read from `views/*.sql` **on disk** rather than from the session's view definitions, unlike
 /// [`expand_through_views`], for two reasons: `define_nest_views` has not run yet at this point in
-/// `run`, and on a pooled connection the catalogue may still hold a *previous* request's
+/// `run`, and on a pooled session the catalogue may still hold a *previous* request's
 /// definitions. The files are the authored truth; the catalogue is a cache of it.
 ///
 /// `None` means "could not work it out", and every caller must then define everything. Returned for
@@ -1883,7 +1871,7 @@ fn reachable_tables(
 
     let mut out = referenced.clone();
     let mut frontier: Vec<String> = referenced.iter().cloned().collect();
-    // Authored files may contain cycles that DuckDB will later reject. `out`
+    // Authored files may contain cycles that the engine will later reject. `out`
     // prevents revisiting them while retaining sources at any dependency depth.
     while !frontier.is_empty() {
         let mut next = Vec::new();
@@ -1943,10 +1931,10 @@ fn table_refs_in(
 /// whitespace) a `(` after it - so a table or column merely *named* like one (e.g. `pool__glob`) is
 /// fine, while `read_text/**/('…')` and `READ_TEXT (…)` are both caught. (SEC-2, primary control.)
 pub(crate) fn reject_file_access(sql: &str) -> Result<()> {
-    // **Double quotes are removed before scanning.** DuckDB accepts a quoted function name and calls
-    // it exactly as the bare form, so `"read_csv"('/etc/passwd')` executed while sailing past a check
-    // that looked for `(` after optional *whitespace* - a quote is not whitespace. Verified against a
-    // live DuckDB during the pre-1.0 adversary pass: the quoted form returned the file's contents.
+    // **Double quotes are removed before scanning.** SQL resolves a quoted function name as the bare
+    // form, so `"read_csv"('/etc/passwd')` executed while sailing past a check that looked for `(`
+    // after optional *whitespace* - a quote is not whitespace. Verified against a live DuckDB during
+    // the pre-1.0 adversary pass: the quoted form returned the file's contents.
     //
     // Stripping is the robust fix rather than "also skip quotes when seeking `(`", because it
     // normalises every placement at once - `"read_csv"(`, `read"_"csv(`, and anything else quoting can
@@ -1978,9 +1966,10 @@ pub(crate) fn reject_file_access(sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// Refuse a DuckDB **replacement scan**: a bare string literal in table position (`FROM '/x.parquet'`,
-/// `JOIN '…'`) makes DuckDB read that file with *no function name* for [`reject_file_access`] to match,
-/// bypassing the denylist entirely. A legitimate query names a view or a subquery after FROM/JOIN, never
+/// Refuse a **replacement scan**: under DuckDB a bare string literal in table position (`FROM
+/// '/x.parquet'`, `JOIN '…'`) read that file with *no function name* for [`reject_file_access`] to
+/// match, bypassing the denylist entirely. Burrmill reads it as an unknown table; this does not rely on
+/// that. A legitimate query names a view or a subquery after FROM/JOIN, never
 /// a single-quoted string (a double-quoted identifier is fine and untouched) - so rejecting a
 /// single-quote as the first non-space token after a word-bounded FROM/JOIN closes the bypass without
 /// affecting real queries. Comments are stripped first, mirroring the denylist scan.
@@ -2851,16 +2840,15 @@ fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
 /// tables. Best-effort: a view over a table with no sealed segment yet - or a bad statement - is
 /// skipped rather than failing the whole query, warned once and named on `/ready` (#1653). Nest SQL
 /// is authored by the nest you chose to consume; it runs read-only in this ephemeral in-memory
-/// DuckDB, same trust as `/sql`.
+/// session, same trust as `/sql`.
 ///
 /// `wanted` is the same reachability set `define_views` narrows by (#896): only a view whose name is
 /// in it is (re)defined, and `None` defines every view as before. **The narrowing has to reach here
-/// too, not only the base tables, and it did not.** DuckDB binds a `CREATE OR REPLACE VIEW` eagerly,
-/// and on the pooled connection the previous request's base-table views are still in the catalogue,
-/// so every authored view bound in full on every request: each bind re-reads the footer of every
-/// segment behind every table the view touches, through the `allowed_directories` path check.
-/// Measured on the Lodestar nest (1,924 segments, 12 view files, 2026-09-06): `SELECT 1` cost
-/// 1.2 s and 32,000 `openat` calls with 640,000 `fstat`/`readlink` behind them, on a statement that
+/// too, not only the base tables, and it did not.** A view is planned when it is defined, and on the
+/// pooled session the previous request's base-table views are still in the catalogue, so every
+/// authored view bound in full on every request. Under DuckDB each bind re-read the footer of every
+/// segment behind every table the view touched. Measured on the Lodestar nest (1,924 segments, 12
+/// view files, 2026-09-06): `SELECT 1` cost 1.2 s and 32,000 `openat` calls with 640,000 `fstat`/`readlink` behind them, on a statement that
 /// reads nothing; the same statement on the same nest was 14 ms before any dashboard view had left
 /// its base tables defined. That fixed cost sat under every one of the dashboard's statements.
 /// `reachable_tables` already carries the intermediate view names in its closure, so a view a
@@ -2997,8 +2985,8 @@ fn define_offchain_views(
 }
 
 /// `stale` is true on a recorded failure, before any success, or past the declared cadence. Views
-/// are defined as each query is prepared, so the age is taken then, in Rust: extracting from
-/// DuckDB's `now()` needs ICU, which the bundled build does not load.
+/// are defined as each query is prepared, so the age is taken then, in Rust, and the view carries a
+/// constant rather than a call to `now()`.
 fn offchain_status_ddl(view: &str, table: &str, refresh: &crate::offchain::Refresh) -> String {
     let text = |value: Option<&str>| {
         value.map_or("CAST(NULL AS VARCHAR)".to_string(), |v| {
@@ -3062,8 +3050,8 @@ fn with_or_replace_view(stmt: &str) -> String {
 ///
 /// Deliberately small rather than a parser: it tracks single-quoted strings, double-quoted
 /// identifiers, and `--` line comments, which is everything a `;` can hide behind in the SQL a nest
-/// authors. A dollar-quoted body would defeat it - DuckDB has no such syntax, and if that changes this
-/// is the function to revisit rather than a mystery to debug.
+/// authors. A dollar-quoted body would defeat it - nest SQL has none, and if that changes this is
+/// the function to revisit rather than a mystery to debug.
 pub(crate) fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -3141,7 +3129,7 @@ pub struct ViewIssue {
     pub hint: Option<String>,
 }
 
-/// If a query fails against a name DuckDB says doesn't exist, and that name is a nest-authored view
+/// If a query fails against a name the engine says doesn't exist, and that name is a nest-authored view
 /// that failed to build, replace the generic "does not exist" + fuzzy-match-on-an-unrelated-table
 /// message with the view's real build error (#539). A view that fails to build is reported as though
 /// it doesn't exist at all - `define_nest_views` loads views per-statement and skips failures for
@@ -3172,7 +3160,7 @@ pub fn enrich_query_error(
 
 /// If `missing` is the name of a nest-authored view (`views/*.sql`) that failed to build, the error
 /// from that specific `CREATE VIEW` statement - the real fault a query against it hit, rather than
-/// the "does not exist" DuckDB reports for a name that was simply never created. `None` if `missing`
+/// the "does not exist" the engine reports for a name that was simply never created. `None` if `missing`
 /// isn't an authored view name at all (an ordinary unknown-table typo), or names one that in fact
 /// built fine (so whatever failed, it wasn't this).
 fn view_build_failure(
@@ -3180,8 +3168,8 @@ fn view_build_failure(
     schema: &[crate::registry::TableSchema],
     missing: &str,
 ) -> Option<ViewIssue> {
-    // DuckDB validates `CREATE VIEW` eagerly (measured, not assumed - see the analytics.rs test
-    // suite), so "two later views joined pool_effective_fee" (#539) means those two views' *own*
+    // Burrmill plans a view when it is defined (`register_view`; see the analytics.rs test suite),
+    // so "two later views joined pool_effective_fee" (#539) means those two views' *own*
     // `CREATE VIEW` statements failed at load, each with the same "pool_effective_fee does not
     // exist". Chase that chain to the view whose failure is not itself just a missing upstream view -
     // the one line that actually explains anything - rather than reporting a hop that only repeats
@@ -3431,8 +3419,8 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
 }
 
 /// Bind one incremental-entity SELECT against the same empty typed fact surface used by view
-/// validation. DuckDB's Rust binding only materialises result metadata after `query`, even for a
-/// prepared statement. The entity has already passed the single-SELECT gate, and no rows are read.
+/// validation. The columns come from the plan; the entity has already passed the single-SELECT gate,
+/// and no rows are read.
 pub fn entity_output_columns(
     dir: &Path,
     schema: &[crate::registry::TableSchema],
@@ -3484,7 +3472,7 @@ pub(crate) fn nest_relation_names(
 #[cfg(feature = "folds")]
 pub(crate) struct FoldBinder {
     session: Box<dyn Session>,
-    /// The parser role stays DuckDB's for now (RFC-0044 Amendment 2, phase 2); it needs no catalogue.
+    /// The engine's parse and plan keys (RFC-0044 Amendment 2), from a session that needs no catalogue.
     parser: crate::graft::Parser,
 }
 
@@ -3845,9 +3833,10 @@ impl FoldEvaluator {
     }
 }
 
-/// The table name out of a DuckDB catalog error, if that is what this is.
+/// The table name out of a catalog error (Burrmill restates DataFusion's in DuckDB's words), if that
+/// is what this is.
 ///
-/// Format-dependent by necessity - DuckDB gives no structured error code for it - so it fails soft:
+/// Format-dependent by necessity - the engine gives no structured error code for it - so it fails soft:
 /// an unrecognised message simply yields `None` and the raw error is reported instead of a
 /// half-parsed one.
 fn missing_table_of(err: &str) -> Option<String> {
@@ -5220,24 +5209,25 @@ template="pool"
     }
 
     #[test]
-    fn segment_vanished_recognises_both_of_duckdbs_wordings_and_nothing_else() {
-        let prep = anyhow::anyhow!(
-            "IO Error: No files found that match the pattern \"/data/x/segments/staking__tokens_delegated-10468dbbf8a613da.parquet\""
-        )
-        .context("failed to prepare query");
+    fn segment_vanished_recognises_burrmills_wording_and_nothing_else() {
+        // As `query_replans_once_when_a_planned_segment_vanishes_before_execution` sees it.
         let exec = anyhow::anyhow!(
-            "IO Error: Cannot open file \"/data/x/segments/staking__tokens_undelegated-efb41c8f.parquet\": No such file or directory"
+            "substrate error: Parquet error: Parquet error: Failed to fetch metadata for file \
+             data/x/segments/staking__tokens_undelegated-efb41c8f.parquet: Object Store error: \
+             Object at location /data/x/segments/staking__tokens_undelegated-efb41c8f.parquet not \
+             found: No such file or directory (os error 2)"
         )
         .context("query failed");
-        assert!(segment_vanished(&prep));
         assert!(segment_vanished(&exec));
         // A missing file that is not a segment (a view, a label snapshot) is not this fault.
-        let other = anyhow::anyhow!("IO Error: Cannot open file \"/data/x/views/90-x.sql\"")
-            .context("query failed");
+        let other = anyhow::anyhow!(
+            "Object at location /data/x/views/90-x.sql not found: No such file or directory"
+        )
+        .context("query failed");
         assert!(!segment_vanished(&other));
         // A segment named in an unrelated error is not this fault either.
         let unrelated =
-            anyhow::anyhow!("Invalid Error: don't know what type: /data/x/segments/a-b.parquet");
+            anyhow::anyhow!("Parquet error: Unexpected struct field type 15: /data/x/segments/a-b.parquet");
         assert!(!segment_vanished(&unrelated));
     }
 
@@ -5404,8 +5394,8 @@ template="pool"
 
     #[test]
     fn sql_cannot_read_files_outside_the_data_dirs() {
-        // Hardening SEC-2: DuckDB table functions (read_text/read_csv/glob/…) are file-read primitives
-        // usable inside a SELECT. The lockdown must confine them to the nest's segments/labels dirs.
+        // Hardening SEC-2: file-reading table functions (read_text/read_csv/glob/…, DuckDB's names)
+        // are file-read primitives usable inside a SELECT, and must never reach outside the nest.
         let dir = tempfile::tempdir().unwrap();
         let cold = vec![r#"{"table":"t__e","block_number":10,"log_index":0,"x":"1"}"#.to_string()];
         crate::seal::seal_range(dir.path(), &cold, 10, 10).unwrap();
@@ -5506,7 +5496,7 @@ template="pool"
         )
         .unwrap();
         assert_eq!(out.rows[0]["n"], Value::from(2u64));
-        // Big-int text summed via DECIMAL; DuckDB returns decimals as strings.
+        // Big-int text summed via DECIMAL; a DECIMAL is served as a string.
         assert_eq!(out.rows[0]["total"].as_str(), Some("12"));
     }
 
@@ -5799,8 +5789,8 @@ template="pool"
     /// that *name* existed yet (#663's fix) - a table already on disk kept its on-disk *columns*
     /// forever, even once the live registry (a re-fetched ABI, same event, one more field) knows more.
     /// The view built "successfully" and was silently missing the column: no error, no log, unlike
-    /// #663's total-failure case. Confirmed directly against DuckDB (see `with_declared_base_cols`'s
-    /// doc) that a column no listed segment carries is a binder error on explicit reference, not a NULL
+    /// #663's total-failure case. Confirmed directly against DuckDB at the time (see
+    /// `with_declared_base_cols`'s doc) that a column no listed segment carries is a binder error on explicit reference, not a NULL
     /// row - so the fix is a name-keyed column merge plus generalizing #434's null-stub from
     /// big-integer columns to every declared column, not a replacement of the disk column set. CLAUDE.md
     /// rules out ever re-decoding the sealed segment itself.
@@ -5894,7 +5884,7 @@ template="pool"
         assert!(query(dir.path(), "/* x */ DROP TABLE t").is_err());
     }
 
-    /// #295: two queries on the same nest, same watermark, share one DuckDB. Deleting the cache
+    /// #295: two queries on the same nest, same watermark, share one session. Deleting the cache
     /// (or opening every time) fails this. Other tests use other dirs and do not evict this slot.
     #[test]
     fn a_second_query_reuses_the_session() {
@@ -5903,7 +5893,7 @@ template="pool"
         assert_eq!(
             session_opens_for(dir.path()),
             1,
-            "the first query opens DuckDB"
+            "the first query opens a session"
         );
         query(dir.path(), "SELECT 42 AS n").unwrap();
         assert_eq!(
@@ -6181,7 +6171,7 @@ template="pool"
     }
 
     /// #539's own repro: a Solidity `bool` column forces a `COALESCE` type mismatch, which fails the
-    /// view's `CREATE VIEW`. Querying it must name the build failure and the real DuckDB error, not
+    /// view's `CREATE VIEW`. Querying it must name the build failure and the real engine error, not
     /// report it as though the view were never defined - and the old fuzzy match onto an unrelated
     /// real table must be gone.
     #[test]
@@ -6233,7 +6223,7 @@ template="pool"
             ],
         }];
 
-        // The exact DuckDB message a query against the broken view produces.
+        // The catalog error a query against the broken view produces.
         let raw = "Catalog Error: Table with name pool_effective_fee does not exist!\nDid you \
                     mean \"pool_manager__set_default_fee_alias\"?";
         let before = view_build_opens();
@@ -6253,7 +6243,7 @@ template="pool"
         );
         assert!(
             msg.contains("COALESCE") && msg.contains("explicit cast"),
-            "carries DuckDB's real error: {msg}"
+            "carries the engine's real error: {msg}"
         );
         assert!(
             !msg.to_ascii_lowercase()
@@ -6263,7 +6253,7 @@ template="pool"
     }
 
     /// The chained case: a view built *on top of* the broken one also fails to build (its own
-    /// `CREATE VIEW` cannot resolve `pool_effective_fee` either), and DuckDB's error for it names
+    /// `CREATE VIEW` cannot resolve `pool_effective_fee` either), and the engine's error for it names
     /// `pool_effective_fee`, not the queried view. The message must still land on the root cause
     /// rather than repeating "pool_effective_fee does not exist" one hop removed.
     #[test]
@@ -6313,7 +6303,7 @@ template="pool"
             ],
         }];
 
-        // DuckDB validates `CREATE VIEW` eagerly, so `pool_effective_fee_summary` was itself never
+        // A view is planned when defined, so `pool_effective_fee_summary` was itself never
         // created - a query against it names *itself* as missing, not `pool_effective_fee`.
         let raw = "Catalog Error: Table with name pool_effective_fee_summary does not exist!";
         let msg = enrich_query_error(
@@ -6486,9 +6476,9 @@ template="pool"
 
     /// SEC-7: a CTE list is only a prefix. The statement after it must still be a query.
     ///
-    /// The leading-keyword gate accepts `WITH`, and the previous comment claimed DuckDB would not
-    /// parse INSERT after a CTE. That is the same class of claim as "`conn.prepare` is
-    /// single-statement". This guard is ours, on the public `query` path, so deleting the call
+    /// The leading-keyword gate accepts `WITH`, and an earlier comment claimed the engine would not
+    /// parse INSERT after a CTE, the same class of claim as "`conn.prepare` is single-statement",
+    /// which was false. This guard is ours, on the public `query` path, so deleting the call
     /// from `attempt` fails the last assertion rather than leaving a unit-tested function with
     /// no caller.
     #[test]
@@ -6541,7 +6531,7 @@ template="pool"
         .to_string();
         assert!(
             err.contains("WITH-prefixed DML"),
-            "the refusal must come from our gate, not DuckDB later: {err}"
+            "the refusal must come from our gate, not the engine later: {err}"
         );
 
         let exfil = dir.path().join("exfil.csv");
@@ -6857,7 +6847,7 @@ template="pool"
     /// corrupt segment throws at DDL time. That failure used to be swallowed, which meant the view was
     /// never created and `/sql` answered `Table with name ... does not exist` - sending an operator to
     /// hunt for a config or naming fault when the actual fault is a file on disk. It also leaked the
-    /// internal `__hot_<table>` temp table through DuckDB's did-you-mean, to an untrusted caller.
+    /// internal `__hot_<table>` temp table through the engine's did-you-mean, to an untrusted caller.
     ///
     /// The missing-segment case one screen up in `define_views` has always done the right thing (drop
     /// it, `warn!`, carry on). Present-but-corrupt is the more alarming of the two and was the quieter,
@@ -6950,12 +6940,12 @@ template="pool"
 
     /// **Issue #433.** A sealed segment whose **pages** are corrupt but whose **footer reads fine**
     /// must reduce its table, exactly as a footer-corrupt one does since #430 - not fail the whole
-    /// query with `Invalid Error: don't know what type: `.
+    /// query with a Parquet decode error that names no file.
     ///
     /// This is the other half of the class #430 opened, and it does not go through #430's machinery at
-    /// all. #430 discriminates with `conn.prepare` over `read_parquet`, which validates the **footer**
-    /// at DDL time. Corruption that leaves the footer intact passes that probe untouched, `CREATE
-    /// VIEW` succeeds, and the failure lands at execution - taking every table in the query down, not
+    /// all. #430 discriminates when a segment binds, which reads the **footer**. Corruption that
+    /// leaves the footer intact passes that untouched, the view is defined, and the failure lands at
+    /// execution - taking every table in the query down, not
     /// just this one, with a message that names nothing.
     ///
     /// The fixture's own claim is asserted rather than assumed: the corrupt file must still **bind**.
@@ -7636,8 +7626,8 @@ template="pool"
     /// the *original* shared `deadline` (only the sweep's own deadline was mutated), which by then has
     /// already passed, so the retry's watchdog interrupts it mid-query instead. Both outcomes are
     /// `Err`, so Ok vs Err cannot see this; the *error itself* differs in kind, though - a plain
-    /// "exceeded budget" message the bounded sweep produces cooperatively, versus DuckDB's own
-    /// "Interrupted!" from a retry that got cut off while running. That is the assertion below, not
+    /// "exceeded budget" message the bounded sweep produces cooperatively, versus the engine's own
+    /// interrupt from a retry that got cut off while running. That is the assertion below, not
     /// elapsed wall-clock time.
     ///
     /// #529: even that was still timing-coupled. The 200ms budget minus a 120ms first-attempt delay
@@ -7745,7 +7735,7 @@ template="pool"
              segment before that budget is spent, so `run` must bail on its own cooperative \"time \
              budget\" check without ever starting a second attempt. A sweep handed a fresh 200ms \
              instead reaches the corrupt segment too late for the *original* shared deadline that \
-             still bounds the retry, so it dies mid-query on DuckDB's own interrupt instead - a \
+             still bounds the retry, so it dies mid-query on the engine's own interrupt instead - a \
              different error, not just a slower one: got {result:?}"
         );
     }
@@ -7868,7 +7858,7 @@ template="pool"
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
         );
-        // DuckDB matches identifiers case-insensitively, so the sweep's lookup must too - otherwise a
+        // Burrmill matches identifiers case-insensitively, so the sweep's lookup must too - otherwise a
         // shouted table name silently loses its reduction.
         assert_eq!(
             refs("SELECT * FROM T__TRANSFER"),
@@ -7884,9 +7874,9 @@ template="pool"
             "a table reached from a subquery is still reached"
         );
 
-        // #896: a statement that reaches a catalogue schema or calls one of DuckDB's enumerating
-        // table functions is asking *what tables exist*, so every view has to be defined for it to
-        // answer. The bare-name set cannot express that - `information_schema.tables` arrives as
+        // #896: a statement that reaches a catalogue schema or calls an enumerating table function
+        // (DuckDB's `duckdb_tables()` and kin) is asking *what tables exist*, so every view has to
+        // be defined for it to answer. The bare-name set cannot express that - `information_schema.tables` arrives as
         // `tables` with the qualifier dropped, indistinguishable from a nest table of that name.
         assert!(!surveys(r#"SELECT * FROM "t__transfer""#));
         assert!(!surveys("SELECT (SELECT max(a) FROM u) FROM t"));
@@ -7894,9 +7884,9 @@ template="pool"
             surveys("SELECT table_name FROM information_schema.tables"),
             "a catalogue schema must be recognised through the dropped qualifier"
         );
-        // DuckDB's own enumerating table functions are refused outright by `ALLOWED_TABLE_FNS`, so
-        // the `duckdb_` branch in the walk is unreachable today. It stays because the failure it
-        // guards is silent: admit `duckdb_tables` to that allowlist without thinking about #896 and
+        // The `duckdb_*` enumerating table functions are refused outright by `ALLOWED_TABLE_FNS`
+        // (and Burrmill has none), so the `duckdb_` branch in the walk is unreachable today. It
+        // stays because the failure it guards is silent: admit `duckdb_tables` to that allowlist without thinking about #896 and
         // the catalogue listing comes back empty rather than erroring.
         assert!(
             reject_unknown_table_refs(conn, "SELECT * FROM duckdb_views()").is_err(),
@@ -8651,7 +8641,7 @@ events = ["Transfer"]
             assert!(e.contains(t), "every unresolved table must be named: {e}");
         }
         // …and as a *summary*, not three concatenated catalog errors. The author needs the work item
-        // ("these three tables are missing"), not three copies of DuckDB explaining what a catalog is.
+        // ("these three tables are missing"), not three copies of the engine explaining a catalog.
         // Asserted explicitly because a plain join of the errors also happens to contain all three
         // names - so without this the summary formatting was untested and a mutation of it survived.
         assert!(
@@ -8692,7 +8682,7 @@ events = ["Transfer"]
     /// **A quoted function name evaded the `/sql` denylist and read arbitrary files.**
     ///
     /// Found in the pre-1.0 adversary pass. `reject_file_access` matched a forbidden name only when the
-    /// next non-space character was `(` - and DuckDB accepts a *quoted* function name, where the next
+    /// next non-space character was `(` - and DuckDB accepted a *quoted* function name, where the next
     /// character is `"`. So `SELECT * FROM "read_csv"('/etc/passwd')` passed both guards and DuckDB
     /// executed it, confirmed against a live connection (it returned the contents of `/etc/hosts`).
     ///
@@ -8742,7 +8732,7 @@ events = ["Transfer"]
 
     /// **Audit finding 5: the allowlist must refuse what the denylist has never heard of.**
     ///
-    /// The denylist enumerates forbidden names over a vocabulary DuckDB grows every release, and has
+    /// The denylist enumerates forbidden names over a vocabulary an engine grows every release, and has
     /// been wrong twice - about spelling and about coverage. This asks the parser what the query
     /// references and permits only what we recognise, so a file-reading function added upstream
     /// tomorrow is refused *by default*.
@@ -8843,7 +8833,7 @@ events = ["Transfer"]
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not permitted") || msg.contains("tables and views only"),
-            "the refusal must come from the allowlist, not from DuckDB failing later: {msg}"
+            "the refusal must come from the allowlist, not from the engine failing later: {msg}"
         );
 
         // And the guarded surface, which is the one actually exposed over HTTP.

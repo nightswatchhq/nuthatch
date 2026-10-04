@@ -244,10 +244,11 @@ fn between<'a>(s: &'a str, a: &str, b: &str) -> Option<&'a str> {
 
 /// A Parquet decode failure in the engine's own words. Caller text reaches an error only as a name
 /// or inside quotes, so the phrase must not follow a quote, nor sit in a binder, parser or catalog
-/// error.
+/// error. A file that is missing rather than corrupt reads as a Parquet error too, and is not this.
 fn parquet_read_failure(raw: &str) -> bool {
     raw.find("Parquet error:")
         .is_some_and(|at| !raw[..at].contains(['"', '\'']))
+        && !raw.contains("No such file or directory")
         && !raw.contains("Binder Error")
         && !raw.contains("Parser Error")
         && !raw.contains("Catalog Error")
@@ -512,6 +513,21 @@ mod tests {
                 .contains("corrupt file on disk"),
             "only the engine-prefixed form means segment corruption; caller text must never reach \
              this branch: {hint:?}"
+        );
+    }
+
+    /// A segment that vanished twice under one query (#1162) surfaces as a Parquet error too, but
+    /// the file is missing, not corrupt, and telling the operator to hunt a bad file is wrong.
+    #[test]
+    fn a_missing_segment_is_not_called_corrupt() {
+        let raw = "query failed: substrate error: Parquet error: Parquet error: Failed to fetch \
+                   metadata for file data/x/segments/a.parquet: Object Store error: Object at \
+                   location /data/x/segments/a.parquet not found: No such file or directory (os \
+                   error 2)";
+        let hint = enrich(raw, "SELECT 1 FROM usdc__transfer", &schema());
+        assert!(
+            !hint.as_deref().unwrap_or("").contains("corrupt file"),
+            "{hint:?}"
         );
     }
 
