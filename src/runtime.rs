@@ -3478,6 +3478,7 @@ pub fn spawn_move_job(
                 _ => false,
             };
             jobs.advance_if_owned(&name, generation, MountPhase::Joining, None)?;
+            crate::crash::point("move:before-join");
             let mut h = handles.lock().await;
             // As for a mount: a claim that was forgotten, or replaced, must not move the name (#1638).
             if !jobs.owns(&name, generation) {
