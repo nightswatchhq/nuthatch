@@ -8,9 +8,10 @@
 
 ```sh
 curl -fsSL https://nuthatch-indexer.com/install.sh | sh                  # macOS Apple Silicon, Linux x86_64
-nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC; the chain is detected
+export PATH="$HOME/.local/bin:$PATH"                                    # the installer's directory; a fresh macOS shell lacks it
+nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --alias weth   # WETH; the chain is detected
 nuthatch dev --backfill 300                                             # the last 300 blocks, then keeps up
-nuthatch sql "SELECT count(*) FROM usdc__transfer"                      # in a second terminal
+nuthatch sql "SELECT count(*) FROM weth__transfer"                      # in a second terminal
 ```
 
 The Linux binary needs glibc 2.35 or newer to run from 4.1.0, which is also what it is built on;
@@ -19,7 +20,7 @@ source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
 `init` creates a **nest**: a directory holding the contract's ABI, its config and, once `dev` runs,
 its indexed data. `--backfill 300` starts 300 blocks behind the tip, about an hour of mainnet, so there
 are rows to query within seconds on the bundled public endpoints. Without it, `dev` backfills from the
-contract's deployment block: for USDC that is 20 million blocks, a long backfill on free public endpoints
+contract's deployment block: for WETH that is 21 million blocks, a long backfill on free public endpoints
 and a job for your own RPC (`--rpc`).
 
 | | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
@@ -79,7 +80,8 @@ curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 
 That downloads the prebuilt binary for your platform from the latest release, verifies its SHA-256,
 and installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). **No compiler is
-involved.** Prebuilt binaries cover macOS Apple Silicon and Linux x86_64 and are attached to every
+involved.** A stock macOS shell does not have `~/.local/bin` on its `PATH`, which is why the quickstart
+above exports it; add the same line to `~/.zshrc` (or `~/.bashrc`) to keep it for new terminals. Prebuilt binaries cover macOS Apple Silicon and Linux x86_64 and are attached to every
 release with their checksums, if you would rather fetch one by hand. **No Intel Mac binary is
 published**; the installer says so and points at the source build below.
 

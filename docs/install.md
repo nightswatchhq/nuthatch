@@ -12,6 +12,12 @@ It downloads the prebuilt binary for your platform from the latest release, veri
 installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). No compiler is involved, so
 whichever rustc you happen to have is irrelevant.
 
+A stock macOS shell does not have `~/.local/bin` on its `PATH`, so right after installing,
+`nuthatch` is "command not found" until you run `export PATH="$HOME/.local/bin:$PATH"`. Put that line
+in `~/.zshrc` (or `~/.bashrc`) to keep it for new terminals. Many Linux distributions already add the
+directory when it exists; if yours does not, the same line applies. The installer itself is served from
+the website and lives in its own repository, so this is documented here rather than changed there.
+
 Prebuilt binaries are published for two targets, attached to every release with their checksums:
 
 | Platform | Target | Prebuilt |
