@@ -128,7 +128,7 @@ view_fault_for() {
   done <"$out/duckdb/views.err"
 }
 
-matched=0 reordered=0 counted=0 differs=0 failed=0 uncompared=0 differ_ids="" failed_ids="" skipped=""
+matched=0 counted=0 differs=0 failed=0 uncompared=0 differ_ids="" failed_ids="" skipped=""
 echo
 printf '%-9s %-36s %9s %9s  %s\n' VERDICT QUERY BURRMILL DUCKDB DETAIL
 i=0
@@ -178,13 +178,6 @@ while [ $i -lt "$n" ]; do
       || die "could not canonicalise DuckDB's answer to $id"
     if [ "$b_digest" = "$d_digest" ]; then
       matched=$((matched + 1))
-    elif [ "$mode" = ordered ] \
-      && [ "$(LC_ALL=C sort "$out/answers/burrmill/$id.rows" | sha256_of /dev/stdin)" \
-        = "$(LC_ALL=C sort "$out/answers/duckdb/$id.rows" | sha256_of /dev/stdin)" ]; then
-      # Rows tied under the ORDER BY come back in each engine's own order, so the same rows in
-      # another order are not a wrong answer between two engines, as they are between releases.
-      reordered=$((reordered + 1))
-      note="the same rows in another order, which ties under its ORDER BY allow"
     else
       verdict=FAIL
       differs=$((differs + 1))
@@ -195,8 +188,17 @@ while [ $i -lt "$n" ]; do
         *) how="sorted, as it could not tell whether an ORDER BY is top-level" ;;
       esac
       note="differs from DuckDB (rows compared $how)"
-      shown=$(first_diff "$out/answers/burrmill/$id.rows" "$out/answers/duckdb/$id.rows" | awk -F'\t' '{
-        printf "          first differing row, row %d:\n", $1
+      label="first differing row"
+      # Still wrong under an ORDER BY. A statement whose ties let two engines order rows
+      # differently needs a tiebreaker in its SQL or a volatile tag in the set.
+      if [ "$mode" = ordered ] \
+        && [ "$(LC_ALL=C sort "$out/answers/burrmill/$id.rows" | sha256_of /dev/stdin)" \
+          = "$(LC_ALL=C sort "$out/answers/duckdb/$id.rows" | sha256_of /dev/stdin)" ]; then
+        note="order differs from DuckDB: the same rows in another order under its top-level ORDER BY"
+        label="first row out of place"
+      fi
+      shown=$(first_diff "$out/answers/burrmill/$id.rows" "$out/answers/duckdb/$id.rows" | awk -F'\t' -v label="$label" '{
+        printf "          %s, row %d:\n", label, $1
         printf "            burrmill: %s\n", substr($2, 1, 400)
         printf "            duckdb:   %s", substr($3, 1, 400) }')
     fi
@@ -207,7 +209,7 @@ while [ $i -lt "$n" ]; do
 done
 
 echo
-echo "reference: $n statements: $matched match DuckDB, $reordered match in another order, $counted compared on row count only, $differs differ, $failed not answered by the binary, $uncompared not compared"
+echo "reference: $n statements: $matched match DuckDB, $counted compared on row count only, $differs differ, $failed not answered by the binary, $uncompared not compared"
 if [ -n "$skipped" ]; then
   echo "reference: not compared, as DuckDB will not run them:"
   printf '%s' "$skipped"

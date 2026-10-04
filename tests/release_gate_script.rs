@@ -1196,9 +1196,10 @@ fn count_body(n: u64) -> String {
 }
 
 /// #1796: the binary's answer is compared with DuckDB's, not with a previous release's, in the
-/// gate's canonical form. A different value fails with the first differing row, in order under a
-/// top-level ORDER BY; the same rows in another order pass, since tied rows are each engine's
-/// choice; a float 1e-13 off is equal; a volatile statement is held to its row count.
+/// gate's canonical form. A different value fails with the first differing row. Under a top-level
+/// ORDER BY the same rows in another order fail as an order that differs, naming the first row out
+/// of place; a float 1e-13 off is equal; a volatile statement is held to its row count, reordered
+/// or not.
 #[test]
 fn an_answer_that_differs_from_duckdbs_fails_and_is_named() {
     let c = case();
@@ -1222,9 +1223,15 @@ fn an_answer_that_differs_from_duckdbs_fails_and_is_named() {
             "volatile",
             "SELECT k FROM (VALUES (1), (2)) AS v(k)".to_string(),
         ),
+        (
+            "volatile_ordered",
+            "SELECT k FROM (VALUES (1), (2)) AS v(k) ORDER BY k".to_string(),
+        ),
     ]);
     let body = std::fs::read_to_string(&set).unwrap();
-    std::fs::write(&set, format!("# volatile: volatile ties\n{body}")).unwrap();
+    std::fs::write(&set, format!(
+            "# volatile: volatile ties\n# volatile: volatile_ordered ties under its ORDER BY\n{body}"
+        )).unwrap();
     c.pin_at_finalized();
     let duck = c.duck(&[
         ("count.json", &count_body(TRANSFERS)),
@@ -1246,6 +1253,10 @@ fn an_answer_that_differs_from_duckdbs_fails_and_is_named() {
             r#"{"count":1,"rows":[{"x":0.3333333333334333}]}"#,
         ),
         ("volatile.json", r#"{"count":2,"rows":[{"k":7},{"k":8}]}"#),
+        (
+            "volatile_ordered.json",
+            r#"{"count":2,"rows":[{"k":2},{"k":1}]}"#,
+        ),
     ]);
     let (out, text) = c.reference(&set, &[], Some(&duck));
     assert_eq!(out.status.code(), Some(1), "{text}");
@@ -1265,8 +1276,19 @@ fn an_answer_that_differs_from_duckdbs_fails_and_is_named() {
         "{text}"
     );
     assert!(
-        line_for(&text, "ordered").contains("the same rows in another order"),
+        line_for(&text, "ordered").starts_with("FAIL ")
+            && line_for(&text, "ordered").contains("order differs from DuckDB"),
         "{text}"
+    );
+    assert!(
+        text.contains("first row out of place, row 1:")
+            && text.contains("burrmill: {\"k\":1}")
+            && text.contains("duckdb:   {\"k\":3}"),
+        "the first row out of place:\n{text}"
+    );
+    assert!(
+        line_for(&text, "volatile_ordered").starts_with("ok "),
+        "a volatile statement reordered under its ORDER BY passes on its count:\n{text}"
     );
     assert!(line_for(&text, "unordered").starts_with("ok "), "{text}");
     assert!(line_for(&text, "float").starts_with("ok "), "{text}");
@@ -1275,13 +1297,11 @@ fn an_answer_that_differs_from_duckdbs_fails_and_is_named() {
         "{text}"
     );
     assert!(
-        text.contains(
-            "3 match DuckDB, 1 match in another order, 1 compared on row count only, 2 differ"
-        ),
+        text.contains("3 match DuckDB, 2 compared on row count only, 3 differ"),
         "{text}"
     );
     assert!(
-        text.contains("RESULT: FAIL - differs from DuckDB: wrong, ordered_wrong"),
+        text.contains("RESULT: FAIL - differs from DuckDB: wrong, ordered, ordered_wrong"),
         "{text}"
     );
 }

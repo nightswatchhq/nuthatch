@@ -147,10 +147,10 @@ compares one binary with DuckDB instead (#1796):
   `crates/burrmill-bench`, where the DuckDB oracles live). It sets the nest up as nuthatch set it up
   before Burrmill (each table `read_parquet` over its files, `_dec` by `TRY_CAST`, the views in file
   order) and writes each answer as nuthatch's `/sql` body, in nuthatch's encoding.
-- **The comparison** is the gate's canonical form above, with one difference: under a top-level
-  `ORDER BY`, the same rows in another order pass and are counted apart, because the order of tied
-  rows is each engine's choice. Between two releases of one engine it is not, which is why the gate
-  holds them to it.
+- **The comparison** is the gate's canonical form above. Under a top-level `ORDER BY` the rows must
+  match in order; the same rows in another order fail as `order differs`, naming the first row out
+  of place. Two engines may order tied rows differently, so a statement whose `ORDER BY` ties needs
+  a unique tiebreaker in its SQL, or a volatile tag in the set, which holds it to its row count.
 
 It fails (exit 1) on an answer that differs from DuckDB's and on a statement the binary does not
 answer. A statement DuckDB will not run is not compared, and is listed with DuckDB's reason, naming
@@ -168,8 +168,9 @@ where a roll is decided: a nightly check would judge production after the roll, 
 at another time would answer for different data. It adds about three minutes to a gate run.
 
 `tests/release_gate_script.rs` drives it with a stand-in for `gate-duck` that serves fixed answers:
-a different value fails with its first differing row, reordered rows fail only where the multiset
-differs, a float 1e-13 off passes, a volatile statement is held to its count, a statement DuckDB
+a different value fails with its first differing row, rows reordered under an `ORDER BY` fail as an
+order that differs, a float 1e-13 off passes, a volatile statement is held to its count even
+reordered, a statement DuckDB
 refuses is listed, one the binary refuses fails, a segment past the pin reaches neither engine, and
 the runner posts the second status.
 
