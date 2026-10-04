@@ -27,6 +27,7 @@
 #   GATE_REPO     (default nightswatchhq/nuthatch)
 #   GATE_TARGET   release asset target         (default x86_64-unknown-linux-gnu)
 #   GATE_PASSES   passes per binary            (default 3)
+#   GATE_CONCURRENCY  statements in flight at once (default 2, as 8107's SQL_MAX_CONCURRENCY)
 set -euo pipefail
 
 CONTEXT=release-gate/alloc-nest
@@ -37,6 +38,7 @@ set_file=${GATE_SET:-$here/gate/alloc-queries.tsv}
 repo=${GATE_REPO:-nightswatchhq/nuthatch}
 target=${GATE_TARGET:-x86_64-unknown-linux-gnu}
 passes=${GATE_PASSES:-3}
+concurrency=${GATE_CONCURRENCY:-2}
 
 log() { echo "release-gate-run: $*" >&2; }
 die() { log "$*"; exit 2; }
@@ -50,7 +52,7 @@ while [ $# -gt 0 ]; do
     --sha) [ $# -ge 2 ] || die "--sha needs a commit"; sha=$2; shift 2 ;;
     --production) [ $# -ge 2 ] || die "--production needs a tag"; production=$2; shift 2 ;;
     --no-status) post=0; shift ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) [ -z "$tag" ] || die "one tag at a time"; tag=$1; shift ;;
   esac
@@ -225,7 +227,7 @@ mkdir -p "$run"
 
 log "measuring production $production for the baseline"
 rc=0
-"$here/release-gate.sh" --passes "$passes" --out "$run/production" \
+"$here/release-gate.sh" --passes "$passes" --concurrency "$concurrency" --out "$run/production" \
   --write-baseline "$run/baseline.tsv" "$prod_bin" "$nest" "$set_file" >"$run/production.txt" 2>&1 || rc=$?
 # Production failing its own gate is still what production does, so it is still the baseline. Only
 # a run that could not measure it (exit 2, no baseline written) leaves nothing to compare with.
@@ -253,7 +255,7 @@ fi
 
 log "gating $label"
 rc=0
-"$here/release-gate.sh" --passes "$passes" --out "$run/candidate" \
+"$here/release-gate.sh" --passes "$passes" --concurrency "$concurrency" --out "$run/candidate" \
   --baseline "$run/baseline.tsv" "$cand_bin" "$nest" "$set_file" >"$run/candidate.txt" 2>&1 || rc=$?
 cat "$run/candidate.txt"
 
