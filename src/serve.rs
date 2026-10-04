@@ -3771,6 +3771,46 @@ async fn run_sql_query(
     run_sql_query_at(s, sql_text, requested_max_rows, None, None).await
 }
 
+/// The memo key for `sql` against the nest as it stands, with the generation, sealed watermark and
+/// entity watermarks it was built from. `None` when the answer is not memoised at all.
+fn memo_identity(
+    s: &AppState,
+    sql: &str,
+    max_rows: usize,
+    historical_block: Option<u64>,
+) -> Option<(
+    crate::sqlmemo::Key,
+    u64,
+    u64,
+    crate::entity_view::Watermarks,
+)> {
+    s.store
+        .write_generation()
+        .filter(|_| historical_block.is_none())
+        .filter(|_| crate::sqlmemo::is_deterministic(sql))
+        .map(|generation| {
+            let watermarks: crate::entity_view::Watermarks = s
+                .entities
+                .iter()
+                .filter(|e| e.unavailable().is_none() && e.fault().is_none())
+                .map(|e| (e.name().to_string(), e.fence_watermark()))
+                .collect();
+            let files = crate::analytics::cache_inputs(&s.dir);
+            let sealed_through = s.store.sealed_through();
+            let key = crate::sqlmemo::Inputs {
+                dir: &s.dir,
+                sql,
+                max_rows,
+                sealed_through,
+                write_generation: generation,
+                entity_watermarks: &watermarks,
+                files: &files,
+            }
+            .key();
+            (key, generation, sealed_through, watermarks)
+        })
+}
+
 async fn run_sql_query_at(
     s: AppState,
     sql_text: String,
@@ -3791,32 +3831,7 @@ async fn run_sql_query_at(
     // remembered answer for that identity is the answer, and it is returned before the permit gate,
     // because a hit costs no DuckDB and the gate exists to bound DuckDB. `None` where the store
     // cannot report a write generation; that backend simply computes every time.
-    let memo = s
-        .store
-        .write_generation()
-        .filter(|_| historical_block.is_none())
-        .filter(|_| crate::sqlmemo::is_deterministic(&q.q))
-        .map(|generation| {
-            let watermarks: crate::entity_view::Watermarks = s
-                .entities
-                .iter()
-                .filter(|e| e.unavailable().is_none() && e.fault().is_none())
-                .map(|e| (e.name().to_string(), e.fence_watermark()))
-                .collect();
-            let files = crate::analytics::cache_inputs(&s.dir);
-            let sealed_through = s.store.sealed_through();
-            let key = crate::sqlmemo::Inputs {
-                dir: &s.dir,
-                sql: &q.q,
-                max_rows,
-                sealed_through,
-                write_generation: generation,
-                entity_watermarks: &watermarks,
-                files: &files,
-            }
-            .key();
-            (key, generation, sealed_through, watermarks)
-        });
+    let memo = memo_identity(&s, &q.q, max_rows, historical_block);
     if let Some((key, generation, sealed_through, before)) = &memo {
         if let Some(hit) = crate::sqlmemo::get(key) {
             // Re-read the fence after the lookup, as the computing path does after its query: a
@@ -8649,17 +8664,30 @@ mod tests {
             outside.display()
         );
 
-        let before = crate::sqlmemo::entries();
+        // By this statement's own key, not the global count: the memo is process-wide, and any other
+        // test's successful /sql moves the count (#1812).
+        let key = |sql: &str| {
+            memo_identity(&state, sql, SQL_MAX_ROWS, None)
+                .expect("a deterministic statement against this store is memoised")
+                .0
+        };
         let (st, body) = sql_json(&state, &q).await;
         assert_eq!(
             st,
             StatusCode::BAD_REQUEST,
             "a file-reading statement must be refused: {body}"
         );
-        assert_eq!(
-            crate::sqlmemo::entries(),
-            before,
+        assert!(
+            !crate::sqlmemo::contains(&key(&q)),
             "a refused statement must leave nothing in the memo"
+        );
+
+        // The same lookup does see an answer that was remembered, so the absence above means something.
+        let (st, body) = sql_json(&state, "SELECT 7 AS n").await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(
+            crate::sqlmemo::contains(&key("SELECT 7 AS n")),
+            "an answered statement is remembered under the key this test computes"
         );
 
         // And again, so a second identical request cannot be answered from an entry the first left.
