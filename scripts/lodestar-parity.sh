@@ -27,8 +27,8 @@
 #   allocations  nest count vs subgraph allocations where isLegacy: false
 #   disputes     nest ids vs subgraph disputes where isLegacy: false
 #   epochs       field-by-field, each field from its own measured comparability epoch.
-#                The reward trio is a hard gate. Three fields measure a different quantity
-#                from their subgraph namesakes and are reported KNOWN-DIFF (#1113), never OK.
+#                All six value fields are hard gates; only an exact fee boundary shift
+#                (#1819) is reported KNOWN-DIFF, never OK.
 #                start/end block are L2 vs L1 and are INCOMPARABLE, not DIFF.
 #   escrow       counts, with a type breakdown; ids are different schemes
 #
@@ -396,9 +396,10 @@ if only_sg:
 # the change itself: a `drift` field that stops drifting prints "reclassify it as a gate" and fails,
 # deliberately, so a stale classification cannot sit unnoticed.
 #
-# `signalled_tokens` stays `drift`. Not because value is still misfiled - every closed epoch from
-# 1105 now agrees - but because the newest closed epoch straddles the open one above it, which is a
-# property of comparing a live chain and will recur at every run.
+# `signalled_tokens` is a `gate` too (2026-10-04). Its residue at the newest closed epoch came from
+# the open epoch's observed start; graph-allocations-nest#29 makes the starts exact through 1401, and
+# every closed epoch from 1105 then agrees, the newest included. That table is static, so once the
+# chain passes it the pair returns and this run fails: extend it with the nest's scripts/epoch-starts.sh.
 #
 # Two classes:
 #   gate   directly comparable. **Any** disagreement above the boundary fails the run, except an
@@ -412,7 +413,7 @@ EPOCH_FIELDS = [
     ("total_rewards", "totalRewards", 1195, "gate"),
     ("total_indexer_rewards", "totalIndexerRewards", 1195, "gate"),
     ("total_delegator_rewards", "totalDelegatorRewards", 1195, "gate"),
-    ("signalled_tokens", "signalledTokens", 1105, "drift"),
+    ("signalled_tokens", "signalledTokens", 1105, "gate"),
     ("query_fees_collected", "queryFeesCollected", 1105, "gate"),
     ("curator_query_fees", "curatorQueryFees", 1105, "gate"),
 ]
