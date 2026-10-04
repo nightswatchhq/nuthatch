@@ -1569,6 +1569,7 @@ pub fn check_catalogue(dir: &Path) -> Result<CatalogueCheck> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Durable {
     FileSync(PathBuf),
+    ParentDir(PathBuf),
     SegmentDir(PathBuf),
     ManifestDir(PathBuf),
 }
@@ -1580,6 +1581,8 @@ fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     if created {
         if let Some(parent) = dir.parent() {
+            #[cfg(test)]
+            note_durable(Durable::ParentDir(parent.to_path_buf()));
             sync_dir(parent)?;
         }
     }
@@ -3399,5 +3402,94 @@ mod tests {
             only(&load_manifest(dir.path()).unwrap(), "t__doc").provisional,
             "2 MiB is well under SEAL_TABLE_BYTES_FLOOR"
         );
+    }
+
+    /// The byte floor is "under", not "at or under": a table whose row JSON is exactly
+    /// SEAL_TABLE_BYTES_FLOOR is final, one byte less is provisional.
+    #[test]
+    fn the_byte_floor_is_exclusive() {
+        let row = |pad: usize| {
+            format!(
+                r#"{{"table":"t__doc","block_number":0,"log_index":0,"doc":"{}"}}"#,
+                "x".repeat(pad)
+            )
+        };
+        let measured = |s: &str| serde_json::from_str::<Value>(s).unwrap().to_string().len();
+        let pad = SEAL_TABLE_BYTES_FLOOR - measured(&row(0));
+        let at = row(pad);
+        assert_eq!(measured(&at), SEAL_TABLE_BYTES_FLOOR);
+
+        for (row, provisional) in [(at, false), (row(pad - 1), true)] {
+            let dir = tempfile::tempdir().unwrap();
+            seal_range(dir.path(), &[row], 0, 0).unwrap().unwrap();
+            assert_eq!(
+                only(&load_manifest(dir.path()).unwrap(), "t__doc").provisional,
+                provisional
+            );
+        }
+    }
+
+    #[test]
+    fn removing_a_segment_already_gone_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!remove_segment_if_unheld(&dir.path().join("gone.parquet")).unwrap());
+    }
+
+    #[test]
+    fn a_segment_that_cannot_be_removed_is_an_error_not_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.parquet");
+        std::fs::create_dir(&path).unwrap();
+        assert!(remove_segment_if_unheld(&path).is_err());
+    }
+
+    /// A segment path that exists but cannot be read is quarantined; only a missing one is skipped.
+    #[test]
+    fn an_unreadable_segment_is_quarantined_not_skipped_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        assert!(dir.path().join("quarantine").join(&seg.file).exists());
+    }
+
+    #[test]
+    fn check_catalogue_reports_an_unreadable_segment_as_a_mismatch_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let check = check_catalogue(dir.path()).unwrap();
+        assert_eq!(check.hash_mismatch, vec![seg.file.clone()]);
+        assert!(check.missing.is_empty());
+    }
+
+    /// #1632: the first seal into a runtime creates the shared store, and that directory's own entry
+    /// in its parent has to be durable before a manifest names a file inside it.
+    #[test]
+    fn creating_the_shared_store_syncs_its_parent_before_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        std::fs::create_dir_all(&dir).unwrap();
+        let trace = capture_durable(|| {
+            seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        });
+        let parent_at = trace
+            .iter()
+            .position(|e| matches!(e, Durable::ParentDir(p) if p == root.path()))
+            .unwrap_or_else(|| panic!("the store's parent was not synced. trace: {trace:?}"));
+        let manifest_dir = dir.join(SEGMENTS_DIR);
+        let manifest_at = trace
+            .iter()
+            .rposition(|e| matches!(e, Durable::ManifestDir(p) if p == &manifest_dir))
+            .unwrap();
+        assert!(parent_at < manifest_at, "trace: {trace:?}");
     }
 }

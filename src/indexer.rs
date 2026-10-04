@@ -16592,17 +16592,23 @@ template = "pool"
         (format!("http://{addr}/"), handle)
     }
 
-    /// A source that remembers the most logs one `getLogs` answer handed the backfill.
+    /// A source that remembers the most logs one `getLogs` answer handed the backfill, and panics when
+    /// one range is refused `MAX_SAME_REFUSALS` times running: a refusal the backfill does not narrow
+    /// for is retried at that width forever, and the test would hang rather than fail.
     struct Largest<'a> {
         inner: &'a dyn Source,
         most: std::sync::atomic::AtomicUsize,
+        refused: std::sync::Mutex<((u64, u64), usize)>,
     }
+
+    const MAX_SAME_REFUSALS: usize = 4;
 
     impl<'a> Largest<'a> {
         fn new(inner: &'a dyn Source) -> Self {
             Self {
                 inner,
                 most: Default::default(),
+                refused: Default::default(),
             }
         }
         fn most(&self) -> usize {
@@ -16630,7 +16636,21 @@ template = "pool"
             from: u64,
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
-            let logs = self.inner.logs(filter, from, to).await?;
+            let answer = self.inner.logs(filter, from, to).await;
+            {
+                let mut refused = self.refused.lock().unwrap();
+                *refused = match (&answer, *refused) {
+                    (Ok(_), _) => ((from, to), 0),
+                    (Err(_), (range, n)) if range == (from, to) => (range, n + 1),
+                    (Err(_), _) => ((from, to), 1),
+                };
+                assert!(
+                    refused.1 < MAX_SAME_REFUSALS,
+                    "{from}..={to} refused {} times running: the backfill is not narrowing",
+                    refused.1
+                );
+            }
+            let logs = answer?;
             self.most
                 .fetch_max(logs.len(), std::sync::atomic::Ordering::SeqCst);
             Ok(logs)
