@@ -144,10 +144,15 @@ fn chain_and_nest(dir: &Path) -> (Reaped, PathBuf) {
 }
 
 fn dev(nest: &Path, port: u16, crash_at: Option<&str>, log: &Path) -> Child {
+    dev_with(nest, port, crash_at, log, &[])
+}
+
+fn dev_with(nest: &Path, port: u16, crash_at: Option<&str>, log: &Path, extra: &[&str]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nuthatch"));
     cmd.args(["dev", "--dir"])
         .arg(nest)
         .args(["--listen", &format!("127.0.0.1:{port}"), "--seal-direct"])
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(log).unwrap());
     match crash_at {
@@ -384,5 +389,186 @@ fn a_prune_killed_before_its_orphan_pass_loses_nothing_and_is_finished_by_the_ne
         Some(TRANSFERS),
         "the surviving mount lost rows to the prune:\n{}",
         read(&log)
+    );
+}
+
+fn nuthatch(args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(args)
+        .env_remove("NUTHATCH_CRASH_AT")
+        .output()
+        .expect("run nuthatch");
+    assert!(
+        out.status.success(),
+        "nuthatch {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Every path under `dir` whose name a move or a fetch stages under.
+fn move_leftovers(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".moving") || name.contains("__moving") || name.starts_with(".fetch-")
+            {
+                found.push(e.path());
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(e.path());
+            }
+        }
+    }
+    found
+}
+
+/// A move dies after fetching the new dataset from the registry and before joining it. The restart
+/// must resume the move: the name serves the new dataset, and nothing staged for it is left behind.
+#[test]
+fn a_move_killed_between_its_fetch_and_its_join_is_finished_by_the_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    let (_rpc, rpc_port) = fixture_chain();
+    let nest = runtime.join("nests").join("usdc");
+    init_nest(&nest, rpc_port);
+    std::fs::write(
+        runtime.join("mounts.toml"),
+        format!(
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = [\"http://127.0.0.1:{rpc_port}/\"]\nnests = [\"usdc\"]\n"
+        ),
+    )
+    .unwrap();
+    nuthatch(&["migrate", "--dir", runtime.to_str().unwrap()]);
+
+    // The dataset the move fetches: the same contract from block 5, so it holds half the transfers
+    // and the count says which dataset the name serves.
+    let next = dir.path().join("next");
+    init_nest(&next, rpc_port);
+    let toml = next.join("nuthatch.toml");
+    let raw = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(&toml, format!("{raw}start_block = 5\n")).unwrap();
+    let next_str = next.to_str().unwrap();
+    nuthatch(&["schema", "--dir", next_str]);
+    let new_nid = nuthatch(&["nest", "nid", "--dir", next_str])
+        .trim()
+        .to_string();
+    let bundle = dir.path().join("next.bundle");
+    nuthatch(&[
+        "nest",
+        "bundle",
+        next_str,
+        "--out",
+        bundle.to_str().unwrap(),
+    ]);
+    let registry = dir.path().join("registry");
+    nuthatch(&[
+        "nest",
+        "publish",
+        bundle.to_str().unwrap(),
+        "--registry",
+        registry.to_str().unwrap(),
+    ]);
+    let new_data = runtime.join("data").join(&new_nid);
+    assert!(
+        !new_data.exists(),
+        "premise: the runtime does not hold the new dataset"
+    );
+
+    let registry_arg = ["--registry", registry.to_str().unwrap()];
+    let count = |api: &str| {
+        sql(api, "SELECT count(*) AS n FROM c0__transfer").and_then(|v| v["rows"][0]["n"].as_u64())
+    };
+    let port = free_port();
+    let first_log = dir.path().join("first.log");
+    let mut first = Reaped(dev_with(
+        &runtime,
+        port,
+        Some("move:before-join"),
+        &first_log,
+        &registry_arg,
+    ));
+    let api = format!("http://127.0.0.1:{port}");
+    poll("the old dataset to serve every transfer", 120, || {
+        count(&format!("{api}/usdc")).filter(|&n| n == TRANSFERS)
+    });
+    let accepted = Command::new("curl")
+        .args([
+            "-fsS",
+            "-m",
+            "10",
+            "-XPOST",
+            "-H",
+            "content-type: application/json",
+        ])
+        .args(["-d", &format!("{{\"nid\": \"{new_nid}\"}}")])
+        .arg(format!("{api}/_admin/move/usdc"))
+        .output()
+        .expect("curl");
+    assert!(
+        accepted.status.success(),
+        "the move was refused: {}{}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let status = poll("the runtime to die mid-move", 120, || {
+        if let Some(status) = first.0.try_wait().ok().flatten() {
+            return Some(status);
+        }
+        let job = get(&format!("{api}/_admin/mounts/usdc")).unwrap_or_default();
+        assert!(
+            !job.contains("\"live\"") && !job.contains("\"failed\""),
+            "the move ended without dying at `move:before-join`, so a restart would prove nothing: \
+             {job}"
+        );
+        None
+    });
+    assert!(
+        !status.success() && read(&first_log).contains("crash point move:before-join: aborting"),
+        "the move was meant to abort between its fetch and its join and did not reach it (exit \
+         {status}). Its log:\n{}",
+        read(&first_log)
+    );
+    drop(first);
+    assert!(
+        new_data.join("nuthatch.toml").exists(),
+        "premise: the move died after its fetch had landed"
+    );
+
+    let port = free_port();
+    let second_log = dir.path().join("second.log");
+    let _second = Reaped(dev_with(&runtime, port, None, &second_log, &registry_arg));
+    let api = format!("http://127.0.0.1:{port}");
+    let job = poll("the resumed move to go live", 120, || {
+        let job: serde_json::Value =
+            serde_json::from_str(&get(&format!("{api}/_admin/mounts/usdc"))?).ok()?;
+        (job["phase"] == "live").then_some(job)
+    });
+    assert_eq!(
+        job["nid"].as_str(),
+        Some(new_nid.as_str()),
+        "the restart left the name on its old dataset: {job}\n{}",
+        read(&second_log)
+    );
+    poll("the name to serve the new dataset's transfers", 120, || {
+        count(&format!("{api}/usdc")).filter(|&n| n == TRANSFERS - 4)
+    });
+    let mounts = std::fs::read_to_string(runtime.join("mounts.toml")).unwrap();
+    assert!(
+        mounts.contains(&new_nid) && !mounts.contains("__moving"),
+        "mounts.toml does not name the new dataset alone:\n{mounts}"
+    );
+    let listed = get(&format!("{api}/_admin/mounts")).expect("the mounts listing");
+    assert!(
+        !listed.contains("__moving"),
+        "a staging mount survived: {listed}"
+    );
+    assert_eq!(
+        move_leftovers(&runtime),
+        Vec::<PathBuf>::new(),
+        "the move left staging behind"
     );
 }
