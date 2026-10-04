@@ -4290,6 +4290,16 @@ impl RuntimeHandles {
         format!("{name}{STAGING_SUFFIX}")
     }
 
+    /// Undo a move's staging mount, record included: an unmount keeps a name's record for a remount,
+    /// and nothing remounts a staging name.
+    async fn back_out_staging(&mut self, staging: &str) -> Result<()> {
+        let unmounted = self.unmount(staging).await;
+        self.mount_ctx
+            .mounts
+            .retain(|m| mount_route(m, &self.default_tenant) != staging);
+        unmounted
+    }
+
     /// Move a live name to another NID without a gap (#1549).
     ///
     /// The new NID is mounted under [`Self::staging_name`], which catches it up before it joins its
@@ -4317,7 +4327,7 @@ impl RuntimeHandles {
             .position(|(n, _)| *n == staging)
             .expect("just mounted");
         if self.states[new_idx].1.chain != chain {
-            self.unmount(&staging).await?;
+            self.back_out_staging(&staging).await?;
             bail!("a move keeps its chain: '{name}' is on {chain}");
         }
         let new_key = self.states[new_idx]
@@ -4334,7 +4344,11 @@ impl RuntimeHandles {
             .count()
             > 1;
         if !old_shared {
-            self.drain_cursor_nest(&chain, &old_key, name).await?;
+            // The old nest keeps its name and routes, so the staged one must not stay beside it.
+            if let Err(e) = self.drain_cursor_nest(&chain, &old_key, name).await {
+                let _ = self.back_out_staging(&staging).await;
+                return Err(e);
+            }
             crate::metrics::METRICS.remove_nest(&old_key);
         }
         // A shared dataset known on the cursor by the name moving off it keeps indexing for the
@@ -4360,7 +4374,7 @@ impl RuntimeHandles {
                 None => Err(anyhow::anyhow!("the {chain} cursor is gone")),
             };
             if let Err(e) = swapped {
-                let _ = self.unmount(&staging).await;
+                let _ = self.back_out_staging(&staging).await;
                 return Err(e);
             }
         }
@@ -6921,5 +6935,122 @@ mod tests {
         assert!(format!("{err:#}").contains("tip lookup failed"), "{err:#}");
         crate::store::Store::open(&dir.join(crate::config::DB_FILE))
             .expect("the refused mount let go of its store");
+    }
+
+    /// #1777: a move whose old nest will not come off the cursor backs its staged mount out. It used
+    /// to leave the staging name mounted, routed and recorded beside the old nest.
+    #[tokio::test(start_paused = true)]
+    async fn a_move_whose_drain_fails_backs_out_its_staged_mount() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let (old_nid, new_nid) = ("a1".repeat(32), "b2".repeat(32));
+        for nid in [&old_nid, &new_nid] {
+            let dir = MountTable::data_dir(root.path(), nid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(CONFIG_FILE),
+                "[nest]\nname = \"usdc\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\nabi = \"abi.json\"\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("abi.json"), "[]").unwrap();
+            // Indexed already, so preparing asks the source nothing.
+            let store = crate::store::Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
+            store.set_meta("last_block", "5").unwrap();
+        }
+
+        // A cursor that admits every nest and acknowledges every unmount but the old nest's, whose
+        // acknowledgement it holds until the driver gives up on it.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cursor = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut drained = Vec::new();
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    indexer::CursorCommand::Mount { nest, ack, .. } => {
+                        drop(nest);
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                    }
+                    indexer::CursorCommand::Unmount { name, ack } if name == "usdc" => {
+                        held.push(ack)
+                    }
+                    indexer::CursorCommand::Unmount { name, ack } => {
+                        drained.push(name);
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                    }
+                    indexer::CursorCommand::Rename { .. } => panic!("a failed drain renamed"),
+                }
+            }
+            drained
+        });
+
+        let mut handles = idle_handles(root.path());
+        let source: Arc<dyn Source> = Arc::new(crate::source::UnpolledSource);
+        handles
+            .mount_ctx
+            .sources
+            .insert("ethereum".to_string(), source);
+        handles.lifecycle.insert("ethereum".to_string(), tx);
+        handles
+            .mount("usdc", Some(Nid::parse(&old_nid).unwrap()))
+            .await
+            .expect("mount the old nest");
+
+        let err = handles
+            .move_name("usdc", Nid::parse(&new_nid).unwrap())
+            .await
+            .expect_err("the old nest never came off the cursor");
+        assert!(
+            format!("{err:#}").contains("did not acknowledge"),
+            "{err:#}"
+        );
+
+        let staging = RuntimeHandles::staging_name("usdc");
+        let mounted: Vec<_> = handles.states.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(mounted, ["usdc"], "the staged mount stayed mounted");
+        let recorded: Vec<_> = handles
+            .mount_ctx
+            .mounts
+            .iter()
+            .map(|m| (mount_route(m, &handles.default_tenant), m.nid.clone()))
+            .collect();
+        assert_eq!(
+            recorded,
+            [("usdc".to_string(), old_nid.clone())],
+            "the staged mount stayed recorded"
+        );
+        assert_eq!(
+            handles.states[0].1.nid.as_deref(),
+            Some(old_nid.as_str()),
+            "the name no longer serves the old nest"
+        );
+        assert!(
+            !handles.health.render_metrics().contains(&staging),
+            "the staged mount is still reported"
+        );
+        crate::store::Store::open(
+            &MountTable::data_dir(root.path(), &new_nid).join(crate::config::DB_FILE),
+        )
+        .expect("the backed-out mount let go of its store");
+
+        handles.lifecycle.clear();
+        for (_, w) in std::mem::take(&mut handles.alert_workers) {
+            w.abort();
+            let _ = w.await;
+        }
+        drop(handles);
+        assert_eq!(
+            cursor.await.unwrap(),
+            [staging],
+            "the staged nest was not drained"
+        );
     }
 }
