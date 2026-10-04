@@ -20869,24 +20869,35 @@ rpc_urls = ["https://rpc.example"]
         let dir = tempfile::tempdir().unwrap();
         let addresses = vec!["0x1111111111111111111111111111111111111111".to_string()];
 
-        let rows = backfill_direct_pipelined(
-            &src,
-            &reg,
-            dir.path(),
-            &addresses,
-            &[],
-            &[],
-            None,
-            0,
-            0,
-            199_999,
-            1_000,
-            SPAN_OFF,
-            4,
-            |_| Ok(()),
-            |_, _, _| {},
+        // The fake's give-up error is transient to the backfill, which retries it forever on a 30s
+        // backoff, so a controller that never stops being refused sleeps rather than fails (#1757).
+        let rows = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            backfill_direct_pipelined(
+                &src,
+                &reg,
+                dir.path(),
+                &addresses,
+                &[],
+                &[],
+                None,
+                0,
+                0,
+                199_999,
+                1_000,
+                SPAN_OFF,
+                4,
+                |_| Ok(()),
+                |_, _, _| {},
+            ),
         )
         .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no result in 60s after {} refusals: the controller kept asking past the cap",
+                src.refused.load(std::sync::atomic::Ordering::SeqCst)
+            )
+        })
         .unwrap();
 
         let served = src.served.load(std::sync::atomic::Ordering::SeqCst);
