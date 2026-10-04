@@ -771,6 +771,28 @@ pub fn read_segment_decoded(
     segment: &Segment,
     schema: &crate::registry::TableSchema,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
+    read_segment_filtered(dir, segment, schema, None)
+}
+
+/// [`read_segment_decoded`], keeping only rows whose block is in `blocks`. Each record batch is
+/// filtered before its rows are decoded, so a sample inside a large segment holds its own rows and
+/// one batch, not the segment. Row groups are not pruned: a segment is one row group below the
+/// writer's 1,048,576-row default, which no seal cut reaches.
+pub fn read_segment_decoded_in(
+    dir: &Path,
+    segment: &Segment,
+    schema: &crate::registry::TableSchema,
+    blocks: std::ops::RangeInclusive<u64>,
+) -> Result<Vec<crate::registry::DecodedRow>> {
+    read_segment_filtered(dir, segment, schema, Some(blocks))
+}
+
+fn read_segment_filtered(
+    dir: &Path,
+    segment: &Segment,
+    schema: &crate::registry::TableSchema,
+    blocks: Option<std::ops::RangeInclusive<u64>>,
+) -> Result<Vec<crate::registry::DecodedRow>> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let mut out = Vec::new();
@@ -783,7 +805,23 @@ pub fn read_segment_decoded(
         .with_context(|| format!("reading sealed segment {}", path.display()))?;
     for batch in reader {
         let batch = batch.with_context(|| format!("decoding sealed segment {}", path.display()))?;
+        let block_numbers = match &blocks {
+            Some(_) => Some(
+                batch
+                    .column_by_name("block_number")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .with_context(|| {
+                        format!("sealed segment {} has no block_number", path.display())
+                    })?,
+            ),
+            None => None,
+        };
         for row in 0..batch.num_rows() {
+            if let (Some(range), Some(numbers)) = (&blocks, block_numbers) {
+                if !range.contains(&numbers.value(row)) {
+                    continue;
+                }
+            }
             let mut stored = serde_json::Map::new();
             for (i, field) in batch.schema().fields().iter().enumerate() {
                 let column = batch.column(i);
@@ -819,9 +857,37 @@ pub fn read_segment_decoded(
                 crate::registry::DecodedRow::from_stored(&Value::Object(stored), schema)
                     .with_context(|| format!("row {row} of sealed segment {}", path.display()))?,
             );
+            #[cfg(test)]
+            note_materialised(dir);
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+fn test_materialised() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static ROWS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    ROWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn note_materialised(dir: &Path) {
+    *test_materialised()
+        .lock()
+        .unwrap()
+        .entry(dir.to_path_buf())
+        .or_default() += 1;
+}
+
+/// Rows the segment readers have decoded under `dir` so far, for tests that bound retention.
+#[cfg(test)]
+pub(crate) fn test_rows_materialised(dir: &Path) -> usize {
+    test_materialised()
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Load the segment catalogue (empty if none yet).

@@ -233,12 +233,10 @@ fn sealed_rows(
             .iter()
             .filter(|s| s.from_block <= to && s.to_block >= from)
         {
-            for row in crate::seal::read_segment_decoded(dir, segment, table)? {
-                if (from..=to).contains(&row.block_number) {
-                    let key = (row.block_number, row.log_index);
-                    if let Some(earlier) = rows.insert(key, canonical(&row)) {
-                        duplicates.push(earlier);
-                    }
+            for row in crate::seal::read_segment_decoded_in(dir, segment, table, from..=to)? {
+                let key = (row.block_number, row.log_index);
+                if let Some(earlier) = rows.insert(key, canonical(&row)) {
+                    duplicates.push(earlier);
                 }
             }
         }
@@ -658,6 +656,30 @@ events = ["Transfer"]
         crate::seal::seal_range(d, &[row(crate::registry::BLOCKS_TABLE, 900)], 21, 1_000).unwrap();
         crate::seal::seal_range(d, &[row("sanction_hit", 3_000)], 21, 5_000).unwrap();
         auditor
+    }
+
+    #[test]
+    fn a_small_sample_of_a_large_segment_decodes_only_its_own_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let auditor = nest(d, "");
+        let rows: Vec<String> = (0..100_000u64)
+            .map(|i| {
+                let log = crate::rpc::Log {
+                    log_index: i % 10,
+                    ..transfer_at(&auditor, 1 + i / 10)
+                };
+                let row = auditor.registry.decode(&log).unwrap().unwrap();
+                row.to_json().to_string()
+            })
+            .collect();
+        crate::seal::seal_range(d, &rows, 1, 10_000).unwrap();
+        let segments = crate::seal::load_manifest(d).unwrap().tables;
+        assert_eq!(segments.values().flatten().count(), 1, "one large segment");
+
+        let (sealed, _) = sealed_rows(d, &auditor.schema, 5_000, 5_009).unwrap();
+        assert_eq!(sealed.len(), 100);
+        assert_eq!(crate::seal::test_rows_materialised(d), 100);
     }
 
     #[test]
