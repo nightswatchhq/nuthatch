@@ -58,35 +58,53 @@ fn pools() -> Pools {
             .filter_map(|(dir, e)| Some((dir.clone(), e.upgrade()?)))
             .collect()
     };
+    let engines: Vec<_> = live
+        .into_iter()
+        .map(|(dir, engine)| {
+            // Held exclusively only while tables are bound, which reserves nothing.
+            let reserved = match engine.try_read() {
+                Ok(e) => Some(e),
+                Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            }
+            .map_or(0, |e| {
+                fold_peak(dir.as_deref(), e.take_memory_peak() as u64);
+                e.memory_reserved() as u64
+            });
+            (dir, reserved)
+        })
+        .collect();
+    let nest_pools: Vec<_> = NEST_POOLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(dir, pool)| (dir.clone(), pool.reserved() as u64))
+        .collect();
+    let mut out = tally(engines, &nest_pools);
+    let peaks = PEAKS.lock().unwrap_or_else(|p| p.into_inner());
+    out.total.peak = peaks.all;
+    for (dir, peak) in &peaks.by_dir {
+        out.by_dir.entry(dir.clone()).or_default().peak = *peak;
+    }
+    out
+}
+
+/// Each engine's reading by the directory it was opened over, and each nest pool's total. A
+/// nest's engines each read their shared pool's total, so a nest's is the pool's, once (#1792).
+fn tally(engines: Vec<(Option<PathBuf>, u64)>, nest_pools: &[(PathBuf, u64)]) -> Pools {
     let mut out = Pools::default();
-    for (dir, engine) in live {
-        // Held exclusively only while tables are bound, which reserves nothing.
-        let reserved = match engine.try_read() {
-            Ok(e) => Some(e),
-            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        }
-        .map_or(0, |e| {
-            fold_peak(dir.as_deref(), e.take_memory_peak() as u64);
-            e.memory_reserved() as u64
-        });
+    for (dir, reserved) in engines {
         out.total.engines += 1;
         match dir {
             Some(dir) => out.by_dir.entry(dir).or_default().engines += 1,
             None => out.total.reserved += reserved,
         }
     }
-    // A nest's engines each report their shared pool's total, so the pool is read once (#1792).
-    for (dir, pool) in NEST_POOLS.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+    for (dir, reserved) in nest_pools {
         if let Some(u) = out.by_dir.get_mut(dir) {
-            u.reserved = pool.reserved() as u64;
-            out.total.reserved += u.reserved;
+            u.reserved = *reserved;
+            out.total.reserved += reserved;
         }
-    }
-    let peaks = PEAKS.lock().unwrap_or_else(|p| p.into_inner());
-    out.total.peak = peaks.all;
-    for (dir, peak) in &peaks.by_dir {
-        out.by_dir.entry(dir.clone()).or_default().peak = *peak;
     }
     out
 }
@@ -846,41 +864,28 @@ mod tests {
         );
     }
 
-    /// #1792: a nest's sessions share one pool, and each reports that pool's total as its own, so a
+    /// #1792: a nest's sessions share one pool and each reads that pool's total as its own, so a
     /// sum over them counts the pool once per session.
     #[test]
     fn two_sessions_of_one_nest_report_their_pool_once() {
-        use crate::engine::Session;
-        let dir = tempfile::tempdir().unwrap();
-        let s = sorting_session(dir.path(), &[("t", 20_000)]);
-        let idle = super::BurrmillSession::new(Some(dir.path())).unwrap();
-        let mut during = None;
-        s.for_each_row("SELECT n, block_number FROM t ORDER BY n", &mut |_| {
-            during.get_or_insert_with(|| {
-                let shared = super::nest_pool(dir.path(), 0).reserved() as u64;
-                let all = super::pools();
-                (
-                    all.by_dir.get(dir.path()).copied().unwrap_or_default(),
-                    shared,
-                    all.total.reserved,
-                )
-            });
-            Ok(())
-        })
-        .unwrap();
-        let (seen, shared, total) = during.expect("the sort returned rows");
-        assert!(shared > 0, "the sort holds part of the pool");
-        assert_eq!(seen.engines, 2);
+        use std::path::PathBuf;
+        let nest = PathBuf::from("/nests/a");
+        let engines = vec![
+            (Some(nest.clone()), 400),
+            (Some(nest.clone()), 400),
+            (Some(PathBuf::from("/nests/b")), 30),
+            (None, 7),
+        ];
+        let pools = [(nest.clone(), 400), (PathBuf::from("/nests/b"), 30)];
+        let out = super::tally(engines, &pools);
+        let a = out.by_dir[&nest];
+        assert_eq!((a.engines, a.reserved), (2, 400), "{out:?}");
+        assert_eq!(out.by_dir[&PathBuf::from("/nests/b")].reserved, 30);
         assert_eq!(
-            seen.reserved, shared,
-            "two sessions on one pool of {shared} bytes reported {}",
-            seen.reserved
+            (out.total.engines, out.total.reserved),
+            (4, 437),
+            "each pool once, plus the bare session's own: {out:?}"
         );
-        assert!(
-            total >= shared,
-            "the process total {total} left out the nest's {shared}"
-        );
-        drop(idle);
     }
 
     /// `/sql` collects, and a scrape must not wait behind it.
