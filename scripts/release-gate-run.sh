@@ -145,8 +145,11 @@ resolve_production() {
   elif [ -f "$nest/PROVENANCE" ]; then
     v=$(sed -n 's/^version=//p' "$nest/PROVENANCE" | tail -n 1 | tr -d '\r')
     v=${v#v}
-    printf '%s\n' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
-      || die "$nest/PROVENANCE records version '$v', which is not a release version; pass --production"
+    if ! printf '%s\n' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+      [ -n "$sha" ] || die "$nest/PROVENANCE records version '$v', which is not a release version, and no candidate is chosen yet, so no status is posted; pass --production"
+      post_status error "the copy's PROVENANCE records version '${v:0:40}', not a release version; pass --production" || true
+      die "$nest/PROVENANCE records version '$v', which is not a release version; pass --production"
+    fi
     production=v$v production_from=provenance
   else
     if [ "$listed_full" -eq 0 ]; then

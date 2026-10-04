@@ -1075,3 +1075,56 @@ fn production_flag_overrides_the_copys_provenance() {
     assert_eq!(code, Some(0), "{text}");
     assert_eq!(r.read("downloaded"), "v4.3.0\nv4.3.1\n", "{text}");
 }
+
+/// A PROVENANCE whose version is not a release version is not guessed around: the run exits 2 and
+/// posts one error status on the candidate naming the version, by tag or after a poll's refresh.
+#[test]
+fn a_provenance_version_that_is_not_a_release_posts_one_error_naming_it() {
+    for poll in [false, true] {
+        let c = case();
+        let set = c.set(&[("answers", c.counts())]);
+        let r = releases(&c, &[("v4.3.1", "full", 0), ("v4.2.1", "full", 0)], &[]);
+        let provenance = c.nest.join("PROVENANCE");
+        let (args, refresh): (&[&str], String) = if poll {
+            std::fs::write(&provenance, "version=4.2.1\n").unwrap();
+            let refresh = format!(
+                "printf 'version=dirty-build\\n' >'{}'",
+                provenance.display()
+            );
+            (&["--poll"], refresh)
+        } else {
+            std::fs::write(&provenance, "version=dirty-build\n").unwrap();
+            (&["v4.3.1"], String::new())
+        };
+        let env: &[(&str, &str)] = if poll {
+            &[("GATE_REFRESH", &refresh)]
+        } else {
+            &[]
+        };
+        let (code, text) = r.runner(&c, &set, args, env);
+        assert_eq!(code, Some(2), "poll={poll}: {text}");
+        let posted = r.read("posted");
+        assert_eq!(posted.lines().count(), 1, "poll={poll}: {posted}\n{text}");
+        assert!(
+            posted.starts_with("sha-v4.3.1 error ") && posted.contains("dirty-build"),
+            "poll={poll}: {posted}\n{text}"
+        );
+        assert_eq!(r.read("downloaded"), "", "poll={poll}: {text}");
+    }
+}
+
+/// Before a poll has chosen a candidate there is no commit to post on: the run exits 2 and says so.
+#[test]
+fn a_bad_provenance_before_a_poll_chooses_exits_loud_with_no_status() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(&c, &[("v4.3.1", "full", 0), ("v4.2.1", "full", 0)], &[]);
+    std::fs::write(c.nest.join("PROVENANCE"), "version=dirty-build\n").unwrap();
+    let (code, text) = r.runner(&c, &set, &["--poll"], &[]);
+    assert_eq!(code, Some(2), "{text}");
+    assert_eq!(r.read("posted"), "", "{text}");
+    assert!(
+        text.contains("dirty-build") && text.contains("no candidate is chosen yet"),
+        "{text}"
+    );
+}

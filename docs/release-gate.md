@@ -191,7 +191,9 @@ means production is `v4.2.1`. It is read after `GATE_REFRESH`, so it is the vers
 copy being measured. `--production <tag>` overrides it. Only a copy with no `PROVENANCE` falls back
 to the latest full release that is not the candidate, and the run says so in its output and in the
 status (`as the latest release, no PROVENANCE`). A `PROVENANCE` whose version is not a release
-version stops the run (exit 2) rather than guessing.
+version stops the run (exit 2) rather than guessing, with an `error` status on the candidate naming
+the version; a `--poll` that meets it before choosing a candidate has no commit to post on, and
+exits 2 saying so.
 
 `--poll` judges "newer than production" against the same production, read from the copy as it
 stands before the refresh; after the refresh it is read again, and a candidate no longer newer than
