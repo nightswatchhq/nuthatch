@@ -379,7 +379,8 @@ if only_sg:
 # property of comparing a live chain and will recur at every run.
 #
 # Two classes:
-#   gate   directly comparable. **Any** disagreement above the boundary fails the run.
+#   gate   directly comparable. **Any** disagreement above the boundary fails the run, except an
+#          exact boundary shift in the two fee fields (#1819, below).
 #   drift  comparable, but subject to the observed-boundary problem in #1116: value filed one epoch
 #          out. A disagreement above the boundary is tolerated **only if it is half of an adjacent
 #          equal-and-opposite pair**. An unpaired one is a new defect and fails. That is the whole
@@ -519,6 +520,112 @@ def deltas(ids, nest_col, sg_col):
     return out
 
 
+# --- boundary shifts in the two fee fields (#1819) ---
+# Fees carry no epoch and are bucketed by block. Where epoch_boundaries has no exact start (after
+# 1370 today) an epoch starts at its first observed event, so a collection between the predecessor's
+# last observation and that start lands one epoch early in the nest. That is excused only when exact:
+# a run of adjacent disagreeing epochs nets to zero and the amount crossing each boundary is a
+# block-aligned tail of the collections in that window, at the same block for both fields. Anything
+# else stays a DIFF.
+FEE_EVENT_INDEX = {"query_fees_collected": 1, "curator_query_fees": 2}
+
+
+def fee_windows(boundaries):
+    """For each boundary, named by its later epoch: (that epoch's nest start, the collections in the
+    unobserved window below it as (block, net, curators))."""
+    ids = sorted({int(b) for b in boundaries} | {int(b) - 1 for b in boundaries})
+    eb = {
+        str(r["epoch"]): r
+        for r in nest_sql(
+            "SELECT CAST(epoch AS VARCHAR) AS epoch, start_block, last_seen, boundary_source"
+            " FROM epoch_boundaries WHERE epoch IN (%s)" % ",".join(map(str, ids))
+        )
+    }
+    out = {}
+    for b in boundaries:
+        prev, cur = eb.get(str(int(b) - 1)), eb.get(b)
+        if not prev or not cur:
+            out[b] = (None, [])
+            continue
+        hi = int(cur["start_block"])
+        if cur.get("boundary_source") != "observed":
+            out[b] = (hi, [])
+            continue
+        lo = prev["last_seen"] if prev.get("last_seen") is not None else prev["start_block"]
+        # The same per-event net as lodestar_epochs' `fees`, which taxes each event, not the total.
+        rows = nest_sql(
+            "SELECT block_number, CAST(net AS VARCHAR) AS net, CAST(curators AS VARCHAR) AS curators"
+            " FROM ("
+            " SELECT block_number, CAST(\"tokensCollected\" AS HUGEINT) - CAST(\"tokensCurators\" AS HUGEINT)"
+            " - (CAST(\"tokensCollected\" AS HUGEINT) // 100) AS net, CAST(\"tokensCurators\" AS HUGEINT) AS curators"
+            " FROM subgraph_service__query_fees_collected"
+            " UNION ALL SELECT block_number, CAST(\"queryFees\" AS HUGEINT), CAST(\"curationFees\" AS HUGEINT)"
+            " FROM staking_legacy__rebate_collected"
+            " UNION ALL SELECT block_number, CAST(tokens AS HUGEINT) - CAST(\"curationFees\" AS HUGEINT),"
+            " CAST(\"curationFees\" AS HUGEINT) FROM staking_legacy__allocation_collected"
+            ") q WHERE block_number > %s AND block_number < %s AND block_number <= %s"
+            % (int(lo), hi, block)
+        )
+        out[b] = (hi, [(int(r["block_number"]), int(r["net"]), int(r["curators"])) for r in rows])
+    return out
+
+
+def tail_cuts(hi, events, idx, amount):
+    """Every block c at which the window's collections from c upward sum to exactly `amount`."""
+    cuts = {hi} if amount == 0 and hi is not None else set()
+    for c in {e[0] for e in events}:
+        if sum(e[idx] for e in events if e[0] >= c) == amount:
+            cuts.add(c)
+    return cuts
+
+
+def trace_boundary_shifts():
+    """{fee field: [(run of epochs, {boundary: (amount moved, first block moved)})]}, exact runs only."""
+    runs = {}
+    for nest_col, sg_col, from_epoch, _ in EPOCH_FIELDS:
+        if nest_col not in FEE_EVENT_INDEX:
+            continue
+        cut = max(from_epoch, epoch_floor)
+        bad = deltas([e for e in overlap if int(e) >= cut], nest_col, sg_col)
+        groups = []
+        for e in sorted(bad, key=int):
+            if groups and int(e) == int(groups[-1][-1]) + 1:
+                groups[-1].append(e)
+            else:
+                groups.append([e])
+        runs[nest_col] = []
+        for g in groups:
+            acc, moved = 0, {}
+            for e in g[:-1]:
+                acc += bad[e]
+                moved[str(int(e) + 1)] = acc
+            if acc + bad[g[-1]] == 0:
+                runs[nest_col].append((g, moved))
+    boundaries = sorted({b for rs in runs.values() for _, m in rs for b in m}, key=int)
+    if not boundaries:
+        return {}
+    windows = fee_windows(boundaries)
+
+    def moved_at(col, b):
+        return next((m[b] for _, m in runs.get(col, []) if b in m), 0)
+
+    common = {}
+    for b in boundaries:
+        hi, events = windows[b]
+        cuts = None
+        for col, idx in FEE_EVENT_INDEX.items():
+            c = tail_cuts(hi, events, idx, moved_at(col, b))
+            cuts = c if cuts is None else cuts & c
+        common[b] = cuts
+    return {
+        col: [(g, {b: (m[b], min(common[b])) for b in m}) for g, m in rs if all(common[b] for b in m)]
+        for col, rs in runs.items()
+    }
+
+
+boundary_shifts = trace_boundary_shifts()
+shifted_epochs = {col: {e for g, _ in rs for e in g} for col, rs in boundary_shifts.items()}
+
 epoch_known_diff = []
 gate_windows = []
 for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
@@ -534,14 +641,33 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
 
     if klass == "gate":
         gate_windows.append(len(window))
-        status = "OK" if not bad else "DIFF"
+        shifts = boundary_shifts.get(nest_col, [])
+        unexplained = [e for e in bad if e not in shifted_epochs.get(nest_col, set())]
+        status = "DIFF" if unexplained else "KNOWN-DIFF (#1819)" if bad else "OK"
         print(
             "  %s %s/%s epochs agree from %s %s"
             % (nest_col, len(window) - len(bad), len(window), cut, status)
         )
-        if bad:
+        for g, moves in shifts:
+            print(
+                "    epochs %s-%s are a boundary shift netting to 0: %s KNOWN-DIFF (#1819)"
+                % (
+                    g[0],
+                    g[-1],
+                    "; ".join(
+                        "%s of epoch %s filed in %s, collections from block %s"
+                        % (amt, b, int(b) - 1, first)
+                        for b, (amt, first) in sorted(moves.items(), key=lambda x: int(x[0]))
+                    ),
+                )
+            )
+        if shifts:
+            epoch_known_diff.append(
+                "%s@%s" % (nest_col, ",".join("%s-%s" % (g[0], g[-1]) for g, _ in shifts))
+            )
+        if unexplained:
             failed = True
-            for e in sorted(bad, key=int)[:20]:
+            for e in sorted(unexplained, key=int)[:20]:
                 print(
                     "    epoch %s nest=%s subgraph=%s"
                     % (e, nest_epochs[e][nest_col], sg_epochs[e][sg_col])
@@ -622,7 +748,7 @@ for nest_col, sg_col, from_epoch, klass in EPOCH_FIELDS:
     # floor to narrow the window is doing something this script supports.
     def property_holds(ids):
         if klass == "gate":
-            return not deltas(ids, nest_col, sg_col)
+            return not [e for e in deltas(ids, nest_col, sg_col) if e not in shifted_epochs.get(nest_col, set())]
         return pairing_holds(ids, nest_col, sg_col)
 
     lowest = None
@@ -913,6 +1039,6 @@ fi
 # Every gated comparison agreed, and three epoch fields still do not. Reporting that as OK would be
 # the same fault this script was rewritten to remove, one level up: a known absence of proof reading
 # as proof. Distinct exit status, so an operator can tell "agrees" from "agrees on what we check".
-echo "  NOT proved: ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1116 and #1114"
+echo "  NOT proved: ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1116, #1114 and #1819"
 echo "parity NOT CLEAN at block $BLOCK ($MODE): gated comparisons agree, known differences outstanding"
 exit 2
