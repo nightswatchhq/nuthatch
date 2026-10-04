@@ -685,7 +685,33 @@ async function loadStorage(){
 }
 
 // ---- rpc & ingest ----
-function renderRpc(){
+// Units a provider bills per call and what a million of them cost: published schedules as of
+// 2026-10. Every figure is editable on the page, because none of them stays put.
+const PRICE_PRESETS = {
+  none: { label: 'not priced', per_million: 0, units: {}, other: 0 },
+  graphops_growth: { label: 'GraphOps Growth ($199 / 10M credits)', per_million: 19.9, units: { eth_getLogs: 2, eth_call: 2 }, other: 1 },
+  graphops_starter: { label: 'GraphOps Starter ($39 / 1.5M credits)', per_million: 26, units: { eth_getLogs: 2, eth_call: 2 }, other: 1 },
+  alchemy: { label: 'Alchemy pay as you go ($0.45 / 1M CU)', per_million: 0.45, units: { eth_getBlockByNumber: 20, eth_getLogs: 60, eth_blockNumber: 10, eth_call: 26, eth_chainId: 0 }, other: 20 },
+};
+const pricePreset = k => ({ preset: k, per_million: PRICE_PRESETS[k].per_million, units: { ...PRICE_PRESETS[k].units }, other: PRICE_PRESETS[k].other });
+function priceSchedule(busiest){
+  const saved = store.get('price', null);
+  if (saved && isFinite(+saved.per_million) && saved.units) return saved;
+  return pricePreset(/graphops/.test(busiest) ? 'graphops_growth' : /alchemy/.test(busiest) ? 'alchemy' : 'none');
+}
+const unitsFor = (p, m) => +(p.units[m] ?? p.other) || 0;
+const usd = v => v === null || !isFinite(v) ? '-' : v === 0 ? '$0' : '$' + (v >= 100 ? Math.round(v).toLocaleString('en-US') : v >= 1 ? v.toFixed(2) : v >= 0.01 ? v.toFixed(3) : v.toFixed(4));
+function priceEditor(p, methods){
+  const names = [...new Set([...methods.map(x => x.method), ...Object.keys(p.units)])].sort();
+  const box = (attr, v, w) => `<input type="text" ${attr} value="${esc(v)}" style="width:${w}px;padding:3px 6px">`;
+  return '<h2>Price</h2><div class="card" style="padding:10px 12px"><div class="chips" style="align-items:center;gap:10px">'
+    + `<select id="pr-preset">${Object.entries(PRICE_PRESETS).map(([k, x]) => `<option value="${k}"${k === p.preset ? ' selected' : ''}>${esc(x.label)}</option>`).join('')}${p.preset === 'custom' ? '<option value="custom" selected>your own figures</option>' : ''}</select>`
+    + `<label>$ per million units ${box('id="pr-rate"', p.per_million, 70)}</label>`
+    + names.map(m => `<label>${esc(m)} ${box(`data-m="${esc(m)}"`, unitsFor(p, m), 46)}</label>`).join('')
+    + `<label>any other ${box('id="pr-other"', p.other, 46)}</label>`
+    + '</div></div><p class="hint">Approximate. Calls since this process started, multiplied by the units each costs; every call is priced as if it went to this provider. The presets are published prices as of October 2026, so check them against your own plan. Your figures are kept in this browser only.</p>';
+}
+function renderRpc(force){
   const el = $('#tab-rpc');
   if (!S.metrics) { el.innerHTML = '<div class="empty">loading</div>'; return; }
   const r = S.ready || {};
@@ -697,6 +723,11 @@ function renderRpc(){
     failure_rate: req[e] ? ((fail[e] || 0) / req[e] * 100).toFixed(2) + '%' : '-', avg_ms: dc[e] ? Math.round(ds[e] / dc[e] * 1000) : null,
   }));
   const methods = ml('nuthatch_rpc_methods_total').map(x => ({ method: x.labels.method || Object.values(x.labels).join(' '), calls: x.value }));
+  const price = priceSchedule(eps.slice().sort((a, b) => b.requests - a.requests)[0]?.endpoint || '');
+  const priced = price.preset !== 'none';
+  for (const x of methods) { x.each = unitsFor(price, x.method); x.units = x.calls * x.each; x.usd = x.units / 1e6 * price.per_million; }
+  const units = methods.reduce((a, x) => a + x.units, 0), spent = units / 1e6 * price.per_million;
+  const started = mv('nuthatch_start_time_seconds'), up = started ? Date.now() / 1000 - started : null;
   const buckets = ml('nuthatch_rpc_request_duration_seconds_bucket');
   const c = r.seal_direct_concurrency || {};
   let h = '<h2>Outbound RPC</h2><div class="grid">'
@@ -704,12 +735,17 @@ function renderRpc(){
     + stat('fetch window', num(r.fetch_window_blocks ?? mv('nuthatch_fetch_window_blocks')), 'blocks per getLogs')
     + stat('concurrency', num(c.effective) + ' of ' + num(c.requested), c.capped_by || 'not capped')
     + stat('indexed blocks', fixed(rate('block')) + '/s', 'over the last minute', '', spark('block'))
+    + stat('cost since start', priced ? '~' + usd(spent) : '-', priced ? num(units) + ' units' + (up > 0 ? ' in ' + span(up) : '') : 'choose a schedule under Price')
+    + stat('at this rate', priced && up > 0 ? '~' + usd(spent / up * 2592000) + ' / 30d' : '-', !priced ? 'not priced' : up > 0 ? 'projected from ' + span(up) + ' of running' : 'this nest does not report its start time')
     + '</div>';
   h += '<h2>Endpoints</h2><div class="card"><div class="scroll">' + grid([
     { key: 'endpoint' }, { key: 'requests', num: 1, fmt: num }, { key: 'failures', num: 1, fmt: num }, { key: 'retries', num: 1, fmt: num },
     { key: 'failure_rate', label: 'failure rate', num: 1 }, { key: 'avg_ms', label: 'avg ms', num: 1, fmt: num },
   ], eps, { empty: 'no endpoint has been called yet' }) + '</div></div>';
-  h += '<h2>Methods</h2><div class="card"><div class="scroll">' + grid([{ key: 'method' }, { key: 'calls', num: 1, fmt: num }], methods, { empty: 'no calls yet' }) + '</div></div>';
+  h += '<h2>Methods</h2><div class="card"><div class="scroll">' + grid([{ key: 'method' }, { key: 'calls', num: 1, fmt: num },
+    ...(priced ? [{ key: 'each', label: 'units each', num: 1, fmt: num }, { key: 'units', num: 1, fmt: num }, { key: 'usd', label: 'approx usd', num: 1, fmt: usd }] : []),
+  ], methods, { empty: 'no calls yet' }) + '</div></div>';
+  const top = h; h = '';
   if (buckets.length) {
     let prev = 0;
     const rows = buckets.filter(b => !b.labels.endpoint || Object.keys(dc).length <= 1 || true).reduce((acc, b) => { const k = b.labels.le; (acc[k] ||= 0); acc[k] += b.value; return acc; }, {});
@@ -720,8 +756,20 @@ function renderRpc(){
   h += '<h2>SQL refusals</h2><div class="card"><div class="scroll">' + grid([{ key: 'reason' }, { key: 'refused', num: 1, fmt: num }], rej, { empty: 'none' }) + '</div></div>';
   const ipfs = Object.keys(S.metrics).filter(k => k.startsWith('nuthatch_ipfs_')).map(k => ({ counter: k.replace('nuthatch_ipfs_', '').replace('_total', ''), value: mv(k) }));
   if (ipfs.some(x => x.value)) h += '<h2>IPFS</h2><div class="card"><div class="scroll">' + grid([{ key: 'counter' }, { key: 'value', num: 1, fmt: num }], ipfs) + '</div></div>';
-  el.innerHTML = h;
+  if (!$('#rpc-price')) el.innerHTML = '<div id="rpc-top"></div><div id="rpc-price"></div><div id="rpc-rest"></div>';
+  $('#rpc-top').innerHTML = top; $('#rpc-rest').innerHTML = h;
+  const pe = $('#rpc-price');
+  // Redrawn on every tick otherwise, which takes the field out from under whoever is typing in it.
+  if (!force && pe.contains(document.activeElement)) return;
+  pe.innerHTML = priceEditor(price, methods);
+  const save = p => { store.set('price', p); renderRpc(true); };
+  $('#pr-preset').onchange = e => save(pricePreset(e.target.value));
+  const edit = fn => e => { const v = parseFloat(e.target.value); if (isFinite(v) && v >= 0) { const p = { ...price, units: { ...price.units }, preset: 'custom' }; fn(p, v, e.target); save(p); } else renderRpc(true); };
+  $('#pr-rate').onchange = edit((p, v) => p.per_million = v);
+  $('#pr-other').onchange = edit((p, v) => p.other = v);
+  pe.querySelectorAll('input[data-m]').forEach(i => i.onchange = edit((p, v, t) => p.units[t.dataset.m] = v));
 }
+
 
 // ---- config ----
 let curFile = 0;

@@ -1271,6 +1271,16 @@ impl Metrics {
             process_cpu_seconds()
         ));
 
+        // Absent until a cursor is built, so a serve-only process never reports one.
+        let started = self.started_at.load(Relaxed);
+        if started != 0 {
+            s.push_str(&format!(
+                "# HELP nuthatch_start_time_seconds Unix time this runtime built its first cursor. The counters above are since then; divide by the elapsed time for a rate.\n\
+                 # TYPE nuthatch_start_time_seconds gauge\n\
+                 nuthatch_start_time_seconds {started}\n"
+            ));
+        }
+
         let (hot_bytes, sealed_bytes) = {
             let per = self.per_nest.lock().unwrap();
             let mut hot = 0u64;
@@ -2021,6 +2031,16 @@ mod tests {
         );
         m.set_last_block(101); // a genuine advance restamps
         assert!(m.last_progress() >= first);
+    }
+
+    #[test]
+    fn start_time_is_rendered_once_a_cursor_exists() {
+        let m = Metrics::new();
+        assert!(!m.render().contains("nuthatch_start_time_seconds"));
+        m.set_started_at_for_test(1_791_000_000);
+        assert!(m
+            .render()
+            .contains("\nnuthatch_start_time_seconds 1791000000\n"));
     }
 
     #[test]
