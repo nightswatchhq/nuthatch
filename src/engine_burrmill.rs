@@ -292,6 +292,100 @@ fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
 /// Rows of one batch turned into JSON before the byte cap is checked again (#1650).
 const ENCODE_ROWS: usize = 32;
 
+/// Burrmill's encoder keeps DuckDB-era nuthatch's `Debug` text for dates and timestamps
+/// (`Date32(20731)`, `Timestamp(Nanosecond, …)`), which no reader can use (#1852). The columns it
+/// applies to are chosen by Arrow type, so a text column that happens to hold such a string is left be.
+#[derive(Clone, Copy)]
+enum Temporal {
+    Date,
+    Timestamp,
+}
+
+fn temporal_columns<'a>(
+    fields: impl Iterator<Item = (&'a String, String)>,
+) -> Vec<(String, Temporal)> {
+    fields
+        .filter_map(|(name, ty)| {
+            let kind = if ty == "Date32" {
+                Temporal::Date
+            } else if ty.starts_with("Timestamp") {
+                Temporal::Timestamp
+            } else {
+                return None;
+            };
+            Some((name.clone(), kind))
+        })
+        .collect()
+}
+
+fn rewrite_temporal(rows: &mut [Value], columns: &[(String, Temporal)]) {
+    if columns.is_empty() {
+        return;
+    }
+    for row in rows {
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        for (name, kind) in columns {
+            let Some(Value::String(s)) = obj.get_mut(name) else {
+                continue;
+            };
+            let civil = match kind {
+                Temporal::Date => iso_date(s),
+                Temporal::Timestamp => rfc3339(s),
+            };
+            if let Some(civil) = civil {
+                *s = civil;
+            }
+        }
+    }
+}
+
+/// `Date32(<days since 1970-01-01>)` as `YYYY-MM-DD`.
+fn iso_date(debug: &str) -> Option<String> {
+    let days: i64 = debug
+        .strip_prefix("Date32(")?
+        .strip_suffix(')')?
+        .parse()
+        .ok()?;
+    let (y, m, d) = crate::publish::civil_from_days(days);
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// `Timestamp(<unit>, <ticks since the epoch, UTC>)` as an RFC 3339 instant in UTC. Arrow stores a
+/// zoned timestamp as UTC ticks too, so one rendering serves both.
+fn rfc3339(debug: &str) -> Option<String> {
+    let (unit, ticks) = debug
+        .strip_prefix("Timestamp(")?
+        .strip_suffix(')')?
+        .split_once(", ")?;
+    let ticks: i64 = ticks.parse().ok()?;
+    let digits = match unit {
+        "Second" => 0,
+        "Millisecond" => 3,
+        "Microsecond" => 6,
+        "Nanosecond" => 9,
+        _ => return None,
+    };
+    let per_sec = 10i64.pow(digits);
+    let (secs, frac) = (ticks.div_euclid(per_sec), ticks.rem_euclid(per_sec));
+    let (y, mo, d) = crate::publish::civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    let mut out = format!(
+        "{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    );
+    if frac != 0 {
+        let f = format!("{frac:0width$}", width = digits as usize);
+        out.push('.');
+        out.push_str(f.trim_end_matches('0'));
+    }
+    out.push('Z');
+    Some(out)
+}
+
 #[cfg(test)]
 thread_local! {
     static ENCODED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -443,9 +537,19 @@ impl Session for BurrmillSession {
                     .map(|f| f.name().clone())
                     .collect();
             }
+            let temporal = temporal_columns(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| (f.name(), f.data_type().to_string())),
+            );
             // A batch can still be wider than the 64 MiB cap, so the cap runs on a slice (#1650).
             let encode = |part| {
-                let rows = burrmill::df::encode::rows(&part);
+                let rows = burrmill::df::encode::rows(&part).map(|mut rows| {
+                    rewrite_temporal(&mut rows, &temporal);
+                    rows
+                });
                 #[cfg(test)]
                 note_encoded_rows(part.num_rows());
                 rows
@@ -505,7 +609,16 @@ impl Session for BurrmillSession {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect();
-            for row in burrmill::df::encode::rows(&batch)? {
+            let temporal = temporal_columns(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| (f.name(), f.data_type().to_string())),
+            );
+            let mut rows = burrmill::df::encode::rows(&batch)?;
+            rewrite_temporal(&mut rows, &temporal);
+            for row in rows {
                 let cells: Vec<Value> = names
                     .iter()
                     .map(|n| row.get(n).cloned().unwrap_or(Value::Null))
@@ -1062,5 +1175,59 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(err.to_string().contains("t__union"), "{err}");
+    }
+
+    #[test]
+    fn timestamps_render_at_every_unit_and_before_the_epoch() {
+        use super::rfc3339;
+        let cases = [
+            ("Timestamp(Second, 1791203696)", "2026-10-05T12:34:56Z"),
+            (
+                "Timestamp(Millisecond, 1791203696007)",
+                "2026-10-05T12:34:56.007Z",
+            ),
+            (
+                "Timestamp(Microsecond, 1791203696250000)",
+                "2026-10-05T12:34:56.25Z",
+            ),
+            (
+                "Timestamp(Nanosecond, -1)",
+                "1969-12-31T23:59:59.999999999Z",
+            ),
+            ("Timestamp(Second, 0)", "1970-01-01T00:00:00Z"),
+        ];
+        for (debug, want) in cases {
+            assert_eq!(rfc3339(debug).as_deref(), Some(want), "{debug}");
+        }
+        assert_eq!(
+            super::iso_date("Date32(-719162)").as_deref(),
+            Some("0001-01-01")
+        );
+    }
+
+    /// Both read paths rewrite by column type, and a text column holding the same string is data.
+    #[test]
+    fn only_temporal_columns_are_rewritten_on_either_read_path() {
+        use crate::engine::Session;
+        let s = super::BurrmillSession::new(None).unwrap();
+        let sql = "SELECT CAST('2026-10-05' AS DATE) AS d, 'Date32(1)' AS text";
+        let out = s.collect(sql, None).unwrap();
+        assert_eq!(
+            out.rows,
+            vec![serde_json::json!({"d": "2026-10-05", "text": "Date32(1)"})]
+        );
+        let mut cells = Vec::new();
+        s.for_each_row(sql, &mut |row| {
+            cells.extend_from_slice(row);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            cells,
+            vec![
+                serde_json::json!("2026-10-05"),
+                serde_json::json!("Date32(1)")
+            ]
+        );
     }
 }
