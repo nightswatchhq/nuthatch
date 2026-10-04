@@ -1070,8 +1070,9 @@ nuthatch dev --dir . --audit-rpc https://another-provider.example/KEY
   is 24 `eth_getLogs` a day per nest. The background audit's calls are counted in
   `nuthatch_rpc_requests_total` with the nest's own.
 - **Memory.** One sample holds at most 20,000 logs; a denser range is compared up to the block where
-  that ran out, and the report says so. Sealed segments are read one at a time and only the sample's
-  blocks are kept. For rows the size of an ERC-20 `Transfer` (about 400 bytes of row JSON) that is
+  that ran out, and the report says so. Sealed segments are read one at a time and filtered a
+  record batch at a time, so a small sample inside a large segment holds its own rows and one batch,
+  never the segment. For rows the size of an ERC-20 `Transfer` (about 400 bytes of row JSON) that is
   tens of megabytes while a sample runs, nothing between samples, and it does not grow with the nest.
 - **Scope.** `--audit-rpc` runs on a single-nest `dev`; a runtime directory refuses it, and
   `nuthatch audit sealed` is run per nest instead. It is off unless set, and talks only to the
