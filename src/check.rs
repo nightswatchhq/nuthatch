@@ -1,6 +1,6 @@
 //! `nuthatch check` - run a nest's invariant/parity checks (RFC-0002 §5).
 //!
-//! Each `checks/<name>.sql` is a read-only query run over the nest's sealed data (the same DuckDB
+//! Each `checks/<name>.sql` is a read-only query run over the nest's sealed data (the same Burrmill
 //! surface as `/sql`, so it sees the per-event tables *and* the nest's derived views). Its result is
 //! compared to a recorded expected fixture `checks/expected/<name>.json`. For the Horizon nest those
 //! fixtures are the deployed subgraph's answers at a pinned block, so this is a parity check; the

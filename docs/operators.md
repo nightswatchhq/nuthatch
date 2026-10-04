@@ -405,7 +405,7 @@ A `/sql` answer is a function of its inputs: the statement and its row cap, the 
 hot store's write generation, each maintained entity's watermark, and the content of `nuthatch.toml`,
 `views/*.sql` and `labels/*.json`. Since 3.6.0 the nest remembers answers under a hash of exactly
 those, so a statement repeated while none of them has moved is answered from memory - before the
-permit gate, since it costs no DuckDB - and reports `"cached": true`. One commit, one seal, one
+permit gate, since it costs no engine work - and reports `"cached": true`. One commit, one seal, one
 edited view changes the key and the next request computes. It is not a TTL and cannot serve a stale
 row: same key, same inputs, same rows. What it does is turn a dashboard's fifth request for the same
 fold from seconds into microseconds, on a cursor that commits a handful of times an hour.
@@ -1251,7 +1251,7 @@ hot store costs a re-index of the unsealed window, not history.
 **Reading sealed data without this binary.** The sealed directory is plain Parquet plus a catalogue.
 [Reading Nuthatch segments without Nuthatch](reading-segments.md) is the contract: layout, catalogue
 schema, ordering, and the 256-bit encoding (canonical decimal text in `Utf8`; `_dec` / `_overflow`
-are DuckDB view columns, not Parquet). Point another engine at the same files. Do not glob
+are view columns the SQL engine adds, not Parquet). Point another engine at the same files. Do not glob
 `segments/*.parquet`, and do not expect a narrowed numeric type in the file.
 
 **Mirroring sealed data to a bucket (RFC-0052).** `nuthatch publish sync --target <dir or

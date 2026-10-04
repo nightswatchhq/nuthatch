@@ -96,7 +96,7 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
 - [ ] ✅ Reorgs only ever touch the mutable hot store; sealed Parquet is append-only past finality.
 - [ ] ✅ Atomic seal/prune (no torn segment on crash mid-seal). *(0.4.0 hardening)*
 - [ ] ✅ Crash-safety e2e (`e2e_crash_safety.rs`): kill mid-index, restart, converge.
-- [ ] ✅ Single-writer discipline: only the ingestion thread writes DuckDB/redb; queries attach
+- [ ] ✅ Single-writer discipline: only the ingestion thread writes redb and the sealed segments; queries attach
   read-only. No concurrent-writer design anywhere.
 - [ ] ✅ Single cursor / single process / one observable failure boundary. A second chain = a second
   process (never multiplex chains behind one cursor).

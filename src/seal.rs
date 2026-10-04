@@ -353,7 +353,7 @@ pub fn seal_range_with_snapshot(
 
 /// Readers of each dataset's segments, and the files a fold replaced that must outlive them.
 ///
-/// A `/sql` read plans against the manifest and opens the files it names later, when DuckDB executes.
+/// A `/sql` read plans against the manifest and opens the files it names later, when Burrmill executes.
 /// A fold that deleted the replaced file as soon as its new manifest was installed could land in
 /// between, and the read then found a planned segment missing and answered short. A reader holds a
 /// [`ReadLease`] from before it reads the manifest until its rows are collected; a replaced file is
@@ -1963,7 +1963,7 @@ mod tests {
             let n = field.name();
             assert!(
                 !n.ends_with("_dec") && !n.ends_with("_overflow"),
-                "{n} is a DuckDB view column and must not be written to parquet"
+                "{n} is a Burrmill view column and must not be written to parquet"
             );
         }
 

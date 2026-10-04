@@ -295,7 +295,7 @@ Reports:
 
 Same house rule as the backfill matrix: numbers come from a committed `bench-report.json` with date,
 provider, hardware and commit, or they are not quoted. Run it before and after any change to the
-serving or storage path - a persistent DuckDB connection, a bounded hot scan, or a compact row format
+serving or storage path - a cached query session, a bounded hot scan, or a compact row format
 would all show up here first. A `query` report carries `hardware` and `commit` but no `provider`,
 because it runs entirely offline against a store on disk: no endpoint is involved, and the machine is
 what makes two of these numbers comparable at all.
@@ -378,7 +378,7 @@ a real regression rather than the 1.61x claimed.
 
 What this gate does **not** catch: a regression landing under 8µs - a partial scan, or a scan when the
 hot store is much smaller than 256 rows - cold-start latency (it measures warm, see `warm_cache` in the
-report), point-reads against the Postgres backend, and anything about the sealed/DuckDB path. It is a
+report), point-reads against the Postgres backend, and anything about the sealed-segment SQL path. It is a
 floor on gross regressions, not a microbenchmark.
 
 ### The baseline is the runner's own artifact (issue #385)

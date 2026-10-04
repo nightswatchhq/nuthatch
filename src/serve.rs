@@ -26,8 +26,8 @@ use crate::views::BalanceView;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// How many analytical (DuckDB) queries may run at once across `/sql`, cold `/table` and a cold
-/// `/entity` (#1657). Each DuckDB query is capped at `analytics.memory_limit` /
+/// How many analytical (Burrmill) queries may run at once across `/sql`, cold `/table` and a cold
+/// `/entity` (#1657). Each Burrmill query is capped at `analytics.memory_limit` /
 /// `analytics.threads` (defaults 512 MB / 2;
 /// see `analytics_budget`), so this bounds the whole analytical surface's worst-case footprint - the
 /// real DoS multiplier is *concurrency*, not any one query. Kept small to stay well inside the
@@ -43,7 +43,7 @@ pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 ///
 /// The permit count is a **memory** bound, not a throughput one (#1006, and the correction in
 /// RFC-0042 §14): concurrent queries do not serialise, but each one that misses the connection cache
-/// opens its own DuckDB. Measured on a 32-core box, unbounded at 32 clients reached **1,313 MB - 64%
+/// opens its own session. Measured on a 32-core box under DuckDB (before 4.1), unbounded at 32 clients reached **1,313 MB - 64%
 /// of one cursor's entire 2 GB budget**, shared across every nest on that cursor. So this is capped
 /// rather than free-form: an operator raising it is trading RAM they may not have, and the
 /// non-negotiable budget is per cursor rather than per nest.
@@ -64,11 +64,11 @@ pub const SQL_MAX_CONCURRENCY_CEILING: usize = 16;
 ///
 /// [`SQL_MAX_CONCURRENCY`]'s own description has always said it "bounds the whole analytical
 /// surface's worst-case footprint". It did not: `build_nest` constructed a **separate** semaphore per
-/// nest, so a runtime hosting six nests admitted `6 x permits` concurrent DuckDB queries.
+/// nest, so a runtime hosting six nests admitted `6 x permits` concurrent Burrmill queries.
 ///
 /// Survivable at a hardcoded 2; a foot-gun the moment the value became settable, because
 /// `NUTHATCH_SQL_MAX_CONCURRENCY=16` across six nests would admit **96**, each able to open its own
-/// DuckDB - precisely the per-cursor budget the override's warning claims to protect. Caught in
+/// session - precisely the per-cursor budget the override's warning claims to protect. Caught in
 /// review of #1006 (#1024), and the same shape as everything else this sprint found: a comment
 /// asserting a property the code did not deliver.
 ///
@@ -140,7 +140,7 @@ const SQL_ADMISSION_WAIT: Duration = Duration::from_millis(250);
 ///
 /// A parked request holds its query string, capped at [`SQL_MAX_QUERY_LEN`] (16 KiB), so the worst
 /// case here is roughly 4 MB of parked requests per nest. The cap is per-nest rather than
-/// per-cursor - unlike the permit count, which is shared because it bounds DuckDB - because what
+/// per-cursor - unlike the permit count, which is shared because it bounds Burrmill - because what
 /// this protects is the memory of requests that are not running at all.
 const SQL_MAX_QUEUED: usize = 256;
 
@@ -174,7 +174,7 @@ impl Drop for QueueSlot {
     }
 }
 /// Cap on rows materialised from one analytical query - bounds the Rust-side result buffer, which
-/// lives outside DuckDB's own memory limit. Beyond this the result is truncated and flagged.
+/// lives outside Burrmill's own memory limit. Beyond this the result is truncated and flagged.
 const SQL_MAX_ROWS: usize = 50_000;
 
 /// The most unsealed rows `/sql` will materialise for one query.
@@ -253,14 +253,14 @@ pub struct AppState {
     pub nest_info: Arc<serde_json::Value>,
     /// The nest's table schemas (from the decode registry) - the source of truth for `/tables`.
     pub tables: Arc<Vec<TableSchema>>,
-    /// Admission control for the analytical (DuckDB) surface: bounds how many `/sql` and cold
-    /// `/table` queries run at once so a burst can't multiply DuckDB's per-query footprint past the
+    /// Admission control for the analytical (Burrmill) surface: bounds how many `/sql` and cold
+    /// `/table` queries run at once so a burst can't multiply Burrmill's per-query footprint past the
     /// process budget. Constructed with [`SQL_MAX_CONCURRENCY`] permits.
     pub sql_gate: Arc<Semaphore>,
     /// Requests currently parked waiting for [`Self::sql_gate`], bounded by [`SQL_MAX_QUEUED`].
     ///
     /// Per-nest and not shared across a cursor, unlike the gate itself: the gate bounds what runs
-    /// in DuckDB, this bounds the memory held by requests that are not running at all (#1319).
+    /// in Burrmill, this bounds the memory held by requests that are not running at all (#1319).
     pub sql_queued: Arc<std::sync::atomic::AtomicUsize>,
     /// The most unsealed rows `/sql` and `/explain` will materialise for one query before refusing
     /// with a `503` (`HotScanTooLarge`) - the live value [`SQL_MAX_HOT_ROWS`] documents. A field
@@ -2991,7 +2991,7 @@ fn graph_history_head(
 }
 
 /// Run a compiled query through the same analytical path `/sql` uses, so a Graph query inherits
-/// RFC-0034's admission bounds rather than opening a second unbounded door into DuckDB.
+/// RFC-0034's admission bounds rather than opening a second unbounded door into Burrmill.
 #[cfg(feature = "graph")]
 async fn graph_rows(
     s: &AppState,
@@ -3289,7 +3289,7 @@ async fn ipfs_gave_up(
 }
 
 async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    // Hot path first (redb). On a miss, fall back to the sealed segments (DuckDB), so a point-read
+    // Hot path first (redb). On a miss, fall back to the sealed segments (Burrmill), so a point-read
     // keeps working across the hot→cold seam even after the hot store has been pruned.
     match s.store.get_entity(&id) {
         Ok(Some(raw)) => match serde_json::from_str::<Value>(&raw) {
@@ -3847,7 +3847,7 @@ async fn run_sql_query_at(
     // The deterministic memo (#1186): the identity of this answer is the statement plus every input
     // it reads - sealed watermark, hot-store write generation, entity watermarks, authored files. A
     // remembered answer for that identity is the answer, and it is returned before the permit gate,
-    // because a hit costs no DuckDB and the gate exists to bound DuckDB. `None` where the store
+    // because a hit costs no Burrmill and the gate exists to bound Burrmill. `None` where the store
     // cannot report a write generation; that backend simply computes every time.
     let memo = memo_identity(&s, &q.q, max_rows, historical_block);
     if let Some((key, generation, sealed_through, before)) = &memo {
@@ -4554,7 +4554,7 @@ fn derived_provenance(
     )
 }
 
-/// **Criterion 2: a direct keyed read does not invoke DuckDB or scan canonical fact history.**
+/// **Criterion 2: a direct keyed read does not invoke Burrmill or scan canonical fact history.**
 ///
 /// It is a `BTreeMap` lookup against the circuit's own output. There is no connection, no
 /// `read_parquet`, and no hot-store scan on this path - which is the whole claim RFC-0041 makes, and
@@ -8723,7 +8723,7 @@ mod tests {
         );
     }
 
-    /// A remembered answer costs no DuckDB, so it is served past a saturated permit gate - that is
+    /// A remembered answer costs no Burrmill, so it is served past a saturated permit gate - that is
     /// most of the point under a dashboard's burst. A statement with no remembered answer is still
     /// refused, so the gate still bounds what it was built to bound.
     #[tokio::test]

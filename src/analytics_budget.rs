@@ -7,9 +7,9 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
-/// Per-connection DuckDB ceiling. Operator key `analytics.memory_limit`.
+/// Per-connection Burrmill ceiling. Operator key `analytics.memory_limit`.
 pub const DEFAULT_MEMORY_LIMIT_MB: u64 = 512;
-/// DuckDB worker threads. Operator key `analytics.threads`.
+/// Burrmill worker threads. Operator key `analytics.threads`.
 pub const DEFAULT_THREADS: i64 = 2;
 /// Hard ceiling on `analytics.threads`. Matches [`crate::serve::SQL_MAX_CONCURRENCY_CEILING`].
 pub const THREADS_CEILING: i64 = crate::serve::SQL_MAX_CONCURRENCY_CEILING as i64;
@@ -26,7 +26,7 @@ pub const ENV_BURRMILL_MEMORY_LIMIT: &str = "NUTHATCH_BURRMILL_MEMORY_LIMIT";
 pub const ENV_MAX_RSS: &str = "NUTHATCH_MAX_RSS";
 
 /// Unmeasured. RFC-0047 §6 wants a high-water mark for Rust, DBSP, decode and result
-/// materialisation outside DuckDB, on the box that enforces the 2 GB budget. Counted as zero
+/// materialisation outside Burrmill, on the box that enforces the 2 GB budget. Counted as zero
 /// rather than invented; the term still appears in the inequality so an operator can see it.
 pub const RUNTIME_HEADROOM_MB: u64 = 0;
 
@@ -43,7 +43,7 @@ pub struct AnalyticsConfig {
     /// Named ingest floor, in MB. `None` → [`derived_ingestion_reservation_mb`].
     pub ingestion_reservation_mb: Option<u64>,
     /// Burrmill's bound per session. `None` → `memory_limit_mb`. Its hash joins and final aggregates
-    /// cannot spill, so a nest whose views DuckDB answers in 512 MB may need more here.
+    /// cannot spill, so a nest whose views Burrmill answers in 512 MB may need more here.
     pub burrmill_memory_limit_mb: Option<u64>,
     /// The wall the split is held to. `None` → [`crate::runtime::DEFAULT_MAX_RSS_MB`].
     pub max_rss_mb: Option<u64>,
@@ -64,27 +64,27 @@ impl Default for AnalyticsConfig {
 }
 
 impl AnalyticsConfig {
-    /// Remainder of the 2 GiB cursor budget after the shipped DuckDB split (2 × 512 MB).
+    /// Remainder of the 2 GiB cursor budget after the shipped Burrmill split (2 × 512 MB).
     ///
     /// Not a measured ingest RSS high-water. RFC-0047 §6 leaves that unresolved; this is the floor
-    /// today's walls already left for everything that is not DuckDB.
+    /// today's walls already left for everything that is not Burrmill.
     pub fn reservation_mb(&self) -> u64 {
         self.ingestion_reservation_mb
             .unwrap_or_else(derived_ingestion_reservation_mb)
     }
 }
 
-/// Named ingest floor left after the shipped DuckDB split:
+/// Named ingest floor left after the shipped Burrmill split:
 /// `2048 - (SQL_MAX_CONCURRENCY × DEFAULT_MEMORY_LIMIT_MB)`. Not an ingest RSS cap.
 ///
 /// **It is a floor and not a slider**, which is the whole reason the inequality means anything.
 /// Nothing in the runtime caps ingest, DBSP, redb or result materialisation at this figure, so a
-/// config that lowered it would not shrink ingest by one byte - it would only buy DuckDB headroom
+/// config that lowered it would not shrink ingest by one byte - it would only buy Burrmill headroom
 /// against a promise no code keeps, and the cursor could then exceed 2 GiB with the gate green.
 /// `runtime_headroom` is inside this number for the same reason: it is unmeasured, so it cannot be
 /// a term an operator gets to spend. Raising the reservation is the conservative direction and is
 /// allowed; lowering it is refused by [`validate_against`]. The consequence is the property worth
-/// stating: **no accepted split hands DuckDB more RAM than the shipped default the footprint CI
+/// stating: **no accepted split hands Burrmill more RAM than the shipped default the footprint CI
 /// job actually measures.**
 impl AnalyticsConfig {
     pub fn burrmill_limit_mb(&self) -> u64 {
@@ -104,7 +104,7 @@ pub fn derived_ingestion_reservation_mb() -> u64 {
 }
 
 /// Read the live operator settings. Unparseable values fall back to the shipped default and warn.
-/// A DuckDB split that dips under the named ingest floor, and a thread count above
+/// A Burrmill split that dips under the named ingest floor, and a thread count above
 /// [`THREADS_CEILING`], are the validator's job - including an explicit zero reservation, which is
 /// carried through as `Some(0)` so it is refused rather than read as "unset".
 pub fn from_env() -> AnalyticsConfig {
@@ -154,7 +154,7 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
     if cfg.threads > THREADS_CEILING {
         bail!(
             "analytics.threads is {}, above the ceiling of {THREADS_CEILING} (set {ENV_THREADS}, \
-             default {DEFAULT_THREADS}). DuckDB worker threads are not an unconstrained config key.",
+             default {DEFAULT_THREADS}). Burrmill worker threads are not an unconstrained config key.",
             cfg.threads
         );
     }
@@ -177,9 +177,9 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
             "ingestion_reservation is {reservation} MB, below the floor of {floor} MB (set \
              {ENV_INGESTION_RESERVATION}). It is a floor, not a slider: nothing caps ingest, DBSP, \
              redb or result materialisation at this figure, so writing a smaller number does not \
-             shrink ingest - it only hands DuckDB headroom against a reservation no code enforces, \
+             shrink ingest - it only hands Burrmill headroom against a reservation no code enforces, \
              and the cursor can then pass this gate and still exceed the 2 GiB budget. Raise it to \
-             give DuckDB less; lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
+             give Burrmill less; lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
              NUTHATCH_SQL_MAX_CONCURRENCY if you need room elsewhere."
         );
     }
@@ -529,7 +529,7 @@ pub(crate) mod tests {
 
     /// The finding on #1241: `2 × 768 + 512 = 2048` balances, and is still a cursor that can go
     /// over 2 GiB, because the 512 reserves accounting space and caps nothing. A split may not buy
-    /// DuckDB room by writing down a smaller number for ingest.
+    /// Burrmill room by writing down a smaller number for ingest.
     #[test]
     fn lowering_the_reservation_to_buy_duckdb_memory_is_refused() {
         let cfg = AnalyticsConfig {
@@ -547,7 +547,7 @@ pub(crate) mod tests {
         assert!(err.contains(ENV_INGESTION_RESERVATION), "{err}");
     }
 
-    /// Raising it is the conservative direction and stays allowed: DuckDB gets less, not more.
+    /// Raising it is the conservative direction and stays allowed: Burrmill gets less, not more.
     #[test]
     fn raising_the_reservation_is_allowed_and_shrinks_duckdb() {
         let cfg = AnalyticsConfig {
@@ -559,7 +559,7 @@ pub(crate) mod tests {
     }
 
     /// The property the floor buys, stated as a test rather than as a paragraph: whatever an
-    /// operator writes, an accepted split never hands DuckDB more than the shipped default that
+    /// operator writes, an accepted split never hands Burrmill more than the shipped default that
     /// the footprint CI job measures.
     #[test]
     fn no_accepted_split_gives_duckdb_more_than_the_measured_default() {
@@ -580,7 +580,7 @@ pub(crate) mod tests {
                     let duck = permits as u64 * memory_limit_mb;
                     assert!(
                         duck <= shipped,
-                        "accepted {permits} × {memory_limit_mb} MB = {duck} MB of DuckDB with a \
+                        "accepted {permits} × {memory_limit_mb} MB = {duck} MB of Burrmill with a \
                          {reservation} MB reservation, above the measured default of {shipped} MB"
                     );
                 }

@@ -205,7 +205,7 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
 /// the identity. Each one below is justified by "the indexing path never reads it":
 ///
 /// - `views/**` - authored SQL is **not materialised**. `analytics::define_nest_views` defines views
-///   per query on an ephemeral in-memory DuckDB over the segments and the hot tip; nothing persists
+///   per query on an ephemeral in-memory Burrmill over the segments and the hot tip; nothing persists
 ///   them, so no view can influence a byte that is stored.
 /// - `entities.toml` and `entities/**` - RFC-0041 declarations and definitions affect derived entity
 ///   state only. Slice one validates them, and slice two rebuilds that state from the adopted facts;

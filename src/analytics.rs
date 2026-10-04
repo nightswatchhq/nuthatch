@@ -47,7 +47,7 @@ fn open_session(dir: &Path) -> Result<Box<dyn Session>> {
     engine().open(dir)
 }
 
-/// One cached read-only DuckDB (#295). A fresh in-memory instance per query was the rebuild the
+/// One cached read-only session (#295). A fresh in-memory instance per query was the rebuild the
 /// issue named: open, lockdown, attach, teardown. The connection is read-only and single-user, and
 /// ingestion never writes here.
 ///
@@ -64,7 +64,7 @@ fn open_session(dir: &Path) -> Result<Box<dyn Session>> {
 /// query holds the slot out, another opens its own instance. That is where concurrent RSS comes
 /// from, and it is why `SQL_MAX_CONCURRENCY` is a memory bound rather than a throughput one.
 ///
-/// An interrupt drops the slot rather than leaving DuckDB half-cancelled for the next caller.
+/// An interrupt drops the slot rather than leaving the engine half-cancelled for the next caller.
 struct SessionCache {
     dir: PathBuf,
     sealed_through: u64,
@@ -248,7 +248,7 @@ fn spilled_bytes(dir: &Path) -> u64 {
 }
 
 /// A resource guard for the untrusted `/sql` surface: a hard wall-clock deadline (enforced by
-/// interrupting the running DuckDB query) and a cap on materialised rows. Trusted internal callers
+/// interrupting the running Burrmill query) and a cap on materialised rows. Trusted internal callers
 /// (`net_balances`, `get_row`) run *unguarded*. A public `/entity` miss uses [`get_row_guarded`]
 /// (#1657). Access control (who may query, per-caller quotas) is deliberately
 /// *not* here: that needs caller identity a sovereign single-tenant node doesn't have - it's a
@@ -811,7 +811,7 @@ pub(crate) fn test_set_remove_after_define(dir: &Path, file: Option<PathBuf>) {
 /// ("No files found that match the pattern") or at execution ("Cannot open file"), always naming a
 /// path under the segments directory; nothing else on this surface produces either wording with that
 /// path in it.
-/// Interrupt handles of the DuckDB statements running now, so a shutdown can stop them rather than
+/// Interrupt handles of the Burrmill statements running now, so a shutdown can stop them rather than
 /// drain behind them.
 type LiveHandles = Mutex<Vec<(u64, PathBuf, Arc<dyn Interrupt>)>>;
 
@@ -2010,9 +2010,9 @@ pub(crate) fn reject_replacement_scan(sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// Net balance per address for one sealed transfer table, summed as i128 (DuckDB HUGEINT). This is
+/// Net balance per address for one sealed transfer table, summed as i128. This is
 /// how the IVM view is re-seeded on restart: instead of replaying every sealed transfer through the
-/// circuit, we let DuckDB fold each immutable segment down to one (address, net) row. Addresses
+/// circuit, we let Burrmill fold each immutable segment down to one (address, net) row. Addresses
 /// whose net is exactly zero are omitted (matching the view's drop-at-zero behaviour). `table` and
 /// the column names come from the registry (`{alias}__transfer`; from/to/value column names vary by
 /// token - USDC from/to/value, WETH src/dst/wad), never user text, so there is no injection surface.
@@ -2120,7 +2120,7 @@ pub fn net_balances(
 }
 
 /// Cold exposure fold (RFC-0008 C1): direct counterparty exposure to the labeled set for one sealed
-/// transfer table, computed in DuckDB by joining the segments against the `labels` view. Mirrors
+/// transfer table, computed in Burrmill by joining the segments against the `labels` view. Mirrors
 /// `net_balances` - it lets a restart re-seed the exposure view from immutable segments instead of
 /// replaying every sealed transfer. Returns `(encoded_key, amount, count)` where the key is
 /// `address\u{1f}label\u{1f}direction`, matching `exposure::seed_item`. `table`/column names are
@@ -2158,7 +2158,7 @@ pub fn cold_exposure(
 }
 
 /// Cold velocity fold (RFC-0008 C3): per-address outbound volume + count per tumbling block-window,
-/// summed in DuckDB over one sealed transfer table - the restart re-seed for the velocity view (as
+/// summed in Burrmill over one sealed transfer table - the restart re-seed for the velocity view (as
 /// `net_balances`/`cold_exposure` are for their views). Returns `(encoded_key, volume, count)` where
 /// the key is `address\u{1f}window_start`, matching `velocity::seed_item`. Registry-derived names.
 pub fn cold_velocity(
@@ -2354,7 +2354,7 @@ fn sealed_rows(dir: &Path, sql: &str, guard: Option<QueryGuard>) -> Result<Vec<V
     }
 }
 
-/// Expose each table's sealed segments as a read-only DuckDB view named after the table. Tables with
+/// Expose each table's sealed segments as a read-only Burrmill view named after the table. Tables with
 /// no sealed segments yet simply have no view (they hold only unsealed tip data, served from hot).
 ///
 /// Big-integer columns (uint/int > 64 bits) are stored as exact text (canonical form). For ergonomic
@@ -2752,7 +2752,7 @@ fn table_scan(files: &[(PathBuf, u64)]) -> TableScan {
     }
 }
 
-/// The DuckDB column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
+/// The SQL column type for a sealed/hot column, matching `seal::rows_to_batch`: the four counter
 /// columns are `UBIGINT`, everything else is stored as canonical text (`VARCHAR`).
 type HeldRelations = Mutex<std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>>;
 
@@ -3559,7 +3559,7 @@ impl FoldBinder {
         self.parser.engine_version()
     }
 
-    /// `(column, type)` of a query's output, as DuckDB spells the type.
+    /// `(column, type)` of a query's output, as Burrmill spells the type.
     pub(crate) fn describe(&self, sql: &str) -> Result<Vec<(String, String)>> {
         self.session.describe(sql)
     }
