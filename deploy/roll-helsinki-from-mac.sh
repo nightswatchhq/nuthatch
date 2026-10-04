@@ -57,6 +57,7 @@ if [ ${#refusals[@]} -gt 0 ] && [ -z "$override" ]; then
   echo "refusing to roll v$v: its release gates did not pass; --override '<reason>' rolls anyway" >&2
   exit 1
 fi
+[ ${#refusals[@]} -gt 0 ] || echo "ok   gates: every rolled unit's release-gate status is success on v$v"
 if [ -n "$override" ]; then
   printf '\n*** OVERRIDE: rolling v%s past its release gates ***\n*** reason: %s ***\n\n' "$v" "$override"
 fi

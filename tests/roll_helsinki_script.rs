@@ -118,6 +118,7 @@ fn a_release_green_on_every_nest_rolls_every_unit() {
     statuses(&r, &[]);
     let (ok, out) = roll(&r, &[]);
     assert!(ok, "a fully gated release was refused:\n{out}");
+    assert!(out.contains("ok   gates: "), "a passed check must say so:\n{out}");
     let ssh =
         reached_the_box(&r).unwrap_or_else(|| panic!("the roll never reached the box:\n{out}"));
     for unit in [
