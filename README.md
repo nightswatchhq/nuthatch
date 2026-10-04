@@ -13,8 +13,9 @@ nuthatch dev --backfill 300                                             # the la
 nuthatch sql "SELECT count(*) FROM usdc__transfer"                      # in a second terminal
 ```
 
-The Linux binary needs glibc 2.34 or newer to run (it is built on 2.35). No Intel Mac binary is
-published: there, and on other platforms, build from source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
+The Linux binary needs glibc 2.35 or newer to run from 4.1.0, which is also what it is built on;
+4.0.x ran on 2.34. No Intel Mac binary is published: there, and on other platforms, build from
+source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
 `init` creates a **nest**: a directory holding the contract's ABI, its config and, once `dev` runs,
 its indexed data. `--backfill 300` starts 300 blocks behind the tip, about an hour of mainnet, so there
 are rows to query within seconds on the bundled public endpoints. Without it, `dev` backfills from the
@@ -55,6 +56,8 @@ chain, no telemetry, no account. The built-in MCP server lets Claude or any MCP 
 
 - **[Lodestar](https://www.lodestar-dashboard.com)**, an analytics dashboard for The Graph Protocol on
   Arbitrum One, serves live panels from self-hosted nests instead of The Graph gateway.
+- **[GraphOps](https://graphops.xyz)**, an indexer and core developer on The Graph, is a design
+  partner. Its feedback is what led to maintained entities ([RFC-0041](docs/rfcs/0041-authored-incremental-entities.md)).
 
 An earlier example, now finished: **[Arcaidia](https://arcaidia.io)**, a speed layer over Circle's
 CCTP built at ETHOnline 2026, read its indexed state from two nests on Ethereum Sepolia and Arc
@@ -64,8 +67,7 @@ for a higher Studio rate limit. They were stopped on 2026-09-29.
 
 More at [nuthatch-indexer.com/stories](https://www.nuthatch-indexer.com/stories).
 
-Nightswatch does not run a hosted nest service. GraphOps plans to offer hosted nests on its own
-platform, running the same binary as anyone else; there is no date for it yet.
+Nightswatch does not run a hosted nest service.
 
 ---
 
@@ -92,7 +94,7 @@ artifact with `objdump -T` rather than inferred:
 It links `libc`, `libm` and `libgcc` and no C++ runtime. Releases before 4.1 embedded DuckDB and
 also needed libstdc++ from GCC 11.
 
-Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34 and ran 4.0.x; for
+Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34 and ran 4.0.x; from
 4.1.0 they need the source build.
 
 **Verify who built it.** Every release binary carries a build provenance attestation, which a
@@ -607,8 +609,9 @@ the findings we closed as *not ours to fix* and why, is in
   [index](docs/rfcs/README.md)); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
-- **Governance:** a grant-funded public good (NLnet / EF-ESP). No hosted service, no token, no
-  phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing design brief [`CLAUDE.md`](CLAUDE.md).
+- **Governance:** a self-funded public good, maintained by one person; everything is open source. No
+  hosted service, no token, no phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing
+  design brief [`CLAUDE.md`](CLAUDE.md).
 - **Out of scope:** a hosted/metered service, non-EVM chains before EVM is airtight, or any deployment
   story beyond binary + compose.
 

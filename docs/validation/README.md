@@ -49,8 +49,8 @@ sample size of one.
 - **Pre-registered bar:** "concrete adoption intent."
 - **Outcome: EXCEEDED.** Unprompted, the operator proposed hosting nuthatch as an offering on their
   data-service platform with revenue-share to fund core development, and agreed a first target (the
-  Lodestar panel migration) as the pilot. This is recorded as sustainability Leg 2 in
-  [RFC-0006 v2](../rfcs/0006-grant-funding.md) and as Phase 1.5 (the operator pilot) in RFC-0007 v2.
+  Lodestar panel migration) as the pilot. This was recorded as sustainability Leg 2 in
+  [RFC-0006 v2](../rfcs/0006-grant-funding.md), withdrawn on 2026-10-04, and as Phase 1.5 (the operator pilot) in RFC-0007 v2.
 - **Neutrality note:** the partnership grants no exclusivity, private fork, partner-only core
   features, or roadmap veto - see [GOVERNANCE.md](../../GOVERNANCE.md#neutrality-the-guarantee-you-can-depend-on).
 

@@ -35,7 +35,7 @@ does it drift?
 
 Honest about scope: nine EVM chains built in and any other with `--rpc`; events, declared `eth_call`s
 (pinned or one per event row) and verified IPFS documents; traces and state diffs need a node; RPC
-polling today (in-process reth ExEx is designed and stubbed). `MIT OR Apache-2.0`, grant-funded public good - not a startup, no token, no phone-home,
+polling today (in-process reth ExEx is designed and stubbed). `MIT OR Apache-2.0`, a self-funded public good maintained by one person - not a startup, no token, no phone-home,
 and a public "what we'll never build" list.
 
 _(Optional, only if the operator has announced:) An operator in this ecosystem is preparing a hosted

@@ -64,8 +64,9 @@ ungoverned parameter - is a pinned-block `eth_call` against an operator-supplied
 (`[[calls]]` + `--state-rpc`). That executor shipped in 2.6.0. IPFS documents are a declared
 `[[ipfs]]` table, content-addressed, verified against the CID (RFC-0037).
 
-It's v2.7.1, solo-maintained, and running in production. `MIT OR Apache-2.0`, a grant-funded public
-good, not a startup - the sustainability plan and the "what we'll never build" list are both in-repo.
+It's v2.7.1, solo-maintained, and running in production. `MIT OR Apache-2.0`, a self-funded public
+good, maintained by one person, not a startup - everything is open source, and the "what we'll never
+build" list is in-repo.
 
 Install, quickstart, the footprint methodology, and the full progress log:
 https://github.com/nightswatchhq/nuthatch

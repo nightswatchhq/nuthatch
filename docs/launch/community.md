@@ -177,9 +177,8 @@ In order. Nothing here blocks on anything below it.
 7. **Open the awesome-selfhosted PR** whenever. It is independent of all of the above and costs an
    hour.
 
-**Not on this list:** NLnet. Its window (3 Sept - 3 Nov 2026) is real and verified, but it is on the
-back burner by decision as of 2026-08-19. Recorded so that if it comes forward again, the date is
-already known rather than rediscovered.
+**Not on this list:** grants. nuthatch takes none (2026-10-04); it is a self-funded public good,
+maintained by one person, and everything is open source.
 
 ## 6. What is unverified
 
