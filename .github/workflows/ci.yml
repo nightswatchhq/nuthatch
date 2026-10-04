@@ -976,7 +976,7 @@ jobs:
     name: backfill throughput
     needs: build-release
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: download binary
@@ -984,28 +984,22 @@ jobs:
         with:
           name: nuthatch-release
           path: bin
-      - name: measure backfill events/sec (MEASURING, no floor yet)
+      - name: measure backfill events/sec (tracked, not gated)
+        # #1723. No floor: on this fixture a 4x decode cost moved the figure about 1%, and on this
+        # runner concurrency 1 reads faster than 4, so a floor would pass the regressions it exists
+        # for. docs/benchmarks.md has the figures. It fails only if the run did not do the work.
         env:
           BIN: bin/nuthatch
-          BATCHES: "5"
           OUT: backfill-throughput-report.json
         run: |
           chmod +x bin/nuthatch
-          echo "runner: $(nproc) cpus, $(free -m | awk '/^Mem:/{print $2}') MB, $(uname -r)"
           bash .github/workflows/backfill-throughput.sh
-      - name: contrast, concurrency 1 (MEASURING)
-        env:
-          BIN: bin/nuthatch
-          BATCHES: "2"
-          CONCURRENCY: "1"
-          OUT: backfill-throughput-c1.json
-        run: bash .github/workflows/backfill-throughput.sh
       - name: upload report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: backfill-throughput-report
-          path: backfill-throughput-*.json
+          path: backfill-throughput-report.json
           retention-days: 30
 
 

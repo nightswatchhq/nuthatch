@@ -1,27 +1,22 @@
 #!/usr/bin/env bash
 #
-# Backfill events/sec on a fixed, locally served chain, against a floor (#1723).
+# Backfill events/sec on a fixed, locally served chain: tracked on every PR, not gated (#1723).
 #
 # `nuthatch bench backfill --seal-direct --concurrency 4` over blocks 1 to 20,000 of the chain
 # footprint-rpc.py serves: one contract, four Transfers a block, 80,000 rows. It is RFC-0052 S2's
-# scenario (scripts/publish-throughput-gate.sh) without the mirror, so no third party and no secret,
-# and a fork PR behaves identically. BATCHES batches of RUNS runs each; the bench reports each batch's
-# median, and the figure gated is the median of those.
+# scenario (scripts/publish-throughput-gate.sh) without the mirror, so there is no third party and no
+# secret. BATCHES batches of RUNS runs; the bench reports each batch's median, and the figure reported
+# is the median of those.
 #
-# The fixture is single-threaded Python and serves every log the run decodes, so part of the wall
-# clock is the fixture's. A slowdown in nuthatch therefore shows here diluted, never amplified.
+# Why there is no floor: the runner's batches agree to 4.2%, but the scenario cannot see the
+# regressions a floor would exist for. A 4x decode cost moved it about 1%, and on the 4-core runner
+# concurrency 1 reads faster than 4. docs/benchmarks.md has the figures.
 #
-# Every scenario knob defaults to the enforced scenario (#395). CI sets only the floor, the baseline
-# and where the report goes.
-#
-# Env: BIN (target/release/nuthatch), MIN_EVENTS_PER_SEC (unset: recorded, not gated), BASELINE
-#      (unset: not checked; CI sets docs/bench/backfill-throughput.json), OUT
-#      (backfill-throughput-report.json), BATCHES (3), RUNS (15), CONCURRENCY (4), RPC_PORT (8547).
+# Env: BIN (target/release/nuthatch), OUT (backfill-throughput-report.json), BATCHES (3), RUNS (15),
+#      CONCURRENCY (4), RPC_PORT (8547).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
-MIN_EVENTS_PER_SEC="${MIN_EVENTS_PER_SEC:-}"
-BASELINE="${BASELINE:-}"
 OUT="${OUT:-backfill-throughput-report.json}"
 BATCHES="${BATCHES:-3}"
 RUNS="${RUNS:-15}"
@@ -30,7 +25,7 @@ RPC_PORT="${RPC_PORT:-8547}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TO_BLOCK=20000
 EXPECT=$(( TO_BLOCK * 4 ))
-LABEL="backfill gate: blocks 1-$TO_BLOCK, 4 Transfers a block, seal-direct, concurrency $CONCURRENCY, locally-served chain"
+LABEL="backfill throughput: blocks 1-$TO_BLOCK, 4 Transfers a block, seal-direct, concurrency $CONCURRENCY, locally-served chain"
 WORK="$(mktemp -d)"
 
 python3 "$HERE/footprint-rpc.py" "$RPC_PORT" &
@@ -46,7 +41,7 @@ done
 mkdir -p "$WORK/nest/abis"
 cat > "$WORK/nest/nuthatch.toml" <<TOML
 [nest]
-name = "backfill-gate"
+name = "backfill-throughput"
 chain = "mainnet"
 chain_id = 1
 rpc_urls = ["http://127.0.0.1:$RPC_PORT"]
@@ -89,37 +84,8 @@ jq --argjson median "$median" --argjson batches "$(printf '%s\n' "${medians[@]}"
   '.events_per_sec = $median | .batch_medians = $batches | .runs = (.runs * ($batches | length))' \
   "$WORK/batch-1.json" > "$OUT"
 
-echo "backfill: median ${median} ev/s across $BATCHES batches (batch medians ${lo}-${hi}, spread ${spread}%), floor ${MIN_EVENTS_PER_SEC:-none}"
+line="median ${median} ev/s across $BATCHES batches of $RUNS (batch medians ${lo}-${hi}, spread ${spread}%), tracked, not gated"
+echo "backfill: $line"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  {
-    echo "### backfill throughput"
-    echo "median **${median} ev/s** across $BATCHES batches of $RUNS (batch medians ${lo}-${hi}, spread ${spread}%), floor ${MIN_EVENTS_PER_SEC:-none}"
-  } >> "$GITHUB_STEP_SUMMARY"
+  { echo "### backfill throughput"; echo "$line"; } >> "$GITHUB_STEP_SUMMARY"
 fi
-
-status=0
-if [ -n "$MIN_EVENTS_PER_SEC" ] && awk -v m="$median" -v f="$MIN_EVENTS_PER_SEC" 'BEGIN {exit !(m < f)}'; then
-  echo "FAIL: backfill median ${median} ev/s is under the ${MIN_EVENTS_PER_SEC} ev/s floor."
-  echo "      The floor and the runner figures it was set from are in ci.yml beside MIN_EVENTS_PER_SEC."
-  status=1
-fi
-
-# As point-read.sh (#385, #424): the committed baseline must come from this machine and this scenario.
-if [ -n "$BASELINE" ]; then
-  if [ ! -f "$BASELINE" ]; then
-    echo "FAIL: BASELINE=$BASELINE does not exist; a missing reference is not a pass."
-    exit 1
-  fi
-  for field in hardware label; do
-    base="$(jq -r ".$field // \"\"" "$BASELINE")"
-    this="$(jq -r ".$field // \"\"" "$OUT")"
-    if [ "$base" != "$this" ]; then
-      echo "FAIL: $BASELINE records $field '$base', this run measured '$this'."
-      echo "      The floor was set from runs on the enforcing runner and scenario. Refresh the baseline"
-      echo "      from a green run of this job and re-derive the floor, or say why not. Do not edit the field."
-      exit 1
-    fi
-  done
-  echo "OK: baseline $BASELINE matches this machine and this scenario"
-fi
-exit "$status"
