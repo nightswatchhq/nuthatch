@@ -35,7 +35,9 @@ impl exports::nuthatch::transform::stage::Guest for Component {
             .ok_or("`value` column is not Int64")?;
 
         let mask = BooleanArray::from_iter(
-            value.iter().map(|v| Some(v.map(|x| x >= THRESHOLD).unwrap_or(false))),
+            value
+                .iter()
+                .map(|v| Some(v.map(|x| x >= THRESHOLD).unwrap_or(false))),
         );
         let filtered = filter_record_batch(&input, &mask).map_err(|e| e.to_string())?;
 
@@ -54,7 +56,8 @@ fn read_batch(bytes: &[u8]) -> Result<RecordBatch, String> {
 fn write_batch(batch: &RecordBatch) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut out, &batch.schema()).map_err(|e| e.to_string())?;
+        let mut writer =
+            StreamWriter::try_new(&mut out, &batch.schema()).map_err(|e| e.to_string())?;
         writer.write(batch).map_err(|e| e.to_string())?;
         writer.finish().map_err(|e| e.to_string())?;
     }
@@ -62,3 +65,100 @@ fn write_batch(batch: &RecordBatch) -> Result<Vec<u8>, String> {
 }
 
 export!(Component);
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, StringArray, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::exports::nuthatch::transform::stage::Guest;
+    use super::*;
+
+    type Row = (u64, u64, &'static str, &'static str, Option<i64>);
+
+    fn ipc(rows: &[Row]) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("log_index", DataType::UInt64, false),
+            Field::new("from", DataType::Utf8, false),
+            Field::new("to", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.0))),
+            Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.1))),
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.2))),
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.3))),
+            Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.4))),
+        ];
+        write_batch(&RecordBatch::try_new(schema, cols).unwrap()).unwrap()
+    }
+
+    fn survivors(out: &[u8]) -> Vec<(u64, u64, i64)> {
+        let b = read_batch(out).unwrap();
+        let blk = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let log = b.column(1).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let val = b.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
+        (0..b.num_rows())
+            .map(|i| (blk.value(i), log.value(i), val.value(i)))
+            .collect()
+    }
+
+    #[test]
+    fn keeps_only_large_transfers_in_input_order() {
+        let out = Component::run(ipc(&[
+            (1, 0, "0xa", "0xb", Some(5)),
+            (1, 1, "0xa", "0xb", Some(2_000_000_000)),
+            (2, 0, "0xc", "0xd", Some(1_500_000_000)),
+        ]))
+        .unwrap();
+        assert_eq!(
+            survivors(&out),
+            vec![(1, 1, 2_000_000_000), (2, 0, 1_500_000_000)]
+        );
+    }
+
+    #[test]
+    fn the_threshold_is_inclusive() {
+        let out = Component::run(ipc(&[
+            (1, 0, "0xa", "0xb", Some(999_999_999)),
+            (1, 1, "0xa", "0xb", Some(1_000_000_000)),
+            (1, 2, "0xa", "0xb", Some(1_000_000_001)),
+        ]))
+        .unwrap();
+        assert_eq!(
+            survivors(&out),
+            vec![(1, 1, 1_000_000_000), (1, 2, 1_000_000_001)]
+        );
+    }
+
+    #[test]
+    fn a_null_value_is_dropped_not_an_error() {
+        let out = Component::run(ipc(&[
+            (1, 0, "0xa", "0xb", None),
+            (1, 1, "0xa", "0xb", Some(1_000_000_000)),
+        ]))
+        .unwrap();
+        assert_eq!(survivors(&out), vec![(1, 1, 1_000_000_000)]);
+    }
+
+    #[test]
+    fn an_empty_batch_yields_an_empty_batch() {
+        let out = Component::run(ipc(&[])).unwrap();
+        assert!(survivors(&out).is_empty());
+    }
+
+    #[test]
+    fn a_batch_without_a_value_column_is_refused() {
+        let schema = Arc::new(Schema::new(vec![Field::new("from", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["0xa"])) as ArrayRef],
+        )
+        .unwrap();
+        let err = Component::run(write_batch(&batch).unwrap()).unwrap_err();
+        assert_eq!(err, "input batch has no `value` column");
+    }
+}
