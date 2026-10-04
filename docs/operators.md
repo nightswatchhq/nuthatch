@@ -1069,8 +1069,11 @@ nuthatch dev --dir . --audit-rpc https://another-provider.example/KEY
   and one `eth_chainId` when the audit starts. No headers and no tip polls. At the default rate that
   is 24 `eth_getLogs` a day per nest. The background audit's calls are counted in
   `nuthatch_rpc_requests_total` with the nest's own.
-- **Memory.** One sample holds at most 20,000 logs; a denser range is compared up to the block where
-  that ran out, and the report says so. Sealed segments are read one at a time and filtered a
+- **Memory.** One sample holds at most 20,000 rows on each side, served and sealed, in whole blocks:
+  a denser range is compared on both sides up to the last block that fit, and the report says so.
+  A single block over the limit is kept and compared whole, as the seal path keeps it, and the
+  report says that too. An endpoint that answers a dense range with nothing therefore costs the
+  same as one that answers it in full. Sealed segments are read one at a time and filtered a
   record batch at a time, so a small sample inside a large segment holds its own rows and one batch,
   never the segment. For rows the size of an ERC-20 `Transfer` (about 400 bytes of row JSON) that is
   tens of megabytes while a sample runs, nothing between samples, and it does not grow with the nest.
