@@ -220,11 +220,11 @@ impl Probe {
 /// The emitting addresses of one unfiltered `eth_getLogs`, refusing to hold more than
 /// [`DISCOVERY_MAX_BYTES`] of the answer.
 ///
-/// **Deliberately its own transport rather than [`RpcClient::get_logs`], and deliberately not a
-/// bounded variant added to that client.** Every other RPC call nuthatch makes is *filtered*, so the
-/// request itself bounds the answer and no reader needs a cap; adding a bounded-read method to the
-/// shared client would put a footgun beside every caller that does not need one. This is the only
-/// unfiltered request in the binary, so the bound lives beside it.
+/// **Deliberately its own transport rather than [`RpcClient::get_logs`].** That client caps a
+/// multi-block body too ([`crate::rpc::GETLOGS_BODY_CAP`], #1788), because a filter does not bound
+/// the answer of a node with no result cap over a wide range; but it refuses past the cap so the
+/// caller narrows. This is the only unfiltered request in the binary, its bound is a quarter of
+/// that, and an abandoned sample is an answer rather than a range to narrow.
 ///
 /// The body is read chunk by chunk and abandoned the moment it passes the cap, so an oversized
 /// answer is never assembled - which is the difference between bounding the request and bounding the
