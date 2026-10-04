@@ -29,9 +29,12 @@
 #   GATE_TARGET   release asset target         (default x86_64-unknown-linux-gnu)
 #   GATE_PASSES   passes per binary            (default 3)
 #   GATE_CONCURRENCY  statements in flight at once (default 2, as 8107's SQL_MAX_CONCURRENCY)
+#   GATE_DUCK     a burrmill-bench binary with gate-duck: when set, the candidate is also checked
+#                 against DuckDB at the copy's sealed pin (gate/reference.sh), status release-gate/duckdb
 set -euo pipefail
 
 CONTEXT=release-gate/alloc-nest
+REF_CONTEXT=release-gate/duckdb
 here=$(cd "$(dirname "$0")" && pwd)
 state=${GATE_STATE:-$HOME/release-gate}
 nest=${GATE_NEST:-$state/alloc-nest}
@@ -53,7 +56,7 @@ while [ $# -gt 0 ]; do
     --sha) [ $# -ge 2 ] || die "--sha needs a commit"; sha=$2; shift 2 ;;
     --production) [ $# -ge 2 ] || die "--production needs a tag"; production_flag=$2; shift 2 ;;
     --no-status) post=0; shift ;;
-    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) [ -z "$tag" ] || die "one tag at a time"; tag=$1; shift ;;
   esac
@@ -81,17 +84,17 @@ trap cleanup EXIT
 gate_lock "$nest" || die "could not take the lock on $nest"
 
 post_status() {
-  local st=$1 desc=$2
+  local st=$1 desc=$2 ctx=${3:-$CONTEXT}
   desc=${desc:0:140}
   if [ "$post" -eq 0 ]; then
-    log "status (not posted): $CONTEXT $st - $desc"
+    log "status (not posted): $ctx $st - $desc"
     return 0
   fi
-  gh api -X POST "repos/$repo/statuses/$sha" -f state="$st" -f context="$CONTEXT" \
+  gh api -X POST "repos/$repo/statuses/$sha" -f state="$st" -f context="$ctx" \
     -f description="$desc" >/dev/null
   # A pending status left behind by a dying run would read as "still running" for ever.
-  [ "$st" = pending ] || status_posted=1
-  log "posted $CONTEXT $st on $sha: $desc"
+  [ "$st" = pending ] || [ "$ctx" != "$CONTEXT" ] || status_posted=1
+  log "posted $ctx $st on $sha: $desc"
 }
 
 sha256_check() {
@@ -291,6 +294,26 @@ summary=$(grep -E '^release-gate: [0-9]+ of [0-9]+ answered' "$run/candidate.txt
 result=$(grep -E '^RESULT: ' "$run/candidate.txt" | sed 's/^RESULT: //' || true)
 case "$rc" in
   0) post_status success "${summary:-passed} (against $production$from_note$prod_note)" ;;
-  1) post_status failure "${summary:-failed}; ${result#FAIL - } (against $production$from_note$prod_note)" ; exit 1 ;;
+  1) post_status failure "${summary:-failed}; ${result#FAIL - } (against $production$from_note$prod_note)" ;;
   *) post_status error "the gate could not run (exit $rc); see $run" ; exit 2 ;;
 esac
+gate_rc=$rc
+
+# The candidate's answers against DuckDB's at the copy's sealed pin (#1796), whatever production
+# answers: a wrong answer production shares passes the comparison above and fails this one.
+if [ -n "${GATE_DUCK:-}" ]; then
+  post_status pending "checking $label's answers against DuckDB at the copy's sealed pin" "$REF_CONTEXT"
+  rc=0
+  "$here/gate/reference.sh" --out "$run/reference" "$cand_bin" "$nest" "$set_file" \
+    >"$run/reference.txt" 2>&1 || rc=$?
+  cat "$run/reference.txt"
+  summary=$(sed -n 's/^reference: \([0-9]* statements: .*\)$/\1/p' "$run/reference.txt" | sed 's/ only,/,/')
+  result=$(sed -n 's/^RESULT: FAIL - //p' "$run/reference.txt")
+  case "$rc" in
+    0) post_status success "${summary:-passed}" "$REF_CONTEXT" ;;
+    1) post_status failure "${result:-failed}; ${summary}" "$REF_CONTEXT" ;;
+    *) post_status error "the DuckDB reference could not run (exit $rc); see $run" "$REF_CONTEXT" ; exit 2 ;;
+  esac
+  [ "$rc" -eq 0 ] || gate_rc=1
+fi
+exit "$gate_rc"
