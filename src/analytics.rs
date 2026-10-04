@@ -2848,8 +2848,8 @@ fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
 /// pooled session the previous request's base-table views are still in the catalogue, so every
 /// authored view bound in full on every request. Under DuckDB each bind re-read the footer of every
 /// segment behind every table the view touched. Measured on the Lodestar nest (1,924 segments, 12
-/// view files, 2026-09-06): `SELECT 1` cost 1.2 s and 32,000 `openat` calls with 640,000 `fstat`/`readlink` behind them, on a statement that
-/// reads nothing; the same statement on the same nest was 14 ms before any dashboard view had left
+/// view files, 2026-09-06): `SELECT 1` cost 1.2 s and 32,000 `openat` calls with 640,000
+/// `fstat`/`readlink` behind them, on a statement that reads nothing; the same statement on the same nest was 14 ms before any dashboard view had left
 /// its base tables defined. That fixed cost sat under every one of the dashboard's statements.
 /// `reachable_tables` already carries the intermediate view names in its closure, so a view a
 /// statement reaches through another view is still defined, in file order, before the one that
@@ -5226,8 +5226,9 @@ template="pool"
         .context("query failed");
         assert!(!segment_vanished(&other));
         // A segment named in an unrelated error is not this fault either.
-        let unrelated =
-            anyhow::anyhow!("Parquet error: Unexpected struct field type 15: /data/x/segments/a-b.parquet");
+        let unrelated = anyhow::anyhow!(
+            "Parquet error: Unexpected struct field type 15: /data/x/segments/a-b.parquet"
+        );
         assert!(!segment_vanished(&unrelated));
     }
 
@@ -5790,8 +5791,8 @@ template="pool"
     /// forever, even once the live registry (a re-fetched ABI, same event, one more field) knows more.
     /// The view built "successfully" and was silently missing the column: no error, no log, unlike
     /// #663's total-failure case. Confirmed directly against DuckDB at the time (see
-    /// `with_declared_base_cols`'s doc) that a column no listed segment carries is a binder error on explicit reference, not a NULL
-    /// row - so the fix is a name-keyed column merge plus generalizing #434's null-stub from
+    /// `with_declared_base_cols`'s doc) that a column no listed segment carries is a binder error on
+    /// explicit reference, not a NULL row - so the fix is a name-keyed column merge plus generalizing #434's null-stub from
     /// big-integer columns to every declared column, not a replacement of the disk column set. CLAUDE.md
     /// rules out ever re-decoding the sealed segment itself.
     #[test]
@@ -7876,8 +7877,8 @@ template="pool"
 
         // #896: a statement that reaches a catalogue schema or calls an enumerating table function
         // (DuckDB's `duckdb_tables()` and kin) is asking *what tables exist*, so every view has to
-        // be defined for it to answer. The bare-name set cannot express that - `information_schema.tables` arrives as
-        // `tables` with the qualifier dropped, indistinguishable from a nest table of that name.
+        // be defined for it to answer. The bare-name set cannot express that -
+        // `information_schema.tables` arrives as `tables` with the qualifier dropped, indistinguishable from a nest table of that name.
         assert!(!surveys(r#"SELECT * FROM "t__transfer""#));
         assert!(!surveys("SELECT (SELECT max(a) FROM u) FROM t"));
         assert!(
@@ -7886,8 +7887,9 @@ template="pool"
         );
         // The `duckdb_*` enumerating table functions are refused outright by `ALLOWED_TABLE_FNS`
         // (and Burrmill has none), so the `duckdb_` branch in the walk is unreachable today. It
-        // stays because the failure it guards is silent: admit `duckdb_tables` to that allowlist without thinking about #896 and
-        // the catalogue listing comes back empty rather than erroring.
+        // stays because the failure it guards is silent: admit `duckdb_tables` to that allowlist
+        // without thinking about #896 and the catalogue listing comes back empty rather than
+        // erroring.
         assert!(
             reject_unknown_table_refs(conn, "SELECT * FROM duckdb_views()").is_err(),
             "an enumerating table function is refused before the survey question arises"

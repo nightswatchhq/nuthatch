@@ -35,7 +35,7 @@ pub const ENV_MAX_BYTES: &str = "NUTHATCH_SQL_MEMO_BYTES";
 /// everything else for the benefit of one caller.
 const MAX_ENTRY_SHARE: usize = 4;
 
-/// DuckDB functions whose value is not a function of the indexed state, so a statement calling one
+/// SQL functions whose value is not a function of the indexed state, so a statement calling one
 /// is not a fact about the nest and is never remembered (Jules on #1189). Matched on identifiers, so
 /// `random_walks` the column is not `random` the function; a column merely *named* `now` loses its
 /// statement a memo hit and nothing else.

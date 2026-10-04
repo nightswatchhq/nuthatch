@@ -265,7 +265,13 @@ fn fields_in_scope(raw: &str) -> Vec<String> {
         .unwrap_or("");
     line.trim_end_matches('.')
         .split(", ")
-        .map(|f| f.rsplit('.').next().unwrap_or(f).trim_matches('"').to_string())
+        .map(|f| {
+            f.rsplit('.')
+                .next()
+                .unwrap_or(f)
+                .trim_matches('"')
+                .to_string()
+        })
         .filter(|f| !f.is_empty())
         .collect()
 }
@@ -436,7 +442,8 @@ mod tests {
 
     /// Burrmill's message for a segment whose pages were overwritten and footer left intact
     /// (`through_burrmill::a_segment_corrupt_past_its_footer`): it binds, and the read names nothing.
-    const CORRUPT: &str = "query failed: substrate error: Parquet error: External: Parquet argument \
+    const CORRUPT: &str =
+        "query failed: substrate error: Parquet error: External: Parquet argument \
                            error: Parquet error: Unexpected struct field type 15";
 
     /// #433: the page-corrupt-segment failure.

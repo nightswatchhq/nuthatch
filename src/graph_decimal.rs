@@ -1,7 +1,8 @@
 //! graph-node's `BigDecimal`, to the extent a nest needs one (RFC-0053, #1266).
 //!
-//! **Why this exists rather than DuckDB arithmetic.** The prices a Uniswap subgraph stores span
-//! `1e-36` to `1e35` and carry 34 significant digits. DuckDB's `DECIMAL` caps at 38 *total* digits
+//! **Why this exists rather than SQL arithmetic.** The prices a Uniswap subgraph stores span
+//! `1e-36` to `1e35` and carry 34 significant digits. Burrmill's `DECIMAL` (Arrow's `Decimal128`) caps
+//! at 38 *total* digits
 //! with a fixed scale, so it cannot represent either end of that range, and `DOUBLE` discards the
 //! precision outright. GraphQL carries `BigDecimal` as a **string**, so the right answer is to compute
 //! exactly over integers and render a decimal string - nothing then loses precision anywhere between

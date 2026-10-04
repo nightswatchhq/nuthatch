@@ -20,7 +20,7 @@ pub use crate::registry::OFFCHAIN_NAMESPACE;
 
 /// The offchain table an entity source names, if it names one.
 ///
-/// Case-insensitive, as DuckDB resolves it. The table after the prefix is returned as written, and
+/// Case-insensitive, as `/sql` resolves it. The table after the prefix is returned as written, and
 /// [`Tables`] resolves it case-insensitively too.
 pub fn table_of(source: &str) -> Option<&str> {
     // `get`, not indexing: a quoted identifier may put a multibyte character across the boundary.
@@ -274,7 +274,7 @@ impl Tables {
         Ok(out)
     }
 
-    /// Case-insensitive, as DuckDB resolves `offchain__<table>`. `offchain drop` refuses a case-only
+    /// Case-insensitive, as `/sql` resolves `offchain__<table>`. `offchain drop` refuses a case-only
     /// variant, so at most one name matches.
     fn retained(&self, table: &str) -> impl Iterator<Item = &crate::offchain::Snapshot> {
         self.catalogue
@@ -585,8 +585,8 @@ mod tests {
         assert!(ts.contains("text, integer and boolean"), "{ts}");
     }
 
-    /// One column, two kinds across snapshots, is refused rather than resolved by a rule DuckDB
-    /// and the entity might not share. Two integer widths are one kind and bind.
+    /// One column, two kinds across snapshots, is refused rather than resolved by a rule the SQL
+    /// engine and the entity might not share. Two integer widths are one kind and bind.
     #[test]
     fn a_column_whose_kind_differs_between_snapshots_is_refused() {
         let dir = tempfile::tempdir().unwrap();

@@ -80,7 +80,7 @@ chains, and verify with a mutation rather than a green test.
 
 Small and specific, which is how it should stay.
 
-- [#289](https://github.com/nightswatchhq/nuthatch/issues/289) DuckDB `allowed_directories` is not enforced on the build we bundle.
+- [#289](https://github.com/nightswatchhq/nuthatch/issues/289) DuckDB `allowed_directories` is not enforced on the build we bundle. *Closed; DuckDB left the binary in 4.1.*
 - The standing rules that already hold and must keep holding: a component with zero capabilities is
   deterministic by construction; an IPFS document's host is discarded so a log cannot choose what the
   indexer connects to; no phone-home.
@@ -90,7 +90,7 @@ Small and specific, which is how it should stay.
 Measured, not asserted. Benchmarks are CI artefacts and regressions fail the build - that rule exists
 and wants enforcing rather than restating.
 
-- [#295](https://github.com/nightswatchhq/nuthatch/issues/295) hold a persistent DuckDB connection instead of rebuilding the world per query.
+- [#295](https://github.com/nightswatchhq/nuthatch/issues/295) hold a persistent DuckDB connection instead of rebuilding the world per query. *Closed; the SQL engine is Burrmill since 4.1, and sessions are pooled.*
 - [#296](https://github.com/nightswatchhq/nuthatch/issues/296) a compact binary row format instead of JSON-string storage.
 - The remaining open performance item is [#296](https://github.com/nightswatchhq/nuthatch/issues/296),
   compact binary rows. Tip-lag evidence, the published backfill number, and the wider RFC-0004

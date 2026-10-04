@@ -167,7 +167,7 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   connection open (**[#289]**, quizzical-quail). Measured against `libduckdb-sys` 1.10504.0: the
   list is a restriction only with that startup flag, which we now pass. `reject_file_access` remains
   the primary control. The tripwire now asserts the second layer *does* refuse an out-of-allowlist
-  `read_text`.
+  `read_text`. *Moot since 4.1: DuckDB is not in the binary, and Burrmill has no file-reading table function.*
 - [ ] ✅ `/sql` surface is structurally read-only (single-writer + read-only attach).
 - [ ] ✅ A security review pass on the **serving surface** (`serve.rs`, `mcp.rs`, `webhooks.rs`,
   `analytics.rs`, `abi.rs`, `rpc.rs`) - *done (0.5.x hardening): no criticals; SQL read-only gate holds
@@ -389,7 +389,7 @@ acceptance tests pass, with 39 tests running against a live Postgres in CI. Noth
 - [ ] ⛔ DataFusion federation across hot + cold behind one SQL surface. - *0013 §2/§4. **The gate  **[#279]**
   said no for 1.0** - DuckDB stays in both modes. Reopen if a DataFusion release closes the aggregate
   gap, or if a scaled-mode query genuinely needs one plan spanning Postgres hot and Parquet cold,
-  which is the case DuckDB cannot serve and the real point of §2.*
+  which is the case DuckDB cannot serve and the real point of §2. Superseded in 4.1, when Burrmill, on DataFusion, replaced DuckDB.*
 - [ ] ⛔ Golden SQL-compat suite across both engines. - *Moot while there is one engine; the spike  **[#279]**
   already showed parity on the fold that matters.*
 - [x] ✅ A multi-machine run. - *Done **2026-08-15 on published 2.4.0 artifacts** (#281, #597).  **[#281]**
@@ -429,7 +429,7 @@ this file spent §11 calling unproven for months finally happened, on 2.4.0 (§1
 
 What is still genuinely open, not time-based: the **published backfill
 number** is worse than stale, it cites a commit that no longer exists (§3, #285); the **DuckDB
-file-access defence** is still one layer deep by design of the bundled build, not two (§4, #289); and
+file-access defence** was one layer deep by design of the bundled build (§4, #289), moot since DuckDB left the binary in 4.1; and
 the **AI/MCP keyed evals** remain pending a keyed run (§9, #815). Two issues this walk found
 closed against no evidence or the wrong PR - #289 and #353 - are reopened as of this pass; treat any
 "closed" state on this file's cited issues as a claim to verify, not a fact, which is the whole reason

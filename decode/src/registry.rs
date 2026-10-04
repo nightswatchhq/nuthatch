@@ -890,7 +890,8 @@ fn reserved_column_names() -> &'static [&'static str] {
 pub const OFFCHAIN_NAMESPACE: &str = "offchain__";
 
 /// Refuse a contract or template whose `{alias}__{event}` tables would land in the offchain
-/// namespace. DuckDB resolves names case-insensitively, so the two views would replace each other.
+/// namespace. View names are lowercased when defined and resolved case-insensitively, so the two
+/// views would replace each other.
 fn refuse_offchain_namespace(what: &str, who: &str) -> Result<()> {
     if format!("{who}__")
         .to_ascii_lowercase()

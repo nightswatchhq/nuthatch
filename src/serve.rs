@@ -2805,8 +2805,8 @@ fn graph_shape(
             Shape::List { key, col } => {
                 let v = row.get(col);
                 let list = match v {
-                    // Already parsed: the row serialiser may hand back a DuckDB `json` column as a
-                    // value rather than a string. Both are accepted rather than one assumed.
+                    // Already parsed: the row serialiser may hand back a `json` column as a value
+                    // rather than a string. Both are accepted rather than one assumed.
                     Some(serde_json::Value::Array(a)) => serde_json::Value::Array(a.clone()),
                     Some(serde_json::Value::String(t)) => match serde_json::from_str(t) {
                         Ok(serde_json::Value::Array(a)) => serde_json::Value::Array(a),
@@ -4125,7 +4125,7 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
     // A guard rejection (timeout / interrupt) or a bad query - counted as a rejection.
     // Errors as prompts (RFC-0016 §3): classify the failure against the schema and append an
     // actionable hint so an agent (or the REPL user) self-corrects in one round-trip. The raw
-    // engine message is preserved but path-scrubbed (SEC review) - DuckDB embeds absolute
+    // engine message is preserved but path-scrubbed (SEC review) - the engine embeds absolute
     // segment paths, which would leak the on-disk layout; the useful table/column detail stays.
     let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
     let msg = match crate::analytics::enrich_query_error(&s.dir, &raw, sql, &s.tables) {
@@ -4202,9 +4202,9 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // different database than the one that runs the query, and the maintained relations are
         // exactly where the two sets differ.
         //
-        // It did not merely omit them, which would at least have been consistently wrong. DuckDB
-        // connections are pooled and `define_views` only refreshes tables in the *current* set, so a
-        // relation defined by an earlier `/sql` on that connection was still bound: the identical
+        // It did not merely omit them, which would at least have been consistently wrong. Sessions
+        // are pooled and `define_views` only refreshes tables in the *current* set, so a relation
+        // defined by an earlier `/sql` on that session was still bound: the identical
         // request returned `400 Table with name received does not exist` on a cold connection and
         // `200 valid` once any `/sql` had warmed one. An agent validating its query before running
         // it was told a good query was invalid, or told it was valid for the wrong reason, depending
@@ -4789,9 +4789,9 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Redact the nest-directory prefix from a DuckDB error before it's relayed to a `/sql`/`/explain`
-/// client (SEC review). DuckDB embeds absolute segment paths (`…/mynest/segments/foo.parquet`) in
-/// binder/IO errors; the useful part for the caller is the table/column/type detail, not the on-disk
+/// Redact the nest-directory prefix from an engine error before it's relayed to a `/sql`/`/explain`
+/// client (SEC review). Engine errors embed segment paths (`…/mynest/segments/foo.parquet`) in
+/// read errors; the useful part for the caller is the table/column/type detail, not the on-disk
 /// layout. We keep the message and replace only the dir prefix with `<nest>`.
 fn sanitize_sql_error(raw: &str, dir: &std::path::Path) -> String {
     let mut out = raw.to_string();
@@ -4812,9 +4812,9 @@ fn sanitize_sql_error(raw: &str, dir: &std::path::Path) -> String {
     for (p, label) in prefixes {
         // Only an *absolute* prefix is worth redacting, and only an absolute one is safe to. The
         // default `--dir` is `.`, which as a plain `replace` target matches every full stop in the
-        // message: `1.5` became `1<nest>5` and DuckDB's `...` ellipsis became `<nest><nest><nest>`.
-        // The absolute form above is what DuckDB actually embeds, so nothing is lost by skipping
-        // the relative one.
+        // message: `1.5` became `1<nest>5` and an `...` ellipsis became `<nest><nest><nest>`. The
+        // engine embeds the absolute form, or that form with its `/` stripped (below), so nothing is
+        // lost by skipping the relative one.
         if !p.is_absolute() {
             continue;
         }
@@ -4948,16 +4948,17 @@ mod tests {
     #[test]
     fn sanitize_sql_error_redacts_the_nest_dir() {
         let dir = std::path::Path::new("/var/lib/nuthatch/mynest");
-        let raw = "IO Error: No files found that match the pattern \
-                   \"/var/lib/nuthatch/mynest/segments/usdc__transfer-abc.parquet\"";
+        let raw = "Object Store error: Object at location \
+                   /var/lib/nuthatch/mynest/segments/usdc__transfer-abc.parquet not found: No such \
+                   file or directory (os error 2)";
         let out = sanitize_sql_error(raw, dir);
         assert!(
             !out.contains("/var/lib/nuthatch/mynest"),
             "dir prefix redacted"
         );
         assert!(out.contains("<nest>/segments/usdc__transfer-abc.parquet"));
-        // The useful DuckDB detail (the message + filename) survives.
-        assert!(out.contains("No files found"));
+        // The useful detail (the message + filename) survives.
+        assert!(out.contains("not found"));
     }
 
     /// #1651: object_store prints a filesystem path without its leading `/`, and a runtime dataset's
@@ -4992,7 +4993,7 @@ mod tests {
     }
 
     /// The default `--dir` is `.`, and a bare `replace(".", "<nest>")` corrupted every message that
-    /// contained a full stop - decimals, qualified names, and DuckDB's `...` ellipsis alike. Observed
+    /// contained a full stop - decimals, qualified names, and an `...` ellipsis alike. Observed
     /// live on `nuthatch dev`: `SELECT 1.5 + bogus` came back as `SELECT 1<nest>5`.
     #[test]
     fn sanitize_sql_error_leaves_full_stops_alone_for_a_relative_dir() {
@@ -8990,7 +8991,7 @@ mod tests {
                 // of them cannot tell "casts everything" from "casts the right things".
                 //
                 // `totalSupply`'s value is small on purpose. The first version used 1e24, which exceeds
-                // DuckDB's `BIGINT` so the serialiser already rendered it as a string - and the mutation
+                // `BIGINT` so the serialiser already rendered it as a string - and the mutation
                 // dropping the cast stayed green against it. A value that fits in an integer is the one
                 // that tells the cast from the storage type.
                 "type Token @entity { id: ID! symbol: String! decimals: Int! totalSupply: BigInt! }\n",
@@ -10728,7 +10729,7 @@ type Signer @entity {
         );
 
         // A `@derivedFrom` list, aggregated into one JSON column and read back as an array. `0xbbb`
-        // has no swaps, so it must answer `[]` - DuckDB's `list()` over zero rows is NULL, which
+        // has no swaps, so it must answer `[]` - `list()` over zero rows is NULL in Burrmill, which
         // would have served null for a field the schema types `[Swap!]!`.
         //
         // `amount` is a **string**, for the same reason a top-level `BigInt` is: this asserted `5` until
@@ -10751,7 +10752,7 @@ type Signer @entity {
 
         // **`orderBy` on a relation is refused.** graph-node's generated enum includes every field of the
         // entity, `@derivedFrom` lists among them, so this is a value the schema advertises and the parent
-        // view has no column for - `ORDER BY b."swaps"` either failed in DuckDB or sorted by a JSON
+        // view has no column for - `ORDER BY b."swaps"` either failed in the engine or sorted by a JSON
         // aggregate (Jules on #1282).
         let body = graph_ask(
             "/graphql",
@@ -10829,7 +10830,7 @@ type Signer @entity {
             "the S2 refusal should be gone now that the compiler exists: {body}"
         );
 
-        // A text operator filters for real over HTTP, through DuckDB's own `LIKE`.
+        // A text operator filters for real over HTTP, through the engine's own `LIKE`.
         let body = graph_ask(
             "/graphql",
             r#"{ pools(where: { hooks_contains: "hook2" }) { id } }"#,
@@ -10855,7 +10856,7 @@ type Signer @entity {
             "an unescaped wildcard would have matched every row: {body}"
         );
 
-        // A nested relation filter, through DuckDB's own EXISTS. `0xaaa`'s token0 is WETH and
+        // A nested relation filter, through the engine's own EXISTS. `0xaaa`'s token0 is WETH and
         // `0xbbb` points at a token that is not there, so exactly one pool can match.
         let body = graph_ask(
             "/graphql",

@@ -39,7 +39,7 @@ pub struct Fold {
     pub file: String,
     pub sql: String,
     pub key: FoldKey,
-    /// `(column, DuckDB type)` in output order, types as DuckDB spells them.
+    /// `(column, type)` in output order, types as the engine's `describe` spells them.
     pub carry: Vec<(String, String)>,
     pub max_rows: u64,
     /// Every fact table and view the fold reads, through views. Other folds and carries excluded.
@@ -2106,7 +2106,7 @@ fn declared_carry(
         if out.iter().any(|(c, _)| c == col) {
             bail!("{at}: carry column `{col}` is declared twice");
         }
-        // DuckDB's own spelling, so `INT` and `INTEGER` compare equal.
+        // The engine's own spelling, so `INT` and `INTEGER` compare equal.
         let canonical = binder
             .describe(&format!("SELECT CAST(NULL AS {}) AS c", ty.trim()))
             .with_context(|| format!("{at}: carry column `{col}` has an unknown type `{ty}`"))?

@@ -877,10 +877,9 @@ pub struct Node {
 
 /// Split `CREATE [OR REPLACE] [TEMP|TEMPORARY] VIEW <name> [(cols)] AS <select>`.
 ///
-/// Deliberately a small scanner over a fixed prefix rather than a SQL parser, for one reason:
-/// `json_serialize_sql` refuses anything that is not a `SELECT` ("Only SELECT statements can be
-/// serialized to json!"), so the engine's parser cannot be used on the statement as written. Only the
-/// prefix is parsed here; the body still goes to DuckDB.
+/// Deliberately a small scanner over a fixed prefix rather than a SQL parser, for one reason: the
+/// engine's canonical parse takes a query, not the `CREATE` statement as written. Only the prefix is
+/// parsed here; the body still goes to the engine.
 ///
 /// **Strict on purpose.** Anything unexpected returns `None`, and a `None` is treated as "not a
 /// derivation" - it drops out of the graph rather than being guessed at. A missed derivation costs a
@@ -1206,7 +1205,7 @@ impl std::fmt::Display for Refusal {
 /// Functions whose value is not a function of the data (RFC-0033 §4).
 ///
 /// Deliberately a **denylist of known-volatile names** rather than an allowlist of known-pure ones,
-/// with the determinism gate (§10) as the empirical backstop. An allowlist over DuckDB's several
+/// with the determinism gate (§10) as the empirical backstop. An allowlist over the engine's several
 /// hundred scalar functions would be wrong on day one and wrong differently after every upgrade;
 /// this list plus a gate that actually runs the query twice is the honest combination.
 pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
@@ -1277,7 +1276,7 @@ pub fn refusals_in_sql(sql: &str) -> Vec<Refusal> {
         }
         fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
             match e {
-                // `t.current_date` reads as a call with no argument list, where DuckDB sees a column
+                // `t.current_date` reads as a call with no argument list, where DuckDB saw a column
                 // of `t`: a keyword counts only unqualified, as the COLUMN_REF rule below has it.
                 Expr::Function(f)
                     if !matches!(f.args, sqlparser::ast::FunctionArguments::None)
