@@ -10,6 +10,8 @@
 #   --out DIR              keep the server logs and per-pass results here (default: a temp dir)
 #   --timeout SECS         per-query timeout (default 300)
 #   --concurrency N        statements in flight at once (default 1)
+#   --env FILE             production's environment for this nest, NUTHATCH_*=VALUE lines read from
+#                          its unit (default: PROD_ENV below, the allocations nest's)
 #
 # At --concurrency N the set goes out N statements at a time in its own order: statements 1..N
 # together, then N+1..2N once all of the first group have answered, and so on, the same groups on
@@ -42,7 +44,7 @@ set -euo pipefail
 
 # Production's budget: the environment the allocations nest runs under on the Lodestar box (unit
 # nuthatch-alloc, port 8107), copied from its systemd unit on 2026-10-03. Change it here when the
-# unit changes, or the gate tests a budget nobody runs.
+# unit changes, or the gate tests a budget nobody runs. --env replaces it with another nest's.
 PROD_ENV=(
   NUTHATCH_SQL_MAX_CONCURRENCY=2
   NUTHATCH_ANALYTICS_MEMORY_LIMIT=256MB
@@ -61,16 +63,17 @@ MAX_RSS_MB=${GATE_MAX_RSS_MB:-2048}
 die() { echo "release-gate: $*" >&2; exit 2; }
 trap 'rc=$?; echo "release-gate: internal error at line $LINENO (exit $rc)" >&2; exit 2' ERR
 
-baseline="" write_baseline="" passes=3 out="" timeout=300 concurrency=1
+baseline="" write_baseline="" passes=3 out="" timeout=300 concurrency=1 env_file=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --concurrency) [ $# -ge 2 ] || die "--concurrency needs a number"; concurrency=$2; shift 2 ;;
+    --env) [ $# -ge 2 ] || die "--env needs a file"; env_file=$2; shift 2 ;;
     --baseline) [ $# -ge 2 ] || die "--baseline needs a file"; baseline=$2; shift 2 ;;
     --write-baseline) [ $# -ge 2 ] || die "--write-baseline needs a file"; write_baseline=$2; shift 2 ;;
     --passes) [ $# -ge 2 ] || die "--passes needs a number"; passes=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
     --timeout) [ $# -ge 2 ] || die "--timeout needs seconds"; timeout=$2; shift 2 ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) break ;;
   esac
@@ -85,6 +88,22 @@ case "$concurrency" in ''|*[!0-9]*|0) die "--concurrency must be a positive inte
 [ -f "$nest/nuthatch.redb" ] || die "no nuthatch.redb in $nest: a copy without its redb serves no sealed history"
 [ -f "$set_file" ] || die "no query set at $set_file"
 [ -z "$baseline" ] || [ -f "$baseline" ] || die "no baseline at $baseline"
+if [ -n "$env_file" ]; then
+  [ -f "$env_file" ] || die "no environment file at $env_file"
+  PROD_ENV=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | '#'*) continue ;; esac
+    printf '%s\n' "$line" | grep -Eq '^NUTHATCH_[A-Z0-9_]+=[^[:space:]]*$' \
+      || die "not a NUTHATCH_*=VALUE line in $env_file: ${line:0:80}"
+    PROD_ENV+=("$line")
+  done <"$env_file"
+  [ ${#PROD_ENV[@]} -gt 0 ] || die "no NUTHATCH_* settings in $env_file"
+  # Production's environment is the file's alone: a NUTHATCH_* setting of the caller's own would
+  # serve the copy under a budget nobody runs.
+  for v in $(compgen -e); do
+    case "$v" in NUTHATCH_*) unset "$v" ;; esac
+  done
+fi
 command -v curl >/dev/null || die "curl is not on PATH"
 command -v jq >/dev/null || die "jq is not on PATH"
 if command -v sha256sum >/dev/null; then
@@ -350,7 +369,7 @@ run_query() {
 version=$("$bin" --version 2>/dev/null | head -n 1) || version="unknown"
 echo "release-gate: $version against $nest"
 echo "release-gate: $n queries from $set_file, $passes pass(es), results in $out"
-echo "release-gate: budget ${PROD_ENV[*]}"
+echo "release-gate: budget ${PROD_ENV[*]}${env_file:+ (from $env_file)}"
 echo "release-gate: concurrency $concurrency (the set's statements sent $concurrency at a time, in order)"
 
 rm -f "$out/rss-peak-kb" "$out/died-after" "$out/unstable" "$out/rss-peak-gauges" "$out/pool-peak-bytes"

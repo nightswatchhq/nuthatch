@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # release-gate-run.sh - the ThinkPad's side of the release gate (#1749): fetch a release
-# candidate's Linux binary, run scripts/release-gate.sh against the allocations nest copy, and
+# candidate's Linux binary, run scripts/release-gate.sh against a production nest's copy, and
 # report the verdict on the candidate's commit as a status. See docs/release-gate.md.
 #
 #   scripts/release-gate-run.sh <tag>                     gate a published release or candidate
@@ -19,19 +19,33 @@
 # The status never blocks the tag: the tag exists before the gate runs, and the context is not a
 # required check anywhere. A red status stops the roll (deploy-nest.sh), not the release.
 #
+# Every production nest (#1794): GATE_NESTS names a config file with one nest per line, and each is
+# gated in turn by this script run for that nest alone, posting its own status,
+# release-gate/<name>. The exit is the worst of theirs. See deploy/release-gate/nests.conf.example.
+#   <name> <copy> <query set> <env file> <refresh: helsinki | local | none>
+#
 # Environment:
+#   GATE_NESTS    the nests' config file; unset means the one nest the variables below describe
 #   GATE_STATE    working directory: binaries and run logs             (default ~/release-gate)
 #   GATE_NEST     the allocations nest copy, segments plus redb        (default $GATE_STATE/alloc-nest)
-#   GATE_SET      the query set, required: kittiwake's nuthatch-gate/alloc-queries.tsv (private)
+#   GATE_NAME     the nest's name, as in its status context            (default alloc-nest)
+#   GATE_SET      the query set, required for one nest: kittiwake's nuthatch-gate/alloc-queries.tsv
+#                 (private); with GATE_NESTS each nest's set comes from the config
+#   GATE_ENV      production's environment for the nest, read from its unit (release-gate.sh --env);
+#                 unset means release-gate.sh's PROD_ENV, the allocations nest's
 #   GATE_REFRESH  a command run before the gate to refresh GATE_NEST, e.g. the rsync from Helsinki;
 #                 unset means the copy is used as it stands
+#   GATE_REFRESH_SCRIPT  what a config's helsinki and local refreshes run
+#                        (default deploy/release-gate/refresh-from-helsinki.sh beside this)
 #   GATE_REPO     (default nightswatchhq/nuthatch)
 #   GATE_TARGET   release asset target         (default x86_64-unknown-linux-gnu)
 #   GATE_PASSES   passes per binary            (default 3)
-#   GATE_CONCURRENCY  statements in flight at once (default 2, as 8107's SQL_MAX_CONCURRENCY)
+#   GATE_CONCURRENCY  statements in flight at once (default 2, as 8107's SQL_MAX_CONCURRENCY); a
+#                     GATE_ENV that sets NUTHATCH_SQL_MAX_CONCURRENCY decides it instead
 set -euo pipefail
 
-CONTEXT=release-gate/alloc-nest
+name=${GATE_NAME:-alloc-nest}
+CONTEXT=release-gate/$name
 here=$(cd "$(dirname "$0")" && pwd)
 state=${GATE_STATE:-$HOME/release-gate}
 nest=${GATE_NEST:-$state/alloc-nest}
@@ -46,6 +60,7 @@ die() { log "$*"; exit 2; }
 trap 'rc=$?; log "internal error at line $LINENO (exit $rc)"; exit 2' ERR
 
 tag="" poll=0 local_bin="" sha="" production_flag="" post=1
+args=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --poll) poll=1; shift ;;
@@ -53,7 +68,7 @@ while [ $# -gt 0 ]; do
     --sha) [ $# -ge 2 ] || die "--sha needs a commit"; sha=$2; shift 2 ;;
     --production) [ $# -ge 2 ] || die "--production needs a tag"; production_flag=$2; shift 2 ;;
     --no-status) post=0; shift ;;
-    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) [ -z "$tag" ] || die "one tag at a time"; tag=$1; shift ;;
   esac
@@ -62,8 +77,72 @@ modes=$(( poll + (${#tag} > 0 ? 1 : 0) + (${#local_bin} > 0 ? 1 : 0) ))
 [ "$modes" -eq 1 ] || die "give exactly one of <tag>, --poll, --binary PATH --sha SHA"
 [ -z "$local_bin" ] || [ -n "$sha" ] || die "--binary needs --sha: the status has to land on a commit"
 command -v gh >/dev/null || die "gh is not on PATH"
+
+# A config path as written, ~ for $HOME, else relative to the config file's directory.
+conf_path() {
+  case "$1" in
+    '~/'*) printf '%s\n' "$HOME/${1#'~/'}" ;;
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$2/$1" ;;
+  esac
+}
+
+if [ -n "${GATE_NESTS:-}" ]; then
+  [ -f "$GATE_NESTS" ] || die "no nests config at $GATE_NESTS (GATE_NESTS)"
+  conf_dir=$(cd "$(dirname "$GATE_NESTS")" && pwd)
+  refresh_script=${GATE_REFRESH_SCRIPT:-$(cd "$here/.." && pwd)/deploy/release-gate/refresh-from-helsinki.sh}
+  names=() copies=() sets=() envs=() refreshes=()
+  lineno=0
+  # Read whole before anything runs, so a bad line gates nothing rather than half the nests.
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    case "$line" in '' | '#'*) continue ;; esac
+    read -r n c s e r extra <<<"$line"
+    [ -n "$r" ] && [ -z "${extra:-}" ] \
+      || die "$GATE_NESTS line $lineno: want <name> <copy> <set> <env> <refresh>, got: ${line:0:100}"
+    printf '%s\n' "$n" | grep -Eq '^[a-z0-9][a-z0-9-]*$' || die "$GATE_NESTS line $lineno: not a nest name: $n"
+    case "$r" in helsinki | local | none) ;; *) die "$GATE_NESTS line $lineno: refresh is helsinki, local or none, not $r" ;; esac
+    for seen in ${names[@]+"${names[@]}"}; do
+      [ "$seen" != "$n" ] || die "$GATE_NESTS line $lineno: $n is listed twice"
+    done
+    names+=("$n") copies+=("$(conf_path "$c" "$conf_dir")") sets+=("$(conf_path "$s" "$conf_dir")")
+    envs+=("$(conf_path "$e" "$conf_dir")") refreshes+=("$r")
+  done <"$GATE_NESTS"
+  [ ${#names[@]} -gt 0 ] || die "no nests in $GATE_NESTS"
+
+  worst=0
+  for i in "${!names[@]}"; do
+    n=${names[$i]}
+    case "${refreshes[$i]}" in
+      helsinki) refresh="'$refresh_script' '$n'" ;;
+      local) refresh="'$refresh_script' --local '$n'" ;;
+      none) refresh="" ;;
+    esac
+    nest_out=$(mktemp "${TMPDIR:-/tmp}/release-gate-run.XXXXXX")
+    rc=0
+    GATE_NESTS="" GATE_NAME=$n GATE_NEST=${copies[$i]} GATE_SET=${sets[$i]} GATE_ENV=${envs[$i]} \
+      GATE_REFRESH=$refresh "$0" ${args[@]+"${args[@]}"} >"$nest_out" 2>&1 || rc=$?
+    # A poll with nothing to gate stays quiet, as the single nest's does.
+    if [ "$rc" -ne 0 ] || [ -s "$nest_out" ]; then
+      sed "s/^/[$n] /" "$nest_out"
+      case "$rc" in 0) v=passed ;; 1) v=failed ;; *) v="could not run (exit $rc)" ;; esac
+      log "$n: $v"
+    fi
+    rm -f "$nest_out"
+    if [ "$rc" -gt 1 ]; then worst=2; elif [ "$rc" -eq 1 ] && [ "$worst" -eq 0 ]; then worst=1; fi
+  done
+  exit "$worst"
+fi
+
 [ -n "$set_file" ] || die "GATE_SET is not set: point it at a kittiwake checkout's nuthatch-gate/alloc-queries.tsv"
 [ -f "$set_file" ] || die "no query set at $set_file (GATE_SET)"
+env_args=()
+if [ -n "${GATE_ENV:-}" ]; then
+  [ -f "$GATE_ENV" ] || die "no environment file at $GATE_ENV (GATE_ENV)"
+  env_args=(--env "$GATE_ENV")
+  c=$(sed -n 's/^NUTHATCH_SQL_MAX_CONCURRENCY=//p' "$GATE_ENV" | tail -n 1)
+  [ -z "$c" ] || concurrency=$c
+fi
 
 mkdir -p "$state/bins" "$state/runs" "$(dirname "$nest")"
 # One gate at a time on the copy, held across the refresh and both runs; release-gate.sh takes the
@@ -245,17 +324,17 @@ if [ "$poll" -eq 1 ] && ! semver_gt "$tag" "$production"; then
 fi
 [ "$production" != "$tag" ] || die "the candidate and production are the same release ($tag)"
 
-post_status pending "running $label against the allocations nest copy, baseline $production$from_note"
+post_status pending "running $label against the $name copy, baseline $production$from_note"
 
 prod_bin=$(fetch "$production")
 if [ -n "$tag" ]; then cand_bin=$(fetch "$tag"); else cand_bin=$local_bin; fi
 
-run=$state/runs/$(date -u +%Y%m%dT%H%M%SZ)-${tag:-${sha:0:12}}
+run=$state/runs/$(date -u +%Y%m%dT%H%M%SZ)-$name-${tag:-${sha:0:12}}
 mkdir -p "$run"
 
 log "measuring production $production for the baseline"
 rc=0
-"$here/release-gate.sh" --passes "$passes" --concurrency "$concurrency" --out "$run/production" \
+"$here/release-gate.sh" --passes "$passes" --concurrency "$concurrency" ${env_args[@]+"${env_args[@]}"} --out "$run/production" \
   --write-baseline "$run/baseline.tsv" "$prod_bin" "$nest" "$set_file" >"$run/production.txt" 2>&1 || rc=$?
 # Production failing its own gate is still what production does, so it is still the baseline. Only
 # a run that could not measure it (exit 2, no baseline written) leaves nothing to compare with.
@@ -283,7 +362,7 @@ fi
 
 log "gating $label"
 rc=0
-"$here/release-gate.sh" --passes "$passes" --concurrency "$concurrency" --out "$run/candidate" \
+"$here/release-gate.sh" --passes "$passes" --concurrency "$concurrency" ${env_args[@]+"${env_args[@]}"} --out "$run/candidate" \
   --baseline "$run/baseline.tsv" "$cand_bin" "$nest" "$set_file" >"$run/candidate.txt" 2>&1 || rc=$?
 cat "$run/candidate.txt"
 

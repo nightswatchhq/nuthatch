@@ -670,22 +670,32 @@ fn finish(mut child: Child, dir: &Path, name: &str, secs: u64) -> (Option<i32>, 
 /// The calls `release-gate-run.sh` makes, answered from `$FAKE_GH_DIR`: `releases` (one
 /// `<tag> full|pre|draft` per line, newest first), `status-<sha>` (the state of the newest gate
 /// status on a commit; absent is none) and `bin-<tag>/nuthatch` (the binary a release ships). A
-/// tag's commit is `sha-<tag>`. Posted statuses are appended to `posted`, downloads to `downloaded`.
+/// tag's commit is `sha-<tag>`. Posted statuses are appended to `posted`, and with their context
+/// first to `posted-ctx`; downloads to `downloaded`. `status-<sha>-<context, / as _>` answers for
+/// one context before `status-<sha>` answers for all.
 const FAKE_GH: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 d=$FAKE_GH_DIR
 case "$1 $2" in
   "api -X")
-    sha=${4##*/} state="" desc=""
+    sha=${4##*/} state="" desc="" ctx=""
     shift 4
     while [ $# -ge 2 ]; do
-      case "$2" in state=*) state=${2#state=} ;; description=*) desc=${2#description=} ;; esac
+      case "$2" in
+        state=*) state=${2#state=} ;;
+        description=*) desc=${2#description=} ;;
+        context=*) ctx=${2#context=} ;;
+      esac
       shift 2
     done
-    echo "$sha $state $desc" >>"$d/posted" ;;
+    echo "$sha $state $desc" >>"$d/posted"
+    echo "$ctx $sha $state $desc" >>"$d/posted-ctx" ;;
   "api "*)
     case "$2" in
-      */statuses) sha=${2%/statuses}; sha=${sha##*/}; cat "$d/status-$sha" 2>/dev/null || echo none ;;
+      */statuses)
+        sha=${2%/statuses}; sha=${sha##*/}
+        ctx=$(printf '%s' "$*" | sed -n 's/.*\.context == "\([^"]*\)".*/\1/p' | head -n 1)
+        cat "$d/status-$sha-${ctx//\//_}" 2>/dev/null || cat "$d/status-$sha" 2>/dev/null || echo none ;;
       */commits/*) echo "sha-${2##*/}" ;;
       *) echo "fake gh: unexpected api call: $*" >&2; exit 3 ;;
     esac ;;
@@ -1127,6 +1137,281 @@ fn a_bad_provenance_before_a_poll_chooses_exits_loud_with_no_status() {
         text.contains("dirty-build") && text.contains("no candidate is chosen yet"),
         "{text}"
     );
+}
+
+// --- every production nest (#1794) ---
+
+/// The ThinkPad's gate config for these runs: per nest, its own copy of the fixture nest, its own
+/// set and its own production environment, and a refresh kind. Returns the config's path.
+/// A nest's name, its set's `(id, sql)` lines, its env file's body and its refresh kind.
+type NestRow<'a> = (&'a str, &'a [(&'a str, String)], &'a str, &'a str);
+
+fn nests_conf(c: &Case, nests: &[NestRow]) -> PathBuf {
+    let mut conf = String::from("# name copy set env refresh\n");
+    for (name, lines, env, refresh) in nests {
+        let copy = c.dir.path().join(name);
+        copy_dir(&c.nest, &copy);
+        let set = c.dir.path().join(format!("{name}-queries.tsv"));
+        let mut body = String::from("# id\tconsumer\tsite\tsql\n");
+        for (id, sql) in *lines {
+            body.push_str(&format!(
+                "{id}\ttest\ttests/release_gate_script.rs\t{sql}\n"
+            ));
+        }
+        std::fs::write(&set, body).unwrap();
+        let env_file = c.dir.path().join(format!("{name}.env"));
+        std::fs::write(&env_file, format!("# read from {name}'s unit\n{env}")).unwrap();
+        conf.push_str(&format!(
+            "{name}\t{}\t{}\t{}\t{refresh}\n",
+            copy.display(),
+            set.display(),
+            env_file.display()
+        ));
+    }
+    let path = c.dir.path().join("nests.conf");
+    std::fs::write(&path, conf).unwrap();
+    path
+}
+
+const ENV_TWO: &str = "NUTHATCH_SQL_MAX_CONCURRENCY=2\nNUTHATCH_ENGINE=burrmill\n";
+const ENV_ONE: &str = "NUTHATCH_SQL_MAX_CONCURRENCY=1\nNUTHATCH_ENGINE=burrmill\n";
+
+fn posted_for<'a>(posted: &'a str, context: &str) -> Vec<&'a str> {
+    posted
+        .lines()
+        .filter(|l| l.split(' ').next() == Some(context))
+        .collect()
+}
+
+/// On 2026-10-03 the QoS nest refused its daily views all day and the gate, which ran the
+/// allocations nest alone, never saw it. Every nest in the config is gated, each under its own
+/// environment and refresh, and each posts its own status; the run's exit is the worst of theirs.
+#[test]
+fn every_nest_in_the_config_is_gated_and_posts_its_own_status() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = case();
+    let answers = [("answers", c.counts())];
+    let refused = [
+        ("answers", c.counts()),
+        ("daily", "SELECT a FROM no_such_view".to_string()),
+    ];
+    let conf = nests_conf(
+        &c,
+        &[
+            ("alloc-nest", &answers, ENV_TWO, "helsinki"),
+            ("qos-nest", &refused, ENV_ONE, "local"),
+        ],
+    );
+    let r = releases(&c, &[("v4.3.0-rc1", "pre", 0), ("v4.2.0", "full", 0)], &[]);
+    let refresh_log = c.dir.path().join("refreshed");
+    let refresh = c.dir.path().join("fake-refresh");
+    std::fs::write(
+        &refresh,
+        format!(
+            "#!/usr/bin/env bash\necho \"$* $GATE_NEST\" >>'{}'\n",
+            refresh_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&refresh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let set = c.set(&[("unused", c.counts())]);
+    let (code, text) = r.runner(
+        &c,
+        &set,
+        &["v4.3.0-rc1"],
+        &[
+            ("GATE_NESTS", conf.to_str().unwrap()),
+            ("GATE_REFRESH_SCRIPT", refresh.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, Some(1), "the worst nest decides:\n{text}");
+    let posted = r.read("posted-ctx");
+    let alloc = posted_for(&posted, "release-gate/alloc-nest");
+    let qos = posted_for(&posted, "release-gate/qos-nest");
+    assert_eq!(alloc.len(), 2, "pending then a verdict:\n{posted}");
+    assert!(
+        alloc[1].starts_with("release-gate/alloc-nest sha-v4.3.0-rc1 success "),
+        "{posted}\n{text}"
+    );
+    assert_eq!(qos.len(), 2, "pending then a verdict:\n{posted}");
+    assert!(
+        qos[1].starts_with("release-gate/qos-nest sha-v4.3.0-rc1 failure ")
+            && qos[1].contains("daily"),
+        "{posted}\n{text}"
+    );
+    assert!(qos[0].contains("against the qos-nest copy"), "{posted}");
+    // Each nest ran under its own environment file, at its own concurrency.
+    let qos_env = c.dir.path().join("qos-nest.env");
+    let from = format!("(from {})", qos_env.display());
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("[qos-nest] ") && l.contains(&from)),
+        "the candidate's run:\n{text}"
+    );
+    let runs = c.dir.path().join("state/runs");
+    let production = std::fs::read_dir(&runs)
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().contains("-qos-nest-"))
+        .map(|e| std::fs::read_to_string(e.path().join("production.txt")).unwrap())
+        .unwrap_or_default();
+    assert!(
+        production.contains(&from),
+        "production's run:\n{production}"
+    );
+    assert!(
+        text.contains("[qos-nest] release-gate: concurrency 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[alloc-nest] release-gate: concurrency 2"),
+        "{text}"
+    );
+    let refreshed = std::fs::read_to_string(&refresh_log).unwrap_or_default();
+    assert_eq!(
+        refreshed,
+        format!(
+            "alloc-nest {}\n--local qos-nest {}\n",
+            c.dir.path().join("alloc-nest").display(),
+            c.dir.path().join("qos-nest").display()
+        ),
+        "{text}"
+    );
+}
+
+/// A poll gates, nest by nest, a release that nest has no status for: the allocations nest gated
+/// the candidate already, so only the QoS nest gates it now.
+#[test]
+fn poll_gates_each_nest_that_lacks_its_own_status() {
+    let c = case();
+    let answers = [("answers", c.counts())];
+    let conf = nests_conf(
+        &c,
+        &[
+            ("alloc-nest", &answers, ENV_TWO, "none"),
+            ("qos-nest", &answers, ENV_TWO, "none"),
+        ],
+    );
+    let r = releases(&c, &[("v4.3.0-rc1", "pre", 0), ("v4.2.0", "full", 0)], &[]);
+    std::fs::write(
+        r.dir.join("status-sha-v4.3.0-rc1-release-gate_alloc-nest"),
+        "success\n",
+    )
+    .unwrap();
+    for nest in ["alloc-nest", "qos-nest"] {
+        std::fs::write(
+            c.dir.path().join(nest).join("PROVENANCE"),
+            "version=4.2.0\n",
+        )
+        .unwrap();
+    }
+    let set = c.set(&[("unused", c.counts())]);
+    let (code, text) = r.runner(
+        &c,
+        &set,
+        &["--poll"],
+        &[("GATE_NESTS", conf.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    let posted = r.read("posted-ctx");
+    assert!(
+        posted_for(&posted, "release-gate/alloc-nest").is_empty(),
+        "{posted}\n{text}"
+    );
+    let qos = posted_for(&posted, "release-gate/qos-nest");
+    assert!(
+        qos.last()
+            .is_some_and(|l| l.starts_with("release-gate/qos-nest sha-v4.3.0-rc1 success ")),
+        "{posted}\n{text}"
+    );
+    assert!(
+        !text.contains("[alloc-nest]"),
+        "a nest with nothing to gate is quiet:\n{text}"
+    );
+}
+
+/// A config line that does not parse gates nothing, rather than half the nests.
+#[test]
+fn a_malformed_nests_config_gates_nothing() {
+    let c = case();
+    let answers = [("answers", c.counts())];
+    let conf = nests_conf(&c, &[("alloc-nest", &answers, ENV_TWO, "none")]);
+    let mut body = std::fs::read_to_string(&conf).unwrap();
+    body.push_str("qos-nest /nowhere /nowhere.tsv /nowhere.env none stray\n");
+    std::fs::write(&conf, body).unwrap();
+    let r = releases(&c, &[("v4.3.0-rc1", "pre", 0), ("v4.2.0", "full", 0)], &[]);
+    let set = c.set(&[("unused", c.counts())]);
+    let (code, text) = r.runner(
+        &c,
+        &set,
+        &["v4.3.0-rc1"],
+        &[("GATE_NESTS", conf.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("line 3"), "{text}");
+    assert_eq!(r.read("posted"), "", "{text}");
+    assert_eq!(r.read("downloaded"), "", "{text}");
+}
+
+/// The environment `serve` runs under is the nest's file alone: what it sets is applied, and a
+/// NUTHATCH_* setting the caller happens to carry is not.
+#[test]
+fn a_nests_environment_file_replaces_the_callers() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let seen = c.dir.path().join("serve-env");
+    let bin = c.dir.path().join("nuthatch");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/usr/bin/env bash\n\
+             [ \"${{1:-}}\" != serve ] || env | grep '^NUTHATCH_' | sort >'{}'\n\
+             exec '{}' \"$@\"\n",
+            seen.display(),
+            env!("CARGO_BIN_EXE_nuthatch")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = c.dir.path().join("nest.env");
+    std::fs::write(
+        &env,
+        "# read from the unit\nNUTHATCH_SQL_MAX_CONCURRENCY=1\nNUTHATCH_SQL_MEMO_BYTES=1048576\n",
+    )
+    .unwrap();
+    let gate = |extra_env: &[(&str, &str)]| {
+        let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+        cmd.args(["--passes", "1", "--env"])
+            .arg(&env)
+            .arg("--out")
+            .arg(c.dir.path().join("out"))
+            .arg(&bin)
+            .arg(&c.nest)
+            .arg(&set);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+    let (code, text) = gate(&[("NUTHATCH_MAX_RSS", "1GB")]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&seen).unwrap(),
+        "NUTHATCH_SQL_MAX_CONCURRENCY=1\nNUTHATCH_SQL_MEMO_BYTES=1048576\n",
+        "{text}"
+    );
+
+    std::fs::write(&env, "RUST_LOG=debug\n").unwrap();
+    let (code, text) = gate(&[]);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("not a NUTHATCH_*=VALUE line"), "{text}");
 }
 
 /// The set lives in the private kittiwake repo, so the runner has no default to fall back on: an
