@@ -5461,7 +5461,9 @@ pub async fn backfill_direct_pipelined_with(
                 if served < fetch_to - fetch_from + 1 {
                     served_width = served;
                 } else {
-                    whole_width = served;
+                    // The window's own width, without the refetched tail: the controller only
+                    // counts a window at exactly its ceiling towards recovery (#1787).
+                    whole_width = fetch_to - w_from + 1;
                 }
                 (logs, covered)
             }
@@ -16358,6 +16360,43 @@ template = "pool"
             .iter()
             .flat_map(|(t, segs)| segs.iter().map(move |s| (t.clone(), s.hash.clone())))
             .collect()
+    }
+
+    /// #1787: a split lowers the ceiling to the piece that was served. Over a long empty tail after
+    /// it the ceiling must climb back, not walk the tail at the piece's width.
+    #[tokio::test]
+    async fn the_ceiling_a_split_lowered_recovers_over_an_empty_tail() {
+        let (reg, addresses, topic0s) = usdc_transfers();
+        // 3,000 logs in the first 1,000 blocks against a 1,000-log cap, then nothing to 1,000,000.
+        let logs: Vec<_> = (0u64..1_000)
+            .flat_map(|b| (0..3).map(move |li| transfer_log(b, li)))
+            .collect();
+        let mut source = ResultCapSource::new(logs, 1_000);
+        source.max_calls = usize::MAX;
+        let d = tempfile::tempdir().unwrap();
+        let total = backfill_direct_pipelined(
+            &source,
+            &reg,
+            d.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            0,
+            1_000_000,
+            1_000,
+            SPAN_OFF,
+            1,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 3_000);
+        // 4,005 calls while the ceiling stayed at the split's piece, 50 once it recovers.
+        let calls = source.calls.lock().unwrap().len();
+        assert!(calls <= 100, "{calls} getLogs calls over the empty tail");
     }
 
     /// Logs `ResultCapSource` served whole, per request.
