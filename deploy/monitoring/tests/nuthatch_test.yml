@@ -123,3 +123,62 @@ tests:
           - exp_labels: {severity: none}
             exp_annotations:
               summary: "The monitoring pipeline is alive"
+
+  # #1786: the audit finds three differing rows at 11 minutes. It pages on the next evaluation,
+  # is still up twelve hours later, and resolves once the day has passed.
+  - interval: 1m
+    input_series:
+      - series: 'nuthatch_audit_mismatches_total{job="nuthatch", instance="100.82.188.91:8113", unit="graph-gns-nest-next", box="helsinki", role="cursor"}'
+        values: '0x10 3x1600'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SealedHistoryDisagrees
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: SealedHistoryDisagrees
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8113", unit: graph-gns-nest-next, box: helsinki, role: cursor}
+            exp_annotations:
+              summary: "graph-gns-nest-next: a second endpoint served different logs for a sealed range; the unit's log names the range and rows"
+      - eval_time: 12h
+        alertname: SealedHistoryDisagrees
+        exp_alerts:
+          - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8113", unit: graph-gns-nest-next, box: helsinki, role: cursor}
+            exp_annotations:
+              summary: "graph-gns-nest-next: a second endpoint served different logs for a sealed range; the unit's log names the range and rows"
+      - eval_time: 25h
+        alertname: SealedHistoryDisagrees
+        exp_alerts: []
+
+  # A clean audit never pages, including across a restart that resets its counter.
+  - interval: 1m
+    input_series:
+      - series: 'nuthatch_audit_mismatches_total{job="nuthatch", instance="100.82.188.91:8104", unit="nuthatch-dips", box="helsinki", role="cursor"}'
+        values: '0x60 _x5 0x60'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: SealedHistoryDisagrees
+        exp_alerts: []
+
+  # The audit compares a range an hour for eight hours, then stops: six hours of nothing plus the
+  # two-hour hold is 16h. A unit freshly started with the audit, at 0 until its first sample an
+  # hour in, does not fire.
+  - interval: 15m
+    input_series:
+      - series: 'nuthatch_audit_ranges_total{job="nuthatch", instance="100.82.188.91:8113", unit="graph-gns-nest-next", box="helsinki", role="cursor"}'
+        values: '0+0.25x32 8+0x60'
+      - series: 'nuthatch_audit_ranges_total{job="nuthatch", instance="100.82.188.91:8104", unit="nuthatch-dips", box="helsinki", role="cursor"}'
+        values: '0 0 0 0 1+0.25x88'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: AuditNotRunning
+        exp_alerts: []
+      - eval_time: 15h
+        alertname: AuditNotRunning
+        exp_alerts: []
+      - eval_time: 16h30m
+        alertname: AuditNotRunning
+        exp_alerts:
+          - exp_labels: {severity: warn, job: nuthatch, instance: "100.82.188.91:8113", unit: graph-gns-nest-next, box: helsinki, role: cursor}
+            exp_annotations:
+              summary: "graph-gns-nest-next: the sealed-history audit has compared nothing in six hours; nuthatch_audit_errors_total and the log say why"

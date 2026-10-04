@@ -995,6 +995,7 @@ per-nest series below.
 | `nuthatch_fetch_window_blocks` | the block span of the cursor's latest `eth_getLogs` window. A backfill whose window sat at ~10 blocks for three hours after a rate-limited hour (#1170) shows here long before it shows in its ETA; the controller now widens again after four clean windows at the lowered ceiling |
 | `nuthatch_seal_direct_fetched` vs `nuthatch_seal_direct_completed` | the seal-direct pass's fetch position against its durable watermark (#1169). A restart resumes from `completed`; the gap is the work it redoes, which on a sparse range can be tens of millions of blocks |
 | `nuthatch_alert_outbox_depth` | webhook/alert delivery backlog |
+| `nuthatch_audit_ranges_total`, `nuthatch_audit_mismatches_total`, `nuthatch_audit_errors_total` | the sealed-history audit, only with `--audit-rpc` (below): ranges compared, rows that differed, samples that could not finish |
 
 Per-nest series, labelled `{nest="…"}` with the nest's route in a runtime (its alias, or `tenant/alias`)
 and its name in a single-nest `dev` (#1415) - the ones that make co-tenancy operable:
@@ -1043,6 +1044,66 @@ Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_scre
 | **Queries out of memory** | `increase(nuthatch_sql_rejections_total{reason="out_of_memory"}[2m]) > 0` | a query did not fit the engine's memory budget; a release that regressed memory shows here first, as 4.1.1 would have |
 | **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
 | **Mirror behind** | `nuthatch_publish_lag_blocks` growing across several intervals, or `nuthatch_publish_dead_letter == 1` | the bucket is unreachable or refusing an object, and consumers of the mirror see stale history |
+| **Sealed history disagrees** | `increase(nuthatch_audit_mismatches_total[1d]) > 0` | a second endpoint served different logs for a sealed range; one of the two providers is wrong (below) |
+| **Audit not running** | `increase(nuthatch_audit_ranges_total[6h]) == 0` for 2h (the series exists only where `--audit-rpc` is set; six hours assumes the default 24 samples a day) | the audit endpoint is unreachable or on the wrong chain; `nuthatch_audit_errors_total` and the log say which |
+
+### Auditing sealed history against a second endpoint
+
+Nothing on the ingest path can see an `eth_getLogs` answer that leaves a log out of the middle of a
+range (#1670): the range seals as if whole. No provider has been seen to do it, and the cheap per-block
+checks cannot catch it without stalling or false alarms, so the detector is a sample. The audit asks
+a **different** endpoint for a sealed range, decodes the answer with the nest's own registry, and
+compares it row by row with the sealed segments for those blocks. A difference is reported and
+nothing else: sealed segments are immutable, and which side is wrong is for you to decide.
+
+```sh
+# One-off: four sampled ranges, exit 1 on any difference.
+nuthatch audit sealed --dir . --rpc https://another-provider.example/KEY --samples 4 --seed 7
+# Re-check one reported range.
+nuthatch audit sealed --dir . --rpc https://another-provider.example/KEY --from 21000000 --to 21000999
+# In the background of a running nest: 24 ranges a day, reported on /metrics and in the log.
+nuthatch dev --dir . --audit-rpc https://another-provider.example/KEY
+```
+
+- **Sampling.** Each sample is `--span` (`--audit-span`) blocks, 1,000 by default, between the
+  first block a compared table covers (or the contracts' `start_block`) and the nest's
+  `sealed_through`, the one boundary the indexer cuts every table at. A stretch past the last
+  event segment was sealed empty, and is sampled like any other. `sanction_hit`, which `nuthatch
+  screen` seals over a range of your choosing, does not move the boundary. The background audit
+  reads `sealed_through` from the running nest; `nuthatch audit sealed` reads it from the hot
+  store when the nest is stopped, and otherwise uses the furthest sealed segment, which can only
+  fall short of it. Even-numbered samples land in a segment picked in proportion to its rows, where an omission
+  has something to omit; odd-numbered samples are uniform over the sealed blocks, so a range the first
+  endpoint called empty is still asked about. The same seed over the same segments picks the same
+  ranges. `--seed` defaults to the current time and is printed; the background audit logs its seed
+  and each range.
+- **What is compared.** The rows of the nest's contract event tables, every column except
+  `block_timestamp`, which comes from a header the audit does not fetch. Factory children's tables,
+  `[extract] blocks` rows and `[[calls]]` rows are not compared.
+- **Reading a mismatch.** The warning names the range, the endpoint (host only, never the key) and up
+  to ten rows of each kind: *endpoint only* is what an omitting indexing endpoint leaves behind,
+  *sealed only* is a row the audit endpoint did not serve, and *differing* is one log decoded two ways.
+  Ask a third endpoint about the same range with `--from`/`--to` before deciding. To repair a range
+  that really is short, re-index the nest from an endpoint that serves it; nothing patches a segment.
+- **Which endpoint.** An endpoint in the nest's `rpc_urls` is refused, and for `--audit-rpc` so are
+  `dev`'s `--rpc` and `--rpc-fallback`, since an endpoint can only agree with itself. One on the
+  same host draws a warning, since one provider may serve both from one backend. The chain id is
+  checked before the first comparison.
+- **RPC cost.** One `eth_getLogs` per sample, plus the splits a provider forces by refusing the width,
+  and one `eth_chainId` when the audit starts. No headers and no tip polls. At the default rate that
+  is 24 `eth_getLogs` a day per nest. The background audit's calls are counted in
+  `nuthatch_rpc_requests_total` with the nest's own.
+- **Memory.** One sample holds at most 20,000 rows on each side, served and sealed, in whole blocks:
+  a denser range is compared on both sides up to the last block that fit, and the report says so.
+  A single block over the limit is kept and compared whole, as the seal path keeps it, and the
+  report says that too. An endpoint that answers a dense range with nothing therefore costs the
+  same as one that answers it in full. Sealed segments are read one at a time and filtered a
+  record batch at a time, so a small sample inside a large segment holds its own rows and one batch,
+  never the segment. For rows the size of an ERC-20 `Transfer` (about 400 bytes of row JSON) that is
+  tens of megabytes while a sample runs, nothing between samples, and it does not grow with the nest.
+- **Scope.** `--audit-rpc` runs on a single-nest `dev`; a runtime directory refuses it, and
+  `nuthatch audit sealed` is run per nest instead. It is off unless set, and talks only to the
+  endpoint you name.
 
 ### Health versus readiness
 
@@ -1603,6 +1664,8 @@ Stated plainly, because finding them yourself in production would be worse.
   token approaches this.
 - One malformed log fails its whole `getLogs` window and retries against another endpoint rather than
   being skipped. Deliberate: silently dropping an on-chain event would be a correctness bug.
+- An endpoint that leaves a log out of the middle of a `getLogs` answer is not detected at ingest;
+  the sealed-history audit above finds it after the fact, by sampling.
 - Segment identity may differ across nuthatch versions built on different arrow-rs releases.
 - Entity reads and derived views are eventually consistent within the reorg window.
 

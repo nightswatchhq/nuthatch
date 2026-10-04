@@ -166,10 +166,11 @@ fn row_hit_key(r: &Value) -> Option<HitKey> {
     ))
 }
 
-/// CLI entry: replay/report dispatch.
-pub fn run(args: crate::cli::AuditArgs) -> Result<()> {
+/// CLI entry: replay/report/sealed dispatch.
+pub async fn run(args: crate::cli::AuditArgs) -> Result<()> {
     use std::path::PathBuf;
     match args.what {
+        crate::cli::AuditWhat::Sealed(a) => crate::sealed_audit::run_cli(a).await,
         crate::cli::AuditWhat::Replay(a) => {
             let dir = PathBuf::from(&a.dir);
             let r = replay(&dir, a.from, a.to).context("replay failed")?;

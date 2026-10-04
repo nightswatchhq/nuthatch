@@ -592,6 +592,10 @@ pub struct Metrics {
     seal_direct_concurrency: AtomicU64,
     ipfs_window_deadline: AtomicU64,
     alert_outbox_depth: AtomicU64,
+    audit_on: AtomicBool,
+    audit_ranges: AtomicU64,
+    audit_mismatches: AtomicU64,
+    audit_errors: AtomicU64,
     // Serving - the surface an operator bills against.
     http_requests: AtomicU64,
     sql_queries: AtomicU64,
@@ -671,6 +675,10 @@ impl Metrics {
             seal_direct_concurrency: AtomicU64::new(0),
             ipfs_window_deadline: AtomicU64::new(0),
             alert_outbox_depth: AtomicU64::new(0),
+            audit_on: AtomicBool::new(false),
+            audit_ranges: AtomicU64::new(0),
+            audit_mismatches: AtomicU64::new(0),
+            audit_errors: AtomicU64::new(0),
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
             sql_rejections: AtomicU64::new(0),
@@ -844,6 +852,18 @@ impl Metrics {
     }
     pub fn set_alert_outbox(&self, v: u64) {
         self.alert_outbox_depth.store(v, Relaxed);
+    }
+    pub fn set_audit_on(&self) {
+        self.audit_on.store(true, Relaxed);
+    }
+    pub fn inc_audit_ranges(&self) {
+        self.audit_ranges.fetch_add(1, Relaxed);
+    }
+    pub fn add_audit_mismatches(&self, n: u64) {
+        self.audit_mismatches.fetch_add(n, Relaxed);
+    }
+    pub fn inc_audit_errors(&self) {
+        self.audit_errors.fetch_add(1, Relaxed);
     }
     pub fn inc_http(&self) {
         self.http_requests.fetch_add(1, Relaxed);
@@ -1091,6 +1111,25 @@ impl Metrics {
             "Pending alert-webhook deliveries in the durable outbox.",
             self.alert_outbox_depth.load(Relaxed),
         ));
+        // Only where an audit runs, so an alert on the ranges counter standing still needs no list
+        // of which units were started with `--audit-rpc`.
+        if self.audit_on.load(Relaxed) {
+            s.push_str(&counter(
+                "nuthatch_audit_ranges_total",
+                "Sealed ranges re-fetched from the audit endpoint and compared, since start.",
+                self.audit_ranges.load(Relaxed),
+            ));
+            s.push_str(&counter(
+                "nuthatch_audit_mismatches_total",
+                "Rows that differed between sealed segments and the audit endpoint, since start.",
+                self.audit_mismatches.load(Relaxed),
+            ));
+            s.push_str(&counter(
+                "nuthatch_audit_errors_total",
+                "Audit samples that could not be completed, since start.",
+                self.audit_errors.load(Relaxed),
+            ));
+        }
         s.push_str(&counter(
             "nuthatch_rows_decoded_total",
             "Rows decoded since start.",
@@ -1760,6 +1799,18 @@ mod tests {
         assert!(out.contains("nuthatch_sql_rejections_total{reason=\"busy\"} 1"));
         assert!(out.contains("nuthatch_sql_rejections_total{reason=\"invalid\"} 1"));
         assert!(out.contains("nuthatch_sql_rejections_total{reason=\"out_of_memory\"} 1"));
+    }
+
+    #[test]
+    fn audit_series_appear_only_once_an_audit_runs() {
+        let m = Metrics::new();
+        assert!(!m.render().contains("nuthatch_audit_"));
+        m.set_audit_on();
+        m.add_audit_mismatches(2);
+        let out = m.render();
+        assert!(out.contains("nuthatch_audit_ranges_total 0"));
+        assert!(out.contains("nuthatch_audit_mismatches_total 2"));
+        assert!(out.contains("nuthatch_audit_errors_total 0"));
     }
 
     /// #1399: a retried IPFS fetch is a series, globally and per nest, and not only a log line.
