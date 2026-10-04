@@ -709,6 +709,12 @@ events = ["Transfer"]
         );
         let from_cut = sealed_blocks_only("");
         assert!(from_cut.iter().any(|&(from, _)| from < 300), "{from_cut:?}");
+
+        // Before the first seal the watermark sits at start - 1.
+        let dir = tempfile::tempdir().unwrap();
+        let auditor = nest(dir.path(), "start_block = 300\n");
+        let none = sample_ranges(dir.path(), &auditor, Some(299), 3, 0..4, 5).unwrap();
+        assert_eq!(none, None);
     }
 
     #[tokio::test]
