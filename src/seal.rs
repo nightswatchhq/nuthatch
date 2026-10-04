@@ -974,13 +974,15 @@ pub fn segments_failing_verification(
                 // Under `slot.result`, the lock a follower holds from its map check to its `wait`, so
                 // this notify cannot fall between the two and be lost (#1810). Same order: result, map.
                 let _result = self.slot.result.lock().unwrap_or_else(|p| p.into_inner());
+                #[cfg(test)]
+                test_panic_hook_cleanup_locked(&self.key.0);
                 sweeps_in_flight()
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(self.key);
                 self.slot.done.notify_all();
                 #[cfg(test)]
-                test_panic_hook_advance(&self.key.0, 2, 3);
+                test_panic_hook_cleanup_done(&self.key.0);
             }
         }
         let _cleanup = Cleanup {
@@ -996,6 +998,8 @@ pub fn segments_failing_verification(
 
     // Follower: wait for the leader, but never past this call's own deadline - the query's time budget
     // is a promise, and that must hold even when it is someone else's sweep in progress, not its own.
+    #[cfg(test)]
+    test_panic_hook_follower_registered(dir);
     let mut guard = slot.result.lock().unwrap();
     loop {
         if let Some(result) = guard.as_ref() {
@@ -1146,13 +1150,25 @@ pub(crate) fn test_sweep_segments_processed_count(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Test-only interleaving (#1810), keyed by `dir`: the leader's sweep panics, but only once a follower
-/// has seen the slot unpublished and the leader still in the map, i.e. sits between its map check and
-/// its `wait`. Stages: 0 armed, 1 leader inside its sweep, 2 follower checked the map, 3 the leader's
-/// cleanup has finished. One-shot: the follower's retry sweeps normally.
+/// Test-only interleavings (#1810), keyed by `dir`: the leader's sweep panics, and its cleanup races a
+/// follower. One-shot: the follower's retry sweeps normally.
+///
+/// `FollowerHoldsLock`: the leader panics only once a follower sits between its map check and its
+/// `wait`. Stages: 0 armed, 1 leader in its sweep, 2 follower checked the map, 3 cleanup done.
+///
+/// `CleanupHoldsLock`: the cleanup pauses where it holds `slot.result`, and a follower registers
+/// meanwhile. Stages: 0 armed, 1 leader in its sweep, 2 cleanup paused, 3 follower registered,
+/// 4 follower checked the map, 5 cleanup done.
 #[cfg(test)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestPanicMode {
+    FollowerHoldsLock,
+    CleanupHoldsLock,
+}
+
+#[cfg(test)]
 pub(crate) struct TestPanicHook {
+    mode: TestPanicMode,
     stage: Mutex<u8>,
     cv: Condvar,
 }
@@ -1164,8 +1180,12 @@ fn test_panic_hooks() -> &'static Mutex<HashMap<PathBuf, Arc<TestPanicHook>>> {
 }
 
 #[cfg(test)]
-pub(crate) fn test_arm_sweep_panic_hook(dir: &Path) -> Arc<TestPanicHook> {
-    let hook = Arc::new(TestPanicHook::default());
+pub(crate) fn test_arm_sweep_panic_hook(dir: &Path, mode: TestPanicMode) -> Arc<TestPanicHook> {
+    let hook = Arc::new(TestPanicHook {
+        mode,
+        stage: Mutex::new(0),
+        cv: Condvar::new(),
+    });
     test_panic_hooks()
         .lock()
         .unwrap()
@@ -1207,30 +1227,66 @@ impl TestPanicHook {
 }
 
 #[cfg(test)]
-fn test_panic_hook_advance(dir: &Path, from: u8, to: u8) {
-    if let Some(hook) = test_panic_hook(dir) {
-        hook.advance(from, to);
-    }
-}
-
-#[cfg(test)]
 fn test_panic_hook_leader(dir: &Path) {
     if let Some(hook) = test_panic_hook(dir) {
         if hook.advance(0, 1) {
-            hook.wait_for(2, Duration::from_secs(60));
+            if hook.mode == TestPanicMode::FollowerHoldsLock {
+                hook.wait_for(2, Duration::from_secs(60));
+            }
             panic!("test-injected sweep panic (#1810)");
         }
     }
 }
 
-/// With the fix the leader's cleanup cannot finish while this follower holds `slot.result`, so the
-/// wait times out and the follower goes on to `wait`; without it the cleanup finishes here, and the
-/// follower then waits for a notification that has already been sent.
+/// Where the cleanup holds `slot.result`. A correct cleanup keeps it until after its notify, so the
+/// follower cannot reach its map check and the short wait times out.
+#[cfg(test)]
+fn test_panic_hook_cleanup_locked(dir: &Path) {
+    if let Some(hook) = test_panic_hook(dir) {
+        if hook.mode == TestPanicMode::CleanupHoldsLock && hook.advance(1, 2) {
+            hook.wait_for(3, Duration::from_secs(60));
+            hook.wait_for(4, Duration::from_millis(200));
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_panic_hook_cleanup_done(dir: &Path) {
+    if let Some(hook) = test_panic_hook(dir) {
+        match hook.mode {
+            TestPanicMode::FollowerHoldsLock => {
+                hook.advance(2, 3);
+            }
+            TestPanicMode::CleanupHoldsLock => {
+                if !hook.advance(3, 5) {
+                    hook.advance(4, 5);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_panic_hook_follower_registered(dir: &Path) {
+    if let Some(hook) = test_panic_hook(dir) {
+        if hook.mode == TestPanicMode::CleanupHoldsLock {
+            hook.advance(2, 3);
+        }
+    }
+}
+
+/// With the fix the cleanup cannot finish while this follower holds `slot.result`, so the wait times
+/// out and the follower goes on to `wait`; without it the cleanup finishes here, and the follower then
+/// waits for a notification that has already been sent.
 #[cfg(test)]
 fn test_panic_hook_follower_checked(dir: &Path) {
     if let Some(hook) = test_panic_hook(dir) {
-        if hook.advance(1, 2) {
-            hook.wait_for(3, Duration::from_millis(200));
+        let (from, to, done) = match hook.mode {
+            TestPanicMode::FollowerHoldsLock => (1, 2, 3),
+            TestPanicMode::CleanupHoldsLock => (3, 4, 5),
+        };
+        if hook.advance(from, to) {
+            hook.wait_for(done, Duration::from_millis(200));
         }
     }
 }
@@ -2223,18 +2279,33 @@ mod tests {
     /// `wait`. Without a deadline that follower is query()/query_cold(), and a lost wake-up is a hang.
     #[test]
     fn a_follower_is_woken_when_its_leader_panics_mid_check() {
+        a_follower_survives_a_panicking_leader(TestPanicMode::FollowerHoldsLock);
+    }
+
+    /// #1810, the other side: a follower that registers while the panicking leader's cleanup is under
+    /// way must not slip in between the cleanup releasing the lock and sending its notify.
+    #[test]
+    fn a_follower_arriving_during_a_panicked_cleanup_is_woken() {
+        a_follower_survives_a_panicking_leader(TestPanicMode::CleanupHoldsLock);
+    }
+
+    fn a_follower_survives_a_panicking_leader(mode: TestPanicMode) {
         let dir = tempfile::tempdir().unwrap();
         seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
-        let hook = test_arm_sweep_panic_hook(dir.path());
+        let hook = test_arm_sweep_panic_hook(dir.path(), mode);
 
         let leader = {
             let dir = dir.path().to_path_buf();
             std::thread::spawn(move || segments_failing_verification(&dir, &usdc(), None))
         };
+        let (ready, done) = match mode {
+            TestPanicMode::FollowerHoldsLock => (1, 3),
+            TestPanicMode::CleanupHoldsLock => (2, 5),
+        };
         assert_eq!(
-            hook.wait_for(1, Duration::from_secs(30)),
-            1,
-            "the leader never reached its sweep"
+            hook.wait_for(ready, Duration::from_secs(30)),
+            ready,
+            "the leader never reached the point the follower is meant to race"
         );
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2249,8 +2320,8 @@ mod tests {
 
         assert!(leader.join().is_err(), "the injected panic never fired");
         assert_eq!(
-            hook.wait_for(3, Duration::ZERO),
-            3,
+            hook.wait_for(done, Duration::ZERO),
+            done,
             "the interleaving under test never happened"
         );
         assert_eq!(
