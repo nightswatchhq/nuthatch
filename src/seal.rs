@@ -2967,4 +2967,157 @@ mod tests {
         );
         assert_eq!(parquet_files(dir.path()).len(), cuts as usize + 1);
     }
+
+    #[test]
+    fn a_hold_on_one_segment_does_not_hold_its_neighbour() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("a.parquet");
+        let free = dir.path().join("b.parquet");
+        std::fs::write(&held, b"a").unwrap();
+        std::fs::write(&free, b"b").unwrap();
+        let _hold = SegmentHold::acquire(&held);
+        assert!(segment_held(&held));
+        assert!(!segment_held(&free), "a hold on a.parquet held b.parquet");
+        assert!(!remove_segment_if_unheld(&held).unwrap());
+        assert!(remove_segment_if_unheld(&free).unwrap());
+        assert!(held.exists() && !free.exists());
+    }
+
+    /// A lease pins the files retired after it was taken, and nothing retired before it.
+    #[test]
+    fn a_retired_file_waits_only_for_leases_older_than_its_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.parquet");
+        std::fs::write(&old, b"x").unwrap();
+        let before = read_lease(dir.path());
+        retire(dir.path(), vec![old.clone()]);
+        assert!(
+            old.exists(),
+            "a lease from before the retire may still be reading it"
+        );
+        let after = read_lease(dir.path());
+        drop(before);
+        assert!(
+            !old.exists(),
+            "a lease taken after the retire read the new manifest and cannot be reading this file"
+        );
+        drop(after);
+    }
+
+    #[test]
+    fn an_unreadable_manifest_is_an_error_not_an_empty_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(manifest_path(dir.path())).unwrap();
+        assert!(load_manifest(dir.path()).is_err());
+        assert!(load_manifest_with_hash(dir.path()).is_err());
+        assert!(catalogue_hash(dir.path()).is_err());
+    }
+
+    #[test]
+    fn check_catalogue_reports_missing_and_mismatched_segments_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        for b in [100u64, 101, 102] {
+            seal_range(dir.path(), &[transfer(b, 0, "1")], b, b).unwrap();
+        }
+        let clean = check_catalogue(dir.path()).unwrap();
+        assert!(clean.ok());
+        assert_eq!(clean.manifest_version, MANIFEST_VERSION);
+        assert_eq!(clean.segments, 3);
+
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        std::fs::remove_file(segment_path(dir.path(), &segs[0].file, &segs[0].hash)).unwrap();
+        let missing = check_catalogue(dir.path()).unwrap();
+        assert_eq!(missing.missing, vec![segs[0].file.clone()]);
+        assert!(missing.hash_mismatch.is_empty());
+        assert!(!missing.ok(), "a missing segment alone must fail the check");
+
+        std::fs::write(
+            segment_path(dir.path(), &segs[1].file, &segs[1].hash),
+            b"not parquet",
+        )
+        .unwrap();
+        let both = check_catalogue(dir.path()).unwrap();
+        assert_eq!(both.missing, vec![segs[0].file.clone()]);
+        assert_eq!(both.hash_mismatch, vec![segs[1].file.clone()]);
+        assert_eq!(both.segments, 3);
+    }
+
+    #[test]
+    fn every_installed_manifest_bumps_the_change_count() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        let rx = manifest_changes(dir.path());
+        let start = *rx.borrow();
+        seal_range(dir.path(), &[transfer(100, 0, "1")], 100, 100).unwrap();
+        seal_range(dir.path(), &[transfer(101, 0, "2")], 101, 101).unwrap();
+        assert_eq!(*rx.borrow(), start + 2);
+    }
+
+    #[test]
+    fn rows_given_out_of_order_seal_to_the_same_sorted_bytes() {
+        let sorted = [
+            transfer(10, 0, "1"),
+            transfer(10, 1, "2"),
+            transfer(11, 0, "3"),
+        ];
+        let mut shuffled = sorted.clone();
+        shuffled.reverse();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        seal_range(a.path(), &sorted, 10, 11).unwrap();
+        seal_range(b.path(), &shuffled, 10, 11).unwrap();
+        let sa = only(&load_manifest(a.path()).unwrap(), "usdc__transfer");
+        let sb = only(&load_manifest(b.path()).unwrap(), "usdc__transfer");
+        assert_eq!(sa.hash, sb.hash, "input order changed the sealed bytes");
+        let rows = read_segment_rows(&segment_path(b.path(), &sb.file, &sb.hash)).unwrap();
+        let order: Vec<(u64, u64)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["block_number"].as_u64().unwrap(),
+                    r["log_index"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(order, vec![(10, 0), (10, 1), (11, 0)]);
+    }
+
+    /// Named rather than derived from `bloom_column`, which would compare the writer with itself.
+    #[test]
+    fn blooms_go_on_address_and_hash_columns_only() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let dir = tempfile::tempdir().unwrap();
+        let row = r#"{"table":"p__swap","address":"0x1","pool_address":"0x2","sender":"0x3","tx_hash":"0x4","amount":"5","block_number":1,"log_index":0}"#;
+        seal_range(dir.path(), &[row.to_string()], 1, 1).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "p__swap");
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let mut bloomed: Vec<String> = reader
+            .metadata()
+            .row_group(0)
+            .columns()
+            .iter()
+            .filter(|c| c.bloom_filter_offset().is_some())
+            .map(|c| c.column_path().string())
+            .collect();
+        bloomed.sort();
+        assert_eq!(bloomed, ["address", "pool_address", "tx_hash"]);
+    }
+
+    #[test]
+    fn a_few_megabytes_of_rows_under_the_row_floor_stay_provisional() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = "x".repeat(512 * 1024);
+        let rows: Vec<String> = (0..4u64)
+            .map(|b| {
+                format!(r#"{{"table":"t__doc","block_number":{b},"log_index":0,"doc":"{doc}"}}"#)
+            })
+            .collect();
+        seal_range(dir.path(), &rows, 0, 3).unwrap();
+        assert!(
+            only(&load_manifest(dir.path()).unwrap(), "t__doc").provisional,
+            "2 MiB is well under SEAL_TABLE_BYTES_FLOOR"
+        );
+    }
 }
