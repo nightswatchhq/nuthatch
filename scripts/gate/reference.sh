@@ -164,6 +164,11 @@ while [ $i -lt "$n" ]; do
     why=$(view_fault_for "${sqls[$i]}")
     note="not compared: DuckDB will not run it: ${why:-$d_err}"
     skipped="$skipped  $id: ${why:-$d_err}"$'\n'
+  elif printf '%s' "${sqls[$i]}" | grep -qiw information_schema; then
+    # Each engine lists its own tables; no release decides what DuckDB's catalog holds.
+    verdict=skip
+    uncompared=$((uncompared + 1))
+    note="not compared: a catalog listing names each engine's own tables"
   elif [ "$mode" = volatile ]; then
     if [ "$b_rows" = "$d_rows" ]; then
       counted=$((counted + 1))

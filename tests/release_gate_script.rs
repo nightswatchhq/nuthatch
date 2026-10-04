@@ -1639,6 +1639,51 @@ fn an_answer_that_differs_from_duckdbs_fails_and_is_named() {
     );
 }
 
+/// A catalog listing names each engine's own tables, which no release decides, so it is not
+/// compared with DuckDB and says why. The binary must still answer it.
+#[test]
+fn a_catalog_listing_is_not_compared_with_duckdb() {
+    let c = case();
+    let set = c.set(&[
+        ("count", c.counts()),
+        (
+            "catalog",
+            "SELECT table_name FROM information_schema.tables ORDER BY table_name LIMIT 3"
+                .to_string(),
+        ),
+        (
+            "bad_catalog",
+            "SELECT no_such_column FROM information_schema.tables".to_string(),
+        ),
+    ]);
+    c.pin_at_finalized();
+    let duck = c.duck(&[
+        ("count.json", &count_body(TRANSFERS)),
+        (
+            "catalog.json",
+            r#"{"count":1,"rows":[{"table_name":"only_duckdb_has_this"}]}"#,
+        ),
+        ("bad_catalog.json", r#"{"count":0,"rows":[]}"#),
+    ]);
+    let (out, text) = c.reference(&set, &[], Some(&duck));
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(line_for(&text, "count").starts_with("ok "), "{text}");
+    let catalog = line_for(&text, "catalog");
+    assert!(
+        catalog.starts_with("skip ") && catalog.contains("not compared: a catalog listing"),
+        "{catalog}"
+    );
+    assert!(
+        text.contains("1 match DuckDB") && text.contains("1 not compared"),
+        "{text}"
+    );
+    assert!(
+        line_for(&text, "bad_catalog").starts_with("FAIL ")
+            && line_for(&text, "bad_catalog").contains("the binary did not answer"),
+        "{text}"
+    );
+}
+
 /// A statement DuckDB will not run is listed with its reason and not compared; one the binary does
 /// not answer fails. A reason that is a view DuckDB would not define names the view.
 #[test]
