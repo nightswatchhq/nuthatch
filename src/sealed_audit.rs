@@ -255,13 +255,8 @@ struct Catalogue {
 impl Catalogue {
     fn load(dir: &Path, auditor: &Auditor) -> Result<Option<Self>> {
         let manifest = crate::seal::load_manifest(dir)?;
-        let all = manifest.tables.values().flatten();
-        let (Some(lo), Some(hi)) = (
-            all.clone().map(|s| s.from_block).min(),
-            all.map(|s| s.to_block).max(),
-        ) else {
-            return Ok(None);
-        };
+        // Bounds from the audited tables alone: a blocks or calls table sealed further would put
+        // samples where no compared row could have been sealed.
         let mut weighted: Vec<(u64, u64, u64)> = auditor
             .schema
             .iter()
@@ -270,6 +265,12 @@ impl Catalogue {
             .map(|s| (s.from_block, s.to_block, s.rows as u64))
             .collect();
         weighted.sort_unstable();
+        let (Some(lo), Some(hi)) = (
+            weighted.iter().map(|w| w.0).min(),
+            weighted.iter().map(|w| w.1).max(),
+        ) else {
+            return Ok(None);
+        };
         let rows = weighted.iter().map(|w| w.2).sum();
         Ok(Some(Self {
             lo,
@@ -592,6 +593,39 @@ events = ["Transfer"]
         let tables: Vec<&str> = auditor.schema.iter().map(|t| t.table.as_str()).collect();
         assert_eq!(tables, ["usdc__transfer"]);
         assert_eq!(auditor.filter.topic0s(), [auditor.schema[0].topic0.clone()]);
+    }
+
+    #[test]
+    fn samples_stay_inside_the_audited_tables_sealed_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let auditor = nest(d, "\n[extract]\nblocks = true\n");
+        let word = |n: u64| format!("0x{n:064x}");
+        let log = crate::rpc::Log {
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            topics: vec![auditor.schema[0].topic0.clone(), word(1), word(2)],
+            data: word(5),
+            block_number: 10,
+            block_hash: word(10),
+            tx_hash: word(99),
+            log_index: 0,
+        };
+        let event = auditor.registry.decode(&log).unwrap().unwrap();
+        crate::seal::test_set_table_floor(d, 0);
+        crate::seal::seal_range(d, &[event.to_json().to_string()], 1, 20).unwrap();
+        let block = serde_json::json!({
+            "table": crate::registry::BLOCKS_TABLE,
+            "block_number": 900,
+            "log_index": 0,
+        });
+        crate::seal::seal_range(d, &[block.to_string()], 21, 1_000).unwrap();
+
+        for (from, to) in sample_ranges(d, &auditor, 5, 0..200, 5).unwrap().unwrap() {
+            assert!(
+                from >= 1 && to <= 20,
+                "sampled {from}..={to}, outside 1..=20"
+            );
+        }
     }
 
     #[tokio::test]
