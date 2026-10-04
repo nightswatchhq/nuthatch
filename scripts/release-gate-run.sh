@@ -7,8 +7,9 @@
 #   scripts/release-gate-run.sh --poll                    gate the newest ungated release that is
 #                                                         newer than production; none, exit 0 quietly
 #   scripts/release-gate-run.sh --binary PATH --sha SHA   gate a local build of commit SHA
-#   options: --production <tag>  the version production runs, measured as the baseline
-#                                (default: the latest full release that is not the candidate)
+#   options: --production <tag>  the version production runs, measured as the baseline (default:
+#                                the version the copy's PROVENANCE records, read after the refresh;
+#                                with no PROVENANCE, the latest full release that is not the candidate)
 #            --no-status         run and print, post nothing
 #
 # The candidate is compared with the production version measured on the same box, the same copy
@@ -44,15 +45,15 @@ log() { echo "release-gate-run: $*" >&2; }
 die() { log "$*"; exit 2; }
 trap 'rc=$?; log "internal error at line $LINENO (exit $rc)"; exit 2' ERR
 
-tag="" poll=0 local_bin="" sha="" production="" post=1
+tag="" poll=0 local_bin="" sha="" production_flag="" post=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --poll) poll=1; shift ;;
     --binary) [ $# -ge 2 ] || die "--binary needs a path"; local_bin=$2; shift 2 ;;
     --sha) [ $# -ge 2 ] || die "--sha needs a commit"; sha=$2; shift 2 ;;
-    --production) [ $# -ge 2 ] || die "--production needs a tag"; production=$2; shift 2 ;;
+    --production) [ $# -ge 2 ] || die "--production needs a tag"; production_flag=$2; shift 2 ;;
     --no-status) post=0; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) [ -z "$tag" ] || die "one tag at a time"; tag=$1; shift ;;
   esac
@@ -132,19 +133,34 @@ has_status() {
       else .state end" | grep -qvE '^(none|stale)$'
 }
 
-full_releases=""
-if [ -z "$production" ]; then
-  full_releases=$(gh release list -R "$repo" -L 20 --exclude-pre-releases --json tagName,isDraft \
-    --jq '.[] | select(.isDraft | not) | .tagName') || die "could not list the releases of $repo"
-fi
-# The version production runs when the candidate is $1: --production, or the latest full release
-# that is not the candidate.
-production_for() {
-  if [ -n "$production" ]; then
-    printf '%s\n' "$production"
+full_releases="" listed_full=0
+# Sets production and production_from for candidate $1: --production; else the version the copy's
+# PROVENANCE records, which the refresh read from production's own /ready; else, with no
+# PROVENANCE, the latest full release that is not the candidate, which is a guess (#1804).
+# Called directly, never in $(...), so that its die exits the run.
+resolve_production() {
+  local v
+  if [ -n "$production_flag" ]; then
+    production=$production_flag production_from=flag
+  elif [ -f "$nest/PROVENANCE" ]; then
+    v=$(sed -n 's/^version=//p' "$nest/PROVENANCE" | tail -n 1 | tr -d '\r')
+    v=${v#v}
+    if ! printf '%s\n' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+      [ -n "$sha" ] || die "$nest/PROVENANCE records version '$v', which is not a release version, and no candidate is chosen yet, so no status is posted; pass --production"
+      post_status error "the copy's PROVENANCE records version '${v:0:40}', not a release version; pass --production" || true
+      die "$nest/PROVENANCE records version '$v', which is not a release version; pass --production"
+    fi
+    production=v$v production_from=provenance
   else
-    printf '%s\n' "$full_releases" | grep -vxF "$1" | head -n 1 || true
+    if [ "$listed_full" -eq 0 ]; then
+      full_releases=$(gh release list -R "$repo" -L 20 --exclude-pre-releases --json tagName,isDraft \
+        --jq '.[] | select(.isDraft | not) | .tagName') || die "could not list the releases of $repo"
+      listed_full=1
+    fi
+    production=$(printf '%s\n' "$full_releases" | grep -vxF "$1" | head -n 1 || true)
+    production_from=latest
   fi
+  [ -n "$production" ] || die "no full release to measure as production; pass --production"
 }
 
 is_num() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; }
@@ -186,13 +202,13 @@ semver_gt() {
 
 if [ "$poll" -eq 1 ]; then
   # Newest first. A draft is skipped: its assets are still being built, and it is not yet a release.
-  # A release at or below production is never a candidate: it was superseded, not missed.
+  # A release at or below production is never a candidate: it was superseded, not missed. Production
+  # here is the copy as it stands; it is read again after the refresh below.
   listed=$(gh release list -R "$repo" -L 20 --json tagName,isDraft \
     --jq '.[] | select(.isDraft | not) | .tagName') || die "could not list the releases of $repo"
   for t in $listed; do
-    base=$(production_for "$t")
-    [ -n "$base" ] || die "no full release to measure as production; pass --production"
-    semver_gt "$t" "$base" || continue
+    resolve_production "$t"
+    semver_gt "$t" "$production" || continue
     c=$(commit_of "$t")
     if ! has_status "$c"; then tag=$t; break; fi
   done
@@ -208,16 +224,27 @@ else
   label="local build of ${sha:0:12}"
 fi
 
-production=$(production_for "${tag:-}")
-[ -n "$production" ] || die "no full release to measure as production; pass --production"
-[ "$production" != "$tag" ] || die "the candidate and production are the same release ($tag)"
-
-post_status pending "running $label against the allocations nest copy, baseline $production"
-
 if [ -n "${GATE_REFRESH:-}" ]; then
   log "refreshing the copy: $GATE_REFRESH"
   sh -c "$GATE_REFRESH" >&2 || die "GATE_REFRESH failed"
 fi
+
+resolve_production "${tag:-}"
+from_note=""
+case "$production_from" in
+  flag) log "production is $production, as --production gives it" ;;
+  provenance) log "production is $production, the version $nest/PROVENANCE records" ;;
+  latest)
+    log "$nest has no PROVENANCE, so production is taken to be $production, the latest full release that is not the candidate; pass --production if it is not"
+    from_note=" as the latest release, no PROVENANCE" ;;
+esac
+if [ "$poll" -eq 1 ] && ! semver_gt "$tag" "$production"; then
+  log "after the refresh production is $production, so $tag is no longer newer than it; nothing to gate"
+  exit 0
+fi
+[ "$production" != "$tag" ] || die "the candidate and production are the same release ($tag)"
+
+post_status pending "running $label against the allocations nest copy, baseline $production$from_note"
 
 prod_bin=$(fetch "$production")
 if [ -n "$tag" ]; then cand_bin=$(fetch "$tag"); else cand_bin=$local_bin; fi
@@ -263,7 +290,7 @@ cat "$run/candidate.txt"
 summary=$(grep -E '^release-gate: [0-9]+ of [0-9]+ answered' "$run/candidate.txt" | sed -e 's/^release-gate: //' -e 's/;.*//' || true)
 result=$(grep -E '^RESULT: ' "$run/candidate.txt" | sed 's/^RESULT: //' || true)
 case "$rc" in
-  0) post_status success "${summary:-passed} (against $production$prod_note)" ;;
-  1) post_status failure "${summary:-failed}; ${result#FAIL - } (against $production$prod_note)" ; exit 1 ;;
+  0) post_status success "${summary:-passed} (against $production$from_note$prod_note)" ;;
+  1) post_status failure "${summary:-failed}; ${result#FAIL - } (against $production$from_note$prod_note)" ; exit 1 ;;
   *) post_status error "the gate could not run (exit $rc); see $run" ; exit 2 ;;
 esac
