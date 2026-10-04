@@ -971,8 +971,16 @@ pub fn segments_failing_verification(
         }
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
-                sweeps_in_flight().lock().unwrap().remove(self.key);
+                // Under `slot.result`, the lock a follower holds from its map check to its `wait`, so
+                // this notify cannot fall between the two and be lost (#1810). Same order: result, map.
+                let _result = self.slot.result.lock().unwrap_or_else(|p| p.into_inner());
+                sweeps_in_flight()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(self.key);
                 self.slot.done.notify_all();
+                #[cfg(test)]
+                test_panic_hook_advance(&self.key.0, 2, 3);
             }
         }
         let _cleanup = Cleanup {
@@ -1000,6 +1008,8 @@ pub fn segments_failing_verification(
             drop(guard);
             return segments_failing_verification(dir, tables, deadline);
         }
+        #[cfg(test)]
+        test_panic_hook_follower_checked(dir);
         guard = match deadline {
             None => slot.done.wait(guard).unwrap(),
             Some(d) => {
@@ -1136,6 +1146,95 @@ pub(crate) fn test_sweep_segments_processed_count(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Test-only interleaving (#1810), keyed by `dir`: the leader's sweep panics, but only once a follower
+/// has seen the slot unpublished and the leader still in the map, i.e. sits between its map check and
+/// its `wait`. Stages: 0 armed, 1 leader inside its sweep, 2 follower checked the map, 3 the leader's
+/// cleanup has finished. One-shot: the follower's retry sweeps normally.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestPanicHook {
+    stage: Mutex<u8>,
+    cv: Condvar,
+}
+
+#[cfg(test)]
+fn test_panic_hooks() -> &'static Mutex<HashMap<PathBuf, Arc<TestPanicHook>>> {
+    static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Arc<TestPanicHook>>>> = OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_arm_sweep_panic_hook(dir: &Path) -> Arc<TestPanicHook> {
+    let hook = Arc::new(TestPanicHook::default());
+    test_panic_hooks()
+        .lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), Arc::clone(&hook));
+    hook
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_sweep_panic_hook(dir: &Path) {
+    test_panic_hooks().lock().unwrap().remove(dir);
+}
+
+#[cfg(test)]
+fn test_panic_hook(dir: &Path) -> Option<Arc<TestPanicHook>> {
+    test_panic_hooks().lock().unwrap().get(dir).cloned()
+}
+
+#[cfg(test)]
+impl TestPanicHook {
+    /// Waits until the stage reaches `at_least`, or `timeout` passes; returns the stage reached.
+    pub(crate) fn wait_for(&self, at_least: u8, timeout: Duration) -> u8 {
+        let guard = self.stage.lock().unwrap();
+        let (guard, _) = self
+            .cv
+            .wait_timeout_while(guard, timeout, |s| *s < at_least)
+            .unwrap();
+        *guard
+    }
+
+    fn advance(&self, from: u8, to: u8) -> bool {
+        let mut stage = self.stage.lock().unwrap();
+        if *stage != from {
+            return false;
+        }
+        *stage = to;
+        self.cv.notify_all();
+        true
+    }
+}
+
+#[cfg(test)]
+fn test_panic_hook_advance(dir: &Path, from: u8, to: u8) {
+    if let Some(hook) = test_panic_hook(dir) {
+        hook.advance(from, to);
+    }
+}
+
+#[cfg(test)]
+fn test_panic_hook_leader(dir: &Path) {
+    if let Some(hook) = test_panic_hook(dir) {
+        if hook.advance(0, 1) {
+            hook.wait_for(2, Duration::from_secs(60));
+            panic!("test-injected sweep panic (#1810)");
+        }
+    }
+}
+
+/// With the fix the leader's cleanup cannot finish while this follower holds `slot.result`, so the
+/// wait times out and the follower goes on to `wait`; without it the cleanup finishes here, and the
+/// follower then waits for a notification that has already been sent.
+#[cfg(test)]
+fn test_panic_hook_follower_checked(dir: &Path) {
+    if let Some(hook) = test_panic_hook(dir) {
+        if hook.advance(1, 2) {
+            hook.wait_for(3, Duration::from_millis(200));
+        }
+    }
+}
+
 /// `deadline`'s check, factored out so a test can override it with an exact, `dir`-keyed check-count
 /// cutoff (`test_set_sweep_expire_after_checks`) instead of racing a real `Instant` against a real
 /// `thread::sleep`. Production behaviour (the path reached whenever no test has armed an override for
@@ -1168,6 +1267,7 @@ fn sweep_segments(
             .unwrap()
             .entry(dir.to_path_buf())
             .or_insert(0) += 1;
+        test_panic_hook_leader(dir);
     }
 
     let mut bad = BTreeSet::new();
@@ -2116,6 +2216,47 @@ mod tests {
             test_sweep_start_count(dir.path()),
             1,
             "4 concurrent callers naming the same tables must pay for one sweep, not 4"
+        );
+    }
+
+    /// #1810: a leader that panics must still wake a follower that sits between its map check and its
+    /// `wait`. Without a deadline that follower is query()/query_cold(), and a lost wake-up is a hang.
+    #[test]
+    fn a_follower_is_woken_when_its_leader_panics_mid_check() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let hook = test_arm_sweep_panic_hook(dir.path());
+
+        let leader = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || segments_failing_verification(&dir, &usdc(), None))
+        };
+        assert_eq!(
+            hook.wait_for(1, Duration::from_secs(30)),
+            1,
+            "the leader never reached its sweep"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let _ = tx.send(segments_failing_verification(&dir, &usdc(), None));
+            });
+        }
+        let followed = rx.recv_timeout(Duration::from_secs(30));
+        test_clear_sweep_panic_hook(dir.path());
+
+        assert!(leader.join().is_err(), "the injected panic never fired");
+        assert_eq!(
+            hook.wait_for(3, Duration::ZERO),
+            3,
+            "the interleaving under test never happened"
+        );
+        assert_eq!(
+            followed
+                .expect("the follower missed its panicking leader's wake-up and never returned"),
+            BTreeSet::new()
         );
     }
 
