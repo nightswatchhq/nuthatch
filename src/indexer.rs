@@ -87,7 +87,24 @@ pub async fn dev(args: DevArgs) -> Result<()> {
             interval: args.publish_interval,
             parallelism: args.publish_parallelism as usize,
         });
-    run(
+    let audit = match &args.audit_rpc {
+        Some(url) => {
+            let indexing: Vec<String> = pool.iter().chain(&config.nest.rpc_urls).cloned().collect();
+            Some(crate::sealed_audit::spawn(
+                dir.clone(),
+                &config,
+                &indexing,
+                crate::sealed_audit::Settings {
+                    rpc: url.clone(),
+                    per_day: args.audit_per_day,
+                    span: args.audit_span,
+                    seed: args.audit_seed,
+                },
+            )?)
+        }
+        None => None,
+    };
+    let result = run(
         source,
         dir,
         config,
@@ -100,7 +117,11 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         publish,
         cors,
     )
-    .await
+    .await;
+    if let Some(audit) = audit {
+        audit.abort();
+    }
+    result
 }
 
 /// `dev`'s run-time settings, carried on `Config` because every layer below already takes `&Config`.
@@ -4918,7 +4939,7 @@ fn suggested_split_point(err: &anyhow::Error, from: u64, to: u64) -> Option<u64>
 /// Holds at most `budget` logs in whole blocks and returns the last block it covered (#1671): the
 /// pieces of a refused range were all merged, so a window grown wide over an empty range held its whole
 /// width of dense history at once. The caller fetches the rest.
-async fn fetch_logs_splitting_tracked(
+pub(crate) async fn fetch_logs_splitting_tracked(
     source: &dyn Source,
     filter: &LogFilter,
     from: u64,

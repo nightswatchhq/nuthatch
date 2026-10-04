@@ -131,6 +131,12 @@ async fn main() -> Result<()> {
                          mount, from `[mounts.publish]` in mounts.toml (RFC-0052 S2)"
                     );
                 }
+                if args.audit_rpc.is_some() {
+                    anyhow::bail!(
+                        "--audit-rpc audits a single nest; for a runtime directory run `nuthatch \
+                         audit sealed --dir <nest>` against each nest instead"
+                    );
+                }
                 runtime::dev(
                     dir,
                     args.listen,
@@ -260,7 +266,7 @@ async fn main() -> Result<()> {
         cli::Command::Lists(args) => run_lists(args).await,
         cli::Command::Screen(args) => screen::backfill(args),
         cli::Command::Pack(args) => pack::run(args, &now_stamp()),
-        cli::Command::Audit(args) => audit::run(args),
+        cli::Command::Audit(args) => audit::run(args).await,
         cli::Command::Nest(args) => match args.what {
             cli::NestWhat::Bundle(a) => blob::bundle(
                 std::path::Path::new(&a.dir),

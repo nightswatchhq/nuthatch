@@ -161,6 +161,8 @@ mod seal_batching_asymmetry;
 #[cfg(feature = "folds")]
 #[path = "seal_latency_with_folds.rs"]
 mod seal_latency_with_folds;
+#[path = "sealed_audit.rs"]
+mod sealed_audit;
 #[path = "secret_isolation.rs"]
 mod secret_isolation;
 #[path = "seed_scale.rs"]

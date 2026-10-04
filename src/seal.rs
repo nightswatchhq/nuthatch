@@ -749,8 +749,6 @@ pub fn read_table_rows_by_segment(
     schema: &crate::registry::TableSchema,
     sink: &mut dyn FnMut(Vec<crate::registry::DecodedRow>) -> Result<()>,
 ) -> Result<()> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
     let manifest = load_manifest(dir)?;
     let Some(segments) = manifest.tables.get(&schema.table) else {
         return Ok(());
@@ -762,60 +760,68 @@ pub fn read_table_rows_by_segment(
     });
 
     for segment in ordered {
-        let mut out = Vec::new();
-        let path = segment_path(dir, &segment.file, &segment.hash);
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("opening sealed segment {}", path.display()))?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("reading sealed segment {}", path.display()))?
-            .build()
-            .with_context(|| format!("reading sealed segment {}", path.display()))?;
-        for batch in reader {
-            let batch =
-                batch.with_context(|| format!("decoding sealed segment {}", path.display()))?;
-            for row in 0..batch.num_rows() {
-                let mut stored = serde_json::Map::new();
-                for (i, field) in batch.schema().fields().iter().enumerate() {
-                    let column = batch.column(i);
-                    let value = match field.data_type() {
-                        DataType::UInt64 => {
-                            let a = column
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .context("a UInt64 column that is not one")?;
-                            Value::from(a.value(row))
-                        }
-                        DataType::Utf8 => {
-                            let a = column
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .context("a Utf8 column that is not one")?;
-                            if a.is_null(row) {
-                                Value::Null
-                            } else {
-                                Value::from(a.value(row))
-                            }
-                        }
-                        other => anyhow::bail!(
-                            "sealed segment {} column {} has type {other}, which this project does \
-                             not write",
-                            path.display(),
-                            field.name()
-                        ),
-                    };
-                    stored.insert(field.name().clone(), value);
-                }
-                out.push(
-                    crate::registry::DecodedRow::from_stored(&Value::Object(stored), schema)
-                        .with_context(|| {
-                            format!("row {row} of sealed segment {}", path.display())
-                        })?,
-                );
-            }
-        }
-        sink(out)?;
+        sink(read_segment_decoded(dir, segment, schema)?)?;
     }
     Ok(())
+}
+
+/// One sealed segment's rows, through the same conversion as [`read_table_rows`].
+pub fn read_segment_decoded(
+    dir: &Path,
+    segment: &Segment,
+    schema: &crate::registry::TableSchema,
+) -> Result<Vec<crate::registry::DecodedRow>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let mut out = Vec::new();
+    let path = segment_path(dir, &segment.file, &segment.hash);
+    let file = std::fs::File::open(&path)
+        .with_context(|| format!("opening sealed segment {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("reading sealed segment {}", path.display()))?
+        .build()
+        .with_context(|| format!("reading sealed segment {}", path.display()))?;
+    for batch in reader {
+        let batch = batch.with_context(|| format!("decoding sealed segment {}", path.display()))?;
+        for row in 0..batch.num_rows() {
+            let mut stored = serde_json::Map::new();
+            for (i, field) in batch.schema().fields().iter().enumerate() {
+                let column = batch.column(i);
+                let value = match field.data_type() {
+                    DataType::UInt64 => {
+                        let a = column
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .context("a UInt64 column that is not one")?;
+                        Value::from(a.value(row))
+                    }
+                    DataType::Utf8 => {
+                        let a = column
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .context("a Utf8 column that is not one")?;
+                        if a.is_null(row) {
+                            Value::Null
+                        } else {
+                            Value::from(a.value(row))
+                        }
+                    }
+                    other => anyhow::bail!(
+                        "sealed segment {} column {} has type {other}, which this project does \
+                         not write",
+                        path.display(),
+                        field.name()
+                    ),
+                };
+                stored.insert(field.name().clone(), value);
+            }
+            out.push(
+                crate::registry::DecodedRow::from_stored(&Value::Object(stored), schema)
+                    .with_context(|| format!("row {row} of sealed segment {}", path.display()))?,
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Load the segment catalogue (empty if none yet).

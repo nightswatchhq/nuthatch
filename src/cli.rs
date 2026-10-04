@@ -700,6 +700,33 @@ pub enum AuditWhat {
     Replay(AuditReplayArgs),
     /// Summarise the hits and flags in a block range (markdown or `--json`).
     Report(AuditReportArgs),
+    /// Re-fetch a sample of sealed ranges from a second endpoint and compare them row by row.
+    Sealed(AuditSealedArgs),
+}
+
+#[derive(Args)]
+pub struct AuditSealedArgs {
+    /// Nest directory.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// The endpoint to compare against. One the nest indexes from is refused.
+    #[arg(long, value_name = "URL")]
+    pub rpc: String,
+    /// Ranges to sample.
+    #[arg(long, default_value_t = 4)]
+    pub samples: u64,
+    /// The same seed over the same segments picks the same ranges. Defaults to the current unix
+    /// time, which is printed.
+    #[arg(long)]
+    pub seed: Option<u64>,
+    /// Blocks in each sampled range.
+    #[arg(long, default_value_t = crate::sealed_audit::DEFAULT_SPAN, value_parser = clap::value_parser!(u64).range(1..))]
+    pub span: u64,
+    /// Audit exactly `--from..=--to` instead of sampling, to re-check a reported range.
+    #[arg(long, requires = "to")]
+    pub from: Option<u64>,
+    #[arg(long, requires = "from")]
+    pub to: Option<u64>,
 }
 
 #[derive(Args)]
@@ -1458,6 +1485,26 @@ pub struct DevArgs {
     /// Objects the mirror uploads at once.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=16))]
     pub publish_parallelism: u64,
+
+    /// Audit sealed history against this endpoint in the background (#1786): re-fetch sampled
+    /// sealed ranges, compare them row by row, and report a difference on `/metrics` and in the log.
+    /// Off when absent. One the nest indexes from is refused. A flag, since a keyed URL does not
+    /// belong in the nest.
+    #[arg(long = "audit-rpc", value_name = "URL")]
+    pub audit_rpc: Option<String>,
+
+    /// Ranges the background audit samples a day, spread evenly.
+    #[arg(long, default_value_t = crate::sealed_audit::DEFAULT_PER_DAY, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    pub audit_per_day: u64,
+
+    /// Blocks in each range the background audit samples.
+    #[arg(long, default_value_t = crate::sealed_audit::DEFAULT_SPAN, value_parser = clap::value_parser!(u64).range(1..))]
+    pub audit_span: u64,
+
+    /// Seed for the background audit's samples. Defaults to the start time; it is logged with every
+    /// sample, as is the range, which `nuthatch audit sealed --from --to` re-checks.
+    #[arg(long)]
+    pub audit_seed: Option<u64>,
 
     /// Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that
     /// front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN`
