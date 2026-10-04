@@ -3286,17 +3286,37 @@ pub async fn start_mount_jobs(
 #[cfg(test)]
 type MountJoinFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
-type MountJoinHook = std::sync::Mutex<std::collections::HashMap<String, MountJoinFn>>;
+type MountJoinHook =
+    std::sync::Mutex<std::collections::HashMap<(std::path::PathBuf, String), MountJoinFn>>;
 
-/// The gap between a job's fetch and its join, by job name. A test forgets the job here (#1638).
+/// The gap between a job's fetch and its join, by runtime dir and job name, so another test's job of
+/// the same name never runs it. A test forgets the job here (#1638).
 #[cfg(test)]
 fn before_mount_join() -> &'static MountJoinHook {
     static HOOK: std::sync::OnceLock<MountJoinHook> = std::sync::OnceLock::new();
     HOOK.get_or_init(Default::default)
 }
 
+/// Calls to `RuntimeHandles::mount`, by runtime dir, so another test's mount cannot move this one's
+/// count (#1820).
 #[cfg(test)]
-static MOUNT_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn mount_entries() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>
+{
+    static ENTRIES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+    > = std::sync::OnceLock::new();
+    ENTRIES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn mount_entries_in(dir: &Path) -> usize {
+    mount_entries()
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
 
 /// Run a mount as a job (#1544). The fetch happens with no lock held, so a slow registry holds up no
 /// other admin call; only the join takes the runtime's lock.
@@ -3323,7 +3343,12 @@ pub fn spawn_mount_job(
             jobs.advance_if_owned(&name, generation, MountPhase::Joining, None)?;
             #[cfg(test)]
             {
-                let hook = before_mount_join().lock().unwrap().get(&name).cloned();
+                let runtime_dir = handles.lock().await.mount_ctx.dir.clone();
+                let hook = before_mount_join()
+                    .lock()
+                    .unwrap()
+                    .get(&(runtime_dir, name.clone()))
+                    .cloned();
                 if let Some(hook) = hook {
                     hook();
                 }
@@ -3539,7 +3564,13 @@ impl RuntimeHandles {
     /// this function with a raw string.
     pub async fn mount(&mut self, name: &str, nid: Option<Nid>) -> Result<()> {
         #[cfg(test)]
-        MOUNT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        {
+            *mount_entries()
+                .lock()
+                .unwrap()
+                .entry(self.mount_ctx.dir.clone())
+                .or_insert(0) += 1;
+        }
         let plan = self.plan_mount(name, nid.as_ref())?;
         // A NID this runtime does not hold is fetched first (#1543). Whatever refuses the mount after
         // that removes the fetch again, so a refusal still leaves nothing behind.
@@ -6604,7 +6635,7 @@ mod tests {
             format!("/_admin/datasets/{nid}"),
         );
         super::before_mount_join().lock().unwrap().insert(
-            "joining".to_string(),
+            (dir.path().to_path_buf(), "joining".to_string()),
             Arc::new(move || {
                 let req = axum::http::Request::delete(&uri)
                     .body(axum::body::Body::empty())
@@ -6618,13 +6649,16 @@ mod tests {
                 jobs_hook.forget("joining").unwrap();
             }),
         );
-        struct Clear;
+        struct Clear(std::path::PathBuf);
         impl Drop for Clear {
             fn drop(&mut self) {
-                super::before_mount_join().lock().unwrap().remove("joining");
+                super::before_mount_join()
+                    .lock()
+                    .unwrap()
+                    .remove(&(self.0.clone(), "joining".to_string()));
             }
         }
-        let _clear = Clear;
+        let _clear = Clear(dir.path().to_path_buf());
         spawn_mount_job(
             handles.clone(),
             jobs.clone(),
@@ -6706,7 +6740,6 @@ mod tests {
     #[tokio::test]
     async fn an_unmount_of_an_accepted_job_is_not_overtaken_by_it() {
         use crate::mount_jobs::{MountJob, MountPhase};
-        use std::sync::atomic::Ordering;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -6720,10 +6753,10 @@ mod tests {
         let claimed = jobs
             .claim(MountJob::new("usdc", None, MountPhase::Accepted))
             .unwrap();
-        super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
         let jobs_hook = jobs.clone();
+        let hook_key = (dir.path().to_path_buf(), "usdc".to_string());
         super::before_mount_join().lock().unwrap().insert(
-            "usdc".to_string(),
+            hook_key.clone(),
             Arc::new(move || {
                 jobs_hook.forget("usdc").unwrap();
                 jobs_hook
@@ -6731,13 +6764,13 @@ mod tests {
                     .expect("the name is free once the first job is forgotten");
             }),
         );
-        struct Clear;
+        struct Clear((std::path::PathBuf, String));
         impl Drop for Clear {
             fn drop(&mut self) {
-                super::before_mount_join().lock().unwrap().remove("usdc");
+                super::before_mount_join().lock().unwrap().remove(&self.0);
             }
         }
-        let _clear = Clear;
+        let _clear = Clear(hook_key.clone());
         let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
         spawn_mount_job(
             handles,
@@ -6749,7 +6782,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            super::MOUNT_ENTRIES.load(Ordering::SeqCst),
+            super::mount_entries_in(dir.path()),
             0,
             "the forgotten job must not mount"
         );
@@ -6758,7 +6791,7 @@ mod tests {
 
         // The generation is the one claim returned. A worker that reads the map adopts this
         // replacement and mounts it.
-        super::before_mount_join().lock().unwrap().remove("usdc");
+        super::before_mount_join().lock().unwrap().remove(&hook_key);
         let claimed = jobs
             .claim(MountJob::new("dai", None, MountPhase::Accepted))
             .unwrap();
@@ -6766,7 +6799,6 @@ mod tests {
         let replacement = jobs
             .claim(MountJob::new("dai", None, MountPhase::Accepted))
             .expect("the name is free once the first job is forgotten");
-        super::MOUNT_ENTRIES.store(0, Ordering::SeqCst);
         let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
         spawn_mount_job(
             handles,
@@ -6778,13 +6810,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            super::MOUNT_ENTRIES.load(Ordering::SeqCst),
+            super::mount_entries_in(dir.path()),
             0,
             "the replaced claim must not mount"
         );
         let again = jobs.get("dai").expect("the replacement claim stays");
         assert_eq!(again.phase, MountPhase::Accepted);
         assert_eq!(again.generation, replacement.generation);
+
+        // A mount on this runtime does move its count, so the zeros above mean something.
+        let _ = idle_handles(dir.path()).mount("dai", None).await;
+        assert_eq!(super::mount_entries_in(dir.path()), 1);
     }
 
     /// #1638, review: a move worker is fenced as a mount worker is. One whose claim was forgotten
