@@ -181,8 +181,24 @@ For each run it downloads and checksums the candidate's Linux binary
 first and writes that as the baseline, then gates the candidate against it. The baseline is
 therefore the same box, the same copy and the same day, so neither a refreshed copy nor a
 different machine reads as a regression. The committed `baseline-4.2.0.tsv` is the proof run's
-record, not what the ThinkPad compares against. Production defaults to the latest full release
-that is not the candidate; `--production <tag>` names it when that is wrong.
+record, not what the ThinkPad compares against.
+
+**Production** is what the allocations nest runs, which is not always the latest release: on
+2026-10-04 it ran 4.2.1, rolled back from 4.3.0 (#1790), and v4.3.1 was gated against v4.3.0 and
+failed for fixing 4.3.0's wrong answers (#1804). So the runner reads it from the copy's
+`PROVENANCE`, whose `version=` the snapshot took from the nest's own `/ready`: `version=4.2.1`
+means production is `v4.2.1`. It is read after `GATE_REFRESH`, so it is the version that served the
+copy being measured. `--production <tag>` overrides it. Only a copy with no `PROVENANCE` falls back
+to the latest full release that is not the candidate, and the run says so in its output and in the
+status (`as the latest release, no PROVENANCE`). A `PROVENANCE` whose version is not a release
+version stops the run (exit 2) rather than guessing, with an `error` status on the candidate naming
+the version; a `--poll` that meets it before choosing a candidate has no commit to post on, and
+exits 2 saying so.
+
+`--poll` judges "newer than production" against the same production, read from the copy as it
+stands before the refresh; after the refresh it is read again, and a candidate no longer newer than
+it (production was rolled to it meanwhile) is left ungated: the run says so and exits 0, posting
+nothing.
 
 Production failing its own gate is still the baseline, since it is what production does: over
 the RSS budget, or refusing statements of its own. Its peak and failures are named in the
