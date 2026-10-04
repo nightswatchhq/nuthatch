@@ -198,8 +198,9 @@ impl Binding {
     }
 
     /// Every expression the plan evaluates must type-check against the columns it will see, by the
-    /// rules [`Expr::eval`] enforces per row (#1590). DuckDB's binder coerces where the circuit does
-    /// not, so `check` passing through DuckDB alone let `fee + '1'` through to fault on its first row.
+    /// rules [`Expr::eval`] enforces per row (#1590). The SQL engine's binder can coerce where the
+    /// circuit does not, so `check` passing through the engine alone let `fee + '1'` through to fault
+    /// on its first row.
     fn check_types(&self, plan: &Plan) -> Result<()> {
         let left = &self.left.types;
         let joined: Vec<Option<Type>> = left

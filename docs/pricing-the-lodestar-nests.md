@@ -14,6 +14,10 @@ is a plan to build. It is the arithmetic an operator would need before anyone di
 The companion page, [the Lodestar lifecycle](lodestar-lifecycle.md), carries the cost and
 performance figures this one prices against.
 
+> **Note, 2026-10-05.** Since 4.1 the SQL engine is Burrmill, on DataFusion, and DuckDB is not in the
+> binary. The DuckDB findings in sections 3 and 6 are 3.5.1 measurements and stand as such; the plan
+> shapes and memory limits they describe have to be measured again on Burrmill before they are priced.
+
 ---
 
 ## 1. The corpus is small, fixed and reviewed, which is the whole reason this is tractable
@@ -98,8 +102,8 @@ Against the 42 builders: **one** carries a correlated scalar subquery in its SQL
 selects, aggregates and joins.
 
 **That is not the same as one refusal, and the difference is the rule.** Rule 1 says take the
-physical plan, not the SQL text, and DuckDB decorrelates scalar subqueries into hash joins as a
-matter of course. Whether `indexerActiveAllocationsSql` is publishable is a question for `EXPLAIN`,
+physical plan, not the SQL text, and DuckDB, the engine on 3.5.1, decorrelated scalar subqueries into hash
+joins as a matter of course. Whether `indexerActiveAllocationsSql` is publishable is a question for `EXPLAIN`,
 not for a grep - and the grep is the answer to a different question, which is how much rewriting a
 Phase 0 would cost. **At most one query out of 42.** The rule is affordable on this corpus.
 
@@ -181,7 +185,7 @@ proof, and the pricing question does not become live until it is.
 
 - **The bytes-to-resident expansion factor** for a hot temp table on this workload. §3's finding
   says it is the number that matters and nobody has it.
-- **The per-query DuckDB working set** across all 42 statements, not the six sampled here.
+- **The per-query working set** across all 42 statements, on Burrmill, not the six sampled here.
 - **A byte-scan distribution** across the corpus. This page establishes the ceiling (660 MB) and one
   outlier; it does not establish the spread, which is what §3's "leave Phase 0" benchmark keys on.
 - **Whether `max_row_bytes` is enforced at write time** in the hot store. RFC-0048 calls this slice

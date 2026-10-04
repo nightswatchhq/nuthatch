@@ -922,10 +922,10 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// no longer hash to their content address. Returns their hashes, for `analytics::define_views` to
 /// drop from a rebuilt view (issue #433).
 ///
-/// ## Why the hash and not a DuckDB probe
+/// ## Why the hash and not an engine probe
 ///
-/// #430 drops a segment that will not **bind**, probing with `conn.prepare` over `read_parquet`. That
-/// catches footer corruption and nothing else. Measured in the DuckDB CLI (1.5.3) against a segment
+/// #430 drops a segment that will not **bind**. That catches footer corruption and nothing else.
+/// Measured in the DuckDB CLI (1.5.3), the engine then, against a segment
 /// whose data region is overwritten but whose footer is intact:
 ///
 /// - `SELECT 1 FROM read_parquet([f]) LIMIT 0` - the #430 probe - **succeeds**;
@@ -933,9 +933,9 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// - `SELECT * … LIMIT 1` fails on that file, and **succeeds** on one where only the late row groups
 ///   are corrupt, because it never reads them.
 ///
-/// So the only sound DuckDB-side discriminator is a full scan of every column of every segment, and
-/// it would be pinned to whatever the query planner prunes this release. The content address is not:
-/// sealed segments are immutable, so any changed byte is unambiguous corruption, and this is already
+/// So the only sound engine-side discriminator is a full scan of every column of every segment, and
+/// it would be pinned to whatever the query planner prunes this release, under any engine. The
+/// content address is not: sealed segments are immutable, so any changed byte is unambiguous corruption, and this is already
 /// the check `verify_and_quarantine` makes at startup. Using the same one here is what stops the
 /// serving path and the startup path disagreeing about the same file, which was half of #419.
 ///
@@ -986,7 +986,7 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// stale the way the `(mtime, len)` memo did - the next call, even for the identical key, always reads
 /// bytes fresh.
 ///
-/// `tables` holds the table names the failed query referenced, lowercased (DuckDB identifiers are
+/// `tables` holds the table names the failed query referenced, lowercased (identifiers are
 /// case-insensitive). An empty set hashes nothing. `deadline`, when set, bounds the sweep by the same
 /// wall-clock budget as the query that triggered it (`analytics::run`'s `QueryGuard`), rather than
 /// running unbounded between the query's two attempts - a caller that has already spent its budget
@@ -1439,7 +1439,7 @@ fn sweep_segments(
 }
 
 /// The segments [`segments_failing_verification`] is allowed to read: those belonging to a table in
-/// `tables` (matched case-insensitively, as DuckDB matches identifiers). Manifest-only, no file IO -
+/// `tables` (matched case-insensitively, as Burrmill matches identifiers). Manifest-only, no file IO -
 /// which is what makes the sweep's cost bound testable without timing anything.
 fn segments_to_verify(dir: &Path, tables: &BTreeSet<String>) -> Vec<(String, Segment)> {
     if tables.is_empty() {
@@ -1930,7 +1930,7 @@ mod tests {
 
     /// RFC-0047 C1 / #1221. The external-reader contract: four counter columns are UInt64,
     /// everything else (including a uint256) is Utf8 decimal or other canonical text, and the
-    /// DuckDB `*_dec` / `*_overflow` companions are not in the file. A type change here makes
+    /// query-side `*_dec` / `*_overflow` companions are not in the file. A type change here makes
     /// `docs/reading-segments.md` a lie.
     #[test]
     fn sealed_parquet_writes_uint64_counters_and_utf8_uint256_without_dec_companions() {
@@ -2159,7 +2159,7 @@ mod tests {
             "a query over one table must not make the other one's segments readable"
         );
         assert_eq!(named("usdc__approval"), vec!["usdc__approval".to_string()]);
-        // DuckDB matches identifiers case-insensitively and the AST reports the name as written, so
+        // Burrmill matches identifiers case-insensitively and the AST reports the name as written, so
         // a shouted table name must still find its own segments and no others.
         assert_eq!(named("USDC__TRANSFER"), vec!["usdc__transfer".to_string()]);
         assert!(
@@ -2174,7 +2174,7 @@ mod tests {
     }
 
     /// **Issue #433.** The serving-path discriminator must catch page corruption that every cheap
-    /// DuckDB probe waves through, and must not accuse a healthy segment.
+    /// engine probe waves through, and must not accuse a healthy segment.
     ///
     /// The fixture asserts its own premise. Corrupting the data region while leaving the footer and
     /// magic bytes intact is the whole condition - if the file stopped binding it would be #430's

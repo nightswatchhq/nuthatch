@@ -497,8 +497,8 @@ fn finish_linear(aggs: &[Agg], acc: &LinAcc) -> Row {
                     Scalar::Int(acc.at(1 + 2 * i))
                 }
             }
-            // Integer division truncating toward zero, once, at the end - matching DuckDB's integer
-            // AVG and `Plan::finish`.
+            // Integer division truncating toward zero, once, at the end - matching `Plan::finish`.
+            // The entity's contract, not the SQL engine's: Burrmill's `avg` over integers is fractional.
             Agg::Avg(_) => {
                 let n = acc.at(2 + 2 * i);
                 if n == 0 {
@@ -1052,7 +1052,7 @@ mod tests {
 
         /// **RFC-0041 §8, as a property.** Insert a window, retract part of it, and the circuit's
         /// relation must equal the batch recomputation over exactly the facts that survive. This is
-        /// the invariant that lets the batch evaluator stand in for the DuckDB oracle, and the one a
+        /// the invariant that let the batch evaluator replace the DuckDB oracle, and the one a
         /// reorg exercises for real (§5.2).
         #[test]
         fn incremental_equals_batch_recomputation_under_retraction(

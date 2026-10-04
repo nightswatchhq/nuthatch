@@ -191,7 +191,7 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
     }
     // And the entities no view answers at all. Stated as a count first, because nine of nineteen
     // is the shape of the problem and a reader scanning a long skipped-field list will not add it up
-    // (#1277). A caller querying one of these gets an error from DuckDB, which is the point.
+    // (#1277). A caller querying one of these gets an error from the engine, which is the point.
     if !result.entities_without_views.is_empty() {
         println!(
             "  ! {} of {} entit(ies) have no view - not one of their exact fields reached a column: {}",
@@ -517,8 +517,8 @@ fn write_entities(
         // `1`, and the outer `sum` does the same job for both.
         //
         // The wrapping matters. RFC-0041 v1's validator requires exactly one `SELECT_NODE`, and a bare
-        // `UNION ALL` parses as a `SET_OPERATION_NODE` - measured against DuckDB's own
-        // `json_serialize_sql`. Wrapped in an outer `SELECT .. FROM ( .. )` it is a `SELECT_NODE` and a
+        // `UNION ALL` parses as a set operation, not a select (DuckDB's `SET_OPERATION_NODE` when
+        // this was measured). Wrapped in an outer `SELECT .. FROM ( .. )` it is a `SELECT_NODE` and a
         // derived table in `FROM` is not an expression subquery, so `nuthatch check` still validates it.
         let mut arms: BTreeMap<(String, String), Vec<AccumulatedField>> = BTreeMap::new();
         for a in accumulated {
@@ -608,7 +608,7 @@ fn write_entities(
         // already answers as `<entity>`.
         //
         // The circuit reads a decoded integer as a checked 128-bit integer and faults the entity on a
-        // value it cannot hold, so the checked cast and `_overflow` flag the DuckDB form needed are
+        // value it cannot hold, so the checked cast and `_overflow` flag a SQL view needs are
         // gone: nothing narrows silently.
         // **An entity when one table feeds the total, a view when several do** (#1595). The circuit
         // that maintains an entity reads one table, or two under an inner join, so the `UNION ALL` of
@@ -1136,7 +1136,7 @@ fn view_for_entity(
     // This used to be a parallel `Vec` pushed inside the loop above. The two were built from the same
     // information and still diverged (#1248), and a divergence here is invisible: `exact_fields` feeds
     // the generated check's projection and the coverage figure, so a field listed but not projected
-    // reads as verified and as answered while DuckDB cannot answer it. Taking the list from `selects`
+    // reads as verified and as answered while the engine cannot answer it. Taking the list from `selects`
     // - the same map `exact_select_sql` renders - makes that impossible rather than unlikely, and
     // `every_emitted_view_projects_exactly_the_fields_it_lists` holds the invariant.
     //
@@ -1472,8 +1472,8 @@ fn map_exact_field_tables(
 
 /// A composed value as SQL: `"tx_hash" || '-' || CAST("log_index" AS VARCHAR)`.
 ///
-/// Every column is cast to text, because the pieces are being concatenated into a string id and DuckDB's
-/// `||` on a non-text operand is not the same expression. A literal is escaped by doubling its quotes, so
+/// Every column is cast to text, because the pieces are being concatenated into a string id and `||`
+/// on a non-text operand is not the same expression. A literal is escaped by doubling its quotes, so
 /// a separator containing one cannot end the literal early.
 ///
 /// `None` if any column does not resolve against this table, so a key with a missing piece is never
@@ -1605,7 +1605,7 @@ fn write_checks(nest: &Path, views: &[EmittedView]) -> Result<()> {
     //
     // **The projection names the promised columns.** `SELECT *` binds a view whatever it contains,
     // so it could not see a field that `exact_fields` advertised and the SQL never emitted - the
-    // defect in #1248, which passed every generated check. Naming each column makes DuckDB the
+    // defect in #1248, which passed every generated check. Naming each column makes the engine the
     // independent party: the two lists were computed in the same loop and still diverged, so the
     // engine refusing to bind an absent column is worth more than either list agreeing with itself.
     let mut labels: Vec<(String, String, Vec<String>)> = views
@@ -1689,7 +1689,7 @@ mod tests {
     /// Jules on #1244: the emitted check used to expect `count(*) = 0` per view, so it passed on a
     /// fresh nest and failed for good the moment the nest indexed one matching event. `port-emit`
     /// is an overlay onto a nest that may already hold data, so the check has to answer the same
-    /// thing either way. Run against real DuckDB, empty and populated.
+    /// thing either way. Run through the real engine, empty and populated.
     #[test]
     fn the_emitted_check_answers_the_same_on_a_populated_nest() {
         crate::engine::on_bare(the_emitted_check_answers_the_same_on_a_populated_nest_on);
@@ -1717,7 +1717,7 @@ mod tests {
         );
 
         // Each table and its view, redefined together: a Burrmill view keeps the table it was
-        // defined over, where DuckDB's reads whatever holds the name now.
+        // defined over, where DuckDB's read whatever held the name at query time.
         let nest = |token: &str, pool: &str| {
             for (alias, ids) in [("token", token), ("pool", pool)] {
                 conn.execute(&format!(
@@ -1777,8 +1777,8 @@ mod tests {
 
     /// Jules on #1244. The fold used to filter on `field IS NOT NULL`, which cannot tell an arm
     /// that never carried the field from an event that genuinely cleared it. A nullable field set
-    /// and then cleared kept its old value for good, and the view called that exact. Run against
-    /// real DuckDB, because the whole claim is about what the SQL returns.
+    /// and then cleared kept its old value for good, and the view called that exact. Run through
+    /// the real engine, because the whole claim is about what the SQL returns.
     #[test]
     fn a_later_explicit_null_clears_the_field_and_a_missing_column_does_not() {
         crate::engine::on_bare(

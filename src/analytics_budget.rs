@@ -294,13 +294,14 @@ pub fn parse_memory_mb(raw: &str) -> Option<u64> {
     }
 }
 
-/// The spill cap when `max_temp_size` is unset. DuckDB's own default is 90% of the free space where
-/// it spills, and that is often a tmpfs `/tmp`, which is RAM.
+/// The spill cap when `max_temp_size` is unset. An engine's own default is far larger (DuckDB's was
+/// 90% of the free space where it spills), and that is often a tmpfs `/tmp`, which is RAM.
 pub const DEFAULT_MAX_TEMP_MB: u64 = 2048;
 
-/// The bytes one analytics connection may spill before its query is stopped. DuckDB does not enforce
-/// `max_temp_directory_size` on every spill (a cross join wrote 1.3 GB past a 128 MB cap), so the
-/// `/sql` guard measures the spill directory against this itself.
+/// The bytes one analytics session may spill before its query is stopped. Burrmill is handed this as
+/// its spill budget, and the `/sql` watchdog also measures the spill directory against it, which it
+/// began doing when DuckDB did not enforce its own cap on every spill (a cross join wrote 1.3 GB past
+/// a 128 MB cap).
 pub fn spill_cap_bytes(cfg: &AnalyticsConfig) -> u64 {
     let mb = cfg
         .max_temp_size

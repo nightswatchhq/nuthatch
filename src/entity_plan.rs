@@ -10,11 +10,11 @@
 //! [`Plan::evaluate`] folds a complete set of rows through that plan in one pass. **That is not a
 //! substitute for the circuit; it is the thing the circuit must agree with.** RFC-0041 §8 requires
 //! "incremental result == batch recomputation over full history", and RFC-0042's Tier 1 research
-//! names exactly this pairing as how the DuckDB oracle gets retired: two independent
+//! named exactly this pairing as how the DuckDB oracle was retired: two independent
 //! implementations that must agree, rather than one implementation and a hope.
 //!
 //! It has a second job. §5.3's warm restart computes "one finalized seed relation" from sealed
-//! facts, which today means a DuckDB query. A native batch evaluator is that seed without the
+//! facts, which would otherwise mean a SQL engine query. A native batch evaluator is that seed without the
 //! engine - which is why this is worth building before the circuit rather than after.
 
 use crate::entity_expr::{admits, Expr};
@@ -187,7 +187,8 @@ impl Plan {
                 Agg::Sum(_) => acc.sum.map_or(Scalar::Null, Scalar::Int),
                 Agg::Min(_) => acc.min.clone().unwrap_or(Scalar::Null),
                 Agg::Max(_) => acc.max.clone().unwrap_or(Scalar::Null),
-                // Integer division truncating toward zero, matching DuckDB's integer AVG. Carrying
+                // Integer division truncating toward zero: the entity's contract (RFC-0041 §3.3), not
+                // the SQL engine's, whose `avg` over integers is fractional. Carrying
                 // sum and count to the end is what makes this exact rather than a drifting mean.
                 Agg::Avg(_) => {
                     if acc.avg_count == 0 {
@@ -378,7 +379,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        // avg = 5/2 truncated toward zero = 2, matching DuckDB integer AVG. Deliberately a pair that
+        // avg = 5/2 truncated toward zero = 2, the entity's integer AVG. Deliberately a pair that
         // *rounds differently*: round-half-up would give 3. 1/2/4 (sum 7, count 3) gives 2 either
         // way and so cannot tell the two apart - a mutation caught that the first time round.
         assert_eq!(

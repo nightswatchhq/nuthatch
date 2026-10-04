@@ -356,9 +356,9 @@ fn seal_snapshot(
 /// **A case-insensitive collision is refused, not merged.**
 ///
 /// The manifest is a `BTreeMap` and would happily hold both `Prices` and `prices` as separate
-/// tables. `define_offchain_views` then creates `offchain__Prices` and `offchain__prices`, and
-/// DuckDB resolves identifiers case-insensitively - so the second `CREATE OR REPLACE VIEW`
-/// replaces the first and one table silently answers with the other's rows.
+/// tables. `define_offchain_views` then creates `offchain__Prices` and `offchain__prices`, and a
+/// view's name is lowercased when it is defined and resolved case-insensitively - so the second
+/// `CREATE OR REPLACE VIEW` replaces the first and one table silently answers with the other's rows.
 ///
 /// Refusing is the honest half of the fix. Lower-casing the name instead would make the two the
 /// same table, which is a guess about intent: an operator who dropped `Prices` and `prices` may
@@ -1095,7 +1095,7 @@ mod tests {
         assert_eq!(rows[0]["token"], "WETH");
     }
 
-    /// Two table names differing only in case would become one DuckDB view, and the later
+    /// Two table names differing only in case would become one view, and the later
     /// `CREATE OR REPLACE VIEW` would make one table answer with the other's rows. Refused rather
     /// than merged, because merging is a guess about what the operator meant.
     #[test]

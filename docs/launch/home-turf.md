@@ -8,6 +8,10 @@ for the ecosystem, not a pitch. Paulie credited and given a heads-up before it p
 announcement lands first, keep the one-sentence hosted-option mention below; if not, delete it and let
 the post stand alone.
 
+> **Note, 2026-10-05.** This copy predates 4.1. DuckDB is no longer in the binary: SQL runs on
+> Burrmill, on DataFusion, over the same sealed Parquet. The DuckDB lines below describe the 3.x
+> architecture and must be rewritten before this is posted.
+
 ---
 
 ## Title

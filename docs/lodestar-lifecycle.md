@@ -11,6 +11,12 @@ carry. **It is a measurement of 3.5.1, not of the current release**: 3.6.0 went 
 and changes what a repeated statement costs, as section 5 says. Nothing here is projected. Where a number comes from a short window, the window is stated,
 because a rate without one is not a number.
 
+> **Note, 2026-10-05.** Since 4.1 the SQL engine is Burrmill, on DataFusion, and DuckDB is not in the
+> binary. The DuckDB memory and spill figures in sections 5 and 7 are 3.5.1 measurements and stand as
+> such. Today one memory pool per nest, sized by `analytics.memory_limit` (default 512 MB) or
+> `NUTHATCH_BURRMILL_MEMORY_LIMIT`, is shared by every statement running against that nest, so raising
+> the permit count no longer shrinks a fixed per-connection slice.
+
 **One thing changed the day after.** On 2026-09-07 Lodestar's read API became a long-lived Rust
 process fronting these same nests, replacing per-request handlers on a serverless platform. That
 alters the consumer described in section 4, and section 4 describes the new shape. It alters nothing
@@ -197,11 +203,11 @@ queries, not materialised ones. The consumer's request timeout is 15 s and the n
 is 30 s, so the network view at 6.1 s has under 2.5x of headroom. RFC-0041's authored incremental
 entities are the answer to this and are shipped; these views have not been migrated onto them.
 
-**A `count(*)` can exhaust the memory budget, and that is the guard working.** `max_memory` per
-DuckDB connection is `min(512 MB, 1024 MB / permits)`, so on this box it is **256 MB**, observed as
-`244.1 MiB` in the error text. The same query on 3.5.0 with two permits saw `488.2 MiB`. Raising
-`NUTHATCH_SQL_MAX_CONCURRENCY` therefore buys throughput by taking memory away from every individual
-query, which is the trade an operator is actually making.
+**A `count(*)` can exhaust the memory budget, and that is the guard working.** On 3.5.1,
+`max_memory` per DuckDB connection was `min(512 MB, 1024 MB / permits)`, so on this box it was
+**256 MB**, observed as `244.1 MiB` in the error text. The same query on 3.5.0 with two permits saw
+`488.2 MiB`. Raising `NUTHATCH_SQL_MAX_CONCURRENCY` then bought throughput by taking memory away from
+every individual query.
 
 **Concurrency: the default is two, and this deployment sets four.** The unit carries
 `NUTHATCH_SQL_MAX_CONCURRENCY=4` (and `NUTHATCH_HOT_STORE_CACHE_BYTES=268435456`). Ten simultaneous
@@ -246,8 +252,8 @@ Ranked by how likely an operator is to meet it.
 
 1. **Concurrency refusals as soon as there is a second caller.** Four permits here, two by default.
    Expected, and self-inflicted only if the consumer fires a `Promise.all`. Fix it client-side.
-2. **The DuckDB memory budget bites on innocuous SQL.** `SELECT count(*)` on one view exhausted the
-   256 MB per-connection limit in 1.5 s. Four scalar subqueries in one statement did the same. The
+2. **The SQL memory budget bites on innocuous SQL.** Under DuckDB on 3.5.1, `SELECT count(*)` on
+   one view exhausted the 256 MB per-connection limit in 1.5 s. Four scalar subqueries in one statement did the same. The
    guard is doing its job; the surprise is how cheap the query looked. On 3.5.1 this is a clean
    `400` with the limit quoted in the error text.
 3. **A slow view against a tight client timeout.** 6.1 s against 15 s. A view that grows, or a box

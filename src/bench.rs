@@ -594,8 +594,8 @@ fn write_report(out: &str, json: &str) -> Result<()> {
 }
 
 /// Read-path bench report (`nuthatch bench query`): entity point-read latency and the `/sql` hot∪cold
-/// scan cost + peak RSS. The regression guard the perf refactors (bound the hot-scan, persistent DuckDB
-/// connection, compact row format) must each beat on a before/after - none of these were measurable
+/// scan cost + peak RSS. The regression guard the perf refactors (bound the hot-scan, persistent
+/// session, compact row format) must each beat on a before/after - none of these were measurable
 /// before, so they could regress silently.
 #[derive(Debug, Serialize)]
 pub struct QueryBenchReport {

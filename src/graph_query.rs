@@ -1518,8 +1518,8 @@ pub fn compile_with(
                 // **Declared is not stored.** graph-node's generated `orderBy` enum includes every field
                 // of the entity, `@derivedFrom` lists among them, so `orderBy: swaps` is a value the
                 // schema advertises and the parent view has no column for. Emitting `ORDER BY b."swaps"`
-                // sent it to DuckDB to fail, or - worse, once the same query selects the list - sorted the
-                // rows by a JSON aggregate (Jules, #1282). Ordering by a relation is the same join a
+                // sent it to the engine to fail, or - worse, once the same query selects the list -
+                // sorted the rows by a JSON aggregate (Jules, #1282). Ordering by a relation is the same join a
                 // traversal needs, and it is refused for the same reason.
                 if field.derived_from.is_some()
                     || matches!(field.ty, graph_schema::FieldType::List(_))
@@ -1967,7 +1967,8 @@ fn lower_predicate(p: &Pred<'_>, key: &str, v: &Value) -> Result<String, Unsuppo
             .collect();
         // Membership preserves parent row counts even with duplicate child IDs. Avoid correlated
         // EXISTS: combined with a selected relation over the recursive network indexer view, DuckDB
-        // produces an invalid HUGEINT/VARCHAR binding (#1458). Coalesce preserves EXISTS semantics
+        // produced an invalid HUGEINT/VARCHAR binding (#1458), not re-measured on Burrmill, and
+        // membership is correct either way. Coalesce preserves EXISTS semantics
         // for null references and null child IDs, including beneath another boolean expression.
         return Ok(format!(
             "coalesce({base}.\"{field_name}\" IN (SELECT {alias}.\"id\" FROM \"{view}\" {alias} WHERE {}), false)",
@@ -2193,8 +2194,9 @@ mod tests {
     ///
     /// The key is four hundred characters of `CASE`, and three of these tests are about *which arguments
     /// reach the SQL* rather than about the key's own shape. Abbreviating keeps them exact on the thing
-    /// they are for; that the key orders numerically is asserted against DuckDB in
-    /// `the_numeric_key_orders_by_value_not_by_text`, which is where it belongs.
+    /// they are for; that the key orders numerically is asserted through the engine by
+    /// `ordering_and_filtering_a_big_number_is_numeric_not_lexicographic` in
+    /// `tests/graph_over_indexed_data.rs`, which is where it belongs.
     fn compact(sql: &str) -> String {
         let mut out = sql.to_string();
         while let Some(at) = out.find("CASE WHEN CAST(") {
@@ -2548,8 +2550,8 @@ type Swap @entity { id: ID! pool: Pool! }
             "{}",
             c.sql
         );
-        // `list()` over zero rows is NULL in DuckDB, so a parent with no children would answer null
-        // for a field the generated schema types `[Swap!]!`. Measured with the CLI, not assumed.
+        // `list()` over zero rows is NULL in Burrmill, so a parent with no children would answer null
+        // for a field the generated schema types `[Swap!]!`. Measured, not assumed.
         assert!(
             c.sql.contains("coalesce(") && c.sql.contains("'[]'"),
             "a childless parent must answer [] rather than null: {}",

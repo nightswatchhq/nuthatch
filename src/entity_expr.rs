@@ -8,14 +8,14 @@
 //!
 //! **Overflow faults** (§3.3.1). Every arithmetic operation is checked. A `sum` whose running total
 //! leaves `i128` is an error at the row that carried it past, not a total that resumes from the other
-//! end of the number line. DuckDB and Postgres error here; DataFusion wraps by default
-//! (arrow-datafusion#17539) and is a candidate engine under RFC-0042 - so "whatever the engine does"
-//! is not a specification, and the contract lives on the entity.
+//! end of the number line. Burrmill errors here, as Postgres does (a BIGINT `+` past `i64` is an
+//! arithmetic overflow error), but DataFusion has wrapped by default (arrow-datafusion#17539) - so
+//! "whatever the engine does" is not a specification, and the contract lives on the entity.
 //!
 //! **NULL is unknown, not false.** SQL's three-valued logic, implemented rather than approximated:
 //! `NULL AND false` is `false` while `NULL AND true` is `NULL`, and a predicate that evaluates to
 //! `NULL` excludes its row without being an error. Getting this wrong produces a relation that
-//! differs from DuckDB only on rows with nulls in them, which is the hardest kind of divergence to
+//! differs from the SQL engine only on rows with nulls in them, which is the hardest kind of divergence to
 //! notice and precisely what the parity gate in §8 exists to catch.
 
 use crate::entity_row::{Row, Scalar};

@@ -36,9 +36,8 @@ pub struct EntityIdentity {
 }
 
 impl EntityIdentity {
-    /// Stable identity for one entity compiler contract. A changed lowerer, DuckDB evaluation
-    /// version, decoded source, upstream entity, key shape or output shape must rebuild rather
-    /// than graft. `Derivation` supplies the carefully length-delimited source and input hashing;
+    /// Stable identity for one entity compiler contract. A changed lowerer, engine version, decoded
+    /// source, upstream entity, key shape or output shape must rebuild rather than graft. `Derivation` supplies the carefully length-delimited source and input hashing;
     /// this extension adds the parts unique to maintained keyed state.
     pub fn reuse_key(&self) -> String {
         let derivation = crate::graft::Derivation {
@@ -88,7 +87,7 @@ pub struct OffchainSourceIdentity {
     pub snapshots: Vec<String>,
 }
 
-/// Construct the entity definition identity from DuckDB's parser. A parser failure is represented
+/// Construct the entity definition identity from the engine's parser. A parser failure is represented
 /// as raw text by `canonical_plan`, which can only forfeit reuse, never make two meanings collide.
 pub fn identity(
     sql: &str,
@@ -674,21 +673,21 @@ fn first_unnarrowable(
 /// Aggregates whose maintenance under insert **and retraction** the v1 lowerer can express.
 ///
 /// Short by design and an **allowlist**, which is the whole point (#836). The refusal list used to
-/// enumerate what was forbidden - `MEDIAN`, `MODE`, `PERCENTILE_*` - over a vocabulary DuckDB owns
-/// and grows, and it was wrong in both the ways `analytics.rs` predicts a denylist is wrong. About
+/// enumerate what was forbidden - `MEDIAN`, `MODE`, `PERCENTILE_*` - over a vocabulary the engine
+/// owns and grows, and it was wrong in both the ways `analytics.rs` predicts a denylist is wrong. About
 /// **coverage**: this build knows 88 distinct aggregate names, of which the list named three, so
 /// `quantile_cont`, `arg_max`, `string_agg`, `list`, `first`, `histogram` and the rest were admitted
 /// as incrementally maintainable. And about **spelling**: `PERCENTILE_CONT` is the SQL-standard alias
-/// while `quantile_cont` is the name DuckDB actually uses, so the list blocked the alias and admitted
-/// the real thing.
+/// while `quantile_cont` is the name DuckDB used, so the list blocked the alias and admitted the
+/// real thing.
 ///
-/// `count_star` is DuckDB's internal name for `count(*)`.
+/// `count_star` is the name the parse gives `count(*)` (`entity_lower::canonical_function_name`).
 const INCREMENTAL_AGGREGATES: &[&str] = &["sum", "min", "max", "avg", "count", "count_star"];
 
 /// Every name DuckDB 1.5's catalogue classifies as an aggregate: what the gate treats as one.
 ///
-/// Frozen from `duckdb_functions()` when the gate stopped asking DuckDB;
-/// `the_aggregate_list_is_duckdbs_catalogue` fails while DuckDB is linked if the two drift. A name
+/// Frozen from `duckdb_functions()` when the gate stopped asking DuckDB, and not checked against
+/// any engine since: DuckDB is no longer linked. A name
 /// here and not in [`INCREMENTAL_AGGREGATES`] is refused; an aggregate some later engine adds is not
 /// here, and is refused at lowering instead, which admits only the six.
 const AGGREGATES: &[&str] = &[
@@ -796,7 +795,8 @@ fn aggregates_among(names: &BTreeSet<String>) -> BTreeSet<String> {
 #[derive(Default)]
 struct Facts {
     volatile: bool,
-    /// Every call, by the name DuckDB's parser gave it. A window call is not one.
+    /// Every call, by its canonical name (`entity_lower::canonical_function_name`). A window call is
+    /// not one.
     functions: BTreeSet<String>,
     /// A scalar `(SELECT ...)`, `IN (SELECT ...)`, `EXISTS`, or a quantified comparison. A derived
     /// table in `FROM` is not one: it is an ordinary relation.
@@ -826,8 +826,8 @@ impl Visitor for Facts {
     fn pre_visit_expr(&mut self, e: &ast::Expr) -> ControlFlow<()> {
         use ast::Expr as E;
         match e {
-            // DuckDB's parser read a bare `current_date` as a column, and the volatile list names
-            // it; `t.current_date` is an ordinary column.
+            // A bare `current_date` can parse as a column, and the volatile list names it;
+            // `t.current_date` is an ordinary column.
             E::Identifier(i) => {
                 self.volatile |= crate::graft::VOLATILE_FUNCTIONS
                     .contains(&i.value.to_ascii_lowercase().as_str());
@@ -907,8 +907,8 @@ fn validate_sql(sql: &str) -> Result<()> {
         bail!("{ONE_SELECT}")
     };
     let facts = Facts::of(&statements);
-    // DuckDB's parser represents `CURRENT_DATE` as an unqualified column reference, not a function
-    // call, and so does this walk. A text matcher that gets this wrong turns time into silently
+    // `CURRENT_DATE` can arrive as an unqualified column reference rather than a function call,
+    // and this walk treats both as the call. A text matcher that gets this wrong turns time into silently
     // frozen state.
     if facts.volatile {
         bail!("volatile functions are not incremental v1 SQL; keep this as views/*.sql")
@@ -983,7 +983,7 @@ pub(crate) fn uses_sample(sql: &str) -> bool {
         .any(|pair| pair[0] == "USING" && pair[1] == "SAMPLE")
 }
 
-/// SQL tokens relevant to the refusal list. DuckDB owns parsing and the statement-shape gate above;
+/// SQL tokens relevant to the refusal list. The parser owns the statement-shape gate above;
 /// this only recognises constructs whose AST forms are deliberately not yet lowered. Quoted text and
 /// comments are discarded first, so an entity may quite safely produce the string `"ORDER BY"`.
 fn sql_tokens(sql: &str) -> Vec<String> {
@@ -1268,7 +1268,7 @@ mod tests {
     /// and the check is that not one of them slips through.
     ///
     /// The list this replaces refused 1 of these 13. It named `MEDIAN`, `MODE` and `PERCENTILE_*`
-    /// over a vocabulary DuckDB owns and grows - this build knows 88 aggregate names - so the real
+    /// over a vocabulary the engine owns and grows - DuckDB knew 88 aggregate names - so the real
     /// spellings (`quantile_cont`) were admitted while the SQL-standard alias was blocked, and any
     /// of them could be hidden behind a double quote regardless.
     #[test]
@@ -1279,8 +1279,8 @@ mod tests {
             ("quantile_cont", "SELECT 1 AS k, quantile_cont(v, 0.5) AS m FROM (VALUES (1),(2)) t(v)"),
             // The SQL-standard alias for the same aggregate. Present because the *old* denylist
             // named `PERCENTILE_*` and missed `quantile_cont`; this list must not have the
-            // inverse hole. It is refused today only because DuckDB's parser rewrites the alias
-            // to `quantile_cont` before serialisation - see
+            // inverse hole. It is refused only because the lowering renames the alias to
+            // `quantile_cont`, as DuckDB's parser did - see
             // `the_allowlist_depends_on_the_parser_canonicalising_aliases`.
             ("percentile_cont alias", "SELECT 1 AS k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS m FROM (VALUES (1),(2)) t(v)"),
             ("quantile_disc", "SELECT 1 AS k, quantile_disc(v, 0.5) AS m FROM (VALUES (1),(2)) t(v)"),
@@ -1316,11 +1316,11 @@ mod tests {
     /// **The allowlist's closure rests on the parser, not on the catalogue** - pinned here because
     /// nothing else states it and a replacement engine must reproduce it (RFC-0042 slice 3, #966).
     ///
-    /// `percentile_cont` has **zero rows** in DuckDB's `duckdb_functions()`, so a gate classifying
-    /// names by the catalogue refuses it only because DuckDB's parser rewrote the alias to
-    /// `quantile_cont` first (`duck_oracle::the_duckdb_gate_depended_on_its_parser_renaming_aliases`).
-    /// sqlparser preserves the source spelling, which is the common design, so the port reproduces
-    /// the rewrite itself; without it a quantile would reach a DBSP circuit that cannot maintain it,
+    /// `percentile_cont` had **zero rows** in DuckDB's `duckdb_functions()`, so a gate classifying
+    /// names by the catalogue refused it only because DuckDB's parser rewrote the alias to
+    /// `quantile_cont` first (shown by a DuckDB oracle test, removed with DuckDB). sqlparser
+    /// preserves the source spelling, which is the common design, so the port reproduces the
+    /// rewrite itself; without it a quantile would reach a DBSP circuit that cannot maintain it,
     /// with every other test here still green.
     #[test]
     fn the_allowlist_depends_on_the_parser_canonicalising_aliases() {
@@ -1854,8 +1854,8 @@ mod tests {
         assert!(issues.iter().any(|i| i.name == "rewards"), "{issues:?}");
     }
 
-    /// The registry keeps a schema entry per decoder, so a table can appear twice; DuckDB refuses a
-    /// repeated CTE name, and a table named in two cases is still one table to it.
+    /// The registry keeps a schema entry per decoder, so a table can appear twice; the engine refuses
+    /// a repeated CTE name, and a table named in two cases is still one table to it.
     #[test]
     fn a_repeated_table_gets_one_typed_cte() {
         let dir = wide_nest();
