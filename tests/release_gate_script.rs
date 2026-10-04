@@ -658,10 +658,12 @@ fn hwm_wrapper(c: &Case, hwm_kb: &[u64]) -> (PathBuf, PathBuf) {
              hwm=$(echo '{list}' | cut -d' ' -f$((n + 1)))\n\
              mkdir -p '{proc}/'$$\n\
              printf 'Name:\\tnuthatch\\nVmPeak:\\t 9999999 kB\\nVmHWM:\\t %s kB\\nVmRSS:\\t 1 kB\\n' \"$hwm\" >'{proc}/'$$/status\n\
-             '{real}' \"$@\" &\n\
+             if [ \"$(cat '{proc}/clash' 2>/dev/null)\" = $((n + 1)) ]; then rm '{proc}/clash'; sh -c 'echo address already in use >&2; exit 1' & else '{real}' \"$@\" & fi\n\
              child=$!\n\
              trap 'rm -rf \"{proc}/'$$'\"; kill $child 2>/dev/null; wait $child; exit 0' TERM INT\n\
-             wait $child\n",
+             rc=0; wait $child || rc=$?\n\
+             # A serve that exits unstopped (a port clash the gate retries) gives its slot back.\n\
+             echo $n >'{proc}/starts'; rm -rf '{proc}/'$$; exit $rc\n",
             real = env!("CARGO_BIN_EXE_nuthatch"),
             proc = proc_root.display(),
             list = list.join(" "),
@@ -741,6 +743,28 @@ fn the_kernel_high_water_mark_over_every_server_is_the_peak_and_the_verdict() {
         text.contains("release-gate: peak RSS 976 MiB, budget 2048 MiB\n"),
         "{text}"
     );
+}
+
+/// A port clash makes the gate start that pass's server again. The retry must carry the pass's own
+/// high-water mark, not shift every later pass along by one.
+#[test]
+fn a_port_clash_retry_keeps_each_pass_high_water_mark() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let (bin, proc_root) = hwm_wrapper(&c, &[1_000_000, 3_000_000, 1_500_000]);
+    std::fs::write(proc_root.join("clash"), "2").unwrap();
+    let proc_env = proc_root.to_str().unwrap();
+    let (out, text) = gate_with(&c, &bin, &set, "3", &[("GATE_PROC_ROOT", proc_env)]);
+    assert!(
+        !proc_root.join("clash").exists(),
+        "the clash never happened:\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("release-gate: peak RSS 2929 MiB, budget 2048 MiB: OVER\n"),
+        "{text}"
+    );
+    assert!(!text.contains("VmHWM unread"), "{text}");
 }
 
 /// Where /proc exists but a server's status is gone, the run says so rather than reporting a
