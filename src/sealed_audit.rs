@@ -733,9 +733,9 @@ events = ["Transfer"]
         let d = dir.path();
         let auditor = nest(d, "");
         seal_dense(d, &auditor, &[100; 1_000]);
-        let r = audit_range(d, &auditor, &Serves(vec![]), 1, 1_000)
-            .await
-            .unwrap();
+        // One sealed log at block 500, past where the sealed side will be cut: not a mismatch.
+        let served = Serves(vec![transfer_at(&auditor, 500)]);
+        let r = audit_range(d, &auditor, &served, 1, 1_000).await.unwrap();
         let held = SAMPLE_LOG_BUDGET as u64 / 100;
         assert_eq!(
             (r.to, r.requested_to),
