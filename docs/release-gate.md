@@ -13,8 +13,7 @@ budget). Every CI gate had passed: the footprint jobs index synthetic data and r
 
 | File | What it is |
 |---|---|
-| `scripts/gate/alloc-queries.tsv` | The query set: 74 statements, one per line, each with its consumer and call site. |
-| `scripts/gate/collect-queries.sh`, `scripts/gate/collect/main.rs` | How the set is generated from kittiwake's source. |
+| `nuthatch-gate/alloc-queries.tsv` in kittiwake | The query set: one statement per line, each with its consumer and call site. Private; see below. |
 | `scripts/release-gate.sh` | Serves a nest copy with one binary, runs the set, gives the verdict. |
 | `scripts/gate/baseline-4.2.0.tsv` | The proof run's baseline: 4.2.0 on the 2026-10-03 copy, on a MacBook. |
 | `scripts/release-gate-run.sh` | The ThinkPad's job: fetch the candidate, gate it, post the status. |
@@ -28,25 +27,15 @@ route and `kittiwake` where it is one of kittiwake's own jobs (the directory ref
 crons, the live feed, RAV collection, QoS scoring). 57 are Lodestar's, 15 kittiwake's, and 2 are
 asked by both.
 
-Parameters are representative literals pinned to 2026-10-03, so the set is the same file however
-often it runs. Addresses and deployments are the heaviest on the nest (the largest indexer on every
-axis, which kittiwake's own tests use as the worst case); windows and page sizes are the edge
-handlers' defaults and the warmer's. Each statement appears once: the nest memoises answers by
-statement text, so a duplicate would time the memo.
+The set carries kittiwake's statements, and kittiwake is private while this repo is public, so it
+lives in the kittiwake repo, under `nuthatch-gate/`, beside the generator that compiles it from
+kittiwake's own source and a CI check that fails when it goes stale. Nothing here holds a copy:
+`release-gate.sh` takes the set as an argument, and `release-gate-run.sh` refuses to start unless
+`GATE_SET` names it. `nuthatch-gate/README.md` there says how to regenerate it.
 
-It is refreshed on purpose, not by drift:
-
-    scripts/gate/collect-queries.sh ~/Projects/kittiwake > scripts/gate/alloc-queries.tsv
-    git diff scripts/gate/alloc-queries.tsv
-
-`collect-queries.sh` compiles `collect/main.rs` against a copy of kittiwake's
-`crates/read/src/sql.rs` with plain `rustc`, so every statement built there regenerates itself. The
-handful written inline at a call site are copied in `main.rs` and marked `inline`; on a refresh,
-re-read those call sites and any new ones:
-
-    grep -rn 'NestId::Alloc' ~/Projects/kittiwake/crates --include='*.rs' | grep -v /tests/
-
-Other consumers may join later; the set is Lodestar's and kittiwake's first.
+Parameters are representative literals pinned to one day, so the set is the same file however often
+it runs. Each statement appears once: the nest memoises answers by statement text, so a duplicate
+would time the memo.
 
 ## Running the gate
 
@@ -218,4 +207,4 @@ candidate does not go to production.
 
 A run that has posted any final status is not repeated by `--poll`; re-gate by hand with the tag.
 
-The timer is `deploy/release-gate/release-gate.{service,timer}`, a systemd user unit running `--poll` every 15 minutes from `~/nuthatch-ops`, a worktree of the repo on `main`; the unit file carries the install lines. The unit sets `GATE_REFRESH` to the refresh script, so the Helsinki half must be installed before the unit file is copied over; the install lines are in `gate-export.sh`.
+The timer is `deploy/release-gate/release-gate.{service,timer}`, a systemd user unit running `--poll` every 15 minutes from `~/nuthatch-ops`, a worktree of the repo on `main`; the unit file carries the install lines. The unit sets `GATE_REFRESH` to the refresh script, so the Helsinki half must be installed before the unit file is copied over; the install lines are in `gate-export.sh`. It also sets `GATE_SET` to `~/kittiwake/nuthatch-gate/alloc-queries.tsv`, so the ThinkPad needs a clone of the private kittiwake repo at `~/kittiwake` (its `gh` is authenticated as cargopete, which can read it); pull it when the set changes.

@@ -4,6 +4,8 @@
 #          loginctl enable-linger "$USER"   # so the timer runs without a login session
 # GATE_REFRESH needs ~/.ssh/nuthatch-gate authorised on Helsinki for gate-export (#1774); until it
 # is, every gate posts `error` because the refresh fails.
+# GATE_SET is the query set, in the private kittiwake repo: the box needs a clone at ~/kittiwake
+# (gh auth as cargopete reaches it). `git -C ~/kittiwake pull` before a gate picks up a new set.
 [Unit]
 Description=nuthatch release gate: gate the newest ungated release against the allocations nest copy
 
@@ -11,6 +13,7 @@ Description=nuthatch release gate: gate the newest ungated release against the a
 Type=oneshot
 WorkingDirectory=%h/nuthatch-ops
 Environment=GATE_REFRESH=%h/nuthatch-ops/deploy/release-gate/refresh-from-helsinki.sh
+Environment=GATE_SET=%h/kittiwake/nuthatch-gate/alloc-queries.tsv
 ExecStart=%h/nuthatch-ops/scripts/release-gate-run.sh --poll
 # The QoS nest shares the box: the gate yields CPU and IO to it.
 Nice=10

@@ -1128,3 +1128,38 @@ fn a_bad_provenance_before_a_poll_chooses_exits_loud_with_no_status() {
         "{text}"
     );
 }
+
+/// The set lives in the private kittiwake repo, so the runner has no default to fall back on: an
+/// unset `GATE_SET` is a setup fault that names the variable, before anything is fetched or posted.
+#[test]
+fn an_unset_gate_set_is_a_setup_fault_that_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fakes = dir.path().join("fakes");
+    std::fs::create_dir_all(&fakes).unwrap();
+    let gh = fakes.join("gh");
+    std::fs::write(&gh, FAKE_GH).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(dir.path().join("releases"), "v4.3.0-rc1 pre\n").unwrap();
+    let mut cmd = Command::new(root().join("scripts/release-gate-run.sh"));
+    cmd.arg("v4.3.0-rc1")
+        .env(
+            "PATH",
+            format!("{}:{}", fakes.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("FAKE_GH_DIR", dir.path())
+        .env("GATE_STATE", dir.path().join("state"))
+        .env_remove("GATE_SET")
+        .env_remove("GATE_LOCK_HELD");
+    let child = run_bounded(cmd, dir.path(), "runner");
+    let (code, text) = finish(child, dir.path(), "runner", 30);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        text.contains("GATE_SET is not set") && text.contains("nuthatch-gate/alloc-queries.tsv"),
+        "{text}"
+    );
+    assert!(!dir.path().join("posted").exists(), "{text}");
+    assert!(!dir.path().join("downloaded").exists(), "{text}");
+}
