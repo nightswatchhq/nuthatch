@@ -15,8 +15,6 @@ Description=nuthatch release gate: gate the newest ungated release against every
 Type=oneshot
 WorkingDirectory=%h/nuthatch-ops
 Environment=GATE_NESTS=%h/release-gate/nests.conf
-# The DuckDB reference per nest (#1796), once burrmill-bench is built there (docs/release-gate.md):
-# Environment=GATE_DUCK=%h/release-gate/bins/burrmill-bench
 ExecStart=%h/nuthatch-ops/scripts/release-gate-run.sh --poll
 # The QoS nest shares the box: the gate yields CPU and IO to it.
 Nice=10
