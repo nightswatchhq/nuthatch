@@ -84,8 +84,10 @@ journalctl -u nuthatch -f          # a clean progress line during backfill, then
 `scripts/deploy-nest.sh install <binary> <version>` puts the binary at
 `/usr/local/bin/nuthatch-<version>`; `scripts/deploy-nest.sh roll <unit> <version> --smoke <file>`
 points the unit at it, restarts, and waits until `/ready` reports that version. It then runs every
-statement in the smoke file against `/sql`. `scripts/smoke/<unit>.sql` holds the statements each
-production unit's real consumers send, one per line.
+statement in the smoke file against `/sql`. Nightswatch's production units keep their smoke files,
+one per unit and one statement per line, in the private kittiwake repo under `nuthatch-gate/smoke/`,
+because they carry its statements; `deploy/roll-helsinki-from-mac.sh` reads them from `SMOKE_DIR`
+(default `~/Projects/kittiwake/nuthatch-gate/smoke`) and copies each unit's file to the box.
 
 When a statement fails, the roll puts the unit back on its previous binary and runs the failing
 statements there. If the previous binary answers any of them, the new one is worse: the unit stays

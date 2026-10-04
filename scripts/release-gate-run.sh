@@ -22,7 +22,7 @@
 # Environment:
 #   GATE_STATE    working directory: binaries and run logs             (default ~/release-gate)
 #   GATE_NEST     the allocations nest copy, segments plus redb        (default $GATE_STATE/alloc-nest)
-#   GATE_SET      the query set                  (default scripts/gate/alloc-queries.tsv beside this)
+#   GATE_SET      the query set, required: kittiwake's nuthatch-gate/alloc-queries.tsv (private)
 #   GATE_REFRESH  a command run before the gate to refresh GATE_NEST, e.g. the rsync from Helsinki;
 #                 unset means the copy is used as it stands
 #   GATE_REPO     (default nightswatchhq/nuthatch)
@@ -35,7 +35,7 @@ CONTEXT=release-gate/alloc-nest
 here=$(cd "$(dirname "$0")" && pwd)
 state=${GATE_STATE:-$HOME/release-gate}
 nest=${GATE_NEST:-$state/alloc-nest}
-set_file=${GATE_SET:-$here/gate/alloc-queries.tsv}
+set_file=${GATE_SET:-}
 repo=${GATE_REPO:-nightswatchhq/nuthatch}
 target=${GATE_TARGET:-x86_64-unknown-linux-gnu}
 passes=${GATE_PASSES:-3}
@@ -62,7 +62,8 @@ modes=$(( poll + (${#tag} > 0 ? 1 : 0) + (${#local_bin} > 0 ? 1 : 0) ))
 [ "$modes" -eq 1 ] || die "give exactly one of <tag>, --poll, --binary PATH --sha SHA"
 [ -z "$local_bin" ] || [ -n "$sha" ] || die "--binary needs --sha: the status has to land on a commit"
 command -v gh >/dev/null || die "gh is not on PATH"
-[ -f "$set_file" ] || die "no query set at $set_file"
+[ -n "$set_file" ] || die "GATE_SET is not set: point it at a kittiwake checkout's nuthatch-gate/alloc-queries.tsv"
+[ -f "$set_file" ] || die "no query set at $set_file (GATE_SET)"
 
 mkdir -p "$state/bins" "$state/runs" "$(dirname "$nest")"
 # One gate at a time on the copy, held across the refresh and both runs; release-gate.sh takes the
