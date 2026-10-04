@@ -297,11 +297,10 @@ fn a_pull_before_any_snapshot_is_refused() {
 
 // --- the ThinkPad: refresh-from-helsinki.sh ---
 
-/// `snapshot` prints `snapshot-out` if present, else the stage's PROVENANCE.
+/// `snapshot [<name>]` prints `snapshot-out` if present, else the stage's PROVENANCE.
 const REFRESH_SSH: &str = r#"#!/usr/bin/env bash
 echo "$*" >> "$FAKE_STATE/ssh-args"
-for last; do :; done
-[ "$last" = snapshot ] || exit 2
+case "$*" in *" snapshot" | *" snapshot "*) ;; *) exit 2 ;; esac
 [ -f "$FAKE_STATE/ssh-fail" ] && { echo "ssh: connect to host 100.82.188.91 port 22: timed out" >&2; exit 255; }
 if [ -f "$FAKE_STATE/snapshot-out" ]; then cat "$FAKE_STATE/snapshot-out"; else cat "$FAKE_STATE/stage/PROVENANCE"; fi
 "#;
@@ -555,6 +554,209 @@ fn a_copy_without_provenance_is_refreshed() {
     let (code, text) = refresh(&t);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("sealed_through unknown -> 200"), "{text}");
+}
+
+// --- every production nest (#1794) ---
+
+/// Allowlists the fixture nest as `gns-nest` and returns the stage root named snapshots go under.
+fn allowlist_gns(h: &Helsinki) -> PathBuf {
+    let root = h.stage.parent().unwrap().join("nests");
+    let mut conf = read(&h.conf);
+    conf.push_str(&format!(
+        "STAGE_ROOT={}\nNEST=gns-nest {} http://127.0.0.1:8113\n",
+        root.display(),
+        h.nest.display()
+    ));
+    std::fs::write(&h.conf, conf).unwrap();
+    root
+}
+
+#[test]
+fn a_named_snapshot_stages_an_allowlisted_nest() {
+    let h = helsinki();
+    let root = allowlist_gns(&h);
+    let (code, text) = export(&h, "snapshot gns-nest");
+    assert_eq!(code, 0, "{text}");
+    let stage = root.join("gns-nest");
+    assert_eq!(read(&stage.join("nuthatch.redb")), "redb-bytes");
+    assert_eq!(read(&stage.join("PROVENANCE")).trim(), text.trim());
+    assert!(
+        !h.stage.exists(),
+        "the allocations nest's stage was touched"
+    );
+
+    let cmd = format!(
+        "rsync --server --sender -logDtpre.iLsfxCIvu . {}/",
+        stage.display()
+    );
+    let (code, text) = export(&h, &cmd);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        read(&h.state.join("rsync-args")).ends_with(&format!(" . {}/\n", stage.display())),
+        "{text}"
+    );
+}
+
+/// The key reaches only the nests the configuration names: any other name, or anything that is
+/// not a bare name, is refused before a byte is copied, and so is a pull of any other stage.
+#[test]
+fn a_nest_off_the_export_allowlist_is_refused() {
+    let h = helsinki();
+    let root = allowlist_gns(&h);
+    for cmd in [
+        "snapshot qos-nest",
+        "snapshot GNS-NEST",
+        "snapshot gns-nest extra",
+        "snapshot gns-nest;id",
+        "snapshot ../stage",
+        "snapshot -gns-nest",
+        "snapshot \ngns-nest",
+        "snapshot ",
+    ] {
+        let (code, text) = export(&h, cmd);
+        assert_eq!(code, 1, "{cmd:?} was not refused:\n{text}");
+        assert!(text.contains("refused"), "{cmd:?}: {text}");
+        assert!(!root.exists(), "{cmd:?} staged something");
+    }
+    assert_eq!(export(&h, "snapshot gns-nest").0, 0);
+    let r = root.display();
+    for path in [
+        format!("{r}/qos-nest/"),
+        format!("{r}/gns-nest/../gns-nest/"),
+        format!("{r}/"),
+        format!("{r}//gns-nest/"),
+    ] {
+        let cmd = format!("rsync --server --sender -logDtpre.iLsfxCIvu . {path}");
+        let (code, text) = export(&h, &cmd);
+        assert_eq!(code, 1, "{cmd:?} was not refused:\n{text}");
+        assert!(text.contains("refused"), "{cmd:?}: {text}");
+        assert!(
+            !h.state.join("rsync-args").exists(),
+            "{cmd:?} reached rsync"
+        );
+    }
+}
+
+#[test]
+fn a_named_refresh_asks_for_that_nest_and_pulls_its_stage() {
+    let t = thinkpad();
+    let (code, text) = output(
+        Command::new("bash")
+            .arg(root().join("deploy/release-gate/refresh-from-helsinki.sh"))
+            .arg("gns-nest")
+            .env("PATH", &t.path)
+            .env("FAKE_STATE", &t.state)
+            .env("GATE_NEST", &t.nest)
+            .env("GATE_SSH_KEY", &t.key)
+            .env("TMPDIR", t.state.parent().unwrap())
+            .env_remove("GATE_LOCK_HELD")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(read(&t.nest.join("nuthatch.redb")), "new-redb");
+    let ssh = read(&t.state.join("ssh-args"));
+    assert!(
+        ssh.trim_end()
+            .ends_with("root@100.82.188.91 snapshot gns-nest"),
+        "{ssh}"
+    );
+    let rsync = read(&t.state.join("rsync-args"));
+    assert!(
+        rsync.contains("root@100.82.188.91:/var/lib/nuthatch-gate/nests/gns-nest/"),
+        "{rsync}"
+    );
+}
+
+/// Copies the second-to-last argument's contents into the last, as a local rsync would.
+const LOCAL_RSYNC: &str = r#"#!/usr/bin/env bash
+echo "$*" >> "$FAKE_STATE/rsync-args"
+args=("$@")
+src=${args[$#-2]} dst=${args[$#-1]}
+mkdir -p "$dst"
+/bin/cp -R "$src." "$dst/"
+"#;
+
+const FAKE_SUDO: &str = r#"#!/usr/bin/env bash
+[ "$1" = -n ] || exit 9
+shift
+echo "$*" >> "$FAKE_STATE/sudo-args"
+exec "$@"
+"#;
+
+/// The QoS nest is on the ThinkPad itself: its copy is taken by the same export, run here as root,
+/// with no ssh, and handed to the gate's user.
+#[test]
+fn a_local_refresh_runs_the_export_here_and_takes_its_stage() {
+    let h = helsinki();
+    let t = thinkpad();
+    let fakes = h.state.parent().unwrap().join("local-fakes");
+    std::fs::create_dir_all(&fakes).unwrap();
+    write_exe(&fakes.join("rsync"), LOCAL_RSYNC);
+    write_exe(&fakes.join("sudo"), FAKE_SUDO);
+    let stage_root = h.state.parent().unwrap().join("nests");
+    let conf = h.state.parent().unwrap().join("export-local.env");
+    std::fs::write(
+        &conf,
+        format!(
+            "NEST=qos-nest {} http://100.83.44.63:8124\n",
+            h.nest.display()
+        ),
+    )
+    .unwrap();
+    let path = format!("{}:{}", fakes.display(), h.path);
+    let run = |args: &[&str], conf: &Path| {
+        output(
+            Command::new("bash")
+                .arg(root().join("deploy/release-gate/refresh-from-helsinki.sh"))
+                .args(args)
+                .env("PATH", &path)
+                .env("FAKE_STATE", &h.state)
+                .env("GATE_NEST", &t.nest)
+                .env("GATE_STAGE_ROOT", &stage_root)
+                .env("GATE_LOCAL_EXPORT_CONF", conf)
+                .env("GATE_EXPORT_ATTEMPTS", "2")
+                .env("GATE_EXPORT_RETRY_SECS", "0")
+                .env("TMPDIR", t.state.parent().unwrap())
+                .env_remove("GATE_LOCK_HELD")
+                .output()
+                .unwrap(),
+        )
+    };
+
+    let (code, text) = run(&["--local"], &conf);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("needs a nest name"), "{text}");
+    let (code, text) = run(&["--local", "qos-nest"], &h.state.join("absent.env"));
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("no local export config"), "{text}");
+    unchanged(&t);
+
+    let (code, text) = run(&["--local", "qos-nest"], &conf);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(read(&t.nest.join("nuthatch.redb")), "redb-bytes");
+    assert_eq!(
+        read(&t.nest.with_extension("prev").join("nuthatch.redb")),
+        "old-redb"
+    );
+    let sudo = read(&h.state.join("sudo-args"));
+    let mut lines = sudo.lines();
+    let export = lines.next().unwrap_or_default();
+    assert!(
+        export.contains(&format!("GATE_EXPORT_CONF={}", conf.display()))
+            && export.ends_with("helsinki/gate-export.sh snapshot qos-nest"),
+        "{sudo}"
+    );
+    let pull = lines.next().unwrap_or_default();
+    assert!(
+        pull.starts_with("rsync -a --delete --chown=")
+            && pull.contains(&format!("{}/qos-nest/ ", stage_root.display())),
+        "{sudo}"
+    );
+    assert!(
+        !t.state.join("ssh-args").exists() && !h.state.join("ssh-args").exists(),
+        "a local refresh used ssh"
+    );
 }
 
 /// End to end: what gate-export stages is what the refresh accepts.

@@ -2,15 +2,16 @@
 # Install: cp deploy/release-gate/release-gate.* ~/.config/systemd/user/
 #          systemctl --user daemon-reload && systemctl --user enable --now release-gate.timer
 #          loginctl enable-linger "$USER"   # so the timer runs without a login session
-# GATE_REFRESH needs ~/.ssh/nuthatch-gate authorised on Helsinki for gate-export (#1774); until it
-# is, every gate posts `error` because the refresh fails.
+# GATE_NESTS is the nests' config (#1794, nests.conf.example), with a copy, a query set, an
+# environment file and a refresh per nest; install-nests-from-mac.sh writes it, and the Helsinki
+# export allowlist its refreshes need. Until it exists, every poll exits 2 and gates nothing.
 [Unit]
-Description=nuthatch release gate: gate the newest ungated release against the allocations nest copy
+Description=nuthatch release gate: gate the newest ungated release against every production nest's copy
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/nuthatch-ops
-Environment=GATE_REFRESH=%h/nuthatch-ops/deploy/release-gate/refresh-from-helsinki.sh
+Environment=GATE_NESTS=%h/release-gate/nests.conf
 ExecStart=%h/nuthatch-ops/scripts/release-gate-run.sh --poll
 # The QoS nest shares the box: the gate yields CPU and IO to it.
 Nice=10
