@@ -64,7 +64,8 @@ pub fn from_nest(dir: &Path, config: &Config) -> Result<DecodeRegistry> {
     }
     Ok(DecodeRegistry::build_with_templates(specs, templates)?
         .with_timestamps(config.nest.block_timestamps)
-        .with_blocks(config.extract.blocks))
+        .with_blocks(config.extract.blocks)
+        .with_l1_blocks(config.extract.l1_blocks))
 }
 
 #[cfg(test)]

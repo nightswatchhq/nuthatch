@@ -475,6 +475,11 @@ pub fn lookup(name: &str) -> Option<&'static Chain> {
     }
 }
 
+/// Registered chains whose block headers carry `l1BlockNumber`: the Arbitrum Nitro family.
+pub fn reports_l1_block_number(chain_id: u64) -> bool {
+    matches!(chain_id, 42161 | 4663)
+}
+
 /// What an operator should know before indexing `chain` through the endpoints actually in use, when
 /// it matters (#1570): only when timestamps are being fetched, and only for `arb1.arbitrum.io` itself.
 ///

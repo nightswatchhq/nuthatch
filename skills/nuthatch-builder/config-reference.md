@@ -163,6 +163,12 @@ top_level_calls = true        # decode transactions sent directly to this nest's
                               # subgraph's `callHandlers` fire on (RFC-0038 §5). Ordinary RPC; no node
                               # needed. `traces` (internal calls) and `state` still are, and are
                               # refused at startup until one exists.
+l1_blocks = true              # Arbitrum-family chains only (arbitrum-one, robinhood): an `l1_blocks`
+                              # table, one row per block that carries a row of this nest, with
+                              # `l1_block_number` from its header. Join on (block_number, block_hash).
+                              # One header per such block, none for the rest. Refused beside
+                              # `blocks = true`, whose `blocks` table already has the column for
+                              # every block. Off: no table, no header fetched.
 ```
 
 ## `entities.toml` - authored incremental relations (RFC-0041)

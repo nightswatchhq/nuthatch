@@ -333,6 +333,12 @@ pub struct Extract {
     /// Bounded by construction: exactly one row per block, so no volume guard applies.
     #[serde(default)]
     pub blocks: bool,
+    /// Emit an `l1_blocks` row - `l1_block_number` - for each block that carries this nest's logs, on
+    /// an Arbitrum-family chain (#1839). Read from the headers those blocks' timestamps come
+    /// from when the logs do not carry one, so it costs at most one header per log-bearing block
+    /// rather than one per block like `blocks`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub l1_blocks: bool,
     /// Emit a row per **call** (top-level and internal), calldata decoded by 4-byte selector.
     ///
     /// Node-gated: the *internal* call tree only exists as an execution artifact, so it needs
@@ -373,6 +379,7 @@ pub struct Extract {
 impl Extract {
     pub fn is_empty(&self) -> bool {
         !self.blocks
+            && !self.l1_blocks
             && !self.traces
             && !self.state
             && self.contracts.is_empty()
@@ -411,6 +418,29 @@ impl Extract {
             return true;
         }
         !self.state && self.traces && !self.selectors.is_empty()
+    }
+
+    /// `l1_blocks` is refused beside `blocks`, whose rows already carry the column for every block and
+    /// share its row key, and on a registered chain that reports no L1 block.
+    pub fn l1_blocks_check(&self, chain: &str, chain_id: u64) -> Result<()> {
+        if !self.l1_blocks {
+            return Ok(());
+        }
+        if self.blocks {
+            bail!(
+                "[extract] l1_blocks = true beside blocks = true: the `blocks` table already holds \
+                 `l1_block_number` for every block. Drop `l1_blocks` and read `blocks` instead."
+            );
+        }
+        let known = crate::chains::lookup(chain).or_else(|| crate::chains::lookup_by_id(chain_id));
+        if let Some(c) = known.filter(|c| !crate::chains::reports_l1_block_number(c.chain_id)) {
+            bail!(
+                "[extract] l1_blocks = true on {}, whose block headers carry no `l1BlockNumber`. It \
+                 exists on Arbitrum-family chains (arbitrum-one, robinhood) only.",
+                c.name
+            );
+        }
+        Ok(())
     }
 
     /// The volume guard (RFC-0014 §3). `Ok(())` to proceed, `Err` with a message that says what to
@@ -572,6 +602,8 @@ impl Config {
             })?,
         };
         cfg.check_schema_version()?;
+        cfg.extract
+            .l1_blocks_check(&cfg.nest.chain, cfg.nest.chain_id)?;
         // Declarations are validated at load, not at the first round trip: a typo'd address would
         // otherwise surface thousands of blocks into a backfill as a wall of identical failures.
         for c in &cfg.calls {
@@ -1356,6 +1388,39 @@ finality = "sealed"
         )
         .unwrap();
         Config::load(dir.path()).expect("sealed (default or explicit) must load");
+    }
+
+    #[test]
+    fn l1_blocks_is_refused_off_arbitrum_and_beside_blocks() {
+        let load = |chain: &str, chain_id: u64, extract: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                format!(
+                    "[nest]\nname = \"n\"\nchain = \"{chain}\"\nchain_id = {chain_id}\n\
+                     rpc_urls = [\"https://rpc.example\"]\n\n[extract]\n{extract}\n"
+                ),
+            )
+            .unwrap();
+            Config::load(dir.path()).map_err(|e| e.to_string())
+        };
+        assert!(load("arbitrum-one", 42161, "l1_blocks = true").is_ok());
+        assert!(load("robinhood", 4663, "l1_blocks = true").is_ok());
+        assert!(load("some-orbit-chain", 999_999_001, "l1_blocks = true").is_ok());
+        let err = load("mainnet", 1, "l1_blocks = true").unwrap_err();
+        assert!(err.contains("carry no `l1BlockNumber`"), "{err}");
+        let err = load("arbitrum-one", 42161, "l1_blocks = true\nblocks = true").unwrap_err();
+        assert!(err.contains("already holds"), "{err}");
+    }
+
+    #[test]
+    fn l1_blocks_off_is_not_written_back() {
+        let out = toml::to_string(&Extract {
+            blocks: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!out.contains("l1_blocks"), "{out}");
     }
 
     #[test]

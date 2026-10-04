@@ -3869,20 +3869,25 @@ fn coverage(config: &Config) -> serde_json::Value {
         v.sort();
         v
     };
+    let mut extract = serde_json::json!({
+        "blocks": e.blocks,
+        "traces": e.traces,
+        "top_level_calls": e.top_level_calls,
+        "state": e.state,
+        "contracts": sorted(&e.contracts),
+        "selectors": sorted(&e.selectors),
+    });
+    // Only when on, so every store recorded before #1839 still matches its config.
+    if e.l1_blocks {
+        extract["l1_blocks"] = serde_json::Value::Bool(true);
+    }
     serde_json::json!({
         "v": COVERAGE_VERSION,
         "chain": config.nest.chain,
         "chain_id": config.nest.chain_id,
         "contracts": contracts,
         "factories": factories,
-        "extract": {
-            "blocks": e.blocks,
-            "traces": e.traces,
-            "top_level_calls": e.top_level_calls,
-            "state": e.state,
-            "contracts": sorted(&e.contracts),
-            "selectors": sorted(&e.selectors),
-        },
+        "extract": extract,
     })
 }
 
@@ -4029,6 +4034,8 @@ async fn fetch_timestamps(
 pub(crate) struct WindowBlockData {
     pub(crate) timestamps: std::collections::HashMap<u64, u64>,
     pub(crate) headers: Option<std::collections::HashMap<u64, serde_json::Value>>,
+    /// The same headers, for an `[extract] l1_blocks` nest's rows (#1839); empty otherwise.
+    pub(crate) l1_headers: std::collections::HashMap<u64, serde_json::Value>,
 }
 
 /// Canonical reads need the same header as the event timestamps. Keep it only
@@ -4039,10 +4046,11 @@ pub(crate) async fn fetch_window_block_data(
     blocks: &[u64],
     canonical_calls: bool,
 ) -> Result<WindowBlockData> {
-    if !canonical_calls {
+    if !canonical_calls && !registry.l1_blocks() {
         return Ok(WindowBlockData {
             timestamps: fetch_timestamps(source, registry, blocks).await?,
             headers: None,
+            l1_headers: std::collections::HashMap::new(),
         });
     }
     let headers = source.block_headers(blocks).await?;
@@ -4050,7 +4058,7 @@ pub(crate) async fn fetch_window_block_data(
     for block in blocks {
         let header = headers
             .get(block)
-            .with_context(|| format!("missing canonical window header at {block}"))?;
+            .with_context(|| format!("missing window header at {block}"))?;
         if registry.timestamps() {
             let timestamp = header
                 .get("timestamp")
@@ -4061,14 +4069,49 @@ pub(crate) async fn fetch_window_block_data(
                             .and_then(|s| u64::from_str_radix(s, 16).ok())
                     })
                 })
-                .with_context(|| format!("missing canonical window timestamp at {block}"))?;
+                .with_context(|| format!("missing window timestamp at {block}"))?;
             timestamps.insert(*block, timestamp);
         }
     }
+    let (headers, l1_headers) = match (canonical_calls, registry.l1_blocks()) {
+        (true, true) => (Some(headers.clone()), headers),
+        (true, false) => (Some(headers), std::collections::HashMap::new()),
+        (false, _) => (None, headers),
+    };
     Ok(WindowBlockData {
         timestamps,
-        headers: Some(headers),
+        headers,
+        l1_headers,
     })
+}
+
+/// One `l1_blocks` row per block that carries a row in `rows` (#1839). A header without
+/// `l1BlockNumber` refuses the window, as a missing timestamp does: a 0 would be sealed for good.
+fn l1_block_rows(
+    registry: &DecodeRegistry,
+    rows: &[crate::registry::DecodedRow],
+    data: &WindowBlockData,
+) -> Result<Vec<crate::registry::DecodedRow>> {
+    if !registry.l1_blocks() {
+        return Ok(Vec::new());
+    }
+    let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+        .into_iter()
+        .map(|b| {
+            data.l1_headers
+                .get(&b)
+                .and_then(|h| crate::registry::l1_block_row(b, h, registry.timestamps()))
+                .with_context(|| {
+                    format!(
+                        "block {b}'s header carries no l1BlockNumber; [extract] l1_blocks needs an \
+                         Arbitrum-family chain and an endpoint that returns it"
+                    )
+                })
+        })
+        .collect()
 }
 
 /// Blocks that still need a header after local filtering (#765).
@@ -4771,6 +4814,7 @@ pub async fn backfill_direct(
             state_rpc.is_some() && calls.iter().any(|c| c.canonical),
         )
         .await?;
+        let l1_rows = l1_block_rows(registry, &rows, &block_data)?;
         let ts = block_data.timestamps;
         for r in &mut rows {
             r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
@@ -4792,6 +4836,10 @@ pub async fn backfill_direct(
             )
             .await?;
             rows.extend(call_rows);
+            rows.sort_by_key(|r| (r.block_number, r.log_index));
+        }
+        if !l1_rows.is_empty() {
+            rows.extend(l1_rows);
             rows.sort_by_key(|r| (r.block_number, r.log_index));
         }
         total += merge_window_rows(
@@ -5510,6 +5558,7 @@ pub async fn backfill_direct_pipelined_with(
             },
         )
         .await?;
+        let l1_rows = l1_block_rows(registry, &rows, &block_data)?;
         let ts = block_data.timestamps;
         // Seal in canonical (block, log_index) order, not RPC-provider order, so a segment's bytes
         // (and its content address) are identical across providers - see `backfill_direct`.
@@ -5545,6 +5594,10 @@ pub async fn backfill_direct_pipelined_with(
                 registry.timestamps(),
             )
             .await?;
+        if !l1_rows.is_empty() {
+            rows.extend(l1_rows);
+            rows.sort_by_key(|r| (r.block_number, r.log_index));
+        }
         // Carry each row's block so the consumer can seal on a data-determined boundary
         // (RFC-0028 §4) instead of at whichever window filled the buffer.
         let mut json: Vec<SealRow> = rows
@@ -5988,6 +6041,7 @@ pub async fn backfill_direct_factory_with(
             },
         )
         .await?;
+        let l1_rows = l1_block_rows(registry, &rows, &block_data)?;
         let ts = block_data.timestamps;
         apply_row_timestamps(&mut rows, &ts);
         children.apply_timestamps(&ts);
@@ -6019,6 +6073,10 @@ pub async fn backfill_direct_factory_with(
                 registry.timestamps(),
             )
             .await?;
+        if !l1_rows.is_empty() {
+            rows.extend(l1_rows);
+            rows.sort_by_key(|r| (r.block_number, r.log_index));
+        }
         let mut documents = 0;
         let row_count = merge_window_rows_seeing(
             &mut buf,
@@ -6819,6 +6877,14 @@ impl NestIngest {
                 return Ok(None);
             }
         };
+        let l1_rows = match l1_block_rows(&self.registry, &rows, &block_data) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("{e:#} - retrying window {next}..={to}");
+                sleep_secs(2).await;
+                return Ok(None);
+            }
+        };
         let timestamps = block_data.timestamps;
         apply_row_timestamps(&mut rows, &timestamps);
         self.children.apply_timestamps(&timestamps);
@@ -6931,6 +6997,13 @@ impl NestIngest {
             // Every row is stored uniformly as typed JSON with a `table` field; per-table
             // sealing groups by it.
             to_store.push((key, row.to_json().to_string()));
+            stored += 1;
+        }
+        for r in &l1_rows {
+            to_store.push((
+                Store::entity_key(r.block_number, r.log_index),
+                r.to_json().to_string(),
+            ));
             stored += 1;
         }
 
