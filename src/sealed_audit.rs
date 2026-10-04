@@ -544,8 +544,23 @@ mod tests {
         refuse_indexing_endpoint("https://other.example/v2/KEY", &pool).unwrap();
     }
 
-    #[test]
-    fn a_row_sealed_twice_is_returned_apart() {
+    struct Serves(Vec<crate::rpc::Log>);
+
+    #[async_trait::async_trait]
+    impl Source for Serves {
+        async fn tip(&self) -> Result<u64> {
+            Ok(u64::MAX)
+        }
+        async fn block_hash(&self, _: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(&self, _: &LogFilter, _: u64, _: u64) -> Result<Vec<crate::rpc::Log>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_sealed_twice_is_reported_as_sealed_only() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         std::fs::create_dir_all(d.join("abis")).unwrap();
@@ -584,12 +599,12 @@ events = ["Transfer"]
             log_index: 0,
         };
         let row = auditor.registry.decode(&log).unwrap().unwrap();
-        let next = crate::rpc::Log {
+        let next_log = crate::rpc::Log {
             block_number: 11,
             block_hash: word(11),
             ..log.clone()
         };
-        let next = auditor.registry.decode(&next).unwrap().unwrap();
+        let next = auditor.registry.decode(&next_log).unwrap().unwrap();
         let json = |r: &DecodedRow| r.to_json().to_string();
         crate::seal::test_set_table_floor(d, 0);
         crate::seal::seal_range(d, &[json(&row)], 10, 10).unwrap();
@@ -598,5 +613,12 @@ events = ["Transfer"]
         let (rows, duplicates) = sealed_rows(d, &auditor.schema, 0, 20).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(duplicates, vec![canonical(&row)]);
+
+        let r = audit_range(d, &auditor, &Serves(vec![log, next_log]), 10, 11)
+            .await
+            .unwrap();
+        assert_eq!((r.sealed_rows, r.endpoint_rows), (3, 2));
+        assert_eq!(r.sealed_only, vec![canonical(&row)]);
+        assert_eq!(r.mismatches(), 1);
     }
 }
