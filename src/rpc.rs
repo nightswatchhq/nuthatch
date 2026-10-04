@@ -52,6 +52,12 @@ type CallBatchFuture<'a> =
 /// where we currently re-fetch every timestamp in a range we just split.
 const TIMESTAMP_CACHE_MAX: usize = 262_144;
 
+/// The most of one multi-block `eth_getLogs` body read before the range is refused as too large
+/// (#1788). A node with no result cap answers a whole window in one response, which held parsed is
+/// several times its size; refused here, it is narrowed like any capped provider. About 50,000
+/// ERC-20 transfers.
+pub const GETLOGS_BODY_CAP: usize = 32 << 20;
+
 // `None` is a stored EVM fact, not a convenient bucket for provider failures.
 fn decode_call_batch(response: &Value, expected: usize) -> Result<Vec<Option<String>>> {
     let items = response
@@ -768,6 +774,8 @@ pub struct RpcClient {
     /// Headers per batch: [`MAX_TIMESTAMP_BATCH`], or less where a known endpoint in the pool takes
     /// less ([`crate::chains::header_batch_cap`], #1570).
     header_width: usize,
+    /// [`GETLOGS_BODY_CAP`], or a smaller one a test sets.
+    logs_body_cap: usize,
 }
 
 impl RpcClient {
@@ -794,7 +802,14 @@ impl RpcClient {
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
             header_width,
+            logs_body_cap: GETLOGS_BODY_CAP,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_logs_body_cap(mut self, cap: usize) -> Self {
+        self.logs_body_cap = cap;
+        self
     }
 
     /// Total HTTP requests attempted so far (including failover retries).
@@ -927,6 +942,17 @@ impl RpcClient {
         params: Value,
         need: Option<u64>,
     ) -> Result<(Value, usize)> {
+        self.call_holding_capped(method, params, need, None).await
+    }
+
+    /// [`Self::call_holding`], refusing a response body past `body_cap` bytes as too large.
+    async fn call_holding_capped(
+        &self,
+        method: &str,
+        params: Value,
+        need: Option<u64>,
+        body_cap: Option<usize>,
+    ) -> Result<(Value, usize)> {
         let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
@@ -937,7 +963,7 @@ impl RpcClient {
             crate::metrics::METRICS.inc_rpc_method(method);
             attempts += 1;
             let t0 = Instant::now();
-            match self.call_one(url, method, &params).await {
+            match self.call_one(url, method, &params, body_cap).await {
                 Ok(v) => {
                     crate::metrics::METRICS.observe_rpc(
                         &crate::metrics::endpoint_label(url),
@@ -1031,7 +1057,12 @@ impl RpcClient {
     /// Replaces the old `send().await?.error_for_status()?.json().await?` chain, which collapsed every
     /// failure mode into an indistinguishable `anyhow::Error` - so a bad API key and a momentary 503
     /// were handled identically, and the former was retried until someone noticed.
-    async fn send_classified(&self, url: &str, body: &Value) -> Result<Value> {
+    async fn send_classified(
+        &self,
+        url: &str,
+        body: &Value,
+        body_cap: Option<usize>,
+    ) -> Result<Value> {
         let classified = |class: FailureClass, detail: String| {
             anyhow::Error::new(ClassifiedError { class, detail })
         };
@@ -1087,7 +1118,7 @@ impl RpcClient {
             }
             return Err(classified(class, detail));
         }
-        resp.json::<Value>().await.map_err(|e| {
+        let read_failed = |e: reqwest::Error| {
             // **A body-read timeout is a size signal, not a transient blip** (RFC-0029 §6g). reqwest's
             // `.timeout()` covers streaming the body, so a response that is large *and* slow to read
             // fails here rather than at the status line - with the opaque text "error decoding response
@@ -1116,7 +1147,26 @@ impl RpcClient {
                 FailureClass::Transient
             };
             classified(class, format!("malformed response: {e}"))
-        })
+        };
+        let Some(cap) = body_cap else {
+            return resp.json::<Value>().await.map_err(read_failed);
+        };
+        let mut resp = resp;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(read_failed)? {
+            body.extend_from_slice(&chunk);
+            if body.len() > cap {
+                return Err(classified(
+                    FailureClass::Narrowable {
+                        suggested: None,
+                        escalated_from_rate_limit: false,
+                    },
+                    format!("response passed the {cap}-byte getLogs body cap; narrowing the range"),
+                ));
+            }
+        }
+        serde_json::from_slice(&body)
+            .map_err(|e| classified(FailureClass::Transient, format!("malformed response: {e}")))
     }
 
     /// Single-endpoint POST for tests that need the *classification* of a raw transport failure,
@@ -1124,11 +1174,11 @@ impl RpcClient {
     #[cfg(test)]
     pub(crate) async fn post_one_for_test(&self, body: &Value) -> Result<Value> {
         let url = self.urls[0].clone();
-        self.send_classified(&url, body).await
+        self.send_classified(&url, body, None).await
     }
 
     async fn post_one(&self, url: &str, body: &Value) -> Result<Value> {
-        let resp: Value = self.send_classified(url, body).await?;
+        let resp: Value = self.send_classified(url, body, None).await?;
         // A whole-batch rejection - e.g. a keyless endpoint answering HTTP 200 with
         // `{"error":{"message":"authenticate with an API key"}}` instead of the expected array - comes
         // back as a single object with a top-level `error`. Treat it as an endpoint failure so
@@ -1145,9 +1195,15 @@ impl RpcClient {
         Ok(resp)
     }
 
-    async fn call_one(&self, url: &str, method: &str, params: &Value) -> Result<Value> {
+    async fn call_one(
+        &self,
+        url: &str,
+        method: &str,
+        params: &Value,
+        body_cap: Option<usize>,
+    ) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let resp: Value = self.send_classified(url, &body).await?;
+        let resp: Value = self.send_classified(url, &body, body_cap).await?;
         if let Some(err) = resp.get("error") {
             return Err(anyhow::Error::new(ClassifiedError {
                 class: classify_rpc_error(err),
@@ -1205,7 +1261,7 @@ impl RpcClient {
             crate::metrics::METRICS.inc_rpc_method("eth_chainId");
             let r = tokio::time::timeout(
                 VERIFY_TIMEOUT,
-                self.call_one(url, "eth_chainId", &json!([])),
+                self.call_one(url, "eth_chainId", &json!([]), None),
             )
             .await;
             (j, url, r)
@@ -1901,7 +1957,13 @@ impl RpcClient {
         filter.insert("fromBlock".into(), json!(format!("0x{from:x}")));
         filter.insert("toBlock".into(), json!(format!("0x{to:x}")));
         let (result, _) = self
-            .call_holding("eth_getLogs", json!([Value::Object(filter)]), Some(to))
+            .call_holding_capped(
+                "eth_getLogs",
+                json!([Value::Object(filter)]),
+                Some(to),
+                // One block cannot be narrowed; refusing it would only make its answer an error.
+                (from < to).then_some(self.logs_body_cap),
+            )
             .await?;
         let arr = result
             .as_array()
@@ -2045,6 +2107,54 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// An `eth_getLogs` endpoint with no result cap: `n` logs in block 1, streamed without a
+    /// `Content-Length`, so only reading the body can tell how large it is.
+    async fn uncapped_logs_rpc(n: usize) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{body::Body, routing::post, Router};
+        const LOG: &str = r#"{"address":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],"data":"0x","blockNumber":"0x1","transactionHash":"0x01","logIndex":"0x0"}"#;
+        let app = Router::new().route(
+            "/",
+            post(move || async move {
+                let parts = std::iter::once(r#"{"jsonrpc":"2.0","id":1,"result":["#.to_string())
+                    .chain((0..n).map(|i| format!("{}{LOG}", if i == 0 { "" } else { "," })))
+                    .chain(std::iter::once("]}".to_string()));
+                Body::from_stream(futures::stream::iter(parts.map(Ok::<_, std::io::Error>)))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// #1788: a node with no result cap answers a multi-block range whole, however large. Past the
+    /// body cap it is refused as too large, so the caller narrows; a single block cannot be narrowed
+    /// and is read whole.
+    #[tokio::test]
+    async fn a_getlogs_body_past_the_cap_is_refused_as_too_large() {
+        let t0 =
+            vec!["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string()];
+        let (url, server) = uncapped_logs_rpc(2_000).await;
+        let capped = super::RpcClient::new(vec![url.clone()])
+            .unwrap()
+            .with_logs_body_cap(64 << 10);
+        let err = capped.get_logs(&[], &t0, 1, 2).await.unwrap_err();
+        assert!(
+            crate::chunker::is_result_too_large(&err),
+            "a body past the cap must read as a cap: {err:#}"
+        );
+        let one = capped.get_logs(&[], &t0, 1, 1).await.unwrap();
+        assert_eq!(one.len(), 2_000, "a single block is read whole");
+        let roomy = super::RpcClient::new(vec![url])
+            .unwrap()
+            .with_logs_body_cap(16 << 20);
+        let all = roomy.get_logs(&[], &t0, 1, 2).await.unwrap();
+        server.abort();
+        assert_eq!(all.len(), 2_000, "a body under the cap is untouched");
     }
 
     /// #1494: a window checkpoint's hash and timestamp are one header, so one request.

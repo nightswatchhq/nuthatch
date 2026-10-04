@@ -3478,6 +3478,8 @@ struct FetchedWindow {
     fetch_from: u64,
     w_to: u64,
     asked_to: u64,
+    /// How many blocks the rest of the window should ask for next.
+    reach: u64,
     final_pass: bool,
     fetched: u64,
     served_width: u64,
@@ -5390,7 +5392,7 @@ pub async fn backfill_direct_pipelined_with(
     // (`source`, `registry`, filters) are shared across the concurrent futures - fine, they run on
     // one task; `buffered` yields them back in window order. A window that comes back short of
     // `asked_to` (#1671) has its remainder fetched by the consumer, in order, before the next one.
-    let run_window = move |w_from: u64, asked_to: u64, final_pass: bool, rest: bool| async move {
+    let run_window = move |w_from: u64, asked_to: u64, final_pass: bool, reach: Option<u64>| async move {
         // Split-and-retry on a provider result cap instead of aborting the whole backfill (H2/H3),
         // and retry the whole fetch on a transient all-endpoints failure (rate-limit / provider
         // blip) so one bad window doesn't abort the run.
@@ -5402,34 +5404,37 @@ pub async fn backfill_direct_pipelined_with(
         let mut whole_width = 0u64;
         // The tail of the previous window is asked for again (#1144), but not before the rest of a
         // cut window: those blocks may be what filled the budget, and asking again would not advance.
-        let fetch_from = if final_pass || rest {
+        let fetch_from = if final_pass || reach.is_some() {
             w_from
         } else {
             overlap_from(w_from, from)
         };
+        // The rest of a cut window asks for what the budget held last time, not for the rest of the
+        // window (#1788): an uncapped node would send all of it again, a capped one refuse and split it.
+        let fetch_to = reach.map_or(asked_to, |r| asked_to.min(w_from.saturating_add(r - 1)));
         let (logs, w_to) = match &filter {
             // Nothing to match on either half means nothing to ask for - and asking anyway is
             // asking for every log on the chain (#432). The window still flows through the rest
             // of the pipeline, because a `blocks` nest derives its rows from the window itself.
-            None => (Vec::new(), asked_to),
+            None => (Vec::new(), fetch_to),
             Some(f) => {
                 // Tracked, so the controller learns what actually worked (#672). Without it the
                 // window grows on a success the splitter manufactured by cutting the range up.
                 let (logs, served, covered) = retry_transient(
-                    &format!("seal-direct getLogs {fetch_from}..={asked_to}"),
+                    &format!("seal-direct getLogs {fetch_from}..={fetch_to}"),
                     BACKFILL_RETRY_BASE,
                     || {
                         fetch_logs_splitting_tracked(
                             source,
                             f,
                             fetch_from,
-                            asked_to,
+                            fetch_to,
                             SEAL_DIRECT_WINDOW_LOGS,
                         )
                     },
                 )
                 .await?;
-                if served < asked_to - fetch_from + 1 {
+                if served < fetch_to - fetch_from + 1 {
                     served_width = served;
                 } else {
                     whole_width = served;
@@ -5437,6 +5442,10 @@ pub async fn backfill_direct_pipelined_with(
                 (logs, covered)
             }
         };
+        // The span that held these logs, scaled to the budget.
+        let span = w_to - logs.first().map_or(fetch_from, |l| l.block_number) + 1;
+        let rest_reach =
+            (span.saturating_mul(SEAL_DIRECT_WINDOW_LOGS as u64) / logs.len().max(1) as u64).max(1);
         // **The controller is fed raw logs, not decoded rows.** It is sizing a *response*, and a
         // log that matches no decoder still costs bytes on the wire and still counts against the
         // provider's result cap. Feeding it `rows.len()` would make a nest with a narrow event
@@ -5548,6 +5557,7 @@ pub async fn backfill_direct_pipelined_with(
             fetch_from,
             w_to,
             asked_to,
+            reach: rest_reach,
             final_pass,
             fetched,
             served_width,
@@ -5556,7 +5566,7 @@ pub async fn backfill_direct_pipelined_with(
         })
     };
     let stream = windows
-        .map(move |(w_from, w_to, final_pass)| run_window(w_from, w_to, final_pass, false))
+        .map(move |(w_from, w_to, final_pass)| run_window(w_from, w_to, final_pass, None))
         .buffered(concurrency.max(1));
     // `unfold`'s generator future is not `Unpin` (it borrows `chunker` across an await), so the stream
     // has to be pinned before it can be polled in a loop.
@@ -5583,6 +5593,7 @@ pub async fn backfill_direct_pipelined_with(
             fetch_from,
             w_to,
             asked_to,
+            reach,
             final_pass,
             fetched,
             served_width,
@@ -5636,7 +5647,7 @@ pub async fn backfill_direct_pipelined_with(
             // The in-flight windows keep being polled, or their requests would time out unread;
             // with the gate shut, at most `concurrency` of them land in `ready`.
             gate.0.store(true, std::sync::atomic::Ordering::SeqCst);
-            let mut rest = std::pin::pin!(run_window(w_to + 1, asked_to, final_pass, true));
+            let mut rest = std::pin::pin!(run_window(w_to + 1, asked_to, final_pass, Some(reach)));
             let res = loop {
                 tokio::select! {
                     biased;
@@ -16286,6 +16297,571 @@ template = "pool"
         assert!(
             ahead <= 4,
             "{ahead} windows past block {cut_to} were asked for before the dense run was fetched"
+        );
+    }
+
+    fn usdc_transfers() -> (DecodeRegistry, Vec<String>, Vec<String>) {
+        use crate::registry::ContractSpec;
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi: serde_json::from_str(ERC20).unwrap(),
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let addresses = reg
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .collect();
+        let topic0s = reg
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+        (reg, addresses, topic0s)
+    }
+
+    fn sealed_hashes(dir: &std::path::Path) -> Vec<(String, String)> {
+        let m = seal::load_manifest(dir).unwrap();
+        m.tables
+            .iter()
+            .flat_map(|(t, segs)| segs.iter().map(move |s| (t.clone(), s.hash.clone())))
+            .collect()
+    }
+
+    /// Logs `ResultCapSource` served whole, per request.
+    fn served_per_request(source: &ResultCapSource) -> Vec<usize> {
+        source
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|&(from, to)| {
+                let lo = source.logs.partition_point(|l| l.block_number < from);
+                let hi = source.logs.partition_point(|l| l.block_number <= to);
+                hi - lo
+            })
+            .filter(|&n| n <= source.cap)
+            .collect()
+    }
+
+    /// #1788: the rest of a cut window asks for about as many blocks as the cut held, not for the rest
+    /// of the window. Asking for the rest of the window has an uncapped node send it all again for each
+    /// 20,000 logs kept, and has a capped one refuse it and split it down again every time.
+    #[tokio::test]
+    async fn the_rest_of_a_cut_window_asks_for_what_the_budget_can_hold() {
+        let (reg, addresses, topic0s) = usdc_transfers();
+        // Empty to 200,000, then 30,000 blocks at three logs each, then 55,000 empty blocks, all inside
+        // the one 100,000-block window the controller has grown to by block 185,000.
+        let logs: Vec<_> = (200_001u64..=230_000)
+            .flat_map(|b| (0..3).map(move |li| transfer_log(b, li)))
+            .collect();
+        let run = |cap: usize| {
+            let (reg, addresses, topic0s, logs) = (&reg, &addresses, &topic0s, logs.clone());
+            async move {
+                let source = ResultCapSource::new(logs, cap);
+                let d = tempfile::tempdir().unwrap();
+                let total = backfill_direct_pipelined(
+                    &source,
+                    reg,
+                    d.path(),
+                    addresses,
+                    topic0s,
+                    &[],
+                    None,
+                    0,
+                    0,
+                    285_000,
+                    1_000,
+                    SPAN_OFF,
+                    1,
+                    |_| Ok(()),
+                    |_, _, _| {},
+                )
+                .await
+                .unwrap();
+                assert_eq!(total, 90_000, "every row once");
+                (source, sealed_hashes(d.path()))
+            }
+        };
+
+        // No cap: the window's first answer is all 90,000 logs, and nothing after it should be.
+        let (uncapped, uncapped_hashes) = run(usize::MAX).await;
+        let mut served = served_per_request(&uncapped);
+        served.sort_unstable();
+        let after_first = served[served.len() - 2];
+        assert!(
+            after_first <= SEAL_DIRECT_WINDOW_LOGS,
+            "a remainder fetch was answered with {after_first} logs against a budget of {SEAL_DIRECT_WINDOW_LOGS}"
+        );
+        // Asking for the rest of the window each time downloads 250,020 logs, and asking for a fixed
+        // width through the empty tail takes 20 requests.
+        let downloaded: usize = served.iter().sum();
+        assert!(
+            downloaded <= 2 * 90_000,
+            "{downloaded} logs downloaded to keep 90,000"
+        );
+        let requests = uncapped.calls.lock().unwrap().len();
+        assert!(requests <= 16, "{requests} getLogs requests without a cap");
+
+        // A cap above the budget, as `GETLOGS_BODY_CAP` makes of an uncapped node.
+        let (capped, capped_hashes) = run(30_000).await;
+        let requests = capped.calls.lock().unwrap().len();
+        // 23 when each remainder is refused and split down again, 22 at a fixed width, 16 otherwise.
+        assert!(
+            requests <= 18,
+            "{requests} getLogs requests against a 30,000-log cap"
+        );
+
+        let d = tempfile::tempdir().unwrap();
+        backfill_direct(
+            &ResultCapSource::new(logs.clone(), 30_000),
+            &reg,
+            d.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            0,
+            285_000,
+            1_000,
+            SPAN_OFF,
+            true,
+        )
+        .await
+        .unwrap();
+        let reference = sealed_hashes(d.path());
+        assert_eq!(uncapped_hashes, reference, "uncapped: the same bytes");
+        assert_eq!(capped_hashes, reference, "capped: the same bytes");
+    }
+
+    /// #1788: a remainder narrowed by the budget was served whole, so it must not teach the
+    /// controller that the provider caps the window at the remainder's width.
+    #[tokio::test]
+    async fn a_narrowed_remainder_does_not_lower_the_window_ceiling() {
+        let (reg, addresses, topic0s) = usdc_transfers();
+        let logs: Vec<_> = (200_001u64..=230_000)
+            .flat_map(|b| (0..3).map(move |li| transfer_log(b, li)))
+            .collect();
+        let source = ResultCapSource::new(logs, usize::MAX);
+        let d = tempfile::tempdir().unwrap();
+        let mut widest_after = 0u64;
+        backfill_direct_pipelined(
+            &source,
+            &reg,
+            d.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            0,
+            1_000_000,
+            1_000,
+            SPAN_OFF,
+            1,
+            |_| Ok(()),
+            |blk, _, window| {
+                if blk > 300_000 {
+                    widest_after = widest_after.max(window)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            widest_after,
+            chunker::MAX_WINDOW,
+            "the empty range after the dense run should grow the window back to the ceiling"
+        );
+    }
+
+    /// An `eth_getLogs` node with no result cap, serving `logs` over HTTP (#1788). Every log carries
+    /// `blockTimestamp`, so no header is asked for.
+    async fn uncapped_node(logs: Vec<crate::rpc::Log>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        async fn handler(
+            State(logs): State<Arc<Vec<crate::rpc::Log>>>,
+            Json(req): Json<Value>,
+        ) -> Json<Value> {
+            let hex = |v: &Value| {
+                u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+            };
+            let one = |r: &Value| -> Value {
+                let result = match r["method"].as_str() {
+                    Some("eth_getLogs") => {
+                        let f = &r["params"][0];
+                        let (from, to) = (hex(&f["fromBlock"]), hex(&f["toBlock"]));
+                        let set = |v: &Value| -> Option<Vec<String>> {
+                            v.as_array().map(|a| {
+                                a.iter()
+                                    .map(|x| x.as_str().unwrap().to_ascii_lowercase())
+                                    .collect()
+                            })
+                        };
+                        let addresses = set(&f["address"]);
+                        let topic0s = set(&f["topics"][0]);
+                        Value::Array(
+                            logs.iter()
+                                .filter(|l| (from..=to).contains(&l.block_number))
+                                .filter(|l| {
+                                    addresses
+                                        .as_ref()
+                                        .is_none_or(|a| a.contains(&l.address.to_ascii_lowercase()))
+                                })
+                                .filter(|l| {
+                                    topic0s.as_ref().is_none_or(|t| {
+                                        l.topics
+                                            .first()
+                                            .is_some_and(|t0| t.contains(&t0.to_ascii_lowercase()))
+                                    })
+                                })
+                                .map(|l| {
+                                    json!({
+                                        "address": l.address,
+                                        "topics": l.topics,
+                                        "data": l.data,
+                                        "blockNumber": format!("0x{:x}", l.block_number),
+                                        "blockHash": l.block_hash,
+                                        "blockTimestamp": format!("0x{:x}", l.block_number * 12),
+                                        "transactionHash": l.tx_hash,
+                                        "logIndex": format!("0x{:x}", l.log_index),
+                                    })
+                                })
+                                .collect(),
+                        )
+                    }
+                    Some("eth_getBlockByNumber") => {
+                        let b = hex(&r["params"][0]);
+                        json!({
+                            "number": format!("0x{b:x}"),
+                            "hash": format!("0x{b:064x}"),
+                            "timestamp": format!("0x{:x}", b * 12),
+                        })
+                    }
+                    _ => Value::Null,
+                };
+                json!({"jsonrpc": "2.0", "id": r["id"], "result": result})
+            };
+            Json(match &req {
+                Value::Array(rs) => Value::Array(rs.iter().map(one).collect()),
+                r => one(r),
+            })
+        }
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(Arc::new(logs));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// A source that remembers the most logs one `getLogs` answer handed the backfill.
+    struct Largest<'a> {
+        inner: &'a dyn Source,
+        most: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> Largest<'a> {
+        fn new(inner: &'a dyn Source) -> Self {
+            Self {
+                inner,
+                most: Default::default(),
+            }
+        }
+        fn most(&self) -> usize {
+            self.most.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for Largest<'_> {
+        async fn tip(&self) -> Result<u64> {
+            self.inner.tip().await
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.inner.block_hash(n).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.inner.block_timestamps(blocks).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let logs = self.inner.logs(filter, from, to).await?;
+            self.most
+                .fetch_max(logs.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(logs)
+        }
+    }
+
+    /// The test's body cap, and the most fixture logs it admits in one answer.
+    const TEST_BODY_CAP: usize = 128 << 10;
+
+    fn logs_under_test_cap(sample: &crate::rpc::Log) -> usize {
+        let one = serde_json::json!({
+            "address": sample.address,
+            "topics": sample.topics,
+            "data": sample.data,
+            "blockNumber": format!("0x{:x}", sample.block_number),
+            "blockHash": sample.block_hash,
+            "blockTimestamp": format!("0x{:x}", sample.block_number * 12),
+            "transactionHash": sample.tx_hash,
+            "logIndex": "0x0",
+        });
+        TEST_BODY_CAP / serde_json::to_vec(&one).unwrap().len()
+    }
+
+    /// Dense from 200,001, after an empty run the window grows across: 6,000 transfers.
+    fn dense_after_empty() -> Vec<crate::rpc::Log> {
+        (200_001u64..=202_000)
+            .flat_map(|b| (0..3).map(move |li| transfer_log(b, li)))
+            .collect()
+    }
+
+    /// #1788: the pipelined path against a node with no result cap. The leaf's cut bounds what is
+    /// kept, but only the body cap bounds what one answer brings.
+    #[tokio::test]
+    async fn the_pipelined_path_reads_no_answer_past_the_body_cap_from_an_uncapped_node() {
+        let (reg, addresses, topic0s) = usdc_transfers();
+        let logs = dense_after_empty();
+        let bound = logs_under_test_cap(&logs[0]);
+        let (url, server) = uncapped_node(logs).await;
+        let mut hashes = Vec::new();
+        for cap in [TEST_BODY_CAP, usize::MAX] {
+            let rpc = crate::rpc::RpcClient::new(vec![url.clone()])
+                .unwrap()
+                .with_logs_body_cap(cap);
+            let source = Largest::new(&rpc);
+            let d = tempfile::tempdir().unwrap();
+            let total = backfill_direct_pipelined(
+                &source,
+                &reg,
+                d.path(),
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                0,
+                0,
+                210_000,
+                1_000,
+                SPAN_OFF,
+                1,
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(total, 6_000, "every row once");
+            if cap == TEST_BODY_CAP {
+                assert!(
+                    source.most() <= bound,
+                    "one answer carried {} logs; the cap admits {bound}",
+                    source.most()
+                );
+            }
+            hashes.push(sealed_hashes(d.path()));
+        }
+        server.abort();
+        assert_eq!(
+            hashes[0], hashes[1],
+            "the cap must not change the sealed bytes"
+        );
+    }
+
+    /// #1788: the sequential path, the bench's control, against a node with no result cap.
+    #[tokio::test]
+    async fn the_sequential_path_reads_no_answer_past_the_body_cap_from_an_uncapped_node() {
+        let (reg, addresses, topic0s) = usdc_transfers();
+        let logs = dense_after_empty();
+        let bound = logs_under_test_cap(&logs[0]);
+        let (url, server) = uncapped_node(logs).await;
+        let mut hashes = Vec::new();
+        for cap in [TEST_BODY_CAP, usize::MAX] {
+            let rpc = crate::rpc::RpcClient::new(vec![url.clone()])
+                .unwrap()
+                .with_logs_body_cap(cap);
+            let source = Largest::new(&rpc);
+            let d = tempfile::tempdir().unwrap();
+            let total = backfill_direct(
+                &source,
+                &reg,
+                d.path(),
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                0,
+                0,
+                210_000,
+                1_000,
+                SPAN_OFF,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(total, 6_000, "every row once");
+            if cap == TEST_BODY_CAP {
+                assert!(
+                    source.most() <= bound,
+                    "one answer carried {} logs; the cap admits {bound}",
+                    source.most()
+                );
+            }
+            hashes.push(sealed_hashes(d.path()));
+        }
+        server.abort();
+        assert_eq!(
+            hashes[0], hashes[1],
+            "the cap must not change the sealed bytes"
+        );
+    }
+
+    /// #1788: the factory path against a node with no result cap. It holds every pass of a chunk at
+    /// once, so each pass's answer is what the body cap has to bound.
+    #[tokio::test]
+    async fn the_factory_path_reads_no_answer_past_the_body_cap_from_an_uncapped_node() {
+        use crate::registry::{ContractSpec, TemplateSpec};
+        use crate::rpc::Log;
+        let factory_addr = "0x1111111111111111111111111111111111111111";
+        let pool_addr = "0x2222222222222222222222222222222222222222";
+        let reg = DecodeRegistry::build_with_templates(
+            vec![ContractSpec {
+                alias: "factory".into(),
+                address: factory_addr.parse().unwrap(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[{"name":"pool","type":"address","indexed":false}]}]"#,
+                ).unwrap(),
+                events: Vec::new(),
+            }],
+            vec![TemplateSpec {
+                name: "pool".into(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}]"#,
+                ).unwrap(),
+                events: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let topic0 = |table: &str| {
+            format!(
+                "0x{}",
+                hex::encode(
+                    reg.tables()
+                        .iter()
+                        .find(|d| d.table == table)
+                        .unwrap()
+                        .topic0
+                )
+            )
+        };
+        let config: Config = toml::from_str(
+            r#"
+[nest]
+name="t"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[templates]]
+name="pool"
+abi="abis/p.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        let fs = FactorySet::build(&config).unwrap();
+        // The pool is created at block 10 and trades three times a block from 200,001.
+        let swap = |b: u64, li: u64| Log {
+            address: pool_addr.into(),
+            topics: vec![topic0("pool__swap")],
+            data: format!("0x{:064x}", b * 10 + li),
+            block_number: b,
+            block_hash: "0xbh".into(),
+            tx_hash: "0xtx".into(),
+            log_index: li,
+        };
+        let logs: Vec<Log> = std::iter::once(Log {
+            address: factory_addr.into(),
+            topics: vec![topic0("factory__pool_created")],
+            data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
+            block_number: 10,
+            block_hash: "0xbh".into(),
+            tx_hash: "0xt1".into(),
+            log_index: 0,
+        })
+        .chain((200_001u64..=202_000).flat_map(|b| (0..3).map(move |li| swap(b, li))))
+        .collect();
+        let bound = logs_under_test_cap(&logs[1]);
+        let (url, server) = uncapped_node(logs).await;
+        let mut hashes = Vec::new();
+        for cap in [TEST_BODY_CAP, usize::MAX] {
+            let rpc = crate::rpc::RpcClient::new(vec![url.clone()])
+                .unwrap()
+                .with_logs_body_cap(cap);
+            let source = Largest::new(&rpc);
+            let d = tempfile::tempdir().unwrap();
+            let mut children = ChildRegistry::new();
+            let total = backfill_direct_factory(
+                &source,
+                &reg,
+                &fs,
+                &mut children,
+                d.path(),
+                &[],
+                &[],
+                None,
+                0,
+                10,
+                210_000,
+                1_000,
+                SPAN_OFF,
+                false,
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(total, 6_001, "every row once");
+            if cap == TEST_BODY_CAP {
+                assert!(
+                    source.most() <= bound,
+                    "one answer carried {} logs; the cap admits {bound}",
+                    source.most()
+                );
+            }
+            hashes.push(sealed_hashes(d.path()));
+        }
+        server.abort();
+        assert_eq!(
+            hashes[0], hashes[1],
+            "the cap must not change the sealed bytes"
         );
     }
 
