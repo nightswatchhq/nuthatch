@@ -1143,7 +1143,10 @@ fn a_bad_provenance_before_a_poll_chooses_exits_loud_with_no_status() {
 
 /// The ThinkPad's gate config for these runs: per nest, its own copy of the fixture nest, its own
 /// set and its own production environment, and a refresh kind. Returns the config's path.
-fn nests_conf(c: &Case, nests: &[(&str, &[(&str, String)], &str, &str)]) -> PathBuf {
+/// A nest's name, its set's `(id, sql)` lines, its env file's body and its refresh kind.
+type NestRow<'a> = (&'a str, &'a [(&'a str, String)], &'a str, &'a str);
+
+fn nests_conf(c: &Case, nests: &[NestRow]) -> PathBuf {
     let mut conf = String::from("# name copy set env refresh\n");
     for (name, lines, env, refresh) in nests {
         let copy = c.dir.path().join(name);
@@ -1252,7 +1255,10 @@ fn every_nest_in_the_config_is_gated_and_posts_its_own_status() {
         .find(|e| e.file_name().to_string_lossy().contains("-qos-nest-"))
         .map(|e| std::fs::read_to_string(e.path().join("production.txt")).unwrap())
         .unwrap_or_default();
-    assert!(production.contains(&from), "production's run:\n{production}");
+    assert!(
+        production.contains(&from),
+        "production's run:\n{production}"
+    );
     assert!(
         text.contains("[qos-nest] release-gate: concurrency 1"),
         "{text}"
