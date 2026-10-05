@@ -401,6 +401,12 @@ if only_sg:
 # every closed epoch from 1105 then agrees, the newest included. That table is static, so once the
 # chain passes it the pair returns and this run fails: extend it with the nest's scripts/epoch-starts.sh.
 #
+# From the nest's `l1_blocks` re-index (#1882) every epoch is placed by its own L1 block and the table
+# is gone. Measured against the subgraph on 2026-10-05 the self-check put the three non-reward fields
+# at 1, 290 and 1: signal and curator fees agree on every epoch the network has had, and query fees
+# from 290. The reward trio stays at 1195. A nest from before the re-index starts at 1104 with an
+# observed boundary there, so these constants need it.
+#
 # Two classes:
 #   gate   directly comparable. **Any** disagreement above the boundary fails the run, except an
 #          exact boundary shift in the two fee fields (#1819, below).
@@ -413,9 +419,9 @@ EPOCH_FIELDS = [
     ("total_rewards", "totalRewards", 1195, "gate"),
     ("total_indexer_rewards", "totalIndexerRewards", 1195, "gate"),
     ("total_delegator_rewards", "totalDelegatorRewards", 1195, "gate"),
-    ("signalled_tokens", "signalledTokens", 1105, "gate"),
-    ("query_fees_collected", "queryFeesCollected", 1105, "gate"),
-    ("curator_query_fees", "curatorQueryFees", 1105, "gate"),
+    ("signalled_tokens", "signalledTokens", 1, "gate"),
+    ("query_fees_collected", "queryFeesCollected", 290, "gate"),
+    ("curator_query_fees", "curatorQueryFees", 1, "gate"),
 ]
 EPOCH_GATE = [(n, g) for n, g, _, c in EPOCH_FIELDS if c == "gate"]
 EPOCH_KNOWN_DIFF = [(n, g) for n, g, _, c in EPOCH_FIELDS if c == "drift"]
