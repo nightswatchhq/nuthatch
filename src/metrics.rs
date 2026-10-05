@@ -79,6 +79,9 @@ pub struct NestMetrics {
     /// Unix seconds of the last pass that succeeded, `0` until one has.
     publish_last_success: AtomicU64,
     publish_sealed_through: AtomicU64,
+    /// Highest block a final local segment reaches, as the publisher last read the catalogue. The
+    /// seal watermark would overstate it: a quiet table's provisional tail never folds (#1927).
+    publish_local_through: AtomicU64,
     publish_pending: AtomicU64,
     publish_bytes: AtomicU64,
     publish_errors: AtomicU64,
@@ -306,12 +309,17 @@ impl NestMetrics {
         self.publish_sealed_through.load(Relaxed)
     }
     pub fn publish_lag_blocks(&self) -> u64 {
-        self.sealed_through
+        self.publish_local_through
             .load(Relaxed)
             .saturating_sub(self.publish_sealed_through.load(Relaxed))
     }
     pub fn publish_last_success(&self) -> u64 {
         self.publish_last_success.load(Relaxed)
+    }
+    /// What the local catalogue holds final; `publish_lag_blocks` is this less what the mirror holds.
+    pub fn set_publish_local_through(&self, block: Option<u64>) {
+        self.publish_local_through
+            .store(block.unwrap_or(0), Relaxed);
     }
     pub fn set_publish_pending(&self, segments: u64) {
         self.publish_pending.store(segments, Relaxed);
@@ -1593,7 +1601,7 @@ impl Metrics {
                 );
                 series(
                     "nuthatch_publish_lag_blocks",
-                    "Blocks sealed locally and not yet published.",
+                    "Blocks held in final local segments the mirror does not have yet.",
                     "gauge",
                     &|m| m.publish_lag_blocks(),
                 );

@@ -1079,7 +1079,7 @@ suspended mount has no series),
 
 A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:
 `nuthatch_publish_sealed_through` (what the published catalogue covers),
-`nuthatch_publish_lag_blocks` (sealed locally, not yet published), `nuthatch_publish_pending_segments`,
+`nuthatch_publish_lag_blocks` (blocks held in final local segments the mirror does not have yet; a quiet table's provisional tail is not owed, so a fully published nest reads 0), `nuthatch_publish_pending_segments`,
 `nuthatch_publish_bytes_total`, `nuthatch_publish_errors_total` and `nuthatch_publish_dead_letter`.
 
 Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_screen`,
