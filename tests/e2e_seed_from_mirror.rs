@@ -289,3 +289,62 @@ async fn a_mirror_of_partial_history_is_refused() {
         .expect_err("history that begins after the declared start block is not this nest's");
     assert!(format!("{err:#}").contains("begins at block 4"), "{err:#}");
 }
+
+/// The path a public mirror actually uses: nobody stops a production nest to publish, so the seed
+/// snapshot has to come from the running nest's own publisher, which cannot open the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_nest_publishes_a_snapshot_another_can_seed_from() {
+    const LIVE: &str = "seedlive";
+    let dir = tempfile::tempdir().unwrap();
+    let mirror = tempfile::tempdir().unwrap();
+    let tape = chain(11);
+    let rt = spawn(dir.path(), tape.clone(), LIVE).await;
+    let store = rt.state.store.clone();
+    tape.advance_finalized_to(5);
+    tape.insert_block(12, empty_block(12, 0, 1_700_000_012));
+    tape.advance_tip_to(12);
+    assert!(
+        wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 5).await,
+        "1..=5 did not seal"
+    );
+
+    let _publisher = nuthatch::publish::spawn(
+        dir.path().to_path_buf(),
+        LIVE.to_string(),
+        nuthatch::publish::Settings {
+            target: mirror.path().to_str().unwrap().to_string(),
+            interval: std::time::Duration::from_millis(200),
+            parallelism: 2,
+        },
+    )
+    .expect("the publisher starts");
+    let snapshot = || {
+        std::fs::read_dir(mirror.path())
+            .ok()?
+            .flatten()
+            .map(|d| d.path().join("_seed/seed.json"))
+            .find(|p| p.exists())
+    };
+    assert!(
+        wait_until(POLL_TIMEOUT, || snapshot().is_some()).await,
+        "a running nest's publisher wrote no seed snapshot"
+    );
+
+    let seeded = tempfile::tempdir().unwrap();
+    scaffold_nest(seeded.path(), LIVE, USDC);
+    let seed = nuthatch::seed::seed(seeded.path(), mirror.path().to_str().unwrap())
+        .await
+        .expect("seed from a mirror its nest is still writing");
+    assert_eq!((seed.indexed_from, seed.complete_through), (1, 5));
+    drop(store);
+    rt.shutdown().await.expect("the publisher's nest stops");
+
+    let got = run_to(seeded.path(), chain(14), LIVE, 14).await;
+    let clean = tempfile::tempdir().unwrap();
+    let want = run_to(clean.path(), chain(14), "seedliveclean", 14).await;
+    assert_eq!(
+        got, want,
+        "a nest seeded from a live mirror must equal a clean replay"
+    );
+    assert_eq!(recipient_balance(&got), 5_500);
+}
