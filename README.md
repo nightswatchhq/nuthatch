@@ -165,9 +165,10 @@ That is the golden path.
 Worth knowing, since we are being precise about it: most figures currently in
 [`docs/benchmarks.md`](docs/benchmarks.md) were measured against *public* endpoints, and that is a
 known weakness of those numbers rather than a recommendation - a benchmark taken through a
-rate-limited endpoint measures the endpoint. We measured the network at **99.3% of backfill wall
-clock**, which is why the replay rig (RFC-0039) exists and why those figures carry that caveat on the
-page itself.
+rate-limited endpoint measures the endpoint. On one workload the network was **99.3% of backfill wall
+clock** (the same tape live against a public endpoint and replayed from disk, 2026-08-23, in
+`docs/benchmarks.md`), which is why the replay rig (RFC-0039) exists and why those figures carry that
+caveat on the page itself.
 
 The free public endpoints bundled per chain exist for one job: so `init` → `dev` works with **zero
 setup**, which is the two-minute demo, and it is deliberate. Treat them as **testing and initial
@@ -214,7 +215,8 @@ Every declared event becomes a table named `{alias}__{event}` (e.g. `usdc__trans
 event's fields plus `block_number`, `block_hash`, `block_timestamp`, `tx_hash`, `log_index`,
 `address` and a `_seq` ordinal.
 
-> `block_timestamp` costs a block-header round trip per block - about 85% of backfill wall clock. A
+> `block_timestamp` costs a block-header round trip per block: on OBIB case 1 it took the backfill
+> from 74.8 s to 1,689 s, 22.6x ([RFC-0029 §4c](docs/rfcs/0029-the-fastest-indexer.md), 2026-07-31). A
 > nest that will never ask a time-series question can drop the column with `init --no-timestamps` and
 > skip that entirely. It is an **init-time** choice: changing it later is a breaking schema change and
 > a full re-index, so it is worth a moment's thought and is deliberately not a flag you can flip.
@@ -262,10 +264,11 @@ We ran **someone else's** benchmark rather than writing our own: Sentio's
 
 | | |
 |---|---|
-| wall clock | **74.8 s** |
+| wall clock | **74.8 s** (median of 3) |
 | events | **294,278** (matches Sentio's own README exactly) |
 | RPC requests | **321** |
 | peak RSS | **320 MB** |
+| measured | commit `8e94f6c`, 2026-07-30, Alchemy, 11-core laptop: [`docs/bench/obib-case1.json`](docs/bench/obib-case1.json) |
 
 **Case 2** is case 1's contract with per-account balances, and OBIB's implementations get them with one
 `balanceOf()` per account. **We make none.** For a plain ERC-20 the balance *is* the transfer history,
@@ -279,8 +282,11 @@ for zero `eth_call` round trips.
 | `eth_call` round trips | **0** |
 | RPC requests | **136** |
 | peak RSS | **325 MB** |
+| measured | commit `5a81a37`, 2026-08-07, Alchemy, 11-core laptop: [`docs/bench/obib-case2.json`](docs/bench/obib-case2.json) |
+| on 4.10.1 | **73.4 s** (median of 3), 174 requests, 403 MB, the release binary against Tenderly's keyless gateway, which throttled it, 2026-10-05: [`docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.json`](docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.json) and [the note beside it](docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.md) |
 
-Reference times for the same case: Sentio 7.78 min, Envio 8.54 min, Subsquid 46.85 min.
+Reference times for the same case, from OBIB's README: Sentio 7.78 min, Envio 8.54 min, Subsquid
+46.85 min.
 
 **Two caveats, stated rather than buried.** First, this is deliberately not like-for-like on *range*:
 OBIB windows to 100,001 blocks, we index 2,611,334. On OBIB's own range we take **9.3 s** - but that
@@ -318,10 +324,13 @@ and that is not a like-for-like ranking: those runs were on other machines, othe
 endpoints, and Envio and Subsquid serve this from their own pre-indexed networks, where nuthatch runs
 against plain JSON-RPC.
 
-Cases 1 and 2 were measured against a real provider (Alchemy) on an 11-core laptop; case 6 as the
-table above says. The artifacts are
+Cases 1 and 2 were measured in July and August 2026 against the same Alchemy account case 6's old
+figure is withdrawn for, so nobody can rerun those two as they were; they stay because their
+artifacts carry commit, provider and hardware, and case 2 has been rerun on the current release
+without an account, in the row above. The artifacts are
 [`docs/bench/obib-case1.json`](docs/bench/obib-case1.json),
-[`docs/bench/obib-case2.json`](docs/bench/obib-case2.json) and
+[`docs/bench/obib-case2.json`](docs/bench/obib-case2.json),
+[`docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.json`](docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.json) and
 [`docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.json`](docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.json);
 `nuthatch bench backfill` re-runs any of them.
 The case-2 nest is committed at [`obib-case2/`](obib-case2/) - keyless, so the endpoint arrives via
@@ -332,34 +341,35 @@ so the run can be reproduced rather than believed, and is submitted upstream as
 Case 6 needs no account at all: the release binary, that nest and the public gateway are the whole
 setup.
 
-**Wall clock on a shared endpoint is the provider's number as much as ours.** In August 2026, on the
-withdrawn Alchemy setup, the same case-6 range on the same commit measured anywhere from 17 s to 57 s
-depending on when it ran. We checked whether the fast runs were provider caching by re-running against
-an adjacent, never-fetched range
-([`obib-case6-cold-control.json`](docs/bench/obib-case6-cold-control.json), same setup): it landed in
-the same band, so caching was not the explanation. The event count was invariant across every run, and
-so was the request count for a given version: **16** then, **14** on 4.7.0 in all five runs. Those are
-the honest measure of range control.
+**Wall clock on a shared endpoint is the provider's number as much as ours.** On the withdrawn Alchemy
+setup we checked whether provider caching flattered the case-6 figure by re-running an adjacent,
+never-fetched range of the same size: **48.2 s** against 49.5 s
+([`obib-case6-cold-control.json`](docs/bench/obib-case6-cold-control.json), 2026-08-04), so caching
+was not the explanation. The event count was the same in every run, and so was the request count for
+a given version: **16** then, **14** on 4.7.0 in all five runs. Those are the honest measure of range
+control.
 
 Two things the case 1 number is worth knowing about:
 
 - **It did not finish at all before v0.9.0.** Alchemy returns its oversized-range refusal as HTTP
   **400**, which our status classifier did not enumerate - so a window that needed splitting was
   retried unchanged, forever. Running an outside benchmark found a defect that our own testing had not.
-- **~85% of the original wall clock was buying `block_timestamp`** - one serial round trip per block,
-  for a column that workload never stores. Timestamps are now demand-driven and the log window adapts
-  to what an endpoint will actually serve. See [RFC-0029](docs/rfcs/0029-the-fastest-indexer.md).
+- **Most of the original wall clock was buying `block_timestamp`** - one serial round trip per block,
+  for a column that workload never stores: 1,689 s with timestamps against 74.8 s without, on the
+  same range and endpoint ([RFC-0029 §4c](docs/rfcs/0029-the-fastest-indexer.md), 2026-07-31).
+  Timestamps are now demand-driven and the log window adapts to what an endpoint will actually serve.
 
 Case 6 found a defect too, in the harness rather than the indexer: `bench backfill` fetched a fixed
 address list, so a **factory nest was measured without its children** - 232 events in 2.6 s against an
-expected 35,039, reported as a success. Running an outside benchmark has now found two things our own
-testing did not.
+expected 35,039, reported as a success ([#310](https://github.com/nightswatchhq/nuthatch/issues/310)).
+Running an outside benchmark has now found two things our own testing did not.
 
 **Analytical queries** run on [Burrmill](https://github.com/nightswatchhq/burrmill), our engine on
 DataFusion, over sealed Parquet. Until 4.1 they ran on DuckDB, and the change was not made for speed:
-measured on a production nest on 2026-10-01, Burrmill takes about **2.5× DuckDB's time** for each
-statement and needs more memory for the same joins. What it buys is one language in the binary and
-exact arithmetic that refuses rather than wraps. The reasons and the log of the switch are in
+on our largest nest, through `/sql`, Burrmill took about **2.5 times DuckDB's time** per statement
+with eight times the memory allowed to each session, measured 2026-10-01 for the
+[4.1.0 release notes](docs/releases/v4.1.0.md). What it buys is one language in the binary and exact
+arithmetic that refuses rather than wraps. The reasons and the log of the switch are in
 [Replacing DuckDB, after all](https://nuthatch-indexer.com/blog/replacing-duckdb-after-all).
 
 ---
@@ -439,8 +449,9 @@ who need more - none of it in the way of the happy path:
   not IVM. And a nest can declare its own **authored incremental entities** in `entities.toml`
   ([RFC-0041](docs/rfcs/0041-authored-incremental-entities.md)): a `SELECT` that DBSP maintains as
   blocks arrive, served from `/derived` and queryable by name from `/sql`, with reorgs handled as
-  retractions like the built-ins. On a real nest that took a panel from 2.15 s to 88 ms. A WASM
-  transform layer remains the imperative escape hatch.
+  retractions like the built-ins. On a copy of the Lodestar nest that took the `indexer_rewards` panel
+  from a p50 of 2.15 s to 87.7 ms ([`docs/bench/3.0.0-alpha-live.md`](docs/bench/3.0.0-alpha-live.md)).
+  A WASM transform layer remains the imperative escape hatch.
 - **Compliance pack** (RFC-0008). Address labels, sanctions/watch-list screening, threshold & velocity
   flags, counterparty-exposure views, and a signed, replayable audit manifest.
 - **Alerts & webhooks** (RFC-0010). HMAC-signed egress with a durable at-least-once outbox; a slow
@@ -448,8 +459,8 @@ who need more - none of it in the way of the happy path:
 - **Built-in admin UI.** A self-contained page at `/_admin/` - status, tables, view/nest inspector.
   Localhost-open; off-localhost it requires a token per request.
 - **Many nests, one runtime, one or more chains** (RFC-0012, RFC-0021). Host many nests in one
-  process; nests on the same chain share a single cursor and one `getLogs` per window (N nests for
-  roughly one nest's RPC cost), and a runtime can span **multiple chains** with **one isolated cursor per
+  process; nests on the same chain share a single cursor and one `getLogs` per window, and a
+  runtime can span **multiple chains** with **one isolated cursor per
   chain** - a Base nest and an Arbitrum nest in one runtime. Per-nest isolation, and a footprint budget
   **per active-chain cursor** (≤2 GB). A capability, not a mandate: one chain per runtime stays the simple
   default.
@@ -523,9 +534,10 @@ who need more - none of it in the way of the happy path:
   Segments are content-addressed and shared across the runtime, so **two nests that decode the same
   contract hold one copy**, not two. What a subgraph pays a full resync for, nuthatch answers with a
   hash comparison.
-- **Derive-first - the `eth_call` you don't need** (RFC-0023). >70% of subgraphs call `eth_call` for
-  reads that are *derivable* from the events they already index - they fetch only because they have no
-  way to derive. Nuthatch does: `nuthatch recipe add total_supply` drops in a SQL view
+- **Derive-first - the `eth_call` you don't need** (RFC-0023). The Graph Foundation's figure is that
+  more than 70% of subgraphs call `eth_call`, much of it for reads that are *derivable* from the
+  events they already index - they fetch only because they have no way to derive. Nuthatch does:
+  `nuthatch recipe add total_supply` drops in a SQL view
   that computes an ERC-20's `totalSupply()` as Σ minted − Σ burned from Transfer events - deterministic,
   free, no archive node. That view runs at query time; it is not a DBSP circuit. It derives what a
   subgraph pays an archive node to fetch. For the handful of
