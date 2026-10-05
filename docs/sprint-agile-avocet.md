@@ -1,5 +1,10 @@
 # Sprint: agile-avocet
 
+**Closed 2026-10-05.** Every agile-avocet issue is closed except #1851, done on a branch whose PR
+Chief opens. 4.6.0 and 4.7.0 shipped; all six production nests run 4.7.0. The README quickstart was
+run as written on a clean macOS environment and a clean ubuntu:24.04 container: 6,844 and 6,980 WETH
+transfers counted. Next: brisk-bunting.
+
 **Scoped 2026-10-04, not started. Starts when every `zealous-zebra` issue is closed and its release
 is cut.**
 
