@@ -157,6 +157,16 @@ async fn spawn_declared(
     })
     .await;
     assert!(landed, "nest did not index to block {tip} in time");
+    // The store commits a window before the entities are fed it (#1913), so `last_block` alone can
+    // lead the relation by a window (#1921).
+    let entities = rt.state.entities.clone();
+    let fed = wait_until(POLL_TIMEOUT, || {
+        entities
+            .iter()
+            .all(|e| e.unavailable().is_some() || e.fault().is_some() || e.applied_through() >= tip)
+    })
+    .await;
+    assert!(fed, "the entities did not fold through block {tip} in time");
     rt
 }
 
@@ -253,14 +263,14 @@ async fn entity_converges_after_reorg(fork: u64) {
     );
 
     let store = rt.state.store.clone();
-    let want_hash = block_hash(CHAIN_LEN, 1);
+    let entities = rt.state.entities.clone();
     let converged = wait_until(POLL_TIMEOUT, || {
-        match store.get_entity(&nuthatch::store::Store::entity_key(CHAIN_LEN, 0)) {
-            Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|v| v["block_hash"].as_str().map(|h| h == want_hash))
-                .unwrap_or(false),
-            _ => false,
+        // The store commits the replayed window before the entity is fed it (#1913). The retraction
+        // was enqueued before that commit and stamps the fork, so a flushed watermark back at the
+        // head means the replay has been folded too (#1921).
+        replacement_head_landed(store.as_ref()) && {
+            entities[0].flush();
+            entities[0].applied_through() == CHAIN_LEN
         }
     })
     .await;
@@ -1358,6 +1368,14 @@ async fn an_entity_converges_on_a_clean_replay_after_a_reorg() {
     entity_converges_after_reorg(4).await;
 }
 
+/// #1921, the case CI shrank to: a two-block reorg cuts exactly the last window, so the replay is
+/// one commit followed by one entity feed. Read the instant the store showed the replacement
+/// block, the relation held the retraction and not yet the replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entity_converges_after_a_reorg_of_the_last_window() {
+    entity_converges_after_reorg(CHAIN_LEN - 2).await;
+}
+
 /// **#822 criterion 2: a direct keyed read does not invoke DuckDB or scan canonical fact history.**
 ///
 /// Asserted by construction rather than by inspecting a plan: `derived_key` reads the circuit's own
@@ -1786,8 +1804,8 @@ max_rows = 10000
     tape.advance_tip_to(16);
     let entity = &rt.state.entities[0];
     let store = &rt.state.store;
-    // Entities fold a window before the store commits it, so the watermark alone can lead the rows
-    // the reference reads.
+    // The store commits a window before the entity is fed it (#1913), so neither watermark alone
+    // says both sides hold block 16.
     let applied = wait_until(POLL_TIMEOUT, || {
         let (_, a) = entity.len_and_watermark();
         a.through == 16
@@ -1958,5 +1976,67 @@ max_rows = {}
     assert!(
         quarantined,
         "a nest whose entity faulted on the last block must be quarantined without another block"
+    );
+}
+
+/// Does the store hold the replacement head, i.e. has the reorg's replay been committed?
+fn replacement_head_landed(store: &dyn nuthatch::store::HotStore) -> bool {
+    let want = block_hash(CHAIN_LEN, 1);
+    match store.get_entity(&nuthatch::store::Store::entity_key(CHAIN_LEN, 0)) {
+        Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v["block_hash"].as_str().map(|h| h == want))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// #1921, read at the instant the store shows the replacement head rather than a poll later. The
+/// store commits the replayed window before the entity is fed it (#1913), so the relation may still
+/// be the retracted one; what it must never be is mislabelled. Under one lock, rows and watermark
+/// agree: the fork with the retraction, or the head with the replay.
+///
+/// The read lands in that gap by construction: on a current-thread runtime the ingest task runs only
+/// when this body yields, and nothing between the tape serving the replayed fetch and the commit's
+/// blocking call pends. Yield until that fetch, then spin until the commit lands, then read.
+#[tokio::test(flavor = "current_thread")]
+async fn an_entity_read_as_the_store_reconverges_is_labelled_for_what_it_holds() {
+    let fork = CHAIN_LEN - 2;
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    let rt = spawn_with_entity(dir.path(), tape.clone(), CHAIN_LEN).await;
+    let fetched_before = tape.logs_call_count();
+    tape.reorg(
+        fork,
+        ((fork + 1)..=CHAIN_LEN).map(replacement_block).collect(),
+    );
+    let start = std::time::Instant::now();
+    while tape.logs_call_count() == fetched_before {
+        assert!(
+            start.elapsed() < POLL_TIMEOUT,
+            "the replayed window was never fetched"
+        );
+        tokio::task::yield_now().await;
+    }
+    while !replacement_head_landed(rt.state.store.as_ref()) {
+        assert!(
+            start.elapsed() < POLL_TIMEOUT,
+            "the replayed window was fetched but never committed"
+        );
+        std::hint::spin_loop();
+    }
+    let entity = &rt.state.entities[0];
+    entity.flush();
+    let (rows, applied) = entity.rows_as_json_with_watermark();
+    let replayed = rows.iter().any(|r| r["to"] == account(4));
+    shutdown(rt);
+    assert!(
+        applied.through == if replayed { CHAIN_LEN } else { fork },
+        "rows {rows:?} labelled through {}",
+        applied.through
     );
 }
