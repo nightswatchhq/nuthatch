@@ -33,7 +33,7 @@ use anyhow::Result;
 
 use crate::controlplane::{ControlPlane, DEFAULT_WORKER_TTL_SECS};
 use crate::scheduler::{plan, Assignment, Plan};
-use crate::store::{HotStore, LeaseHeld};
+use crate::store::{HotStore, LeaseHeld, LostOwnership};
 
 /// What one tick actually did, as opposed to what it intended. Returned rather than logged-and-
 /// forgotten so a caller can assert on it, and so an operator endpoint can report it.
@@ -51,6 +51,12 @@ pub struct TickOutcome {
     /// What nobody could place, straight from the plan. Surfaced every tick so an under-served fleet
     /// is loud rather than merely incomplete.
     pub unplaceable: Vec<String>,
+    /// Cursors leased to this worker once the tick is done: what it renewed plus what it acquired.
+    /// The worker's own memory of what it holds is replaced by this each tick, because a lease can be
+    /// taken from under a worker between ticks and a remembered `held` cannot see that.
+    pub held: Vec<String>,
+    /// Cursors whose renewal the store refused: the fence had moved, so another holder has them.
+    pub lost: Vec<String>,
 }
 
 /// A worker's view of the cursors it can act on: chain → its hot store.
@@ -132,11 +138,22 @@ pub fn tick(
         if held_here.contains(chain.as_str()) {
             // Ours already - extend rather than re-acquire, so the fence stays put and our in-flight
             // writes stay valid.
-            store.renew_lease(lease_ttl_secs)?;
+            match store.renew_lease(lease_ttl_secs) {
+                Ok(_) => out.held.push(chain.clone()),
+                // The fence moved under us: another holder has this cursor. Recorded, not returned,
+                // so the caller stops this one and the other cursors still get their tick.
+                Err(e) if e.downcast_ref::<LostOwnership>().is_some() => {
+                    out.lost.push(chain.clone())
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
         match store.acquire_lease(worker_id, lease_ttl_secs) {
-            Ok(_) => out.acquired.push(chain.clone()),
+            Ok(_) => {
+                out.acquired.push(chain.clone());
+                out.held.push(chain.clone());
+            }
             // Someone got there first. Benign by design - see the module docs.
             Err(e) if e.downcast_ref::<LeaseHeld>().is_some() => out.contended.push(chain.clone()),
             Err(e) => return Err(e),
@@ -147,5 +164,7 @@ pub fn tick(
     out.released.sort();
     out.contended.sort();
     out.unplaceable.sort();
+    out.held.sort();
+    out.lost.sort();
     Ok(out)
 }
