@@ -1,0 +1,523 @@
+{
+  "label": "tip lag: footprint fixture, moving tip, 4 Transfers a block, poll 1s",
+  "version": "nuthatch 4.7.0",
+  "commit": "b27f520b56b9eda98a6a90d8986ce5e50624a98a",
+  "provider": "footprint-rpc.py --moving, local",
+  "hardware": "4 cores, Linux x86_64",
+  "poll_interval_ms": 1000,
+  "samples": 100,
+  "lag_ms": {
+    "p50": 548,
+    "p99": 1008,
+    "min": 36,
+    "max": 1017
+  },
+  "after_seen_ms": {
+    "p50": 17,
+    "p99": 157,
+    "min": 7,
+    "max": 279
+  },
+  "raw": [
+    {
+      "block": 20006,
+      "lag_ms": 774,
+      "after_seen_ms": 23
+    },
+    {
+      "block": 20007,
+      "lag_ms": 445,
+      "after_seen_ms": 20
+    },
+    {
+      "block": 20008,
+      "lag_ms": 36,
+      "after_seen_ms": 18
+    },
+    {
+      "block": 20009,
+      "lag_ms": 250,
+      "after_seen_ms": 10
+    },
+    {
+      "block": 20010,
+      "lag_ms": 560,
+      "after_seen_ms": 23
+    },
+    {
+      "block": 20011,
+      "lag_ms": 1017,
+      "after_seen_ms": 19
+    },
+    {
+      "block": 20012,
+      "lag_ms": 919,
+      "after_seen_ms": 17
+    },
+    {
+      "block": 20013,
+      "lag_ms": 578,
+      "after_seen_ms": 17
+    },
+    {
+      "block": 20014,
+      "lag_ms": 542,
+      "after_seen_ms": 279
+    },
+    {
+      "block": 20015,
+      "lag_ms": 826,
+      "after_seen_ms": 113
+    },
+    {
+      "block": 20016,
+      "lag_ms": 1006,
+      "after_seen_ms": 15
+    },
+    {
+      "block": 20017,
+      "lag_ms": 496,
+      "after_seen_ms": 22
+    },
+    {
+      "block": 20018,
+      "lag_ms": 904,
+      "after_seen_ms": 17
+    },
+    {
+      "block": 20019,
+      "lag_ms": 772,
+      "after_seen_ms": 13
+    },
+    {
+      "block": 20020,
+      "lag_ms": 185,
+      "after_seen_ms": 14
+    },
+    {
+      "block": 20021,
+      "lag_ms": 783,
+      "after_seen_ms": 157
+    },
+    {
+      "block": 20022,
+      "lag_ms": 201,
+      "after_seen_ms": 15
+    },
+    {
+      "block": 20023,
+      "lag_ms": 201,
+      "after_seen_ms": 18
+    },
+    {
+      "block": 20024,
+      "lag_ms": 838,
+      "after_seen_ms": 18
+    },
+    {
+      "block": 20025,
+      "lag_ms": 299,
+      "after_seen_ms": 18
+    },
+    {
+      "block": 20026,
+      "lag_ms": 398,
+      "after_seen_ms": 22
+    },
+    {
+      "block": 20027,
+      "lag_ms": 104,
+      "after_seen_ms": 11
+    },
+    {
+      "block": 20028,
+      "lag_ms": 792,
+      "after_seen_ms": 20
+    },
+    {
+      "block": 20029,
+      "lag_ms": 921,
+      "after_seen_ms": 11
+    },
+    {
+      "block": 20030,
+      "lag_ms": 709,
+      "after_seen_ms": 21
+    },
+    {
+      "block": 20031,
+      "lag_ms": 119,
+      "after_seen_ms": 19
+    },
+    {
+      "block": 20032,
+      "lag_ms": 514,
+      "after_seen_ms": 19
+    },
+    {
+      "block": 20033,
+      "lag_ms": 348,
+      "after_seen_ms": 18
+    },
+    {
+      "block": 20034,
+      "lag_ms": 270,
+      "after_seen_ms": 33
+    },
+    {
+      "block": 20035,
+      "lag_ms": 365,
+      "after_seen_ms": 20
+    },
+    {
+      "block": 20036,
+      "lag_ms": 950,
+      "after_seen_ms": 17
+    },
+    {
+      "block": 20037,
+      "lag_ms": 610,
+      "after_seen_ms": 22
+    },
+    {
+      "block": 20038,
+      "lag_ms": 153,
+      "after_seen_ms": 21
+    },
+    {
+      "block": 20039,
+      "lag_ms": 430,
+      "after_seen_ms": 7
+    },
+    {
+      "block": 20040,
+      "lag_ms": 742,
+      "after_seen_ms": 21
+    },
+    {
+      "block": 20041,
+      "lag_ms": 283,
+      "after_seen_ms": 19
+    },
+    {
+      "block": 20042,
+      "lag_ms": 991,
+      "after_seen_ms": 36
+    },
+    {
+      "block": 20043,
+      "lag_ms": 54,
+      "after_seen_ms": 8
+    },
+    {
+      "block": 20044,
+      "lag_ms": 708,
+      "after_seen_ms": 17
+    },
+    {
+      "block": 20045,
+      "lag_ms": 317,
+      "after_seen_ms": 14
+    },
+    {
+      "block": 20046,
+      "lag_ms": 250,
+      "after_seen_ms": 14
+    },
+    {
+      "block": 20047,
+      "lag_ms": 301,
+      "after_seen_ms": 22
+    },
+    {
+      "block": 20048,
+      "lag_ms": 612,
+      "after_seen_ms": 13
+    },
+    {
+      "block": 20049,
+      "lag_ms": 169,
+      "after_seen_ms": 11
+    },
+    {
+      "block": 20050,
+      "lag_ms": 988,
+      "after_seen_ms": 14
+    },
+    {
+      "block": 20051,
+      "lag_ms": 742,
+      "after_seen_ms": 16
+    },
+    {
+      "block": 20052,
+      "lag_ms": 954,
+      "after_seen_ms": 16
+    },
+    {
+      "block": 20053,
+      "lag_ms": 685,
+      "after_seen_ms": 135
+    },
+    {
+      "block": 20054,
+      "lag_ms": 875,
+      "after_seen_ms": 9
+    },
+    {
+      "block": 20055,
+      "lag_ms": 982,
+      "after_seen_ms": 10
+    },
+    {
+      "block": 20056,
+      "lag_ms": 742,
+      "after_seen_ms": 19
+    },
+    {
+      "block": 20057,
+      "lag_ms": 874,
+      "after_seen_ms": 23
+    },
+    {
+      "block": 20058,
+      "lag_ms": 514,
+      "after_seen_ms": 14
+    },
+    {
+      "block": 20059,
+      "lag_ms": 104,
+      "after_seen_ms": 20
+    },
+    {
+      "block": 20060,
+      "lag_ms": 269,
+      "after_seen_ms": 9
+    },
+    {
+      "block": 20061,
+      "lag_ms": 775,
+      "after_seen_ms": 15
+    },
+    {
+      "block": 20062,
+      "lag_ms": 219,
+      "after_seen_ms": 22
+    },
+    {
+      "block": 20063,
+      "lag_ms": 779,
+      "after_seen_ms": 35
+    },
+    {
+      "block": 20064,
+      "lag_ms": 727,
+      "after_seen_ms": 17
+    },
+    {
+      "block": 20065,
+      "lag_ms": 318,
+      "after_seen_ms": 10
+    },
+    {
+      "block": 20066,
+      "lag_ms": 367,
+      "after_seen_ms": 10
+    },
+    {
+      "block": 20067,
+      "lag_ms": 1007,
+      "after_seen_ms": 17
+    },
+    {
+      "block": 20068,
+      "lag_ms": 481,
+      "after_seen_ms": 14
+    },
+    {
+      "block": 20069,
+      "lag_ms": 596,
+      "after_seen_ms": 13
+    },
+    {
+      "block": 20070,
+      "lag_ms": 977,
+      "after_seen_ms": 30
+    },
+    {
+      "block": 20071,
+      "lag_ms": 335,
+      "after_seen_ms": 10
+    },
+    {
+      "block": 20072,
+      "lag_ms": 89,
+      "after_seen_ms": 11
+    },
+    {
+      "block": 20073,
+      "lag_ms": 944,
+      "after_seen_ms": 29
+    },
+    {
+      "block": 20074,
+      "lag_ms": 39,
+      "after_seen_ms": 10
+    },
+    {
+      "block": 20075,
+      "lag_ms": 1008,
+      "after_seen_ms": 38
+    },
+    {
+      "block": 20076,
+      "lag_ms": 367,
+      "after_seen_ms": 9
+    },
+    {
+      "block": 20077,
+      "lag_ms": 629,
+      "after_seen_ms": 19
+    },
+    {
+      "block": 20078,
+      "lag_ms": 708,
+      "after_seen_ms": 19
+    },
+    {
+      "block": 20079,
+      "lag_ms": 596,
+      "after_seen_ms": 20
+    },
+    {
+      "block": 20080,
+      "lag_ms": 975,
+      "after_seen_ms": 12
+    },
+    {
+      "block": 20081,
+      "lag_ms": 258,
+      "after_seen_ms": 32
+    },
+    {
+      "block": 20082,
+      "lag_ms": 514,
+      "after_seen_ms": 13
+    },
+    {
+      "block": 20083,
+      "lag_ms": 400,
+      "after_seen_ms": 14
+    },
+    {
+      "block": 20084,
+      "lag_ms": 661,
+      "after_seen_ms": 16
+    },
+    {
+      "block": 20085,
+      "lag_ms": 727,
+      "after_seen_ms": 13
+    },
+    {
+      "block": 20086,
+      "lag_ms": 712,
+      "after_seen_ms": 12
+    },
+    {
+      "block": 20087,
+      "lag_ms": 548,
+      "after_seen_ms": 22
+    },
+    {
+      "block": 20088,
+      "lag_ms": 824,
+      "after_seen_ms": 16
+    },
+    {
+      "block": 20089,
+      "lag_ms": 647,
+      "after_seen_ms": 13
+    },
+    {
+      "block": 20090,
+      "lag_ms": 72,
+      "after_seen_ms": 15
+    },
+    {
+      "block": 20091,
+      "lag_ms": 73,
+      "after_seen_ms": 12
+    },
+    {
+      "block": 20092,
+      "lag_ms": 417,
+      "after_seen_ms": 19
+    },
+    {
+      "block": 20093,
+      "lag_ms": 351,
+      "after_seen_ms": 20
+    },
+    {
+      "block": 20094,
+      "lag_ms": 40,
+      "after_seen_ms": 25
+    },
+    {
+      "block": 20095,
+      "lag_ms": 270,
+      "after_seen_ms": 24
+    },
+    {
+      "block": 20096,
+      "lag_ms": 925,
+      "after_seen_ms": 23
+    },
+    {
+      "block": 20097,
+      "lag_ms": 40,
+      "after_seen_ms": 11
+    },
+    {
+      "block": 20098,
+      "lag_ms": 90,
+      "after_seen_ms": 23
+    },
+    {
+      "block": 20099,
+      "lag_ms": 500,
+      "after_seen_ms": 17
+    },
+    {
+      "block": 20100,
+      "lag_ms": 614,
+      "after_seen_ms": 18
+    },
+    {
+      "block": 20101,
+      "lag_ms": 928,
+      "after_seen_ms": 12
+    },
+    {
+      "block": 20102,
+      "lag_ms": 106,
+      "after_seen_ms": 18
+    },
+    {
+      "block": 20103,
+      "lag_ms": 695,
+      "after_seen_ms": 16
+    },
+    {
+      "block": 20104,
+      "lag_ms": 302,
+      "after_seen_ms": 24
+    },
+    {
+      "block": 20105,
+      "lag_ms": 549,
+      "after_seen_ms": 15
+    }
+  ]
+}

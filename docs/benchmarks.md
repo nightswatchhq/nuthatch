@@ -55,6 +55,34 @@ rule (ci.yml): a ceiling that passes the known break is decoration. A throughput
 scenario where nuthatch's own work dominates the wall clock. Until there is one, the floor is a
 design target measured by hand with `bench backfill`, not a gate.
 
+## Tip lag is gated on its after-seen median
+
+The `tip lag` job runs `.github/workflows/tip-lag.sh` on every PR. `footprint-rpc.py --moving` serves
+the footprint chain with a tip the script advances one block at a time, and `dev --poll-interval 1s`
+follows it. For 100 blocks the script records two figures: **lag**, from the block appearing to its
+four rows answering through `/sql`, and **after seen**, from nuthatch's first `eth_blockNumber`
+reporting the block to the same answer. After seen is the fetch, decode and commit without the wait
+for the next poll. Both go to the step summary and the artifact
+([runner report](bench/tip-lag-runner.json)). The job fails when the after-seen p50 exceeds 30 ms, or
+when a block's rows are not queryable within 30 s.
+
+#1884 measured the noise and then put a sleep before the hot-store commit, behind an environment
+variable in a throwaway build, to see what each figure could detect. Three batches of 100 per row,
+`ubuntu-latest` (4 cores) and the ThinkPad (32 cores). The 4.7.0 row includes the throwaway build
+run with a 0 ms sleep:
+
+| build | after-seen p50, runner | after-seen p50, ThinkPad | lag p50, runner |
+| --- | --- | --- | --- |
+| 4.7.0 | 17, 18, 18, 19 ms | 19, 20, 21, 19, 25, 23 ms | 497-604 ms |
+| +20 ms before the commit | 38, 38, 39 ms | 42, 43, 43 ms | 509-600 ms |
+| +50 ms before the commit | 66, 67, 68 ms | 71, 74, 71 ms | 561-615 ms |
+
+The after-seen median sees a 20 ms delay with no overlap on either machine, so it carries the
+ceiling, set at 30 ms between the runner's 19 and 38. The lag median moves about 100 ms between runs
+on where the block lands in the poll interval, more than a 50 ms delay moves it, so it is tracked
+and not gated. Both p99s are tracked: the runner's after-seen p99 ran from 32 to 229 ms at a fixed
+build, which is preemption rather than nuthatch.
+
 ## Workloads (pinned, public, reproducible)
 
 | ID | Nest | Range | Character |

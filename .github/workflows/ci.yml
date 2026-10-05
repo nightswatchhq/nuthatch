@@ -1094,6 +1094,36 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  tip-lag:
+    name: tip lag
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: download binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nuthatch-release
+          path: bin
+      - name: measure tip lag
+        # #1884. After-seen p50 read 17-19 ms in four runs here; a 20 ms sleep before the commit read
+        # 38-39 ms in three. 30 ms sits between. The total lag and both p99s are tracked, not gated.
+        env:
+          BIN: bin/nuthatch
+          OUT: tip-lag-report.json
+          MAX_SEEN_P50_MS: "30"
+        run: |
+          chmod +x bin/nuthatch
+          bash .github/workflows/tip-lag.sh
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tip-lag-report
+          path: tip-lag-report.json
+          retention-days: 30
+
   fuzz-smoke:
     name: fuzz smoke (decode path)
     runs-on: ubuntu-latest
