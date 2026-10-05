@@ -256,7 +256,7 @@ beside `[runtime]`), one isolated cursor per chain, and each nest declares its o
 name = "my-runtime"
 max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048); the runtime's
                               # total budget is Σ cursors
-default_tenant = "acme"       # optional; the tenant whose mounts are served without a tenant
+default_tenant = "acme"       # optional; the tenant a mount belongs to when it does not say, served without a tenant segment
                               # segment in the route (default "default"). It does NOT change which
                               # tenant a mount without `tenant` belongs to: that is always
                               # "default", which would then serve at /default/<alias>/…. Opaque -
@@ -503,9 +503,9 @@ nid = "9f2c…"         # same nest, one dataset, one backfill
 or whatever `[runtime] default_tenant` names) serves at `/usdc/…`; any other tenant's at
 `/acme/usdc/…`. Each mount's route depends on its own tenant alone (3.13.1), so adding or removing
 another tenant never moves it, before or after a restart. A runtime whose mounts all belong to the
-default tenant never shows the word in a URL. Setting `default_tenant = "acme"` does not rename a
-mount that omits `tenant`: it stays `default` and moves to `/default/usdc/…`, so set the key only
-when every mount names its tenant. `GET /nests` reports each mount's `tenant` and `base_path`.
+default tenant never shows the word in a URL. A mount that omits `tenant` belongs to the default
+tenant, so with `default_tenant = "acme"` it is served at `/usdc/…` and a mount that says
+`tenant = "default"` at `/default/usdc/…` (#1933). `GET /nests` reports each mount's `tenant` and `base_path`.
 
 Both `tenant` and `alias` are path segments, so both are restricted to letters, digits, `_` and `-`.
 Opaque means nuthatch does not interpret it, not that it may contain `..`.
