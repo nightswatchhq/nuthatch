@@ -404,6 +404,13 @@ Screen sealed transfers against a list snapshot, recording `sanction_hit` annota
 - `--to <TO>` - Last block of the range to screen (inclusive)
 - `--dir <DIR>` - Nest directory (must contain a `nuthatch.toml` and sealed segments over the range)
 
+## `nuthatch seed`
+
+Fill a nest that has not indexed from a published mirror, instead of backfilling over RPC
+
+- `--from <FROM>` - The mirror `publish sync` wrote: a filesystem path, `s3://bucket/prefix`, or the `https://` address of a public one
+- `--dir <DIR>` - Nest directory
+
 ## `nuthatch serve`
 
 Serve a nest without indexing it (RFC-0022 slice 3)
