@@ -6834,10 +6834,16 @@ impl NestIngest {
             .get_meta("last_block")?
             .and_then(|v| v.parse::<u64>().ok());
         let fold_floor = next.max(committed_through.map_or(0, |b| b + 1));
+        // A sealed block's rows were folded when they first arrived and are pruned from hot since, so
+        // the lookup below would find nothing and fold them a second time.
+        let sealed_through = self.store.sealed_through();
         let mut stale_tail: Option<(u64, u64)> = None;
         rows.retain(|r| {
             if r.block_number >= fold_floor {
                 return true;
+            }
+            if sealed_through > 0 && r.block_number <= sealed_through {
+                return false;
             }
             match self
                 .store
@@ -15571,6 +15577,42 @@ template = "pool"
             store.entity_keys().unwrap().len(),
             12,
             "six blocks of two rows, each stored exactly once"
+        );
+    }
+
+    /// A refetched tail block that has since been sealed and pruned is no longer in the store, but was
+    /// folded when it first arrived: it must be dropped, not folded again. Reached whenever the sealed
+    /// watermark sits within the tail of the cursor, as it does with a narrow window near finality.
+    #[tokio::test]
+    async fn a_refetched_row_sealed_since_is_not_folded_again() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let recipient = "0xdb5985dbd132b9e5cc4bf0a18a8fb04a396ba0a0";
+
+        let first: Vec<_> = (10u64..=12).map(|b| transfer_log(b, 0)).collect();
+        nest.process_window(source.as_ref(), &first, 10, 12, 100)
+            .await
+            .unwrap()
+            .expect("first window commits");
+        nest.balances.flush();
+        let after_first = nest.balances.balance(recipient).unwrap();
+        // As a seal through block 12 leaves it: the rows gone from hot, the watermark at 12.
+        nest.store
+            .prune_and_set_meta(10, 12, "sealed_through", "12")
+            .unwrap();
+
+        let second: Vec<_> = (11u64..=13).map(|b| transfer_log(b, 0)).collect();
+        nest.process_window(source.as_ref(), &second, 13, 13, 100)
+            .await
+            .unwrap()
+            .expect("second window commits");
+        nest.balances.flush();
+        assert_eq!(
+            nest.balances.balance(recipient).unwrap(),
+            after_first / 3 * 4,
+            "one new block after three: the two sealed blocks refetched must not be folded again"
         );
     }
 
