@@ -6,8 +6,9 @@
 //! `--seal-direct` backfill leaves it on finishing at the snapshot's `complete_through`. The first
 //! `dev` is then a warm start: it folds the segments and follows the chain from the next block.
 //!
-//! The hashes prove the files are the ones the publisher wrote. Nothing here proves the publisher
-//! indexed the chain honestly. That is decided by whose mirror the operator points at.
+//! The hashes prove each file is the one the mirror's own catalogue names, so nothing changed in
+//! transit or at rest. They prove nothing about who wrote the catalogue or whether it is true to the
+//! chain. That is decided by whose mirror the operator points at.
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
@@ -19,6 +20,9 @@ use crate::publish::{self, Mirror, SeedEnvelope};
 use crate::seal::{self, Manifest, Segment, MANIFEST_FILE};
 use crate::store::Store;
 
+/// Present from the moment a seed installs a catalogue until it has stamped the store complete. A
+/// store holding it is half-seeded: `dev` refuses it and `seed` finishes it.
+pub const SEED_PENDING_KEY: &str = "seed_pending";
 const PARALLELISM: usize = 8;
 /// Reads of the catalogue and the snapshot that may disagree before giving up: a publisher writes
 /// the first, then the second, and a pass is short.
@@ -59,15 +63,20 @@ pub async fn seed(dir: &Path, from: &str) -> Result<SeedReport> {
     let (catalogue, wanted) = local_catalogue(published, &snapshot)?;
 
     let (fetched, fetched_bytes) = download(mirror.as_ref(), dir, &dataset, &wanted).await?;
-    seal::install_manifest(dir, &catalogue)?;
-
     let store = Store::open(&db)?;
+    store.set_meta(SEED_PENDING_KEY, &dataset)?;
+    seal::install_manifest(dir, &catalogue)?;
     crate::indexer::stamp_fresh_store(&store, dir, &config)?;
     let through = snapshot.complete_through.to_string();
-    store.set_meta(START_BLOCK_KEY, &snapshot.indexed_from.to_string())?;
-    store.set_meta(SEALED_THROUGH_KEY, &through)?;
-    // Last: this key is what makes the next start warm, so an interrupted seed stays re-runnable.
-    store.set_meta(LAST_BLOCK_KEY, &through)?;
+    let from = snapshot.indexed_from.to_string();
+    store.set_metas(
+        &[
+            (START_BLOCK_KEY, &from),
+            (SEALED_THROUGH_KEY, &through),
+            (LAST_BLOCK_KEY, &through),
+        ],
+        &[SEED_PENDING_KEY],
+    )?;
 
     Ok(SeedReport {
         dataset,
@@ -96,8 +105,8 @@ pub async fn run(dir: &Path, from: &str) -> Result<()> {
         r.complete_through + 1
     );
     println!(
-        "The files match the mirror's catalogue. Whether the mirror indexed the chain correctly is \
-         not something a hash can show."
+        "Every file matches the mirror's catalogue. Who wrote that catalogue, and whether it is true \
+         to the chain, is not something a hash can show."
     );
     Ok(())
 }
@@ -108,6 +117,9 @@ fn refuse_an_indexed_nest(db: &Path) -> Result<()> {
     }
     let store = Store::open_existing(db)
         .context("opening this nest's store (is the nest running? stop it first)")?;
+    if store.get_meta(SEED_PENDING_KEY)?.is_some() {
+        return Ok(());
+    }
     if store.get_meta(LAST_BLOCK_KEY)?.is_some() || store.sealed_through() > 0 {
         bail!(
             "this nest has already indexed. Seeding fills a nest that holds no data; to replace \
@@ -230,6 +242,19 @@ fn local_catalogue(mut published: Manifest, s: &SeedEnvelope) -> Result<(Manifes
             .or_default()
             .push(tail);
     }
+    for (table, segs) in published.tables.iter_mut() {
+        segs.sort_by_key(|s| (s.from_block, s.to_block));
+        for pair in segs.windows(2) {
+            if pair[1].from_block <= pair[0].to_block {
+                bail!(
+                    "the mirror lists segments of {table} that overlap at blocks {}..={}; seeding it \
+                     would count those rows twice",
+                    pair[1].from_block,
+                    pair[0].to_block
+                );
+            }
+        }
+    }
     Ok((published, wanted))
 }
 
@@ -342,6 +367,35 @@ mod tests {
         for bad in ["../../x", &"AB".repeat(32), &"ab".repeat(31)] {
             canonical("t", &mut segment(bad, 1, 5), 5).expect_err("a hash that is not one");
         }
+    }
+
+    fn envelope(complete_through: u64) -> SeedEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "layout_version": 1, "chain_id": 1, "data_identity": "d", "indexed_from": 1,
+            "complete_through": complete_through, "catalogue_sha256": "c", "tails": {},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_catalogue_listing_rows_twice_is_refused() {
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        for segs in [
+            vec![segment(&a, 1, 5), segment(&a, 1, 5)],
+            vec![segment(&a, 1, 5), segment(&b, 5, 9)],
+            vec![segment(&b, 4, 9), segment(&a, 1, 5)],
+        ] {
+            let mut m = Manifest::default();
+            m.tables.insert("t".into(), segs);
+            let err = local_catalogue(m, &envelope(9))
+                .err()
+                .expect("overlapping segments");
+            assert!(format!("{err:#}").contains("twice"), "{err:#}");
+        }
+        let mut m = Manifest::default();
+        m.tables
+            .insert("t".into(), vec![segment(&b, 6, 9), segment(&a, 1, 5)]);
+        local_catalogue(m, &envelope(9)).expect("adjacent segments are fine");
     }
 
     #[test]

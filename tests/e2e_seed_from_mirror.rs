@@ -348,3 +348,52 @@ async fn a_running_nest_publishes_a_snapshot_another_can_seed_from() {
     );
     assert_eq!(recipient_balance(&got), 5_500);
 }
+
+/// A seed killed after it installed the catalogue and before it stamped the store would otherwise
+/// leave segments that a cold `dev` indexes again on top of.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_seed_is_refused_by_dev_and_finished_by_seed() {
+    let publisher = tempfile::tempdir().unwrap();
+    let mirror = tempfile::tempdir().unwrap();
+    published(publisher.path(), mirror.path()).await;
+    let seeded = tempfile::tempdir().unwrap();
+    scaffold_nest(seeded.path(), PUBLISHER, USDC);
+    let from = mirror.path().to_str().unwrap();
+    nuthatch::seed::seed(seeded.path(), from)
+        .await
+        .expect("seed");
+
+    // The state a kill leaves between installing the catalogue and the final commit.
+    {
+        let store = nuthatch::store::Store::open(&seeded.path().join("nuthatch.redb")).unwrap();
+        store
+            .set_metas(
+                &[(nuthatch::seed::SEED_PENDING_KEY, "x")],
+                &["last_block", "sealed_through"],
+            )
+            .unwrap();
+    }
+    let cfg = scaffold_nest(seeded.path(), PUBLISHER, USDC);
+    let refused = indexer::spawn_nest(
+        chain(14),
+        seeded.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await;
+    let err = refused
+        .err()
+        .expect("dev must not start a half-seeded nest");
+    assert!(format!("{err:#}").contains("did not finish"), "{err:#}");
+
+    nuthatch::seed::seed(seeded.path(), from)
+        .await
+        .expect("seed finishes what it started");
+    let got = run_to(seeded.path(), chain(14), PUBLISHER, 14).await;
+    assert_eq!(recipient_balance(&got), 5_500);
+}

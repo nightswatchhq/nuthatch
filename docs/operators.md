@@ -1359,8 +1359,10 @@ publisher's history begins at. Both are in a seed snapshot under `<dataset>/_see
 running nest's `--publish-target` once it has caught up, and by `publish sync` on a stopped nest.
 `publish sync` beside a running nest cannot read its store and leaves the snapshot alone. A mirror
 whose history begins after the nest's declared start block is refused.
-The hashes show the files are the publisher's. They do not show the publisher indexed the chain
-correctly, so seed from an operator you would trust to run the nest for you.
+The hashes show every file is the one the mirror's catalogue names. They do not show who wrote that
+catalogue or that it is true to the chain, so seed from an operator you would trust to run the nest
+for you. A seed that is interrupted leaves the nest marked, and `dev` refuses it until `seed` is run
+again.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 

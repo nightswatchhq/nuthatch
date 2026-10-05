@@ -2832,6 +2832,12 @@ async fn build_nest(
     let identity = hex::encode(crate::project::decode_identity(&dir, config, &registry)?);
     // Only the ingestion owner records what a store was indexed under. A `serve` role or query FE reads a
     // store it does not own, so it compares and refuses a mismatch but never writes (#1423 review).
+    if store.get_meta(crate::seed::SEED_PENDING_KEY)?.is_some() {
+        anyhow::bail!(
+            "this nest was being seeded from a mirror and the seed did not finish. Run `nuthatch seed` \
+             again with the same --from; it keeps what it has downloaded."
+        );
+    }
     let owner = !config.read_only_role;
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps, owner)?;
     guard_registry_identity(

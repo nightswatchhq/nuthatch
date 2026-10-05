@@ -1280,6 +1280,23 @@ impl Store {
         Ok(())
     }
 
+    /// Several meta writes and removals as one commit, for state a crash must not see half of.
+    pub fn set_metas(&self, set: &[(&str, &str)], remove: &[&str]) -> Result<()> {
+        let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
+        {
+            let mut t = wtx.open_table(META)?;
+            for (k, v) in set {
+                t.insert(*k, *v)?;
+            }
+            for k in remove {
+                t.remove(*k)?;
+            }
+        }
+        self.commit(wtx)?;
+        Ok(())
+    }
+
     pub fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(META)?;
