@@ -808,6 +808,25 @@ impl EntityView {
         self.apply_window_inner(rows, weight, through, true)
     }
 
+    /// Convert a decoded window to this entity's input at `weight` without feeding it, so a caller
+    /// can fail before a commit and [`Self::apply`] only once the commit has landed. `None` for an
+    /// unavailable entity, which is fed nothing.
+    pub fn bind_window(&self, rows: &[DecodedRow], weight: ZWeight) -> Result<Option<Batch>> {
+        // An unavailable entity is fed nothing at all. Half an answer is the failure mode; none is
+        // merely an absence, and `unavailable()` is what says so.
+        if self.unavailable.is_some() {
+            return Ok(None);
+        }
+        let (left, right) = self
+            .binding
+            .window(rows)
+            .with_context(|| format!("converting a window for entity `{}`", self.name))?;
+        Ok(Some(Batch {
+            left: left.into_iter().map(|r| (r, weight)).collect(),
+            right: right.into_iter().map(|r| (r, weight)).collect(),
+        }))
+    }
+
     fn apply_window_inner(
         &self,
         rows: &[DecodedRow],
@@ -815,18 +834,8 @@ impl EntityView {
         through: u64,
         publish: bool,
     ) -> Result<()> {
-        // An unavailable entity is fed nothing at all. Half an answer is the failure mode; none is
-        // merely an absence, and `unavailable()` is what says so.
-        if self.unavailable.is_some() {
+        let Some(batch) = self.bind_window(rows, weight)? else {
             return Ok(());
-        }
-        let (left, right) = self
-            .binding
-            .window(rows)
-            .with_context(|| format!("converting a window for entity `{}`", self.name))?;
-        let batch = Batch {
-            left: left.into_iter().map(|r| (r, weight)).collect(),
-            right: right.into_iter().map(|r| (r, weight)).collect(),
         };
         if publish {
             self.apply(batch, through);

@@ -6806,17 +6806,13 @@ impl NestIngest {
     }
 
     /// Undo the views this attempt just fed. The commit did not land, so a retry starts from here.
+    /// Entities are absent because they are fed only after the commit.
     fn retract_folded_window(
         &self,
-        rows: &[crate::registry::DecodedRow],
-        through: u64,
         deltas: crate::views::WeightedBatch,
         exp_deltas: crate::exposure::ExposureBatch,
         vel_deltas: crate::velocity::VelocityBatch,
     ) {
-        for entity in self.entities.iter() {
-            let _ = entity.apply_window(rows, -1, through);
-        }
         self.balances.retract(deltas);
         self.exposure.retract(exp_deltas);
         self.velocity.retract(vel_deltas);
@@ -7195,31 +7191,40 @@ impl NestIngest {
             }
         }
 
+        // Bound before the commit and fed after it (#1906). An entity's watermark claims its blocks
+        // are in the store, and `/sql` over the store is what a reader reconciles it against.
+        let mut bound = Vec::with_capacity(self.entities.len());
+        for entity in self.entities.iter() {
+            bound.push(
+                entity.bind_window(&rows, 1).with_context(|| {
+                    format!("feeding this window to entity `{}`", entity.name())
+                })?,
+            );
+        }
         // Before the commit. A failure retracts what this attempt fed, so a retry folds the
         // window once. A restart still rebuilds these views from the store.
-        for (i, entity) in self.entities.iter().enumerate() {
-            if let Err(e) = entity.apply_window(&rows, 1, to) {
-                for done in self.entities.iter().take(i) {
-                    let _ = done.apply_window(&rows, -1, to);
-                }
-                return Err(e.context(format!("feeding this window to entity `{}`", entity.name())));
-            }
-        }
         self.balances.apply(deltas.clone());
         self.exposure.apply(exp_deltas.clone());
         self.velocity.apply(vel_deltas.clone());
         #[cfg(test)]
         if let Err(e) = take_fold_failure() {
-            self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
+            self.retract_folded_window(deltas, exp_deltas, vel_deltas);
             return Err(e);
         }
+        #[cfg(test)]
+        before_commit();
         if let Err(e) = self
             .store
             .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
             .await
         {
-            self.retract_folded_window(&rows, to, deltas, exp_deltas, vel_deltas);
+            self.retract_folded_window(deltas, exp_deltas, vel_deltas);
             return Err(e);
+        }
+        for (entity, batch) in self.entities.iter().zip(bound) {
+            if let Some(batch) = batch {
+                entity.apply(batch, to);
+            }
         }
         if let Some(why) = checkpoint_missed {
             let n = self.metrics.inc_checkpoints_missed();
@@ -8641,6 +8646,21 @@ mod entity_fixture;
 thread_local! {
     static FAIL_AFTER_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_AFTER_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `probe` inside the next `process_window`, at the instant before its commit.
+#[cfg(test)]
+fn probe_before_the_next_commit(probe: impl FnOnce() + 'static) {
+    BEFORE_COMMIT.with(|p| *p.borrow_mut() = Some(Box::new(probe)));
+}
+
+#[cfg(test)]
+fn before_commit() {
+    if let Some(probe) = BEFORE_COMMIT.with(|p| p.borrow_mut().take()) {
+        probe();
+    }
 }
 
 /// The next `process_window` feeds its views and then fails, before the commit.
@@ -15801,6 +15821,54 @@ template = "pool"
             "two transfers in two blocks, the first committed before the retry, got {got:?}"
         );
         assert_eq!(nest.store.sample_entity_keys(8).unwrap().len(), 2);
+    }
+
+    /// #1906: an entity's watermark says which blocks its rows answer for, and `/sql` over the store
+    /// is what a reader reconciles it against. Fed before the commit, the entity read "through 16"
+    /// while the store still ended at 14, and the e2e reference came back two blocks short.
+    #[tokio::test]
+    async fn an_entity_claims_no_block_the_store_has_not_committed() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("entities")).unwrap();
+        std::fs::write(
+            d.path().join("entities.toml"),
+            "[[entities]]\nname='received'\nsql='entities/received.sql'\nkey=['to']\nmax_rows=100\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("entities/received.sql"),
+            "SELECT \"to\", SUM(value) AS total FROM tok__transfer GROUP BY \"to\"",
+        )
+        .unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        assert_eq!(nest.entities.len(), 1, "premise: the entity started");
+        let entities = nest.entities.clone();
+        let seen = Arc::new(AtomicU64::new(u64::MAX));
+        let probe = seen.clone();
+        super::probe_before_the_next_commit(move || {
+            entities[0].flush();
+            let (rows, applied) = entities[0].len_and_watermark();
+            probe.store(applied.through.max(rows as u64), Ordering::SeqCst);
+        });
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        nest.process_window(source.as_ref(), &[transfer_log(10, 0)], 10, 10, 100)
+            .await
+            .expect("the window commits")
+            .expect("the window commits");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "before the commit the entity must hold no row and claim no block of this window"
+        );
+        nest.entities[0].flush();
+        let (rows, applied) = nest.entities[0].len_and_watermark();
+        assert_eq!(
+            (rows, applied.through),
+            (1, 10),
+            "after the commit it holds the window"
+        );
     }
 
     /// #1144, review: a refetched tail row that is already stored under a *different* block hash is
