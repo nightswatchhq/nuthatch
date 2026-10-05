@@ -153,3 +153,28 @@ first_diff() {
       } }
     END { if (!done) { r = nb + 1; printf "%d\t%s\t%s\n", r, (r > na ? "(no row)" : a[r]), "(no row)" } }' "$1" "$2"
 }
+
+# The box's load, so a measurement taken while something else saturates it is not read as a
+# regression (#1898). GATE_LOADAVG_FILE and GATE_NCPU stand in for the real sources in tests.
+
+# gate_ncpu: the core count.
+gate_ncpu() {
+  if [ -n "${GATE_NCPU:-}" ]; then printf '%s\n' "$GATE_NCPU"; return 0; fi
+  nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1
+}
+
+# gate_load1: the 1-minute load average, from /proc/loadavg or macOS's `sysctl -n vm.loadavg`
+# ("{ 1.23 1.50 1.60 }"); fails when it cannot be read.
+gate_load1() {
+  local raw
+  if [ -n "${GATE_LOADAVG_FILE:-}" ]; then raw=$(cat "$GATE_LOADAVG_FILE" 2>/dev/null) || return 1
+  elif [ -r /proc/loadavg ]; then raw=$(cat /proc/loadavg)
+  else raw=$(sysctl -n vm.loadavg 2>/dev/null) || return 1
+  fi
+  printf '%s\n' "$raw" | tr -d '{}' | awk 'NR == 1 && $1 ~ /^[0-9]+(\.[0-9]+)?$/ { print $1; ok = 1 } END { exit !ok }'
+}
+
+# gate_load_over LOAD NCPU LIMIT: LOAD per core is above LIMIT.
+gate_load_over() {
+  awk -v l="$1" -v n="$2" -v t="$3" 'BEGIN { exit !(l / n > t) }'
+}

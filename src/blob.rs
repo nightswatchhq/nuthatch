@@ -237,7 +237,13 @@ const NON_DATA_INPUTS: &[&str] = &[
     ".claude/",
 ];
 
+/// A hidden file or directory is never a data input: no indexing path reads one, and nests accumulate
+/// them (an engine's extension cache, `.gitignore`), which made two copies of one nest unable to
+/// find each other's mirror. Only the data identity skips them; the NID still counts every input.
 fn affects_data(path: &str) -> bool {
+    if path.split('/').any(|part| part.starts_with('.')) {
+        return false;
+    }
     !NON_DATA_INPUTS.iter().any(|p| {
         if let Some(dir) = p.strip_suffix('/') {
             path == dir || path.starts_with(p)
@@ -1082,6 +1088,29 @@ abi = "abis/c.json"
         assert!(
             DERIVED_STATE.contains(&DB_FILE) && DERIVED_STATE.contains(&"segments"),
             "adoption must carry both halves of a dataset - hot store and sealed segments"
+        );
+    }
+
+    #[test]
+    fn hidden_files_do_not_move_the_data_identity() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = build_manifest(a.path(), None).unwrap();
+        std::fs::create_dir_all(a.path().join(".duckdb/extensions")).unwrap();
+        std::fs::write(a.path().join(".duckdb/extensions/icu"), b"x").unwrap();
+        std::fs::write(a.path().join(".gitignore"), b"target/\n").unwrap();
+        std::fs::create_dir_all(a.path().join("abis/.cache")).unwrap();
+        std::fs::write(a.path().join("abis/.cache/x"), b"y").unwrap();
+        let after = build_manifest(a.path(), None).unwrap();
+        assert_eq!(
+            after.data_identity(),
+            before.data_identity(),
+            "litter moved the data identity"
+        );
+        assert_ne!(
+            after.nid(),
+            before.nid(),
+            "the NID still counts every input"
         );
     }
 
