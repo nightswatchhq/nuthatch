@@ -661,10 +661,12 @@ impl SeedEnvelope {
         data_identity: &str,
         chain_id: u64,
         indexed_from: u64,
+        watermark: u64,
     ) -> Option<Self> {
-        // The highest block any segment reaches, tails included. The publisher's own watermark may
-        // be higher, but only by blocks that held no row, so resuming here re-reads nothing sealed.
-        let complete_through = local.tables.values().flatten().map(|s| s.to_block).max()?;
+        // Every row at or below the publisher's seal watermark is in the catalogue, so a quiet nest
+        // is complete far past its last row, and a seeder need not scan the gap again.
+        let last_row = local.tables.values().flatten().map(|s| s.to_block).max()?;
+        let complete_through = last_row.max(watermark);
         let tails: std::collections::BTreeMap<_, _> = local
             .tables
             .iter()
@@ -695,15 +697,18 @@ pub(crate) fn tails_digest(tails: &std::collections::BTreeMap<String, Segment>) 
     hex::encode(h.finalize())
 }
 
-/// The publisher's start block, read from its store. Only a stopped nest's can be opened; a running
-/// one reports it through its metrics instead.
-fn stopped_indexed_from(dir: &Path) -> Option<u64> {
-    crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE))
-        .ok()?
+/// The publisher's start block and seal watermark, read from its store. Only a stopped nest's can be
+/// opened; a running one reports both through its metrics instead.
+fn stopped_publisher(dir: &Path) -> (Option<u64>, u64) {
+    let Ok(store) = crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE)) else {
+        return (None, 0);
+    };
+    let start = store
         .get_meta(crate::indexer::START_BLOCK_KEY)
-        .ok()??
-        .parse()
         .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok());
+    (start, store.sealed_through())
 }
 
 /// Write the seed snapshot: changed tails first, then the envelope naming them. Returns what it put.
@@ -800,6 +805,12 @@ pub async fn sync_with(
     parallelism: usize,
     metrics: Option<&crate::metrics::NestMetrics>,
 ) -> Result<SyncReport> {
+    // Before the catalogue: a seal writes its catalogue entry before its watermark, so a watermark
+    // read first can only understate what the catalogue read after it holds.
+    let (indexed_from, watermark) = match metrics {
+        Some(m) => (m.indexed_from(), m.sealed_through()),
+        None => stopped_publisher(dir),
+    };
     let (local_bytes, local) = read_local(dir)?;
     let catalogue = published_catalogue(&local_bytes, &local)?;
     let (data_identity, nid, bundle_hash, chain_id) = identity_of(dir)?;
@@ -919,12 +930,15 @@ pub async fn sync_with(
     uploaded.push("publish.json".into());
 
     // Last, so a seed snapshot never names a catalogue the mirror does not hold yet.
-    let indexed_from = match metrics {
-        Some(m) => m.indexed_from(),
-        None => stopped_indexed_from(dir),
-    };
     if let Some(indexed_from) = indexed_from {
-        let seed = SeedEnvelope::of(&local, &catalogue, &data_identity, chain_id, indexed_from);
+        let seed = SeedEnvelope::of(
+            &local,
+            &catalogue,
+            &data_identity,
+            chain_id,
+            indexed_from,
+            watermark,
+        );
         if let Some(seed) = seed {
             uploaded.extend(put_seed(mirror.as_ref(), dir, &seed).await?);
         }

@@ -416,3 +416,38 @@ async fn a_snapshot_that_lost_a_tail_is_refused() {
         .expect_err("a snapshot missing a tail would seed a nest without those rows");
     assert!(format!("{err:#}").contains("own digest"), "{err:#}");
 }
+
+/// A quiet nest is sealed far past its last row. The snapshot must say so, or every seeder scans
+/// the gap since that row again: data-services-nest was sixteen million blocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_nest_is_complete_through_its_watermark_not_its_last_row() {
+    let publisher = tempfile::tempdir().unwrap();
+    let mirror = tempfile::tempdir().unwrap();
+    published(publisher.path(), mirror.path()).await;
+    // The rows end at block 12; 13..=20 seal empty, which moves the watermark and writes no segment.
+    force_seal_through(publisher.path(), 12);
+    force_seal_through(publisher.path(), 20);
+    nuthatch::publish::sync(publisher.path(), mirror.path().to_str().unwrap(), false)
+        .await
+        .expect("publish sync");
+
+    let seeded = tempfile::tempdir().unwrap();
+    scaffold_nest(seeded.path(), PUBLISHER, USDC);
+    let seed = nuthatch::seed::seed(seeded.path(), mirror.path().to_str().unwrap())
+        .await
+        .expect("seed");
+    assert_eq!(
+        seed.complete_through, 20,
+        "the watermark, not the last segment at 12"
+    );
+
+    let tape = chain(24);
+    let got = run_to(seeded.path(), tape.clone(), PUBLISHER, 24).await;
+    let floor = 21 - indexer::FETCH_TAIL_OVERLAP;
+    let asked = tape.logs_ranges();
+    assert!(
+        asked.iter().all(|(from, _)| *from >= floor),
+        "a seeded quiet nest scanned the gap again: {asked:?}"
+    );
+    assert_eq!(recipient_balance(&got), 5_500);
+}
