@@ -29,8 +29,8 @@ faked: a restart drill, a deliberate reorg, breaking a nest to watch its co-tena
 comparing a row count against an independent source. That last one is the step separating *it ran* from
 *it is correct*, and no script can do it for you.
 
-CI runs the fleet half on every push - `the compose fleet comes up` stands the whole stack up, walks
-level 5, and asserts exactly one worker takes the lease.
+CI runs the fleet half on every push to `main` and every pull request - `the compose fleet comes up`
+stands the whole stack up, walks level 5, and asserts exactly one worker takes the lease.
 
 ## How to use it
 
@@ -57,11 +57,11 @@ now names one.
 
 | Level | Verified by us | On what |
 |---|---|---|
-| 0 Artifact | yes, **by hand, on 2.4.0** | From the *published* `nuthatch-x86_64-unknown-linux-gnu.tar.gz` of **v2.4.0**, on **2026-08-14**: checksum `OK` against the release's own `.sha256`, `nuthatch --version` reports `2.4.0`, the worker role refuses by name, and the binary's highest required symbol is exactly `GLIBC_2.34`, read off `objdump -T` rather than inferred from the fact that it started. All four steps, `verify.sh 0` green. **Not automated** - `release.yml` publishes the checksums and nothing in CI verifies a published artifact afterwards, so this is a practice rather than a gate, and it is only as current as the last person who did it. The aarch64 tarball is *not* covered: nobody has run this on an arm64 machine |
-| 1 Single nest | CI every commit; **production through 2.4.0** (2026-08-15) | CI, plus the Lodestar production box upgraded **2.0.0 → 2.4.0** in place, a four-version jump. Level 0 first on that machine: the *published* Linux tarball, `sha256sum -c` → `OK`, binary reports 2.4.0, glibc 2.43 against the 2.35 floor. Then all three services (`nuthatch`, `nuthatch-gns`, **`horizon-nest`** - the third is not named `nuthatch*` and a name-based enumeration misses it) restarted onto the new binary, confirmed by `readlink /proc/<pid>/exe` rather than assumed. **Row counts identical at a fixed watermark** (block ≤ 494,743,936): staking 127 / 8 / 261 / 142, GNS 3,529, plus 19 horizon tables - no gaps, no duplicates. Resumed from checkpoint, `as_of` climbing 494,747,848 → 494,754,297 (80 blocks in 20 s). End-to-end proved by **data match, not a flag**: the dashboard's newest delegation event `0x138872fd…` for 77,100,063,717,931,471,486,199 tokens returns from the nest at block 494,718,328. **One gap, self-inflicted:** the before-snapshot was piped through `head -30`, which SIGPIPE'd the capture, so only 19 of horizon's 73 tables have a before-value. Those 19 match; the other 54 are unverified and cannot be retrospectively. The two nests Lodestar depends on are fully covered |
+| 0 Artifact | yes, **by hand, on 2.4.0** | From the *published* `nuthatch-x86_64-unknown-linux-gnu.tar.gz` of **v2.4.0**, on **2026-08-14**: checksum `OK` against the release's own `.sha256`, `nuthatch --version` reports `2.4.0`, the worker role refuses by name, and the binary's highest required symbol is exactly `GLIBC_2.34`, read off `objdump -T` rather than inferred from the fact that it started. All four steps, `verify.sh 0` green. **Not automated** - `release.yml` publishes the checksums and nothing in CI verifies a published artifact afterwards, so this is a practice rather than a gate, and it is only as current as the last person who did it. **Repeated on 4.10.1, 2026-10-05, on an Apple Silicon Mac:** the published `aarch64-apple-darwin` tarball, `verify.sh 0` all four green beside its `.sha256` (the first arm64 run), and `gh attestation verify` exit 0. The same day's `x86_64-unknown-linux-gnu` tarball: checksum `OK`, attestation verified, and `objdump -T` on the unpacked binary gives `hypot`/`hypotf` at `GLIBC_2.35` as its highest requirement, linking `libc`, `libm` and `libgcc_s` only, read on the Mac without running it |
+| 1 Single nest | CI every commit; **production through 2.4.0** (2026-08-15) | CI, plus the Lodestar production box upgraded **2.0.0 → 2.4.0** in place, a four-version jump. Level 0 first on that machine: the *published* Linux tarball, `sha256sum -c` → `OK`, binary reports 2.4.0, glibc 2.43 against the 2.35 floor. Then all three services (`nuthatch`, `nuthatch-gns`, **`horizon-nest`** - the third is not named `nuthatch*` and a name-based enumeration misses it) restarted onto the new binary, confirmed by `readlink /proc/<pid>/exe` rather than assumed. **Row counts identical at a fixed watermark** (block ≤ 494,743,936): staking 127 / 8 / 261 / 142, GNS 3,529, plus 19 horizon tables - no gaps, no duplicates. Resumed from checkpoint, `as_of` climbing 494,747,848 → 494,754,297 (80 blocks in 20 s). End-to-end proved by **data match, not a flag**: the dashboard's newest delegation event `0x138872fd…` for 77,100,063,717,931,471,486,199 tokens returns from the nest at block 494,718,328. **One gap, self-inflicted:** the before-snapshot was piped through `head -30`, which SIGPIPE'd the capture, so only 19 of horizon's 73 tables have a before-value. Those 19 match; the other 54 are unverified and cannot be retrospectively. The two nests Lodestar depends on are fully covered. **Steps 1.1 to 2.2 repeated on 4.10.1, 2026-10-05, macOS:** a WETH nest over the last 200 mainnet blocks through the bundled public endpoints; `weth__transfer` at a fixed watermark counted 6,169 before a SIGTERM and 6,169 after the restart, and `nuthatch check` passed |
 | 2 Correctness | yes | CI (deterministic fixtures, property tests) |
-| 3 Many nests | yes | live two-chain run, 8-nest density run, and a 2.0 two-alias/one-dataset run |
-| 4 Guards | yes | CI + a live `/sql` adversary check. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
+| 3 Many nests | yes | live two-chain run, 8-nest density run, and a 2.0 two-alias/one-dataset run. **3.1, 3.4 and 3.6 repeated on 4.10.1, 2026-10-05:** a one-chain runtime, a second mount of the same dataset reaching `live` and unmounting while the first kept answering, and `cross-nest-adoption.sh` 10 of 10 |
+| 4 Guards | yes | CI + a live `/sql` adversary check; **4.1 and 4.2 repeated against 4.10.1 on 2026-10-05**, quoted `"read_csv"` included. **4.4 is CI-only so far** - the flip refusal and the schema-version stamp are covered by tests; no one has yet run a timestamp-free nest over a long backfill and timed it, so we publish no speed figure for it |
 | 5 Scaled mode | **across machines on 2.4.0** (2026-08-15), except skew | Two real machines on the **published 2.4.0 artifacts**: control plane, Postgres and an FE on one host, a second writer on another, reaching the store over an SSH tunnel. **5.1** both register - `{"count":2,...,"thinkpad-remote"}`. **5.2** declaring a nest starts it with no restart. **5.3** exactly one owner for the cursor. **5.4** killing the holding writer moved the lease to the remote machine and incremented `owner_fence` to 2, so the fence was exercised by a **real handover** rather than a simulated one (it reached 3 later, on a second genuine handover). **5.5** the dead writer aged out of the registry on the 30 s TTL. **5.11** the remote worker indexed **2.2 M blocks** into the other machine's Postgres - the check that could not be completed on 0.9.3, where a held cursor produced no indexing. **5.9** with the control plane stopped and Postgres deliberately left up, it indexed **3,000,000 blocks through the outage** (61,733,584 -> 64,733,584) and resumed on healing, never losing the lease; the script asserts control returns `000` and Postgres returns `1` *before* claiming a pass, so a cut that never happened cannot pass trivially. **Skew is NOT re-verified** and remains proven on v0.9.3 only: pushing a worker's clock needs root on a machine running other work. What was measured instead is the renewal cadence the skew claim rests on - `lease_expires_at` advancing 77 s over a 70 s window, on the store's clock. **One improvement found:** a worker holding a cursor with no nest present was *silent* on 0.9.3 (`nests=0`, cause unstated); on 2.4.0 it warns, naming both the cause and the remedy. |
 
 Level 5 is where independent verification is worth the most, for exactly that reason.
@@ -110,7 +110,7 @@ means a stale binary earlier in `PATH` — check `command -v nuthatch`.
 
 ```sh
 sha256sum -c nuthatch-x86_64-unknown-linux-gnu.tar.gz.sha256   # Linux
-shasum -a 256 -c nuthatch-x86_64-unknown-linux-gnu.tar.gz.sha256   # macOS
+shasum -a 256 -c nuthatch-aarch64-apple-darwin.tar.gz.sha256    # macOS
 ```
 
 Expect `nuthatch-…tar.gz: OK`. *Proves* transport integrity. Run it in the directory you unpacked
@@ -163,7 +163,7 @@ exact walk 429s on `eth_getBlockByNumber` and indexes **nothing** - the cursor h
 rather than sealing zeroed timestamps, so you get a live, queryable, empty API. The two-minute claim is
 about *API live and answering with provenance*, which it comfortably makes (17 s, measured on the
 published 2.4.0 tarball); it is not a claim that a public endpoint will feed you 2000 blocks of USDC in
-that time. See #578 for the related defect: `/ready` says `ready:true` throughout.
+that time. #578 was the related defect, closed 2026-08-15: `/ready` said `ready:true` throughout.
 
 **1.1 Scaffold**
 
@@ -174,14 +174,16 @@ nuthatch init 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --chain mainnet --alias
 Expect a scaffolded nest, and a printed table count > 0 (17, for this contract). *Proves* ABI
 resolution and code generation.
 
-**`--alias usdc` is doing real work here, not decoration.** Without it the tables are named `c0__*`
-after the positional default, and step 1.3 below - which asks for `usdc__transfer` - fails with a
-catalog error. It did, for anyone who ran this page verbatim before 2026-08-14.
+**`--alias usdc` is doing real work here, not decoration.** Without it the alias is the contract name
+from the ABI (`fiat_token_v2_2__*` for this one; `c0__*` only when the ABI carries no usable name),
+and step 1.3 below - which asks for `usdc__transfer` - fails with a catalog error. It did, for anyone
+who ran this page verbatim before 2026-08-14.
 
-**If it warns that no logs match the resolved ABI**, that is the check working: you have hit a proxy
-whose implementation ABI the public resolvers did not return. Re-run with
-`--abi path/to/implementation.json`. A nest that indexes nothing is the failure this warning exists to
-prevent.
+**If it warns that sampled logs match none of the resolved ABI's events**, that is the check working:
+you have hit a proxy whose implementation ABI the public resolvers did not return, or one whose
+earlier implementation emitted different events (USDC warns about its pre-upgrade history). Re-run
+with `--abi path/to/implementation.json`, or add the earlier ABI as a second `[[contracts]]` entry
+bounded to its era. A nest that indexes nothing is the failure this warning exists to prevent.
 
 **1.2 Index and serve**
 
@@ -258,8 +260,8 @@ nuthatch dev --dir /tmp/v-runtime   # a dir with a mounts.toml runs every nest i
 curl -s localhost:8288/nests
 ```
 
-Expect every mounted nest listed with its chain, registry hash and footprint, and each serving its full
-API under `/<name>/`. *Proves* co-tenancy with per-nest routing.
+Expect every mounted nest listed with its chain, registry hash and footprint (`estimated_rss_mb`), and
+each serving its full API under `/<name>/`. *Proves* co-tenancy with per-nest routing.
 
 **3.2 Nests on one chain share a cursor**
 
@@ -274,13 +276,16 @@ never multiplexed across chains. Stalling one chain's RPC must not stall the oth
 **3.4 Mount and unmount without a restart**
 
 ```sh
-curl -XPOST   localhost:8288/_admin/nests -H 'Content-Type: application/json' -d '{"name":"another"}'   # 202 and the job
+curl -XPOST   localhost:8288/_admin/nests -H 'Content-Type: application/json' \
+              -d '{"name":"another","nid":"<nid>"}'                  # 202 and the job
 curl          localhost:8288/_admin/mounts/another                   # until "phase": "live"
 curl -XDELETE localhost:8288/_admin/nests/another
 ```
 
-Expect the mount to reach `live` and the unmount to succeed **without co-tenants being interrupted** —
-check the other nests' `/ready` and row counts across the operation. *Proves* the live runtime: a
+The `nid` is what `nuthatch nest nid --dir <nest>` prints; a body without one resolves only a name
+the runtime already has on record, and a fresh name without it ends `failed`. Expect the mount to
+reach `live` and the unmount to succeed **without co-tenants being interrupted**: check the other
+nests' `/ready` and row counts across the operation. *Proves* the live runtime: a
 configuration change no longer has a wider blast radius than a fault.
 
 Expect a mount that would breach the cursor's RAM budget to end `failed`, its reason carrying the
@@ -296,7 +301,7 @@ is the most serious finding in this document.
 **3.6 Cross-nest dataset adoption**
 
 ```sh
-./scripts/cross-nest-adoption.sh   # NUTHATCH=/path/to/binary optional
+bash scripts/cross-nest-adoption.sh   # NUTHATCH=/path/to/binary optional; PORT and RPC_PORT too
 ```
 
 *Scripted acceptance run.* Two independently-authored nests — different alias, description, and
@@ -349,17 +354,21 @@ partial tip would silently change the answer to an aggregate.
 nuthatch init 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --dir ts-nest
 nuthatch dev --dir ts-nest --backfill 500       # let it index, then stop
 sed -i 's/block_timestamps = true/block_timestamps = false/' ts-nest/nuthatch.toml
-nuthatch dev --dir ts-nest
+nuthatch dev --dir ts-nest                      # refused: the declaration needs `schema_version = 2`
+sed -i 's/schema_version = 1/schema_version = 2/' ts-nest/nuthatch.toml
+nuthatch dev --dir ts-nest                      # refused: a breaking schema change
 ```
 
-Expect the last command to **refuse to start**, naming it a breaking schema change. *Proves* a nest
-cannot end up holding two schemas — rows and segments written before the edit carrying
-`block_timestamp` and everything after not, with nothing to say so until a query hits the wrong half.
+Expect both `dev` commands to **refuse to start**: the first names the `schema_version` stamp the
+declaration needs, the second, with the stamp set, names it a breaking schema change against the
+data already indexed. *Proves* a nest cannot end up holding two schemas: rows and segments written
+before the edit carrying `block_timestamp` and everything after not, with nothing to say so until a
+query hits the wrong half.
 
 Then the other direction, which is the one an operator actually wants:
 
 ```sh
-nuthatch init 0xA0b8…eB48 --dir fast-nest --no-timestamps
+nuthatch init 0xA0b8…eB48 --alias usdc --dir fast-nest --no-timestamps
 grep -E 'schema_version|block_timestamps' fast-nest/nuthatch.toml
 nuthatch dev --dir fast-nest --backfill 5000 --seal-direct
 nuthatch sql --dir fast-nest 'SELECT * FROM usdc__transfer LIMIT 1'
@@ -465,12 +474,13 @@ unauthenticated off-localhost.
 > shared Postgres and exit non-zero on failure. **Neither had been run at the time of writing**;
 > both were run on 2026-08-02 (#255), which is when the table above moved.
 
-Our 41 automated tests run against a live Postgres and cover every invariant below, and the compose
+Our automated tests run against a live Postgres in CI and cover every invariant below, and the compose
 fleet has since been brought up end to end on real machines: `fleet-lab.sh up multi`, three Hetzner
-boxes on a private network, installing the **published v0.9.3** artifacts (#255). That run has not
-been repeated on 1.x or 2.x, so for the release you are holding this level rests on the automated
-tests plus a cross-machine run two majors old. If you verify one level from this document, this is
-still the one worth your time.
+boxes on a private network, installing the **published v0.9.3** artifacts (#255), then two machines
+on the published 2.4.0 artifacts (2026-08-15, the table above). That run has not been repeated on
+3.x or 4.x, so for the release you are holding this level rests on CI's compose job plus a
+cross-machine run two majors old. If you verify one level from this document, this is still the one
+worth your time.
 
 Needs the **scaled** artifact — `…:<version>-scaled` or `nuthatch-scaled-…tar.gz`. The default build
 refuses these commands by name.
@@ -496,12 +506,16 @@ permissions. If you are testing on a Mac and it works, that is not evidence it w
 docker compose -f docker-compose.scaled.yml --profile fleet up \
   --scale writer=2 --scale fe=3
 curl -s localhost:8290/health     # expect: ok
-curl -s localhost:8290/workers    # expect: 2 workers with their budgets
+curl -s -H "authorization: Bearer $NUTHATCH_CONTROL_TOKEN" localhost:8290/workers    # expect: 2 workers with their budgets
 ```
 
+Every control-plane route except `/health` needs that bearer header (the token the fleet was
+started with); the commands below omit it for brevity.
+
 *Proves* the topology: control plane reachable, workers registering, FE nodes up. We have run this on a
-single host and, on 2026-08-02, across three machines on published v0.9.3 artifacts (#255). **It has
-not been run on 1.x or 2.x**, so a report against the release you are holding still helps most.
+single host, on 2026-08-02 across three machines on published v0.9.3 artifacts (#255), and on
+2026-08-15 across two machines on 2.4.0. **It has not been run on 3.x or 4.x**, so a report against
+the release you are holding still helps most.
 
 **5.2 Declaring a nest starts it, without a restart**
 
