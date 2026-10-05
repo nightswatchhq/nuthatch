@@ -24,7 +24,13 @@ COPYFILE_DISABLE=1 tar -cf - -C "$repo/scripts" deploy-nest.sh -C "$smoke_dir" "
   ssh "$host" "UNIT=$unit SETTINGS='$settings'; "'set -euo pipefail
 d=$(mktemp -d); trap "rm -rf $d" EXIT
 tar -xf - -C "$d"
-sudo -n bash "$d/deploy-nest.sh" env "$UNIT" $SETTINGS --smoke "$d/$UNIT.sql"
+# A ceiling the kernel enforces if the budget check misses; MemoryHigh sits just under it because page
+# cache counts toward the unit. Applied by the restart below, and reverted with it on failure.
+cap=/etc/systemd/system/$UNIT.service.d/zzz-engine.conf
+sudo -n cp "$cap" "$d/zzz-engine.conf.prev"
+sudo -n sed -i -E "s/^MemoryHigh=.*/MemoryHigh=2816M/; s/^MemoryMax=.*/MemoryMax=3G/" "$cap"
+sudo -n bash "$d/deploy-nest.sh" env "$UNIT" $SETTINGS --smoke "$d/$UNIT.sql" \
+  || { sudo -n cp "$d/zzz-engine.conf.prev" "$cap"; sudo -n systemctl daemon-reload; sudo -n systemctl restart "$UNIT"; exit 1; }
 env_file=$HOME/release-gate/env/qos-nest.env
 pid=$(systemctl show -p MainPID --value "$UNIT")
 keys="NUTHATCH_(SQL_MAX_CONCURRENCY|ANALYTICS_MEMORY_LIMIT|ANALYTICS_THREADS|ANALYTICS_MAX_TEMP_SIZE|ENGINE|BURRMILL_MEMORY_LIMIT|MAX_RSS|SQL_MEMO_BYTES|HOT_STORE_CACHE_BYTES|INGESTION_RESERVATION)"
