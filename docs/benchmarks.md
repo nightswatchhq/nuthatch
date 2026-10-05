@@ -31,7 +31,7 @@ Nothing here optimises anything. It exists so the seal-direct / adaptive-chunker
 ## Backfill throughput is tracked, not gated
 
 CLAUDE.md sets a backfill floor of 10K events/s, aiming for 30K. **No CI check fails on events/sec.**
-The `backfill throughput` job runs `.github/workflows/backfill-throughput.sh` on every PR: three
+The `backfill throughput · tip lag` job runs `.github/workflows/backfill-throughput.sh` on every PR: three
 batches of 15 over the chain `footprint-rpc.py` serves (blocks 1 to 20,000, 80,000 rows, seal-direct,
 concurrency 4). It reports the median to the step summary and an artifact, and fails only if a run
 did not decode all 80,000 events. #1723 measured the figure before choosing that shape.
@@ -57,7 +57,7 @@ design target measured by hand with `bench backfill`, not a gate.
 
 ## Tip lag is gated on its after-seen median
 
-The `tip lag` job runs `.github/workflows/tip-lag.sh` on every PR. `footprint-rpc.py --moving` serves
+The `backfill throughput · tip lag` job also runs `.github/workflows/tip-lag.sh` on every PR. `footprint-rpc.py --moving` serves
 the footprint chain with a tip the script advances one block at a time, and `dev --poll-interval 1s`
 follows it. For 100 blocks the script records two figures: **lag**, from the block appearing to its
 four rows answering through `/sql`, and **after seen**, from nuthatch's first `eth_blockNumber`
