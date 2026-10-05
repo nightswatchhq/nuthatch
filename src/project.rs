@@ -1756,21 +1756,33 @@ async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
     let probe = normalise_address(&addresses[0])?;
     println!("→ no --chain given; probing known chains for {probe}…");
 
-    let probes = chains::all().iter().map(|chain| {
-        let probe = probe.clone();
-        async move {
-            let rpc =
-                RpcClient::new(chain.rpc_urls.iter().map(|s| s.to_string()).collect()).ok()?;
-            let tip = rpc.block_number().await.ok()?;
-            let code = rpc.get_code(&probe, tip).await.ok()?;
-            (!is_empty_code(&code)).then_some(*chain)
-        }
-    });
-    let found: Vec<&'static chains::Chain> = futures::future::join_all(probes)
-        .await
-        .into_iter()
-        .flatten()
+    let candidates = chains::all()
+        .iter()
+        .map(|chain| {
+            (
+                *chain,
+                chain.rpc_urls.iter().map(|s| s.to_string()).collect(),
+            )
+        })
         .collect();
+    let probed = probe_chains(&probe, candidates, CHAIN_PROBE_TIMEOUT).await;
+    let found: Vec<&'static chains::Chain> = probed
+        .iter()
+        .filter_map(|(c, f)| (*f == Some(true)).then_some(*c))
+        .collect();
+    let unreachable: Vec<&str> = probed
+        .iter()
+        .take_while(|(c, _)| found.first().map(|f| f.name) != Some(c.name))
+        .filter(|(_, f)| f.is_none())
+        .map(|(c, _)| c.name)
+        .collect();
+    if !unreachable.is_empty() {
+        println!(
+            "  ⚠ no answer from {} within {}s; pass --chain if the contract lives there",
+            unreachable.join(", "),
+            CHAIN_PROBE_TIMEOUT.as_secs()
+        );
+    }
 
     match found.as_slice() {
         [] => bail!(
@@ -1791,6 +1803,30 @@ async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
             Ok(first)
         }
     }
+}
+
+/// Per request while probing. A public endpoint that never answers (tenderly from a Docker network,
+/// 2026-10-05) otherwise holds `init` for the client's 20 s before failover reaches the next one.
+const CHAIN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether each candidate has bytecode at `probe`, in candidate order: `None` when no endpoint of
+/// that chain answered.
+async fn probe_chains(
+    probe: &str,
+    candidates: Vec<(&'static chains::Chain, Vec<String>)>,
+    timeout: std::time::Duration,
+) -> Vec<(&'static chains::Chain, Option<bool>)> {
+    let probes = candidates.into_iter().map(|(chain, urls)| async move {
+        let found = async {
+            let rpc = RpcClient::with_timeout(urls, timeout).ok()?;
+            let tip = rpc.block_number().await.ok()?;
+            let code = rpc.get_code(probe, tip).await.ok()?;
+            Some(!is_empty_code(&code))
+        }
+        .await;
+        (chain, found)
+    });
+    futures::future::join_all(probes).await
 }
 
 /// Detect a known chain through the endpoint(s) the operator supplied, without probing public
@@ -2683,6 +2719,88 @@ abi = "abis/tok.json"
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// Answers `eth_blockNumber` with 0x10 and `eth_getCode` with `code`.
+    async fn fake_code_rpc(code: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler(State(code): State<&'static str>, Json(req): Json<Value>) -> Json<Value> {
+            let result = match req["method"].as_str() {
+                Some("eth_blockNumber") => json!("0x10"),
+                Some("eth_getCode") => json!(code),
+                _ => Value::Null,
+            };
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(code);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Accepts connections and never answers.
+    async fn silent_rpc() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// #1885: a silent first endpoint held `init`'s chain probe for the client's 20 s timeout.
+    #[tokio::test]
+    async fn a_silent_endpoint_costs_the_chain_probe_at_most_its_short_budget() {
+        let (silent, hs) = silent_rpc().await;
+        let (code, hc) = fake_code_rpc("0x6080").await;
+        let (empty, he) = fake_code_rpc("0x").await;
+        let all = chains::all();
+        let (mainnet, base, arb) = (all[0], all[1], all[2]);
+
+        let started = std::time::Instant::now();
+        let probed = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            probe_chains(
+                "0x00000000000000000000000000000000000000aa",
+                vec![
+                    (mainnet, vec![silent.clone(), code]),
+                    (base, vec![silent.clone(), empty]),
+                    (arb, vec![silent]),
+                ],
+                CHAIN_PROBE_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("the probe hung");
+        let elapsed = started.elapsed();
+
+        let probed: Vec<_> = probed.iter().map(|(c, f)| (c.name, *f)).collect();
+        assert_eq!(
+            probed,
+            vec![
+                (mainnet.name, Some(true)),
+                (base.name, Some(false)),
+                (arb.name, None)
+            ],
+            "a healthy endpoint behind a silent one still answers, and a chain that never \
+             answered is unreachable rather than absent"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "a silent endpoint held the chain probe for {elapsed:?}"
+        );
+        for h in [hs, hc, he] {
+            h.abort();
+        }
     }
 
     const BSC_MANIFEST: &str = r#"

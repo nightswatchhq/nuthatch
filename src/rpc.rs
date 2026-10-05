@@ -799,11 +799,16 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(urls: Vec<String>) -> Result<Self> {
+        Self::with_timeout(urls, Duration::from_secs(20))
+    }
+
+    /// [`Self::new`] with a per-request deadline other than 20 s.
+    pub fn with_timeout(urls: Vec<String>, timeout: Duration) -> Result<Self> {
         if urls.is_empty() {
             bail!("no RPC URLs configured");
         }
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(timeout)
             .build()
             .context("failed to build HTTP client")?;
         let n = urls.len();
