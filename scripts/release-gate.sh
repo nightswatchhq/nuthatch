@@ -43,8 +43,8 @@
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
 # Load (#1898): the box's 1-minute load average and core count are recorded, sampled into
 # <out>/load.tsv during the run. Before starting, the gate waits up to GATE_MAX_LOAD_WAIT seconds
-# (1800) for load per core to fall under GATE_MAX_LOAD_PER_CORE (0.75), else exits 2. If over
-# GATE_RUN_MAX_LOAD_PER_CORE (1.5) for more than GATE_LOAD_MAX_SHARE (0.25) of the run's samples,
+# (1800) for load per core to fall under GATE_MAX_LOAD_PER_CORE (0.3), else exits 2. If over
+# GATE_RUN_MAX_LOAD_PER_CORE (0.6) for more than GATE_LOAD_MAX_SHARE (0.25) of the run's samples,
 # the result is a setup fault, exit 2, and no baseline is written. See docs/release-gate.md.
 # Two runs against one copy wait for each other: the second `serve` could not open the redb.
 set -euo pipefail
@@ -55,10 +55,10 @@ P99_FACTOR=${GATE_P99_FACTOR:-1.5}
 P99_SLACK_MS=${GATE_P99_SLACK_MS:-1000}
 MAX_RSS_MB=${GATE_MAX_RSS_MB:-2048}
 PROC_ROOT=${GATE_PROC_ROOT:-/proc}
-MAX_LOAD_PER_CORE=${GATE_MAX_LOAD_PER_CORE:-0.75}
+MAX_LOAD_PER_CORE=${GATE_MAX_LOAD_PER_CORE:-0.3}
 MAX_LOAD_WAIT=${GATE_MAX_LOAD_WAIT:-1800}
 LOAD_POLL_SECS=${GATE_LOAD_POLL_SECS:-15}
-RUN_MAX_LOAD_PER_CORE=${GATE_RUN_MAX_LOAD_PER_CORE:-1.5}
+RUN_MAX_LOAD_PER_CORE=${GATE_RUN_MAX_LOAD_PER_CORE:-0.6}
 LOAD_MAX_SHARE=${GATE_LOAD_MAX_SHARE:-0.25}
 LOAD_SAMPLE_SECS=${GATE_LOAD_SAMPLE_SECS:-5}
 

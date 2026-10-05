@@ -89,19 +89,23 @@ on a box something else is saturating say nothing about the binary, so the gate 
   every 5 s into `<out>/load.tsv` and reports the peak and the share of samples over the limit.
   A baseline's header carries the same line.
 - **It waits before it starts.** Until the load per core is under `GATE_MAX_LOAD_PER_CORE`
-  (default 0.75) it sleeps, polling every `GATE_LOAD_POLL_SECS` (15), for up to `GATE_MAX_LOAD_WAIT`
+  (default 0.3) it sleeps, polling every `GATE_LOAD_POLL_SECS` (15), for up to `GATE_MAX_LOAD_WAIT`
   seconds (1800). If the box is still loaded it exits 2 naming the load, serves nothing and posts no
   regression.
 - **It refuses a verdict from a run that was loaded.** If more than `GATE_LOAD_MAX_SHARE` (0.25) of
-  the samples taken during the run were over `GATE_RUN_MAX_LOAD_PER_CORE` (1.5), the result is
+  the samples taken during the run were over `GATE_RUN_MAX_LOAD_PER_CORE` (0.6), the result is
   `RESULT: SETUP FAULT`, exit 2, whatever the timings or RSS say, and no `--write-baseline` file is
   written. `release-gate-run.sh` posts `error`, not `failure`, for any exit 2.
 
-The run's own limit is higher than the start's because the gate's server is part of the load it
-reads: a quiet box serving the set at concurrency 2 with eight analytics threads sits well above
-the idle figure. 0.75 per core at the start leaves a production nest using about 15% of a core
-far below it. Read a few runs' `load.tsv` on the ThinkPad before trusting 1.5. The 1-minute average lags,
-so a burst that starts late in a run may only show in the next one.
+The defaults are calibrated to the ThinkPad: 32 cores, idling at a load of about 3.8 (0.12 per
+core) with the QoS nest running. The 4.8.0 incident was a load of 26, 0.81 per core. The start
+limit of 0.3 per core (about 9.6) sits well above idle and well under the incident. The run's own
+limit is higher, 0.6 (about 19), because the gate's server is part of the load it reads: its eight
+analytics threads add roughly 0.25 to 0.4 per core, so a quiet run reads 0.37 to 0.52 and stays
+under 0.6, while the incident's 0.81 does not. The run limit is the start limit plus the gate's own
+share, set by hand; on a box with a different core count, scale both. Read a few runs' `load.tsv`
+before trusting them elsewhere. The 1-minute average lags, so a burst that starts late in a run may
+only show in the next one.
 
 If the load cannot be read at all (no `/proc/loadavg`, no `sysctl`), the gate says so and measures
 anyway. `GATE_LOADAVG_FILE` points the reader at a file whose first field is the load, and

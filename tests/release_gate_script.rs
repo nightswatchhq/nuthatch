@@ -1853,3 +1853,49 @@ fn an_unreadable_load_source_is_noted_and_the_gate_runs() {
     assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.contains("load could not be read"), "{text}");
 }
+
+/// The defaults, on the gate box's shape: 32 cores idling near load 4 (0.12 per core), where the
+/// 4.8.0 incident's 26 was 0.81 per core. A start at 4 passes; 26 is refused at the start, and 26
+/// arriving mid-run is a setup fault too, on the defaults alone.
+#[test]
+fn the_defaults_catch_the_incident_on_a_32_core_box_both_ways() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+
+    let loaded = load_file(&c, "loaded", "26.00");
+    let (out, text) = c.gate(
+        &set,
+        &[],
+        &[
+            ("GATE_LOADAVG_FILE", loaded.to_str().unwrap()),
+            ("GATE_NCPU", "32"),
+            ("GATE_MAX_LOAD_WAIT", "0"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "26 at the start:\n{text}");
+
+    let load = load_file(&c, "loadavg", "4.00");
+    let later = set_load_later(
+        &load,
+        "26.00",
+        Some(c.dir.path().join("out/serve-pass-1.log")),
+        Duration::ZERO,
+    );
+    let (out, text) = c.gate(
+        &set,
+        &[],
+        &[
+            ("GATE_LOADAVG_FILE", load.to_str().unwrap()),
+            ("GATE_NCPU", "32"),
+            ("GATE_LOAD_SAMPLE_SECS", "0.2"),
+            ("GATE_LOAD_MAX_SHARE", "0.01"),
+        ],
+    );
+    later.join().unwrap();
+    assert!(
+        text.contains("box load 4.00 over 32 cores"),
+        "4 passes the start:\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(2), "26 mid-run:\n{text}");
+    assert!(text.contains("RESULT: SETUP FAULT"), "{text}");
+}
