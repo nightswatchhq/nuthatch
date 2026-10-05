@@ -67,9 +67,8 @@ chain, no telemetry, no account. The built-in MCP server lets Claude or any MCP 
 
 An earlier example, now finished: **[Arcaidia](https://arcaidia.io)**, a speed layer over Circle's
 CCTP built at ETHOnline 2026, read its indexed state from two nests on Ethereum Sepolia and Arc
-Testnet. Its solver discovered intents there, its settlement agent tracked CCTP there, and its web
-console rendered from them. The nests were serving within two hours of the builder asking The Graph
-for a higher Studio rate limit. They were stopped on 2026-09-29.
+Testnet: its solver discovered intents there, its settlement agent tracked CCTP there, and its web
+console rendered from them. The nests were stopped on 2026-09-29.
 
 More at [nuthatch-indexer.com/stories](https://www.nuthatch-indexer.com/stories).
 
