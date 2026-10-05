@@ -186,20 +186,44 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
     let headroom = RUNTIME_HEADROOM_MB;
     let total = duck.saturating_add(reservation).saturating_add(headroom);
     if total > ceiling {
+        let limit = cfg.burrmill_limit_mb();
+        // Burrmill's limit overrides analytics.memory_limit, so lowering the latter would change nothing.
+        let knob = if cfg.burrmill_memory_limit_mb.is_some() {
+            ENV_BURRMILL_MEMORY_LIMIT.to_string()
+        } else {
+            format!("analytics.memory_limit ({ENV_MEMORY_LIMIT})")
+        };
+        let wall = if cfg.max_rss_mb.is_some() {
+            format!("the {ceiling} MB wall {ENV_MAX_RSS} sets")
+        } else {
+            format!("the {ceiling} MB wall (the per-cursor default; {ENV_MAX_RSS} is unset)")
+        };
+        let fit = ceiling.saturating_sub(reservation + headroom) / pools;
+        let remedy = if fit == 0 {
+            format!("No pool fits beside the reservation: lower {ENV_INGESTION_RESERVATION} towards {floor} MB")
+        } else {
+            format!("Set {knob} at most {fit} MB")
+        };
+        let permits = if pools > 1 {
+            " or lower NUTHATCH_SQL_MAX_CONCURRENCY"
+        } else {
+            ""
+        };
+        let raised = if fit > 0 && reservation > floor {
+            format!(", or bring ingestion_reservation back towards its {floor} MB floor")
+        } else {
+            String::new()
+        };
         bail!(
-            "the analytics split does not leave the named ingest floor: (pools × \
-             analytics.memory_limit) + ingestion_reservation + runtime_headroom = ({pools} × \
-             {} MB) + {reservation} MB + {headroom} MB = {total} MB, which is above \
-             {ceiling} MB. pools is the smaller of sql_permits and the cursor's nest datasets, \
-             since a dataset's sessions share one pool. {ENV_BURRMILL_MEMORY_LIMIT} takes the place \
-             of analytics.memory_limit where it is set. {ENV_MAX_RSS} raises the wall where the \
-             process has been given more. This gate refuses that split; it does not cap ingest, \
-             DBSP, redb, or result materialisation. The 2 GiB cursor budget is the footprint CI job / \
-             process RSS wall, not this arithmetic. Lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
-             NUTHATCH_SQL_MAX_CONCURRENCY, or ingestion_reservation ({ENV_INGESTION_RESERVATION}). \
-             analytics.max_temp_size is disk and does not buy RAM. A query that cannot run in its \
-             budget fails; it never degrades block processing.",
-            cfg.burrmill_limit_mb()
+            "the analytics split does not fit its wall: (pools × {knob}) + ingestion_reservation + \
+             runtime_headroom = ({pools} × {limit} MB) + {reservation} MB + {headroom} MB = {total} \
+             MB, above {wall}. pools is the smaller of sql_permits and the cursor's nest datasets, \
+             since a dataset's sessions share one pool. {remedy}{permits}{raised}. \
+             ingestion_reservation ({ENV_INGESTION_RESERVATION}) is a floor and may only be raised. \
+             {ENV_MAX_RSS} raises the wall only where the process has been given more than the 2 GiB \
+             per-cursor budget. This gate refuses that split; it does not cap ingest, DBSP, redb, or \
+             result materialisation. analytics.max_temp_size is disk and does not buy RAM. A query \
+             that cannot run in its budget fails; it never degrades block processing."
         );
     }
     Ok(())
@@ -447,6 +471,48 @@ pub(crate) mod tests {
         };
         let err = validate_against(&lowered, 1).unwrap_err().to_string();
         assert!(err.contains("may only be raised"), "{err}");
+    }
+
+    /// #1899: the QoS nest's settings under the 2 GiB wall. Burrmill's limit is what counted, so the
+    /// refusal names it and what would fit, not analytics.memory_limit, which it overrides.
+    #[test]
+    fn a_refusal_names_the_limit_that_counted_and_what_fits() {
+        let qos = AnalyticsConfig {
+            burrmill_memory_limit_mb: Some(2048),
+            threads: 8,
+            ..AnalyticsConfig::default()
+        };
+        let err = validate_on_cursor(&qos, 2, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("(1 × 2048 MB) + 1024 MB + 0 MB = 3072 MB")
+                && err.contains("above the 2048 MB wall"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("{ENV_BURRMILL_MEMORY_LIMIT} at most 1024 MB")),
+            "{err}"
+        );
+        assert!(!err.contains("Lower analytics.memory_limit"), "{err}");
+        assert!(
+            !err.contains(&format!(
+                "or ingestion_reservation ({ENV_INGESTION_RESERVATION})"
+            )),
+            "lowering the reservation is refused by the floor, so it is not a remedy: {err}"
+        );
+        let two_pools = validate_on_cursor(&qos, 2, 2).unwrap_err().to_string();
+        assert!(
+            two_pools.contains(&format!("{ENV_BURRMILL_MEMORY_LIMIT} at most 512 MB")),
+            "{two_pools}"
+        );
+        validate_on_cursor(
+            &AnalyticsConfig {
+                burrmill_memory_limit_mb: Some(768),
+                ..qos
+            },
+            2,
+            1,
+        )
+        .expect("768 + 1024 is under 2048");
     }
 
     #[test]
