@@ -954,7 +954,7 @@ impl RpcClient {
         })
     }
 
-    /// Every endpoint is resting after a 429: wait for the soonest, then try them soonest first. A
+    /// Every endpoint is resting after a 429: wait for the soonest, then try only those now free. A
     /// rest is at most [`ENDPOINT_COOLDOWN_MS`], so a throttled pool slows the run and never spins,
     /// nor stops.
     async fn wait_out_rate_limits(&self) -> Vec<usize> {
@@ -970,7 +970,17 @@ impl RpcClient {
             self.urls.len()
         );
         retry_pause(wait).await;
-        order
+        let now = now_millis();
+        let free: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&j| self.limited[j].load(Ordering::Relaxed) <= now)
+            .collect();
+        if free.is_empty() {
+            order.truncate(1);
+            return order;
+        }
+        free
     }
 
     fn mark_unhealthy(&self, j: usize) {
@@ -4507,6 +4517,58 @@ mod rfc0036_tests {
     async fn the_doubling_rest_stops_at_the_cooldown() {
         let waits = lone_endpoint_waits(&[true; 8]).await;
         assert!(about(&waits, &[1, 2, 4, 8, 16, 30, 30]), "{waits:?}");
+    }
+
+    /// With every endpoint resting, the wait ends when the soonest rest does, and only the endpoints
+    /// whose rest is over are asked: one resting 16s is not asked when one resting 1s comes free.
+    #[tokio::test]
+    async fn a_pool_waiting_out_its_rests_asks_only_the_endpoints_that_are_free() {
+        use axum::{
+            extract::State, http::StatusCode, response::IntoResponse, routing::post, Router,
+        };
+        use std::sync::Arc;
+        async fn serve(retry_after: Option<&'static str>) -> (String, Arc<AtomicUsize>) {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .route(
+                    "/",
+                    post(move |State(hits): State<Arc<AtomicUsize>>| async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let mut resp = (StatusCode::TOO_MANY_REQUESTS, "").into_response();
+                        if let Some(secs) = retry_after {
+                            resp.headers_mut()
+                                .insert("retry-after", secs.parse().unwrap());
+                        }
+                        resp
+                    }),
+                )
+                .with_state(hits.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            (format!("http://{addr}/"), hits)
+        }
+        let (short, short_hits) = serve(None).await;
+        let (long, long_hits) = serve(Some("16")).await;
+        let c = RpcClient::new(vec![short, long]).unwrap();
+        let pauses = RETRY_PAUSES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                assert!(c.block_number().await.is_err());
+                assert!(c.block_number().await.is_err());
+                RETRY_PAUSES.with(|p| p.borrow().clone())
+            })
+            .await;
+        assert!(about(&pauses, &[1]), "{pauses:?}");
+        assert_eq!(
+            (
+                short_hits.load(Ordering::SeqCst),
+                long_hits.load(Ordering::SeqCst)
+            ),
+            (2, 1),
+            "the 16s rest was cut short"
+        );
     }
 
     /// When every endpoint is pruned no retry can help, so the verdict says so, names them all, and
