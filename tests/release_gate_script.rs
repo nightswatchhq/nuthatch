@@ -400,8 +400,7 @@ impl Case {
 /// #1772: a statement that answers, but not what production answered, fails and is named, with
 /// the first row at which the two differ. Row order is part of the answer only under a top-level
 /// ORDER BY: a statement without one passes with its rows reversed (the quoted ORDER BY is a
-/// literal, not a clause), and a float 1e-13 off is equal to 12 significant digits, as a number or
-/// cast to text.
+/// literal, not a clause). A float 1e-13 off differs too, as a number or cast to text (#1883).
 #[test]
 fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row() {
     let c = case();
@@ -450,9 +449,10 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
         line_for(&text, "unordered").starts_with("ok "),
         "only the order differs, and it has no top-level ORDER BY:\n{text}"
     );
+    let float = line_for(&text, "float");
     assert!(
-        line_for(&text, "float").starts_with("ok "),
-        "equal to 12 significant digits:\n{text}"
+        float.starts_with("FAIL ") && float.contains("answer differs"),
+        "1e-13 off is a different answer:\n{text}"
     );
     let volatile = line_for(&text, "volatile");
     assert!(
@@ -461,7 +461,7 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
         "{volatile}"
     );
     assert!(
-        text.contains("RESULT: FAIL - answer differs: value, ordered, volatile"),
+        text.contains("RESULT: FAIL - answer differs: value, ordered, float, volatile"),
         "{text}"
     );
 }
@@ -554,11 +554,7 @@ fn at_concurrency_two_an_answer_that_differs_still_fails_and_is_named() {
             "ordered",
             "SELECT third FROM gate_probe ORDER BY s".to_string(),
         ),
-        (
-            "float",
-            "SELECT third, CAST(third * CAST('1e22' AS DOUBLE) AS VARCHAR) AS text FROM gate_probe"
-                .to_string(),
-        ),
+        ("by_key", "SELECT k FROM gate_rows ORDER BY k".to_string()),
     ]);
     let (out, text) = c.against_a_wrong_candidate(&set, &["--concurrency", "2"]);
     assert_eq!(out.status.code(), Some(1), "{text}");
@@ -580,7 +576,7 @@ fn at_concurrency_two_an_answer_that_differs_still_fails_and_is_named() {
         "{ordered}"
     );
     assert!(line_for(&text, "unordered").starts_with("ok "), "{text}");
-    assert!(line_for(&text, "float").starts_with("ok "), "{text}");
+    assert!(line_for(&text, "by_key").starts_with("ok "), "{text}");
     assert!(
         text.contains("2 match, 2 differ")
             && text.contains("RESULT: FAIL - answer differs: value, ordered"),
@@ -601,7 +597,7 @@ fn at_concurrency_two_an_answer_that_differs_still_fails_and_is_named() {
             ("1", "unordered"),
             ("1", "value"),
             ("2", "ordered"),
-            ("2", "float")
+            ("2", "by_key")
         ],
         "{schedule}"
     );

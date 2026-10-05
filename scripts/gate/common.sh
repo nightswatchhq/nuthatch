@@ -126,25 +126,9 @@ order_of() {
     }'
 }
 
-# One row per line, keys sorted. A number written as an integer is kept exactly; any other is
-# rounded to 12 significant digits, so a float summed in another order still compares equal. So is
-# a string in exponent form: a DOUBLE cast to VARCHAR, which no integer or DECIMAL renders as.
-CANON_JQ='
-def canon_float:
-  if . == 0 then 0
-  else
-    (if . < 0 then -1 else 1 end) as $sign
-    | fabs as $a
-    | ($a | log10 | floor) as $e
-    | (if $e >= 11 then $a / pow(10; $e - 11) else $a * pow(10; 11 - $e) end | round) as $m
-    | [$m, $e - 11]
-    | until(.[0] % 10 != 0; [.[0] / 10, .[1] + 1])
-    | (if .[1] >= 0 then .[0] * pow(10; .[1]) else .[0] / pow(10; -.[1]) end) * $sign
-  end;
-.rows[] | walk(
-  if type == "number" and (tojson | test("^-?[0-9]+$") | not) then canon_float
-  elif type == "string" and test("^-?[0-9]+(\\.[0-9]+)?[eE][-+]?[0-9]+$") then tonumber | canon_float | tostring
-  else . end)'
+# One row per line, keys sorted, every value as served. No float rule: two fresh servers answer every
+# production set alike to the last bit since burrmill sums DOUBLE exactly (#1883).
+CANON_JQ='.rows[]'
 
 # canon_answer <body> <mode> <dest>: writes the canonical rows to dest and prints their sha256.
 canon_answer() {
