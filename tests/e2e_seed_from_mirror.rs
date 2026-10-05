@@ -424,6 +424,8 @@ async fn a_quiet_nest_is_complete_through_its_watermark_not_its_last_row() {
     let publisher = tempfile::tempdir().unwrap();
     let mirror = tempfile::tempdir().unwrap();
     published(publisher.path(), mirror.path()).await;
+    // The rows end at block 12; 13..=20 seal empty, which moves the watermark and writes no segment.
+    force_seal_through(publisher.path(), 12);
     force_seal_through(publisher.path(), 20);
     nuthatch::publish::sync(publisher.path(), mirror.path().to_str().unwrap(), false)
         .await
@@ -436,7 +438,7 @@ async fn a_quiet_nest_is_complete_through_its_watermark_not_its_last_row() {
         .expect("seed");
     assert_eq!(
         seed.complete_through, 20,
-        "the watermark, not the last row at 10"
+        "the watermark, not the last segment at 12"
     );
 
     let tape = chain(24);
