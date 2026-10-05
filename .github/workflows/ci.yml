@@ -46,27 +46,36 @@ jobs:
   # rust-cache keys, clippy+test still sharing artifacts *within* a feature set. A third job
   # keeps the required name so the ruleset does not have to move.
   #
+  # Each leg is a build job (fmt, clippy, a nextest archive) and a matrix of shards that run that
+  # archive by `--partition`, so the suite's wall time divides by the shard count instead of
+  # running every test binary one after another. A matrix job's result is `failure` if any shard
+  # failed.
+  #
   # `if: always()` so a cancelled or skipped leg still runs this and fails it - a skipped
   # required check is how a red child reads as a green merge.
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
-    needs: [check-default, check-exex]
+    needs: [check-default, test-default, check-exex, test-exex]
     if: always()
     timeout-minutes: 5
     steps:
-      - name: both legs green
+      - name: every build and every shard green
         run: |
-          echo "default: ${{ needs.check-default.result }}"
-          echo "exex: ${{ needs.check-exex.result }}"
+          echo "default build: ${{ needs.check-default.result }}"
+          echo "default shards: ${{ needs.test-default.result }}"
+          echo "exex build: ${{ needs.check-exex.result }}"
+          echo "exex shards: ${{ needs.test-exex.result }}"
           if [ "${{ needs.check-default.result }}" != success ] \
-            || [ "${{ needs.check-exex.result }}" != success ]; then
-            echo "::error::fmt · clippy · test needs both legs green (see check-default and check-exex)"
+            || [ "${{ needs.test-default.result }}" != success ] \
+            || [ "${{ needs.check-exex.result }}" != success ] \
+            || [ "${{ needs.test-exex.result }}" != success ]; then
+            echo "::error::fmt · clippy · test needs both legs green, builds and shards (see check-default, test-default, check-exex, test-exex)"
             exit 1
           fi
 
   check-default:
-    name: fmt · clippy · test (default)
+    name: fmt · clippy · build (default)
     runs-on: ubuntu-latest
     # 90, not 45 (#584). A `Cargo.lock` change invalidates every `Swatinem/rust-cache` entry at
     # once - the cache key is the lock hash - and this job runs `cargo fmt`/`clippy`/`test` cold
@@ -150,8 +159,20 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test --locked
+      - uses: ./.github/actions/install-nextest
+      # Built here, run by the `test-default` shards. Outside `target/`, so rust-cache never saves it.
+      - name: build the test archive
+        run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/nextest-default.tar.zst"
+      # nextest does not run doctests. There are none today; this keeps the first one from going unrun.
+      - name: doctests
+        run: cargo test --doc --locked
+      - name: upload the test archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-default
+          path: ${{ runner.temp }}/nextest-default.tar.zst
+          compression-level: 0
+          retention-days: 1
       # `nuthatch-decode` is a path dependency, and the root manifest has no `[workspace]` table -
       # deliberately, so `fuzz/` stays its own workspace (see nuthatch#581). A consequence nobody
       # intended: cargo builds a path dependency but never runs its unit tests, so the 18 tests
@@ -165,7 +186,7 @@ jobs:
       #
       # `CARGO_TARGET_DIR` here is a disk measure, not tidiness: `decode/` is its own workspace, so
       # without it these steps build a *second* artifact set under `decode/target`. Pointing them at
-      # the root `target/` costs almost nothing, because `cargo test` above already compiles
+      # the root `target/` costs almost nothing, because the archive build above already compiles
       # `nuthatch-decode` as a path dependency into that directory - the only new artifact is
       # decode's own test harness.
       #
@@ -190,7 +211,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo test --locked --manifest-path decode/Cargo.toml
       # `components/*` are standalone crates (a wasm32-wasip2 cdylib only links for that target), so
-      # neither `cargo test` above nor the decode steps reach them. Their logic is plain Rust over
+      # neither the archive above nor the decode steps reach them. Their logic is plain Rust over
       # Arrow, so the unit tests run on the host target; no wasm toolchain is needed (#1722).
       - name: fmt (components)
         run: |
@@ -241,8 +262,27 @@ jobs:
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
+  # No toolchain and no rust-cache: the shards run prebuilt binaries and never compile. The archive
+  # extracts over the checkout at the path it was built at (see .github/actions/nextest-shard).
+  test-default:
+    name: test (default, ${{ matrix.shard }}/3)
+    needs: check-default
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/nextest-shard
+        with:
+          archive: nextest-default
+          shard: ${{ matrix.shard }}
+          of: 3
+
   check-exex:
-    name: fmt · clippy · test (exex)
+    name: fmt · clippy · build (exex)
     runs-on: ubuntu-latest
     # Same 90m ceiling as the default leg (#584). Cold-cache is a full clippy+test of the exex
     # feature set from scratch; this used to share a disk with that pair and lose.
@@ -271,8 +311,18 @@ jobs:
           df -h /
       - name: clippy (exex)
         run: cargo clippy --features exex --all-targets -- -D warnings
-      - name: test (exex)
-        run: cargo test --features exex --locked
+      - uses: ./.github/actions/install-nextest
+      - name: build the test archive
+        run: cargo nextest archive --features exex --locked --archive-file "$RUNNER_TEMP/nextest-exex.tar.zst"
+      - name: doctests
+        run: cargo test --doc --features exex --locked
+      - name: upload the test archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-exex
+          path: ${{ runner.temp }}/nextest-exex.tar.zst
+          compression-level: 0
+          retention-days: 1
       - name: disk after the builds
         if: always()
         run: df -h /
@@ -286,8 +336,25 @@ jobs:
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
+  test-exex:
+    name: test (exex, ${{ matrix.shard }}/3)
+    needs: check-exex
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/nextest-shard
+        with:
+          archive: nextest-exex
+          shard: ${{ matrix.shard }}
+          of: 3
+
   check-counter:
-    name: fmt · clippy · test (counter)
+    name: fmt · clippy · build (counter)
     runs-on: ubuntu-latest
     # The exact lesson `check-exex` above was created for (#423), applied to the second
     # feature-gated surface: **a feature nobody lints is a feature that rots silently.** RFC-0046's
@@ -322,11 +389,38 @@ jobs:
           df -h /
       - name: clippy (counter)
         run: cargo clippy --features counter --all-targets -- -D warnings
-      - name: test (counter)
-        run: cargo test --features counter --locked
+      - uses: ./.github/actions/install-nextest
+      - name: build the test archive
+        run: cargo nextest archive --features counter --locked --archive-file "$RUNNER_TEMP/nextest-counter.tar.zst"
+      - name: doctests
+        run: cargo test --doc --features counter --locked
+      - name: upload the test archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-counter
+          path: ${{ runner.temp }}/nextest-counter.tar.zst
+          compression-level: 0
+          retention-days: 1
       - name: disk after the builds
         if: always()
         run: df -h /
+
+  test-counter:
+    name: test (counter, ${{ matrix.shard }}/3)
+    needs: check-counter
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/nextest-shard
+        with:
+          archive: nextest-counter
+          shard: ${{ matrix.shard }}
+          of: 3
 
   pg-parity:
     name: scaled mode (parity · control plane · reconcile)
@@ -436,8 +530,18 @@ jobs:
         run: cargo clippy --features folds --all-targets -- -D warnings
       # The whole suite, not only the facade's own: the feature changes what the Graph surface
       # serves, so every test that reaches it has to hold in this build too.
-      - name: test (graph)
-        run: cargo test --locked --features graph
+      - uses: ./.github/actions/install-nextest
+      - name: build the test archive
+        run: cargo nextest archive --locked --features graph --archive-file "$RUNNER_TEMP/nextest-graph.tar.zst"
+      - name: doctests
+        run: cargo test --doc --locked --features graph
+      - name: upload the test archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-graph
+          path: ${{ runner.temp }}/nextest-graph.tar.zst
+          compression-level: 0
+          retention-days: 1
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         run: |
@@ -447,6 +551,23 @@ jobs:
           fi
           elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
+
+  test-graph:
+    name: test (graph, ${{ matrix.shard }}/4)
+    needs: graph-facade
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/nextest-shard
+        with:
+          archive: nextest-graph
+          shard: ${{ matrix.shard }}
+          of: 4
 
   # #1717. Kills the real binary at named instants in the seal path and restarts it on the same
   # directory. The points exist only under `--features crash-points`, so no other job reaches them.
