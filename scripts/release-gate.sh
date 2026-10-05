@@ -37,8 +37,8 @@
 # sampled peak the binary's /metrics is read too, so a binary that exports the analytics pool and jemalloc gauges
 # (#1778) reports where the peak sat.
 # With --baseline, also FAIL ("answer differs") on a statement whose answer is not the baseline's.
-# Each answer is kept canonical in <out>/answers/<id>.rows (keys sorted, floats to 12 significant
-# digits, rows sorted unless the statement has a top-level ORDER BY) and compared by its sha256.
+# Each answer is kept canonical in <out>/answers/<id>.rows (keys sorted, values exact,
+# rows sorted unless the statement has a top-level ORDER BY) and compared by its sha256.
 # A statement tagged `# volatile: <id> <why>` in the set is compared on its row count only.
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
 # Two runs against one copy wait for each other: the second `serve` could not open the redb.
@@ -85,6 +85,11 @@ case "$concurrency" in ''|*[!0-9]*|0) die "--concurrency must be a positive inte
 [ -z "$env_file" ] || gate_load_env "$env_file"
 command -v curl >/dev/null || die "curl is not on PATH"
 command -v jq >/dev/null || die "jq is not on PATH"
+# jq before 1.7 parses every number to a double, folding 2^53 + 1 into 2^53 and 1.0 into 1; 1.7 keeps
+# the served literal, which the exact comparison depends on.
+jq_version=$(jq --version 2>/dev/null || true)
+printf '%s\n' "$jq_version" | grep -Eq '^jq-(1\.([7-9]|[1-9][0-9])|[2-9])' \
+  || die "${jq_version:-a jq that reports no version} folds numbers together; the gate needs jq 1.7 or later"
 
 # shellcheck source=gate/lock.sh
 . "$(dirname "$0")/gate/lock.sh"

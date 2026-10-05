@@ -340,10 +340,20 @@ impl Case {
     /// Defines `gate_probe` over the fixture table and `gate_rows` over literals. `wrong` stands
     /// in for a candidate that answers block 5 as 50, sorts on `s` the other way round, is 1e-13
     /// off on a float, and returns `gate_rows` in the reverse order: a view's own ORDER BY is not
-    /// kept, but a VALUES list's order is.
+    /// kept, but a VALUES list's order is. `gate_numbers` answers 2^53 + 1 as 2^53 and 1 as 1.0.
     fn probe(&self, wrong: bool) {
         let views = self.nest.join("views");
         std::fs::create_dir_all(&views).unwrap();
+        let numbers = if wrong {
+            "CAST(9007199254740992 AS BIGINT) AS big, CAST(1 AS DOUBLE) AS one"
+        } else {
+            "CAST(9007199254740993 AS BIGINT) AS big, CAST(1 AS BIGINT) AS one"
+        };
+        std::fs::write(
+            views.join("92-gate-numbers.sql"),
+            format!("CREATE VIEW gate_numbers AS SELECT {numbers};\n"),
+        )
+        .unwrap();
         let (block, s, third, rows) = if wrong {
             (
                 "CASE WHEN block_number = 5 THEN 50 ELSE block_number END",
@@ -400,8 +410,7 @@ impl Case {
 /// #1772: a statement that answers, but not what production answered, fails and is named, with
 /// the first row at which the two differ. Row order is part of the answer only under a top-level
 /// ORDER BY: a statement without one passes with its rows reversed (the quoted ORDER BY is a
-/// literal, not a clause), and a float 1e-13 off is equal to 12 significant digits, as a number or
-/// cast to text.
+/// literal, not a clause). A float 1e-13 off differs too, as a number or cast to text (#1883).
 #[test]
 fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row() {
     let c = case();
@@ -450,9 +459,10 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
         line_for(&text, "unordered").starts_with("ok "),
         "only the order differs, and it has no top-level ORDER BY:\n{text}"
     );
+    let float = line_for(&text, "float");
     assert!(
-        line_for(&text, "float").starts_with("ok "),
-        "equal to 12 significant digits:\n{text}"
+        float.starts_with("FAIL ") && float.contains("answer differs"),
+        "1e-13 off is a different answer:\n{text}"
     );
     let volatile = line_for(&text, "volatile");
     assert!(
@@ -461,7 +471,7 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
         "{volatile}"
     );
     assert!(
-        text.contains("RESULT: FAIL - answer differs: value, ordered, volatile"),
+        text.contains("RESULT: FAIL - answer differs: value, ordered, float, volatile"),
         "{text}"
     );
 }
@@ -496,6 +506,56 @@ fn a_volatile_statement_that_answers_differently_passes_on_its_row_count() {
         text.contains("1 match, 0 differ, 1 compared on row count only"),
         "{text}"
     );
+}
+
+/// #1883: numbers jq could fold together under a lossy number model still differ: an integer past
+/// 2^53 one apart, and an integer that comes back as a float of the same value.
+#[test]
+fn numbers_a_lossy_parse_would_fold_together_still_differ() {
+    let c = case();
+    let set = c.set(&[
+        ("big", "SELECT big FROM gate_numbers".to_string()),
+        ("one", "SELECT one FROM gate_numbers".to_string()),
+    ]);
+    let (out, text) = c.against_a_wrong_candidate(&set, &[]);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    for id in ["big", "one"] {
+        let line = line_for(&text, id);
+        assert!(
+            line.starts_with("FAIL ") && line.contains("answer differs"),
+            "{line}"
+        );
+    }
+    assert!(
+        text.contains("candidate: {\"big\":9007199254740992}")
+            && text.contains("baseline:  {\"big\":9007199254740993}")
+            && text.contains("candidate: {\"one\":1.0}")
+            && text.contains("baseline:  {\"one\":1}"),
+        "{text}"
+    );
+}
+
+/// A jq before 1.7 parses every number to a double, which folds those numbers together, so the
+/// gate will not run on one: a setup fault, not a verdict.
+#[test]
+fn a_jq_that_folds_numbers_is_a_setup_fault() {
+    let c = case();
+    let bin = c.dir.path().join("old-jq");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("jq");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo jq-1.6; exit 0; }\nexit 99\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&shim, perms).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let set = c.set(&[("answers", c.counts())]);
+    let (out, text) = c.gate(&set, &[], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("jq-1.6") && text.contains("1.7"), "{text}");
 }
 
 /// #1773: production serves two statements at once. At `--concurrency 2` the set goes out a pair at
@@ -554,11 +614,7 @@ fn at_concurrency_two_an_answer_that_differs_still_fails_and_is_named() {
             "ordered",
             "SELECT third FROM gate_probe ORDER BY s".to_string(),
         ),
-        (
-            "float",
-            "SELECT third, CAST(third * CAST('1e22' AS DOUBLE) AS VARCHAR) AS text FROM gate_probe"
-                .to_string(),
-        ),
+        ("by_key", "SELECT k FROM gate_rows ORDER BY k".to_string()),
     ]);
     let (out, text) = c.against_a_wrong_candidate(&set, &["--concurrency", "2"]);
     assert_eq!(out.status.code(), Some(1), "{text}");
@@ -580,7 +636,7 @@ fn at_concurrency_two_an_answer_that_differs_still_fails_and_is_named() {
         "{ordered}"
     );
     assert!(line_for(&text, "unordered").starts_with("ok "), "{text}");
-    assert!(line_for(&text, "float").starts_with("ok "), "{text}");
+    assert!(line_for(&text, "by_key").starts_with("ok "), "{text}");
     assert!(
         text.contains("2 match, 2 differ")
             && text.contains("RESULT: FAIL - answer differs: value, ordered"),
@@ -601,7 +657,7 @@ fn at_concurrency_two_an_answer_that_differs_still_fails_and_is_named() {
             ("1", "unordered"),
             ("1", "value"),
             ("2", "ordered"),
-            ("2", "float")
+            ("2", "by_key")
         ],
         "{schedule}"
     );

@@ -84,12 +84,15 @@ Each answer is kept canonical in `<out>/answers/<id>.rows`, one row per line as 
 sorted, and the baseline records its sha256 and where its rows are (`# answers:`), so a candidate run
 can show the row that differs. The canonical form decides what counts as the same answer:
 
-- A number written as an integer, and any string (a `CAST(... AS VARCHAR)` decimal or a uint256
-  among them), compares exactly. Any other number is rounded to **12 significant digits**, so a
-  float summed in another order compares equal; a type change from integer to float of the same
-  value does too. So is a string in exponent form, `6.93379390844438e22`: that is a DOUBLE cast to
-  text, which no integer or DECIMAL renders as. A float cast to text without an exponent is
-  indistinguishable from a decimal and compares exactly.
+- Every value compares exactly as served, floats included: a float one bit off, or an integer that
+  comes back as a float, is a different answer. Floats were rounded to 12 significant digits until
+  #1883, when two fresh 4.7.0 servers answered every production set alike to the last bit
+  ([the record](reproducibility-2026-10-05.md)). A baseline from a binary before 4.6.0, which summed
+  DOUBLE in arrival order, can differ from a later one in the last digit.
+  The rows go through jq, and only jq 1.7 or later keeps each number's digits and form: an older one parses
+  every number to a double, so 9007199254740993 would match 9007199254740992 and 1.0 would match 1.
+  The gate refuses an older jq as a setup fault (exit 2). The ThinkPad, the Mac and CI's
+  ubuntu-latest all have 1.7.
 - Rows are compared in order when the statement has a top-level `ORDER BY`, and sorted first when it
   has none, since without one the order is the engine's choice. A window's or a subquery's `ORDER
   BY` sits inside parentheses and does not count. When it cannot tell (a comment, an unclosed quote,
