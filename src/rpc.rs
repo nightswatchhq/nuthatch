@@ -1560,11 +1560,9 @@ impl RpcClient {
     /// Unix timestamps (seconds) for the given block numbers, fetched in a single JSON-RPC batch so
     /// even a dense window costs one round-trip.
     ///
-    /// Two different "missing" cases, deliberately kept distinct because timestamps feed the sealed
-    /// (immutable) path: a block the endpoint *answered but omitted* is simply absent from the returned
-    /// map (best-effort; the caller stores 0 for it), but a *whole-batch request failure* is retried a
-    /// few times and then returned as `Err` - never silently collapsed into an all-zeros map, which
-    /// would bake `block_timestamp = 0` into a permanent segment from a transient blip.
+    /// A *whole-batch request failure* is retried a few times and then returned as `Err`, and a
+    /// partial answer is an `Err` too (COR-3 below): either would otherwise bake
+    /// `block_timestamp = 0` into a permanent segment from a transient blip.
     /// Forget cached timestamps for blocks above `block` - **called on every reorg**.
     ///
     /// A block number is not a block identity. When the chain reorganises, the block at a given height
