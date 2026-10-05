@@ -85,6 +85,11 @@ case "$concurrency" in ''|*[!0-9]*|0) die "--concurrency must be a positive inte
 [ -z "$env_file" ] || gate_load_env "$env_file"
 command -v curl >/dev/null || die "curl is not on PATH"
 command -v jq >/dev/null || die "jq is not on PATH"
+# jq before 1.7 parses every number to a double, folding 2^53 + 1 into 2^53 and 1.0 into 1; 1.7 keeps
+# the served literal, which the exact comparison depends on.
+jq_version=$(jq --version 2>/dev/null || true)
+printf '%s\n' "$jq_version" | grep -Eq '^jq-(1\.([7-9]|[1-9][0-9])|[2-9])' \
+  || die "${jq_version:-a jq that reports no version} folds numbers together; the gate needs jq 1.7 or later"
 
 # shellcheck source=gate/lock.sh
 . "$(dirname "$0")/gate/lock.sh"

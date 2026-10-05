@@ -89,6 +89,10 @@ can show the row that differs. The canonical form decides what counts as the sam
   #1883, when two fresh 4.7.0 servers answered every production set alike to the last bit
   ([the record](reproducibility-2026-10-05.md)). A baseline from a binary before 4.6.0, which summed
   DOUBLE in arrival order, can differ from a later one in the last digit.
+  The rows go through jq, and only jq 1.7 or later keeps each number's digits and form: an older one parses
+  every number to a double, so 9007199254740993 would match 9007199254740992 and 1.0 would match 1.
+  The gate refuses an older jq as a setup fault (exit 2). The ThinkPad, the Mac and CI's
+  ubuntu-latest all have 1.7.
 - Rows are compared in order when the statement has a top-level `ORDER BY`, and sorted first when it
   has none, since without one the order is the engine's choice. A window's or a subquery's `ORDER
   BY` sits inside parentheses and does not count. When it cannot tell (a comment, an unclosed quote,
