@@ -25,7 +25,7 @@ Lodestar sends nothing to the nest itself: its dashboard reads kittiwake's API, 
 only thing that opens a socket to a nest (`crates/nest`). So the set is every statement kittiwake
 sends to the allocations nest (`NestId::Alloc`), labelled `lodestar` where it serves a dashboard
 route and `kittiwake` where it is one of kittiwake's own jobs (the directory refresh, the ingest
-crons, the live feed, RAV collection, QoS scoring). 57 are Lodestar's, 15 kittiwake's, and 2 are
+crons, the live feed, RAV collection, QoS scoring). 58 are Lodestar's, 15 kittiwake's, and 2 are
 asked by both.
 
 The set carries kittiwake's statements, and kittiwake is private while this repo is public, so it
@@ -69,6 +69,9 @@ It fails (exit 1) on:
 
 - any error or refusal from `/sql`, an out-of-memory, or a degraded answer;
 - the server dying under a query;
+- the serving process's peak RSS over the 2 GiB per-cursor budget (`GATE_MAX_RSS_MB`, 2048): on
+  Linux the kernel's high-water mark, `VmHWM`, read as each server is stopped, elsewhere the
+  half-second samples;
 - with `--baseline`, a query slower than **2x its baseline and more than 1000 ms slower**, or the
   set's p99 slower than **1.5x the baseline's and more than 1000 ms slower**. Both halves must hold,
   so a 40 ms query taking 90 ms is noise. The bounds are `GATE_QUERY_FACTOR`, `GATE_QUERY_SLACK_MS`,
@@ -162,8 +165,8 @@ sees those. A per-nest DuckDB reference stage (#1796) also did, and was removed 
 
 ## Where it runs: the ThinkPad
 
-The copy is about 700 MB and the gate wants a quiet box for its timings, so it does not fit a GitHub
-runner. It runs on the ThinkPad, which already runs the QoS nest; the gate is scheduled away from
+The copy is a whole nest directory, segments and redb, and the gate wants a quiet box for its
+timings, so it does not fit a GitHub runner. It runs on the ThinkPad, which already runs the QoS nest; the gate is scheduled away from
 that nest's busy periods. Every gate run against a copy, the timer's or one by hand with
 `release-gate.sh`, takes the same lock beside it (`alloc-nest.gate-lock`; flock on Linux, a mkdir
 lock elsewhere) and waits for any other: two `serve`s cannot open one redb.
