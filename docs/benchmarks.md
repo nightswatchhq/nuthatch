@@ -28,6 +28,33 @@ repeatable. `--rpc` overrides the nest's endpoints - point it at your own node f
 Nothing here optimises anything. It exists so the seal-direct / adaptive-chunker / pipeline work
 (later RFC-0004 slices) is each gated on a measured before/after, not a wish.
 
+## Backfill throughput is tracked, not gated
+
+CLAUDE.md sets a backfill floor of 10K events/s, aiming for 30K. **No CI check fails on events/sec.**
+The `backfill throughput` job runs `.github/workflows/backfill-throughput.sh` on every PR: three
+batches of 15 over the chain `footprint-rpc.py` serves (blocks 1 to 20,000, 80,000 rows, seal-direct,
+concurrency 4). It reports the median to the step summary and an artifact, and fails only if a run
+did not decode all 80,000 events. #1723 measured the figure before choosing that shape.
+
+The runner's figure is stable. Five batches on `ubuntu-latest` (4 cores, 16 GB) gave medians from
+23,735 to 24,770 ev/s, a 4.2% spread, median 24,446 ([report](bench/backfill-throughput-runner.json)).
+
+It cannot see the regressions a floor would be there to catch:
+
+| change | effect on the median | report |
+| --- | --- | --- |
+| concurrency 1 instead of 4, same runner | **+19%** (29,185 ev/s) | [runner c1](bench/backfill-throughput-runner-c1.json) |
+| `decode_window` decodes every log 4 times, dev box | -3.1% (98,391 to 95,338) | [base a](bench/backfill-sensitivity-base-a.json), [mutant a](bench/backfill-sensitivity-decode4-a.json) |
+| the same mutation, second pair | -1.4% (96,959 to 95,611) | [base b](bench/backfill-sensitivity-base-b.json), [mutant b](bench/backfill-sensitivity-decode4-b.json) |
+
+A floor tight enough to see a 4x decode cost would sit inside the runner's own batch spread. A
+floor loose enough to survive that spread passes the decode mutation, and losing the pipeline
+reads as an improvement. The fixture is single-threaded Python sharing four cores with the binary,
+so the figure is mostly the fixture and the fetch, not nuthatch. The point-read gate states the
+rule (ci.yml): a ceiling that passes the known break is decoration. A throughput gate needs a
+scenario where nuthatch's own work dominates the wall clock. Until there is one, the floor is a
+design target measured by hand with `bench backfill`, not a gate.
+
 ## Workloads (pinned, public, reproducible)
 
 | ID | Nest | Range | Character |
