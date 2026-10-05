@@ -647,6 +647,9 @@ pub(crate) struct SeedEnvelope {
     pub(crate) complete_through: u64,
     /// SHA-256 of the `manifest.json` these tails complete. A seeder that reads another retries.
     pub(crate) catalogue_sha256: String,
+    /// [`tails_digest`] of `tails`, so a snapshot that lost an entry on the way is refused rather than
+    /// seeding a nest that silently lacks that table's tail. Not authentication: an editor can recompute it.
+    pub(crate) tails_sha256: String,
     pub(crate) tails: std::collections::BTreeMap<String, Segment>,
 }
 
@@ -662,7 +665,7 @@ impl SeedEnvelope {
         // The highest block any segment reaches, tails included. The publisher's own watermark may
         // be higher, but only by blocks that held no row, so resuming here re-reads nothing sealed.
         let complete_through = local.tables.values().flatten().map(|s| s.to_block).max()?;
-        let tails = local
+        let tails: std::collections::BTreeMap<_, _> = local
             .tables
             .iter()
             .filter_map(|(t, segs)| Some((t.clone(), segs.iter().find(|s| s.provisional)?.clone())))
@@ -674,9 +677,22 @@ impl SeedEnvelope {
             indexed_from,
             complete_through,
             catalogue_sha256: sha256_hex(catalogue),
+            tails_sha256: tails_digest(&tails),
             tails,
         })
     }
+}
+
+/// Each tail's table, hash and range, in table order.
+pub(crate) fn tails_digest(tails: &std::collections::BTreeMap<String, Segment>) -> String {
+    let mut h = Sha256::new();
+    for (table, s) in tails {
+        h.update(format!(
+            "{table}\0{}\0{}\0{}\0{}\n",
+            s.hash, s.from_block, s.to_block, s.rows
+        ));
+    }
+    hex::encode(h.finalize())
 }
 
 /// The publisher's start block, read from its store. Only a stopped nest's can be opened; a running

@@ -397,3 +397,22 @@ async fn an_interrupted_seed_is_refused_by_dev_and_finished_by_seed() {
     let got = run_to(seeded.path(), chain(14), PUBLISHER, 14).await;
     assert_eq!(recipient_balance(&got), 5_500);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_that_lost_a_tail_is_refused() {
+    let publisher = tempfile::tempdir().unwrap();
+    let mirror = tempfile::tempdir().unwrap();
+    let report = published(publisher.path(), mirror.path()).await;
+    let path = mirror.path().join(&report.dataset).join("_seed/seed.json");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    snapshot["tails"] = serde_json::json!({});
+    std::fs::write(&path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+
+    let seeded = tempfile::tempdir().unwrap();
+    scaffold_nest(seeded.path(), PUBLISHER, USDC);
+    let err = nuthatch::seed::seed(seeded.path(), mirror.path().to_str().unwrap())
+        .await
+        .expect_err("a snapshot missing a tail would seed a nest without those rows");
+    assert!(format!("{err:#}").contains("own digest"), "{err:#}");
+}

@@ -180,6 +180,12 @@ fn check_snapshot(s: &SeedEnvelope, dataset: &str, chain_id: u64, config: &Confi
             s.layout_version
         );
     }
+    if publish::tails_digest(&s.tails) != s.tails_sha256 {
+        bail!(
+            "the seed snapshot's tails do not match its own digest: an entry was lost or changed, and \
+             seeding from it would leave a table missing rows"
+        );
+    }
     if s.data_identity != dataset {
         bail!(
             "the seed snapshot is for dataset {}, not this nest's {dataset}",
@@ -373,6 +379,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "layout_version": 1, "chain_id": 1, "data_identity": "d", "indexed_from": 1,
             "complete_through": complete_through, "catalogue_sha256": "c", "tails": {},
+            "tails_sha256": "",
         }))
         .unwrap()
     }
