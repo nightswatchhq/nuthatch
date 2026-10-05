@@ -139,23 +139,14 @@ say where it lives:
 nuthatch init 0xADDR --chain world-chain --rpc https://your-endpoint.example
 ```
 
-The chain id is read **from the endpoint itself**, so there is no id to look up and nothing to type
-wrong. A built-in chain never dials to learn its id: on one of the nine names `--rpc` is not consulted
-for the chain id, but it **is** the pool - your endpoints replace the bundled public ones outright, and
-nothing public is appended after them. Omit `--rpc` on an unregistered name and the refusal tells you
-the remedy rather than just listing the built-ins.
+The chain id is read **from the endpoint itself**, so there is nothing to look up or type wrong. On
+one of the nine built-in names `--rpc` is not consulted for the chain id, but it **is** the pool: your
+endpoints replace the bundled public ones outright. Omit `--rpc` on an unregistered name and the
+refusal tells you the remedy.
 
-Public endpoints are a moving target, and the ones shipped here are measured rather than assumed -
-but a measurement is a snapshot, not a property. Run `nuthatch doctor --rpc <url>` before trusting a
-long backfill to any endpoint, yours or ours: it reports the widest `eth_getLogs` range, the JSON-RPC
-batch limit and whether the node has archive depth, and prints the largest safe `--window`.
-
-Everything downstream was always chain-agnostic - `dev`, `sql` and `bench`, and the indexer's
-unregistered-chain finality and window defaults. `init`'s allow-list was the only thing narrower than
-what nuthatch actually scaffolds, and it went in 2.4.0. See
-[running an unlisted EVM chain](docs/operators.md#running-an-unlisted-evm-chain) for the finality
-caveat, which is the part worth reading: a chain whose `finalized` tag runs close to the tip needs a
-depth-based policy instead, or you seal immutable Parquet that could never be corrected.
+See [running an unlisted EVM chain](docs/operators.md#running-an-unlisted-evm-chain) for the
+finality caveat, which is the part worth reading: a chain whose `finalized` tag runs close to the tip
+needs a depth-based policy instead, or you seal immutable Parquet that could never be corrected.
 
 ### Bring your own RPC endpoint
 
@@ -171,21 +162,15 @@ clock** (the same tape live against a public endpoint and replayed from disk, 20
 caveat on the page itself.
 
 The free public endpoints bundled per chain exist for one job: so `init` → `dev` works with **zero
-setup**, which is the two-minute demo, and it is deliberate. Treat them as **testing and initial
-validation** - trying it out, checking a contract resolves, following the tip of something quiet.
-They are the on-ramp, not the road.
+setup**. Treat them as testing and initial validation. Why they are not fine for real work, said here
+rather than discovered at 3am:
 
-Why they are not fine for real work, said here rather than discovered at 3am:
-
-- **They are rate-limited and shared.** You are queueing behind everyone else using the same free tier
-  from the same IP range. Throughput varies by the hour.
-- **They fail intermittently, and not always loudly.** A rate-limited endpoint may return an empty
-  result rather than an error. nuthatch fails over across the pool and retries, but a window that every
-  endpoint refuses will stall until one recovers - `/ready` reports `stalled` when that happens.
-- **Deep backfills will crawl or stop.** Full history over a busy contract means millions of
-  `eth_getLogs` calls. Expect a free endpoint to throttle you long before that finishes.
-- **No archive guarantees.** Many free endpoints prune old state, so a backfill from a 2020 deploy block
-  can simply fail partway.
+- **They are rate-limited and shared**, and throughput varies by the hour.
+- **They fail intermittently, and not always loudly.** nuthatch fails over across the pool and
+  retries, but a window that every endpoint refuses stalls until one recovers; `/ready` reports
+  `stalled` when that happens.
+- **Deep backfills will crawl or stop**, and many free endpoints prune old blocks, so a backfill from
+  a 2020 deploy block can fail partway.
 
 **Check an endpoint before you trust a backfill to it.** `nuthatch doctor` probes one and reports the
 largest `getLogs` window it will actually serve, its batch limit, and whether it has archive history -
@@ -238,12 +223,10 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
   server carries the same notice. The caveat is a fact about the *nest*, not about the row count you
   happened to get, so it appears whether or not this particular query touched the gap.
 - **A failed query tells you how to fix it.** An engine error is classified against the nest's own
-  schema and an actionable line is appended - the engine's raw message is always kept, the hint is
-  added after it. An unknown table names the closest real one; a view that failed to *build* says so
-  rather than reporting "does not exist" and sending you hunting for a missing view; and a Solidity
-  `bool` column explains itself, because it is stored as exact text `'true'`/`'false'` and therefore
-  blows up inside `COALESCE`, `CASE`, `UNION` and `bool_and`/`bool_or` while comparing fine on its
-  own. Same treatment on `/sql`, the MCP `sql` tool and the `nuthatch sql` REPL.
+  schema and a hint is appended after the engine's raw message: an unknown table names the closest
+  real one, a view that failed to *build* says so rather than "does not exist", and a Solidity `bool`
+  column, stored as exact text `'true'`/`'false'`, explains why it blows up inside `COALESCE`, `CASE`
+  and `bool_and`. Same treatment on `/sql`, the MCP `sql` tool and `nuthatch sql`.
 - **Hot + cold in one surface.** Queries span the live unsealed tip (redb) *and* sealed history
   (Parquet), transparently - you never think about the boundary.
 - **Big-int friendly.** `uint256` values are exact text; amounts that fit in 38 digits also get a
@@ -294,10 +277,8 @@ run cannot produce the case's output at all, because absolute balances need hist
 window, which is precisely why the benchmark makes the RPC calls. Second, "derived" is proven rather
 than asserted: at the pinned end block, 39 sampled accounts - the ten largest, ten smallest non-zero,
 ten zero-balance and ten by address order - **all matched `balanceOf()`**, including every zero-balance
-account, which is the case an off-by-one in the ledger would betray.
-
-The count is 7,634 and not 7,635 because `0x0` is the mint/burn counterparty rather than a holder. That
-off-by-one was the tell that the interpretation was right.
+account, which is the case an off-by-one in the ledger would betray. The count is 7,634 and not 7,635
+because `0x0` is the mint/burn counterparty rather than a holder.
 
 **Case 6** is the factory-template case: the Uniswap V2 factory over blocks 19,000,000-19,010,000,
 discovering pairs from `PairCreated` and indexing `Swap` on every child it finds. No per-child config,
@@ -317,12 +298,11 @@ The figure this table used to show, **49.5 s** with 16 requests and 247 MB, is *
 a closed Alchemy account**. Nobody, us included, can rerun it. Its report stays in the tree as
 [`docs/bench/obib-case6.json`](docs/bench/obib-case6.json) for the record, not as a claim.
 
-For scale, OBIB's own published figures for case 6 differ between its two tables: the January 2026
-results table gives Envio HyperIndex **1.92 min**, Subsquid 5.34 min and Sentio 14.36 min, while the
-case-6 page reports Envio at **30 s** from an earlier round. We quote both. Our 4.67 s is under both,
-and that is not a like-for-like ranking: those runs were on other machines, other days and other
-endpoints, and Envio and Subsquid serve this from their own pre-indexed networks, where nuthatch runs
-against plain JSON-RPC.
+For scale, OBIB's own published figures for case 6 differ between its two tables: its results table
+gives Envio HyperIndex **1.92 min**, Subsquid 5.34 min and Sentio 14.36 min, while its case-6 page
+reports Envio at **30 s** from an earlier round. We quote both, and neither is a like-for-like
+ranking: those runs were on other machines, other days and other endpoints, and Envio and Subsquid
+serve this from their own pre-indexed networks, where nuthatch runs against plain JSON-RPC.
 
 Cases 1 and 2 were measured in July and August 2026 against the same Alchemy account case 6's old
 figure is withdrawn for, so nobody can rerun those two as they were; they stay because their
@@ -478,54 +458,30 @@ who need more - none of it in the way of the happy path:
   chain** - a Base nest and an Arbitrum nest in one runtime. Per-nest isolation, and a footprint budget
   **per active-chain cursor** (≤2 GB). A capability, not a mandate: one chain per runtime stays the simple
   default.
-- **Mount and unmount nests without a restart** (RFC-0027). Changing a runtime's nest set
-  used to mean editing config and restarting, which stops every *co-tenant* nest too - so the blast
-  radius of a config change was larger than that of a fault. Now `POST /_admin/nests` mounts one and
-  `DELETE /_admin/nests/<name>` unmounts one, live. A mount is admitted only if it fits the cursor's RAM
-  budget (refused, never warned - a budget that can be quietly exceeded is not a budget),
+- **Mount and unmount nests without a restart** (RFC-0027). `POST /_admin/nests` mounts one and
+  `DELETE /_admin/nests/<name>` unmounts one, live, so a change to the nest set no longer stops every
+  co-tenant. A mount is admitted only if it fits the cursor's RAM budget (refused, never warned),
   catches up *before* it joins so it never drags co-tenants back through history, and only then gets
-  routes. An unmount is a **drain**, not a route removal: the cursor finishes its window and releases
-  the store before anything is torn down. The set is persisted to `mounts.toml`, so a restart converges
-  on what you last asked for. An unmount keeps the dataset, so a remount is free; `?reclaim=true` on the
-  `DELETE` removes it once no mount references it, and `DELETE /_admin/datasets/<nid>` reclaims one
-  unmounted earlier. A runtime may start with nothing mounted: declare its chains under `[[chains]]`,
-  and the first mount onto a chain starts that chain's cursor, dialling its RPC only then.
-  Started with `--registry`, a runtime fetches a mounted NID it does not hold, verifies it as `nest load`
-  does, and installs it at `data/<nid>/` first. A mount answers `202` at once, and `GET
-  /_admin/mounts/<name>` reports it fetching, joining, live, or failed with the reason, across a
-  restart; `?wait=true` answers only when it is done, with `507` for a breached budget. `POST
-  /_admin/suspend/<name>` takes a mount off its cursor and answers `503` in its place, keeping its data
-  and record across a restart; `POST /_admin/resume/<name>` catches it up from where it stopped.
-  `?dry_run=true` on a mount reports its chain, backfill, per-block RPC work and projected footprint,
-  and the refusal a real mount would give, mounting nothing. `POST /_admin/move/<name>` with a new
-  `nid` catches the new nest up beside the old one, then switches the name in one step: a reader sees
-  the old nest, then the new, and never an error between.
+  routes; an unmount is a drain, not a route removal. The set persists in `mounts.toml`, so a restart
+  converges on what you last asked for. Suspend, resume, move a name to a new NID without a gap,
+  dry-run a mount for its projected footprint, and fetch a NID from a registry at mount time: all in
+  [nest lifecycle operations](docs/operators.md#nest-lifecycle-operations).
 - **Scaled mode - a fleet across machines** (RFC-0022). When one box can no longer hold your cursors,
-  or when serving and ingestion want to scale independently, the *same crates* run as three roles:
-  a **control plane** holding what should run, a **writer pool** (`nuthatch worker`) whose members take
-  cursor **leases**, and a **query-FE tier** (`nuthatch serve`) that serves from shared state and owns
-  nothing. A role flag, never a fork -
-  and opt-in at build time (`--features postgres-store`), so the published binary carries no database
-  driver and embedded mode stays a single file with zero services. The writer pool is safely scalable
-  because ownership is enforced *by the store*: every write carries a fence, and a stalled worker that
-  wakes up finds its writes **refused** rather than merely discouraged. Nests are added and removed
-  over HTTP with no restarts, versions are pinned fleet-wide so two FE nodes can never serve the same
-  endpoint from different schemas, and runtime secrets are injected at mount - scoped to the nests a
-  worker actually holds, write-only, and never baked into a content-addressed bundle. A worker **pulls
-  the nests it is assigned** from a registry, because the machine the scheduler picks may have nothing
-  on disk; with a `bundle_hash` pinned the fetch is by **content address**, so re-tagging a version in
-  a registry cannot change what a fleet runs. This is the
-  **self-hosted distributed** path for one operator's cooperating nests; per-tenant billing and authz
-  between untrusting paying customers stay firmly out of scope.
+  the *same crates* run as three roles: a **control plane** holding what should run, a **writer pool**
+  (`nuthatch worker`) whose members take cursor **leases**, and a **query-FE tier** (`nuthatch serve`)
+  that serves from shared state and owns nothing. A role flag, never a fork, and opt-in at build time
+  (`--features postgres-store`), so the published binary carries no database driver. Ownership is
+  enforced by the store: every write carries a fence, and a stalled worker that wakes up finds its
+  writes refused. Workers pull the nests they are assigned from a registry by content address, so
+  re-tagging a version cannot change what a fleet runs. This is the **self-hosted distributed** path
+  for one operator's cooperating nests; per-tenant billing and authz stay out of scope.
 - **Nest bundles + registry - bundle one, publish it, load it anywhere.** `nuthatch nest bundle` packs
   a nest's authored inputs into one portable, content-addressed `.bundle`; `nest load <bundle-or-url>`
-  verifies and installs it - regenerating the decode registry and asserting it matches - so anyone runs
-  your *exact* nest, hash-verified. Share at scale with a **registry** (RFC-0019): `nest publish <bundle>
-  --registry <path|s3://…> --as name@version`, then `nest load name@version --registry …` - a filesystem
-  path or any S3-compatible bucket (MinIO/S3/R2, via `AWS_*` env), with **private nests** behind your
-  bucket's auth. Self-hosted-first: the registry is decoupled and never mandatory - a self-built bundle
-  and `load <file|dir>` need no registry at all. S3/MinIO/R2 is built in - configure it with the usual
-  `AWS_*` env (`AWS_ENDPOINT` for non-AWS), verified live against Hetzner Object Storage.
+  verifies and installs it, regenerating the decode registry and asserting it matches, so anyone runs
+  your *exact* nest. A **registry** (RFC-0019) is a filesystem path or any S3-compatible bucket
+  (`AWS_*` env, `AWS_ENDPOINT` for non-AWS): `nest publish <bundle> --registry … --as name@version`,
+  then `nest load name@version --registry …`. The registry is never mandatory; a bundle and
+  `load <file|dir>` need none.
 - **Mirror a nest to a bucket** ([RFC-0052](docs/rfcs/0052-the-mirrored-nest.md)). `nuthatch publish
   sync --target s3://bucket/prefix` copies a nest's sealed Parquet segments, its catalogue and a
   provenance envelope to any S3-compatible bucket or a directory, and `dev --publish-target` keeps
@@ -604,10 +560,9 @@ counterpart: an acceptance runbook that *proves* a deployment works, step by fal
 plainly which levels we have verified ourselves and which we have not.
 
 **Still deciding whether to trust it at all?** [`docs/kicking-the-tyres.md`](docs/kicking-the-tyres.md)
-is written for that: a guide to *falsifying* nuthatch rather than confirming it, with the cold walk,
-correctness against a public subgraph, what it costs to keep running, a red-team pass on `/sql`, and a
-section listing where we have already been wrong - including two of our own security patches and an
-open finding. We would rather you found the next one than a user did.
+is a guide to *falsifying* nuthatch rather than confirming it: the cold walk, correctness against a
+public subgraph, what it costs to keep running, a red-team pass on `/sql`, and where we have already
+been wrong. We would rather you found the next one than a user did.
 
 The guide covers the questions people actually hit:
 
@@ -638,12 +593,11 @@ A major version is a promise about **stability**, not a claim of completeness.
 - **Upgrades are a binary swap.** No data migration, no conversion step. Proven on a production box
   across 0.3.0 → 0.6.0 → 0.7.2 and at each major since, and in CI: every build opens a frozen
   v3.13.2 data directory and reads it back exactly (`tests/upgrade_golden.rs`).
-- **MSRV 1.95**, measured rather than asserted - it is what CI, `rust-toolchain.toml` and the release
-  build all use. (Before 1.0 this file claimed 1.85, which `cargo +1.85.0 check` refutes in one
-  command. A version nobody tests is not a promise.)
-- **Embedded mode is the production path.** `dev` runs in production today, whether it is hosting one nest or many. **Scaled mode
-  is built and verified across real machines, but younger** - and until 0.9.3 its writer pool did not
-  index at all. If one process per box is enough, that is still the shape to reach for.
+- **MSRV 1.95**, measured rather than asserted: it is what CI, `rust-toolchain.toml` and the release
+  build all use. A version nobody tests is not a promise.
+- **Embedded mode is the production path.** `dev` runs in production today, hosting one nest or many.
+  Scaled mode is built and verified across real machines, but younger: until 0.9.3 its writer pool
+  did not index at all. If one process per box is enough, that is still the shape to reach for.
 
 **What is deliberately not here:** a hosted service, a token, telemetry, non-EVM chains before EVM is
 airtight, or any deployment story beyond binary + compose. Those are not backlog items; they are out
