@@ -296,36 +296,49 @@ no redeploy, one rule.
 
 | | |
 |---|---|
-| wall clock | **49.5 s** (median of 5) |
+| wall clock | **4.67 s** (median of 5; runs 4.5-5.4 s) |
 | events | **35,271** = **35,039** swaps, matching OBIB's expected count exactly, plus the 232 `PairCreated` rows |
 | children discovered | **232** |
-| RPC requests | **16** |
-| peak RSS | **247 MB** |
+| RPC requests | **14** |
+| peak RSS | **229 MB** (median; 205-251 MB across runs) |
+| measured | nuthatch **4.7.0**, the published `aarch64-apple-darwin` release binary, against Tenderly's keyless public gateway (`mainnet.gateway.tenderly.co`), on an 18-core Apple M5 Pro with 48 GB, 2026-10-05 |
+| artifact | [`docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.json`](docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.json), with the binary's sha256, the command and every run in [the note beside it](docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.md) |
+
+The figure this table used to show, **49.5 s** with 16 requests and 247 MB, is **withdrawn: 1.0.1 on
+a closed Alchemy account**. Nobody, us included, can rerun it. Its report stays in the tree as
+[`docs/bench/obib-case6.json`](docs/bench/obib-case6.json) for the record, not as a claim.
 
 For scale, OBIB's own published figures for case 6 differ between its two tables: the January 2026
 results table gives Envio HyperIndex **1.92 min**, Subsquid 5.34 min and Sentio 14.36 min, while the
-case-6 page reports Envio at **30 s** from an earlier round. We are quoting both rather than the
-flattering one; on the second, Envio is faster than us. Note too that Envio and Subsquid serve this
-from their own pre-indexed networks, where nuthatch runs against plain JSON-RPC.
+case-6 page reports Envio at **30 s** from an earlier round. We quote both. Our 4.67 s is under both,
+and that is not a like-for-like ranking: those runs were on other machines, other days and other
+endpoints, and Envio and Subsquid serve this from their own pre-indexed networks, where nuthatch runs
+against plain JSON-RPC.
 
-Both against a real provider (Alchemy), on an 11-core laptop. The artifacts are
+Cases 1 and 2 were measured against a real provider (Alchemy) on an 11-core laptop; case 6 as the
+table above says. The artifacts are
 [`docs/bench/obib-case1.json`](docs/bench/obib-case1.json),
 [`docs/bench/obib-case2.json`](docs/bench/obib-case2.json) and
-[`docs/bench/obib-case6.json`](docs/bench/obib-case6.json); `nuthatch bench backfill` re-runs any of them.
+[`docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.json`](docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.json);
+`nuthatch bench backfill` re-runs any of them.
 The case-2 nest is committed at [`obib-case2/`](obib-case2/) - keyless, so the endpoint arrives via
 `--rpc`, and verified to rebuild from a clean checkout.
 The case-6 nest is published at [`nightswatchhq/obib-case6`](https://github.com/nightswatchhq/obib-case6)
 so the run can be reproduced rather than believed, and is submitted upstream as
 [sentioxyz/open-blockchain-indexer-benchmark#3](https://github.com/sentioxyz/open-blockchain-indexer-benchmark/pull/3).
+Case 6 needs no account at all: the release binary, that nest and the public gateway are the whole
+setup.
 
-**Wall clock on a shared endpoint is the provider's number as much as ours.** The same case-6 range on
-the same commit measured anywhere from 17 s to 57 s depending on when it ran. We checked whether the
-fast runs were provider caching by re-running against an adjacent, never-fetched range
-([`obib-case6-cold-control.json`](docs/bench/obib-case6-cold-control.json)): it landed in the same
-band, so caching is not the explanation. The event count and the **16 RPC requests** are invariant
-across every run, and they are the honest measure of range control.
+**Wall clock on a shared endpoint is the provider's number as much as ours.** In August 2026, on the
+withdrawn Alchemy setup, the same case-6 range on the same commit measured anywhere from 17 s to 57 s
+depending on when it ran. We checked whether the fast runs were provider caching by re-running against
+an adjacent, never-fetched range
+([`obib-case6-cold-control.json`](docs/bench/obib-case6-cold-control.json), same setup): it landed in
+the same band, so caching was not the explanation. The event count was invariant across every run, and
+so was the request count for a given version: **16** then, **14** on 4.7.0 in all five runs. Those are
+the honest measure of range control.
 
-Two things that number is worth knowing about:
+Two things the case 1 number is worth knowing about:
 
 - **It did not finish at all before v0.9.0.** Alchemy returns its oversized-range refusal as HTTP
   **400**, which our status classifier did not enumerate - so a window that needed splitting was
