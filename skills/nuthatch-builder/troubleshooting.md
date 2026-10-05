@@ -48,10 +48,13 @@ use a provider with a higher/no result cap. This fails loudly rather than loopin
 
 ## RAM near the 2 GB budget
 
-- The budget is per-runtime and CI-enforced. With several nests in one runtime it's shared across them (`max_rss_mb`, default
-  2048); a mount projected to exceed it is refused. Check actual `nuthatch_rss_bytes` in the roster.
-- Analytical queries have their own 512 MB / 2-thread cap; the concurrency gate bounds the aggregate. If
-  you're tight, lower concurrency rather than the per-query cap.
+- The budget is per cursor (one chain's tip-following plus serving) and CI-enforced. Nests on one
+  cursor share it (`max_rss_mb`, default 2048, per cursor); a mount projected to exceed it is refused.
+  `GET /nests` reports `projected_rss_mb` and each mount's `estimated_rss_mb`; `nuthatch_rss_bytes`
+  is the measured figure.
+- Burrmill answers from one memory pool per nest (`NUTHATCH_BURRMILL_MEMORY_LIMIT`, default 512 MB) on
+  2 threads; the 2 concurrent statements share that pool and spill or refuse rather than double it.
+  If you're tight, lower concurrency rather than the pool.
 
 ## "semantic.toml drift" warnings at startup
 
@@ -61,6 +64,7 @@ authored descriptions are yours to maintain.
 
 ## ABI won't resolve at `init`
 
-nuthatch tries Sourcify then Etherscan-class APIs. If both miss (unverified contract), supply the ABI
-manually into `abis/` and reference it in `nuthatch.toml`, or point `--rpc` at a node for a proxy's
-implementation lookup (EIP-1967 proxies resolve the implementation ABI automatically).
+nuthatch tries Sourcify then Etherscan-class APIs (`--explorer <url>` adds a Blockscout instance in
+between). If they miss (unverified contract), pass `--abi <file>` to `init` or `add`, or point `--rpc`
+at a node for a proxy's implementation lookup (EIP-1967 proxies resolve the implementation ABI
+automatically).

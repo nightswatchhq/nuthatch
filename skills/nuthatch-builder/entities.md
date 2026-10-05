@@ -21,9 +21,9 @@ file and are completely different at runtime, and choosing wrongly is the common
 history. Reach for an entity when a specific query is both *asked often* and *expensive*, which in
 practice means an aggregation over a table with a lot of sealed history.
 
-On a real nest, one panel over 733 sealed segments went from **2.15 s to 88 ms** by becoming an
-entity. That is the shape worth converting: the same aggregate, asked repeatedly, over history that
-keeps growing.
+Measured on 3.0.0 against a copy of the Lodestar nest (`docs/bench/3.0.0-alpha-live.md`), one panel
+over 733 sealed segments went from **2.15 s to 88 ms** by becoming an entity. That is the shape worth
+converting: the same aggregate, asked repeatedly, over history that keeps growing.
 
 ## Declaring one
 
@@ -73,14 +73,16 @@ Charged against the per-cursor RAM budget at **3,200 bytes per declared `max_row
 for the circuit and its thread. So `max_rows = 100000` reserves roughly 320 MB of the cursor's budget
 whether or not the relation ever fills. A mount that would exceed the budget is refused at load.
 
-Measured at real scale the true cost is 940-1,482 bytes per maintained row depending on how wide the
-key and aggregates are, so the charge is deliberately conservative.
+Measured at real scale on 3.0.0-alpha (`docs/bench/3.0.0-alpha-live.md`) the true cost was 940 to
+1,482 bytes per maintained row depending on how wide the key and aggregates are, so the charge is
+deliberately conservative. `nuthatch_entity_state_bytes` on `/metrics` is what a running circuit holds.
 
 ## What happens on a restart
 
 **The entity is rebuilt from the sealed corpus and the hot tail.** No RPC, no re-index: the facts are
-already on disk. On a nest with 733 sealed segments that took **1.9 seconds**; on one with 2,985, 2.4
-seconds. Expect a restart to get slower by about that much, once, per entity.
+already on disk. Measured on 3.0.0-alpha (`docs/bench/3.0.0-alpha-live.md`): a nest with 733 sealed
+segments took **1.9 seconds**, one with 2,985 took 2.4 seconds. Expect a restart to get slower by
+about that much, once, per entity.
 
 This is also why editing an entity is cheap. `entities.toml` is excluded from the nest's *data*
 identity, so an edit moves the package NID without invalidating the decoded facts - the entity
@@ -90,8 +92,9 @@ rebuilds locally and the chain is never re-fetched.
 
 Nothing you have to write. The removed facts are fed back at weight `-1` and the aggregate retracts;
 there is no rollback interface because there is nothing to roll back. Observed live on Ethereum
-mainnet: a reorg rolled back 32 rows and the relation still summed to the same total as every decoded
-transfer the nest held, to the last digit.
+mainnet during the 3.0.0-alpha stress test (`docs/releases/3.0.0-alpha-stresstest.md`): a reorg rolled
+back 32 rows and the relation still summed to the same total as every decoded transfer the nest held,
+to the last digit.
 
 ## Reading an offchain table
 

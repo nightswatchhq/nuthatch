@@ -1,21 +1,27 @@
-# Config as code: `nest.star` (Starlark front-end) - RETIRED
+# Config as code: `nest.star` (Starlark front-end) - REMOVED
 
-> **Retired (2026-07-21). Do not author new nests in Starlark - use `nuthatch.toml`.**
-> Starlark is no longer a recommended or maintained authoring path. Every first-party nest is a plain
-> `nuthatch.toml` (that's what `init` writes), and there is no first-party nest that uses `.star`. The
-> front-end remains compiled into the binary for **backward compatibility** - an existing `nest.star`
-> still evaluates to the same `Config` - but it receives no new features and should not be reached for.
-> This page is kept only as a reference for legacy `.star` files. For everything new, write TOML.
+> **Retired 2026-07-21, removed from the binary in 2.0. Do not author nests in Starlark - use
+> `nuthatch.toml`.** Every first-party nest is a plain `nuthatch.toml` (that's what `init` writes).
+> A directory that still holds a `nest.star` is **refused at load**, not silently ignored, because the
+> file used to take precedence over `nuthatch.toml`:
+>
+> `<dir> has a nest.star, and the Starlark front-end was removed in 2.0 (RFC-0018 §2, retired
+> 2026-07-21). Port it to nuthatch.toml - nuthatch init emits that shape, and it is what every other
+> nest already uses.`
+>
+> This page is kept only so a legacy `.star` file can be read and ported. Everything below describes
+> how the front-end behaved while it existed; none of it runs today.
 
 Historically, RFC-0018 §2 added an **optional** second front-end: a `nest.star` file that *computes*
 the config in [Starlark](https://github.com/facebook/starlark-rust) (a small, hermetic Python dialect)
 and evaluates to the **exact same `Config`** the TOML would - sugar, never a new capability. A `.star`
 and its equivalent `.toml` produce a byte-identical config.
 
-## When it takes precedence
+## When it took precedence
 
-If a nest dir contains **`nest.star`, it is used and `nuthatch.toml` is ignored.** Don't ship both
-expecting a merge - there is none. Keep one front-end per nest.
+Before 2.0, if a nest dir contained **`nest.star`, it was used and `nuthatch.toml` was ignored.** That
+is why the file is refused now rather than skipped: skipping it would change what a nest indexes
+without saying so. Delete the `.star` once its TOML equivalent is in place.
 
 ## The four verbs (the whole surface)
 
