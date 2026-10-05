@@ -17,6 +17,15 @@
 # and checks it came back. The box side runs as a transient systemd unit, so a dropped ssh cannot
 # leave it half done.
 #
+# The staged unit ran its backfill without --rpc-fallback (arb1 in the pool caps header batches at ten,
+# and publicnode answers 403). That does not carry over: the swap keeps production's own unit, so 8107
+# serves with its own ExecStart, fallbacks and drop-ins.
+#
+# Order, for #1882: apply kittiwake's db/schema.sql (two nullable epoch columns) as the app role, run
+# `check`, run `swap` (Chief schedules it), roll kittiwake (nightswatchhq/kittiwake#201), then
+# Lodestar (nightswatchhq/lodestar#325). Each of the two consumers also reads a nest without the L1
+# range, so a rollback here never strands them.
+#
 # Smoke statements: SMOKE (default ~/Projects/kittiwake/nuthatch-gate/smoke/graph-allocations-nest.sql).
 set -euo pipefail
 
