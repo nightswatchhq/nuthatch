@@ -32,10 +32,26 @@ effective() {
   done
   echo "$line"
 }
+# Environment= lines in the order systemd reads them, space-separated as `show` prints them.
+environment() {
+  local f l
+  for f in "$NUTHATCH_UNIT_DIR/$1.service" "$NUTHATCH_UNIT_DIR/$1.service.d"/*.conf; do
+    [ -f "$f" ] || continue
+    while IFS= read -r l; do
+      case "$l" in Environment=*) printf '%s ' "${l#Environment=}" ;; esac
+    done < "$f"
+  done
+}
 case "$1" in
-  show) u=$5; cmd=$(effective "$u"); bin=${cmd%% *}; echo "{ path=$bin ; argv[]=$cmd ; }" ;;
+  show) u=$5
+    case "$3" in
+      Environment) environment "$u"; echo ;;
+      MainPID) echo 4242 ;;
+      *) cmd=$(effective "$u"); bin=${cmd%% *}; echo "{ path=$bin ; argv[]=$cmd ; }" ;;
+    esac ;;
   daemon-reload) ;;
-  restart) cmd=$(effective "$2"); echo "${cmd%% *}" > "$FAKE_STATE/running" ;;
+  restart) cmd=$(effective "$2"); echo "${cmd%% *}" > "$FAKE_STATE/running"
+    mkdir -p "$FAKE_STATE/proc/4242"; environment "$2" | tr ' ' '\0' > "$FAKE_STATE/proc/4242/environ" ;;
   is-active) echo active ;;
 esac
 "#;
@@ -55,6 +71,13 @@ case "$url" in */sql*)
       case "$q" in *"$pat"*) mode=$m ;; esac
     done < "$FAKE_STATE/sql-$v"
   fi
+  # `<KEY=VALUE> <substring> <mode>`: the mode applies while the running process has that setting.
+  if [ -f "$FAKE_STATE/sql-env" ]; then
+    while read -r kv pat m; do
+      tr '\0' '\n' < "$FAKE_STATE/proc/4242/environ" 2>/dev/null | grep -qx "$kv" || continue
+      case "$q" in *"$pat"*) mode=$m ;; esac
+    done < "$FAKE_STATE/sql-env"
+  fi
   case "$mode" in
     ok) printf '{"columns":["count"],"rows":[[7]]}\n200' ;;
     error) printf '{"error":"Catalog Error: Table lodestar_epochs does not exist"}\n200' ;;
@@ -66,6 +89,11 @@ esac
 # A restart that came back on the old process, as a no-op roll does.
 [ -f "$FAKE_STATE/stale" ] && bin=$(dirname "$bin")/nuthatch-4.1.0
 v=$("$bin" --version | awk '{print $2}')
+# A process started with the setting in `unready-under` never becomes ready.
+if [ -f "$FAKE_STATE/unready-under" ] &&
+  tr '\0' '\n' < "$FAKE_STATE/proc/4242/environ" 2>/dev/null | grep -qx "$(cat "$FAKE_STATE/unready-under")"; then
+  printf '{"version":"%s","ready":false}' "$v"; exit 0
+fi
 if [ -f "$FAKE_STATE/spaced" ]; then printf '{ "version" : "%s", "ready" : true, "last_block" : 42 }' "$v"; elif [ -f "$FAKE_STATE/serve-only" ]; then printf '{"version":"%s","ready":true}' "$v"; else printf '{"version":"%s","ready":true,"last_block":42}' "$v"; fi
 "#;
 
@@ -417,4 +445,128 @@ fn a_shared_failure_does_not_hide_a_regression_in_another_statement() {
     let (code, out) = roll_exit(&b, &["--smoke", &smoke]);
     assert_eq!(code, Some(1), "{out}");
     assert_rolled_back(&b, false, &out, "Catalog Error");
+}
+
+// #1899 - `env` replaces a unit's NUTHATCH_* budget with a drop-in that sorts after the others, and
+// keeps it only if the unit comes back ready with the values and answers its smoke.
+
+const BUDGET: [&str; 3] = [
+    "NUTHATCH_BURRMILL_MEMORY_LIMIT=1536MB",
+    "NUTHATCH_ANALYTICS_THREADS=4",
+    "NUTHATCH_MAX_RSS=2560MB",
+];
+
+/// The QoS unit's shape: an earlier drop-in holds the budget the new settings replace.
+fn a_box_with_a_budget() -> Rig {
+    let b = a_box(false);
+    std::fs::create_dir_all(b.units.join("dips.service.d")).unwrap();
+    std::fs::write(
+        b.units.join("dips.service.d/zzz-engine.conf"),
+        "[Service]\nEnvironment=NUTHATCH_BURRMILL_MEMORY_LIMIT=2GB\nEnvironment=NUTHATCH_ANALYTICS_THREADS=8\nEnvironment=NUTHATCH_MAX_RSS=6GB\n",
+    )
+    .unwrap();
+    b
+}
+
+fn set_env(b: &Rig, args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new("bash")
+        .arg(script())
+        .args(["env", "dips"])
+        .args(args)
+        .env("PATH", &b.path)
+        .env("NUTHATCH_BIN_DIR", &b.bin)
+        .env("NUTHATCH_UNIT_DIR", &b.units)
+        .env("NUTHATCH_PROC_ROOT", b.state.join("proc"))
+        .env("FAKE_STATE", &b.state)
+        .env("ROLL_POLL_SECS", "0")
+        .output()
+        .expect("run deploy-nest.sh");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.code(), text)
+}
+
+/// What the restarted process got for `key`: the last assignment, as systemd applies them.
+fn started_with(b: &Rig, key: &str) -> Option<String> {
+    let env = std::fs::read(b.state.join("proc/4242/environ")).unwrap_or_default();
+    String::from_utf8_lossy(&env)
+        .split('\0')
+        .filter_map(|kv| kv.strip_prefix(&format!("{key}=")).map(str::to_string))
+        .next_back()
+}
+
+fn env_drop_in(b: &Rig) -> PathBuf {
+    b.units.join("dips.service.d/zzzz-env.conf")
+}
+
+#[test]
+fn env_overrides_the_earlier_drop_in_and_runs_the_smoke() {
+    let b = a_box_with_a_budget();
+    let smoke = smoke_file(&b);
+    let mut args = BUDGET.to_vec();
+    args.extend(["--smoke", &smoke]);
+    let (code, out) = set_env(&b, &args);
+    assert_eq!(code, Some(0), "{out}");
+    for kv in BUDGET {
+        let (k, v) = kv.split_once('=').unwrap();
+        assert_eq!(started_with(&b, k).as_deref(), Some(v), "{out}");
+    }
+    assert_eq!(sql_log(&b).len(), 2, "both statements asked:\n{out}");
+    assert!(env_drop_in(&b).exists(), "{out}");
+}
+
+#[test]
+fn a_unit_not_ready_under_the_new_settings_gets_the_old_ones_back() {
+    let b = a_box_with_a_budget();
+    std::fs::write(b.state.join("unready-under"), "NUTHATCH_MAX_RSS=2560MB").unwrap();
+    let (code, out) = set_env(&b, &BUDGET);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        !env_drop_in(&b).exists(),
+        "the new drop-in was left:\n{out}"
+    );
+    assert_eq!(
+        started_with(&b, "NUTHATCH_MAX_RSS").as_deref(),
+        Some("6GB"),
+        "{out}"
+    );
+    assert!(
+        out.contains("not ready") && out.contains("ready on them"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_smoke_refused_under_the_new_settings_restores_the_previous_drop_in() {
+    let b = a_box_with_a_budget();
+    let prev = "[Service]\nEnvironment=NUTHATCH_ANALYTICS_THREADS=6\n";
+    std::fs::write(env_drop_in(&b), prev).unwrap();
+    std::fs::write(
+        b.state.join("sql-env"),
+        "NUTHATCH_ANALYTICS_THREADS=4 lodestar_epochs oom\n",
+    )
+    .unwrap();
+    let smoke = smoke_file(&b);
+    let mut args = BUDGET.to_vec();
+    args.extend(["--smoke", &smoke]);
+    let (code, out) = set_env(&b, &args);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(std::fs::read_to_string(env_drop_in(&b)).unwrap(), prev);
+    assert_eq!(
+        started_with(&b, "NUTHATCH_ANALYTICS_THREADS").as_deref(),
+        Some("6"),
+        "{out}"
+    );
+    assert!(out.contains("1 smoke statement(s) refused"), "{out}");
+}
+
+#[test]
+fn env_refuses_a_value_systemd_would_split() {
+    let b = a_box_with_a_budget();
+    let (code, out) = set_env(&b, &["NUTHATCH_MAX_RSS=2GB extra"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(!env_drop_in(&b).exists(), "{out}");
 }

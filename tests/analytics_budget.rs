@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use common::tape::*;
 use nuthatch::analytics_budget::{
-    AnalyticsConfig, ENV_BURRMILL_MEMORY_LIMIT, ENV_INGESTION_RESERVATION, ENV_MEMORY_LIMIT,
-    ENV_TEMP_DIRECTORY, ENV_THREADS,
+    AnalyticsConfig, ENV_BURRMILL_MEMORY_LIMIT, ENV_INGESTION_RESERVATION, ENV_MAX_RSS,
+    ENV_MEMORY_LIMIT, ENV_RUNTIME_HEADROOM, ENV_TEMP_DIRECTORY, ENV_THREADS,
 };
 use nuthatch::indexer;
 use nuthatch::serve::SQL_MAX_CONCURRENCY;
@@ -176,6 +176,68 @@ async fn two_datasets_on_one_cursor_count_two_pools() {
         Err(e) => e.to_string(),
     };
     assert!(err.contains("(2 × 1024 MB)"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_qos_budget_is_refused_under_the_default_wall_naming_what_fits() {
+    let _g = env_lock().lock().await;
+    let _a = install(ENV_MEMORY_LIMIT, Some("512MB"));
+    let _b = install(ENV_BURRMILL_MEMORY_LIMIT, Some("2GB"));
+    let _c = install(ENV_THREADS, Some("8"));
+    let _d = install(ENV_MAX_RSS, None);
+    let _e = install("NUTHATCH_SQL_MAX_CONCURRENCY", Some("2"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = match spawn_under(dir.path()).await {
+        Ok(_) => panic!("a 2 GiB pool plus the 1024 MB floor must not start under 2048 MB"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains(&format!("{ENV_BURRMILL_MEMORY_LIMIT} at most 1024 MB")),
+        "{err}"
+    );
+
+    let _f = install(ENV_BURRMILL_MEMORY_LIMIT, Some("1536MB"));
+    let _g2 = install(ENV_THREADS, Some("4"));
+    let _h = install(ENV_MAX_RSS, Some("2560MB"));
+    let dir = tempfile::tempdir().unwrap();
+    let rt = spawn_under(dir.path())
+        .await
+        .expect("1536 + 1024 under a 2560 MB wall must start");
+    let ingest = rt.ingest;
+    ingest.abort();
+    let _ = ingest.await;
+}
+
+/// #1899: QoS measured, a cursor following the chain with no queries at 372 MiB and up to 931 MiB
+/// outside the pool at the peak while it answers. Those replace the derived floor, and leave 704 MB.
+#[tokio::test(flavor = "multi_thread")]
+async fn measured_terms_replace_the_floor_at_startup() {
+    let _g = env_lock().lock().await;
+    let _a = install(ENV_BURRMILL_MEMORY_LIMIT, Some("1536MB"));
+    let _b = install(ENV_INGESTION_RESERVATION, Some("384MB"));
+    let _c = install(ENV_RUNTIME_HEADROOM, Some("960MB"));
+    let _d = install(ENV_MAX_RSS, None);
+    let _e = install("NUTHATCH_SQL_MAX_CONCURRENCY", Some("2"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = match spawn_under(dir.path()).await {
+        Ok(_) => panic!("1536 + 384 + 960 must not start under 2048 MB"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains(&format!("{ENV_BURRMILL_MEMORY_LIMIT} at most 704 MB")),
+        "{err}"
+    );
+
+    let _f = install(ENV_BURRMILL_MEMORY_LIMIT, Some("704MB"));
+    let dir = tempfile::tempdir().unwrap();
+    let rt = spawn_under(dir.path())
+        .await
+        .expect("704 + 384 + 960 = 2048 must start");
+    let ingest = rt.ingest;
+    ingest.abort();
+    let _ = ingest.await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

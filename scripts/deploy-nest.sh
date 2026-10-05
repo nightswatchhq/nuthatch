@@ -205,6 +205,98 @@ cmd_roll() {
   [ -z "$smoke" ] || ok "$u answered all ${#stmts[@]} statement(s) in $(basename "$smoke")"
 }
 
+# --- set a unit's environment -------------------------------------------------------------------
+# NUTHATCH_* settings in a drop-in that sorts after the unit's others, then a restart on the same
+# binary (#1899). Kept only when the unit comes back ready on its version, the new process carries
+# every value, and each smoke statement answers; otherwise the previous drop-in is put back.
+ENV_DROP_IN=zzzz-env.conf
+PROC_ROOT=${NUTHATCH_PROC_ROOT:-/proc}
+
+# The value systemd applies: a later assignment of a name overrides an earlier one.
+unit_env_value() {
+  systemctl show -p Environment --value "$1" 2>/dev/null | tr ' ' '\n' | grep "^$2=" | tail -1 | cut -d= -f2- || true
+}
+# The value the running process was started with, which is the proof, as /ready's version is for a roll.
+process_env_value() {
+  local pid
+  pid=$(systemctl show -p MainPID --value "$1" 2>/dev/null || true)
+  [ -r "$PROC_ROOT/$pid/environ" ] || { echo "(no environment readable for pid ${pid:-none})"; return 0; }
+  tr '\0' '\n' <"$PROC_ROOT/$pid/environ" | grep "^$2=" | tail -1 | cut -d= -f2- || true
+}
+
+# Puts the drop-in back as it was, restarts on it, and exits 1 with the reason.
+env_put_back() {
+  local u=$1 f=$2 port=$3 want=$4 why=$5
+  if [ -n "$ROLL_SAVED" ]; then cat "$ROLL_SAVED" >"$f"; else rm -f "$f"; fi
+  systemctl daemon-reload
+  systemctl restart "$u"
+  await_version "$port" "$want" \
+    || die "$u: $why; the previous settings are back and it did not come ready on them: $READY_BODY"
+  die "$u: $why; the previous settings are back and it is ready on them"
+}
+
+cmd_env() {
+  local usage="usage: env <unit> NUTHATCH_KEY=VALUE... [--smoke <file>]"
+  local u=${1:?$usage}
+  shift
+  local smoke="" sets=() kv
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --smoke) smoke=${2:?--smoke needs a file}; shift 2 ;;
+      *)
+        [[ $1 =~ ^NUTHATCH_[A-Z0-9_]+=[A-Za-z0-9._/:-]+$ ]] || die "env: not a NUTHATCH_KEY=VALUE setting: $1"
+        sets+=("$1"); shift ;;
+    esac
+  done
+  [ "${#sets[@]}" -gt 0 ] || die "$usage"
+
+  local stmts=() q
+  if [ -n "$smoke" ]; then
+    [ -r "$smoke" ] || die "cannot read smoke file $smoke"
+    while IFS= read -r q; do stmts+=("$q"); done < <(smoke_statements "$smoke")
+    [ "${#stmts[@]}" -gt 0 ] || die "$smoke holds no statements - the smoke would examine nothing"
+  fi
+
+  local port s want
+  port=$(unit_port "$u")
+  s=$(curl -sS -m5 "http://$port/ready" 2>/dev/null || true)
+  want=$(ready_field "$s" version)
+  [ -n "$want" ] && [ "$(ready_field "$s" ready)" = true ] \
+    || die "$u is not ready before the change, so nothing was changed: ${s:-no answer}"
+
+  local f="$UNIT_DIR/$u.service.d/$ENV_DROP_IN"
+  mkdir -p "$UNIT_DIR/$u.service.d"
+  if [ -f "$f" ]; then ROLL_SAVED=$(mktemp); cp "$f" "$ROLL_SAVED"; fi
+  {
+    echo "[Service]"
+    echo "# deploy-nest.sh env, $(date -u +%Y-%m-%dT%H:%M:%SZ). Sorts last, so these values win."
+    for kv in "${sets[@]}"; do echo "Environment=$kv"; done
+  } >"$f"
+  systemctl daemon-reload
+  for kv in "${sets[@]}"; do
+    [ "$(unit_env_value "$u" "${kv%%=*}")" = "${kv#*=}" ] && continue
+    if [ -n "$ROLL_SAVED" ]; then cat "$ROLL_SAVED" >"$f"; else rm -f "$f"; fi
+    systemctl daemon-reload
+    die "$u: systemd would not apply $kv, so nothing was restarted"
+  done
+
+  systemctl restart "$u"
+  await_version "$port" "$want" || env_put_back "$u" "$f" "$port" "$want" "not ready on $want under ${sets[*]}: $READY_BODY"
+  for kv in "${sets[@]}"; do
+    s=$(process_env_value "$u" "${kv%%=*}")
+    [ "$s" = "${kv#*=}" ] || env_put_back "$u" "$f" "$port" "$want" "the restarted process has ${kv%%=*}=$s, not ${kv#*=}"
+  done
+  local failed=0 why
+  for q in ${stmts[@]+"${stmts[@]}"}; do
+    why=$(smoke_one "$port" "$q") && continue
+    printf '\033[31mFAIL\033[0m %s: smoke under %s: %s -> %s\n' "$u" "${sets[*]}" "$q" "$why" >&2
+    failed=$((failed + 1))
+  done
+  [ "$failed" = 0 ] || env_put_back "$u" "$f" "$port" "$want" "$failed smoke statement(s) refused under the new settings"
+  ok "$u ready on $want with ${sets[*]} via $ENV_DROP_IN"
+  [ -z "$smoke" ] || ok "$u answered all ${#stmts[@]} statement(s) in $(basename "$smoke")"
+}
+
 # --- check --------------------------------------------------------------------------------------
 # The question nobody could answer on 2026-09-01: what is every unit actually running?
 cmd_check() {
@@ -278,6 +370,7 @@ case "${1:-}" in
   install) shift; cmd_install "$@" ;;
   roll)    shift; cmd_roll "$@" ;;
   check)   shift; cmd_check "$@" ;;
+  env)     shift; cmd_env "$@" ;;
   *) cat >&2 <<USAGE
 usage:
   deploy-nest.sh install <path-to-binary> <version>   install and verify it reports that version
@@ -289,6 +382,11 @@ usage:
                                                       (exit 1); if it refuses them all, the failure is
                                                       pre-existing: roll forward again and exit 3
   deploy-nest.sh check                                what is every unit actually running
+  deploy-nest.sh env     <unit> NUTHATCH_KEY=VALUE... [--smoke <file>]
+                                                      write the settings into a last-sorting drop-in, restart on
+                                                      the same binary, and keep them only if it comes back ready
+                                                      with every value in its environment and answers each
+                                                      statement; otherwise put the previous drop-in back (exit 1)
 
 exit: 0 ok, 1 failed (a smoke regression leaves the previous version), 2 usage,
       3 smoke failures the previous binary shares (the new version is kept)

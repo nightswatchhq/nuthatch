@@ -302,6 +302,12 @@ A proposal to start the last row is a proposal for a carve-out, same rule as RFC
 
 - Exact default for `ingestion_reservation`. Needs a measured ingest RSS high-water mark per
   chain profile, on the box that enforces the 2 GB budget, not on a laptop.
+  *2026-10-05, #1899:* the default stays the derived 1024 MB, but both terms are now settable from a
+  measurement, the reservation only beside a measured `runtime_headroom` and never under 256 MB. On
+  the QoS nest (gnosis) the ingest path peaked at 372 MiB and the memory statements hold outside
+  the engine pool at up to 1,200 MiB with 4 threads: the derived floor had been standing for the
+  second, not the first. Burrmill 1a1e326 brought the second to 931 MiB and the pool the nest needs
+  under 704 MB, so 704 + 384 + 960 fits 2048. Per-chain defaults are still open.
 - Whether a `decimal-checked` *seal* failure is ever wanted, versus today's query-time
   `c_overflow`. Convenient fallback to exact-text-only would be silent narrowing's cousin.
 - Whether the catalogue should flag per-column bloom presence so an external reader can plan

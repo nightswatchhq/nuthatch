@@ -25,10 +25,15 @@ pub const ENV_BURRMILL_MEMORY_LIMIT: &str = "NUTHATCH_BURRMILL_MEMORY_LIMIT";
 /// shipped 2 GiB. Raise-only: the default is what the footprint job measures.
 pub const ENV_MAX_RSS: &str = "NUTHATCH_MAX_RSS";
 
-/// Unmeasured. RFC-0047 §6 wants a high-water mark for Rust, DBSP, decode and result
-/// materialisation outside Burrmill, on the box that enforces the 2 GB budget. Counted as zero
-/// rather than invented; the term still appears in the inequality so an operator can see it.
+/// `runtime_headroom` when nobody has measured it: zero, since the derived reservation covers it.
+/// [`ENV_RUNTIME_HEADROOM`] states a measured one, which is what lets the reservation go lower.
 pub const RUNTIME_HEADROOM_MB: u64 = 0;
+
+/// Measured RSS outside the engine pool while it answers: decoded scan batches, result materialisation.
+pub const ENV_RUNTIME_HEADROOM: &str = "NUTHATCH_RUNTIME_HEADROOM";
+/// The least a measured reservation may be: an idle `serve` of the QoS nest peaked at 144 MiB and one
+/// following the chain with no queries at 372 MiB, so a lower figure is a typo, not a measurement.
+pub const RESERVATION_MINIMUM_MB: u64 = 256;
 
 /// Live analytics resource settings. Defaults equal the constants the binary already applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +52,8 @@ pub struct AnalyticsConfig {
     pub burrmill_memory_limit_mb: Option<u64>,
     /// The wall the split is held to. `None` → [`crate::runtime::DEFAULT_MAX_RSS_MB`].
     pub max_rss_mb: Option<u64>,
+    /// Measured `runtime_headroom`. `None` → [`RUNTIME_HEADROOM_MB`], which the derived reservation covers.
+    pub runtime_headroom_mb: Option<u64>,
 }
 
 impl Default for AnalyticsConfig {
@@ -59,6 +66,7 @@ impl Default for AnalyticsConfig {
             ingestion_reservation_mb: None,
             burrmill_memory_limit_mb: None,
             max_rss_mb: None,
+            runtime_headroom_mb: None,
         }
     }
 }
@@ -77,15 +85,12 @@ impl AnalyticsConfig {
 /// Named ingest floor left after the shipped Burrmill split:
 /// `2048 - (SQL_MAX_CONCURRENCY × DEFAULT_MEMORY_LIMIT_MB)`. Not an ingest RSS cap.
 ///
-/// **It is a floor and not a slider**, which is the whole reason the inequality means anything.
-/// Nothing in the runtime caps ingest, DBSP, redb or result materialisation at this figure, so a
-/// config that lowered it would not shrink ingest by one byte - it would only buy Burrmill headroom
-/// against a promise no code keeps, and the cursor could then exceed 2 GiB with the gate green.
-/// `runtime_headroom` is inside this number for the same reason: it is unmeasured, so it cannot be
-/// a term an operator gets to spend. Raising the reservation is the conservative direction and is
-/// allowed; lowering it is refused by [`validate_against`]. The consequence is the property worth
-/// stating: **no accepted split hands Burrmill more RAM than the shipped default the footprint CI
-/// job actually measures.**
+/// **Unset, it is a floor and not a slider.** Nothing caps ingest, DBSP, redb or what a statement
+/// holds outside the pool at this figure, so lowering it alone would buy Burrmill room against memory no
+/// term counts (#1241). It may go below the floor only beside a measured `runtime_headroom`, the two
+/// terms RFC-0047 names in place of the one derived number, and never under
+/// [`RESERVATION_MINIMUM_MB`] (#1899). Unless an operator states both, or raises the wall, **no
+/// accepted split hands Burrmill more RAM than the shipped default the footprint CI job measures.**
 impl AnalyticsConfig {
     pub fn burrmill_limit_mb(&self) -> u64 {
         self.burrmill_memory_limit_mb
@@ -116,6 +121,7 @@ pub fn from_env() -> AnalyticsConfig {
         ingestion_reservation_mb: env_optional_memory(ENV_INGESTION_RESERVATION),
         burrmill_memory_limit_mb: env_optional_memory(ENV_BURRMILL_MEMORY_LIMIT),
         max_rss_mb: env_optional_memory(ENV_MAX_RSS),
+        runtime_headroom_mb: env_optional_memory(ENV_RUNTIME_HEADROOM),
     }
 }
 
@@ -172,34 +178,67 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
     let duck = pools.saturating_mul(cfg.burrmill_limit_mb());
     let reservation = cfg.reservation_mb();
     let floor = derived_ingestion_reservation_mb();
-    if reservation < floor {
+    let headroom = cfg.runtime_headroom_mb.unwrap_or(RUNTIME_HEADROOM_MB);
+    if reservation < floor && headroom == 0 {
         bail!(
-            "ingestion_reservation is {reservation} MB, below the floor of {floor} MB (set \
-             {ENV_INGESTION_RESERVATION}). It is a floor, not a slider: nothing caps ingest, DBSP, \
-             redb or result materialisation at this figure, so writing a smaller number does not \
-             shrink ingest - it only hands Burrmill headroom against a reservation no code enforces, \
-             and the cursor can then pass this gate and still exceed the 2 GiB budget. Raise it to \
-             give Burrmill less; lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
-             NUTHATCH_SQL_MAX_CONCURRENCY if you need room elsewhere."
+            "ingestion_reservation is {reservation} MB, below the derived floor of {floor} MB (set \
+             {ENV_INGESTION_RESERVATION}), with no measured runtime_headroom ({ENV_RUNTIME_HEADROOM}). \
+             The derived floor covers ingest, DBSP and redb and also what a statement holds outside \
+             the pool, its decoded batches and results. A smaller reservation alone only hands \
+             Burrmill room against memory no term counts. Set both from a measurement: the \
+             reservation from a cursor following the chain with no queries, the headroom from the \
+             release gate's peak RSS less the pool held at that peak. Otherwise raise it, or lower \
+             analytics.memory_limit ({ENV_MEMORY_LIMIT}) or NUTHATCH_SQL_MAX_CONCURRENCY."
         );
     }
-    let headroom = RUNTIME_HEADROOM_MB;
+    if reservation < RESERVATION_MINIMUM_MB {
+        bail!(
+            "ingestion_reservation is {reservation} MB, below the minimum of \
+             {RESERVATION_MINIMUM_MB} MB (set {ENV_INGESTION_RESERVATION}). No measured cursor \
+             has run in less, so this is not a measurement."
+        );
+    }
     let total = duck.saturating_add(reservation).saturating_add(headroom);
     if total > ceiling {
+        let limit = cfg.burrmill_limit_mb();
+        // Burrmill's limit overrides analytics.memory_limit, so lowering the latter would change nothing.
+        let knob = if cfg.burrmill_memory_limit_mb.is_some() {
+            ENV_BURRMILL_MEMORY_LIMIT.to_string()
+        } else {
+            format!("analytics.memory_limit ({ENV_MEMORY_LIMIT})")
+        };
+        let wall = if cfg.max_rss_mb.is_some() {
+            format!("the {ceiling} MB wall {ENV_MAX_RSS} sets")
+        } else {
+            format!("the {ceiling} MB wall (the per-cursor default; {ENV_MAX_RSS} is unset)")
+        };
+        let fit = ceiling.saturating_sub(reservation + headroom) / pools;
+        let remedy = if fit == 0 {
+            format!("No pool fits beside the reservation and the headroom: raise {ENV_MAX_RSS} only if the process has been given more")
+        } else {
+            format!("Set {knob} at most {fit} MB")
+        };
+        let permits = if pools > 1 {
+            " or lower NUTHATCH_SQL_MAX_CONCURRENCY"
+        } else {
+            ""
+        };
+        let raised = if fit > 0 && reservation > floor {
+            format!(", or bring ingestion_reservation back towards its {floor} MB floor")
+        } else {
+            String::new()
+        };
         bail!(
-            "the analytics split does not leave the named ingest floor: (pools × \
-             analytics.memory_limit) + ingestion_reservation + runtime_headroom = ({pools} × \
-             {} MB) + {reservation} MB + {headroom} MB = {total} MB, which is above \
-             {ceiling} MB. pools is the smaller of sql_permits and the cursor's nest datasets, \
-             since a dataset's sessions share one pool. {ENV_BURRMILL_MEMORY_LIMIT} takes the place \
-             of analytics.memory_limit where it is set. {ENV_MAX_RSS} raises the wall where the \
-             process has been given more. This gate refuses that split; it does not cap ingest, \
-             DBSP, redb, or result materialisation. The 2 GiB cursor budget is the footprint CI job / \
-             process RSS wall, not this arithmetic. Lower analytics.memory_limit ({ENV_MEMORY_LIMIT}) or \
-             NUTHATCH_SQL_MAX_CONCURRENCY, or ingestion_reservation ({ENV_INGESTION_RESERVATION}). \
-             analytics.max_temp_size is disk and does not buy RAM. A query that cannot run in its \
-             budget fails; it never degrades block processing.",
-            cfg.burrmill_limit_mb()
+            "the analytics split does not fit its wall: (pools × {knob}) + ingestion_reservation + \
+             runtime_headroom = ({pools} × {limit} MB) + {reservation} MB + {headroom} MB = {total} \
+             MB, above {wall}. pools is the smaller of sql_permits and the cursor's nest datasets, \
+             since a dataset's sessions share one pool. {remedy}{permits}{raised}. \
+             ingestion_reservation ({ENV_INGESTION_RESERVATION}) goes below its derived floor only beside a \
+             measured runtime_headroom ({ENV_RUNTIME_HEADROOM}). \
+             {ENV_MAX_RSS} raises the wall only where the process has been given more than the 2 GiB \
+             per-cursor budget. This gate refuses that split; it does not cap ingest, DBSP, redb, or \
+             result materialisation. analytics.max_temp_size is disk and does not buy RAM. A query \
+             that cannot run in its budget fails; it never degrades block processing."
         );
     }
     Ok(())
@@ -234,7 +273,7 @@ fn env_optional_memory(key: &str) -> Option<u64> {
             None => {
                 tracing::warn!(
                     value = %raw,
-                    "{key} is not a size in MB or GB; leaving ingestion_reservation unset"
+                    "{key} is not a size in MB or GB; leaving it unset"
                 );
                 None
             }
@@ -447,6 +486,125 @@ pub(crate) mod tests {
         };
         let err = validate_against(&lowered, 1).unwrap_err().to_string();
         assert!(err.contains("may only be raised"), "{err}");
+    }
+
+    /// #1899: the QoS nest's settings under the 2 GiB wall. Burrmill's limit is what counted, so the
+    /// refusal names it and what would fit, not analytics.memory_limit, which it overrides.
+    #[test]
+    fn a_refusal_names_the_limit_that_counted_and_what_fits() {
+        let qos = AnalyticsConfig {
+            burrmill_memory_limit_mb: Some(2048),
+            threads: 8,
+            ..AnalyticsConfig::default()
+        };
+        let err = validate_on_cursor(&qos, 2, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("(1 × 2048 MB) + 1024 MB + 0 MB = 3072 MB")
+                && err.contains("above the 2048 MB wall"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("{ENV_BURRMILL_MEMORY_LIMIT} at most 1024 MB")),
+            "{err}"
+        );
+        assert!(!err.contains("Lower analytics.memory_limit"), "{err}");
+        assert!(
+            !err.contains(&format!(
+                "or ingestion_reservation ({ENV_INGESTION_RESERVATION})"
+            )),
+            "lowering the reservation is refused by the floor, so it is not a remedy: {err}"
+        );
+        let two_pools = validate_on_cursor(&qos, 2, 2).unwrap_err().to_string();
+        assert!(
+            two_pools.contains(&format!("{ENV_BURRMILL_MEMORY_LIMIT} at most 512 MB")),
+            "{two_pools}"
+        );
+        validate_on_cursor(
+            &AnalyticsConfig {
+                burrmill_memory_limit_mb: Some(768),
+                ..qos
+            },
+            2,
+            1,
+        )
+        .expect("768 + 1024 is under 2048");
+    }
+
+    /// #1899: the derived 1024 MB stands in for two terms RFC-0047 names, ingest and the memory a
+    /// statement holds outside the pool. Measured, they may replace it, together.
+    fn measured(pool: u64) -> AnalyticsConfig {
+        AnalyticsConfig {
+            burrmill_memory_limit_mb: Some(pool),
+            ingestion_reservation_mb: Some(384),
+            runtime_headroom_mb: Some(1088),
+            ..AnalyticsConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_measured_reservation_and_headroom_replace_the_derived_floor() {
+        validate_on_cursor(&measured(512), 2, 1).expect("512 + 384 + 1088 = 1984");
+        let err = validate_on_cursor(&measured(1536), 2, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("(1 × 1536 MB) + 384 MB + 1088 MB = 3008 MB")
+                && err.contains(&format!("{ENV_BURRMILL_MEMORY_LIMIT} at most 576 MB")),
+            "{err}"
+        );
+    }
+
+    /// Lowering the reservation alone is #1241's trap: the 1024 also covers what a statement holds
+    /// outside the pool, so a smaller one is only honest beside a measured headroom.
+    #[test]
+    fn a_lowered_reservation_without_a_measured_headroom_is_refused() {
+        let cfg = AnalyticsConfig {
+            ingestion_reservation_mb: Some(384),
+            ..AnalyticsConfig::default()
+        };
+        let err = validate_on_cursor(&cfg, 2, 1).unwrap_err().to_string();
+        assert!(err.contains(ENV_RUNTIME_HEADROOM), "{err}");
+        let zero = AnalyticsConfig {
+            runtime_headroom_mb: Some(0),
+            ..cfg
+        };
+        let err = validate_on_cursor(&zero, 2, 1).unwrap_err().to_string();
+        assert!(err.contains(ENV_RUNTIME_HEADROOM), "{err}");
+    }
+
+    #[test]
+    fn a_reservation_under_the_minimum_is_refused_even_with_a_headroom() {
+        let cfg = AnalyticsConfig {
+            ingestion_reservation_mb: Some(128),
+            runtime_headroom_mb: Some(512),
+            ..AnalyticsConfig::default()
+        };
+        let err = validate_on_cursor(&cfg, 2, 1).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("{RESERVATION_MINIMUM_MB} MB")),
+            "{err}"
+        );
+    }
+
+    /// A headroom beside the default reservation only adds: it is the conservative direction.
+    #[test]
+    fn a_headroom_beside_the_derived_reservation_counts_on_top() {
+        let cfg = AnalyticsConfig {
+            runtime_headroom_mb: Some(600),
+            ..AnalyticsConfig::default()
+        };
+        let err = validate_on_cursor(&cfg, 2, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("512 MB) + 1024 MB + 600 MB = 2136 MB"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn from_env_reads_the_runtime_headroom() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _v = EnvVars::set(&[(ENV_RUNTIME_HEADROOM, "1088MB")]);
+        assert_eq!(from_env().runtime_headroom_mb, Some(1088));
     }
 
     #[test]
