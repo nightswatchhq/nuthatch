@@ -12,8 +12,11 @@
 # regressions a floor would exist for. A 4x decode cost moved it about 1%, and on the 4-core runner
 # concurrency 1 reads faster than 4. docs/benchmarks.md has the figures.
 #
+# COMMIT overrides the report's `commit`. On a pull_request the checkout is GitHub's merge ref, on no
+# branch, so `git rev-parse HEAD` records a commit nobody can resolve (#1918); CI passes the PR head.
+#
 # Env: BIN (target/release/nuthatch), OUT (backfill-throughput-report.json), BATCHES (3), RUNS (15),
-#      CONCURRENCY (4), RPC_PORT (8547).
+#      CONCURRENCY (4), RPC_PORT (8547), COMMIT (unset: keep the checkout's HEAD).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
@@ -81,7 +84,9 @@ lo="$(echo "$sorted" | head -1)"
 hi="$(echo "$sorted" | tail -1)"
 spread="$(awk -v lo="$lo" -v hi="$hi" -v m="$median" 'BEGIN {printf "%.1f", (hi-lo)*100/m}')"
 jq --argjson median "$median" --argjson batches "$(printf '%s\n' "${medians[@]}" | jq -s .)" \
-  '.events_per_sec = $median | .batch_medians = $batches | .runs = (.runs * ($batches | length))' \
+  --arg commit "${COMMIT:-}" \
+  '.events_per_sec = $median | .batch_medians = $batches | .runs = (.runs * ($batches | length))
+   | if $commit != "" then .commit = $commit[0:7] else . end' \
   "$WORK/batch-1.json" > "$OUT"
 
 line="median ${median} ev/s across $BATCHES batches of $RUNS (batch medians ${lo}-${hi}, spread ${spread}%), tracked, not gated"
