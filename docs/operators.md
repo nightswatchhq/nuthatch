@@ -1282,8 +1282,10 @@ duplicates.
 
 **Backup.** The nest directory is the whole state. Sealed segments are content-addressed and
 immutable, so they are safe to copy while the process runs. The hot store (`nuthatch.redb`) is a live
-redb file: snapshot it at the filesystem level, or stop the process for a consistent copy. Losing the
-hot store costs a re-index of the unsealed window, not history.
+redb file: snapshot it at the filesystem level, or stop the process for a consistent copy. The
+hot store is not optional: every resume marker lives in it, so a nest directory restored without it
+backfills from its start block again, and with a store older than its segments it re-reads the
+difference. Back the two up together.
 
 **Reading sealed data without this binary.** The sealed directory is plain Parquet plus a catalogue.
 [Reading Nuthatch segments without Nuthatch](reading-segments.md) is the contract: layout, catalogue
@@ -1343,6 +1345,20 @@ when the store's ETag is the MD5 of the object, as on AWS S3 without SSE-KMS or 
 Without it a bucket fails closed as not content-checked, and on any other store
 `nuthatch publish verify --deep`, which downloads and re-hashes, is the check. `/_admin/` shows each
 publishing nest's target, lag and last success.
+
+**Seeding a nest from a mirror.** `nuthatch seed --from <mirror> --dir <nest>` fills a nest that has
+not indexed with a mirror's history, so it never backfills over RPC. `<mirror>` is what `publish sync`
+was given as `--target`: a path, `s3://bucket/prefix`, or the `https://` address of a public bucket.
+The nest directory must be the one that was published, unedited, because the dataset is found by its
+data identity. Every file is checked against its hash, a second run resumes a failed one, and the
+next `dev` follows the chain from the block after the mirror ends.
+Seeding needs more than the reader's mirror holds: the provisional tails, and the block the
+publisher's history begins at. Both are in a seed snapshot under `<dataset>/_seed/`, written by a
+running nest's `--publish-target` once it has caught up, and by `publish sync` on a stopped nest.
+`publish sync` beside a running nest cannot read its store and leaves the snapshot alone. A mirror
+whose history begins after the nest's declared start block is refused.
+The hashes show the files are the publisher's. They do not show the publisher indexed the chain
+correctly, so seed from an operator you would trust to run the nest for you.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 

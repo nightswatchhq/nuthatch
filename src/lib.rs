@@ -100,6 +100,7 @@ pub mod scheduler;
 pub mod screen;
 pub mod seal;
 pub mod sealed_audit;
+pub mod seed;
 pub mod semantic;
 pub mod serve;
 /// RFC-0046 S3: drain and settle recorded authorisations, outside the nest.

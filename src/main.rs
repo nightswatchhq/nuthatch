@@ -239,6 +239,7 @@ async fn main() -> Result<()> {
                 publish::run_finalise(std::path::Path::new(&a.dir), a.yes)
             }
         },
+        cli::Command::Seed(a) => nuthatch::seed::run(std::path::Path::new(&a.dir), &a.from).await,
         cli::Command::Mcp(args) => {
             if args.print_config {
                 mcp::print_client_config(&args.url);
