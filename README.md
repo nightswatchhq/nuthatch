@@ -23,6 +23,11 @@ are rows to query within seconds on the bundled public endpoints. Without it, `d
 contract's deployment block: for WETH that is 21 million blocks, a long backfill on free public endpoints
 and a job for your own RPC (`--rpc`).
 
+Those five lines, run as written on the 4.10.1 release on 2026-10-05, took 13 s from the `curl` to a
+non-zero count in a clean macOS shell on an M5 Pro, and 21 s in a fresh `ubuntu:24.04` container
+([docs/readme-check-2026-10-05.md](docs/readme-check-2026-10-05.md), which records every command in
+this file).
+
 | | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
 |---|---|---|---|---|---|
 | **The Graph** | yes | yes (AssemblyScript) | indexers on the network | nothing, or graph-node + Postgres + IPFS | GraphQL |
@@ -121,9 +126,8 @@ default toolchain fails to compile a dependency.
 embedded, `:<version>-scaled` for the scaled build. The image ships the *same binary attached to the
 release*, so the two cannot drift.
 
-[docs/install.md](docs/install.md) has the detail behind each of these: why the two ABI floors are
-different numbers, what the attestation proves and what `--repo` is for, and why the toolchain pin
-exists.
+[docs/install.md](docs/install.md) has the detail behind each of these: how the ABI floor is measured,
+what the attestation proves and what `--repo` is for, and why the toolchain pin exists.
 
 **Chains.** Ethereum, Arbitrum One, Base, BSC, Polygon, Gnosis, Optimism, Monad and Robinhood Chain are *built in*, with
 measured public endpoints and tuned finality settings - **omit `--chain` and nuthatch probes each for
