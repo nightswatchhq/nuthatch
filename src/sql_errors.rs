@@ -853,6 +853,14 @@ mod through_burrmill {
     }
 
     #[test]
+    fn an_unknown_column_with_no_near_match_or_a_quoted_name() {
+        let h = hint("SELECT zzzz FROM usdc__transfer");
+        assert!(h.starts_with("no column `zzzz`."), "{h}");
+        let h = hint("SELECT \"Total Value\" FROM usdc__transfer");
+        assert!(h.starts_with("no column `Total Value`."), "{h}");
+    }
+
+    #[test]
     fn a_dec_column_whose_base_is_in_scope() {
         let h = hint("SELECT \"from\" FROM usdc__transfer WHERE value_dec > 1");
         assert!(h.contains("derived on the fly"), "{h}");
