@@ -4,7 +4,7 @@ A falsifiable acceptance runbook. Every step has a **command**, an **expected re
 against, what it **proves**, and what a failure means.
 
 This is deliberately not [`operators.md`](operators.md), which tells you *how to run* nuthatch. This
-tells you *how to prove it works* — for your own sign-off, or so a second operator can independently
+tells you *how to prove it works*, for your own sign-off, or so a second operator can independently
 confirm the claims this project makes rather than taking them on trust.
 
 ## Run it, don't read it
@@ -34,8 +34,8 @@ stands the whole stack up, walks level 5, and asserts exactly one worker takes t
 
 ## How to use it
 
-Levels are independent and cumulative. **Run the levels that match what you deploy** — level 5 is
-irrelevant if you run a single nest, and levels 1–4 still matter if you run a fleet.
+Levels are independent and cumulative. **Run the levels that match what you deploy**: level 5 is
+irrelevant if you run a single nest, and levels 1 to 4 still matter if you run a fleet.
 
 Every step is written so a *failure is unambiguous*. If a step says "expect `ok`" and you get something
 else, that is a finding worth reporting, not something to interpret. Wherever an expected value depends
@@ -95,7 +95,7 @@ quiet about ours.
 
 ---
 
-## Level 0 — the artifact is what it claims
+## Level 0: the artifact is what it claims
 
 **0.1 Version matches the tag you downloaded**
 
@@ -104,7 +104,7 @@ nuthatch --version
 ```
 
 Expect the version you fetched. *Proves* you are testing what you think you are. A mismatch usually
-means a stale binary earlier in `PATH` — check `command -v nuthatch`.
+means a stale binary earlier in `PATH`: check `command -v nuthatch`.
 
 **0.2 Checksum**
 
@@ -114,7 +114,7 @@ shasum -a 256 -c nuthatch-aarch64-apple-darwin.tar.gz.sha256    # macOS
 ```
 
 Expect `nuthatch-…tar.gz: OK`. *Proves* transport integrity. Run it in the directory you unpacked
-into, next to the tarball the checksum file names — `-c` reads that name out of the file rather than
+into, next to the tarball the checksum file names: `-c` reads that name out of the file rather than
 taking it from you.
 
 `verify.sh` covers this step too, and only when it can: it wants the tarball and its `.sha256` sitting
@@ -138,12 +138,12 @@ nuthatch worker --control-db x --hot-store y --chains z
 ```
 
 Expect a refusal naming `--features postgres-store`. *Proves* the default artifact is the embedded one
-(non-negotiable 1). The subcommand is *listed* in `--help` on purpose — a command that vanishes
+(non-negotiable 1). The subcommand is *listed* in `--help` on purpose: a command that vanishes
 depending on build flags is harder to diagnose than one that explains itself.
 
 ---
 
-## Level 1 — a single nest, end to end
+## Level 1: a single nest, end to end
 
 The under-two-minutes claim. Use any contract on any supported chain; a busy ERC-20 is easiest.
 
@@ -203,7 +203,7 @@ curl -s --get localhost:8288/sql --data-urlencode 'q=select count(*) from "usdc_
 ```
 
 Expect a non-zero count. *Proves* the decoded data is queryable. **Compare it against an independent
-source** — a block explorer, or `cast logs` over the same range. Matching counts is the whole point;
+source**: a block explorer, or `cast logs` over the same range. Matching counts is the whole point;
 this is the step that distinguishes "it ran" from "it is correct".
 
 **1.4 Provenance is attached**
@@ -215,7 +215,7 @@ history.
 
 ---
 
-## Level 2 — correctness under adverse conditions
+## Level 2: correctness under adverse conditions
 
 The levels above prove it works. These prove it stays right when things go wrong.
 
@@ -236,7 +236,7 @@ count means duplicates; a lower one means a gap. Either is a serious finding.
 nuthatch check --dir /tmp/v-usdc
 ```
 
-Expect a pass. *Proves* the nest's committed fixtures still decode to the same entities — the
+Expect a pass. *Proves* the nest's committed fixtures still decode to the same entities, the
 regression net for decode changes.
 
 **2.3 A reorg converges** *(needs a chain that reorgs, or trust CI)*
@@ -251,7 +251,7 @@ not the same as what consensus agreed.
 
 ---
 
-## Level 3 — a runtime hosting many nests
+## Level 3: a runtime hosting many nests
 
 **3.1 Co-tenancy**
 
@@ -265,7 +265,7 @@ each serving its full API under `/<name>/`. *Proves* co-tenancy with per-nest ro
 
 **3.2 Nests on one chain share a cursor**
 
-Expect one `getLogs` per window regardless of how many nests share a chain — visible in RPC-provider
+Expect one `getLogs` per window regardless of how many nests share a chain, visible in RPC-provider
 metering, or in the logs. *Proves* the cost claim: N nests on a chain for roughly one nest's RPC spend.
 
 **3.3 Multichain isolation**
@@ -294,7 +294,7 @@ feature; a budget that can be quietly exceeded is not a budget.
 
 **3.5 Per-nest blast radius**
 
-Break one nest deliberately — an invalid authored view is easiest. Expect that nest to be quarantined
+Break one nest deliberately; an invalid authored view is easiest. Expect that nest to be quarantined
 and reported, and **every other nest to keep serving**. *Proves* isolation. A runtime-wide failure here
 is the most serious finding in this document.
 
@@ -304,8 +304,8 @@ is the most serious finding in this document.
 bash scripts/cross-nest-adoption.sh   # NUTHATCH=/path/to/binary optional; PORT and RPC_PORT too
 ```
 
-*Scripted acceptance run.* Two independently-authored nests — different alias, description, and
-`views/` — share the same contract, ABI, and start block, so their `data_identity()` matches and
+*Scripted acceptance run.* Two independently-authored nests (different alias, description, and
+`views/`) share the same contract, ABI, and start block, so their `data_identity()` matches and
 their NIDs differ. Nest A indexes and seals a small fixture history; nest B is then migrated in
 against an endpoint switched to return **zero logs for the whole range**. Expect:
 
@@ -314,13 +314,13 @@ against an endpoint switched to return **zero logs for the whole range**. Expect
 - B's row count equals A's after mounting, even though its RPC endpoint cannot serve the history.
 - Zero `eth_getLogs` calls into the historic range after B was mounted.
 
-*Proves* that `runtime::adoptable` is general — it matches any nest whose decode inputs agree, not
+*Proves* that `runtime::adoptable` is general: it matches any nest whose decode inputs agree, not
 only edits of the same lineage. This is the case GraphOps described: "if two entity hashes across
 any nest are the same, you can reuse the data across."
 
 ---
 
-## Level 4 — the guards
+## Level 4: the guards
 
 Each of these is a deliberate refusal. **A missing refusal is the finding**, not a convenience.
 
@@ -331,7 +331,7 @@ curl -s --get localhost:8288/sql --data-urlencode 'q=CREATE TABLE x(a int)'
 curl -s --get localhost:8288/sql --data-urlencode "q=SELECT 1; COPY (SELECT 1) TO '/tmp/x'"
 ```
 
-Expect both refused — the second because `;`-stacked statements are rejected. *Proves* the surface is
+Expect both refused, the second because `;`-stacked statements are rejected. *Proves* the surface is
 structurally read-only. A stacked `COPY TO` succeeding is an arbitrary file write.
 
 **4.2 Filesystem access is refused**
@@ -376,7 +376,7 @@ nuthatch sql --dir fast-nest 'SELECT * FROM usdc__transfer LIMIT 1'
 
 Expect `schema_version = 2`, no `block_timestamp` column in the result, and a **visibly faster**
 backfill than the same range with timestamps on. The v2 stamp is what makes a 0.8.x binary refuse this
-nest rather than index timestamps into it — check that too if you have an old binary to hand.
+nest rather than index timestamps into it; check that too if you have an old binary to hand.
 
 **4.5 Admin exposure**
 
@@ -386,7 +386,7 @@ unauthenticated off-localhost.
 
 ---
 
-## Level 5 — scaled mode (a fleet)
+## Level 5: scaled mode (a fleet)
 
 **This is the level we most want independently verified.**
 
@@ -482,7 +482,7 @@ on the published 2.4.0 artifacts (2026-08-15, the table above). That run has not
 cross-machine run two majors old. If you verify one level from this document, this is still the one
 worth your time.
 
-Needs the **scaled** artifact — `…:<version>-scaled` or `nuthatch-scaled-…tar.gz`. The default build
+Needs the **scaled** artifact: `…:<version>-scaled` or `nuthatch-scaled-…tar.gz`. The default build
 refuses these commands by name.
 
 **5.0 Prerequisites, both of which have bitten us**
@@ -528,14 +528,14 @@ curl -s localhost:8290/plan
 Expect the declare to return `200` with a note that it is *desired state*, and the plan to assign the
 chain to one worker. Within a tick (5s) expect that worker's logs to show `acquired cursors`.
 
-*Proves* dynamic lifecycle. Note `200` means **told**, not **running** — the fleet converges on its own
+*Proves* dynamic lifecycle. Note `200` means **told**, not **running**: the fleet converges on its own
 tick. Conflating those is the most likely source of confusion at this level.
 
 **5.3 Exactly one owner**
 
 With two workers both able to host the chain, expect **exactly one** to log `acquired cursors` for it.
 *Proves* the single-owner invariant. Two workers claiming one cursor is the most serious possible
-finding in this document — it is the failure the lease and fence exist to prevent.
+finding in this document: it is the failure the lease and fence exist to prevent.
 
 **5.4 Lease handover on writer loss**
 
@@ -545,7 +545,7 @@ docker compose -f docker-compose.scaled.yml kill <the owning writer>
 
 Expect the other worker to acquire the cursor within a lease TTL (30s by default), and indexing to
 continue. *Proves* failover. Then bring the killed worker back and expect it **not** to resume writing
-the cursor it lost — its fence is stale, and the store refuses it.
+the cursor it lost: its fence is stale, and the store refuses it.
 
 **5.5 A stale writer is refused, not trusted**
 
@@ -573,7 +573,7 @@ Expect the same version from every node. *Proves* the fix for the bug that only 
 if each node resolved `latest` itself, one would serve the new schema while another served the old, and
 the same endpoint would answer differently depending on where the load balancer sent the request.
 
-An unpinned endpoint must report `servable: false` — an FE refusing is correct, guessing is not.
+An unpinned endpoint must report `servable: false`: an FE refusing is correct, guessing is not.
 
 **5.8 Secrets stay out of bundles**
 
@@ -584,7 +584,7 @@ curl -s localhost:8290/nests/usdc/secrets     # expect: key names only, never va
 
 Then `grep` your canary through the nest directory, any generated bundle, and the sealed segments.
 Expect **no match anywhere**. *Proves* secret isolation. Also confirm rotating the secret does not
-change the nest's bundle hash — if it does, every rotation invalidates segment reuse.
+change the nest's bundle hash; if it does, every rotation invalidates segment reuse.
 
 **5.9 A control-plane outage does not stop ingestion**
 
@@ -626,7 +626,7 @@ Two details are the point rather than incidental:
   is never consulted, so re-tagging `1.0.0` in the registry cannot change what a worker runs.
   Unpinned, a worker is exactly as trustworthy as its registry.
 
-Pulled nests are cached at `<--nest-cache>/<name>/<hash>` — content-addressed so that re-pinning
+Pulled nests are cached at `<--nest-cache>/<name>/<hash>`, content-addressed so that re-pinning
 resolves to a different directory and re-pulls, rather than silently reusing the bundle it already
 has. Deleting that cache costs one download.
 
@@ -634,7 +634,7 @@ has. Deleting that cache costs one download.
 
 ## Reporting
 
-Please report **passes as well as failures** — a level someone ran is worth more than a level we
+Please report **passes as well as failures**: a level someone ran is worth more than a level we
 assert, and the table at the top should get shorter over time.
 
 Useful to include: the level and step, expected versus actual, `nuthatch --version`, chain and

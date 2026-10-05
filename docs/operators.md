@@ -66,7 +66,7 @@ ExecStart=/usr/local/bin/nuthatch dev --listen 127.0.0.1:8288 --seal-direct --co
 Restart=on-failure
 RestartSec=5
 # Remote admin is OFF as written: the bind above is localhost, so the admin UI needs no token.
-# To enable it you must change the bind AND choose a token — generate one, never paste a literal:
+# To enable it you must change the bind AND choose a token: generate one, never paste a literal:
 #   Environment=NUTHATCH_ADMIN_TOKEN=<openssl rand -hex 32>
 # Keep it inside the footprint budget; the box needs headroom for analytical queries.
 MemoryMax=2G
@@ -121,7 +121,7 @@ docker run -d --name nuthatch --restart unless-stopped \
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
 > the bind is not localhost and `NUTHATCH_ADMIN_TOKEN` decides whether the admin routes exist at all.
-> Without one they are **not mounted** — the right default for a command people copy-paste. Turning
+> Without one they are **not mounted**, the right default for a command people copy-paste. Turning
 > remote admin on is a deliberate second step: see [Enabling remote admin](#enabling-remote-admin).
 
 The image **ships the same binary attached to the GitHub Release** rather than a separate from-source
@@ -1023,14 +1023,14 @@ openssl rand -hex 32
 ```
 
 Set it as `NUTHATCH_ADMIN_TOKEN`, keep the published port on `127.0.0.1`, reach it through a reverse
-proxy with TLS, and treat the value as a credential — not in shell history, not in a committed compose
+proxy with TLS, and treat the value as a credential: not in shell history, not in a committed compose
 file, and not in a world-readable unit file (`chmod 600`, or `EnvironmentFile=` pointing at a
 root-owned file).
 
 Two things worth knowing first:
 
 - **Setting a token also removes a refusal.** `nuthatch` declines to serve the admin routes
-  off-localhost *unless* a token is set. So setting one is not purely "adding auth" — it also lifts
+  off-localhost *unless* a token is set. So setting one is not purely "adding auth", it also lifts
   the guard that was protecting you. Correct behaviour, but it means the token is the only thing
   between the network and `POST /_admin/nests`.
 - **Anything on the same Docker network reaches it** regardless of `-p 127.0.0.1:...`, because the
