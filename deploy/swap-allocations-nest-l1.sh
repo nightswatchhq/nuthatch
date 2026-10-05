@@ -97,7 +97,8 @@ if [ "$mode" = swap ] || [ "$mode" = check ]; then
   get 8107/ready >/dev/null || die "8107 is not ready"
   get 8108/ready >/dev/null || die "8108 is not ready"
   lp=$(last 8107) ls=$(last 8108)
-  [ "$ls" -ge $((lp - 2000)) ] || die "8108 is at $ls, more than 2000 blocks behind 8107 at $lp"
+  gap=$((ls - lp))
+  [ "${gap#-}" -le 2000 ] || die "8108 is at $ls, more than 2000 blocks from 8107 at $lp"
   old_nid=$(nid 8107) new_nid=$(nid 8108)
   [ "$old_nid" != "$new_nid" ] || die "both nests report NID $old_nid"
   [ "$(fees1390 8108)" = "$WANT" ] || die "8108 does not read epoch 1390's query fees as $WANT"
@@ -139,9 +140,14 @@ if [ "$mode" = swap ] || [ "$mode" = check ]; then
   say "rollback: deploy/swap-allocations-nest-l1.sh rollback $stamp"
 else
   [ -d $OLD ] || die "no $OLD to roll back to"
-  [ -f "$work/old-nid" ] || die "no $work/old-nid from the swap"
+  [ -f "$work/old-nid" ] && [ -f "$work/new-nid" ] || die "no $work/old-nid and new-nid from the swap"
   [ ! -e $L ] || die "$L exists; move it aside first"
   old_nid=$(cat "$work/old-nid")
+  new_nid=$(cat "$work/new-nid")
+  # Only the state this swap left: anything else means the directories are not what they were.
+  ! systemctl is-active -q $STAGED || die "$STAGED is active; it must stay stopped after the swap"
+  get 8107/ready >/dev/null || die "8107 is not ready, so what it serves cannot be checked"
+  [ "$(nid 8107)" = "$new_nid" ] || die "8107 serves $(nid 8107), not the swapped-in $new_nid; nothing moved"
   systemctl stop $PROD
   mv $P $L
   mv $OLD $P
