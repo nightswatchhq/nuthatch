@@ -23,7 +23,7 @@ src=$repo/deploy/release-gate/helsinki/gate-export.sh
 helsinki_nests="alloc-nest:graph-allocations-nest-next gns-nest:graph-gns-nest-next dips-nest:nuthatch-dips data-services-nest:data-services-nest staking-archive-nest:graph-staking-legacy-readonly"
 # The settings that shape what serving costs. Tokens, RPC URLs and paths into the unit's own
 # directory (its spill directory) stay on the box.
-keys='NUTHATCH_(SQL_MAX_CONCURRENCY|ANALYTICS_MEMORY_LIMIT|ANALYTICS_THREADS|ANALYTICS_MAX_TEMP_SIZE|ENGINE|BURRMILL_MEMORY_LIMIT|MAX_RSS|SQL_MEMO_BYTES|HOT_STORE_CACHE_BYTES|INGESTION_RESERVATION)'
+keys='NUTHATCH_(SQL_MAX_CONCURRENCY|ANALYTICS_MEMORY_LIMIT|ANALYTICS_THREADS|ANALYTICS_MAX_TEMP_SIZE|ENGINE|BURRMILL_MEMORY_LIMIT|MAX_RSS|SQL_MEMO_BYTES|HOT_STORE_CACHE_BYTES|INGESTION_RESERVATION|RUNTIME_HEADROOM)'
 
 # Prints "<dir> <host:port>" for the running unit $1; run on the box that runs it, as root.
 # shellcheck disable=SC2016

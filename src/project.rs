@@ -1909,6 +1909,8 @@ fn scaffold_ai_surface(
          - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{{alias}}__{{event}}`\n\
          - `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)\n\
          - `GET /balance/{{address}}`   one address's derived balance\n\
+         - `GET /queries`             the nest's named queries (`views/*.sql`); `GET /q/{{name}}` runs one\n\
+         - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{{entity}}` reads one\n\
          \n\
          ## MCP (for coding agents)\n\
          Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity,\n\

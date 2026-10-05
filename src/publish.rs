@@ -1175,9 +1175,11 @@ pub async fn run_sync(dir: &Path, target: &str, dry_run: bool) -> Result<()> {
     let report = sync(dir, target, dry_run).await?;
     let verb = if dry_run { "would upload" } else { "uploaded" };
     println!(
-        "dataset {} sealed_through {:?} {verb} {} skipped {}",
+        "dataset {} sealed_through {} {verb} {} skipped {}",
         report.dataset,
-        report.sealed_through,
+        report
+            .sealed_through
+            .map_or("none".to_string(), |b| b.to_string()),
         report.uploaded.len(),
         report.skipped
     );
