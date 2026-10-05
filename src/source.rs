@@ -124,8 +124,8 @@ pub trait Source: Send + Sync {
         Ok(None)
     }
 
-    /// Unix timestamps (seconds) for the given blocks. Best-effort: a source that can't answer omits
-    /// them (default: none). Used to populate every row's implicit `block_timestamp` column.
+    /// Unix timestamps (seconds) for the given blocks (default: none). Used to populate every row's
+    /// implicit `block_timestamp` column; a block omitted or answered as 0 refuses its window.
     async fn block_timestamps(&self, _blocks: &[u64]) -> Result<HashMap<u64, u64>> {
         Ok(HashMap::new())
     }

@@ -4067,6 +4067,28 @@ async fn fetch_timestamps(
     source.block_timestamps(blocks).await
 }
 
+/// A block the source answered without a timestamp, or with 0, refuses the window: the stamp
+/// below would store 0, and once sealed it is permanent (#1911). Genesis is the one block at 0.
+fn refuse_unstamped(
+    registry: &DecodeRegistry,
+    blocks: &[u64],
+    timestamps: &std::collections::HashMap<u64, u64>,
+) -> Result<()> {
+    if !registry.timestamps() {
+        return Ok(());
+    }
+    match blocks
+        .iter()
+        .find(|&&b| b != 0 && timestamps.get(&b).is_none_or(|&t| t == 0))
+    {
+        Some(b) => anyhow::bail!(
+            "the source gave block {b} no timestamp (missing or 0); refusing the window rather \
+             than storing block_timestamp 0"
+        ),
+        None => Ok(()),
+    }
+}
+
 pub(crate) struct WindowBlockData {
     pub(crate) timestamps: std::collections::HashMap<u64, u64>,
     pub(crate) headers: Option<std::collections::HashMap<u64, serde_json::Value>>,
@@ -4083,8 +4105,10 @@ pub(crate) async fn fetch_window_block_data(
     canonical_calls: bool,
 ) -> Result<WindowBlockData> {
     if !canonical_calls && !registry.l1_blocks() {
+        let timestamps = fetch_timestamps(source, registry, blocks).await?;
+        refuse_unstamped(registry, blocks, &timestamps)?;
         return Ok(WindowBlockData {
-            timestamps: fetch_timestamps(source, registry, blocks).await?,
+            timestamps,
             headers: None,
             l1_headers: std::collections::HashMap::new(),
         });
@@ -4109,6 +4133,7 @@ pub(crate) async fn fetch_window_block_data(
             timestamps.insert(*block, timestamp);
         }
     }
+    refuse_unstamped(registry, blocks, &timestamps)?;
     let (headers, l1_headers) = match (canonical_calls, registry.l1_blocks()) {
         (true, true) => (Some(headers.clone()), headers),
         (true, false) => (Some(headers), std::collections::HashMap::new()),
@@ -10739,6 +10764,12 @@ template="pool"
                 } else {
                     Vec::new()
                 })
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
             }
         }
         let source = ResumeSource {
@@ -19444,6 +19475,12 @@ template="pool"
             ) -> Result<Vec<crate::rpc::Log>> {
                 Ok(Vec::new())
             }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect())
+            }
             async fn block_headers(
                 &self,
                 blocks: &[u64],
@@ -21080,6 +21117,219 @@ template="pool"
             advertised.len() + 1,
             "exactly one column differs"
         );
+    }
+
+    /// #1911: answers `bad_block`'s timestamp as `bad` (`None` omits it) the first time it is asked,
+    /// and truthfully after. arb1.arbitrum.io's `blockTimestamp: 0x0`, cached, stored 1,132 zeros.
+    struct FirstAnswerBadSource {
+        logs: Vec<crate::rpc::Log>,
+        bad_block: u64,
+        bad: Option<u64>,
+        bad_asks: usize,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FirstAnswerBadSource {
+        fn new(
+            logs: Vec<crate::rpc::Log>,
+            bad_block: u64,
+            bad: Option<u64>,
+            bad_asks: usize,
+        ) -> Self {
+            FirstAnswerBadSource {
+                logs,
+                bad_block,
+                bad,
+                bad_asks,
+                asked: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for FirstAnswerBadSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            let lying =
+                self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < self.bad_asks;
+            let mut out: std::collections::HashMap<u64, u64> =
+                blocks.iter().map(|&b| (b, 1_700_000_000 + b)).collect();
+            if lying && out.contains_key(&self.bad_block) {
+                match self.bad {
+                    Some(v) => out.insert(self.bad_block, v),
+                    None => out.remove(&self.bad_block),
+                };
+            }
+            Ok(out)
+        }
+    }
+
+    /// The header branch (canonical calls, `l1_blocks`) takes its timestamp from the header, and a
+    /// header answering `0x0` is no more a timestamp than a log answering it.
+    #[tokio::test]
+    async fn a_window_header_with_a_zero_timestamp_is_refused() {
+        struct ZeroHeader;
+        #[async_trait::async_trait]
+        impl Source for ZeroHeader {
+            async fn tip(&self) -> Result<u64> {
+                Ok(5)
+            }
+            async fn block_hash(&self, _: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _: &crate::source::LogFilter,
+                _: u64,
+                _: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(vec![])
+            }
+            async fn block_headers(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                Ok(blocks
+                    .iter()
+                    .map(|&b| (b, serde_json::json!({"hash": "0xab", "timestamp": "0x0"})))
+                    .collect())
+            }
+        }
+        let registry = DecodeRegistry::build(Vec::new()).unwrap();
+        assert!(fetch_window_block_data(&ZeroHeader, &registry, &[5], true)
+            .await
+            .is_err());
+    }
+
+    fn sealed_timestamps(dir: &std::path::Path) -> Vec<String> {
+        sealed_columns(dir)
+            .remove("block_timestamp")
+            .unwrap_or_default()
+    }
+
+    /// Two bad answers, because the window's tail is asked again and #1911's zero came from a cache
+    /// that gave the same wrong answer both times.
+    #[tokio::test]
+    async fn seal_direct_retries_a_window_whose_timestamp_is_zero_or_missing() {
+        for bad in [Some(0), None] {
+            let reg = transfer_registry();
+            let src = FirstAnswerBadSource::new(ping_logs(&reg, &[5, 6]), 6, bad, 2);
+            let dir = tempfile::tempdir().unwrap();
+            backfill_direct_pipelined(
+                &src,
+                &reg,
+                dir.path(),
+                &["0x1111111111111111111111111111111111111111".into()],
+                &[],
+                &[],
+                None,
+                0,
+                5,
+                6,
+                100,
+                SPAN_OFF,
+                1,
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                sealed_timestamps(dir.path()),
+                [r#"Ok("1700000005")"#, r#"Ok("1700000006")"#],
+                "{bad:?}: a bad timestamp answer was sealed rather than retried"
+            );
+            assert!(src.asked() > 2, "{bad:?}: the window was never re-asked");
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_seal_direct_refuses_a_window_whose_timestamp_is_zero_or_missing() {
+        for bad in [Some(0), None] {
+            let reg = transfer_registry();
+            let src = FirstAnswerBadSource::new(ping_logs(&reg, &[5, 6]), 6, bad, usize::MAX);
+            let dir = tempfile::tempdir().unwrap();
+            let run = backfill_direct(
+                &src,
+                &reg,
+                dir.path(),
+                &["0x1111111111111111111111111111111111111111".into()],
+                &[],
+                &[],
+                None,
+                0,
+                5,
+                6,
+                100,
+                SPAN_OFF,
+                true,
+            )
+            .await;
+            assert!(run.is_err(), "{bad:?}: the window was not refused");
+            assert!(
+                sealed_timestamps(dir.path()).is_empty(),
+                "{bad:?}: a refused window sealed rows"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tip_path_retries_a_window_whose_timestamp_is_zero_or_missing() {
+        for bad in [Some(0), None] {
+            let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+            let d = tempfile::tempdir().unwrap();
+            let mut nest = build_test_nest(d.path(), addr).await;
+            let logs: Vec<_> = (10u64..=12).map(|b| transfer_log(b, 0)).collect();
+            let source = FirstAnswerBadSource::new(logs.clone(), 11, bad, 1);
+            let first = nest
+                .process_window(&source, &logs, 10, 12, 100)
+                .await
+                .unwrap();
+            assert!(first.is_none(), "{bad:?}: the window was not refused");
+            assert!(
+                nest.store.entities_in_range(10, 12).unwrap().is_empty(),
+                "{bad:?}: a refused window stored rows"
+            );
+            nest.process_window(&source, &logs, 10, 12, 100)
+                .await
+                .unwrap()
+                .expect("the retried window commits");
+            let rows = nest.store.entities_in_range(10, 12).unwrap();
+            assert_eq!(rows.len(), 3);
+            for row in rows {
+                let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+                let b = v["block_number"].as_u64().unwrap();
+                assert_eq!(
+                    v["block_timestamp"].as_u64(),
+                    Some(1_700_000_000 + b),
+                    "{bad:?}: {row}"
+                );
+            }
+        }
     }
 
     /// The declaration is `init`-time: a nest that has already indexed refuses to flip it.
