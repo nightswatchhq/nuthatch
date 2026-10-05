@@ -147,8 +147,10 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
   must be deterministic and reviewed like any code.
 - Property tests for reorg handling: random reorg depths against the hot store must always
   converge to the canonical chain state.
-- Benchmarks are CI artifacts: backfill events/sec, tip lag ms, entity point-read p50/p99,
-  RSS. Regressions fail the build.
+- Benchmarks are CI artifacts. Single-nest RSS, dense multi-nest RSS and entity point-read p50
+  fail the build on regression. Backfill events/sec is measured on every PR and tracked, not gated:
+  the CI fixture cannot see a 4x decode cost (docs/benchmarks.md, #1723). Tip lag has no CI
+  measurement yet.
 
 ## AI-native surface (built-in, sovereignty-respecting)
 
