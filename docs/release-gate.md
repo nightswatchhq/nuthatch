@@ -78,6 +78,35 @@ It fails (exit 1) on:
 
 Exit 2 is a broken rig (no redb, a port, a binary that will not start), not a verdict on the binary.
 
+### A loaded box is a setup fault (#1898)
+
+On 2026-10-05 the 4.8.0 gate ran with a load average of 26, a build on every core, and called the
+noise a regression: production's own binary went over budget in the same run. Timings and RSS taken
+on a box something else is saturating say nothing about the binary, so the gate checks the load:
+
+- **It records it.** The first lines of the output give the 1-minute load average
+  (`/proc/loadavg`, or `sysctl -n vm.loadavg` on macOS) and the core count; the run samples it
+  every 5 s into `<out>/load.tsv` and reports the peak and the share of samples over the limit.
+  A baseline's header carries the same line.
+- **It waits before it starts.** Until the load per core is under `GATE_MAX_LOAD_PER_CORE`
+  (default 0.75) it sleeps, polling every `GATE_LOAD_POLL_SECS` (15), for up to `GATE_MAX_LOAD_WAIT`
+  seconds (1800). If the box is still loaded it exits 2 naming the load, serves nothing and posts no
+  regression.
+- **It refuses a verdict from a run that was loaded.** If more than `GATE_LOAD_MAX_SHARE` (0.25) of
+  the samples taken during the run were over `GATE_RUN_MAX_LOAD_PER_CORE` (1.5), the result is
+  `RESULT: SETUP FAULT`, exit 2, whatever the timings or RSS say, and no `--write-baseline` file is
+  written. `release-gate-run.sh` posts `error`, not `failure`, for any exit 2.
+
+The run's own limit is higher than the start's because the gate's server is part of the load it
+reads: a quiet box serving the set at concurrency 2 with eight analytics threads sits well above
+the idle figure. 0.75 per core at the start leaves a production nest using about 15% of a core
+far below it. Read a few runs' `load.tsv` on the ThinkPad before trusting 1.5. The 1-minute average lags,
+so a burst that starts late in a run may only show in the next one.
+
+If the load cannot be read at all (no `/proc/loadavg`, no `sysctl`), the gate says so and measures
+anyway. `GATE_LOADAVG_FILE` points the reader at a file whose first field is the load, and
+`GATE_NCPU` fixes the core count; the tests use both.
+
 ### Comparing answers
 
 Each answer is kept canonical in `<out>/answers/<id>.rows`, one row per line as JSON with its keys

@@ -208,6 +208,7 @@ impl Case {
 
     fn gate(&self, set: &Path, extra: &[&str], env: &[(&str, &str)]) -> (Output, String) {
         let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+        calm(&mut cmd);
         cmd.args(["--passes", "1", "--out"])
             .arg(self.dir.path().join("out"))
             .args(extra)
@@ -738,6 +739,7 @@ fn gate_with(
     env: &[(&str, &str)],
 ) -> (Output, String) {
     let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+    calm(&mut cmd);
     cmd.args(["--passes", passes, "--out"])
         .arg(c.dir.path().join("out"))
         .arg(bin)
@@ -985,6 +987,7 @@ impl Releases {
         env: &[(&str, &str)],
     ) -> (Option<i32>, String) {
         let mut cmd = Command::new(root().join("scripts/release-gate-run.sh"));
+        calm(&mut cmd);
         cmd.args(args)
             .env(
                 "PATH",
@@ -1135,6 +1138,7 @@ fn two_gate_runs_against_one_copy_serialise() {
         let set = c.set(&[("answers", c.counts())]);
         let start = |name: &str| {
             let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+            calm(&mut cmd);
             cmd.args(["--passes", "2", "--out"])
                 .arg(c.dir.path().join(name))
                 .arg(env!("CARGO_BIN_EXE_nuthatch"))
@@ -1176,6 +1180,7 @@ fn a_lock_left_by_a_killed_run_is_broken() {
     std::fs::create_dir(&held).unwrap();
     std::fs::write(held.join("pid"), format!("{pid}\n")).unwrap();
     let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+    calm(&mut cmd);
     cmd.args(["--passes", "1", "--out"])
         .arg(c.dir.path().join("out"))
         .arg(env!("CARGO_BIN_EXE_nuthatch"))
@@ -1586,6 +1591,7 @@ fn a_nests_environment_file_replaces_the_callers() {
     .unwrap();
     let gate = |extra_env: &[(&str, &str)]| {
         let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
+        calm(&mut cmd);
         cmd.args(["--passes", "1", "--env"])
             .arg(&env)
             .arg("--out")
@@ -1648,6 +1654,7 @@ fn an_unset_gate_set_is_a_setup_fault_that_names_it() {
     }
     std::fs::write(dir.path().join("releases"), "v4.3.0-rc1 pre\n").unwrap();
     let mut cmd = Command::new(root().join("scripts/release-gate-run.sh"));
+    calm(&mut cmd);
     cmd.arg("v4.3.0-rc1")
         .env(
             "PATH",
@@ -1666,4 +1673,183 @@ fn an_unset_gate_set_is_a_setup_fault_that_names_it() {
     );
     assert!(!dir.path().join("posted").exists(), "{text}");
     assert!(!dir.path().join("downloaded").exists(), "{text}");
+}
+
+/// A load source of the tests' own, so no case reads the machine it runs on: the gate waits for a
+/// quiet box and a case run on a busy one would wait with it (#1898).
+fn load_file(c: &Case, name: &str, one_minute: &str) -> PathBuf {
+    let path = c.dir.path().join(name);
+    std::fs::write(&path, format!("{one_minute} 5.00 5.00 1/100 1\n")).unwrap();
+    path
+}
+
+fn calm(cmd: &mut Command) {
+    static CALM: OnceLock<tempfile::NamedTempFile> = OnceLock::new();
+    let file = CALM.get_or_init(|| {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "0.10 0.10 0.10 1/100 1\n").unwrap();
+        f
+    });
+    cmd.env("GATE_LOADAVG_FILE", file.path())
+        .env("GATE_NCPU", "4");
+}
+
+/// After `delay`, writes `one_minute` into the fake load file; with `until` set, waits first for
+/// that file to exist (a server's log: the run has started serving).
+fn set_load_later(
+    file: &Path,
+    one_minute: &str,
+    until: Option<PathBuf>,
+    delay: Duration,
+) -> std::thread::JoinHandle<()> {
+    let file = file.to_path_buf();
+    let body = format!("{one_minute} 5.00 5.00 1/100 1\n");
+    std::thread::spawn(move || {
+        if let Some(p) = until {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while !p.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        std::thread::sleep(delay);
+        std::fs::write(file, body).unwrap();
+    })
+}
+
+/// #1898: the 4.8.0 gate measured at a load average of 26 and called the noise a regression. A box
+/// that stays loaded past the wait is a setup fault: exit 2, nothing served, no verdict.
+#[test]
+fn a_loaded_box_is_waited_on_and_then_a_setup_fault_not_a_verdict() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let load = load_file(&c, "loadavg", "26.00");
+    let started = Instant::now();
+    let (out, text) = c.gate(
+        &set,
+        &[],
+        &[
+            ("GATE_LOADAVG_FILE", load.to_str().unwrap()),
+            ("GATE_NCPU", "4"),
+            ("GATE_MAX_LOAD_WAIT", "3"),
+            ("GATE_LOAD_POLL_SECS", "0.2"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "it did not wait:\n{text}"
+    );
+    assert!(text.contains("26.00") && text.contains("load"), "{text}");
+    assert!(
+        !text.contains("RESULT: FAIL") && !text.contains("RESULT: PASS"),
+        "{text}"
+    );
+    assert!(
+        !c.dir.path().join("out/serve-pass-1.log").exists(),
+        "a server was started on a loaded box"
+    );
+}
+
+#[test]
+fn a_box_that_quietens_during_the_wait_is_measured() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let load = load_file(&c, "loadavg", "26.00");
+    let later = set_load_later(&load, "0.10", None, Duration::from_secs(1));
+    let (out, text) = c.gate(
+        &set,
+        &[],
+        &[
+            ("GATE_LOADAVG_FILE", load.to_str().unwrap()),
+            ("GATE_NCPU", "4"),
+            ("GATE_MAX_LOAD_WAIT", "60"),
+            ("GATE_LOAD_POLL_SECS", "0.2"),
+        ],
+    );
+    later.join().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("waited"), "{text}");
+}
+
+/// Load that arrives after the start turns what would be a regression into a setup fault, and no
+/// baseline is written from it. The control, on a quiet box, is the regression it would have been.
+#[test]
+fn load_rising_mid_run_turns_a_regression_into_a_setup_fault() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let baseline = c.dir.path().join("baseline.tsv");
+    std::fs::write(&baseline, "# hand-made\nanswers\ttest\tok\t1\t-1\t-\t\n").unwrap();
+    let base = baseline.to_str().unwrap();
+    let zero_slack = [("GATE_QUERY_SLACK_MS", "0"), ("GATE_P99_SLACK_MS", "0")];
+
+    let (out, text) = c.gate(&set, &["--baseline", base], &zero_slack);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the control, on a quiet box:\n{text}"
+    );
+
+    let load = load_file(&c, "loadavg", "0.10");
+    let later = set_load_later(
+        &load,
+        "26.00",
+        Some(c.dir.path().join("loaded-out/serve-pass-1.log")),
+        Duration::ZERO,
+    );
+    let written = c.dir.path().join("written.tsv");
+    let loaded_out = c.dir.path().join("loaded-out");
+    let mut env = vec![
+        ("GATE_LOADAVG_FILE", load.to_str().unwrap()),
+        ("GATE_NCPU", "4"),
+        ("GATE_LOAD_SAMPLE_SECS", "0.2"),
+        ("GATE_LOAD_MAX_SHARE", "0.01"),
+    ];
+    env.extend_from_slice(&zero_slack);
+    let (out, text) = c.gate(
+        &set,
+        &[
+            "--out",
+            loaded_out.to_str().unwrap(),
+            "--baseline",
+            base,
+            "--write-baseline",
+            written.to_str().unwrap(),
+        ],
+        &env,
+    );
+    later.join().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("RESULT: SETUP FAULT") && text.contains("load"),
+        "{text}"
+    );
+    assert!(!text.contains("RESULT: FAIL"), "{text}");
+    assert!(
+        !written.exists(),
+        "a baseline was written from a loaded run"
+    );
+}
+
+/// A quiet box passes as before, and the run says what the load was: at the start and over the run.
+#[test]
+fn a_quiet_box_passes_and_the_run_records_its_load() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let (out, text) = c.gate(&set, &[], &[]);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("box load 0.10 over 4 cores"), "{text}");
+    assert!(text.contains("load during the run"), "{text}");
+    assert!(c.dir.path().join("out/load.tsv").is_file());
+}
+
+/// No readable load is not a reason to refuse: the gate says so and measures, as it does for an
+/// optional integration that is not configured.
+#[test]
+fn an_unreadable_load_source_is_noted_and_the_gate_runs() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let gone = c.dir.path().join("no-such-loadavg");
+    let (out, text) = c.gate(&set, &[], &[("GATE_LOADAVG_FILE", gone.to_str().unwrap())]);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("load could not be read"), "{text}");
 }
