@@ -17,10 +17,11 @@ lives in the [issue queue](https://github.com/nightswatchhq/nuthatch/issues)
 (the `parked` label means *decided against for now*, not *forgotten*); [`backlog.md`](backlog.md)
 explains how to read it and the [RFC index](rfcs/README.md) says what each RFC is.
 
-Written against **2.0.0** (2026-08-06). The container tags below were refreshed for **2.5.0**
-(2026-08-15) after they were found still pinning `:2.0.0`, five releases on - the rest of this
-document has *not* been re-read against a newer release, and saying so is more use to you than a
-bumped number would be. Read [Known gaps](#known-gaps) before exposing `/sql`.
+Written against **2.0.0** (2026-08-06) and re-read against **4.10.1** on 2026-10-05, by running
+what it describes: every command, flag, route, metric name and default below was checked against
+that binary or its source, and the figures that could not be re-sourced were removed. A figure that
+names its date is a measurement from that day, not a promise about today. Read
+[Known gaps](#known-gaps) before exposing `/sql`.
 
 ---
 
@@ -295,6 +296,7 @@ out of scope - see RFC-0022 §6.
 ```
 runtime-dir/
   mounts.toml             # runtime state: chains + mount records (tenant, alias, nid) + budget
+  mount-jobs.json         # the admin API's job table (3.13.0): every mount, move and resume job
   segments/               # SHARED sealed Parquet, content-addressed - two nests that decode the
                           #   same contract hold ONE copy here, not two (RFC-0033 §11a)
   data/
@@ -323,7 +325,7 @@ Nests live in their own repositories rather than in-tree; see the
 
 > **Scaled mode exists** (RFC-0022): a Postgres hot store, a writer pool taking one lease per cursor,
 > a query-FE tier, and a control plane holding desired state - see *Scaled mode* below. DataFusion
-> federation (RFC-0013) is a separate question and remains unbuilt.
+> federation (RFC-0013) was a separate question, never built, and closed on 2026-09-08.
 >
 > It is newer and less exercised than embedded mode, which runs in production. If one process per box
 > is enough for you, that remains the recommended shape.
@@ -371,8 +373,8 @@ has raised the wall with `NUTHATCH_MAX_RSS`, or measured both terms below, and s
 arithmetic over the walls, not an enforcement of ingest RSS; ingest, DBSP, redb and result
 materialisation are still bounded by the `max_rss_mb` wall and the footprint job, not by this sum.
 
-**Measuring the two terms** (#1899), on a copy of the nest, under production's settings, on the box
-that runs it:
+**Measuring the two terms** (#1899, closed 2026-10-05 with the figures below, taken on 4.10.0), on a
+copy of the nest, under production's settings, on the box that runs it:
 
 - `NUTHATCH_INGESTION_RESERVATION`: the VmHWM of `nuthatch dev` on the copy with no queries, over a
   catch-up and a few polls. The QoS nest: 372 MiB.
@@ -395,13 +397,16 @@ The projection model (deliberately rough):
 | Component | MB |
 |---|---|
 | runtime base, paid once per process | 120 |
-| each nest: hot store + decode registry + balance view | 90 |
+| each nest: hot store + decode registry + balance view | 5 (fitted at ~1 MB observed, with a 5x margin) |
 | each additional IVM view (exposure, velocity) or factory child registry | 40 |
+| each authored incremental entity: its circuit and thread | 8, plus 3,200 bytes per declared row |
 
-**Measured reality is far below the projection.** A single-chain ERC-20 nest at tip measures ~37 MB
-resident; a two-nest runtime measures ~110 MB against a ~300 MB projection. Provision against the
-measurement (`nuthatch_rss_bytes`, also reported as `rss_bytes` on `GET /nests`) and treat the
-projection as a guard rail rather than a sizing tool.
+`GET /nests` reports the projection as `projected_rss_mb` and each mount's share as
+`estimated_rss_mb` (`0` for a second mount of a dataset already charged once). Provision against
+the measurement (`nuthatch_rss_bytes`, also reported as `rss_bytes` on `GET /nests`) and treat the
+projection as a guard rail rather than a sizing tool. A runtime holding one WETH dataset under two
+mounts, forty blocks of history, measured 48 MB resident against a 125 MB projection on 4.10.1
+(macOS, 2026-10-05); the same nest alone, at tip with 300 blocks behind it, measured 216 MB.
 
 **What actually drives memory:**
 
@@ -415,8 +420,10 @@ over a pinned range; `nuthatch bench query` reports entity point-read p50/p99 pl
 cost and RSS. Run both against a representative nest on your hardware and your RPC before sizing a
 fleet.
 
-**Disk.** Sealed Parquet is Snappy-compressed and content-addressed. Growth is proportional to decoded
-events, not chain history: a nest tracking a few events on a few contracts stays small.
+**Disk.** Sealed Parquet is zstd-compressed (level 3, the `zstd-bloom-v1` writer profile; segments
+sealed before that profile existed are Snappy and still read) and content-addressed. Growth is
+proportional to decoded events, not chain history: a nest tracking a few events on a few contracts
+stays small.
 
 ---
 
@@ -594,7 +601,8 @@ SQL surfaces). Full key reference:
 | `NUTHATCH_SQL_MEMO_BYTES` | ceiling on the analytical memo's remembered rows, in serialized bytes (default 64 MiB; `0` turns it off). See *The analytical memo* under capacity and sizing. |
 | `NUTHATCH_CALL_BODY_CONCURRENCY` | block-body batches (20 blocks each) fetched at once for `top_level_calls` (default 4, ceiling 10). Memory stays one 200-block chunk of bodies whatever the value. On `--seal-direct` it multiplies with `--concurrency`, since each window fetches its own bodies. |
 
-**Runtime flags that matter operationally** (`dev` and `bench backfill`):
+**Runtime flags that matter operationally** (`dev`; `bench backfill` shares `--rpc`, `--seal-direct`
+and `--concurrency`):
 
 | Flag | Use |
 |---|---|
@@ -616,7 +624,10 @@ cost a separate `eth_getBlockByNumber` per distinct block. On the workloads we m
 roughly **85% of backfill wall clock** (RFC-0029 §4). `nuthatch init --no-timestamps` drops the column
 and stops paying for it. Since 3.11 that cost is gone on any node that returns `blockTimestamp` on
 its logs, which every endpoint we checked does (see *What a nest costs at tip*), so check yours before
-giving up the column.
+giving up the column. One public endpoint, `arb1.arbitrum.io`, returns the field as `0x0` on every
+log; since 4.10.1 a window holding a block whose timestamp is missing or zero is refused and retried,
+against another endpoint where the pool has one, rather than stored (#1911). Such a node costs
+retries, never wrong rows.
 
 Read the next paragraph before you reach for it.
 
@@ -822,14 +833,17 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /metrics` | Prometheus text exposition |
 | `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold; `"degraded": true` and the table in `degraded_tables`, as on `/sql`, when the sealed rows could not be read |
 | `GET /schema` | the full data model |
-| `GET /sql?q=…` | read-only analytical SQL over hot and sealed data |
-| `GET /explain` | query plan and cost hints |
+| `GET /sql?q=…` | read-only analytical SQL over hot and sealed data; the answer carries `cached`, `degraded`, `tip_unavailable` and a `provenance` block (`as_of`, `sealed_through`, `nid`, `registry_hash`) |
+| `GET /explain` | binds caller-supplied SQL without running it (`valid`, `note`); guarded like `/sql` |
+| `GET /queries`, `GET /q/{name}` | the mount's `sql` mode (`open`, `allowlist`, `deny`) and its declared queries (RFC-0034), and one of them by name |
+| `GET /derived`, `GET /derived/{entity}`, `GET /derived/{entity}/{key}` | authored incremental entities (RFC-0041): the list with its head, one relation, one row |
+| `GET /ipfs/gave-up?limit=100` | the `[[ipfs]]` documents the nest stopped trying to fetch, in block order |
 | `GET /entities`, `GET /entity/{id}` | entity point-reads, transparently across the hot/cold seam |
 | `GET /balances`, `GET /balance/{address}` | the derived IVM balance view |
 | `GET /exposure/{address}`, `GET /flags` | compliance surfaces (RFC-0008) |
 | `GET /nest` | nest identity and registry hash |
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
-| `GET /_admin/`, `/_admin/events` | admin UI. Token-gated off-localhost; removable with `--no-admin` |
+| `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, and the sealed catalogue per table (`?table=` for one table's segments). Token-gated off-localhost; removable with `--no-admin` |
 
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
 `GET /health`, and `GET /metrics` (the whole runtime's exposition, served before anything is mounted;
@@ -1040,6 +1054,7 @@ per-nest series below.
 | `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total`, `nuthatch_sql_rejections_total{reason=…}` | serving; the unlabelled rejection total is the aggregate, and the fixed `reason` label classifies its refusals |
 | `nuthatch_sql_memo_hits_total`, `nuthatch_sql_memo_misses_total`, `nuthatch_sql_memo_bytes` | the analytical memo (#1186): how many `/sql` answers were remembered rather than computed, and what it holds |
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
+| `nuthatch_rpc_endpoint_requests_total{endpoint}`, `nuthatch_rpc_endpoint_failures_total{endpoint}`, `nuthatch_rpc_endpoint_retries_total{endpoint}`, `nuthatch_rpc_request_duration_seconds` | the same traffic per endpoint, host only, and its latency histogram; what the admin page's RPC tab reads |
 | `nuthatch_rpc_methods_total{method=…}` | individual JSON-RPC method invocations; a batch of 200 `eth_getBlockByNumber` is 200 here and 1 on `nuthatch_rpc_requests_total`. Multiply by a provider's per-method CU schedule to estimate a bill |
 | `nuthatch_start_time_seconds` | unix time the runtime built its first cursor; the counters are since then, so this is what turns `nuthatch_rpc_methods_total` into a monthly figure. Absent on a serve-only process |
 | `nuthatch_rss_bytes` | process memory: the number to provision against |
@@ -1287,7 +1302,7 @@ duplicates.
 | A nest stuck at a block | its `quarantine.reason` on `/nests`; logs | a `getLogs` provider cap on a busy template usually wants a smaller `--window` |
 | RSS approaching the ceiling | which nest, via `nuthatch_nest_*`; recent `/sql` traffic | the hot-scan is the usual cause. Restrict `/sql` at the gateway, or move the nest to its own cursor |
 | Backfill crawling | `--window` versus contract sparsity; `--concurrency` | a sparse contract wants a *large* window; a dense one wants concurrency against your own node |
-| Webhook backlog | `nuthatch_alert_outbox_depth`, sink availability | delivery is sequential today; one slow sink throttles others |
+| Webhook backlog | `nuthatch_alert_outbox_depth`, sink availability | a drain posts eight deliveries at once with a 10 s timeout each, so one slow sink delays its own alerts, not the others'; past 10,000 undelivered alerts the oldest are shed, loudly |
 | Chain-id mismatch at startup | the startup error names the endpoint | an endpoint in the pool is on the wrong network. Every endpoint is verified at boot, on purpose |
 | Suspect data | `nuthatch check --dir <nest>` | runs the nest's committed invariant and parity checks against recorded fixtures |
 | Need to prove a compliance result | `nuthatch audit replay --from --to` | re-runs screening over sealed segments and confirms stored hits reproduce exactly |
@@ -1416,8 +1431,9 @@ stated explicitly rather than left to be discovered.
 
 **Binary upgrades.** Proven in production across 0.3.0 → 0.6.0 → 0.6.2 → 1.0.0 on a box serving public
 traffic throughout: each was a binary swap and a restart, with no data migration and no flag changes.
-In-place-safe upgrades are the target, and each release's notes state "in-place safe" or "reseal
-required" explicitly.
+Every 4.x release since has been the same swap and restart, and each release's notes carry a
+**Compatibility and upgrade** section that says so, or names the migration or re-index if one is
+needed.
 
 ---
 
@@ -1445,23 +1461,32 @@ path). That test is a heuristic and cannot recognise every key, so keep credenti
 bundle: pass RPC endpoints at run time with `--rpc`. `--allow-secrets` bundles anyway, for a bundle that
 is never meant to leave the box.
 
-**Upgrading a nest without the resync tax** (RFC-0020):
+**Upgrading a nest** (RFC-0020 named the goal, "without the resync tax"; what 4.10.1 does is
+narrower than that RFC, and is stated here as it is):
 
 ```sh
-# 2.0: there is no upgrade command to remember. Stage the new version and migrate; the runtime
-# classifies the change itself and refuses a breaking one until you accept it.
+# There is no upgrade command. A pre-2.0 directory is migrated once; the runtime classifies the
+# change and refuses a breaking one until you accept it.
 nuthatch migrate --dir <runtime> --dry-run    # prints the plan, including any BREAKING changes by name
 nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking to accept one
 ```
 
-- **Compatible** (internal changes, or purely additive schema): the new version indexes alongside the
-  old, then the endpoint atomically flips. The served address never changes and consumers notice
-  nothing. When the decode registry is unchanged, the old version's sealed segments are **reused**
-  rather than re-indexed, so a view-only or semantic-only change costs no backfill at all.
-- **Breaking** (anything a consumer observes as removed, renamed, retyped or semantically changed):
-  both versions run. The old stays at the root carrying a `Deprecation: true` header and a `Link` to
-  its successor; the new is served under `--new-endpoint` (default `/next`). Consumers migrate on
-  their own clock.
+- **A new version is a new NID**, because the NID is a content address: any edit to the nest's
+  inputs, a view or a description included, yields a different dataset, and that dataset is indexed
+  from its start block. What it shares with the old one is disk, not work: a sealed segment is
+  content-addressed, so two datasets that decode the same contract over the same range hold one
+  copy under the runtime's `segments/`. Per-derivation reuse across an NID change (RFC-0033, #357)
+  is not built; `dev` computes the reuse keys at startup, warns about a view that could never be
+  reused, and acts on none of it.
+- **On a runtime the swap is `POST /_admin/move/<name> {"nid": "<new nid>"}`** (3.13.0): the new
+  NID is mounted beside the old, caught up, then takes over the name's routes in one step, so a
+  reader sees the old answers, then the new, and never an error between. The old dataset is left
+  for `nuthatch prune` or `DELETE /_admin/datasets/<nid>`. For a change consumers would observe as
+  removed, renamed or retyped, mount the new NID under a second alias instead and move consumers
+  on their own clock; nothing in the binary serves two versions of one name.
+- **`nuthatch migrate` classifies**, and only for a pre-2.0 directory: its plan names each
+  `BREAKING` change per alias, and the run stops before anything moves unless `--allow-breaking`
+  accepts it. A 4.x directory has nothing for it to do.
 
 **Hosting nests on a runtime** (RFC-0027, 3.13.0). A runtime runs its own nests' lifecycle: a caller
 hands it a NID and it does the rest, with no restart and no co-tenant interrupted.
@@ -1609,8 +1634,9 @@ be found. What a test enforces in the required CI job:
   checks exact values: both mount records, the NID recomputed from the stored nest, the sealed
   segment's hash, the hot store's rows and watermarks, `/sql` over sealed and hot rows, `/entity`
   point reads and an authored entity's value. It then indexes two more blocks and seals, and checks
-  those too. Renaming a redb table or changing the NID derivation turns it red. Each 4.x minor adds
-  its own directory beside it; none is ever rewritten.
+  those too. Renaming a redb table or changing the NID derivation turns it red. The tree holds that
+  one data directory and a `config-4.0` beside it; no later 4.x minor has added a directory of its
+  own, and none is ever rewritten.
 - **Config:** the same file freezes a `nuthatch.toml`, `mounts.toml` and `entities.toml` as a 4.0
   user writes them, and checks what each key means, not only that it parses. Four more committed
   `nuthatch.toml` files must parse with no unknown key (`only_keys_nothing_reads_are_unknown`).
@@ -1737,7 +1763,8 @@ Stated plainly, because finding them yourself in production would be worse.
   machines (runbook level 5). It has not run a production workload for anyone, and until 0.9.3 the
   writer pool did not index at all (#250) - a defect a suite of ten passing checks did not catch,
   because every one of them tested the control plane rather than the data. Weigh it accordingly.
-  DataFusion federation (RFC-0013) is separate and still unbuilt; both modes use the embedded engine.
+  DataFusion federation (RFC-0013) was never built and was closed on 2026-09-08; both modes use the
+  embedded engine, Burrmill.
 - **No ExEx or trace/state extraction.** Colocated-reth ingestion (RFC-0003) and firehose-class
   extraction (RFC-0014) are gated on a synced node - an infrastructure decision, not a coding one.
 
@@ -1783,7 +1810,9 @@ Before pointing real traffic at a nuthatch deployment:
 - [ ] Backup covering the nest directory, tested by restoring into a clean box.
 - [ ] `nuthatch check` passing for each nest, with parity fixtures committed.
 - [ ] A restart drill performed: SIGTERM, restart, confirm no gaps or duplicates.
-- [ ] A nest upgrade rehearsed with `nuthatch migrate --dry-run` on a non-production copy.
+- [ ] A binary upgrade rehearsed on a copy of the data directory: the 4.x promise runs forwards only,
+      so the copy is the way back (see [Stability contract](#stability-contract)). A pre-2.0
+      directory is rehearsed with `nuthatch migrate --dry-run` on the copy first.
 - [ ] Nest onboarding process agreed. *(Adding a nest no longer restarts the runtime - `POST
       /_admin/nests` mounts one live, since 0.7.0. This line said otherwise for two releases.)*
 - [ ] **The acceptance runbook walked**, at the levels matching your deployment - see
