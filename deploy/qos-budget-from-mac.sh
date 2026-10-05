@@ -12,9 +12,8 @@ host=${QOS_HOST:-thinkpad}
 unit=qos-reo-nest
 smoke_dir=${SMOKE_DIR:-$HOME/Projects/kittiwake/nuthatch-gate/smoke}
 repo=$(cd "$(dirname "$0")/.." && pwd)
-# Release gate, four Linux runs on 4.8.0: peak RSS 1745 to 1773 MiB, all nine statements answered.
-# The pool stays above 1 GiB because at 1 GiB its sorts refuse; fewer threads is what lowers the peak.
-# MAX_RSS is what the startup check needs for this pool: 1536 + the 1024 MB ingest floor.
+# Held to 2 GiB by the kernel: inside MemoryMax=2G the gate peaked at 1717 to 1792 MiB, nine of nine
+# answered. MAX_RSS is 4.8.0's arithmetic for this pool (1536 + its 1024 MB floor), not the budget (#1899).
 settings="NUTHATCH_BURRMILL_MEMORY_LIMIT=1536MB NUTHATCH_ANALYTICS_THREADS=4 NUTHATCH_MAX_RSS=2560MB"
 
 [ -f "$repo/scripts/deploy-nest.sh" ] || { echo "no scripts/deploy-nest.sh under $repo" >&2; exit 2; }
@@ -28,7 +27,7 @@ tar -xf - -C "$d"
 # cache counts toward the unit. Applied by the restart below, and reverted with it on failure.
 cap=/etc/systemd/system/$UNIT.service.d/zzz-engine.conf
 sudo -n cp "$cap" "$d/zzz-engine.conf.prev"
-sudo -n sed -i -E "s/^MemoryHigh=.*/MemoryHigh=2816M/; s/^MemoryMax=.*/MemoryMax=3G/" "$cap"
+sudo -n sed -i -E "s/^MemoryHigh=.*/MemoryHigh=1900M/; s/^MemoryMax=.*/MemoryMax=2G/" "$cap"
 sudo -n bash "$d/deploy-nest.sh" env "$UNIT" $SETTINGS --smoke "$d/$UNIT.sql" \
   || { sudo -n cp "$d/zzz-engine.conf.prev" "$cap"; sudo -n systemctl daemon-reload; sudo -n systemctl restart "$UNIT"; exit 1; }
 env_file=$HOME/release-gate/env/qos-nest.env
