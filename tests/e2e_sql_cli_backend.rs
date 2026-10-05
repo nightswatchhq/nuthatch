@@ -475,3 +475,86 @@ async fn bring_up_solo_runtime(root: &Path) -> std::net::SocketAddr {
     });
     addr
 }
+
+const TEMPORAL: &str = "SELECT CAST('2026-10-05' AS DATE) AS d, \
+     CAST('1969-12-31' AS DATE) AS before_epoch, \
+     CAST('2026-10-05 12:34:56.25' AS TIMESTAMP) AS ts, \
+     CAST('2026-10-05 12:34:56' AS TIMESTAMP) AS whole, \
+     CAST('2026-10-05T12:34:56+02:00' AS TIMESTAMP WITH TIME ZONE) AS tz";
+
+fn temporal_row() -> serde_json::Value {
+    json!({
+        "d": "2026-10-05",
+        "before_epoch": "1969-12-31",
+        "ts": "2026-10-05T12:34:56.25Z",
+        "whole": "2026-10-05T12:34:56Z",
+        "tz": "2026-10-05T10:34:56Z",
+    })
+}
+
+async fn run_sql_json(dir: &Path, url: &str, query: &str) -> serde_json::Value {
+    let (dir, url, query) = (dir.to_path_buf(), url.to_string(), query.to_string());
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+            .args(["sql", &query, "--json", "--dir"])
+            .arg(&dir)
+            .args(["--url", &url])
+            .output()
+            .expect("running the nuthatch binary")
+    })
+    .await
+    .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+}
+
+/// #1852: dates print as YYYY-MM-DD and timestamps as RFC 3339, in the table and in `--json`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_answer_prints_dates_and_timestamps_as_iso_8601() {
+    let instance = serving_instance().await;
+    let nest = tempfile::tempdir().unwrap();
+    drop(nuthatch::store::Store::open(&nest.path().join("nuthatch.redb")).unwrap());
+
+    let (status, output) = run_sql(nest.path(), &instance.url, TEMPORAL).await;
+    assert!(status.success(), "{output}");
+    let want = temporal_row();
+    let (header, row) = table_head(&output);
+    for (col, cell) in header.iter().zip(&row) {
+        assert_eq!(Some(cell.as_str()), want[col].as_str(), "{col}:\n{output}");
+    }
+    assert_eq!(header.len(), 5, "{output}");
+
+    assert_eq!(
+        run_sql_json(nest.path(), &instance.url, TEMPORAL).await,
+        want
+    );
+    assert_eq!(instance.hits.load(Ordering::SeqCst), 0);
+}
+
+/// The same answer from `/sql` itself and from the CLI going through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_over_http_returns_dates_and_timestamps_as_iso_8601() {
+    let root = tempfile::tempdir().unwrap();
+    let addr = bring_up_solo_runtime(root.path()).await;
+    let url = format!("http://{addr}");
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{url}/sql"))
+        .query(&[("q", TEMPORAL)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["rows"], json!([temporal_row()]), "{body}");
+
+    assert_eq!(
+        run_sql_json(root.path(), &url, TEMPORAL).await,
+        temporal_row()
+    );
+    let (status, output) = run_sql(root.path(), &url, TEMPORAL).await;
+    assert!(status.success(), "{output}");
+    assert!(output.contains("2026-10-05T10:34:56Z"), "{output}");
+}

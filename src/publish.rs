@@ -563,7 +563,7 @@ fn rfc3339_utc(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097) as u32;
