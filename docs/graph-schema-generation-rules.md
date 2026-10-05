@@ -1,7 +1,8 @@
 # graph-node's generated schema, derived from a live reference
 
 RFC-0053 S1 (#1265). What `nuthatch` must generate from an imported `schema.graphql` so that a
-generated client validates against it.
+generated client validates against it. The schema is served, by introspection on `/graphql`, only in a
+nuthatch built with `--features graph`; the published binary is a default build and has no such route.
 
 **Every rule below was extracted mechanically from a recorded introspection of a real graph-node**,
 not inferred from documentation. The reference is
@@ -26,7 +27,7 @@ Ten, of which five are graph-node's own additions on top of GraphQL's built-ins:
 `Query`, `_Meta_`, `_Block_`, `_Log_`, `_LogMeta_`, `_LogArgument_`.
 
 ```graphql
-type _Meta_ { block: _Block_  deployment: String  hasIndexingErrors: Boolean }
+type _Meta_ { block: _Block_!  deployment: String!  hasIndexingErrors: Boolean! }
 ```
 
 ## Query root
@@ -34,16 +35,24 @@ type _Meta_ { block: _Block_  deployment: String  hasIndexingErrors: Boolean }
 For every `@entity` type `E`, two fields - and note the two different name derivations:
 
 ```graphql
-e(id: ID!, block: Block_height, subgraphError: _SubgraphErrorPolicy_ = deny): E
+e(id: ID!, block: Block_height, subgraphError: _SubgraphErrorPolicy_! = deny): E
 es(skip: Int = 0, first: Int = 100, orderBy: E_orderBy, orderDirection: OrderDirection,
-   where: E_filter, block: Block_height, subgraphError: _SubgraphErrorPolicy_ = deny): [E!]!
+   where: E_filter, block: Block_height, subgraphError: _SubgraphErrorPolicy_! = deny): [E!]!
 ```
+
+`subgraphError` is **non-null with a default**, which the SDL documentation does not show and which
+has been reported as a bug more than once: the introspection graph-node serves is `NON_NULL`, and a
+non-null argument with a default does not reject a client that omits it.
 
 Plus `_meta(block: Block_height): _Meta_` and `_logs`. For 19 entities: 19x2 + 2 = 40.
 
 **Pluralisation is a real rule, not `+ "s"`.** Observed: `modifyLiquidity` → `modifyLiquidities`,
 `poolDayData` → `poolDayDatas`, `poolHourData` → `poolHourDatas`, `subscribe` → `subscribes`,
-`transfer` → `transfers`, `pool` → `pools`. A `y` after a consonant becomes `ies`. Getting this wrong
+`transfer` → `transfers`, `pool` → `pools`. The rule is graph-node's own: Inflector's full English
+ruleset through `to_plural` (`graph/src/data/graphql/ext.rs`, `camel_cased_names`), irregulars
+included, with `_collection` appended when the plural equals the singular. That means Inflector's
+answers rather than English's, `persons` and `childs`, because a client generated against the real
+subgraph asked for those (#1282). Getting this wrong
 means the client's generated query names do not exist on our schema, which is a hard failure before a
 single row is read.
 
@@ -81,11 +90,14 @@ and: [E_filter]   or: [E_filter]   _change_block: BlockChangedFilter
 
 ## Ordering: `E_orderBy`
 
-An enum over the entity's own fields **and one level of relation traversal**, joined by a double
-underscore. `Pool_orderBy` has **65 values: 35 plain and 30 nested** - `token0__id`,
-`token0__symbol`, `token0__decimals`, `token0__volume` and so on.
+An enum over **every** field of the entity by bare name, lists and `@derivedFrom` fields included,
+**and one level of relation traversal**, joined by a double underscore. `Pool_orderBy` has **65
+values: 35 plain and 30 nested** - `token0__id`, `token0__symbol`, `token0__decimals`,
+`token0__volume` and so on.
 
-One level only. There is no `token0__whitelistPools__id`.
+One level only, and the nested level carries only the target's scalar and enum fields: there is no
+`token0__whitelistPools__id`, and `Tick_orderBy` has 28 of `Pool`'s 35 under `pool__` because the
+five lists and the two relations are left out. A `@derivedFrom` relation is not traversed.
 
 ## Supporting types
 
@@ -99,7 +111,8 @@ enum _SubgraphErrorPolicy_ { allow  deny }
 ## `@derivedFrom` fields
 
 Rendered as a list with collection arguments, but **no `block`** - a derived field inherits the
-parent query's block:
+parent query's block. The rule is "is a list", not "is derived": a stored list such as
+`Token.whitelistPools` carries the same five arguments.
 
 ```graphql
 Transaction.swaps(skip: Int, first: Int, orderBy: Swap_orderBy,
