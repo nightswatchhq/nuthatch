@@ -66,6 +66,19 @@ jobs:
           echo "default shards: ${{ needs.test-default.result }}"
           echo "exex build: ${{ needs.check-exex.result }}"
           echo "exex shards: ${{ needs.test-exex.result }}"
+          # A shard reads `skipped` when its build did not succeed, so no test of that leg ran. That
+          # has happened with no step of the build executed, when GitHub assigned it no runner inside
+          # its window (#1920, during an Actions incident): a cancelled build, skipped shards, and
+          # nothing red of its own. This job is what makes it red.
+          for leg in default exex; do
+            case "$leg" in
+              default) build="${{ needs.check-default.result }}" shards="${{ needs.test-default.result }}" ;;
+              exex) build="${{ needs.check-exex.result }}" shards="${{ needs.test-exex.result }}" ;;
+            esac
+            if [ "$shards" = skipped ]; then
+              echo "::error::the $leg test shards were skipped because the build job ended '$build' - no test of that leg ran. If the build ran no step, GitHub gave it no runner: re-run the failed jobs."
+            fi
+          done
           if [ "${{ needs.check-default.result }}" != success ] \
             || [ "${{ needs.test-default.result }}" != success ] \
             || [ "${{ needs.check-exex.result }}" != success ] \
@@ -1192,6 +1205,14 @@ jobs:
         run: |
           echo "density: ${{ needs.multinest-footprint.result }}"
           echo "wide ABI: ${{ needs.wideabi-footprint.result }}"
+          # `skipped` means the release build did not succeed and neither measurement ran; see the
+          # same case in `check` above.
+          for r in "${{ needs.multinest-footprint.result }}" "${{ needs.wideabi-footprint.result }}"; do
+            if [ "$r" = skipped ]; then
+              echo "::error::a RAM budget measurement was skipped because build-release did not succeed - nothing was measured. If build-release ran no step, GitHub gave it no runner: re-run the failed jobs."
+              break
+            fi
+          done
           if [ "${{ needs.multinest-footprint.result }}" != success ] \
             || [ "${{ needs.wideabi-footprint.result }}" != success ]; then
             echo "::error::the per-cursor RAM budget needs both measurements green (see multinest-footprint and wideabi-footprint)"
