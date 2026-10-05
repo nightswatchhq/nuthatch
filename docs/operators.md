@@ -353,10 +353,10 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 | `analytics.threads` | `NUTHATCH_ANALYTICS_THREADS` | 2 (ceiling 16) | worker threads per session. Above 16 is refused; not a term in the RAM equation |
 | `analytics.temp_directory` | `NUTHATCH_ANALYTICS_TEMP_DIRECTORY` | Linux: `$XDG_CACHE_HOME/nuthatch` or `~/.cache/nuthatch`; elsewhere the process temp dir | parent of per-session spill dirs (`nuthatch-spill-{pid}-{seq}`; do not point two processes at one directory). Not `/tmp` on Linux by default, because that is often a tmpfs, where spill is RAM outside the per-cursor budget; do not point this at one |
 | `analytics.max_temp_size` | `NUTHATCH_ANALYTICS_MAX_TEMP_SIZE` | 2GB | spill per analytics session. A `/sql` query that spills past it is stopped and answered `507`. On disk it does not buy room in the equation above; on a tmpfs it is RAM |
-| `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | named floor for ingest, and **raise-only**: 1024 is the remainder of today's 2 GiB split after 2 × 512 MB of analytics, **not** a measured ingest RSS high-water (RFC-0047 §6). A lower value is refused at startup, because nothing caps ingest at this figure - writing a smaller number would not shrink ingest, only hand analytics headroom against a reservation no code enforces |
+| `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | the ingest path: runtime, decode, DBSP, redb. The derived 1024 is the remainder of today's 2 GiB split after 2 × 512 MB of analytics, **not** a measurement, and it also covers `runtime_headroom` below. Raising it is always allowed. Lowering it is allowed only together with a measured `runtime_headroom`, and never below 256MB; alone it is refused, because the 1024 also stands for what statements hold outside the pool (#1241, #1899) |
 | the engine's limit | `NUTHATCH_BURRMILL_MEMORY_LIMIT` | `analytics.memory_limit` | takes the place of `analytics.memory_limit` where set, shared the same way, and is what each pool counts at in the split. Kept from the releases that carried two engines |
 | the wall | `NUTHATCH_MAX_RSS` | 2048MB | the ceiling the split is held to, for a process given more than 2 GiB. **Raise-only**, and a statement by the operator, not a measurement: the footprint job measures the default and nothing above it |
-| `runtime_headroom` | (not settable) | 0 | unmeasured. Named in the inequality so the term is visible; counted as zero until someone measures it on the box that enforces the budget |
+| `runtime_headroom` | `NUTHATCH_RUNTIME_HEADROOM` | 0 (inside the derived reservation) | what the process holds outside the engine pool while it answers: decoded scan batches and results, which the pool does not count. Set it from a measurement, and with it the reservation may be measured too |
 
 Sizes accept `512`, `512MB`, `1GB`, `2GiB`. `NUTHATCH_SQL_MAX_CONCURRENCY` remains the permit
 count, still capped at 16, and is **not** an unconstrained config key. `analytics.threads` shares
@@ -364,12 +364,24 @@ that ceiling. Raising permits on a one-nest cursor costs no memory in the split,
 statements share one pool; two datasets at 1024 MB each plus the derived ingest floor is 3072 MB,
 and is refused at startup.
 
-`ingestion_reservation` may be raised and not lowered, which is what makes the inequality worth
+`ingestion_reservation` alone may be raised and not lowered, which is what makes the inequality worth
 having. The consequence is the property to hold onto: **no configuration this gate accepts gives
 analytics more RAM than the shipped default that the footprint CI job measures**, unless the operator
-has raised the wall with `NUTHATCH_MAX_RSS` and so said the process has it. The gate is
+has raised the wall with `NUTHATCH_MAX_RSS`, or measured both terms below, and so said what the process holds. The gate is
 arithmetic over the walls, not an enforcement of ingest RSS; ingest, DBSP, redb and result
 materialisation are still bounded by the `max_rss_mb` wall and the footprint job, not by this sum.
+
+**Measuring the two terms** (#1899), on a copy of the nest, under production's settings, on the box
+that runs it:
+
+- `NUTHATCH_INGESTION_RESERVATION`: the VmHWM of `nuthatch dev` on the copy with no queries, over a
+  catch-up and a few polls. The QoS nest: 372 MiB.
+- `NUTHATCH_RUNTIME_HEADROOM`: from four release-gate runs, the largest peak RSS less the pool held
+  at that peak. The gate prints both. The QoS nest, at 4 threads: up to 1,200 MiB, so 1,216 MB.
+
+Round each up. The headroom grows with `analytics.threads` and with how much a statement scans, so
+measure again when either changes. A pool sized from these may still be too small for a statement
+to run: the gate says so as a refusal, and that is the trade to take to whoever owns the budget.
 
 **Ingestion liveness outranks query completion.** A query that cannot run in its budget fails naming
 these keys. It never degrades block processing.
