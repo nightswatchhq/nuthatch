@@ -799,11 +799,16 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(urls: Vec<String>) -> Result<Self> {
+        Self::with_timeout(urls, Duration::from_secs(20))
+    }
+
+    /// [`Self::new`] with a per-request deadline other than 20 s.
+    pub fn with_timeout(urls: Vec<String>, timeout: Duration) -> Result<Self> {
         if urls.is_empty() {
             bail!("no RPC URLs configured");
         }
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(timeout)
             .build()
             .context("failed to build HTTP client")?;
         let n = urls.len();
@@ -1360,8 +1365,8 @@ impl RpcClient {
         // timeout, a default pool with a couple of dead endpoints (mainnet ships four) delayed the start
         // of indexing by over a minute - a regression against the "<2 minutes to first indexed query"
         // promise, and one that only shows up when a public endpoint is having a bad day. Concurrent +
-        // 5 s bounds the whole check at ~5 s no matter how many endpoints are configured or dead.
-        const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        // 2 s bounds the whole check at ~2 s no matter how many endpoints are configured or dead.
+        const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         let checks = self.urls.iter().enumerate().map(|(j, url)| async move {
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
@@ -1392,16 +1397,23 @@ impl RpcClient {
                 }
                 // Unreachable or slow now ≠ wrong chain. Leave it in the pool; failover copes, and a
                 // wrong-chain endpoint that was merely late still gets caught the moment it answers a
-                // real call with a mismatching block hash.
-                Ok(Err(e)) => tracing::warn!(
-                    "could not verify chain id of {} at startup ({e:#}) - leaving it in the pool",
-                    redact_url(url)
-                ),
-                Err(_) => tracing::warn!(
-                    "chain id check for {} timed out after {}s - leaving it in the pool",
-                    redact_url(url),
-                    VERIFY_TIMEOUT.as_secs()
-                ),
+                // real call with a mismatching block hash. It is cooled, though: left healthy, the
+                // first real call waited out the client's 20 s timeout on it (#1885).
+                Ok(Err(e)) => {
+                    self.mark_unhealthy(j);
+                    tracing::warn!(
+                        "could not verify chain id of {} at startup ({e:#}) - leaving it in the pool",
+                        redact_url(url)
+                    )
+                }
+                Err(_) => {
+                    self.mark_unhealthy(j);
+                    tracing::warn!(
+                        "chain id check for {} timed out after {}s - leaving it in the pool",
+                        redact_url(url),
+                        VERIFY_TIMEOUT.as_secs()
+                    )
+                }
             }
         }
         Ok(())
@@ -3240,6 +3252,60 @@ mod tests {
              that time is paid before a single block is indexed"
         );
         h.abort();
+    }
+
+    /// Accepts connections and never answers, the shape of mainnet.gateway.tenderly.co on 2026-10-05.
+    async fn silent_rpc() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// #1885: an endpoint that never answered `eth_chainId` cost startup the verify deadline, then the
+    /// client's whole 20 s timeout on the first real call, because it was left healthy.
+    #[tokio::test]
+    async fn a_silent_endpoint_costs_startup_at_most_its_short_budget() {
+        let (silent, hs) = silent_rpc().await;
+        let (good, hg) = fake_rpc(1).await;
+        let c = RpcClient::new(vec![silent, good]).unwrap();
+
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            c.verify_chain_ids(1).await?;
+            c.block_number().await
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(r.expect("startup hung").unwrap(), HEALTHY_TIP);
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "a silent endpoint held startup for {elapsed:?}"
+        );
+        assert!(
+            c.endpoint_order().contains(&0),
+            "a silent endpoint is unverified, not dropped"
+        );
+        hs.abort();
+        hg.abort();
+    }
+
+    /// The shorter budget must not wave through a wrong-chain endpoint that answers in time.
+    #[tokio::test]
+    async fn a_wrong_chain_endpoint_beside_a_silent_one_is_still_rejected() {
+        let (silent, hs) = silent_rpc().await;
+        let (wrong, hw) = fake_rpc(8453).await;
+        let c = RpcClient::new(vec![silent, wrong]).unwrap();
+        let err = c.verify_chain_ids(1).await.unwrap_err();
+        assert!(format!("{err:#}").contains("8453"), "{err:#}");
+        hs.abort();
+        hw.abort();
     }
 
     /// Offline is not the same as wrong. Nuthatch tolerates an endpoint being down at startup (the
