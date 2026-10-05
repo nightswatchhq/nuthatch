@@ -50,7 +50,7 @@ chain, no telemetry, no account. The built-in MCP server lets Claude or any MCP 
 
 - **No authoring.** `init 0xAddr` resolves the ABI (Sourcify, then Etherscan), generates the schema and
   decoders, and scaffolds the project. You write nothing.
-- **No infra.** A single static Rust binary. Embedded mode needs no Postgres, no Docker, no IPFS.
+- **No infra.** A single Rust binary. Embedded mode needs no Postgres, no Docker, no IPFS.
 - **It's just SQL.** Your contract's events become per-event tables you query with real analytical SQL -
   the live tip *and* sealed history, one surface.
 - **It's yours, and it's small.** ≤2 GB RAM for single-chain tip-following, CI-enforced. No telemetry, no
@@ -377,18 +377,32 @@ arithmetic that refuses rather than wraps. The reasons and the log of the switch
 ## How it works (the 30-second version)
 
 ```
-RPC ingestion  →  deterministic decode  →  redb hot store (tip)
+RPC ingestion  →  deterministic decode  →  redb hot store (the unsealed tip)
                                                             │
                                         past finality  →  content-addressed Parquet segments
                                                             │
-                                        Burrmill reads segments read-only   →  SQL (hot ∪ cold)
+                                        Burrmill reads segments read-only   →  SQL (hot ∪ sealed)
 ```
 
-- **Deterministic core.** Decode, reorg handling, and entity derivation are deterministic and
-  re-executable - same inputs, same content-addressed output. No LLM ever sits in the data path.
-- **Reorg-safe by construction.** Reorgs only ever touch the mutable hot store; sealed segments are
-  strictly past finality and immutable.
-- **Single writer.** One ingestion thread writes; queries only ever attach read-only.
+- **One cursor per chain.** It follows the tip over `eth_getLogs`, decodes each window into the hot
+  store, and seals a segment once its blocks are past the chain's finality (a depth of 64 on mainnet;
+  a tag or a depth per chain). Reorgs only ever touch the hot store; a sealed segment is never
+  rewritten.
+- **Deterministic core.** Decode, reorg handling and entity derivation are deterministic and
+  re-executable: same inputs, same content-addressed output. No LLM sits in the data path.
+- **Single writer, read-only queries.** One ingestion thread writes; `/sql` attaches read-only.
+  Analytical SQL has run on [Burrmill](https://github.com/nightswatchhq/burrmill), our engine on
+  DataFusion, since 4.1.0; DuckDB was the engine before that and is no longer in the binary.
+- **Derived tables are circuits.** The three built-in relations and any entity declared in
+  `entities.toml` are maintained by DBSP as blocks arrive; a reorg is a retraction. On Arbitrum,
+  `[extract] l1_blocks = true` adds a table of each block's L1 block number (4.6.0).
+- **History travels.** `publish` mirrors a nest's sealed segments to a bucket and `seed` starts a nest
+  from one instead of backfilling (4.9.0); a public mirror of four Graph Protocol nests is at
+  [nuthatch-indexer.com/mirror](https://nuthatch-indexer.com/mirror).
+- **A release is gated before it reaches production.** The candidate serves a copy of a production
+  nest under its production budget, answers the statements that nest actually receives, and every
+  answer is compared with production's ([docs/release-gate.md](docs/release-gate.md)). It exists
+  because 4.1.1 passed CI and refused the dashboard's views within minutes of deployment.
 
 ---
 
@@ -525,6 +539,12 @@ who need more - none of it in the way of the happy path:
   mirrored until they do; on a nest whose chain has gone quiet, `publish finalise` lets them go.
   Reading it needs no nuthatch: DuckDB, Trino or anything that reads Parquet, as
   [Reading a published nest](docs/reading-published-nest.md) describes.
+- **Start a nest from a mirror** (4.9.0). `nuthatch seed --from <mirror> --dir <nest>` fills a nest
+  that has not indexed from a path, an `s3://` prefix or a public bucket's `https://` address,
+  checking every file against the mirror's catalogue, and the next `dev` follows the chain from the
+  block after the mirror ends. The hashes show each file is the one the catalogue names, not that
+  the catalogue is true to the chain: seed from an operator you would trust to run the nest. Four
+  Graph Protocol nests are published at [nuthatch-indexer.com/mirror](https://nuthatch-indexer.com/mirror).
 - **Safe upgrades - no resync tax** (RFC-0020, RFC-0033). Updating a nest is not a subgraph-style
   genesis resync, and in 2.0 it needs no command to remember. The **runtime** classifies the update
   when a nest's identity changes: *compatible* (additive only) is applied, *breaking* (a
@@ -561,9 +581,16 @@ layer; nuthatch ships the *guards* (query timeout, row cap, result-byte cap, con
 filesystem-access denylist on `/sql`) and *signals* (`/metrics`) that make fronting it safe. It binds `127.0.0.1` by
 default; `--listen` elsewhere and put a gateway in front. See [`docs/operators.md`](docs/operators.md).
 
-- **Footprint:** ≤2 GB RAM per active-chain cursor, single static binary, graceful SIGTERM shutdown with
-  checkpointed resume.
+- **Footprint:** ≤2 GB RAM per active-chain cursor, one binary, graceful SIGTERM shutdown with
+  checkpointed resume. The startup check counts the engine's memory pool, the ingestion reservation
+  and a headroom against `NUTHATCH_MAX_RSS` and refuses a configuration that does not fit, naming
+  the largest value that would; since 4.10.0 an operator can set the headroom and the reservation
+  from measurements (`NUTHATCH_RUNTIME_HEADROOM`, `NUTHATCH_INGESTION_RESERVATION`;
+  [capacity and sizing](docs/operators.md#capacity-and-sizing)).
 - **Durability:** content-addressed segments are safe to copy while running; back up the nest directory.
+- **Before you roll a release:** the [release gate](docs/release-gate.md) runs the candidate against
+  a copy of a production nest with the statements it serves and compares every answer with
+  production's. The same discipline applies to your own nest: compare answers, not just status.
 - **`dev` is the serve command** - it backfills, follows the tip, and serves in one process.
   Copy-paste **systemd** and **Docker** recipes are in [`docs/operators.md`](docs/operators.md#deploy-recipes).
 - **Outgrown one machine?** [Scaled mode](docs/operators.md#scaled-mode-a-fleet-across-machines-rfc-0022)
