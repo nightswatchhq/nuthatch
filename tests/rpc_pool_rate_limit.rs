@@ -155,3 +155,30 @@ async fn a_pool_that_is_all_429_waits_as_long_as_it_was_asked() {
         "{calls} calls in 2.5s asked the endpoints {a} and {b} times"
     );
 }
+
+/// Without a `Retry-After` the rest is the ordinary cooldown, so a pool that is all 429 is asked once
+/// and then not again for the window measured here, however often it is called.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pool_that_is_all_429_without_a_hint_is_not_asked_again_at_once() {
+    let (a, b) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let pool = RpcClient::new(vec![
+        throttled(a.clone(), None).await,
+        throttled(b.clone(), None).await,
+    ])
+    .unwrap();
+
+    let calls = AtomicUsize::new(0);
+    let _ = tokio::time::timeout(Duration::from_millis(2_500), async {
+        loop {
+            assert!(pool.block_number().await.is_err());
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+    })
+    .await;
+    let (a, b) = (a.load(Ordering::SeqCst), b.load(Ordering::SeqCst));
+    assert!(
+        a <= 2 && b <= 2,
+        "{} calls in 2.5s asked the endpoints {a} and {b} times",
+        calls.load(Ordering::SeqCst)
+    );
+}

@@ -7,7 +7,7 @@ pub use nuthatch_decode::rpc::Log;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// How many times a whole `block_timestamps` batch is retried before it's returned as an error rather
@@ -768,12 +768,9 @@ pub struct RpcClient {
     /// (`0` = healthy). Set on a failed call, cleared on a successful one. Endpoints past their cooldown
     /// are tried first; still-unhealthy ones are the fallback of last resort (soonest-to-recover first).
     health: Vec<AtomicU64>,
-    /// Millis-since-epoch until which an endpoint that answered 429 with a retry hint is not asked at
-    /// all (#1853). `0` = no hint in force.
+    /// Millis-since-epoch until which an endpoint that answered 429 is not asked at all, not even as
+    /// the last resort a cooling endpoint otherwise is (#1853). `0` = not resting.
     limited: Vec<AtomicU64>,
-    /// The endpoint's cooldown is for a 429, so it is asked only when no other endpoint is left, not
-    /// as the last resort after a healthy one fails (#1853).
-    throttled: Vec<AtomicBool>,
     /// The highest block each endpoint has reported from `eth_blockNumber`, so a lower bound on its
     /// head. Pool members' heads differ by a block or two, and one behind refuses a `toBlock` it lacks.
     heads: Vec<AtomicU64>,
@@ -810,7 +807,6 @@ impl RpcClient {
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         let heads = urls.iter().map(|_| AtomicU64::new(0)).collect();
         let limited = urls.iter().map(|_| AtomicU64::new(0)).collect();
-        let throttled = urls.iter().map(|_| AtomicBool::new(false)).collect();
         Ok(Self {
             http,
             urls,
@@ -818,7 +814,6 @@ impl RpcClient {
             primaries: n,
             health,
             limited,
-            throttled,
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
@@ -890,7 +885,6 @@ impl RpcClient {
         let now = now_millis();
         let mut healthy = Vec::with_capacity(n);
         let mut cooling = Vec::with_capacity(n);
-        let mut throttled = Vec::new();
         for i in 0..n {
             let j = if i < p { (start + i) % p } else { i };
             if self.limited[j].load(Ordering::Relaxed) > now {
@@ -899,37 +893,28 @@ impl RpcClient {
             let until = self.health[j].load(Ordering::Relaxed);
             if until <= now {
                 healthy.push(j);
-            } else if self.throttled[j].load(Ordering::Relaxed) {
-                throttled.push((until, j));
             } else {
                 cooling.push((until, j));
             }
         }
         cooling.sort_by_key(|(until, _)| *until);
-        throttled.sort_by_key(|(until, _)| *until);
-        let order: Vec<usize> = healthy
+        healthy
             .into_iter()
             .chain(cooling.into_iter().map(|(_, j)| j))
-            .collect();
-        if order.is_empty() {
-            return throttled.into_iter().map(|(_, j)| j).collect();
-        }
-        order
+            .collect()
     }
 
     fn mark_healthy(&self, j: usize) {
         self.health[j].store(0, Ordering::Relaxed);
     }
 
-    /// A 429 cools the endpoint like any failure. One that said when to come back is not asked again
-    /// before then, within [`clamp_retry_hint`]'s cap; without a hint the caller's pacing stands.
+    /// A 429 rests the endpoint for as long as it asked, within [`clamp_retry_hint`]'s cap, or for
+    /// the ordinary cooldown when it did not say.
     fn mark_rate_limited(&self, j: usize, retry_after: Option<Duration>) {
         self.mark_unhealthy(j);
-        self.throttled[j].store(true, Ordering::Relaxed);
-        let Some(hint) = retry_after else {
-            return;
-        };
-        let rest = clamp_retry_hint(hint, Duration::ZERO);
+        let rest = retry_after.map_or(Duration::from_millis(ENDPOINT_COOLDOWN_MS), |hint| {
+            clamp_retry_hint(hint, Duration::ZERO)
+        });
         self.limited[j].store(now_millis() + rest.as_millis() as u64, Ordering::Relaxed);
         tracing::debug!(
             "rpc {} rate-limited us; not asking it again for {rest:?}",
@@ -952,9 +937,9 @@ impl RpcClient {
         })
     }
 
-    /// Every endpoint is resting on a retry hint: wait for the soonest, then try them soonest first.
-    /// A rest is clamped to [`MAX_RETRY_HINT`] when set, so a throttled pool slows the run and never
-    /// spins, nor stops.
+    /// Every endpoint is resting after a 429: wait for the soonest, then try them soonest first. A
+    /// rest is at most [`ENDPOINT_COOLDOWN_MS`], so a throttled pool slows the run and never spins,
+    /// nor stops.
     async fn wait_out_rate_limits(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.urls.len()).collect();
         order.sort_by_key(|&j| self.limited[j].load(Ordering::Relaxed));
@@ -993,7 +978,6 @@ impl RpcClient {
     /// Route a failed call to the right cooldown, per its classification. An unclassified error
     /// (nothing downcasts) is treated as transient, which is the pre-RFC-0028 behaviour.
     fn record_failure(&self, j: usize, method: &str, err: &anyhow::Error) {
-        self.throttled[j].store(false, Ordering::Relaxed);
         match class_of(err) {
             Some(FailureClass::Terminal) => self.mark_terminal(j, method, &err.to_string()),
             Some(FailureClass::RateLimited { retry_after }) => {
@@ -2793,7 +2777,12 @@ mod tests {
         let (url, seen) = serve(true).await;
         let mut c = RpcClient::new(vec![url]).unwrap();
         c.header_width = 10;
-        assert!(c.block_timestamps(&[1, 2, 3, 4]).await.is_err());
+        // Recorded rather than slept: the endpoint rests a full cooldown after each 429 (#1853).
+        super::RETRY_PAUSES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                assert!(c.block_timestamps(&[1, 2, 3, 4]).await.is_err());
+            })
+            .await;
         let sent = seen.lock().unwrap().clone();
         assert!(
             sent.iter().all(|&n| n == 4),
@@ -4171,7 +4160,19 @@ mod rfc0036_tests {
                 expected.push(Duration::from_millis(250 * round));
             }
         }
-        assert_eq!(without_hint, expected);
+        // Without a hint the endpoint rests for the cooldown (#1853), so before each of the 31 later
+        // requests the client waits out what the retry loop's own pause left of it.
+        let (rests, own): (Vec<Duration>, Vec<Duration>) = without_hint
+            .into_iter()
+            .partition(|p| *p > Duration::from_secs(2));
+        assert_eq!(own, expected);
+        assert_eq!(rests.len(), 31, "{rests:?}");
+        assert!(
+            rests
+                .iter()
+                .all(|r| *r <= Duration::from_millis(ENDPOINT_COOLDOWN_MS)),
+            "{rests:?}"
+        );
     }
 
     /// A rate limit that carries no hint stays `None`, so the caller keeps its own pacing. This is
