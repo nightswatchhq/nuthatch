@@ -1350,7 +1350,9 @@ publishing nest's target, lag and last success.
 not indexed with a mirror's history, so it never backfills over RPC. `<mirror>` is what `publish sync`
 was given as `--target`: a path, `s3://bucket/prefix`, or the `https://` address of a public bucket.
 The nest directory must be the one that was published, unedited, because the dataset is found by its
-data identity. Every file is checked against its hash, a second run resumes a failed one, and the
+data identity. A file one side holds and the other lacks moves that identity, and so does a
+`schema.json` written by a different release, so publish from a clean checkout and commit
+`schema.json`. Every file is checked against its hash, a second run resumes a failed one, and the
 next `dev` follows the chain from the block after the mirror ends.
 Seeding needs more than the reader's mirror holds: the provisional tails, and the block the
 publisher's history begins at. Both are in a seed snapshot under `<dataset>/_seed/`, written by a

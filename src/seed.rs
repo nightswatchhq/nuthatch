@@ -45,9 +45,12 @@ pub async fn seed(dir: &Path, from: &str) -> Result<SeedReport> {
     }
     let db = dir.join(crate::config::DB_FILE);
     refuse_an_indexed_nest(&db)?;
-    // `schema.json` is part of the data identity, and `dev` writes a missing one on every start, so
-    // the publisher's identity always includes it. A fresh checkout has to be brought level first.
-    crate::project::refresh_stale_artifacts(dir, &config)?;
+    // `schema.json` is part of the data identity, and `dev` writes a missing one at its first start,
+    // so the publisher's identity includes it. Only a missing one: regenerating a present file with
+    // this binary would move the identity away from a publisher whose release wrote it differently.
+    if !dir.join("schema.json").exists() {
+        crate::project::refresh_stale_artifacts(dir, &config)?;
+    }
 
     let (dataset, _, _, chain_id) = publish::identity_of(dir)?;
     let mirror = publish::open_mirror(from)?;
@@ -130,7 +133,8 @@ async fn read_snapshot(mirror: &dyn Mirror, dataset: &str) -> Result<(SeedEnvelo
             {
                 bail!(
                     "the mirror holds no dataset {dataset}. Its name is this nest's data identity, \
-                     so either nothing was published there or the nest differs from the one that was."
+                     so either nothing was published there or this directory differs from the publisher's: \
+                     an edit, a stray file, or a schema.json written by another release."
                 );
             }
             bail!(
