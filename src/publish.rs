@@ -841,6 +841,12 @@ pub async fn sync_with(
     }
 
     if let Some(m) = metrics {
+        m.set_publish_lag_blocks(
+            missing
+                .iter()
+                .map(|(_, s)| s.to_block - s.from_block + 1)
+                .sum(),
+        );
         m.set_publish_pending(missing.len() as u64);
     }
     let mirror_ref = mirror.as_ref();
@@ -2131,6 +2137,30 @@ abi = "abis/usdc.json"
         verify(nest.path(), target, false, false).await.unwrap();
         let second = sync(nest.path(), target, false).await.unwrap();
         assert_eq!(second.uploaded, vec!["publish.json".to_string()]);
+    }
+
+    /// #1927: a quiet nest's provisional tail never folds, so its watermark sits far past its last
+    /// final segment. That gap is not work the publisher owes: the gauge counts the blocks of the final
+    /// segments the mirror lacks, and reads 0 once every one is there.
+    #[tokio::test]
+    async fn lag_is_zero_when_every_final_segment_is_published() {
+        let nest = nest_with_a_provisional_tail();
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap();
+        let m = crate::metrics::METRICS.nest("publish-lag-quiet");
+        m.set_publish_enabled(target);
+        m.set_sealed_through(1_000);
+        let report = sync_with(nest.path(), target, false, 1, Some(m.as_ref()))
+            .await
+            .unwrap();
+        assert_eq!(
+            m.publish_lag_blocks(),
+            2,
+            "the final segment, until the mirror holds it"
+        );
+        m.publish_succeeded(report.sealed_through);
+        assert_eq!(report.sealed_through, Some(2));
+        assert_eq!(m.publish_lag_blocks(), 0, "nothing final is unpublished");
     }
 
     #[tokio::test]
