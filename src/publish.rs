@@ -819,9 +819,6 @@ pub async fn sync_with(
 
     let remote_bytes = mirror.get(&prefix(MANIFEST_FILE)).await?;
     let want = want_entries(&local);
-    if let Some(m) = metrics {
-        m.set_publish_local_through(want.iter().map(|(_, s)| s.to_block).max());
-    }
     let (missing, skipped) = missing_entries(
         mirror.as_ref(),
         &data_identity,
@@ -844,6 +841,12 @@ pub async fn sync_with(
     }
 
     if let Some(m) = metrics {
+        m.set_publish_lag_blocks(
+            missing
+                .iter()
+                .map(|(_, s)| s.to_block - s.from_block + 1)
+                .sum(),
+        );
         m.set_publish_pending(missing.len() as u64);
     }
     let mirror_ref = mirror.as_ref();
@@ -2137,8 +2140,8 @@ abi = "abis/usdc.json"
     }
 
     /// #1927: a quiet nest's provisional tail never folds, so its watermark sits far past its last
-    /// final segment. That gap is not work the publisher owes; the metric must read 0 once every final
-    /// segment is in the mirror.
+    /// final segment. That gap is not work the publisher owes: the gauge counts the blocks of the final
+    /// segments the mirror lacks, and reads 0 once every one is there.
     #[tokio::test]
     async fn lag_is_zero_when_every_final_segment_is_published() {
         let nest = nest_with_a_provisional_tail();
