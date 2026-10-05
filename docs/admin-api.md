@@ -65,12 +65,13 @@ roster.
 A mount can take minutes when it fetches, so it answers `202` at once with a job:
 
 ```json
-{"name": "usdc", "nid": "9f2c…", "phase": "accepted", "since_unixtime": 1790700000}
+{"name": "usdc", "nid": "9f2c…", "phase": "accepted", "since_unixtime": 1790700000, "generation": 1}
 ```
 
-`phase` moves through `accepted`, `fetching` (only when the registry is needed), `joining` (catching up
-beside the cursor before it joins), and ends at `live` or `failed`, with a `reason` on a failure. A
-suspended mount reads `suspended`. Poll
+`generation` is the claim this job holds on the name, from a counter the runtime never reuses, so a
+job that was forgotten cannot mount over a later one. `phase` moves through `accepted`, `fetching`
+(only when the registry is needed), `joining` (catching up beside the cursor before it joins), and
+ends at `live` or `failed`, with a `reason` on a failure. A suspended mount reads `suspended`. Poll
 `GET /_admin/mounts/<name>`; reading it never waits on a mount in progress. Unfinished jobs survive a
 restart and resume; failed ones stay readable until the name is mounted again or unmounted.
 
@@ -132,8 +133,9 @@ quarantined mount is its explicit release.
 ### Moving a name
 
 `POST /_admin/move/<name>` mounts the new NID beside the old one, catches it up, then switches the
-name's routes in one step. A reader polling `/<name>/` sees the old nest, then the new, and never an
-error between. The old nest is then taken off its cursor. A move keeps its chain.
+name's routes in one step. Its job carries `"is_move": true`. A reader polling `/<name>/` sees the
+old nest, then the new, and never an error between. The old nest is then taken off its cursor. A
+move keeps its chain.
 
 ### Reclaiming disk
 
