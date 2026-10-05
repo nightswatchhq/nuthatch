@@ -132,7 +132,8 @@ async fn bring_up(
         None,
         false,
         1,
-        Some(2),
+        // One window over the backfill, so a padded block is fetched once, not again as a tail.
+        Some(TIP),
         false,
         None,
         health.clone(),
