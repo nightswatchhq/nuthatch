@@ -81,7 +81,8 @@ Startup moves a per-dataset file that is missing, unreadable, or hash-mismatched
         "to_block": 100,
         "rows": 20000,
         "file": "usdc__transfer-ab….parquet",
-        "writer_profile": "zstd-bloom-v1"
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "ab…"
       }
     ]
   }
@@ -101,15 +102,16 @@ Per segment, today:
 | `rows` | yes | row count in the file |
 | `file` | yes | `{table}-{hash}.parquet` |
 | `registry_snapshot` | no | factory-discovered child-set hash at seal time; absent on a static nest and on pre-RFC-0009 manifests |
-| `provisional` | no | `true` when this table had fewer than 1,000 rows at the cut and the next seal will fold it; omitted when `false`, which is every segment sealed before this existed |
+| `provisional` | no | `true` when this table had fewer than 1,000 rows, and under 16 MiB of row JSON, at the cut and the next seal will fold it; omitted when `false`, which is every segment sealed before this existed |
 | `writer_profile` | no | the writer settings the file was produced with. Absent means `"snappy"`, **not** unknown: every segment sealed before the field existed was that profile |
+| `input_hash` | no | sha256 of the Parquet this seal was given, before a fold rewrote the file (#1631); equal to `hash` when nothing was folded. Absent on segments sealed before 4.1.1 |
 
 Two named writer profiles exist:
 
 | profile | compression | blooms | dictionary | sort metadata |
 | --- | --- | --- | --- | --- |
 | `snappy` | SNAPPY | none | crate default (on) | none |
-| `zstd-bloom-v1` | ZSTD level 3 | address, topic and hash columns | off on near-unique 32-byte hashes | rows sorted by `(block_number, log_index)` |
+| `zstd-bloom-v1` | ZSTD level 3 | address, topic and hash columns (`address`, `from`, `to`, `owner`, `spender`, `topic0`, `*_hash`, `*_address`) | off on near-unique 32-byte hashes | rows sorted by `(block_number, log_index)` |
 
 A reader that only decodes Parquet needs neither: the footer describes the file, and both profiles
 are ordinary Parquet. The name is there so a reader can tell the two apart **without** opening the
@@ -137,8 +139,10 @@ The order a reader who wants block order must impose, and the one `read_table_ro
 (from_block, to_block, hash)
 ```
 
-Content address breaks ties inside a range, so a re-seal cannot reorder rows. Within one file,
-rows are in ingest order for that seal.
+Content address breaks ties inside a range, so a re-seal cannot reorder rows. Within one
+`zstd-bloom-v1` file, rows are sorted by `(block_number, log_index)`, ties broken by the row's
+canonical JSON (`src/seal.rs::sort_rows_for_seal`); a `snappy` file holds its rows in ingest order
+for that seal.
 
 nuthatch's views union the files in **catalogue order** and do not sort. `ORDER BY
 block_number, log_index` if you need a sequence; do not assume the scan comes back in chain
@@ -193,10 +197,11 @@ TRY_CAST("c" AS DECIMAL(38,0)) AS "c_dec",
 ```
 
 `c_dec` is the value as `DECIMAL(38,0)` when it fits, else NULL. `c_overflow` is true when the
-exact text is present and that cast is NULL. On nuthatch's own `/sql`, `SUM`, `MIN` or `MAX` of
-`c_dec` is refused when a value under it did not fit, rather than answered from the ones that
-did; an external reader that re-derives the column gets the sum of what fits unless it checks
-`c_overflow`. `SUM(c)` is the footgun (it concatenates text, or fails, depending on the engine). Values with
+exact text is present and that cast is NULL. On nuthatch's own `/sql`, `MIN` or `MAX` of `c_dec`
+is refused when a value under it did not fit, rather than answered from the ones that did;
+`SUM` and `AVG` of `c_dec` are the values that fit (#1664), exactly as an external reader that
+re-derives the column gets them, so check `c_overflow` before trusting either. `SUM(c)` is the
+footgun (it concatenates text, or fails, depending on the engine). Values with
 more than 38 digits (a Uniswap `sqrtPriceX96` can) stay exact in `c` and flag on `c_overflow`.
 
 These columns are **never written to Parquet**. An external reader of the raw files does not
@@ -217,7 +222,8 @@ The conversion, per engine:
 
 Another engine is listed here once its recipe has been run, not before (RFC-0052 S5).
 
-Overflow is concentrated, not general. Measured on the Arbitrum Network corpus (RFC-0061):
+Overflow is concentrated, not general. Measured on the Arbitrum Network corpus for RFC-0061
+(2026-09-21):
 
 - **Approvals:** 46.9% of `graph_token__approval.value` has more than 38 digits, most of it the
   unlimited-allowance sentinel `2^256 − 1`.
@@ -226,7 +232,8 @@ Overflow is concentrated, not general. Measured on the Arbitrum Network corpus (
 Amounts fit `DECIMAL(38,0)`; `c_overflow` mostly marks the sentinel.
 
 The physical type stays text. RFC-0061 records why: `DECIMAL(76,0)` cannot hold every 256-bit
-value, and DuckDB reads it as `DOUBLE`. `FIXED_LEN_BYTE_ARRAY(32)` reads as an opaque blob.
+value, and DuckDB, the engine at the time, read it as `DOUBLE`. `FIXED_LEN_BYTE_ARRAY(32)` reads
+as an opaque blob.
 
 The query-side gate is `bigint_columns_get_decimal_and_overflow_views` in `src/analytics.rs`.
 
@@ -287,10 +294,12 @@ That is the migration path. Reading `src/seal.rs` to reconstruct it is not.
 
 ## Writer footer, for orientation
 
-`write_parquet` sets SNAPPY and nothing else. A 2026-08-29 footer read of production segments
-is in [segment-layout.md](bench/segment-layout.md): column statistics on every column, no Bloom
-filters, one row group per file, `parquet-rs` 58.3.0. Those measurements are not a second
-schema. Changing them is a writer-config decision and is not implied by this page.
+`write_parquet` writes the `zstd-bloom-v1` profile above and nothing more. A footer read of a
+4.10.1 segment (2026-10-05): ZSTD on every column, Bloom filters on the columns the profile names,
+column statistics on every column, one row group per file, `parquet-rs` 58.3.0. A 2026-08-29 footer
+read of production `snappy` segments is in [segment-layout.md](bench/segment-layout.md). Those
+measurements are not a second schema. Changing them is a writer-config decision and is not implied
+by this page.
 
 ## What this page does not cover
 
