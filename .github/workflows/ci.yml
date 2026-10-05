@@ -266,21 +266,21 @@ jobs:
   # No toolchain and no rust-cache: the shards run prebuilt binaries and never compile. The archive
   # extracts over the checkout at the path it was built at (see .github/actions/nextest-shard).
   test-default:
-    name: test (default, ${{ matrix.shard }}/3)
+    name: test (default, ${{ matrix.shard }}/2)
     needs: check-default
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/nextest-shard
         with:
           archive: nextest-default
           shard: ${{ matrix.shard }}
-          of: 3
+          of: 2
           name: default-${{ matrix.shard }}
 
   check-exex:
@@ -340,21 +340,21 @@ jobs:
           echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
 
   test-exex:
-    name: test (exex, ${{ matrix.shard }}/3)
+    name: test (exex, ${{ matrix.shard }}/2)
     needs: check-exex
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/nextest-shard
         with:
           archive: nextest-exex
           shard: ${{ matrix.shard }}
-          of: 3
+          of: 2
           name: exex-${{ matrix.shard }}
 
   check-counter:
