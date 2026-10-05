@@ -51,8 +51,10 @@ pub async fn init(args: InitArgs) -> Result<()> {
     // persisted config. Otherwise use the chain defaults.
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, chain.rpc_urls.iter().map(|s| s.to_string()));
 
-    // One RPC client for best-effort deployment-block detection.
+    // One RPC client for best-effort deployment-block detection. Verified first, which cools an
+    // endpoint that does not answer before its 20 s timeout lands on the tip lookup.
     let rpc = RpcClient::new(rpc_urls.clone())?;
+    rpc.verify_chain_ids(chain.chain_id).await?;
     let tip = rpc.block_number().await.ok();
 
     let overrides = resolve_abi_overrides(&args.abi, addresses.len())?;
@@ -2721,13 +2723,14 @@ abi = "abis/tok.json"
         (format!("http://{addr}"), handle)
     }
 
-    /// Answers `eth_blockNumber` with 0x10 and `eth_getCode` with `code`.
+    /// Mainnet at block 0x10, answering `eth_getCode` with `code`.
     async fn fake_code_rpc(code: &'static str) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{extract::State, routing::post, Json, Router};
         use serde_json::{json, Value};
 
         async fn handler(State(code): State<&'static str>, Json(req): Json<Value>) -> Json<Value> {
             let result = match req["method"].as_str() {
+                Some("eth_chainId") => json!("0x1"),
                 Some("eth_blockNumber") => json!("0x10"),
                 Some("eth_getCode") => json!(code),
                 _ => Value::Null,
@@ -2801,6 +2804,43 @@ abi = "abis/tok.json"
         for h in [hs, hc, he] {
             h.abort();
         }
+    }
+
+    /// #1885: after detection, `init` built a fresh pool and paid the silent endpoint's 20 s again.
+    #[tokio::test]
+    async fn a_silent_endpoint_costs_init_at_most_its_short_budget() {
+        let (silent, hs) = silent_rpc().await;
+        let (good, hg) = fake_code_rpc("0x6080").await;
+        let dir = tempfile::tempdir().unwrap();
+        let abi = dir.path().join("pool.json");
+        std::fs::write(&abi, POOL_ABI).unwrap();
+        let args = InitArgs {
+            explorer: None,
+            addresses: vec!["0x00000000000000000000000000000000000000aa".into()],
+            from: None,
+            from_subgraph: None,
+            ipfs: vec![],
+            alias: vec!["pool".into()],
+            abi: vec![abi.to_string_lossy().into_owned()],
+            start_block: vec!["1".into()],
+            chain: Some("mainnet".into()),
+            rpc: vec![silent, good],
+            dir: dir.path().join("nest").to_string_lossy().into_owned(),
+            no_timestamps: false,
+        };
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(90), init(args))
+            .await
+            .expect("init hung")
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a silent endpoint held init for {elapsed:?}"
+        );
+        hs.abort();
+        hg.abort();
     }
 
     const BSC_MANIFEST: &str = r#"
