@@ -77,6 +77,9 @@ run with a 0 ms sleep:
 | +20 ms before the commit | 38, 38, 39 ms | 42, 43, 43 ms | 509-600 ms |
 | +50 ms before the commit | 66, 67, 68 ms | 71, 74, 71 ms | 561-615 ms |
 
+Of those cells, the runner's 4.7.0 after-seen p50 of 17 ms is the committed artifact; the other
+batches and the throwaway builds are recorded on #1884 and have no `docs/bench` file.
+
 The after-seen median sees a 20 ms delay with no overlap on either machine, so it carries the
 ceiling, set at 30 ms between the runner's 19 and 38. The lag median moves about 100 ms between runs
 on where the block lands in the poll interval, more than a 50 ms delay moves it, so it is tracked
@@ -171,7 +174,7 @@ fixed-window arm, reproducing that artifact takes `--seal-direct --window-adapti
 
 | Path | Range | Events | Wall-clock | events/sec | RPC requests |
 |---|---|---|---|---|---|
-| hot store (decode → redb) | USDC, blocks 25,809,368–25,809,487 (public RPC) | 11,758 | 4.11 s | **2,860** | 34 |
+| hot store (decode → redb) | USDC, blocks 25,809,368 to 25,809,487 (public RPC) | 11,758 | 4.11 s | **2,860** | 34 |
 | seal-direct (decode → Parquet) | same | 11,758 | 4.46 s | **2,634** | 34 |
 
 **No speedup measured today - if anything ~8% slower (0.92×).** That contradicts both this page's own
@@ -246,7 +249,7 @@ only, so 11,758 is the right count for *this* table; 12,933, reported by this PR
 commit and separately by Iris's independent replication, is the count of every log at the contract
 address, which is what an `init`-scaffolded nest declares (every event in the ABI) over the same
 range. Verified directly against `eth_getLogs` with no nuthatch binary involved, blocks
-25,809,368–25,809,487 in four 30-block chunks summed, on two independent providers (`eth.drpc.org`,
+25,809,368 to 25,809,487 in four 30-block chunks summed, on two independent providers (`eth.drpc.org`,
 `eth.api.onfinality.io/public`) that agree exactly: every log at `0xa0b8…eB48` = 12,933;
 `topics[0] = Transfer` = 11,758; `Approval` = 1,046; everything else = 129.
 11,758 + 1,046 + 129 = 12,933 exactly, with nothing left over. Two nests, two workloads, two correct
@@ -264,7 +267,7 @@ nest with `[[calls]]` will not reach these figures - `BenchReport.calls_declared
 would prove that from the artifact rather than the prose, but these two were measured at `6145386`,
 before #742 added it, so they predate `calls_declared: 0`. (#725 - every seal-direct path hardcoding
 an empty calls slice regardless of what the nest declared - is closed; `bench` now refuses a
-declared-`[[calls]]` nest run without `--state-rpc` outright, `src/bench.rs:220-233`. #743 closed the
+declared-`[[calls]]` nest run without `--state-rpc` outright, the `state_rpc` guard in `src/bench.rs`. #743 closed the
 same hole in the *hot* arm, which is this table's denominator: until then it took no `calls`
 parameter at all, so a calls nest would have paid tier-3 cost in the numerator and not in the
 denominator, and the ratio would have flattered seal-direct by exactly the work the hot arm skipped.
@@ -361,8 +364,8 @@ Reporting a number is not tracking it. CLAUDE.md says benchmark regressions fail
 `bench query` also takes limits, and exits non-zero when one is breached:
 
 ```sh
-nuthatch bench query --dir <nest> --reads 8004 \
-  --min-reads 256 --max-point-read-p50-us 8
+nuthatch bench query --dir <nest> --reads 200200 \
+  --min-reads 12800 --max-point-read-p50-us 8
 ```
 
 Pass none of them and the bench only reports, which is what an operator poking at their own nest
@@ -372,19 +375,20 @@ That is the command CI runs, and it deliberately sets no p99 ceiling - see below
 tracked rather than gated. `--max-point-read-p99-us` still exists for an operator who wants it.
 
 **Point-reads see the unsealed tip, not the backfill.** `get_entity` is a hot-store read, and rows
-past finality are sealed to Parquet and pruned out of redb - so of the fixture's 8,004 indexed rows
-only 256 (64 blocks x 4 logs) are still readable this way, which is what `--min-reads` is set against.
-The first version of this gate asserted `--min-reads 8004`, reasoned from the backfill size, and
-therefore failed every run.
+past finality are sealed to Parquet and pruned out of redb - so of the fixture's 200,200 indexed
+rows only 12,800 (64 blocks x 200 logs) are still readable this way, which is what `--min-reads` is
+set against. The first version of this gate, on the earlier 8,004-row fixture, asserted
+`--min-reads 8004`, reasoned from the backfill size, and therefore failed every run.
 
 **Always pass `--min-reads` alongside a ceiling.** A nest with nothing indexed samples no keys and
 reports `p50 = 0µs`, and zero is under every ceiling anyone would ever write - so a gate without a
 floor is greenest exactly when it has measured nothing. The `footprint` check learned the same lesson
 and asserts its row count before it compares a peak.
 
-CI runs this as the **`point-read latency`** job (`.github/workflows/point-read.sh`), on the same
-hermetic fixture the `footprint` job uses: `footprint-rpc.py` serves the chain, the nest is written
-inline, and every run indexes exactly 8,004 rows. No secret and no third party, so a fork's pull
+CI runs this as the **`point-read latency`** job (`.github/workflows/point-read.sh`), on the dense
+fixture the `per-cursor RAM budget` job uses (#424): `multinest-rpc.py` serves the chain, one contract
+with the 10-event Uniswap V4 ABI at 200 logs a block, the nest is written inline, and every run
+indexes exactly 200,200 rows across ten tables. No secret and no third party, so a fork's pull
 request can satisfy it, and a change in p99 is a change in nuthatch rather than in somebody's rate
 limiter. The report uploads as an artifact on every run, including a failing one.
 
@@ -399,6 +403,12 @@ the exact regression the gate claims to catch - gives, over the 256-row hot stor
 |---|---|---|---|
 | baseline, 3 CI runs | 0.59 - 0.82µs | 0.70 - 1.00µs | 0.77 - 3.96µs |
 | linear scan in place of the seek | 18.15µs | 34.45µs | 49.78µs |
+
+That table is the 256-hot-row fixture the gate first ran on. #424 re-pointed it at the dense
+fixture and measured the same mutation there on `ubuntu-latest`: the committed baseline
+`docs/bench/point-read.json` reads p50 0.94µs, p99 1.5µs over 12,800 hot rows, and the linear scan
+landed 87x above the 8µs ceiling where the 256-row fixture had put it at 1.8x (the figures are in
+the job's own comment in `ci.yml`, not in a committed `docs/bench` file).
 
 The first version of this gate used 200µs/2,000µs. The scan sits comfortably under both, so that gate
 reported `OK: within the point-read ceilings` **with a full scan in the read path** - a number, not a
@@ -439,9 +449,8 @@ floor on gross regressions, not a microbenchmark.
 ### The baseline is the runner's own artifact (issue #385)
 
 `docs/bench/point-read.json` is the `point-read latency` job's uploaded report, taken verbatim from a
-green run on `main` (commit `a53565a`, run
-[31511769517](https://github.com/nightswatchhq/nuthatch/actions/runs/31511769517), p50 0.78µs, p99
-0.93µs) and committed with nothing edited but a trailing newline. Its `hardware` field reads
+green run (commit `03d296b`, p50 0.94µs, p99 1.5µs, 12,800 hot rows across ten tables) and committed
+with nothing edited but a trailing newline. Its `hardware` field reads
 `4 cores, 16 GB RAM`, which is the machine the table above was measured on and the machine the 8µs
 ceiling is enforced on. **The committed baseline and the enforcing surface are now the same box.**
 
@@ -497,23 +506,25 @@ smaller band and a ceiling below the healthy enforced figure (#395).
 | | ceiling | what a breach means |
 |---|---|---|
 | `MAX_RSS_MB` | 2048 MB | the **budget** was broken. A product promise, not a tuning parameter. |
-| `REGRESSION_MB` | 466 MB | this scenario got materially more expensive. |
+| `REGRESSION_MB` | 602 MB | this scenario got materially more expensive. |
 
-Both halves of that 466 are measured **on the runner that enforces it**, which is the only place the
-margin is real:
+Both halves of that 602 are measured **on the runner that enforces it**, which is the only place the
+margin is real (the derivation sits beside the value in `ci.yml`):
 
 | | |
 |---|---|
-| runner baseline (#1067) | 372 MB (ceiling sits 1.25x above; CI run 33602467469) |
-| previous baseline (pre-batching) | 131 MB, ceiling 180 MB |
+| runner band (#1156) | 387 to 481 MB over seven sequential runs, median 429 (`rss-band.yml` run 33956127005, 2026-09-05); ceiling 481 x 1.25 + 1 |
+| previous (#1067) | 372 MB from a single run, ceiling 466 MB, which main then crossed at random |
+| before batching | 131 MB, ceiling 180 MB |
 
-#1067 is why it moved. The scenario is 12,010 rows per nest, below `SEAL_DIRECT_BATCH` (20,000), so
-the tip path now holds the whole 240,200 rows in the hot store instead of sealing each finality
-advance. The 2 GB budget still has 1.6 GB of margin. Re-derive with `scripts/multinest-rss-spread.sh`
-on the runner before moving it again.
+#1067 is why it first moved. The scenario is 12,010 rows per nest, below `SEAL_DIRECT_BATCH` (20,000),
+so the tip path now holds the whole 240,200 rows in the hot store instead of sealing each finality
+advance. The 2 GB budget still has 1.4 GB of margin. Re-run `rss-band.yml` on the runner before
+moving it again; `scripts/multinest-rss-spread.sh` is the same arithmetic by hand.
 
-The budget alone cannot be a regression gate. The scenario measures ~145 MB against 2048, so a change
-could cost ten times the memory and still pass. A gate that cannot fail is not coverage, so the
+The budget alone cannot be a regression gate. The scenario measured ~145 MB against 2048 when the
+ceiling was first set, and a few hundred since, so a change could cost several times the memory and
+still pass. A gate that cannot fail is not coverage, so the
 regression ceiling is set from the observed run-to-run spread and is the one that actually catches
 drift. They are nested and must not be reconciled into a single number.
 
@@ -547,12 +558,13 @@ the peak - so the peak is a backfill burst, not a steady-state cost. RSS tracks 
 and the per-window fan-out, not the size of history, because past finality the rows are sealed to
 Parquet and leave the heap.
 
-**The runtime's own projection is ~13x too pessimistic.** `estimate_nest_rss_mb` projected 1920 MB for
-this exact cursor (`120 + 20 × 90`) against a measured 143 MB, and it is a flat per-nest constant - it
-cannot see ABI size, table count, or event rate, so a ten-event nest is projected identically to a
-one-event one. Since a cursor whose *projected* RSS exceeds `max_rss_mb` is refused before it starts,
-admission control currently caps a cursor at ~22 nests on a model an order of magnitude out. Worth
-revisiting; not changed here, because loosening a refusal path wants more than one scenario behind it.
+**The runtime's own projection was ~13x too pessimistic at the time.** `estimate_nest_rss_mb`
+projected 1920 MB for this exact cursor (`120 + 20 × 90`) against a measured 143 MB, a flat per-nest
+constant that could not see ABI size, table count, or event rate, and since a cursor whose
+*projected* RSS exceeds `max_rss_mb` is refused before it starts, admission control capped a cursor
+at ~22 nests on a model an order of magnitude out. It has since been fitted to this artifact:
+`NEST_BASE_RSS_MB` is 5 MB per nest on a 120 MB base, a 5x margin over the ~1 MB per nest observed
+(`src/runtime.rs`); the view terms are still the conservative guesses.
 
 ### The fixture
 
