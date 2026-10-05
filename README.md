@@ -631,8 +631,10 @@ A major version is a promise about **stability**, not a claim of completeness.
   not break. Upgrade only: a downgrade is not promised. Off-by-default cargo features are
   experimental and not covered. The full terms are the
   [stability contract](docs/operators.md#stability-contract).
-- **Monthly minors, immediate fixes.** A released 4.x only gets patch releases. Features wait for the
-  next monthly minor (4.1, 4.2, ...); correctness and security fixes ship at once as patches.
+- **Minors add, patches fix.** A released 4.x only gets patch releases; features wait for the next
+  minor, and correctness and security fixes ship at once as patches. The cadence is whatever the
+  work needs: 4.1.0 to 4.10.1 shipped between 2026-10-02 and 2026-10-05, each with notes under
+  [`docs/releases/`](docs/releases/).
 - **Upgrades are a binary swap.** No data migration, no conversion step. Proven on a production box
   across 0.3.0 → 0.6.0 → 0.7.2 and at each major since, and in CI: every build opens a frozen
   v3.13.2 data directory and reads it back exactly (`tests/upgrade_golden.rs`).
@@ -643,8 +645,9 @@ A major version is a promise about **stability**, not a claim of completeness.
   is built and verified across real machines, but younger** - and until 0.9.3 its writer pool did not
   index at all. If one process per box is enough, that is still the shape to reach for.
 
-**What is deliberately not here:** a hosted service, a token, telemetry, non-EVM chains, or any
-deployment story beyond binary + compose. Those are not backlog items; they are out of scope.
+**What is deliberately not here:** a hosted service, a token, telemetry, non-EVM chains before EVM is
+airtight, or any deployment story beyond binary + compose. Those are not backlog items; they are out
+of scope.
 
 ## Security
 
