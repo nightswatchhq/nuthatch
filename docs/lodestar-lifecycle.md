@@ -1,8 +1,9 @@
 # The Lodestar lifecycle: what hosting a nest actually looks like
 
 **What this is:** one page describing the whole loop - RPC in, storage on disk, SQL out - for the
-five nests the [Lodestar dashboard](https://www.lodestar-dashboard.com) reads in production, so an
-operator considering hosting nuthatch nests knows what to expect before committing a box to it.
+five nests the [Lodestar dashboard](https://www.lodestar-dashboard.com) read in production on
+2026-09-06, so an operator considering hosting nuthatch nests knows what to expect before committing
+a box to it.
 
 **Provenance:** every figure was read off the live Hetzner VPS on **2026-09-06**, in two passes: one
 between 12:47 and 13:20 UTC against **3.5.0**, and one between 16:00 and 17:05 UTC against **3.5.1**,
@@ -16,6 +17,19 @@ because a rate without one is not a number.
 > such. Today one memory pool per nest, sized by `analytics.memory_limit` (default 512 MB) or
 > `NUTHATCH_BURRMILL_MEMORY_LIMIT`, is shared by every statement running against that nest, so raising
 > the permit count no longer shrinks a fixed per-connection slice.
+>
+> **The fleet has moved on as well.** On 2026-10-05 the Helsinki box runs five units, all on 4.10.1:
+> `graph-allocations-nest-next` (8107), `graph-gns-nest-next` (8113), `nuthatch-dips` (8104),
+> `data-services-nest` (8114, new since) and `graph-staking-legacy-readonly` (8103, the archive);
+> `dips-nest-sepolia` is gone. A sixth production nest, kittiwake's `qos-reo-nest`, runs on the
+> ThinkPad (8124). Each of the six answered `/ready` with `"version":"4.10.1"` on 2026-10-05, and
+> `deploy/monitoring/targets/nests.yml` is the list. The allocations nest's unit now carries
+> `NUTHATCH_SQL_MAX_CONCURRENCY=2`, `NUTHATCH_BURRMILL_MEMORY_LIMIT=2GB`, `NUTHATCH_ANALYTICS_THREADS=8`
+> and `NUTHATCH_MAX_RSS=6GB` (`scripts/gate/common.sh`, copied from the unit on 2026-10-03), so the
+> RSS figures in section 3 and the four permits in sections 5 and 7 are 3.5.1 facts, not today's. The
+> RPC bill in section 2 was Alchemy's; the nests now run on GraphOps, and
+> [the GraphOps count](lodestar-rpc-cost-graphops.md) (2026-10-05, against 4.8.0, tentative)
+> replaces section 2's figures and section 8's dollar lines.
 
 **One thing changed the day after.** On 2026-09-07 Lodestar's read API became a long-lived Rust
 process fronting these same nests, replacing per-request handlers on a serverless platform. That
@@ -23,16 +37,17 @@ alters the consumer described in section 4, and section 4 describes the new shap
 about the nests measured everywhere else on this page, and it did not move the cold query cost in
 section 5, because no runtime changes what a fold costs.
 
-**The box:** `ubuntu-8gb-hel1-1`, 4 cores, 7.7 GB RAM, 150 GB disk. It carries the five nuthatch
-processes inventoried below - four tip-following cursors and one `serve`-only archive - together with
-a TAP gateway and Caddy, at a load average of 0.63, with 91 GB of disk and 5.3 GB of memory free.
-Nothing here needs a large machine.
+**The box, on 2026-09-06:** `ubuntu-8gb-hel1-1`, 4 cores, 7.7 GB RAM, 150 GB disk. It carried the
+five nuthatch processes inventoried below - four tip-following cursors and one `serve`-only archive -
+together with a TAP gateway and Caddy, at a load average of 0.63, with 91 GB of disk and 5.3 GB of
+memory free. Nothing here needed a large machine.
 
 ---
 
 ## 1. The shape
 
-One host, one basic-auth credential, five nests selected by base path. Lodestar holds
+One host, one basic-auth credential, five nests selected by base path (the 2026-09-06 set; the note
+above has today's units). Lodestar holds
 `NUTHATCH_URL`, `NUTHATCH_USER` and `NUTHATCH_PASSWORD`, and nothing else. There is no Graph API
 key in the dashboard, no gateway client, and no fallback: an unreachable nest is reported as
 unavailable rather than silently answered from somewhere else.
@@ -104,7 +119,7 @@ nest's views use `block_timestamp`, and flipping the flag is a breaking schema c
 every sealed segment. Structural, not a config edit.
 
 **8113 is what a backfill costs.** A nest catching up spends roughly 35x a nest at tip. Budget for
-it as a one-off, and note it is running on keyless public endpoints rather than a paid key.
+it as a one-off, and note it was running on keyless public endpoints rather than a paid key.
 
 ---
 
@@ -118,8 +133,8 @@ it as a one-off, and note it is running on keyless public endpoints rather than 
 | 8106 | dips-sepolia | 27 MB | 83 MB | |
 | 8103 | legacy archive | 39 MB | 100 MB | |
 
-Well inside the ≤2 GB per-cursor budget: **four tip-following cursors and one `serve`-only process**
-on one 7.7 GB box. 8103 carries no cursor at all, which is why it costs no RPC, and counting it as a
+On 3.5.1 that sat well inside the ≤2 GB per-cursor budget: **four tip-following cursors and one
+`serve`-only process** on one 7.7 GB box. 8103 carries no cursor at all, which is why it costs no RPC, and counting it as a
 fifth would overstate what the per-cursor budget is being asked to hold. **Do not read RSS
 straight after a restart** - the in-memory views have not rebuilt, and the figure is an order of
 magnitude low for the first few minutes.
@@ -209,8 +224,9 @@ entities are the answer to this and are shipped; these views have not been migra
 `488.2 MiB`. Raising `NUTHATCH_SQL_MAX_CONCURRENCY` then bought throughput by taking memory away from
 every individual query.
 
-**Concurrency: the default is two, and this deployment sets four.** The unit carries
-`NUTHATCH_SQL_MAX_CONCURRENCY=4` (and `NUTHATCH_HOT_STORE_CACHE_BYTES=268435456`). Ten simultaneous
+**Concurrency: the default is two, and this deployment set four on 2026-09-06.** The unit then
+carried `NUTHATCH_SQL_MAX_CONCURRENCY=4` (and `NUTHATCH_HOT_STORE_CACHE_BYTES=268435456`); by
+2026-10-03 it ran two (the note above). Ten simultaneous
 requests over three rounds were admitted nine times and refused twenty-one, consistent with four
 permits partly occupied by the dashboard. A refusal is `503 server busy: too many concurrent SQL
 queries`, returned in **1.7-3.2 ms**: `try_acquire_owned`, so a caller past the limit is refused
@@ -250,7 +266,8 @@ Live on 8107 at the time of writing: `tip` 502,346,920, `sealed_through` 501,993
 
 Ranked by how likely an operator is to meet it.
 
-1. **Concurrency refusals as soon as there is a second caller.** Four permits here, two by default.
+1. **Concurrency refusals as soon as there is a second caller.** Four permits here on 3.5.1 (two
+   since), two by default.
    Expected, and self-inflicted only if the consumer fires a `Promise.all`. Fix it client-side.
 2. **The SQL memory budget bites on innocuous SQL.** Under DuckDB on 3.5.1, `SELECT count(*)` on
    one view exhausted the 256 MB per-connection limit in 1.5 s. Four scalar subqueries in one statement did the same. The
@@ -279,12 +296,15 @@ every production process on the box and once took it down for 80 minutes. Kill b
 
 ## 8. The summary an operator wants
 
-- **A tip-following cursor costs about $2 a month in RPC** at a 5-minute poll, and about $185 at a
-  2-second one. The cadence is the bill.
+- **A tip-following cursor cost about $2 a month in RPC** at a 5-minute poll on Alchemy's
+  2026-09-06 count, and about $185 at a 2-second one. On GraphOps' 2026-10-05 count it is about
+  52,000 credits a month per cursor at 5 minutes, roughly a dollar at the Growth rate
+  ([the record](lodestar-rpc-cost-graphops.md), tentative). The cadence is the bill.
 - **A nest nobody reads costs the same as one under load.** Tip-following cost is independent of
   demand. Park a nest and it keeps billing; a `serve`-only archive bills nothing.
-- **Four cursors and a serving process, 7.7 GB, 4 cores, 1 GB of nest data, load 0.63.** The
-  hardware is not the constraint.
+- **On 2026-09-06: four cursors and a serving process, 7.7 GB, 4 cores, 1 GB of nest data, load
+  0.63.** The hardware was not the constraint; since 4.1 the allocations nest's engine budget alone
+  is 2 GB (the note above).
 - **Reads are sub-second to seconds, and concurrency is a handful.** Size the consumer's caching,
-  not the box, and know that raising the permit count takes memory from every individual query.
+  not the box, and know that the permits share one memory pool per nest (the note above).
 - **Backfill is the expensive part.** Roughly 35x tip, once.
