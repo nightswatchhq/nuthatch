@@ -36,7 +36,8 @@ The Linux binary is dynamically linked and needs one thing, measured off the pub
 with `objdump -T` rather than inferred.
 
 **glibc 2.35 or newer.** This is the measured ABI floor, read with `objdump -T` from the published
-binary: 4.1.0 references `hypot` and `hypotf` at `GLIBC_2.35`, where libm re-versioned them. It is
+binary: 4.1.0 references `hypot` and `hypotf` at `GLIBC_2.35`, where libm re-versioned them, and
+4.10.1 still does (read the same way on 2026-10-05; nothing newer than 2.35 is referenced). It is
 also the glibc the release is *built* on (`ubuntu-22.04` in `.github/workflows/release.yml`), which is
 a coincidence and not the reason: up to 4.0.2 the binary referenced nothing newer than `GLIBC_2.34`
 and ran on RHEL 9, and stating the build baseline as the requirement once wrongly excluded it
@@ -46,7 +47,7 @@ and ran on RHEL 9, and stating the build baseline as the requirement once wrongl
 which is C++, and also needed libstdc++ from GCC 11 (`GLIBCXX_3.4.29`).
 
 Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34: they ran 4.0.x and
-need the source build for 4.1.0.
+need the source build from 4.1.0 on.
 
 ## Verifying a download
 
