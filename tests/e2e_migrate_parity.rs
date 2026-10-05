@@ -97,7 +97,8 @@ async fn migrating_preserves_every_sealed_byte() {
         None,
         false,
         1,
-        Some(2),
+        // Windows [1,4] and [5,8]: block 6's seal padding is fetched once, not again as a tail.
+        Some(4),
         false,
         None,
         Arc::new(nuthatch::health::RuntimeHealth::new()),
