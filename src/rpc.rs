@@ -151,6 +151,9 @@ pub fn select_rpcs(
 /// outage fails over fast instead of stalling the tip loop.
 const ENDPOINT_COOLDOWN_MS: u64 = 30_000;
 
+/// The first rest after a 429 that named no `Retry-After` (#1853).
+const RATE_LIMIT_PAUSE_MS: u64 = 1_000;
+
 /// A *terminal* failure (bad credentials, endpoint refusing us outright) earns a much longer cooldown
 /// than a transient one: asking again in 30s will get the same 401, and a tight retry loop against a
 /// 403 is exactly how a production nest spent forty minutes logging nothing useful (RFC-0028 §3).
@@ -771,6 +774,8 @@ pub struct RpcClient {
     /// Millis-since-epoch until which an endpoint that answered 429 is not asked at all, not even as
     /// the last resort a cooling endpoint otherwise is (#1853). `0` = not resting.
     limited: Vec<AtomicU64>,
+    /// 429s without a hint in a row per endpoint, which double its rest; cleared by an answer.
+    limited_streak: Vec<AtomicU64>,
     /// The highest block each endpoint has reported from `eth_blockNumber`, so a lower bound on its
     /// head. Pool members' heads differ by a block or two, and one behind refuses a `toBlock` it lacks.
     heads: Vec<AtomicU64>,
@@ -807,6 +812,7 @@ impl RpcClient {
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         let heads = urls.iter().map(|_| AtomicU64::new(0)).collect();
         let limited = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        let limited_streak = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             http,
             urls,
@@ -814,6 +820,7 @@ impl RpcClient {
             primaries: n,
             health,
             limited,
+            limited_streak,
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
@@ -906,15 +913,25 @@ impl RpcClient {
 
     fn mark_healthy(&self, j: usize) {
         self.health[j].store(0, Ordering::Relaxed);
+        self.limited_streak[j].store(0, Ordering::Relaxed);
     }
 
-    /// A 429 rests the endpoint for as long as it asked, within [`clamp_retry_hint`]'s cap, or for
-    /// the ordinary cooldown when it did not say.
+    /// A 429 rests the endpoint for as long as it asked, within [`clamp_retry_hint`]'s cap. Without a
+    /// hint the rest starts at [`RATE_LIMIT_PAUSE_MS`] and doubles per 429 in a row, up to the
+    /// ordinary cooldown: a lone public endpoint usually throttles per second.
     fn mark_rate_limited(&self, j: usize, retry_after: Option<Duration>) {
         self.mark_unhealthy(j);
-        let rest = retry_after.map_or(Duration::from_millis(ENDPOINT_COOLDOWN_MS), |hint| {
-            clamp_retry_hint(hint, Duration::ZERO)
-        });
+        let rest = match retry_after {
+            Some(hint) => clamp_retry_hint(hint, Duration::ZERO),
+            None => {
+                let streak = self.limited_streak[j].fetch_add(1, Ordering::Relaxed);
+                Duration::from_millis(
+                    RATE_LIMIT_PAUSE_MS
+                        .saturating_mul(1 << streak.min(16))
+                        .min(ENDPOINT_COOLDOWN_MS),
+                )
+            }
+        };
         self.limited[j].store(now_millis() + rest.as_millis() as u64, Ordering::Relaxed);
         tracing::debug!(
             "rpc {} rate-limited us; not asking it again for {rest:?}",
@@ -4160,18 +4177,24 @@ mod rfc0036_tests {
                 expected.push(Duration::from_millis(250 * round));
             }
         }
-        // Without a hint the endpoint rests for the cooldown (#1853), so before each of the 31 later
-        // requests the client waits out what the retry loop's own pause left of it.
-        let (rests, own): (Vec<Duration>, Vec<Duration>) = without_hint
-            .into_iter()
-            .partition(|p| *p > Duration::from_secs(2));
-        assert_eq!(own, expected);
-        assert_eq!(rests.len(), 31, "{rests:?}");
+        // Without a hint the endpoint rests 1s, 2s, 4s… up to the cooldown (#1853), each longer than
+        // the loop's own pause, so the client waits out the remainder: the loop's pauses still appear
+        // in order, and the 31 gaps between requests add up to the rests, plus the final 800ms.
+        let mut own = expected.iter().peekable();
+        for p in &without_hint {
+            if own.peek() == Some(&p) {
+                own.next();
+            }
+        }
+        assert!(own.next().is_none(), "{without_hint:?}");
+        let rests: Duration = (0..31)
+            .map(|n| Duration::from_millis((1_000u64 << n.min(16)).min(ENDPOINT_COOLDOWN_MS)))
+            .sum::<Duration>()
+            + Duration::from_millis(800);
+        let total: Duration = without_hint.iter().sum();
         assert!(
-            rests
-                .iter()
-                .all(|r| *r <= Duration::from_millis(ENDPOINT_COOLDOWN_MS)),
-            "{rests:?}"
+            total <= rests && total > rests - Duration::from_secs(1),
+            "{total:?} against {rests:?}: {without_hint:?}"
         );
     }
 
@@ -4420,6 +4443,70 @@ mod rfc0036_tests {
             pauses[0] <= MAX_RETRY_HINT && pauses[0] > MAX_RETRY_HINT - Duration::from_secs(5),
             "{pauses:?}"
         );
+    }
+
+    /// A lone endpoint answering 429 with no hint, per request in turn: `true` is a 429, `false` an
+    /// answer. Returns the waits the client recorded across one call per entry.
+    async fn lone_endpoint_waits(script: &'static [bool]) -> Vec<Duration> {
+        use axum::{
+            extract::State, http::StatusCode, response::IntoResponse, routing::post, Router,
+        };
+        use std::sync::Arc;
+        let next = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/",
+                post(move |State(next): State<Arc<AtomicUsize>>| async move {
+                    let n = next.fetch_add(1, Ordering::SeqCst);
+                    if script[n.min(script.len() - 1)] {
+                        (StatusCode::TOO_MANY_REQUESTS, "").into_response()
+                    } else {
+                        axum::Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":"0x10"}))
+                            .into_response()
+                    }
+                }),
+            )
+            .with_state(next);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let c = RpcClient::new(vec![format!("http://{addr}/")]).unwrap();
+        let waits = RETRY_PAUSES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                for &throttled in script {
+                    assert_eq!(c.block_number().await.is_err(), throttled);
+                }
+                RETRY_PAUSES.with(|p| p.borrow().clone())
+            })
+            .await;
+        server.abort();
+        assert_eq!(c.request_count(), script.len() as u64);
+        waits
+    }
+
+    fn about(waits: &[Duration], want: &[u64]) -> bool {
+        waits.len() == want.len()
+            && waits.iter().zip(want).all(|(w, &s)| {
+                let s = Duration::from_secs(s);
+                *w <= s && *w > s - Duration::from_millis(500)
+            })
+    }
+
+    /// #1853: a lone endpoint that 429s without a hint is asked again after 1s, then 2s, not after
+    /// the 30s cooldown, and an answer starts the doubling over.
+    #[tokio::test]
+    async fn a_lone_endpoint_without_a_hint_rests_one_second_then_two_and_an_answer_resets_it() {
+        let waits = lone_endpoint_waits(&[true, true, false, true, false]).await;
+        assert!(about(&waits, &[1, 2, 1]), "{waits:?}");
+    }
+
+    /// The doubling stops at the ordinary cooldown.
+    #[tokio::test]
+    async fn the_doubling_rest_stops_at_the_cooldown() {
+        let waits = lone_endpoint_waits(&[true; 8]).await;
+        assert!(about(&waits, &[1, 2, 4, 8, 16, 30, 30]), "{waits:?}");
     }
 
     /// When every endpoint is pruned no retry can help, so the verdict says so, names them all, and
