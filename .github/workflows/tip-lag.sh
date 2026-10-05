@@ -14,8 +14,12 @@
 # The poll interval is 1 s, the least `--poll-interval` accepts; mainnet's default is 12 s, which
 # would make `lag` a measurement of the timer.
 #
+# Only the after-seen p50 can carry a ceiling. `lag` p50 moves 100 ms between runs on the poll phase,
+# and the p99s are preemption; docs/benchmarks.md has the figures. The ceiling is the runner's, so
+# it is set in ci.yml and unset here.
+#
 # Env: BIN (target/release/nuthatch), OUT (tip-lag-report.json), SAMPLES (100), WARMUP (5),
-#      PORT (8290), RPC_PORT (8548), MAX_P50_MS / MAX_SEEN_P50_MS (unset: recorded, not gated).
+#      PORT (8290), RPC_PORT (8548), MAX_SEEN_P50_MS (unset: recorded, not gated).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
@@ -24,7 +28,6 @@ SAMPLES="${SAMPLES:-100}"
 WARMUP="${WARMUP:-5}"
 PORT="${PORT:-8290}"
 RPC_PORT="${RPC_PORT:-8548}"
-MAX_P50_MS="${MAX_P50_MS:-}"
 MAX_SEEN_P50_MS="${MAX_SEEN_P50_MS:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIP=20000
@@ -127,17 +130,15 @@ jq -s --arg label "tip lag: footprint fixture, moving tip, 4 Transfers a block, 
 ' "$WORK/samples.jsonl" > "$OUT"
 
 read -r p50 p99 sp50 sp99 < <(jq -r '"\(.lag_ms.p50) \(.lag_ms.p99) \(.after_seen_ms.p50) \(.after_seen_ms.p99)"' "$OUT")
-line="lag p50 ${p50} ms, p99 ${p99} ms; after seen p50 ${sp50} ms, p99 ${sp99} ms ($SAMPLES samples)"
+gate="${MAX_SEEN_P50_MS:+ceiling ${MAX_SEEN_P50_MS} ms on after-seen p50}"
+line="lag p50 ${p50} ms, p99 ${p99} ms; after seen p50 ${sp50} ms, p99 ${sp99} ms ($SAMPLES samples; ${gate:-not gated})"
 echo "tip lag: $line"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  { echo "### tip lag"; echo "$line, tracked, not gated"; } >> "$GITHUB_STEP_SUMMARY"
+  { echo "### tip lag"; echo "$line"; } >> "$GITHUB_STEP_SUMMARY"
 fi
 
-fail=0
-if [ -n "$MAX_P50_MS" ] && [ "$p50" -gt "$MAX_P50_MS" ]; then
-  echo "FAIL: lag p50 ${p50} ms exceeds ${MAX_P50_MS} ms"; fail=1
-fi
 if [ -n "$MAX_SEEN_P50_MS" ] && [ "$sp50" -gt "$MAX_SEEN_P50_MS" ]; then
-  echo "FAIL: after-seen p50 ${sp50} ms exceeds ${MAX_SEEN_P50_MS} ms"; fail=1
+  echo "FAIL: after-seen p50 ${sp50} ms exceeds ${MAX_SEEN_P50_MS} ms. Fetch, decode or commit at the"
+  echo "      tip got slower; the per-sample figures are in $OUT."
+  exit 1
 fi
-exit "$fail"

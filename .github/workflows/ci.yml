@@ -1106,12 +1106,13 @@ jobs:
         with:
           name: nuthatch-release
           path: bin
-      - name: measure tip lag (tracked, not gated)
-        # #1884. docs/benchmarks.md has the runner's spread and what a delay in the commit path does
-        # to it. It fails only if a block's rows never became queryable.
+      - name: measure tip lag
+        # #1884. After-seen p50 read 17-19 ms in four runs here; a 20 ms sleep before the commit read
+        # 38-39 ms in three. 30 ms sits between. The total lag and both p99s are tracked, not gated.
         env:
           BIN: bin/nuthatch
           OUT: tip-lag-report.json
+          MAX_SEEN_P50_MS: "30"
         run: |
           chmod +x bin/nuthatch
           bash .github/workflows/tip-lag.sh
