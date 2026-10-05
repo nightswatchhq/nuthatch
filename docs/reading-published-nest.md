@@ -19,6 +19,7 @@ two disagree, the build fails.
     schema.json               present when the nest has one
     <table>/
       <hash>.parquet          one object per catalogued, non-provisional segment
+    _seed/                    for `nuthatch seed` only; rewritten in place, not for readers
 ```
 
 `<dataset>` is the data identity, not the NID, so a cosmetic edit to a nest does not fork its mirror.

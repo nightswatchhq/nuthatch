@@ -1707,6 +1707,12 @@ fn before_manifest() {
     });
 }
 
+/// Install a whole catalogue into a nest that has none of its own yet (`nuthatch seed`).
+pub(crate) fn install_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
+    std::fs::create_dir_all(dir.join(SEGMENTS_DIR)).context("creating the segments directory")?;
+    save_manifest(dir, manifest)
+}
+
 fn save_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     let raw = serde_json::to_string_pretty(manifest)?;
     // The manifest is the segment catalogue - the crown jewels of a `kill -9`-survivable single binary

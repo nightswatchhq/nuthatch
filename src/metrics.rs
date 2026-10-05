@@ -71,6 +71,8 @@ impl SqlRejection {
 pub struct NestMetrics {
     last_block: AtomicU64,
     sealed_through: AtomicU64,
+    /// The block this nest's history begins at, once known. A mirror needs it to say what it covers.
+    indexed_from: Mutex<Option<u64>>,
     /// RFC-0052 S2: set once this nest mirrors itself, so only publishing nests render the series.
     publish_enabled: AtomicBool,
     publish_target: Mutex<Option<String>>,
@@ -285,6 +287,12 @@ impl NestMetrics {
             self.last_seal_progress.store(now_unix(), Relaxed);
         }
         METRICS.set_sealed_through(v);
+    }
+    pub fn set_indexed_from(&self, block: u64) {
+        *self.indexed_from.lock().unwrap() = Some(block);
+    }
+    pub fn indexed_from(&self) -> Option<u64> {
+        *self.indexed_from.lock().unwrap()
     }
     pub fn set_publish_enabled(&self, target: &str) {
         *self.publish_target.lock().unwrap() = Some(target.to_string());

@@ -42,14 +42,14 @@ struct PublishEnvelope {
 
 /// What a HEAD says about one object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Head {
-    size: u64,
+pub(crate) struct Head {
+    pub(crate) size: u64,
     /// Unquoted. Not necessarily content-derived: an in-memory store counts writes.
-    e_tag: Option<String>,
+    pub(crate) e_tag: Option<String>,
 }
 
 #[async_trait]
-trait Mirror: Send + Sync {
+pub(crate) trait Mirror: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     async fn put_file(&self, key: &str, src: &Path) -> Result<()>;
@@ -139,6 +139,85 @@ impl Mirror for FsMirror {
 
     fn content_etags(&self) -> bool {
         true
+    }
+}
+
+/// A mirror read over plain HTTP(S), which is what a public bucket serves. Read-only: `nuthatch seed`
+/// is its one caller, and nothing publishes through it.
+struct HttpMirror {
+    base: String,
+    client: reqwest::Client,
+}
+
+impl HttpMirror {
+    fn new(base: &str) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("nuthatch/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("building the HTTP client")?;
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            client,
+        })
+    }
+
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        key: &str,
+    ) -> Result<Option<reqwest::Response>> {
+        // `without_url`: a presigned or keyed mirror URL must not reach a log through an error.
+        let resp = self
+            .client
+            .request(method, format!("{}/{key}", self.base))
+            .send()
+            .await
+            .map_err(|e| e.without_url())
+            .with_context(|| format!("fetching {key}"))?;
+        match resp.status() {
+            s if s.is_success() => Ok(Some(resp)),
+            reqwest::StatusCode::NOT_FOUND => Ok(None),
+            // A bucket that forbids listing answers 403 for an absent key, so 403 cannot be read
+            // as "not there".
+            s => bail!("fetching {key}: the mirror answered {s}"),
+        }
+    }
+}
+
+#[async_trait]
+impl Mirror for HttpMirror {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let Some(resp) = self.request(reqwest::Method::GET, key).await? else {
+            return Ok(None);
+        };
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| e.without_url())
+            .with_context(|| format!("reading {key}"))?;
+        Ok(Some(bytes.to_vec()))
+    }
+
+    async fn put(&self, key: &str, _bytes: &[u8]) -> Result<()> {
+        bail!("an http mirror is read-only; cannot write {key}")
+    }
+
+    async fn put_file(&self, key: &str, _src: &Path) -> Result<()> {
+        bail!("an http mirror is read-only; cannot write {key}")
+    }
+
+    async fn put_if(&self, key: &str, _bytes: &[u8], _expected: Option<&[u8]>) -> Result<()> {
+        bail!("an http mirror is read-only; cannot write {key}")
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<Head>> {
+        Ok(self
+            .request(reqwest::Method::HEAD, key)
+            .await?
+            .map(|resp| Head {
+                size: resp.content_length().unwrap_or(0),
+                e_tag: None,
+            }))
     }
 }
 
@@ -450,7 +529,7 @@ fn is_md5_etag(e_tag: &str) -> bool {
         && parts.is_none_or(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-fn open_mirror(target: &str) -> Result<Box<dyn Mirror>> {
+pub(crate) fn open_mirror(target: &str) -> Result<Box<dyn Mirror>> {
     let t = target.trim();
     if t.starts_with("s3://") || t.starts_with("memory://") {
         #[cfg(feature = "object-store")]
@@ -469,16 +548,19 @@ fn open_mirror(target: &str) -> Result<Box<dyn Mirror>> {
     if let Some(name) = t.strip_prefix("test://") {
         return tests::test_mirror(name);
     }
+    if t.starts_with("https://") || t.starts_with("http://") {
+        return Ok(Box::new(HttpMirror::new(t)?));
+    }
     Ok(Box::new(FsMirror {
         root: PathBuf::from(t),
     }))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn parquet_key(table: &str, hash: &str) -> String {
+pub(crate) fn parquet_key(table: &str, hash: &str) -> String {
     format!("{table}/{hash}.parquet")
 }
 
@@ -540,6 +622,121 @@ fn published_catalogue(local_bytes: &[u8], local: &Manifest) -> Result<Vec<u8>> 
     Ok(serde_json::to_string_pretty(&published)?.into_bytes())
 }
 
+/// The seed snapshot's envelope, under the dataset prefix.
+pub(crate) const SEED_FILE: &str = "_seed/seed.json";
+
+/// Where a table's provisional tail sits in the seed snapshot. Keyed by table, not by hash: the tail
+/// is rewritten at every seal, and a hash-keyed object per rewrite would never stop accumulating.
+/// Not named `.parquet`, so no reader's glob over the dataset can count a tail as a segment.
+pub(crate) fn seed_tail_key(table: &str) -> String {
+    format!("_seed/{table}.tail")
+}
+
+/// What `nuthatch seed` needs beyond the mirror itself: each table's provisional tail, which the
+/// mirror withholds, and the block the whole of it is complete through. Outside the reader contract;
+/// `_seed/` is rewritten in place and only this envelope says which bytes it should hold.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct SeedEnvelope {
+    pub(crate) layout_version: u32,
+    pub(crate) chain_id: u64,
+    pub(crate) data_identity: String,
+    /// The block the publisher's history begins at, so a `--backfill N` mirror cannot pass for a
+    /// full one.
+    pub(crate) indexed_from: u64,
+    /// No row at or below this block is missing from the catalogue plus `tails`.
+    pub(crate) complete_through: u64,
+    /// SHA-256 of the `manifest.json` these tails complete. A seeder that reads another retries.
+    pub(crate) catalogue_sha256: String,
+    /// [`tails_digest`] of `tails`, so a snapshot that lost an entry on the way is refused rather than
+    /// seeding a nest that silently lacks that table's tail. Not authentication: an editor can recompute it.
+    pub(crate) tails_sha256: String,
+    pub(crate) tails: std::collections::BTreeMap<String, Segment>,
+}
+
+impl SeedEnvelope {
+    /// `None` when nothing is sealed yet.
+    fn of(
+        local: &Manifest,
+        catalogue: &[u8],
+        data_identity: &str,
+        chain_id: u64,
+        indexed_from: u64,
+    ) -> Option<Self> {
+        // The highest block any segment reaches, tails included. The publisher's own watermark may
+        // be higher, but only by blocks that held no row, so resuming here re-reads nothing sealed.
+        let complete_through = local.tables.values().flatten().map(|s| s.to_block).max()?;
+        let tails: std::collections::BTreeMap<_, _> = local
+            .tables
+            .iter()
+            .filter_map(|(t, segs)| Some((t.clone(), segs.iter().find(|s| s.provisional)?.clone())))
+            .collect();
+        Some(Self {
+            layout_version: 1,
+            chain_id,
+            data_identity: data_identity.to_string(),
+            indexed_from,
+            complete_through,
+            catalogue_sha256: sha256_hex(catalogue),
+            tails_sha256: tails_digest(&tails),
+            tails,
+        })
+    }
+}
+
+/// Each tail's table, hash and range, in table order.
+pub(crate) fn tails_digest(tails: &std::collections::BTreeMap<String, Segment>) -> String {
+    let mut h = Sha256::new();
+    for (table, s) in tails {
+        h.update(format!(
+            "{table}\0{}\0{}\0{}\0{}\n",
+            s.hash, s.from_block, s.to_block, s.rows
+        ));
+    }
+    hex::encode(h.finalize())
+}
+
+/// The publisher's start block, read from its store. Only a stopped nest's can be opened; a running
+/// one reports it through its metrics instead.
+fn stopped_indexed_from(dir: &Path) -> Option<u64> {
+    crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE))
+        .ok()?
+        .get_meta(crate::indexer::START_BLOCK_KEY)
+        .ok()??
+        .parse()
+        .ok()
+}
+
+/// Write the seed snapshot: changed tails first, then the envelope naming them. Returns what it put.
+async fn put_seed(mirror: &dyn Mirror, dir: &Path, seed: &SeedEnvelope) -> Result<Vec<String>> {
+    let prefix = |k: &str| format!("{}/{k}", seed.data_identity);
+    let remote_bytes = mirror.get(&prefix(SEED_FILE)).await?;
+    let remote: Option<SeedEnvelope> = remote_bytes
+        .as_deref()
+        .and_then(|b| serde_json::from_slice(b).ok());
+    let mut put = Vec::new();
+    for (table, seg) in &seed.tails {
+        let held = remote.as_ref().and_then(|r| r.tails.get(table));
+        if held.is_some_and(|h| h.hash == seg.hash) {
+            continue;
+        }
+        let src = seal::segment_path(dir, &seg.file, &seg.hash);
+        if !src.exists() {
+            // A seal folded this tail after the catalogue was read. The seal wakes the next pass.
+            tracing::debug!("seed snapshot skipped: {table}'s tail was folded mid-pass");
+            return Ok(put);
+        }
+        let key = seed_tail_key(table);
+        mirror.put_file(&prefix(&key), &src).await?;
+        put.push(key);
+    }
+    let bytes = serde_json::to_vec_pretty(seed)?;
+    if remote_bytes.as_deref() != Some(bytes.as_slice()) {
+        mirror.put(&prefix(SEED_FILE), &bytes).await?;
+        put.push(SEED_FILE.into());
+    }
+    Ok(put)
+}
+
 /// The entries of `want` a pass would upload, and how many it would skip.
 async fn missing_entries<'a>(
     mirror: &dyn Mirror,
@@ -559,7 +756,7 @@ async fn missing_entries<'a>(
     Ok((missing, held.len()))
 }
 
-fn identity_of(dir: &Path) -> Result<(String, String, String, u64)> {
+pub(crate) fn identity_of(dir: &Path) -> Result<(String, String, String, u64)> {
     let m = crate::blob::build_manifest(dir, None)?;
     let cfg = crate::config::Config::load(dir)?;
     Ok((m.data_identity(), m.nid(), m.blob_hash(), cfg.nest.chain_id))
@@ -720,6 +917,18 @@ pub async fn sync_with(
     let env_bytes = serde_json::to_vec_pretty(&envelope)?;
     mirror.put(&prefix("publish.json"), &env_bytes).await?;
     uploaded.push("publish.json".into());
+
+    // Last, so a seed snapshot never names a catalogue the mirror does not hold yet.
+    let indexed_from = match metrics {
+        Some(m) => m.indexed_from(),
+        None => stopped_indexed_from(dir),
+    };
+    if let Some(indexed_from) = indexed_from {
+        let seed = SeedEnvelope::of(&local, &catalogue, &data_identity, chain_id, indexed_from);
+        if let Some(seed) = seed {
+            uploaded.extend(put_seed(mirror.as_ref(), dir, &seed).await?);
+        }
+    }
 
     Ok(SyncReport {
         dataset: data_identity,

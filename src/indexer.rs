@@ -28,7 +28,7 @@ use crate::store::Store;
 use crate::velocity::{self, VelocityView};
 use crate::views::{self, BalanceView};
 
-const LAST_BLOCK_KEY: &str = "last_block";
+pub(crate) const LAST_BLOCK_KEY: &str = "last_block";
 /// What this nest's stored data was indexed *with*: `"1"` if rows carry `block_timestamp`, `"0"` if
 /// not (RFC-0029 §6b). Written on first index and compared on every start.
 ///
@@ -41,7 +41,7 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
 /// configuration, which is what a nest's content address is a statement about.
 use crate::store::{IDENTITY_FORMULA, IDENTITY_FORMULA_KEY, REGISTRY_KEY};
-const SEALED_THROUGH_KEY: &str = "sealed_through";
+pub(crate) const SEALED_THROUGH_KEY: &str = "sealed_through";
 pub(crate) const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
 const DEFAULT_BACKFILL: u64 = 5_000;
@@ -2832,6 +2832,12 @@ async fn build_nest(
     let identity = hex::encode(crate::project::decode_identity(&dir, config, &registry)?);
     // Only the ingestion owner records what a store was indexed under. A `serve` role or query FE reads a
     // store it does not own, so it compares and refuses a mismatch but never writes (#1423 review).
+    if store.get_meta(crate::seed::SEED_PENDING_KEY)?.is_some() {
+        anyhow::bail!(
+            "this nest was being seeded from a mirror and the seed did not finish. Run `nuthatch seed` \
+             again with the same --from; it keeps what it has downloaded."
+        );
+    }
     let owner = !config.read_only_role;
     guard_timestamp_policy(store.as_ref(), config.nest.block_timestamps, owner)?;
     guard_registry_identity(
@@ -3970,6 +3976,26 @@ fn guard_coverage(store: &dyn crate::store::HotStore, config: &Config, owner: bo
         _ => {}
     }
     store.set_meta(crate::store::COVERAGE_KEY, &want.to_string())
+}
+
+/// Records what a fresh store is about to hold, exactly as its first start would. A seeded store
+/// is then compared with `nuthatch.toml` on every later start, not adopted unverified (#653, #1420).
+pub(crate) fn stamp_fresh_store(
+    store: &dyn crate::store::HotStore,
+    dir: &std::path::Path,
+    config: &Config,
+) -> Result<()> {
+    let registry = crate::registry::from_nest(dir, config)?;
+    let identity = hex::encode(crate::project::decode_identity(dir, config, &registry)?);
+    guard_timestamp_policy(store, config.nest.block_timestamps, true)?;
+    guard_registry_identity(
+        store,
+        &identity,
+        &hex::encode(registry.hash()),
+        config.extract.top_level_calls,
+        true,
+    )?;
+    guard_coverage(store, config, true)
 }
 
 fn guard_timestamp_policy(
@@ -6518,6 +6544,13 @@ impl NestIngest {
                 start
             }
         };
+        if let Some(from) = self
+            .store
+            .get_meta(START_BLOCK_KEY)?
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            self.metrics.set_indexed_from(from);
+        }
         self.start_ipfs_resolver();
         Ok(next)
     }

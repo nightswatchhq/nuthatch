@@ -113,6 +113,12 @@ pub enum Command {
     Offchain(OffchainArgs),
     /// Mirror sealed segments to an object-store prefix (RFC-0052).
     Publish(PublishArgs),
+    /// Fill a nest that has not indexed from a published mirror, instead of backfilling over RPC.
+    ///
+    /// Downloads the mirror's sealed history for this exact nest, checks every file against its
+    /// hash, and leaves `dev` to follow the chain from where the mirror ends. The nest directory
+    /// must be the one that was published: an edited nest is a different dataset.
+    Seed(SeedArgs),
     /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
     Nest(NestArgs),
     /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
@@ -401,6 +407,17 @@ pub struct SettleArgs {
     /// outcome line per row it settled or failed, and an unreported row stays pending.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     pub batch: u64,
+}
+
+#[derive(Args)]
+pub struct SeedArgs {
+    /// The mirror `publish sync` wrote: a filesystem path, `s3://bucket/prefix`, or the `https://`
+    /// address of a public one.
+    #[arg(long)]
+    pub from: String,
+    /// Nest directory.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
 }
 
 #[derive(Args)]
