@@ -41,6 +41,11 @@
 # rows sorted unless the statement has a top-level ORDER BY) and compared by its sha256.
 # A statement tagged `# volatile: <id> <why>` in the set is compared on its row count only.
 # Exit 0 is PASS; exit 2 is a usage or setup fault, which is not a verdict on the binary.
+# Load (#1898): the box's 1-minute load average and core count are recorded, sampled into
+# <out>/load.tsv during the run. Before starting, the gate waits up to GATE_MAX_LOAD_WAIT seconds
+# (1800) for load per core to fall under GATE_MAX_LOAD_PER_CORE (0.3), else exits 2. If over
+# GATE_RUN_MAX_LOAD_PER_CORE (0.6) for more than GATE_LOAD_MAX_SHARE (0.25) of the run's samples,
+# the result is a setup fault, exit 2, and no baseline is written. See docs/release-gate.md.
 # Two runs against one copy wait for each other: the second `serve` could not open the redb.
 set -euo pipefail
 
@@ -50,6 +55,12 @@ P99_FACTOR=${GATE_P99_FACTOR:-1.5}
 P99_SLACK_MS=${GATE_P99_SLACK_MS:-1000}
 MAX_RSS_MB=${GATE_MAX_RSS_MB:-2048}
 PROC_ROOT=${GATE_PROC_ROOT:-/proc}
+MAX_LOAD_PER_CORE=${GATE_MAX_LOAD_PER_CORE:-0.3}
+MAX_LOAD_WAIT=${GATE_MAX_LOAD_WAIT:-1800}
+LOAD_POLL_SECS=${GATE_LOAD_POLL_SECS:-15}
+RUN_MAX_LOAD_PER_CORE=${GATE_RUN_MAX_LOAD_PER_CORE:-0.6}
+LOAD_MAX_SHARE=${GATE_LOAD_MAX_SHARE:-0.25}
+LOAD_SAMPLE_SECS=${GATE_LOAD_SAMPLE_SECS:-5}
 
 die() { echo "release-gate: $*" >&2; exit 2; }
 trap 'rc=$?; echo "release-gate: internal error at line $LINENO (exit $rc)" >&2; exit 2' ERR
@@ -108,6 +119,46 @@ mkdir -p "$out/answers"
 
 gate_load_set "$set_file"
 
+case "$MAX_LOAD_WAIT" in ''|*[!0-9]*) die "GATE_MAX_LOAD_WAIT must be whole seconds" ;; esac
+ncpu=$(gate_ncpu)
+case "$ncpu" in ''|*[!0-9]*|0) ncpu=1 ;; esac
+rm -f "$out/load.tsv"
+load_readable=1 load_note="" load_pid=""
+if load=$(gate_load1); then
+  wait_began=$SECONDS
+  while gate_load_over "$load" "$ncpu" "$MAX_LOAD_PER_CORE"; do
+    if [ $((SECONDS - wait_began)) -ge "$MAX_LOAD_WAIT" ]; then
+      die "the box is loaded: load average $load on $ncpu cores, over $MAX_LOAD_PER_CORE per core after waiting ${MAX_LOAD_WAIT}s; timings taken now would measure the load, not the binary. Nothing was run"
+    fi
+    sleep "$LOAD_POLL_SECS"
+    load=$(gate_load1) || { load_readable=0; break; }
+  done
+  [ "$SECONDS" -eq "$wait_began" ] || load_note=", waited $((SECONDS - wait_began))s for it to fall"
+else
+  load_readable=0
+fi
+if [ "$load_readable" -eq 1 ]; then
+  load_line="box load $load over $ncpu cores ($(awk -v l="$load" -v n="$ncpu" 'BEGIN { printf "%.2f", l / n }') per core), start limit $MAX_LOAD_PER_CORE$load_note"
+else
+  load_line="the box's load could not be read, so it is not checked"
+fi
+echo "release-gate: $load_line"
+
+sample_load() {
+  while :; do
+    printf '%s\t%s\n' "$(date +%s)" "$(gate_load1 || echo -)" >>"$out/load.tsv"
+    sleep "$LOAD_SAMPLE_SECS"
+  done
+}
+stop_load_sampler() {
+  [ -z "$load_pid" ] || { kill "$load_pid" 2>/dev/null; wait "$load_pid" 2>/dev/null; } || true
+  load_pid=""
+}
+if [ "$load_readable" -eq 1 ]; then
+  sample_load >/dev/null 2>&1 9>&- &
+  load_pid=$!
+fi
+
 server_pid=""
 sampler_pid=""
 # Keeps the highest RSS (KiB) seen for the serving process in $out/rss-peak-kb, across servers.
@@ -155,7 +206,7 @@ stop_server() {
     server_pid=""
   fi
 }
-trap 'stop_server; gate_unlock' EXIT
+trap 'stop_server; stop_load_sampler; gate_unlock' EXIT
 
 alive() { [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; }
 
@@ -303,6 +354,21 @@ while [ "$pass" -le "$passes" ]; do
   stop_server
   pass=$((pass + 1))
 done
+
+# One last sample, so a run shorter than the interval still has its end on record.
+stop_load_sampler
+load_fault=0 load_summary=""
+if [ "$load_readable" -eq 1 ]; then
+  printf '%s\t%s\n' "$(date +%s)" "$(gate_load1 || echo -)" >>"$out/load.tsv"
+  load_summary=$(awk -F'\t' -v n="$ncpu" -v t="$RUN_MAX_LOAD_PER_CORE" -v s="$LOAD_MAX_SHARE" '
+    $2 != "-" { c++; if ($2 > peak) peak = $2; if ($2 / n > t) over++ }
+    END { if (!c) { print "0 0 0 0 0"; exit }
+          printf "%d %s %d %.2f %d\n", c, peak + 0, over, over / c, (over / c > s) }' "$out/load.tsv")
+  # shellcheck disable=SC2086
+  set -- $load_summary
+  load_samples=$1 load_peak=$2 load_over=$3 load_share=$4 load_fault=$5
+  echo "release-gate: load during the run: $load_samples samples, peak $load_peak over $ncpu cores, $load_over over $RUN_MAX_LOAD_PER_CORE per core ($load_share of the run; setup fault above $LOAD_MAX_SHARE)"
+fi
 
 # Fold the passes: a query's status is its worst pass, its time the median of its passes.
 results=$out/results.tsv
@@ -460,9 +526,13 @@ if [ -n "$baseline" ]; then
   fi
 fi
 
-if [ -n "$write_baseline" ]; then
+if [ -n "$write_baseline" ] && [ "$load_fault" -eq 1 ]; then
+  echo
+  echo "release-gate: no baseline written: the box was loaded during the run"
+elif [ -n "$write_baseline" ]; then
   {
     echo "# release-gate baseline: $version, $(date -u +%Y-%m-%dT%H:%M:%SZ), $passes pass(es)"
+    echo "# load: $load_line"
     echo "# nest: $nest ${prov:-}"
     echo "# set: $set_file"
     echo "# answers: $out/answers"
@@ -510,6 +580,10 @@ if [ -s "$out/rss-peak-gauges" ]; then
 fi
 if [ -s "$out/pool-peak-bytes" ]; then
   echo "release-gate: largest single analytics pool reservation $(( $(cat "$out/pool-peak-bytes") / 1048576 )) MiB"
+fi
+if [ "$load_fault" -eq 1 ]; then
+  echo "RESULT: SETUP FAULT - the box was loaded during the run (load per core over $RUN_MAX_LOAD_PER_CORE in $load_over of $load_samples samples, peak load $load_peak on $ncpu cores); the timings and peak above measure the load, not the binary"
+  exit 2
 fi
 if [ "$failures" -gt 0 ] || [ "$regressions" -gt 0 ] || [ "$differs" -gt 0 ] || [ "$p99_failed" -gt 0 ] || [ "$rss_failed" -gt 0 ]; then
   failed_ids=$(awk -F'\t' '$3 != "ok" { printf "%s%s", sep, $1; sep = ", " }' "$results")

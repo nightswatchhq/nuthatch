@@ -340,7 +340,9 @@ rc=0
 # a run that could not measure it (exit 2, no baseline written) leaves nothing to compare with.
 if { [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; } || [ ! -s "$run/baseline.tsv" ]; then
   cat "$run/production.txt" >&2
-  post_status error "production $production could not be measured (exit $rc), so there is no baseline; see $run"
+  why=""
+  ! grep -qE '^release-gate: the box is loaded|^RESULT: SETUP FAULT - the box was loaded' "$run/production.txt" || why=", the box was loaded"
+  post_status error "production $production could not be measured (exit $rc$why), so there is no baseline; see $run"
   exit 2
 fi
 prod_note=""
@@ -369,9 +371,12 @@ cat "$run/candidate.txt"
 # The counts only: the p99 is in the run's output, and the status has 140 characters.
 summary=$(grep -E '^release-gate: [0-9]+ of [0-9]+ answered' "$run/candidate.txt" | sed -e 's/^release-gate: //' -e 's/;.*//' || true)
 result=$(grep -E '^RESULT: ' "$run/candidate.txt" | sed 's/^RESULT: //' || true)
+# A loaded box is a setup fault (#1898): said in the status, so it is not read as a broken rig.
+load_why=""
+grep -qE '^release-gate: the box is loaded|^RESULT: SETUP FAULT - the box was loaded' "$run/candidate.txt" && load_why="box load" || true
 case "$rc" in
   0) post_status success "${summary:-passed} (against $production$from_note$prod_note)" ;;
   1) post_status failure "${summary:-failed}; ${result#FAIL - } (against $production$from_note$prod_note)" ;;
-  *) post_status error "the gate could not run (exit $rc); see $run" ; exit 2 ;;
+  *) post_status error "the gate could not run (exit $rc${load_why:+: $load_why}); see $run" ; exit 2 ;;
 esac
 exit "$rc"
