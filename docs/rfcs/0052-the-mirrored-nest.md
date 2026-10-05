@@ -163,7 +163,7 @@ tombstones. A future compaction RFC still cannot delete in place.
 <prefix>/                                 # s3://bucket/path or a directory (FsStore)
   <dataset>/                              # data identity (RFC-0033 s5) - not the NID; see below
     publish.json                          # provenance envelope, §3.5
-    manifest.json                         # the catalogue, byte-identical to segments/manifest.json
+    manifest.json                         # the catalogue less its provisional entries (§3.2)
     schema.json                           # logical types (which Utf8 columns are big ints) [VERIFY name/shape]
     <table>/
       <hash>.parquet                      # one object per catalogued, non-provisional segment
@@ -206,7 +206,18 @@ The publisher's unit is a **catalogue entry**, never a file it found on disk. Ru
 1. An entry with `provisional: true` is **not published**. The local catalogue promises the next
    seal folds it; publishing it and then folding would leave a globbing consumer double-counting
    or require a delete. Waiting costs at most one seal of freshness for a table with under 1,000
-   rows at the cut.
+   rows at the cut. **The published catalogue omits it too** (#1851): S1 copied the local catalogue
+   byte for byte, so a reader resolving through it was handed an entry the mirror did not hold. The
+   rule is that a reader never sees a catalogue entry it cannot fetch.
+
+   That freshness bound holds only while the table keeps receiving rows. A table that goes quiet,
+   and every table of an archived nest, keeps its last provisional segment indefinitely, so the
+   mirror never carries those rows. `nuthatch publish finalise` is the operator's declaration that
+   the tail is done: with the nest stopped, it clears `provisional` on each table's tail. The file
+   and its hash are unchanged and nothing is rewritten, so the entry becomes an ordinary final
+   segment and the next sync publishes it. It is never automatic, because nuthatch cannot tell a
+   quiet table from a finished one. If rows do arrive later, they start a new segment instead of
+   folding, so that nest's segment boundaries differ from one that never finalised; its rows do not.
 2. Every other entry is published exactly once, at `<dataset>/<table>/<hash>.parquet`. Same hash,
    same key, so re-publishing is a no-op by construction (RFC-0019 §1's dedup argument).
 3. An entry is never removed from the mirror. The mirror inherits the catalogue's append-only
@@ -242,7 +253,8 @@ for each entry in want − have, by (from_block, to_block, hash):
                                                  else HEAD size check after put
 if every put succeeded:
     put <dataset>/schema.json                    (only when changed)
-    put <dataset>/manifest.json                  conditional on the remote version (ETag /
+    put <dataset>/manifest.json                  want as a catalogue (local, provisional entries
+                                                 dropped), conditional on the remote version (ETag /
                                                  object_store PutMode::Update); refuse on mismatch
     put <dataset>/publish.json                   after the catalogue, with its sha256 and
                                                  sealed_through = max to_block of want
@@ -269,7 +281,8 @@ Properties this buys:
 - **Single writer, enforced.** The conditional put on `manifest.json` makes a second publisher
   for the same dataset fail loudly, the way a fenced write fails in RFC-0022. Two roosts
   publishing one dataset is a configuration error and is reported as one.
-- **The remote catalogue is byte-identical to the local one.** So `doctor` compares by hash, a
+- **The remote catalogue is the local one less its provisional entries**, and byte-identical to it
+  when there are none (amended for #1851; S1 shipped it byte-identical always). So `doctor` compares by hash, a
   consumer can check what it holds against what the operator has, and RFC-0047 C2's
   enrichments (`manifest_version`, `sort_order`, `logical_type`, stats) arrive in the mirror
   the day they land locally, with no change here. The `file` field's `{table}-{hash}.parquet`

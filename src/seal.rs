@@ -351,6 +351,24 @@ pub fn seal_range_with_snapshot(
     Ok(Some(summary))
 }
 
+/// Mark each table's provisional segment final, for a table the operator knows is done (#1851). The
+/// file is not touched; the table's next seal starts a new segment instead of folding this one. The
+/// caller must hold the nest's writer: this is a read-modify-write of the catalogue.
+pub fn finalise_provisional(dir: &Path) -> Result<Vec<(String, Segment)>> {
+    let mut manifest = load_manifest(dir)?;
+    let mut finalised = Vec::new();
+    for (table, segments) in &mut manifest.tables {
+        for s in segments.iter_mut().filter(|s| s.provisional) {
+            s.provisional = false;
+            finalised.push((table.clone(), s.clone()));
+        }
+    }
+    if !finalised.is_empty() {
+        save_manifest(dir, &manifest)?;
+    }
+    Ok(finalised)
+}
+
 /// Readers of each dataset's segments, and the files a fold replaced that must outlive them.
 ///
 /// A `/sql` read plans against the manifest and opens the files it names later, when Burrmill executes.
@@ -3017,6 +3035,38 @@ mod tests {
                 (once.from_block, once.to_block, once.rows)
             );
         }
+    }
+
+    #[test]
+    fn a_finalised_tail_keeps_its_file_and_is_never_folded() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let tail = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let bytes = std::fs::read(dir.path().join(SEGMENTS_DIR).join(&tail.file)).unwrap();
+
+        let finalised = finalise_provisional(dir.path()).unwrap();
+        assert_eq!(finalised.len(), 1);
+        let now = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        assert!(!now.provisional);
+        assert_eq!(
+            (now.hash.as_str(), now.from_block, now.to_block, now.rows),
+            (tail.hash.as_str(), 10, 10, 1)
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(SEGMENTS_DIR).join(&now.file)).unwrap(),
+            bytes
+        );
+        assert!(finalise_provisional(dir.path()).unwrap().is_empty());
+
+        seal_range(dir.path(), &[transfer(11, 0, "2")], 11, 11).unwrap();
+        let segs = &load_manifest(dir.path()).unwrap().tables["usdc__transfer"];
+        assert_eq!(
+            segs.len(),
+            2,
+            "the next seal must not fold a finalised tail: {segs:?}"
+        );
+        assert_eq!(segs[0].hash, tail.hash);
+        assert!(segs[1].provisional);
     }
 
     #[test]

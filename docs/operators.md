@@ -1292,8 +1292,16 @@ are view columns the SQL engine adds, not Parquet). Point another engine at the 
 `segments/*.parquet`, and do not expect a narrowed numeric type in the file.
 
 **Mirroring sealed data to a bucket (RFC-0052).** `nuthatch publish sync --target <dir or
-s3://bucket/prefix>` copies every non-provisional segment and the catalogue under
-`<target>/<data identity>/`, then writes `publish.json`; a second run uploads only what changed.
+s3://bucket/prefix>` copies every non-provisional segment and the catalogue, less its provisional
+entries, under `<target>/<data identity>/`, then writes `publish.json`; a second run uploads only
+what changed. A provisional segment is a table's tail of under 1,000 rows, held back because the
+table's next seal rewrites it. A table that has stopped receiving rows, and every table of an
+archived nest, keeps that tail forever, so the mirror never has those rows. When you know the chain
+is done with the nest, stop it and run `nuthatch publish finalise --dir <nest>`, which lists the
+tails, then again with `--yes`, which marks them final; the next `publish sync` uploads them.
+Nothing is rewritten: the files and their hashes are unchanged. It refuses while anything holds the
+nest's `nuthatch.redb`. If rows arrive after all, they start a new segment rather than folding into
+the finalised one.
 `dev` and `serve` do it continuously with `--publish-target`: a pass at start, one after every seal,
 and one every `--publish-interval` (60 s) otherwise, with `--publish-parallelism` uploads in flight
 (2). The publisher runs on its own thread, so a slow or unreachable bucket delays the mirror and never

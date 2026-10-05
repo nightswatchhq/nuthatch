@@ -507,7 +507,9 @@ who need more - none of it in the way of the happy path:
   the same dataset, and any edit that changes what is decoded forks a new one.
   `publish status` says what is still to upload, `publish verify` checks every object against the
   local segment (`--deep` re-downloads and re-hashes), and `doctor --publish` puts the mirror in a
-  health check. Reading it needs no nuthatch: DuckDB, Trino or anything that reads Parquet, as
+  health check. A table's last few hundred rows wait to fold into its next segment and are not
+  mirrored until they do; on a nest whose chain has gone quiet, `publish finalise` lets them go.
+  Reading it needs no nuthatch: DuckDB, Trino or anything that reads Parquet, as
   [Reading a published nest](docs/reading-published-nest.md) describes.
 - **Safe upgrades - no resync tax** (RFC-0020, RFC-0033). Updating a nest is not a subgraph-style
   genesis resync, and in 2.0 it needs no command to remember. The **runtime** classifies the update

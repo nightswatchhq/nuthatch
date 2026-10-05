@@ -418,6 +418,13 @@ pub enum PublishWhat {
     /// Where this nest publishes, how far each side is sealed, and what is still to upload. Writes
     /// nothing.
     Status(PublishStatusArgs),
+    /// Mark each table's provisional tail final, so the mirror can carry it (#1851).
+    ///
+    /// A table's last segment of under 1,000 rows waits to fold into its next seal and is not
+    /// published until then. On a chain or contract that has gone quiet that seal never comes. Run
+    /// this when you know it will not: it rewrites no file, and later rows start a new segment.
+    /// Lists by default; `--yes` acts.
+    Finalise(PublishFinaliseArgs),
 }
 
 #[derive(Args)]
@@ -457,6 +464,16 @@ pub struct PublishVerifyArgs {
     /// For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use --deep otherwise.
     #[arg(long)]
     pub etag_md5: bool,
+}
+
+#[derive(Args)]
+pub struct PublishFinaliseArgs {
+    /// Nest directory. The nest must be stopped.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// Mark the listed segments final. Without it, only lists them.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]
