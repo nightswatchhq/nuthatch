@@ -14,6 +14,12 @@ inputs:
   of:
     description: How many shards the archive is split into.
     required: true
+  filter:
+    description: Filterset applied before partitioning.
+    default: all()
+  name:
+    description: Distinguishes this job's JUnit artifact.
+    required: true
 
 runs:
   using: composite
@@ -23,11 +29,12 @@ runs:
         name: ${{ inputs.archive }}
         path: ${{ runner.temp }}/archive
     - uses: ./.github/actions/install-nextest
-    - name: nextest run (${{ inputs.archive }} ${{ inputs.shard }}/${{ inputs.of }})
+    - name: nextest run (${{ inputs.name }})
       shell: bash
       env:
         ARCHIVE: ${{ runner.temp }}/archive/${{ inputs.archive }}.tar.zst
         PARTITION: ${{ inputs.shard }}/${{ inputs.of }}
+        FILTER: ${{ inputs.filter }}
       run: |
         set -euo pipefail
         cargo-nextest nextest run --profile ci \
@@ -35,12 +42,13 @@ runs:
           --workspace-remap "$GITHUB_WORKSPACE" \
           --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
           --partition "count:$PARTITION" \
+          -E "$FILTER" \
           --no-tests=fail
     - name: upload the JUnit report
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: junit-${{ inputs.archive }}-${{ inputs.shard }}
+        name: junit-${{ inputs.name }}
         path: target/nextest/ci/junit.xml
         if-no-files-found: warn
         retention-days: 14
