@@ -120,12 +120,14 @@ for i in $(seq 1 $(( WARMUP + SAMPLES ))); do
 done
 
 hardware="$(nproc 2>/dev/null || sysctl -n hw.ncpu) cores, $(uname -sm)"
+commit="${GITHUB_SHA:-$(git -C "$HERE" rev-parse HEAD 2>/dev/null || echo unknown)}"
 jq -s --arg label "tip lag: footprint fixture, moving tip, 4 Transfers a block, poll 1s" \
-  --arg hardware "$hardware" --arg version "$("$BIN" --version)" '
+  --arg hardware "$hardware" --arg version "$("$BIN" --version)" --arg commit "$commit" '
   def stats(k): (map(.[k]) | sort) as $s | ($s | length) as $n |
     {p50: $s[(($n - 1) / 2 | floor)], p99: $s[((($n * 99 + 99) / 100 | floor) - 1)],
      min: $s[0], max: $s[$n - 1]};
-  {label: $label, version: $version, hardware: $hardware, poll_interval_ms: 1000,
+  {label: $label, version: $version, commit: $commit, provider: "footprint-rpc.py --moving, local",
+   hardware: $hardware, poll_interval_ms: 1000,
    samples: length, lag_ms: stats("lag_ms"), after_seen_ms: stats("after_seen_ms"), raw: .}
 ' "$WORK/samples.jsonl" > "$OUT"
 
