@@ -97,6 +97,8 @@ async fn roost_is_byte_identical_to_solo() {
     let cfg_u = scaffold_nest(solo_u.path(), "usdc", USDC);
     let cfg_a = scaffold_nest(solo_a.path(), "arb", ARB);
 
+    // `--window 4` throughout: windows [1,4] and [5,8], so block 6's seal padding is fetched once,
+    // not again as the next window's tail.
     let rt_u = indexer::spawn_nest(
         solo_tape.clone(),
         solo_u.path().to_path_buf(),
@@ -104,7 +106,7 @@ async fn roost_is_byte_identical_to_solo() {
         None,
         false,
         1,
-        Some(2),
+        Some(4),
         false,
         None,
     )
@@ -117,7 +119,7 @@ async fn roost_is_byte_identical_to_solo() {
         None,
         false,
         1,
-        Some(2),
+        Some(4),
         false,
         None,
     )
@@ -146,7 +148,7 @@ async fn roost_is_byte_identical_to_solo() {
         None,
         false,
         1,
-        Some(2),
+        Some(4),
         false,
         None,
         std::sync::Arc::new(nuthatch::health::RuntimeHealth::new()),

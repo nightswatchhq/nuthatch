@@ -78,7 +78,8 @@ async fn index_once(root: &Path) -> (usize, std::path::PathBuf, u64) {
         None,
         false,
         1,
-        Some(2),
+        // Several windows, as the fetch count below needs, with block 10 fetched once, not as a tail.
+        Some(4),
         false,
         None,
         health,

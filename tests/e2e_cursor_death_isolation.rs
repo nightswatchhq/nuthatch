@@ -94,7 +94,8 @@ async fn spawn_cursor(
         None,
         false,
         1,
-        Some(2),
+        // One window over the backfill, so a padded block is fetched once, not again as a tail.
+        Some(10),
         false,
         None,
         health,

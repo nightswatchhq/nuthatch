@@ -11,7 +11,11 @@ Symptom → what to look at (`/metrics`, Prometheus) → remedy. All `/metrics` 
 - Watch `nuthatch_rows_decoded_total` / `nuthatch_last_block` climb. On a TTY, `dev` shows a live progress
   line with events/sec + ETA; if it's frozen, it's the concurrency stall above.
 - A *sparse* contract over millions of blocks looks slow because each window is near-empty - widen it:
-  `--window 50000`.
+  `--window 50000`. That is also the widest range it will ask for, so keep it within the provider's
+  `getLogs` range cap.
+- An endpoint in the pool answering 429 is rested for its `Retry-After` (or the usual cooldown) and the
+  rest of the pool serves the range; only when every endpoint is rate-limiting does the backfill slow
+  down, and the log says so.
 
 ## "block N alone exceeds the provider's getLogs result cap"
 

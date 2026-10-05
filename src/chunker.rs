@@ -252,6 +252,14 @@ impl AdaptiveWindow {
         self.max = self.learned.map_or(self.hard_max, |l| l.min(self.hard_max));
         self.window = self.window.min(self.max);
     }
+
+    /// Lower the ceiling to an operator's explicit `--window` (#1853), never raise it.
+    pub fn capped_at(mut self, ceiling: Option<u64>) -> Self {
+        if let Some(c) = ceiling {
+            self.set_max(c.min(self.hard_max));
+        }
+        self
+    }
 }
 
 /// Whether an RPC error looks like a result-size / range cap (so the caller shrinks and retries the

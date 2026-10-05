@@ -1447,11 +1447,12 @@ pub struct DevArgs {
     #[arg(long, default_value = "300s", value_name = "DURATION", value_parser = crate::freshness::parse_span)]
     pub ipfs_window_deadline: std::time::Duration,
 
-    /// Override the `eth_getLogs` block-window (the chain default otherwise). For a *sparse* contract
-    /// over a long backfill - few events across many blocks - a large window (e.g. 50000) turns tens
-    /// of thousands of near-empty requests into a few, so a from-history backfill finishes in minutes.
-    /// Keep it under your provider's max block-range for `getLogs` (many allow 100k+ when the result
-    /// set is small); the concurrent backfill fails the range rather than auto-shrinking it.
+    /// The widest `eth_getLogs` block range to ask for, and where the adaptive window starts. Without
+    /// it the window starts at the chain default and grows over empty ranges, to 100000 blocks for a
+    /// nest that reads only logs. With
+    /// it no request spans more than this many blocks; the window still shrinks below it when a
+    /// provider refuses a range or a range is dense. Set it to your provider's `getLogs` block-range
+    /// limit, or high (e.g. 50000) to cross a sparse contract's history in few requests.
     #[arg(long)]
     pub window: Option<u64>,
 

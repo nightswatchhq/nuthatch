@@ -587,7 +587,7 @@ SQL surfaces). Full key reference:
 | `--rpc-fallback` | endpoint(s) asked only while every other endpoint is failing. Repeatable. Put a paid key here behind free endpoints and it bills only for what they could not answer. Otherwise endpoints share the load round-robin, so a paid key in `--rpc` takes its share of every call. Single-chain runtimes only |
 | `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Prerequisite for `--concurrency`; the storage path alone is not a speedup. Current figures: [benchmarks.md](benchmarks.md) |
 | `--concurrency` | concurrent window fetches during seal-direct backfill. 8-16 against your own node; low on rate-limited public RPC |
-| `--window` | override the `eth_getLogs` block window. A *sparse* contract wants a large window (50k) to turn thousands of near-empty requests into a few. Keep under your provider's range cap |
+| `--window` | the widest `eth_getLogs` block range nuthatch asks for, and where its adaptive window starts. Without it the window starts at the chain default and grows over empty ranges (to 100,000 blocks for a log-only nest); with it no request is wider than this, though it still shrinks when a provider refuses a range. Set it to your provider's range cap, or high (50k) for a *sparse* contract |
 | `--backfill N` | index only the last N blocks (recent-history mode) |
 | `--no-admin` | remove the admin UI routes entirely. Use it when you front your own dashboard |
 | `--fail-fast` | exit on first fault instead of quarantining. For CI and operators who prefer fail-stop |
@@ -678,8 +678,9 @@ runtimes, bundles - is chain-agnostic and behaves exactly as it does on a built-
    **20-block** `eth_getLogs` window, because nuthatch has no per-chain policy for it. Depth-64 is the
    Ethereum-L1-shaped assumption; if your chain finalises differently - a fast L2, or one with deeper
    reorgs - that default is a guess, and the conservative direction is *deeper*. The 20-block window is
-   deliberately small and will make a long backfill crawl: raise it with `--window` (a sparse contract
-   can often take 50000) up to whatever your provider's range cap allows.
+   deliberately small: it grows over empty ranges, but a long backfill starts slowly. Start it wider
+   with `--window` (a sparse contract can often take 50000), which is also the widest range nuthatch
+   will then ask for, so keep it within your provider's range cap.
 2. **`chain_id` is enforced.** Every endpoint in `rpc_urls` is checked against it at startup and a
    mismatch is refused, because indexing against the wrong chain corrupts state silently. Get the id
    right and the pool stays honest; get it wrong and nuthatch tells you immediately rather than three

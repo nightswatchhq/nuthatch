@@ -151,6 +151,9 @@ pub fn select_rpcs(
 /// outage fails over fast instead of stalling the tip loop.
 const ENDPOINT_COOLDOWN_MS: u64 = 30_000;
 
+/// The first rest after a 429 that named no `Retry-After` (#1853).
+const RATE_LIMIT_PAUSE_MS: u64 = 1_000;
+
 /// A *terminal* failure (bad credentials, endpoint refusing us outright) earns a much longer cooldown
 /// than a transient one: asking again in 30s will get the same 401, and a tight retry loop against a
 /// 403 is exactly how a production nest spent forty minutes logging nothing useful (RFC-0028 §3).
@@ -258,6 +261,9 @@ fn escalate_pool_wide_rate_limit(
 #[derive(Default)]
 struct PoolFailures {
     other: Option<anyhow::Error>,
+    /// A 429 is about our pacing at that endpoint, so another endpoint's answer outranks it (#1853):
+    /// as the last error it hid a healthy endpoint's range cap, and the window never narrowed.
+    limited: Option<anyhow::Error>,
     pruned: Vec<String>,
     last_pruned: Option<anyhow::Error>,
 }
@@ -267,15 +273,23 @@ impl PoolFailures {
         if matches!(class_of(&e), Some(FailureClass::HistoryUnavailable)) {
             self.pruned.push(redact_url(url));
             self.last_pruned = Some(e);
+        } else if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
+            self.limited = Some(e);
         } else {
             self.other = Some(e);
+        }
+    }
+
+    fn rested(&mut self, resting: Option<anyhow::Error>) {
+        if self.limited.is_none() {
+            self.limited = resting;
         }
     }
 
     fn verdict(self, attempts: usize, rate_limited: usize) -> anyhow::Error {
         let remedy = "supply an archive-capable RPC with `--rpc` or `rpc_urls`";
         let pruned = self.pruned.join(", ");
-        match (self.other, self.last_pruned) {
+        match (self.other.or(self.limited), self.last_pruned) {
             (None, Some(e)) => anyhow::Error::new(ClassifiedError {
                 class: FailureClass::HistoryUnavailable,
                 detail: format!(
@@ -757,6 +771,11 @@ pub struct RpcClient {
     /// (`0` = healthy). Set on a failed call, cleared on a successful one. Endpoints past their cooldown
     /// are tried first; still-unhealthy ones are the fallback of last resort (soonest-to-recover first).
     health: Vec<AtomicU64>,
+    /// Millis-since-epoch until which an endpoint that answered 429 is not asked at all, not even as
+    /// the last resort a cooling endpoint otherwise is (#1853). `0` = not resting.
+    limited: Vec<AtomicU64>,
+    /// 429s without a hint in a row per endpoint, which double its rest; cleared by an answer.
+    limited_streak: Vec<AtomicU64>,
     /// The highest block each endpoint has reported from `eth_blockNumber`, so a lower bound on its
     /// head. Pool members' heads differ by a block or two, and one behind refuses a `toBlock` it lacks.
     heads: Vec<AtomicU64>,
@@ -792,12 +811,16 @@ impl RpcClient {
             .map_or(MAX_TIMESTAMP_BATCH, |cap| cap.clamp(1, MAX_TIMESTAMP_BATCH));
         let health = urls.iter().map(|_| AtomicU64::new(0)).collect();
         let heads = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        let limited = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        let limited_streak = urls.iter().map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             http,
             urls,
             cursor: AtomicUsize::new(0),
             primaries: n,
             health,
+            limited,
+            limited_streak,
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
@@ -871,6 +894,9 @@ impl RpcClient {
         let mut cooling = Vec::with_capacity(n);
         for i in 0..n {
             let j = if i < p { (start + i) % p } else { i };
+            if self.limited[j].load(Ordering::Relaxed) > now {
+                continue;
+            }
             let until = self.health[j].load(Ordering::Relaxed);
             if until <= now {
                 healthy.push(j);
@@ -887,6 +913,74 @@ impl RpcClient {
 
     fn mark_healthy(&self, j: usize) {
         self.health[j].store(0, Ordering::Relaxed);
+        self.limited_streak[j].store(0, Ordering::Relaxed);
+    }
+
+    /// A 429 rests the endpoint for as long as it asked, within [`clamp_retry_hint`]'s cap. Without a
+    /// hint the rest starts at [`RATE_LIMIT_PAUSE_MS`] and doubles per 429 in a row, up to the
+    /// ordinary cooldown: a lone public endpoint usually throttles per second.
+    fn mark_rate_limited(&self, j: usize, retry_after: Option<Duration>) {
+        self.mark_unhealthy(j);
+        let rest = match retry_after {
+            Some(hint) => clamp_retry_hint(hint, Duration::ZERO),
+            None => {
+                let streak = self.limited_streak[j].fetch_add(1, Ordering::Relaxed);
+                Duration::from_millis(
+                    RATE_LIMIT_PAUSE_MS
+                        .saturating_mul(1 << streak.min(16))
+                        .min(ENDPOINT_COOLDOWN_MS),
+                )
+            }
+        };
+        self.limited[j].store(now_millis() + rest.as_millis() as u64, Ordering::Relaxed);
+        tracing::debug!(
+            "rpc {} rate-limited us; not asking it again for {rest:?}",
+            redact_url(&self.urls[j])
+        );
+    }
+
+    /// The endpoints a call left out of `asked` because they are resting after a 429, as one failure,
+    /// so a verdict drawn from the rest does not speak for the whole pool.
+    fn resting(&self, asked: &[usize]) -> Option<anyhow::Error> {
+        let resting: Vec<String> = (0..self.urls.len())
+            .filter(|j| !asked.contains(j))
+            .map(|j| redact_url(&self.urls[j]))
+            .collect();
+        (!resting.is_empty()).then(|| {
+            anyhow::Error::new(ClassifiedError {
+                class: FailureClass::RateLimited { retry_after: None },
+                detail: format!("not asked while rate-limiting us: {}", resting.join(", ")),
+            })
+        })
+    }
+
+    /// Every endpoint is resting after a 429: wait for the soonest, then try only those now free. A
+    /// rest is at most [`ENDPOINT_COOLDOWN_MS`], so a throttled pool slows the run and never spins,
+    /// nor stops.
+    async fn wait_out_rate_limits(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.urls.len()).collect();
+        order.sort_by_key(|&j| self.limited[j].load(Ordering::Relaxed));
+        let wait = self.limited[order[0]]
+            .load(Ordering::Relaxed)
+            .saturating_sub(now_millis());
+        let wait = Duration::from_millis(wait);
+        tracing::warn!(
+            "every RPC endpoint ({}) is rate-limiting us; waiting {wait:?} as asked before trying \
+             again",
+            self.urls.len()
+        );
+        retry_pause(wait).await;
+        let now = now_millis();
+        let free: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&j| self.limited[j].load(Ordering::Relaxed) <= now)
+            .collect();
+        if free.is_empty() {
+            order.truncate(1);
+            return order;
+        }
+        free
     }
 
     fn mark_unhealthy(&self, j: usize) {
@@ -913,6 +1007,9 @@ impl RpcClient {
     fn record_failure(&self, j: usize, method: &str, err: &anyhow::Error) {
         match class_of(err) {
             Some(FailureClass::Terminal) => self.mark_terminal(j, method, &err.to_string()),
+            Some(FailureClass::RateLimited { retry_after }) => {
+                self.mark_rate_limited(j, retry_after)
+            }
             _ => {
                 self.mark_unhealthy(j);
                 tracing::debug!(
@@ -956,7 +1053,11 @@ impl RpcClient {
         let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
-        for j in self.endpoint_order_holding(need) {
+        let mut order = self.endpoint_order_holding(need);
+        if order.is_empty() {
+            order = self.wait_out_rate_limits().await;
+        }
+        for &j in &order {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
@@ -989,6 +1090,7 @@ impl RpcClient {
                 }
             }
         }
+        failures.rested(self.resting(&order));
         Err(failures.verdict(attempts, rate_limited))
     }
 
@@ -998,7 +1100,11 @@ impl RpcClient {
         let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
-        for j in self.endpoint_order() {
+        let mut order = self.endpoint_order();
+        if order.is_empty() {
+            order = self.wait_out_rate_limits().await;
+        }
+        for &j in &order {
             let url = &self.urls[j];
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
@@ -1049,6 +1155,7 @@ impl RpcClient {
                 }
             }
         }
+        failures.rested(self.resting(&order));
         Err(failures.verdict(attempts, rate_limited))
     }
 
@@ -2032,10 +2139,17 @@ fn parse_hex_u64(s: &str) -> Result<u64> {
 /// Wall-clock millis since the epoch - used only for endpoint-health cooldowns (a coarse "try again
 /// after" timer), never for anything in the deterministic data path.
 fn now_millis() -> u64 {
-    std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    // A recorded pause stands in for a sleep, so the clock that rests endpoints must see it pass.
+    #[cfg(test)]
+    let now = now
+        + RETRY_PAUSES
+            .try_with(|p| p.borrow().iter().sum::<Duration>().as_millis() as u64)
+            .unwrap_or(0);
+    now
 }
 
 /// Reduce an RPC URL to `scheme://host[:port]` for logging - provider endpoints routinely carry the API
@@ -2690,7 +2804,12 @@ mod tests {
         let (url, seen) = serve(true).await;
         let mut c = RpcClient::new(vec![url]).unwrap();
         c.header_width = 10;
-        assert!(c.block_timestamps(&[1, 2, 3, 4]).await.is_err());
+        // Recorded rather than slept: the endpoint rests a full cooldown after each 429 (#1853).
+        super::RETRY_PAUSES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                assert!(c.block_timestamps(&[1, 2, 3, 4]).await.is_err());
+            })
+            .await;
         let sent = seen.lock().unwrap().clone();
         assert!(
             sent.iter().all(|&n| n == 4),
@@ -4068,7 +4187,25 @@ mod rfc0036_tests {
                 expected.push(Duration::from_millis(250 * round));
             }
         }
-        assert_eq!(without_hint, expected);
+        // Without a hint the endpoint rests 1s, 2s, 4s… up to the cooldown (#1853), each longer than
+        // the loop's own pause, so the client waits out the remainder: the loop's pauses still appear
+        // in order, and the 31 gaps between requests add up to the rests, plus the final 800ms.
+        let mut own = expected.iter().peekable();
+        for p in &without_hint {
+            if own.peek() == Some(&p) {
+                own.next();
+            }
+        }
+        assert!(own.next().is_none(), "{without_hint:?}");
+        let rests: Duration = (0..31)
+            .map(|n| Duration::from_millis((1_000u64 << n.min(16)).min(ENDPOINT_COOLDOWN_MS)))
+            .sum::<Duration>()
+            + Duration::from_millis(800);
+        let total: Duration = without_hint.iter().sum();
+        assert!(
+            total <= rests && total > rests - Duration::from_secs(1),
+            "{total:?} against {rests:?}: {without_hint:?}"
+        );
     }
 
     /// A rate limit that carries no hint stays `None`, so the caller keeps its own pacing. This is
@@ -4214,7 +4351,8 @@ mod rfc0036_tests {
             }
         }
         assert!(pruned_hits.load(Ordering::Relaxed) >= 6);
-        assert!(throttled_hits.load(Ordering::Relaxed) >= 6);
+        // Once per client: a 429 is left to cool while another endpoint can still be asked (#1853).
+        assert_eq!(throttled_hits.load(Ordering::Relaxed), 2);
         hp.abort();
         ht.abort();
     }
@@ -4243,6 +4381,194 @@ mod rfc0036_tests {
         }
         hp.abort();
         hc.abort();
+    }
+
+    /// #1853: a 429 tried after the capped endpoint used to be the verdict, so the window never
+    /// narrowed and the same range went round for as long as the run lasted.
+    #[tokio::test]
+    async fn a_throttled_endpoint_does_not_hide_another_endpoints_cap() {
+        let (throttled, ht, _) = answering(429, NODIES_THROTTLED).await;
+        let (capped, hc, _) = answering(200, NODIES_CAPPED).await;
+        for urls in [
+            vec![throttled.clone(), capped.clone()],
+            vec![capped.clone(), throttled.clone()],
+        ] {
+            let err = RpcClient::new(urls)
+                .unwrap()
+                .get_logs(&["0xa0b8".into()], &[], 6_082_525, 6_082_604)
+                .await
+                .unwrap_err();
+            assert!(
+                crate::chunker::is_result_too_large(&err),
+                "the cap was lost: {err:#}"
+            );
+        }
+        ht.abort();
+        hc.abort();
+    }
+
+    /// The batch path's verdict also speaks for the endpoint it left to cool: once the throttled one
+    /// rests, the pruned one alone must not report that no endpoint keeps the history.
+    #[tokio::test]
+    async fn a_batch_left_to_a_pruned_endpoint_still_reports_the_throttle() {
+        let (pruned, hp, _) = answering(200, DRPC_PRUNED).await;
+        let (throttled, ht, _) = answering(429, NODIES_THROTTLED).await;
+        let c = RpcClient::new(vec![pruned, throttled]).unwrap();
+        let batch = serde_json::json!([{"jsonrpc": "2.0", "id": 0, "method": "eth_blockNumber"}]);
+        for _ in 0..3 {
+            let err = c.raw_batch(&batch).await.unwrap_err();
+            assert!(
+                matches!(class_of(&err), Some(FailureClass::RateLimited { .. })),
+                "{err:#}"
+            );
+        }
+        hp.abort();
+        ht.abort();
+    }
+
+    /// A pool that is all resting waits for the soonest, and an hour's `Retry-After` is held to the cap.
+    #[tokio::test]
+    async fn a_pool_resting_on_a_long_retry_after_waits_no_longer_than_the_cap() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+        async fn hour() -> impl IntoResponse {
+            (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "3600")], "")
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().route("/", post(hour))).await;
+        });
+        let c = RpcClient::new(vec![format!("http://{addr}/")]).unwrap();
+        let pauses = RETRY_PAUSES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                assert!(c.block_number().await.is_err());
+                assert!(c.block_number().await.is_err());
+                RETRY_PAUSES.with(|p| p.borrow().clone())
+            })
+            .await;
+        server.abort();
+        assert_eq!(c.request_count(), 2);
+        assert_eq!(pauses.len(), 1, "{pauses:?}");
+        assert!(
+            pauses[0] <= MAX_RETRY_HINT && pauses[0] > MAX_RETRY_HINT - Duration::from_secs(5),
+            "{pauses:?}"
+        );
+    }
+
+    /// A lone endpoint answering 429 with no hint, per request in turn: `true` is a 429, `false` an
+    /// answer. Returns the waits the client recorded across one call per entry.
+    async fn lone_endpoint_waits(script: &'static [bool]) -> Vec<Duration> {
+        use axum::{
+            extract::State, http::StatusCode, response::IntoResponse, routing::post, Router,
+        };
+        use std::sync::Arc;
+        let next = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/",
+                post(move |State(next): State<Arc<AtomicUsize>>| async move {
+                    let n = next.fetch_add(1, Ordering::SeqCst);
+                    if script[n.min(script.len() - 1)] {
+                        (StatusCode::TOO_MANY_REQUESTS, "").into_response()
+                    } else {
+                        axum::Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":"0x10"}))
+                            .into_response()
+                    }
+                }),
+            )
+            .with_state(next);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let c = RpcClient::new(vec![format!("http://{addr}/")]).unwrap();
+        let waits = RETRY_PAUSES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                for &throttled in script {
+                    assert_eq!(c.block_number().await.is_err(), throttled);
+                }
+                RETRY_PAUSES.with(|p| p.borrow().clone())
+            })
+            .await;
+        server.abort();
+        assert_eq!(c.request_count(), script.len() as u64);
+        waits
+    }
+
+    fn about(waits: &[Duration], want: &[u64]) -> bool {
+        waits.len() == want.len()
+            && waits.iter().zip(want).all(|(w, &s)| {
+                let s = Duration::from_secs(s);
+                *w <= s && *w > s - Duration::from_millis(500)
+            })
+    }
+
+    /// #1853: a lone endpoint that 429s without a hint is asked again after 1s, then 2s, not after
+    /// the 30s cooldown, and an answer starts the doubling over.
+    #[tokio::test]
+    async fn a_lone_endpoint_without_a_hint_rests_one_second_then_two_and_an_answer_resets_it() {
+        let waits = lone_endpoint_waits(&[true, true, false, true, false]).await;
+        assert!(about(&waits, &[1, 2, 1]), "{waits:?}");
+    }
+
+    /// The doubling stops at the ordinary cooldown.
+    #[tokio::test]
+    async fn the_doubling_rest_stops_at_the_cooldown() {
+        let waits = lone_endpoint_waits(&[true; 8]).await;
+        assert!(about(&waits, &[1, 2, 4, 8, 16, 30, 30]), "{waits:?}");
+    }
+
+    /// With every endpoint resting, the wait ends when the soonest rest does, and only the endpoints
+    /// whose rest is over are asked: one resting 16s is not asked when one resting 1s comes free.
+    #[tokio::test]
+    async fn a_pool_waiting_out_its_rests_asks_only_the_endpoints_that_are_free() {
+        use axum::{
+            extract::State, http::StatusCode, response::IntoResponse, routing::post, Router,
+        };
+        use std::sync::Arc;
+        async fn serve(retry_after: Option<&'static str>) -> (String, Arc<AtomicUsize>) {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .route(
+                    "/",
+                    post(move |State(hits): State<Arc<AtomicUsize>>| async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let mut resp = (StatusCode::TOO_MANY_REQUESTS, "").into_response();
+                        if let Some(secs) = retry_after {
+                            resp.headers_mut()
+                                .insert("retry-after", secs.parse().unwrap());
+                        }
+                        resp
+                    }),
+                )
+                .with_state(hits.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            (format!("http://{addr}/"), hits)
+        }
+        let (short, short_hits) = serve(None).await;
+        let (long, long_hits) = serve(Some("16")).await;
+        let c = RpcClient::new(vec![short, long]).unwrap();
+        let pauses = RETRY_PAUSES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                assert!(c.block_number().await.is_err());
+                assert!(c.block_number().await.is_err());
+                RETRY_PAUSES.with(|p| p.borrow().clone())
+            })
+            .await;
+        assert!(about(&pauses, &[1]), "{pauses:?}");
+        assert_eq!(
+            (
+                short_hits.load(Ordering::SeqCst),
+                long_hits.load(Ordering::SeqCst)
+            ),
+            (2, 1),
+            "the 16s rest was cut short"
+        );
     }
 
     /// When every endpoint is pruned no retry can help, so the verdict says so, names them all, and

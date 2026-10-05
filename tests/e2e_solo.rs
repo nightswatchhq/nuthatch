@@ -54,7 +54,8 @@ async fn drive_land_seal_query(dir: &std::path::Path) -> Vec<String> {
         None,
         false,
         1,
-        Some(2),
+        // One window over the backfill, so a padded block is fetched once, not again as a tail.
+        Some(10),
         false,
         None,
     )
@@ -766,7 +767,8 @@ async fn compatible_upgrade_reuses_sealed_segments_when_decode_unchanged() {
             None,
             false,
             1,
-            Some(2),
+            // One window over the backfill, so a padded block is fetched once, not again as a tail.
+            Some(10),
             false,
             None,
         )
@@ -899,7 +901,8 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
         None,
         false,
         1,
-        Some(2),
+        // One window over the backfill, so a padded block is fetched once, not again as a tail.
+        Some(10),
         false,
         None,
     )
@@ -1566,7 +1569,8 @@ async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_
         None,
         false,
         1,
-        Some(2),
+        // One window over the backfill, so a padded block is fetched once, not again as a tail.
+        Some(6),
         false,
         None,
     )
