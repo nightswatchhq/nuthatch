@@ -39,12 +39,12 @@ non-negotiables below, stop and flag it instead of proceeding.
 **Embedded mode (default):** single process. Ingestion (RPC extraction with aggressive
 batching, Cryo-style; optional reth ExEx when colocated with a node) → deterministic decode →
 hot tip store (redb) for entity point-reads → sealed content-addressed Parquet segments past
-finality → DuckDB attaching segments **read-only** for analytical SQL. DuckDB is single-writer:
-only the ingestion thread writes; queries attach read-only. Never design around concurrent
-DuckDB writers.
+finality → Burrmill (DataFusion) reading the segments **read-only** for analytical SQL, since 4.1
+(DuckDB until then). Only the ingestion thread writes segments; queries only read them. Never
+design around concurrent segment writers.
 
 **Scaled mode (docker-compose):** same crates, Postgres replaces redb for the hot store,
-DataFusion federates hot + cold behind one SQL surface. Feature-flag the storage backend
+the same Burrmill engine serves hot + cold behind one SQL surface. Feature-flag the storage backend
 behind a trait; no `#[cfg]` forks of business logic.
 
 **Multi-nest tenancy (in the runtime):** one runtime hosts **N nests**, across **one or more
@@ -169,7 +169,8 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 >
 > **The carve-out mechanism is retired with it.** All five carve-outs were taken and all five are
 > spent: RFC-0041 (authored incremental entities, shipped 3.0.0-alpha), RFC-0042 (the no-DuckDB
-> investigation, closed KEEP DuckDB at §14), RFC-0051 (Monad), RFC-0050 (Robinhood Chain) and
+> investigation, closed KEEP DuckDB at §14, superseded when Burrmill replaced DuckDB in 4.1),
+> RFC-0051 (Monad), RFC-0050 (Robinhood Chain) and
 > RFC-0040 (the freshness dial, shipped 3.5.0). Their reasoning lives in those RFCs and in the
 > release notes; it is not repeated here. Nothing needs a carve-out any more, because nothing is
 > frozen that a decision has not separately deferred.
@@ -245,8 +246,7 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred
 > RFC-0003, RFC-0023, RFC-0031, RFC-0033, RFC-0034 and RFC-0036 again on 2026-09-08, and closed
 > RFC-0013 and RFC-0021 the same day. Slice 6 below (ExEx, scaled mode) is not started. RFC-0042 is
-> parked to 2027-09-01 or a §14 trigger, and its fourth trigger still binds: **if RFC-0033 slice 4
-> (#357) is ever scheduled, reopen RFC-0042 before it, not after.**
+> moot: Burrmill replaced DuckDB in 4.1, so its trigger on RFC-0033 slice 4 (#357) no longer applies.
 >
 > **The out-of-scope list below is unchanged and still binds.** No hosted service, no token, no
 > non-EVM before EVM is airtight, no TEE or zk, no Kubernetes. The freeze ending widens what may be
@@ -272,7 +272,7 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 1. Skeleton: single binary, config, `init` (ABI fetch → generated project), RPC ingestion,
    decode, redb hot store, HTTP serving of entity point-reads. One chain (Ethereum). This
    slice alone must hit the <2-minute demo.
-2. Parquet sealing past finality + DuckDB read-only analytical SQL + reorg property tests.
+2. Parquet sealing past finality + DuckDB (Burrmill since 4.1) read-only analytical SQL + reorg property tests.
 3. DBSP declarative views (the IVM core) replacing hand-rolled entity updates.
 4. Transform runtime ported from liminal with batched Arrow WIT interfaces.
 5. MCP server + scaffolded skills + llms.txt.
