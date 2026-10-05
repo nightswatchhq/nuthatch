@@ -18,6 +18,7 @@ empty chain.
 
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 CHAIN_ID = 1
@@ -26,6 +27,18 @@ LOGS_PER_BLOCK = 4
 # `Transfer(address,address,uint256)`
 TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 CONTRACT = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+
+# `--moving` (tip-lag.sh): the tip advances one block per `fixture_advance` call, and the fixture
+# records when each block appeared and when an `eth_blockNumber` first reported it. Without it the
+# chain is fixed at TIP, as every other job expects.
+MOVING = "--moving" in sys.argv[2:]
+FINALITY = 64
+APPEARED = {}
+SEEN = {}
+
+
+def now_ms() -> float:
+    return time.time() * 1000
 
 
 def h(n: int) -> str:
@@ -61,14 +74,22 @@ def logs_for(from_block: int, to_block: int):
 
 
 def handle(req):
+    global TIP
     m = req.get("method")
     p = req.get("params") or []
     if m == "eth_chainId":
         return h(CHAIN_ID)
     if m == "eth_blockNumber":
+        if MOVING:
+            SEEN.setdefault(TIP, now_ms())
         return h(TIP)
     if m == "eth_getBlockByNumber":
         n = int(p[0], 16) if isinstance(p[0], str) and p[0].startswith("0x") else TIP
+        if MOVING:
+            if p[0] in ("finalized", "safe"):
+                n = max(TIP - FINALITY, 0)
+            if n > TIP:
+                return None
         return {
             "number": h(n),
             "hash": "0x" + f"{n:064x}",
@@ -82,6 +103,12 @@ def handle(req):
         f = TIP if f == "latest" else int(f, 16)
         t = TIP if t == "latest" else int(t, 16)
         return logs_for(f, t)
+    if MOVING and m == "fixture_advance":
+        TIP += 1
+        APPEARED[TIP] = now_ms()
+        return {"tip": TIP, "at": APPEARED[TIP]}
+    if MOVING and m == "fixture_seen":
+        return SEEN.get(int(p[0]))
     # Loudly, so an unimplemented method can never be mistaken for an empty chain.
     raise KeyError(m)
 
