@@ -1,5 +1,12 @@
 # Sprint: brisk-bunting
 
+**Closed 2026-10-05.** Every brisk-bunting issue is closed. 4.8.0, 4.9.0, 4.10.0 and 4.10.1 shipped;
+all six production nests run 4.10.1. The allocations nest derives its epochs from L1 block numbers and
+the hand-run table is gone; two fresh servers agree byte for byte on every production gate set and the
+gate compares floats exactly; tip lag is gated in CI; the quickstart runs in 10 s on Linux; QoS runs
+under an honest 2 GiB. Alongside it, the public mirror went live end to end at
+nuthatch-indexer.com/mirror. Next: candid-chaffinch.
+
 **Scoped 2026-10-05. Starts now: agile-avocet is closed bar #1851, whose PR Chief opens.**
 
 **Nothing in production depends on someone remembering to run it.**
