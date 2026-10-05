@@ -82,10 +82,10 @@ const FIELDS: [(&str, &str); 6] = [
     ("curator_query_fees", "curatorQueryFees"),
 ];
 
-/// Each epoch sits on one side of a measured boundary (1105 signal and fees, 1195 rewards); 1392
-/// is the open epoch.
-const EPOCHS: [u32; 11] = [
-    1104, 1105, 1106, 1194, 1195, 1301, 1302, 1380, 1390, 1391, 1392,
+/// Each epoch sits on one side of a measured boundary (signal and curator fees from 1, query fees
+/// from 290, rewards from 1195); 1392 is the open epoch.
+const EPOCHS: [u32; 13] = [
+    1, 2, 289, 290, 291, 1194, 1195, 1301, 1302, 1380, 1390, 1391, 1392,
 ];
 
 struct Fixture {
@@ -96,7 +96,8 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Every boundary disagrees just below itself and nowhere above.
+    /// Every boundary above epoch 1 disagrees just below itself and nowhere above; signal and curator
+    /// fees agree everywhere, which is what a boundary of 1 claims.
     fn new() -> Self {
         let mut deltas = BTreeMap::new();
         for f in [
@@ -106,9 +107,7 @@ impl Fixture {
         ] {
             deltas.insert((1194, f), 1);
         }
-        deltas.insert((1104, "signalled_tokens"), 3);
-        deltas.insert((1104, "query_fees_collected"), 1);
-        deltas.insert((1104, "curator_query_fees"), 1);
+        deltas.insert((289, "query_fees_collected"), 1);
         Fixture {
             deltas,
             source_1391: "observed",
@@ -264,11 +263,11 @@ fn the_fixture_without_a_shift_is_clean() {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("parity CLEAN at block 900"), "{text}");
     assert!(
-        text.contains("query_fees_collected 9/9 epochs agree from 1105 OK"),
+        text.contains("query_fees_collected 9/9 epochs agree from 290 OK"),
         "{text}"
     );
     assert!(
-        text.contains("signalled_tokens 9/9 epochs agree from 1105 OK"),
+        text.contains("signalled_tokens 12/12 epochs agree from 1 OK"),
         "{text}"
     );
     assert!(!text.contains("boundary shift"), "{text}");
@@ -281,7 +280,7 @@ fn a_shifted_pair_is_a_known_difference_naming_the_epochs() {
     let (code, text) = Fixture::new().shift(60, 6).run();
     assert_eq!(code, 2, "{text}");
     assert!(
-        text.contains("query_fees_collected 7/9 epochs agree from 1105 KNOWN-DIFF (#1819)"),
+        text.contains("query_fees_collected 7/9 epochs agree from 290 KNOWN-DIFF (#1819)"),
         "{text}"
     );
     assert!(
@@ -305,7 +304,7 @@ fn a_shifted_pair_plus_a_real_discrepancy_fails() {
         .run();
     assert_eq!(code, 1, "{text}");
     assert!(
-        text.contains("query_fees_collected 6/9 epochs agree from 1105 DIFF"),
+        text.contains("query_fees_collected 6/9 epochs agree from 290 DIFF"),
         "{text}"
     );
     assert!(text.contains("epoch 1380 nest=1000005"), "{text}");
@@ -321,7 +320,7 @@ fn a_pair_that_nets_out_but_is_not_in_the_window_fails() {
     let (code, text) = Fixture::new().shift(50, 6).run();
     assert_eq!(code, 1, "{text}");
     assert!(
-        text.contains("query_fees_collected 7/9 epochs agree from 1105 DIFF"),
+        text.contains("query_fees_collected 7/9 epochs agree from 290 DIFF"),
         "{text}"
     );
     assert!(!text.contains("boundary shift"), "{text}");
@@ -336,7 +335,7 @@ fn a_pair_that_traces_but_does_not_net_to_zero_fails() {
         .run();
     assert_eq!(code, 1, "{text}");
     assert!(
-        text.contains("query_fees_collected 7/9 epochs agree from 1105 DIFF"),
+        text.contains("query_fees_collected 7/9 epochs agree from 290 DIFF"),
         "{text}"
     );
 }
@@ -367,27 +366,27 @@ fn no_shift_is_excused_across_an_exact_boundary() {
     assert!(!text.contains("boundary shift"), "{text}");
 }
 
-/// Fees that also agree at 1104 make 1105 too high: the constant would exclude comparable data.
+/// Fees that also agree at 289 make 290 too high: the constant would exclude comparable data.
 #[test]
 fn a_fee_boundary_set_too_high_fails_the_self_check() {
-    let (code, text) = Fixture::new().delta(1104, "query_fees_collected", 0).run();
+    let (code, text) = Fixture::new().delta(289, "query_fees_collected", 0).run();
     assert_eq!(code, 1, "{text}");
     assert!(
         text.contains(
-            "BOUNDARY query_fees_collected: the lowest epoch at which the property holds is 1104, not the configured 1105 - the constant is too high"
+            "BOUNDARY query_fees_collected: the lowest epoch at which the property holds is 1, not the configured 290 - the constant is too high"
         ),
         "{text}"
     );
 }
 
-/// Fees that still disagree at 1105 make 1105 too low: it claims more than it can show.
+/// Curator fees that disagree at epoch 1 make 1 too low: it claims more than it can show.
 #[test]
 fn a_fee_boundary_set_too_low_fails_the_self_check() {
-    let (code, text) = Fixture::new().delta(1105, "curator_query_fees", 1).run();
+    let (code, text) = Fixture::new().delta(1, "curator_query_fees", 1).run();
     assert_eq!(code, 1, "{text}");
     assert!(
         text.contains(
-            "BOUNDARY curator_query_fees: the lowest epoch at which the property holds is 1106, not the configured 1105 - the constant is too low"
+            "BOUNDARY curator_query_fees: the lowest epoch at which the property holds is 2, not the configured 1 - the constant is too low"
         ),
         "{text}"
     );
@@ -397,13 +396,13 @@ fn a_fee_boundary_set_too_low_fails_the_self_check() {
 #[test]
 fn a_signalled_tokens_adjacent_pair_fails() {
     let (code, text) = Fixture::new()
-        .delta(1105, "signalled_tokens", 7)
-        .delta(1106, "signalled_tokens", -7)
+        .delta(1, "signalled_tokens", 7)
+        .delta(2, "signalled_tokens", -7)
         .run();
     assert_eq!(code, 1, "{text}");
     assert!(
-        text.contains("signalled_tokens 7/9 epochs agree from 1105 DIFF"),
+        text.contains("signalled_tokens 10/12 epochs agree from 1 DIFF"),
         "{text}"
     );
-    assert!(text.contains("epoch 1105 nest=1000007"), "{text}");
+    assert!(text.contains("epoch 1 nest=1000007"), "{text}");
 }
