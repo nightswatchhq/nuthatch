@@ -1,0 +1,30 @@
+{
+  "bench": "backfill",
+  "label": "OBIB case 6: UniV2 factory templates - PairCreated + Swap on discovered pairs, blocks 19,000,000-19,010,000",
+  "nest": "obib-case6",
+  "chain": "mainnet",
+  "from_block": 19000000,
+  "to_block": 19010000,
+  "blocks": 10001,
+  "initial_window": 20,
+  "window_adaptive": true,
+  "seal_direct": true,
+  "concurrency": 1,
+  "runs": 5,
+  "events": 35271,
+  "wall_clock_s": 4.67,
+  "events_per_sec": 7545.64,
+  "peak_rss_mb": 229,
+  "rpc_requests": 14,
+  "factory": true,
+  "children": 232,
+  "calls_declared": 0,
+  "calls_resolved": 0,
+  "events_declared": [
+    "PairCreated"
+  ],
+  "commit": "da4dc65",
+  "provider": "mainnet.gateway.tenderly.co",
+  "hardware": "18 cores, 48 GB RAM",
+  "work_backing": "disk"
+}
