@@ -1785,9 +1785,14 @@ max_rows = 10000
     }
     tape.advance_tip_to(16);
     let entity = &rt.state.entities[0];
+    let store = &rt.state.store;
+    // Entities fold a window before the store commits it, so the watermark alone can lead the rows
+    // the reference reads.
     let applied = wait_until(POLL_TIMEOUT, || {
         let (_, a) = entity.len_and_watermark();
-        a.through == 16 && a.offchain.get("prices").is_some_and(|m| m.snapshots == 2)
+        a.through == 16
+            && a.offchain.get("prices").is_some_and(|m| m.snapshots == 2)
+            && store.get_meta("last_block").ok().flatten().as_deref() == Some("16")
     })
     .await;
     assert!(applied, "the second snapshot never reached the entity");
