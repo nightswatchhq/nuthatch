@@ -166,14 +166,33 @@ else
   ! systemctl is-active -q "$STAGED" || die "$STAGED is active; it must stay stopped after the swap"
   get "$PP/ready" >/dev/null || die "$PP is not ready, so what it serves cannot be checked"
   [ "$(invariant "$PP")" = "$INVARIANT_WANT" ] || die "$PP answers the invariant as $(invariant "$PP"), not the swapped-in $INVARIANT_WANT; nothing moved"
+  moved_new=0 moved_old=0
+  # A failed move, a failed start or a stop of this unit between the moves: put the swapped-in
+  # directory back where it was serving, so the rollback is abandoned rather than half done.
+  unroll() {
+    trap - ERR TERM INT HUP; set +e
+    say "putting the swapped-in directory back at $P"
+    systemctl stop "$PROD" || true
+    # Each flag is set before its move, since a signal lands between the two: what is actually at
+    # $P decides, so an interrupted move is undone and a failed one is not repeated.
+    if [ "$moved_old" = 1 ] && [ -d "$P" ]; then mv "$P" "$OLD"; fi
+    if [ "$moved_new" = 1 ] && [ ! -e "$P" ]; then mv "$L" "$P"; fi
+    systemctl start "$PROD"
+    wait_ready "$PP" 900 && [ "$(invariant "$PP")" = "$INVARIANT_WANT" ] \
+      && say "ROLLBACK ABANDONED: $PP serves the swapped-in directory again (invariant $INVARIANT_WANT); $OLD is intact" \
+      || say "ROLLBACK ABANDONED AND $PP DID NOT COME BACK ON THE SWAPPED-IN DIRECTORY: look at journalctl -u $PROD now"
+    exit 1
+  }
+  trap unroll ERR TERM INT HUP
   systemctl stop "$PROD"
-  mv "$P" "$L"
-  mv "$OLD" "$P"
+  moved_new=1; mv "$P" "$L"
+  moved_old=1; mv "$OLD" "$P"
   systemctl start "$PROD"
-  wait_ready "$PP" 900 || die "$PP not ready after 15 minutes; journalctl -u $PROD"
-  [ "$(nid "$PP")" = "$old_nid" ] || die "$PP reports $(nid "$PP"), not $old_nid"
-  [ "$(invariant "$PP")" = "$old_inv" ] || die "$PP answers the invariant as $(invariant "$PP"), not the old $old_inv"
-  smoke "$PP" || die "$PP failed the smoke"
+  wait_ready "$PP" 900 || { say "$PP not ready after 15 minutes; journalctl -u $PROD"; false; }
+  [ "$(nid "$PP")" = "$old_nid" ] || { say "$PP reports $(nid "$PP"), not $old_nid"; false; }
+  [ "$(invariant "$PP")" = "$old_inv" ] || { say "$PP answers the invariant as $(invariant "$PP"), not the old $old_inv"; false; }
+  smoke "$PP" || false
+  trap - ERR TERM INT HUP
   say "ROLLED BACK: $PP serves $old_nid with invariant $old_inv. The staged directory is back at $L ($STAGED is stopped)."
 fi
 REMOTE
