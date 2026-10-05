@@ -356,7 +356,7 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 | `ingestion_reservation` | `NUTHATCH_INGESTION_RESERVATION` | derived: 1024MB | the ingest path: runtime, decode, DBSP, redb. The derived 1024 is the remainder of today's 2 GiB split after 2 × 512 MB of analytics, **not** a measurement, and it also covers `runtime_headroom` below. Raising it is always allowed. Lowering it is allowed only together with a measured `runtime_headroom`, and never below 256MB; alone it is refused, because the 1024 also stands for what statements hold outside the pool (#1241, #1899) |
 | the engine's limit | `NUTHATCH_BURRMILL_MEMORY_LIMIT` | `analytics.memory_limit` | takes the place of `analytics.memory_limit` where set, shared the same way, and is what each pool counts at in the split. Kept from the releases that carried two engines |
 | the wall | `NUTHATCH_MAX_RSS` | 2048MB | the ceiling the split is held to, for a process given more than 2 GiB. **Raise-only**, and a statement by the operator, not a measurement: the footprint job measures the default and nothing above it |
-| `runtime_headroom` | `NUTHATCH_RUNTIME_HEADROOM` | 0 (inside the derived reservation) | what the process holds outside the engine pool while it answers: decoded scan batches and results, which the pool does not count. Set it from a measurement, and with it the reservation may be measured too |
+| `runtime_headroom` | `NUTHATCH_RUNTIME_HEADROOM` | 0 (inside the derived reservation) | what the process holds outside the engine pool while it answers: the runtime, the unsealed rows each statement reads from the hot store, the segment lists it binds, and pages the allocator has not yet returned. Set it from a measurement, and with it the reservation may be measured too |
 
 Sizes accept `512`, `512MB`, `1GB`, `2GiB`. `NUTHATCH_SQL_MAX_CONCURRENCY` remains the permit
 count, still capped at 16, and is **not** an unconstrained config key. `analytics.threads` shares
@@ -377,7 +377,11 @@ that runs it:
 - `NUTHATCH_INGESTION_RESERVATION`: the VmHWM of `nuthatch dev` on the copy with no queries, over a
   catch-up and a few polls. The QoS nest: 372 MiB.
 - `NUTHATCH_RUNTIME_HEADROOM`: from four release-gate runs, the largest peak RSS less the pool held
-  at that peak. The gate prints both. The QoS nest, at 4 threads: up to 1,200 MiB, so 1,216 MB.
+  at that peak. The gate reads the pool every 0.5 s, so its reading can come from a moment other
+  than the high-water mark; read `nuthatch_rss_bytes` and `nuthatch_analytics_pool_reserved_bytes`
+  from `/metrics` together a few times a second and take the pool at the largest RSS. The QoS nest,
+  at 4 threads: up to 931 MiB over twelve runs, so 960 MB. Before burrmill 1a1e326 it was up to
+  1,200 MiB, and the pool had to be 1.25 GiB rather than 704 MB for every statement to answer.
 
 Round each up. The headroom grows with `analytics.threads` and with how much a statement scans, so
 measure again when either changes. A pool sized from these may still be too small for a statement

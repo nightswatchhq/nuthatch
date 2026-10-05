@@ -12,9 +12,11 @@ host=${QOS_HOST:-thinkpad}
 unit=qos-reo-nest
 smoke_dir=${SMOKE_DIR:-$HOME/Projects/kittiwake/nuthatch-gate/smoke}
 repo=$(cd "$(dirname "$0")/.." && pwd)
-# Held to 2 GiB by the kernel: inside MemoryMax=2G the gate peaked at 1717 to 1792 MiB, nine of nine
-# answered. MAX_RSS is 4.8.0's arithmetic for this pool (1536 + its 1024 MB floor), not the budget (#1899).
-settings="NUTHATCH_BURRMILL_MEMORY_LIMIT=1536MB NUTHATCH_ANALYTICS_THREADS=4 NUTHATCH_MAX_RSS=2560MB"
+# Measured on burrmill 1a1e326 (#1899): ingest 372 MiB, up to 931 MiB outside the pool at the gate's
+# peak over twelve runs. 704 + 384 + 960 = 2048; four gate runs inside MemoryMax=2G peaked at 1316 to
+# 1349 MiB, nine of nine answering. Needs a release with that burrmill and this check: 4.8.0 refuses
+# the reservation, and an older burrmill refuses indexer_day at 704 MB.
+settings="NUTHATCH_BURRMILL_MEMORY_LIMIT=704MB NUTHATCH_ANALYTICS_THREADS=4 NUTHATCH_MAX_RSS=2048MB NUTHATCH_INGESTION_RESERVATION=384MB NUTHATCH_RUNTIME_HEADROOM=960MB"
 
 [ -f "$repo/scripts/deploy-nest.sh" ] || { echo "no scripts/deploy-nest.sh under $repo" >&2; exit 2; }
 [ -f "$smoke_dir/$unit.sql" ] || { echo "no $smoke_dir/$unit.sql: clone nightswatchhq/kittiwake or set SMOKE_DIR" >&2; exit 2; }
@@ -32,7 +34,7 @@ sudo -n bash "$d/deploy-nest.sh" env "$UNIT" $SETTINGS --smoke "$d/$UNIT.sql" \
   || { sudo -n cp "$d/zzz-engine.conf.prev" "$cap"; sudo -n systemctl daemon-reload; sudo -n systemctl restart "$UNIT"; exit 1; }
 env_file=$HOME/release-gate/env/qos-nest.env
 pid=$(systemctl show -p MainPID --value "$UNIT")
-keys="NUTHATCH_(SQL_MAX_CONCURRENCY|ANALYTICS_MEMORY_LIMIT|ANALYTICS_THREADS|ANALYTICS_MAX_TEMP_SIZE|ENGINE|BURRMILL_MEMORY_LIMIT|MAX_RSS|SQL_MEMO_BYTES|HOT_STORE_CACHE_BYTES|INGESTION_RESERVATION)"
+keys="NUTHATCH_(SQL_MAX_CONCURRENCY|ANALYTICS_MEMORY_LIMIT|ANALYTICS_THREADS|ANALYTICS_MAX_TEMP_SIZE|ENGINE|BURRMILL_MEMORY_LIMIT|MAX_RSS|SQL_MEMO_BYTES|HOT_STORE_CACHE_BYTES|INGESTION_RESERVATION|RUNTIME_HEADROOM)"
 body=$(sudo -n cat "/proc/$pid/environ" | tr "\0" "\n" | grep -E "^$keys=")
 { echo "# Production environment of $UNIT on this box, the NUTHATCH_* budget settings read from its running"
   echo "# process on $(date -u +%Y-%m-%dT%H:%M:%SZ) by qos-budget-from-mac.sh. Re-run the installer when the unit changes."
