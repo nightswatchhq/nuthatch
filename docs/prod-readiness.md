@@ -3,7 +3,8 @@
 The bar a nuthatch release must clear before it's pointed at someone's real workload, unattended.
 Reconciled against [CLAUDE.md](../CLAUDE.md) (non-negotiables + build order), the
 [RFC series](rfcs/README.md), the [issue queue](https://github.com/nightswatchhq/nuthatch/issues), and
-[CI](../.github/workflows/ci.yml) on **2026-08-20** (repo at `2.6.0`).
+[CI](../.github/workflows/ci.yml) on **2026-08-20** (repo at `2.6.0`), and re-read against **4.10.1**
+on 2026-10-05 for the engine rows, the benchmark gates and the state of every issue it cites.
 
 This is a *standing* checklist - the target, not a claim it's all done. Status reflects what's
 verifiable today. When you cut a release, walk it top to bottom and update the flags with evidence.
@@ -49,8 +50,8 @@ shipping.
 If any of these is ❌ the release does not go out, full stop. These are the CLAUDE.md invariants.
 
 - [ ] ✅ **Single static binary, zero external services in embedded mode.** `curl | sh` → `init` →
-  `dev` → live API, no Postgres/Docker/IPFS. - *CI builds the release binary; footprint job runs the
-  real `init → dev` path.*
+  `dev` → live API, no Postgres/Docker/IPFS. - *CI builds the release binary; the footprint job runs
+  the real `dev` path on a nest it writes inline.*
 - [ ] ✅ **Footprint ≤ 2 GB RAM** for a single-chain runtime, CI-enforced. - *`footprint.sh` gate, 256 MB
   ceiling, measured ~37 MB, for the single-nest backfill tripwire. The dense-multi-nest-at-tip case is
   now its own **required** CI gate too - `per-cursor RAM budget (dense multi-nest)`, 20 nests on one
@@ -71,11 +72,11 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
 
 - [ ] ✅ Deterministic decode: topic0-keyed, contract-ABI priority with generic fallback. *(RFC-0001)*
 - [ ] ✅ ABI acquisition Sourcify → Etherscan-class, cached locally.
-- [ ] 🟡 Decodings are **versioned**; no retroactive re-decode of stored history when ABIs improve. -
-  *The no-retroactive-re-decode half holds. The versioning half has one narrow gap open and tracked:  **[#653]**
-  a nest whose config **gains** events keeps running on data indexed under the old config and stamps
-  the new `registry_hash` on it anyway - the version tag lies about what actually decoded those rows.
-  A fix exists on an unmerged branch; not credited here.*
+- [ ] ✅ Decodings are **versioned**; no retroactive re-decode of stored history when ABIs improve. -
+  *The gap this row carried, a nest whose config **gains** events stamping the new `registry_hash`  **[#653]**
+  on data indexed under the old one, closed in #654 (v2.6.1): `guard_registry_identity` in
+  `indexer.rs` refuses to start when the stored data's registry hash differs from the config's,
+  naming both hashes and the remedy.*
 - [ ] ✅ Golden/deterministic tests per handler and view (fixed fixtures in → exact state out).
 - [ ] ✅ Property tests: random reorg depths converge to canonical state (`e2e_reorg.rs`).
 - [ ] ✅ Nest invariant/parity checks (`nuthatch check`) run hermetically in CI against committed
@@ -89,7 +90,8 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   crosses the cap no longer dies permanently, it recovers via an address-filtered refetch (`#297`,
   `6412ee5`, commit-backed close - not a bare issue-close). What is still open is different: the
   discovered-child watch-set is unbounded, with no `end`/expiry condition (**#271**), and wildcard-
-  address decode is unimplemented (**#272**). Both OPEN, zero commits against either.*
+  address decode is unimplemented (**#272**). Both closed on 2026-08-31 for the 2026 freeze,
+  deferred rather than fixed; the reopening conditions are in `docs/frozen-for-2027.md`.*
 
 ## 2. Reliability, reorgs & crash safety
 
@@ -113,7 +115,8 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   provider no longer costs a request-timeout on every round-robin hit), the tip loop retries the same
   window (no silent gaps), and a stall is now **loud**: `nuthatch_last_poll_unixtime` in `/metrics`, an
   escalating tip-loop log (warn on the first miss → error every ~60 s of "all endpoints unreachable →
-  STALLED"), and `/ready` returns 503 once no poll has succeeded within 90 s (§7). `/ready` now also
+  STALLED"), and `/ready` returns 503 once no poll has succeeded within the stall threshold, 90 s at
+  the default poll interval and scaled with `--poll-interval` since RFC-0040 (§7). `/ready` now also
   catches a second, distinct failure shape: a **wedged** cursor that keeps polling successfully but
   makes no block progress, not just a dead one (`#578`, `804249f`, 2026-08-14).*
 
@@ -124,13 +127,21 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
 
 - [ ] ✅ Backfill throughput bench exists and is reproducible (`nuthatch bench backfill`). - *Floor
   ≥10K events/sec, aim 30K.*
-- [ ] 🟡 A **published, current** backfill number for the release commit on reference hardware. -  **[#285]**
-  *Still open, and the existing artifact is worse than "stale": `docs/bench/obib-case1.json`
-  (3,934.59 events/sec, 2026-07-30) cites commit `707e1af`, which is not a valid object in this repo -
-  unreproducible, not just old - and its own number sits under this file's own "floor ≥10K events/sec"
-  a few lines up. Needs a fresh run pinned to a real 2.6.0 SHA.*
-- [ ] ⛔ Tip-lag benchmark (notification → row queryable) as a tracked number. - *Meaningful number  **[#282]**
-  needs ExEx. **Blocked on:** reth node (0003).*
+- [ ] ✅ A **published, current** backfill number for the release commit on reference hardware. -  **[#285]**
+  *The `backfill throughput` job measures it on every PR, tracked and not gated (#1723, 2026-10-05):
+  three batches of 15 over the locally served chain, seal-direct, concurrency 4, on `ubuntu-latest`.
+  The committed artifact is `docs/bench/backfill-throughput-runner.json`, 24,446 events/sec at
+  `1668e97`, with `benchmarks.md`'s caveat that the fixture, not nuthatch, dominates that wall
+  clock. The `obib-case1.json` ghost commit this row used to name is gone: it
+  cites `8e94f6c`, and `tests/bench_commits.rs` refuses the three ghosts. #285 itself was closed for
+  the 2026 freeze on 2026-08-31.*
+- [ ] ✅ Tip-lag benchmark (notification → row queryable) as a tracked number. - *The `tip lag` job  **[#282]**
+  (`.github/workflows/tip-lag.sh`) runs on every PR against a locally served moving tip at
+  `--poll-interval 1s`, records lag and after-seen p50/p99 over 100 blocks, and fails when the
+  after-seen p50 exceeds 30 ms (`MAX_SEEN_P50_MS`) or a block's rows are not queryable within 30 s
+  (#1884, 2026-10-05). Artifact `docs/bench/tip-lag-runner.json` (4.7.0, after-seen p50 17 ms). Not
+  a required context. #282 was closed for the 2026 freeze; the ExEx number it wanted is still gated
+  on a node (§12).*
 - [ ] ✅ Entity point-read p50/p99 bench tracked across releases, `point-read latency` a **required**  **[#283]**
   CI context. - *Landed PR #375 (`ef3b619`). Both gaps its own discussion left open are since closed
   with real evidence: the gate's fixture was a near-empty 256-row store that a 32-core dev-box and a
@@ -142,7 +153,8 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
 - [ ] ✅ Peak-RSS regression gate wired for the **dense multi-nest** scenario, not just single-nest  **[#284]**
   `--backfill 200`. - *`per-cursor RAM budget (dense multi-nest)` is a **required** CI context: 20
   nests on one cursor, the real 10-event Uniswap V4 ABI, 200 blocks live tip-following, two ceilings
-  (2048 MB budget, 180 MB regression band from 8 runs). Mutation-checked against six cases including a
+  (the 2048 MB budget, and a regression ceiling of 602 MB from a seven-run band of 387 to 481 MB on
+  the runner, #1156, 2026-09-05; it was 180 MB from 8 runs when the gate landed). Mutation-checked against six cases including a
   synthetic 2.4x leak caught at 323 MB with 1.7 GB of budget headroom still unused - the case a
   budget-only ceiling cannot see. PR #391, `76fa504`, 2026-08-10.*
 - [ ] ✅ Regressions fail the build (benchmarks-as-gates principle established). - *Extend coverage as
@@ -163,11 +175,13 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   crates.io package. Worth revisiting if that ever changes.
 - [ ] ✅ Blob-mount RCE fixed (0.4.0 critical).
 - [ ] ✅ `/sql` arbitrary file-read fixed (0.4.0 critical).
-- [ ] ✅ **DuckDB `allowed_directories` is enforced** when `enable_external_access=false` is set at
-  connection open (**[#289]**, quizzical-quail). Measured against `libduckdb-sys` 1.10504.0: the
-  list is a restriction only with that startup flag, which we now pass. `reject_file_access` remains
-  the primary control. The tripwire now asserts the second layer *does* refuse an out-of-allowlist
-  `read_text`. *Moot since 4.1: DuckDB is not in the binary, and Burrmill has no file-reading table function.*
+- [ ] ✅ **Until 4.0, DuckDB's `allowed_directories` was enforced** by setting
+  `enable_external_access=false` at connection open (**[#289]**, quizzical-quail, shipped in #805).
+  Measured against `libduckdb-sys` 1.10504.0: the list was a restriction only with that startup
+  flag, which the binary then passed, with `reject_file_access` as the primary control and a
+  tripwire asserting the second layer refused an out-of-allowlist `read_text`. *Moot since 4.1:
+  DuckDB is not in the binary, Burrmill has no file-reading table function, and `reject_file_access`
+  still stands in `analytics.rs`.*
 - [ ] ✅ `/sql` surface is structurally read-only (single-writer + read-only attach).
 - [ ] ✅ A security review pass on the **serving surface** (`serve.rs`, `mcp.rs`, `webhooks.rs`,
   `analytics.rs`, `abi.rs`, `rpc.rs`) - *done (0.5.x hardening): no criticals; SQL read-only gate holds
@@ -252,7 +266,7 @@ case.
   RFC-0013 spike, and cargo reports that as a one-line warning nobody reads.*
 - [ ] ✅ Coverage of the AI/MCP surface (schema discovery, SQL exec, entity lookup) through
   `tools/call` against a fake nest. Streaming subscribe is not shipped (RFC-0010) and is not
-  advertised. The RFC-0016/0017 keyed evals are **[#815]**.
+  advertised. The RFC-0016 Tier-B keyed baseline ran in #1049 (**[#815]**, 2026-08-31; §9).
 - [ ] ✅ No-network test path proving AI features degrade gracefully. - *`initialize` / `tools/list`
   answer with no nest (fail-open). `tools/call` against an unreachable nest returns `isError` and
   names `nuthatch dev`. There is no `--offline` flag; the test is the path. [#304]*
@@ -264,8 +278,9 @@ case.
   per nest rather than only process-globally. *(This closes the old SEC-9 gap.)*
 - [ ] ✅ Health/readiness endpoint suitable for a supervisor. - *0.5.x: `/health` = liveness (plain
   `200 "ok"`); `/ready` = readiness - JSON with tip / last_block / lag / sealed_through / last-poll age,
-  `200` when fresh and **`503` when stalled** (no successful source poll within 90 s ⇒ every RPC endpoint
-  down). A just-started node gets grace (never-polled ≠ stalled). **0.6.x (RFC-0026):** `/ready` is now
+  `200` when fresh and **`503` when stalled** (no successful source poll within the stall threshold,
+  90 s at the default poll interval and scaled with `--poll-interval` since RFC-0040 ⇒ every RPC
+  endpoint down). A just-started node gets grace (never-polled ≠ stalled). **0.6.x (RFC-0026):** `/ready` is now
   also mounted at the **runtime root** - `200` only when every cursor and nest is indexing, `503` naming
   what is quarantined - with per-nest `/<name>/ready` answering for that nest alone. Route traffic on
   the per-nest one and page on the root; wiring a load balancer to the root means one sick nest evicts
@@ -299,7 +314,7 @@ case.
   *(RFC-0005)*
 - [ ] ✅ `curl | sh` install path.
 - [ ] ✅ MSRV is honest. `Cargo.toml` declares `rust-version = "1.95"` and every CI job pins
-  `dtolnay/rust-toolchain@1.95.0`, so the declared floor is the tested floor. (Raised from an
+  `dtolnay/rust-toolchain` at 1.95.0 (by commit hash), so the declared floor is the tested floor. (Raised from an
   untested `1.85` in `b2abc9f`, 2026-07-14.)
 - [ ] ✅ Cross-platform release matrix, stated plainly rather than implied:
 
@@ -326,15 +341,18 @@ case.
 ## 9. AI-native surface (MCP)
 
 - [ ] ✅ MCP server compiled into the binary (`mcp.rs`), works offline against the local instance.
-- [ ] ✅ `init` scaffolds schema + views + handlers + tests from the ABI.
+- [ ] ✅ `init` scaffolds `nuthatch.toml`, `schema.json`, `semantic.toml`, `views/`, `llms.txt` and
+  `.claude/skills/` from the ABI. - *No handlers and no tests: that is what a 4.10.1 `init` writes
+  (scratch run, 2026-10-05), and CLAUDE.md's "handlers + tests" wording still promises both.*
 - [ ] ✅ Ships `llms.txt` / docs-as-MCP / `.claude/skills/` in scaffolded projects.
-- [ ] 🟡 The RFC-0016 governed semantic layer (`semantic.toml`, enriched `schema`, errors-as-prompts,  **[#815]**
-  `explain`) - *Tier-B keyed eval still pending. The layer itself is in the binary; the eval is not.*
-- [ ] 🟡 The RFC-0017 builder skill with CI-checked CLI/config reference drift. - *CLI-flags direction  **[#353]**
-  ships (`cli_reference_names_every_real_flag`, PR #514) but that PR does not touch the gap #353 was
-  narrowed to and closed against by mistake: `CONFIG_SOURCES` in `tests/skill_refs.rs` scans
-  `config.rs`/`semantic.rs`/`runtime.rs` but not `src/allowlist.rs`, so `queries.toml`'s `NamedQuery`/
-  `Ceiling` keys can drift from `config-reference.md` with CI green. Reopened; still real.*
+- [ ] ✅ The RFC-0016 governed semantic layer (`semantic.toml`, enriched `schema`, errors-as-prompts,  **[#815]**
+  `explain`) - *The layer is in the binary, and the Tier-B keyed baseline was delivered in #1049
+  (2026-08-31): 0/15 first-try and 0/15 overall, median of three isolated MCP-only runs. The number is
+  on the record; it is not a pass.*
+- [ ] ✅ The RFC-0017 builder skill with CI-checked CLI/config reference drift. - *Both directions  **[#353]**
+  ship: `cli_reference_names_every_real_flag` (PR #514), and `CONFIG_SOURCES` in
+  `tests/skill_refs.rs` scans `src/allowlist.rs` for `Ceiling`/`NamedQuery` (PR #706, `e14ad9d`,
+  #353 closed 2026-08-21).*
 
 ## 10. Docs & first-run UX
 
@@ -344,10 +362,8 @@ case.
 - [ ] ✅ A single "here's how you run this in production, unattended" guide that ties together
   §7 (ops), §4 (safe exposure), and §8 (upgrades). - *[`operators.md`](operators.md) is it: deploy
   recipes, the division of labour, capacity, what to scrape, what to back up, the stability contract,
-  upgrade notes, known gaps, and a go-live checklist. Written against 2.0.0; its own container tags
-  were refreshed for 2.5.0 after being caught five releases stale, with the rest of the document
-  named explicitly as not re-read since - a stated staleness rather than a silent one, but at 2.6.0
-  the gap is now six releases and growing. Not this issue's fix; named for whoever's turn it is.*
+  upgrade notes, known gaps, and a go-live checklist. Its own header states what it was last re-read
+  against; trust that line over this one.*
 
 ---
 
@@ -386,10 +402,11 @@ acceptance tests pass, with 39 tests running against a live Postgres in CI. Noth
   segments at 2M/8M/20M rows, each size in both engine orders to defeat the page-cache confound.
   **DataFusion is 1.6-2.7x slower and the gap widens with size**, at exact result parity. RFC-0013 §5;
   artifact in `docs/bench/rfc-0013-datafusion-gate.json`.*
-- [ ] ⛔ DataFusion federation across hot + cold behind one SQL surface. - *0013 §2/§4. **The gate  **[#279]**
-  said no for 1.0** - DuckDB stays in both modes. Reopen if a DataFusion release closes the aggregate
-  gap, or if a scaled-mode query genuinely needs one plan spanning Postgres hot and Parquet cold,
-  which is the case DuckDB cannot serve and the real point of §2. Superseded in 4.1, when Burrmill, on DataFusion, replaced DuckDB.*
+- [ ] ⛔ One plan spanning Postgres hot and Parquet cold in scaled mode. - *0013 §2/§4. The  **[#279]**
+  2026-08-02 gate said no for 1.0 and DuckDB stayed in both modes; #279 was closed on 2026-08-31 as
+  superseded by RFC-0042 §14, which holds the reopen triggers. Since 4.1 the one engine in both
+  modes is Burrmill, on DataFusion, answering hot ∪ sealed through one surface (`analytics.rs`); a
+  plan that spans the Postgres hot store is still not built, and no open issue tracks it.*
 - [ ] ⛔ Golden SQL-compat suite across both engines. - *Moot while there is one engine; the spike  **[#279]**
   already showed parity on the fold that matters.*
 - [x] ✅ A multi-machine run. - *Done **2026-08-15 on published 2.4.0 artifacts** (#281, #597).  **[#281]**
@@ -406,11 +423,12 @@ acceptance tests pass, with 39 tests running against a live Postgres in CI. Noth
 Almost everything un-buildable-on-a-laptop traces to one missing box.
 
 - [ ] ⛔ **Colocated reth node** (full for tip, archive for deep backfill/traces). - *Provisioning +  **[#276]**
-  days of sync; hardware/ops, not code. Gates the two below.*
+  days of sync; hardware/ops, not code. Gates the two below. #276 was closed for the 2026 freeze on
+  2026-08-31, deferred, and RFC-0003 was deferred again on 2026-09-08 (`docs/frozen-for-2027.md`).*
 - [ ] ⛔ ExEx tip mode wired to a real node; `nuthatch-node` binary; honest tip-latency number. *(0003;  **[#276]**
   groundwork in, **blocked on** the node.)*
 - [ ] ⛔ Firehose-class extraction (traces + state diffs), own-node/ExEx only. *(0014; **blocked on**  **[#277]**
-  0003.)* - *One node-independent slice is buildable now and forward-compatible: the calldata decoder,
+  0003; #277 closed for the freeze with #276.)* - *One node-independent slice is buildable now and forward-compatible: the calldata decoder,
   `[extract]` config, `traces`/`state_diffs` schemas, and the unbounded-volume guard.*
 
 ---
@@ -427,13 +445,15 @@ whole cluster including the live-credential probe against production (§4, #292/
 the decode path** is a required check this file never named (§6, #290); and the **multi-machine run**
 this file spent §11 calling unproven for months finally happened, on 2.4.0 (§11, #281/#597).
 
-What is still genuinely open, not time-based: the **published backfill
-number** is worse than stale, it cites a commit that no longer exists (§3, #285); the **DuckDB
-file-access defence** was one layer deep by design of the bundled build (§4, #289), moot since DuckDB left the binary in 4.1; and
-the **AI/MCP keyed evals** remain pending a keyed run (§9, #815). Two issues this walk found
-closed against no evidence or the wrong PR - #289 and #353 - are reopened as of this pass; treat any
-"closed" state on this file's cited issues as a claim to verify, not a fact, which is the whole reason
-this rule exists.
+What is still genuinely open, not time-based, as of the 2026-10-05 re-read: the **factory
+watch-set and wildcard decode** (§1, #271/#272) and everything **node-gated** (§12, #276/#277),
+all closed for the 2026 freeze as deferred rather than fixed, and the **scaled-mode plan across
+Postgres hot and Parquet cold** (§11), which nothing tracks. Closed on evidence since the 2.6.0
+walk: the **published backfill number** is a runner artifact on every PR (§3, #285/#1723), **tip
+lag** is measured and gated (§3, #282/#1884), the **DuckDB file-access defence** (§4, #289) is moot
+since DuckDB left the binary in 4.1, the **keyed eval** ran (§9, #815) and the **skill drift gate**
+scans both directions (§9, #353). Treat any "closed" state on this file's cited issues as a claim
+to verify, not a fact, which is the whole reason this rule exists.
 
 **Scaled mode and anything node-gated (§11, §12):** not production-ready, and correctly deferred - the
 project's "build only what we can verify live" discipline is why. Don't let a red column here read as
