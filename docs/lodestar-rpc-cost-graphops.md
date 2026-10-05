@@ -1,4 +1,4 @@
-# What the Lodestar nests cost in RPC on GraphOps
+# What the Lodestar nests cost in RPC on GraphOps (tentative)
 
 **What this is:** the RPC bill for the five Lodestar nests on the Helsinki box, backfill and
 continuous running, priced in GraphOps credits. Measured and counted on **2026-10-05** against
@@ -6,12 +6,17 @@ continuous running, priced in GraphOps credits. Measured and counted on **2026-1
 [the Lodestar lifecycle](lodestar-lifecycle.md) §2, which were taken on 3.5.1 and a different
 provider.
 
+> **Status: tentative.** The running figures rest on two polls per nest, taken ten minutes after a
+> restart. They are a first reading, not a figure to quote or budget against. Leave the nests running
+> for several days, then replace the continuous section with what the per-key Usage page on
+> platform.graphops.xyz reports for that period.
+
 **How much of it is measured.** Continuous running is measured: per-method counters on the live
 nests across polls. Backfill is **computed, not measured**: these nests were backfilled mostly on
 Alchemy, so the backfill figure is a count of what the stored data would have required, priced at
 GraphOps rates. The two are labelled throughout.
 
-## The answer
+## The answer so far
 
 | | credits | at Growth rate ($19.90/M) | at Starter rate ($26/M) |
 |---|---:|---:|---:|
