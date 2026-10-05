@@ -1,0 +1,54 @@
+name: Run one nextest shard
+description: >
+  Run shard `shard` of `of` of a nextest archive a build job uploaded. The archive is extracted over
+  the checkout, so the target directory lands at the path it was built at and compile-time paths
+  such as CARGO_BIN_EXE_nuthatch still resolve.
+
+inputs:
+  archive:
+    description: Artifact name; the archive inside it is <archive>.tar.zst.
+    required: true
+  shard:
+    description: This shard, 1-based.
+    required: true
+  of:
+    description: How many shards the archive is split into.
+    required: true
+  filter:
+    description: Filterset applied before partitioning.
+    default: all()
+  name:
+    description: Distinguishes this job's JUnit artifact.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ inputs.archive }}
+        path: ${{ runner.temp }}/archive
+    - uses: ./.github/actions/install-nextest
+    - name: nextest run (${{ inputs.name }})
+      shell: bash
+      env:
+        ARCHIVE: ${{ runner.temp }}/archive/${{ inputs.archive }}.tar.zst
+        PARTITION: ${{ inputs.shard }}/${{ inputs.of }}
+        FILTER: ${{ inputs.filter }}
+      run: |
+        set -euo pipefail
+        cargo-nextest nextest run --profile ci \
+          --archive-file "$ARCHIVE" \
+          --workspace-remap "$GITHUB_WORKSPACE" \
+          --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+          --partition "count:$PARTITION" \
+          -E "$FILTER" \
+          --no-tests=fail
+    - name: upload the JUnit report
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: junit-${{ inputs.name }}
+        path: target/nextest/ci/junit.xml
+        if-no-files-found: warn
+        retention-days: 14

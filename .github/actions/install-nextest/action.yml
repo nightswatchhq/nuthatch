@@ -1,0 +1,24 @@
+name: Install cargo-nextest
+description: >
+  Put a pinned, checksum-verified cargo-nextest on PATH. A plain download rather than a third-party
+  action, so nothing outside this repository runs with its credentials.
+
+runs:
+  using: composite
+  steps:
+    - name: Download and verify cargo-nextest
+      shell: bash
+      env:
+        VERSION: 0.9.146
+        # The x86_64-unknown-linux-gnu .sha256 published with the release.
+        SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/nextest-bin"
+        mkdir -p "$dir"
+        curl -sSfL --retry 3 -o "$dir/nextest.tar.gz" \
+          "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$VERSION/cargo-nextest-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+        echo "$SHA256  $dir/nextest.tar.gz" | sha256sum -c -
+        tar xzf "$dir/nextest.tar.gz" -C "$dir"
+        echo "$dir" >> "$GITHUB_PATH"
+        "$dir/cargo-nextest" nextest --version

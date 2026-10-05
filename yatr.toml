@@ -5,7 +5,7 @@
 # `check`: `yatr check` is a builtin that validates this file, and it shadows
 # any task of that name without warning.
 
-# `yatr ci` runs what the required `fmt · clippy · test` check runs (check-default and check-exex in
+# `yatr ci` runs what the required `fmt · clippy · test` check runs (the default and exex legs in
 # .github/workflows/ci.yml: fmt, clippy and test for the root crate and for decode/, and the exex
 # leg), the non-required counter and graph legs, and cargo-deny.
 #
@@ -38,8 +38,8 @@ run = ["cargo clippy --all-targets -- -D warnings"]
 sources = ["src/**/*.rs", "decode/**/*.rs", "Cargo.toml", "Cargo.lock"]
 
 [tasks.test]
-desc = "Run the test suite"
-run = ["cargo test --locked"]
+desc = "Run the test suite (needs cargo-nextest, as CI does)"
+run = ["cargo nextest run --locked", "cargo test --doc --locked"]
 sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
 watch = ["src/**/*.rs", "tests/**/*.rs"]
 
@@ -71,7 +71,8 @@ sources = ["decode/**/*.rs", "decode/Cargo.toml", "decode/Cargo.lock"]
 desc = "clippy and test with --features exex"
 run = [
   "cargo clippy --features exex --all-targets -- -D warnings",
-  "cargo test --features exex --locked",
+  "cargo nextest run --features exex --locked",
+  "cargo test --doc --features exex --locked",
 ]
 sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
 
@@ -79,7 +80,8 @@ sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Carg
 desc = "clippy and test with --features counter"
 run = [
   "cargo clippy --features counter --all-targets -- -D warnings",
-  "cargo test --features counter --locked",
+  "cargo nextest run --features counter --locked",
+  "cargo test --doc --features counter --locked",
 ]
 sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
 
@@ -88,7 +90,8 @@ desc = "clippy (graph, folds alone) and test with --features graph"
 run = [
   "cargo clippy --features graph --all-targets -- -D warnings",
   "cargo clippy --features folds --all-targets -- -D warnings",
-  "cargo test --locked --features graph",
+  "cargo nextest run --locked --features graph",
+  "cargo test --doc --locked --features graph",
 ]
 sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
 

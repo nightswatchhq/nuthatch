@@ -1755,7 +1755,14 @@ fn a_box_that_quietens_during_the_wait_is_measured() {
     let c = case();
     let set = c.set(&[("answers", c.counts())]);
     let load = load_file(&c, "loadavg", "26.00");
-    let later = set_load_later(&load, "0.10", None, Duration::from_secs(1));
+    // Timed from `out/answers`, made just before the gate's first load read. Timed from the spawn,
+    // a gate slower than a second to start read 0.10 first and never waited.
+    let later = set_load_later(
+        &load,
+        "0.10",
+        Some(c.dir.path().join("out/answers")),
+        Duration::from_secs(1),
+    );
     let (out, text) = c.gate(
         &set,
         &[],

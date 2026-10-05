@@ -1,0 +1,34 @@
+# CI runs every test target through nextest: one process per test, binaries in parallel, and the
+# suite sharded across runners by `--partition` (the test-* jobs in .github/workflows/ci.yml).
+# `ci` inherits everything here and adds a JUnit report, which is what shard balancing reads.
+
+[profile.default]
+# A flake must stay visible. A retry that turns red into green hides the defect a gate exists for.
+retries = 0
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+# Exclusive tests start first: one queued behind a running test idles the other threads until that
+# test finishes, and the lib suite has tests that run for minutes.
+
+# The replays share a 30 s query allowance and were serialised under `cargo test` by an in-process
+# lock, with nothing else running beside them. Separate processes cannot see that lock, so each one
+# gets the runner to itself.
+[[profile.default.overrides]]
+filter = "binary(network_contract)"
+threads-required = "num-test-threads"
+priority = 100
+
+# Split out of the shared `it` binary to keep a long restart and reseal sequence away from the broad
+# parallel harness (Cargo.toml). Beside minute-long lib tests on a 4-core runner, the first index in
+# `a_restarted_nest_reports_its_cursor_position_before_it_commits_again` overran its 20 s bound
+# (CI run 37334232962, attempt 3), so it gets the runner to itself as it effectively had before.
+[[profile.default.overrides]]
+filter = "binary(e2e_warm_restart)"
+threads-required = "num-test-threads"
+priority = 100
+
+[profile.ci]
+
+[profile.ci.junit]
+path = "junit.xml"
