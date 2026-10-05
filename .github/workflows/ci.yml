@@ -1124,8 +1124,28 @@ jobs:
           retention-days: 30
 
 
-  multinest-footprint:
+  # The required name. Its two measurements used to run one after the other on one runner, which put
+  # 13 minutes after the 12-minute release build on every PR's critical path. They share nothing but
+  # the binary, so each has its own runner and this job fails if either does.
+  multinest-budget:
     name: per-cursor RAM budget (dense multi-nest)
+    needs: [multinest-footprint, wideabi-footprint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: both measurements green
+        run: |
+          echo "density: ${{ needs.multinest-footprint.result }}"
+          echo "wide ABI: ${{ needs.wideabi-footprint.result }}"
+          if [ "${{ needs.multinest-footprint.result }}" != success ] \
+            || [ "${{ needs.wideabi-footprint.result }}" != success ]; then
+            echo "::error::the per-cursor RAM budget needs both measurements green (see multinest-footprint and wideabi-footprint)"
+            exit 1
+          fi
+
+  multinest-footprint:
+    name: per-cursor RAM budget (20 nests, one cursor)
     needs: build-release
     runs-on: ubuntu-latest
     # TIMEOUT_S (default 1800s = 30 min) bounds the harness's own wait loop; this is the backstop for
@@ -1191,8 +1211,31 @@ jobs:
         run: |
           chmod +x bin/nuthatch
           bash .github/workflows/multinest-footprint.sh
+      - name: upload the report
+        # The measurement is a CI artifact, per CLAUDE.md. It is also what re-baselining reads: the
+        # ceilings above are one machine's numbers and want revisiting from the runner's own reports.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: multinest-footprint-report
+          path: multinest-footprint.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  wideabi-footprint:
+    name: per-cursor RAM budget (wide ABI, one nest)
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: download binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nuthatch-release
+          path: bin
       - name: measure peak RSS, wide ABI, one nest (#286)
-        # The density job above is twenty nests × ten events. This is one nest × 31 events - the
+        # The density job is twenty nests × ten events. This is one nest × 31 events - the
         # ABI-breadth half #286 asked for and the density job cannot answer. Same binary, same
         # budget, a different pressure on the hot store. Floor: every table non-empty.
         env:
@@ -1203,15 +1246,11 @@ jobs:
           chmod +x bin/nuthatch
           bash .github/workflows/wideabi-footprint.sh
       - name: upload the report
-        # The measurement is a CI artifact, per CLAUDE.md. It is also what re-baselining reads: the
-        # ceilings above are one machine's numbers and want revisiting from the runner's own reports.
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: multinest-footprint-report
-          path: |
-            multinest-footprint.json
-            wideabi-footprint.json
+          name: wideabi-footprint-report
+          path: wideabi-footprint.json
           if-no-files-found: warn
           retention-days: 30
 
