@@ -39,6 +39,10 @@ pub const SQL_MAX_CONCURRENCY: usize = 2;
 /// real client sends it in one write; ten seconds covers a slow link and still frees a stalled socket.
 pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a stopping server waits for open connections before dropping them (#1964). Inside
+/// Docker's default 10 s stop grace, so the ingest is still stopped by us and not by SIGKILL.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Hard ceiling on the override below.
 ///
 /// The permit count is a **memory** bound, not a throughput one (#1006, and the correction in
@@ -944,7 +948,7 @@ pub async fn bind_and_serve(
         Some(layer) => cors_outside_admin(app, layer),
         None => app,
     };
-    let mut listener = tokio::net::TcpListener::bind(listen)
+    let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind {listen}"))?;
     tracing::info!("API live on http://{listen}  (try GET /  and  /metrics)");
@@ -957,6 +961,20 @@ pub async fn bind_and_serve(
              before exposing it publicly. See docs/operators.md."
         );
     }
+    serve_until(listener, app, shutdown_signal(), SHUTDOWN_GRACE).await;
+    tracing::info!("shutdown signal received; API stopped");
+    Ok(())
+}
+
+/// Serve `app` on `listener` until `shutdown` resolves, then drain connections for at most `grace`.
+async fn serve_until(
+    mut listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl std::future::Future<Output = ()>,
+    grace: Duration,
+) {
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let app = app.layer(axum::Extension(Stopping(stopping)));
     // Not `axum::serve`: it gives hyper no timer, so the header-read timeout never fires (#1660).
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(hyper_util::rt::TokioTimer::new())
@@ -964,23 +982,42 @@ pub async fn bind_and_serve(
     // Graceful shutdown on SIGTERM/SIGINT: in-flight requests drain, then this returns so the
     // caller can abort the ingest task(s) (progress is checkpointed, so a restart resumes cleanly).
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-    let mut shutdown = std::pin::pin!(shutdown_signal());
+    let mut shutdown = std::pin::pin!(shutdown);
+    let mut conns = tokio::task::JoinSet::new();
     loop {
         let (io, _) = tokio::select! {
             conn = axum::serve::Listener::accept(&mut listener) => conn,
+            Some(_) = conns.join_next(), if !conns.is_empty() => continue,
             _ = &mut shutdown => break,
         };
         let service = hyper_util::service::TowerToHyperService::new(app.clone());
         let conn = graceful.watch(http.serve_connection(hyper_util::rt::TokioIo::new(io), service));
-        tokio::spawn(async move {
+        conns.spawn(async move {
             if let Err(e) = conn.await {
                 tracing::trace!("connection ended: {e:#}");
             }
         });
     }
-    graceful.shutdown().await;
-    tracing::info!("shutdown signal received; API stopped");
-    Ok(())
+    // A graceful drain only waits for responses to finish, and a stream must be told to (#1964).
+    stop.send_replace(true);
+    if tokio::time::timeout(grace, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!("connections still open {grace:?} after shutdown; dropping them");
+    }
+    conns.shutdown().await;
+}
+
+/// Set on every request by [`serve_until`]; resolves once the server has started stopping, which is
+/// what ends a response that would otherwise never finish.
+#[derive(Clone)]
+struct Stopping(tokio::sync::watch::Receiver<bool>);
+
+impl Stopping {
+    async fn wait(mut self) {
+        let _ = self.0.wait_for(|stopping| *stopping).await;
+    }
 }
 
 /// The built-in admin UI (RFC-0010 Part A) - a single self-contained page, embedded in the binary.
@@ -2087,6 +2124,7 @@ async fn admin_events(
     State(s): State<AppState>,
     Query(q): Query<AdminQuery>,
     headers: axum::http::HeaderMap,
+    stopping: Option<axum::Extension<Stopping>>,
 ) -> impl IntoResponse {
     // Same as [`admin_index`]: unreachable while the route is unmounted, kept as the handler's own
     // precondition rather than a rule that lives only in the router.
@@ -2108,6 +2146,12 @@ async fn admin_events(
         }
         let ev = Event::default().data(summary_value(&s).to_string());
         Some((Ok::<_, std::convert::Infallible>(ev), (s, false)))
+    });
+    let stream = futures::StreamExt::take_until(stream, async move {
+        match stopping {
+            Some(axum::Extension(stopping)) => stopping.wait().await,
+            None => std::future::pending().await,
+        }
     });
     // Keep-alive comment every 15 s so an idle proxy doesn't close a quiet stream between frames.
     Sse::new(stream)
@@ -9024,7 +9068,8 @@ mod tests {
             admin_events(
                 State(state.clone()),
                 tok(None),
-                axum::http::HeaderMap::new()
+                axum::http::HeaderMap::new(),
+                None
             )
             .await
             .into_response()
@@ -9037,7 +9082,8 @@ mod tests {
             admin_events(
                 State(state.clone()),
                 tok(None),
-                axum::http::HeaderMap::new()
+                axum::http::HeaderMap::new(),
+                None
             )
             .await
             .into_response()
@@ -9051,7 +9097,8 @@ mod tests {
             admin_events(
                 State(state.clone()),
                 tok(None),
-                axum::http::HeaderMap::new()
+                axum::http::HeaderMap::new(),
+                None
             )
             .await
             .into_response()
@@ -9062,7 +9109,8 @@ mod tests {
             admin_events(
                 State(state.clone()),
                 tok(Some("s3cret")),
-                axum::http::HeaderMap::new()
+                axum::http::HeaderMap::new(),
+                None
             )
             .await
             .into_response()
@@ -9077,11 +9125,89 @@ mod tests {
             axum::http::HeaderValue::from_static("Bearer s3cret"),
         );
         assert_eq!(
-            admin_events(State(state), tok(None), hdr)
+            admin_events(State(state), tok(None), hdr, None)
                 .await
                 .into_response()
                 .status(),
             StatusCode::OK
+        );
+    }
+
+    /// Serve `app` on an ephemeral port behind [`serve_until`]; the sender is the shutdown signal.
+    async fn served(
+        app: Router,
+        grace: Duration,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until(
+            listener,
+            app,
+            async {
+                let _ = fired.await;
+            },
+            grace,
+        ));
+        (addr, fire, server)
+    }
+
+    /// #1964: an admin tab holding `/_admin/events` kept SIGTERM from ever stopping the nest. The
+    /// grace here is far longer than the test's bound, so only the stream ending can pass it.
+    #[tokio::test]
+    async fn shutdown_ends_an_open_admin_events_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(SharedNest::new(test_state(tmp.path(), SQL_MAX_CONCURRENCY)));
+        let (addr, fire, server) = served(app, Duration::from_secs(600)).await;
+
+        let mut events = reqwest::get(format!("http://{addr}/_admin/events"))
+            .await
+            .unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+        assert!(events.chunk().await.unwrap().is_some(), "first frame");
+
+        fire.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve still waiting on the events stream after shutdown")
+            .unwrap();
+        let rest = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(_)) = events.chunk().await {}
+        })
+        .await;
+        assert!(rest.is_ok(), "the events stream did not end");
+    }
+
+    /// The backstop: a connection that never finishes is dropped once the grace runs out, so the
+    /// caller still gets to stop the ingest.
+    #[tokio::test]
+    async fn shutdown_drops_a_connection_that_never_finishes_after_the_grace() {
+        let stuck = Router::new().route(
+            "/stuck",
+            axum::routing::get(|| async {
+                axum::body::Body::from_stream(futures::stream::pending::<
+                    Result<String, std::convert::Infallible>,
+                >())
+            }),
+        );
+        let (addr, fire, server) = served(stuck, Duration::from_millis(200)).await;
+
+        let mut held = reqwest::get(format!("http://{addr}/stuck")).await.unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+
+        fire.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve ignored its grace and waited on a connection that never ends")
+            .unwrap();
+        let cut = tokio::time::timeout(Duration::from_secs(5), held.chunk()).await;
+        assert!(
+            matches!(cut, Ok(Err(_)) | Ok(Ok(None))),
+            "the stuck connection was left open: {cut:?}"
         );
     }
 
