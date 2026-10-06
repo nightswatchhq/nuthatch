@@ -3404,7 +3404,11 @@ mod tests {
             catalogue_hash(publisher.path()).unwrap()
         );
         assert!(fresh.path().join(SEGMENTS_DIR).is_dir());
-        assert_eq!(*rx.borrow(), 1, "a mirror waiting on this nest was not woken");
+        assert_eq!(
+            *rx.borrow(),
+            1,
+            "a mirror waiting on this nest was not woken"
+        );
     }
 
     #[test]
