@@ -60,6 +60,8 @@ pub struct FieldRow {
     /// Declared `T!` rather than `T`. The emitter needs it to decide whether a single literal can answer
     /// for every row (#1316).
     pub non_null: bool,
+    /// For a `@derivedFrom` field, the entity it looks up and the forward field it keys on.
+    pub derived_from: Option<(String, String)>,
 }
 
 impl FieldRow {
@@ -72,6 +74,11 @@ impl FieldRow {
 pub struct Report {
     pub source: String,
     pub fields: Vec<FieldRow>,
+    /// Handlers the manifest names that no mapping file defines.
+    pub missing_handlers: Vec<String>,
+    /// Whether any mapping source was read. A deployment CID carries compiled WASM only, and then every
+    /// row says nothing about the mapping (#1947).
+    pub mapping_source: bool,
 }
 
 impl Report {
@@ -98,14 +105,42 @@ pub fn classify_dir(dir: &Path) -> Result<Report> {
         .with_context(|| format!("read {}", schema_path.display()))?;
     let schema = parse_schema(&schema_text)?;
     let mappings = load_mappings(dir)?;
-    let fields = classify(&schema, &mappings);
+    let missing_handlers: Vec<String> = mappings
+        .declared_handlers
+        .iter()
+        .filter(|h| !mappings.functions.contains_key(*h))
+        .cloned()
+        .collect();
+    let mapping_source = if mappings.declared_handlers.is_empty() {
+        !mappings.functions.is_empty()
+    } else {
+        missing_handlers.len() < mappings.declared_handlers.len()
+    };
+    let mut fields = classify(&schema, &mappings);
+    if !mapping_source {
+        for f in fields
+            .iter_mut()
+            .filter(|f| f.reason == NO_WRITER && f.citation.file == "schema.graphql")
+        {
+            f.reason = "not classified: no mapping source was read (a deployment CID carries \
+                        compiled WASM, not the `.ts` this report reads)"
+                .into();
+        }
+    }
     let source = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(".")
         .to_string();
-    Ok(Report { source, fields })
+    Ok(Report {
+        source,
+        fields,
+        missing_handlers,
+        mapping_source,
+    })
 }
+
+const NO_WRITER: &str = "no mapping writes this field";
 
 pub fn render_report(report: &Report) -> String {
     let mut out = String::new();
@@ -120,6 +155,25 @@ pub fn render_report(report: &Report) -> String {
     out.push_str(
         "Path: `--from-subgraph`. The proxy trap does not apply: the manifest pins implementation ABIs.\n\n",
     );
+    if !report.mapping_source {
+        out.push_str(
+            "**Nothing was classified.** No mapping source was read: the manifest's handlers are not \
+             defined in any `.ts` file here. A deployment CID carries compiled WASM, and this report \
+             reads AssemblyScript source, so every class below except `@derivedFrom` says nothing \
+             about the subgraph. Point `--dir` at the subgraph's source repository.\n\n",
+        );
+    } else if !report.missing_handlers.is_empty() {
+        out.push_str(&format!(
+            "**Partly classified.** These handlers are named in the manifest and defined in no mapping \
+             file read here, so a field only they write reads as unwritten: {}.\n\n",
+            report
+                .missing_handlers
+                .iter()
+                .map(|h| format!("`{h}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     let [exact, call, fixed, unreachable] = report.counts();
     out.push_str("## Summary\n\n");
@@ -221,6 +275,8 @@ struct SchemaField {
     /// save a row whose non-nullable field is unset, so a non-nullable field has a value on every stored
     /// row - which is what lets a single literal answer for all of them.
     non_null: bool,
+    /// The type with list brackets and `!` removed: `Trade` for `[Trade!]!`.
+    named_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -374,12 +430,7 @@ fn parse_fields(body: &str, start_line: usize) -> Vec<SchemaField> {
             .map(|(_, rest)| rest.split('@').next().unwrap_or(rest))
             .map(|t| t.split('#').next().unwrap_or(t).trim().to_string())
             .unwrap_or_default();
-        flush_field(
-            &mut fields,
-            Some((name.clone(), line)),
-            &dirs,
-            ty.ends_with('!'),
-        );
+        flush_field(&mut fields, Some((name.clone(), line)), &dirs, &ty);
     }
     fields
 }
@@ -448,7 +499,7 @@ fn flush_field(
     fields: &mut Vec<SchemaField>,
     pending: Option<(String, usize)>,
     dirs: &str,
-    non_null: bool,
+    ty: &str,
 ) {
     let Some((name, line)) = pending else {
         return;
@@ -461,7 +512,10 @@ fn flush_field(
         name,
         line,
         derived_from,
-        non_null,
+        non_null: ty.ends_with('!'),
+        named_type: ty
+            .trim_matches(|c: char| c == '[' || c == ']' || c == '!' || c.is_whitespace())
+            .to_string(),
     });
 }
 
@@ -657,7 +711,11 @@ pub(crate) struct FunctionInfo {
     /// Source order, so `fetchTokenSymbol(event.params.token0)` can map the helper's bind
     /// argument back onto the triggering row.
     param_names: Vec<String>,
-    body: String,
+    /// The declared return type's leading name: `Bribe` for `): Bribe {` and for `): Bribe | null {`.
+    return_type: Option<String>,
+    /// `<Template>.create(<arg>)` calls, with the template's manifest name and the argument as written.
+    pub template_creates: Vec<(String, String, Citation)>,
+    pub body: String,
     file: String,
     body_start_line: usize,
 }
@@ -688,6 +746,8 @@ pub(crate) struct HandlerBinding {
 pub(crate) struct Mappings {
     pub functions: BTreeMap<String, FunctionInfo>,
     pub handlers: Vec<HandlerBinding>,
+    /// Every handler the manifest names, of any kind.
+    pub declared_handlers: BTreeSet<String>,
 }
 
 /// A contract read the mapping actually makes, tied to the Call-derived field it feeds.
@@ -711,6 +771,7 @@ pub(crate) fn load_mappings(dir: &Path) -> Result<Mappings> {
     let mut handler_kinds: BTreeMap<String, HandlerKind> = BTreeMap::new();
     let mut handler_bindings: Vec<HandlerBinding> = Vec::new();
     let mut yaml_files: Vec<PathBuf> = Vec::new();
+    let mut templates: BTreeSet<String> = BTreeSet::new();
     for name in ["subgraph.yaml", "subgraph.yml"] {
         let p = dir.join(name);
         if p.exists() {
@@ -721,6 +782,7 @@ pub(crate) fn load_mappings(dir: &Path) -> Result<Mappings> {
                     &mut handler_kinds,
                     &mut handler_bindings,
                     &mut yaml_files,
+                    &mut templates,
                 );
             }
         }
@@ -741,17 +803,84 @@ pub(crate) fn load_mappings(dir: &Path) -> Result<Mappings> {
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
+        let imported = template_imports(&text);
         for mut func in parse_functions(&text, &rel) {
             if let Some(kind) = handler_kinds.get(&func.name) {
                 func.kind = *kind;
             }
+            func.template_creates = std::mem::take(&mut func.template_creates)
+                .into_iter()
+                .filter_map(|(ident, arg, at)| {
+                    let name = imported.get(&ident).cloned().unwrap_or(ident);
+                    templates.contains(&name).then_some((name, arg, at))
+                })
+                .collect();
             functions.insert(func.name.clone(), func);
         }
     }
+    bind_helper_returns(&mut functions);
     Ok(Mappings {
         functions,
         handlers: handler_bindings,
+        declared_handlers: handler_kinds.into_keys().collect(),
     })
+}
+
+/// `import { Pool as PoolTemplate } from '../generated/templates'`, as alias → manifest name.
+fn template_imports(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("import") {
+        rest = &rest[at + "import".len()..];
+        let Some(end) = rest.find(';').or_else(|| rest.find('\n')) else {
+            break;
+        };
+        let stmt = &rest[..end];
+        if !stmt.contains("generated/templates") {
+            continue;
+        }
+        let (Some(open), Some(close)) = (stmt.find('{'), stmt.find('}')) else {
+            continue;
+        };
+        for item in stmt[open + 1..close].split(',') {
+            let item = item.trim();
+            let (name, alias) = item.split_once(" as ").unwrap_or((item, item));
+            if !name.trim().is_empty() {
+                out.insert(alias.trim().to_string(), name.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `let bribe = getBribe(..)` makes `bribe` whatever `getBribe` is declared to return. Without it a
+/// getOrCreate helper's `= ZERO_INT` was the only write seen (Bunni's `Bribe.amount`, S0 #1941).
+fn bind_helper_returns(functions: &mut BTreeMap<String, FunctionInfo>) {
+    let returns: BTreeMap<String, String> = functions
+        .iter()
+        .filter_map(|(n, f)| f.return_type.clone().map(|t| (n.clone(), t)))
+        .collect();
+    for func in functions.values_mut() {
+        for i in 0..func.assignments.len() {
+            if !func.assignments[i].entity.is_empty() {
+                continue;
+            }
+            let receiver = func.assignments[i].receiver.clone();
+            let Some(expr) = plain_local_expr(&func.body, &receiver) else {
+                continue;
+            };
+            let callee: String = expr
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !expr[callee.len()..].starts_with('(') {
+                continue;
+            }
+            if let Some(ty) = returns.get(&callee) {
+                func.assignments[i].entity = ty.clone();
+            }
+        }
+    }
 }
 
 fn collect_manifest_hints(
@@ -760,6 +889,7 @@ fn collect_manifest_hints(
     kinds: &mut BTreeMap<String, HandlerKind>,
     bindings: &mut Vec<HandlerBinding>,
     files: &mut Vec<PathBuf>,
+    templates: &mut BTreeSet<String>,
 ) {
     let Ok(docs) = YamlLoader::load_from_str(text) else {
         return;
@@ -772,6 +902,11 @@ fn collect_manifest_hints(
             continue;
         };
         for src in arr {
+            if key == "templates" {
+                if let Some(name) = get_yaml(src, "name").and_then(|v| v.as_str()) {
+                    templates.insert(name.to_string());
+                }
+            }
             let Some(mapping) = get_yaml(src, "mapping") else {
                 continue;
             };
@@ -913,14 +1048,10 @@ fn parse_functions(text: &str, file: &str) -> Vec<FunctionInfo> {
                     let param_names = param_names_of(sig);
                     let body = &stripped[open + 1..close];
                     let start_line = line_of(&stripped, open);
-                    out.push(analyse_function(
-                        name,
-                        file,
-                        body,
-                        start_line,
-                        params,
-                        param_names,
-                    ));
+                    let mut func =
+                        analyse_function(name, file, body, start_line, params, param_names);
+                    func.return_type = return_type_of(sig);
+                    out.push(func);
                     i = close + 1;
                     continue;
                 }
@@ -928,9 +1059,145 @@ fn parse_functions(text: &str, file: &str) -> Vec<FunctionInfo> {
             i = after_name;
             continue;
         }
+        if let Some((class, open)) = match_class(&stripped, i) {
+            if let Some(close) = match_ts_brace(&stripped, open) {
+                out.extend(parse_class_methods(&stripped, &class, open, close, file));
+                i = close + 1;
+                continue;
+            }
+        }
         i += 1;
     }
     out
+}
+
+/// `class NAME ... {`, giving the name and the offset of the opening brace.
+fn match_class(text: &str, i: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    if !text.is_char_boundary(i) || !text[i..].starts_with("class ") {
+        return None;
+    }
+    if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        return None;
+    }
+    let mut k = i + "class ".len();
+    skip_ws_str(text, &mut k);
+    let name = take_ident_str(text, &mut k)?;
+    // `extends Base` and `implements X` sit between the name and the brace, but nothing else does.
+    let open = k + text[k..].find('{')?;
+    if text[k..open].contains([';', '(', '=']) {
+        return None;
+    }
+    Some((name, open))
+}
+
+/// The methods of one class, each as a function named `Class.method`. The Messari SDK writes only from
+/// these (395 morpho fields unseen in S0, #1941); a property's declared type binds `this.<prop>`.
+fn parse_class_methods(
+    text: &str,
+    class: &str,
+    open: usize,
+    close: usize,
+    file: &str,
+) -> Vec<FunctionInfo> {
+    const MODIFIERS: [&str; 9] = [
+        "public",
+        "private",
+        "protected",
+        "static",
+        "readonly",
+        "get",
+        "set",
+        "export",
+        "async",
+    ];
+    let bytes = text.as_bytes();
+    let mut props: BTreeMap<String, String> = BTreeMap::new();
+    let mut methods: Vec<(String, usize, usize, usize)> = Vec::new();
+    let mut i = open + 1;
+    while i < close {
+        skip_ws_str(text, &mut i);
+        if i >= close {
+            break;
+        }
+        let mut k = i;
+        let mut name = take_ident_str(text, &mut k);
+        while let Some(n) = name.as_deref().filter(|n| MODIFIERS.contains(n)) {
+            let mut look = k;
+            skip_ws_str(text, &mut look);
+            // A modifier is only one when an identifier follows it: `get(): T` is a method named `get`.
+            if look < close && (bytes[look].is_ascii_alphabetic() || bytes[look] == b'_') {
+                k = look;
+                name = take_ident_str(text, &mut k);
+            } else {
+                name = Some(n.to_string());
+                break;
+            }
+        }
+        let Some(name) = name.filter(|n| !matches!(n.as_str(), "if" | "for" | "while" | "switch"))
+        else {
+            // Not a member start: move to the next line.
+            i = text[i..close].find('\n').map_or(close, |n| i + n + 1);
+            continue;
+        };
+        skip_ws_str(text, &mut k);
+        while k < close && (bytes[k] == b'!' || bytes[k] == b'?') {
+            k += 1;
+        }
+        skip_ws_str(text, &mut k);
+        if k < close && bytes[k] == b'(' {
+            let Some(paren) = match_ts_delim(text, k, b'(', b')') else {
+                break;
+            };
+            let Some(brace) = text[paren..close].find('{').map(|b| paren + b) else {
+                break;
+            };
+            let Some(end) = match_ts_brace(text, brace) else {
+                break;
+            };
+            methods.push((name, k, brace, end));
+            i = end + 1;
+            continue;
+        }
+        if k < close && bytes[k] == b':' {
+            k += 1;
+            skip_ws_str(text, &mut k);
+            if let Some(ty) = take_ident_str(text, &mut k) {
+                props.insert(name, ty);
+            }
+        }
+        // A property, with or without an initialiser, ends at its `;` or line end.
+        i = text[k.min(close)..close]
+            .find([';', '\n'])
+            .map_or(close, |n| k + n + 1);
+    }
+    methods
+        .into_iter()
+        .map(|(name, sig_at, brace, end)| {
+            let sig = &text[sig_at..brace];
+            let mut bindings = props.clone();
+            bindings.extend(parse_params(sig));
+            let mut func = analyse_function(
+                format!("{class}.{name}"),
+                file,
+                &text[brace + 1..end],
+                line_of(text, brace),
+                bindings,
+                param_names_of(sig),
+            );
+            func.return_type = return_type_of(sig);
+            func
+        })
+        .collect()
+}
+
+/// The leading type name after a signature's closing paren: `(..): Bribe | null` gives `Bribe`.
+fn return_type_of(sig: &str) -> Option<String> {
+    let close = sig.rfind(')')?;
+    let rest = sig[close + 1..].trim_start().strip_prefix(':')?;
+    let mut k = 0;
+    let rest = rest.trim_start();
+    take_ident_str(rest, &mut k)
 }
 
 fn match_function_name(text: &str, i: usize) -> Option<std::ops::Range<usize>> {
@@ -1149,10 +1416,50 @@ fn analyse_function(
         reads_loaded_entity_field,
         field_reads,
         param_names,
+        return_type: None,
+        template_creates: collect_template_creates(body, file, body_start_line),
         body: body.to_string(),
         file: file.to_string(),
         body_start_line,
     }
+}
+
+/// `Ident.create(arg)` and `Ident.createWithContext(arg, ctx)`, unfiltered: the caller keeps only the
+/// identifiers that name a manifest template.
+fn collect_template_creates(
+    body: &str,
+    file: &str,
+    body_start_line: usize,
+) -> Vec<(String, String, Citation)> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    for method in [".create(", ".createWithContext("] {
+        let mut from = 0;
+        while let Some(rel) = body[from..].find(method) {
+            let dot = from + rel;
+            from = dot + method.len();
+            let mut b = dot;
+            while b > 0 && (bytes[b - 1].is_ascii_alphanumeric() || bytes[b - 1] == b'_') {
+                b -= 1;
+            }
+            if b == dot || (b > 0 && bytes[b - 1] == b'.') {
+                continue;
+            }
+            let args = take_paren_list(body, dot + method.len() - 1);
+            let Some(arg) = args.first() else {
+                continue;
+            };
+            out.push((
+                body[b..dot].to_string(),
+                collapse_ws(arg.trim()),
+                Citation {
+                    file: file.to_string(),
+                    line: body_start_line + line_of(body, dot) - 1,
+                },
+            ));
+        }
+    }
+    out
 }
 
 fn collect_bindings(body: &str) -> BTreeMap<String, String> {
@@ -1431,7 +1738,13 @@ fn collect_assignments(
         if let Some((var, field, eq_at)) = match_assign(body, i) {
             let entity = bindings.get(&var).cloned().unwrap_or_default();
             let receiver_is_entity = bindings.contains_key(&var) || saved.contains(&var);
-            let expr = resolve_local(body, &take_expr(body, eq_at + 1));
+            let mut expr = resolve_local(body, &take_expr(body, eq_at + 1));
+            // Rewritten as the `.plus` / `.minus` a running total is recognised by.
+            match bytes[eq_at - 1] {
+                b'+' => expr = format!("{var}.{field}.plus({expr})"),
+                b'-' => expr = format!("{var}.{field}.minus({expr})"),
+                _ => {}
+            }
             let line = body_start_line + line_of(body, eq_at) - 1;
             out.push(Assignment {
                 receiver: var,
@@ -1509,6 +1822,10 @@ fn match_assign(text: &str, i: usize) -> Option<(String, String, usize)> {
     skip_ws_str(text, &mut k);
     let field = take_ident_str(text, &mut k)?;
     skip_ws_str(text, &mut k);
+    // `+=` and `-=` are writes too; the caller reads the operator off the byte before the `=`.
+    if k + 1 < bytes.len() && (bytes[k] == b'+' || bytes[k] == b'-') && bytes[k + 1] == b'=' {
+        k += 1;
+    }
     if k >= bytes.len() || bytes[k] != b'=' {
         return None;
     }
@@ -1940,6 +2257,7 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
     let entity_names: BTreeSet<&str> = schema.entities.iter().map(|e| e.name.as_str()).collect();
     let unique_fields = unique_field_owners(schema);
     let functions = &mappings.functions;
+    let contract_helpers = contract_returning_helpers(functions);
 
     let mut writers: BTreeMap<(String, String), Vec<(String, Assignment)>> = BTreeMap::new();
     for func in functions.values() {
@@ -2036,12 +2354,13 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
                             file: "schema.graphql".into(),
                             line: f.line,
                         },
-                        "no mapping writes this field".into(),
+                        NO_WRITER.into(),
                     ),
                 );
                 continue;
             };
-            let (worst, citation, reason) = worst_writer(sites, functions, &fn_class, &field_class);
+            let (worst, citation, reason) =
+                worst_writer(sites, functions, &fn_class, &field_class, &contract_helpers);
             field_class.insert(key, (worst, citation, reason));
         }
     }
@@ -2086,7 +2405,8 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
             changed = true;
         }
         for (key, sites) in &writers {
-            let (worst, citation, reason) = worst_writer(sites, functions, &fn_class, &snapshot);
+            let (worst, citation, reason) =
+                worst_writer(sites, functions, &fn_class, &snapshot, &contract_helpers);
             let new = (worst, citation, reason);
             if field_class.get(key) != Some(&new) {
                 changed = true;
@@ -2101,19 +2421,23 @@ fn classify(schema: &Schema, mappings: &Mappings) -> Vec<FieldRow> {
     let mut rows: Vec<FieldRow> = field_class
         .into_iter()
         .map(|((entity, field), (class, citation, reason))| {
-            let non_null = schema
+            let declared = schema
                 .entities
                 .iter()
                 .find(|e| e.name == entity)
-                .and_then(|e| e.fields.iter().find(|f| f.name == field))
-                .is_some_and(|f| f.non_null);
+                .and_then(|e| e.fields.iter().find(|f| f.name == field));
             FieldRow {
                 entity,
                 field,
                 class,
                 citation,
                 reason,
-                non_null,
+                non_null: declared.is_some_and(|f| f.non_null),
+                derived_from: declared.and_then(|f| {
+                    f.derived_from
+                        .clone()
+                        .map(|back| (f.named_type.clone(), back))
+                }),
             }
         })
         .collect();
@@ -2153,12 +2477,23 @@ fn worst_writer(
     functions: &BTreeMap<String, FunctionInfo>,
     fn_class: &BTreeMap<String, Class>,
     field_class: &BTreeMap<(String, String), (Class, Citation, String)>,
+    helpers: &BTreeSet<String>,
 ) -> (Class, Citation, String) {
     let mut worst = Class::Exact;
-    let mut citation = sites[0].1.citation.clone();
-    let mut reason = format!("assigned from `{}`", sites[0].1.expr);
+    // A write in a handler over one in a helper: a getOrCreate helper's `= ZERO_INT` initialises the
+    // field, and the handler's write is the value it holds.
+    let first = sites
+        .iter()
+        .find(|(f, _)| {
+            functions
+                .get(f)
+                .is_some_and(|f| matches!(f.kind, HandlerKind::Event | HandlerKind::Call))
+        })
+        .unwrap_or(&sites[0]);
+    let mut citation = first.1.citation.clone();
+    let mut reason = format!("assigned from `{}`", first.1.expr);
     for (fn_name, asg) in sites {
-        let c = class_of_assignment(fn_name, asg, functions, fn_class, field_class);
+        let c = class_of_assignment(fn_name, asg, functions, fn_class, field_class, helpers);
         if c > worst {
             worst = c;
             // Cite the line that *decided* the class. For a call-derived field that is the
@@ -2166,7 +2501,7 @@ fn worst_writer(
             // called it: a reader following the assignment site finds no contract call there and
             // cannot check the claim (#1210). The assignment stays in the reason, so the row still
             // says where the field is written.
-            citation = deciding_call_citation(fn_name, asg, functions, fn_class)
+            citation = deciding_call_citation(fn_name, asg, functions, fn_class, helpers)
                 .unwrap_or_else(|| asg.citation.clone());
             reason = reason_for(c, fn_name, asg, functions.get(fn_name));
             if citation != asg.citation {
@@ -2186,11 +2521,16 @@ fn deciding_call_citation(
     asg: &Assignment,
     functions: &BTreeMap<String, FunctionInfo>,
     fn_class: &BTreeMap<String, Class>,
+    helpers: &BTreeSet<String>,
 ) -> Option<Citation> {
     if expr_has_contract_call(&asg.expr) {
         return None;
     }
     let func = functions.get(fn_name)?;
+    let expanded = expand_locals(&func.body, &asg.expr, LOCAL_DEPTH);
+    if let Some(h) = helpers.iter().find(|h| reads_through_helper(&expanded, h)) {
+        return functions.get(h).and_then(|h| h.contract_call.clone());
+    }
     for callee in &func.calls {
         if !expr_calls(&asg.expr, callee) {
             continue;
@@ -2233,6 +2573,7 @@ fn class_of_assignment(
     functions: &BTreeMap<String, FunctionInfo>,
     fn_class: &BTreeMap<String, Class>,
     field_class: &BTreeMap<(String, String), (Class, Citation, String)>,
+    helpers: &BTreeSet<String>,
 ) -> Class {
     let Some(func) = functions.get(fn_name) else {
         return Class::Exact;
@@ -2241,6 +2582,12 @@ fn class_of_assignment(
         return Class::Unreachable;
     }
     let mut c = Class::Exact;
+    // `getPeeranhaNFT().getAchievementsNFTConfig(id)` is a contract read even though the bind lives in
+    // the helper, and it usually arrives through a local, hence the expansion (S0 #1941).
+    let expanded = expand_locals(&func.body, &asg.expr, LOCAL_DEPTH);
+    if helpers.iter().any(|h| reads_through_helper(&expanded, h)) {
+        c = Class::CallDerived;
+    }
     // **A contract bound to a local counts too.** `expr_has_contract_call` only sees a bind, an
     // `ethereum.call` or a `try_` in the expression it is given, and the commonest shape puts the bind on
     // its own line - `let contract = ERC20.bind(id)` then `token.symbol = contract.symbol()`. That RHS
@@ -2302,7 +2649,6 @@ fn class_of_assignment(
     //
     // The assignment names no classified field, so the direct test above sees nothing while the total
     // still cannot be computed without `decimals`. Ten more fields on Uniswap V4 (#1310).
-    let expanded = expand_locals(&func.body, &asg.expr, LOCAL_DEPTH);
     for (ent, field) in &func.field_reads {
         if expr_reads_field(&expanded, field) {
             if let Some((cl, _, _)) = field_class.get(&(ent.clone(), field.clone())) {
@@ -2787,6 +3133,50 @@ const RETURN_DEPTH: usize = 4;
 
 fn expr_has_contract_call(expr: &str) -> bool {
     expr.contains(".bind(") || expr.contains("ethereum.call(") || expr.contains(".try_")
+}
+
+/// Functions that hand back a bound contract: `return PeeranhaNFT.bind(..)`, or a local bound to one.
+fn contract_returning_helpers(functions: &BTreeMap<String, FunctionInfo>) -> BTreeSet<String> {
+    functions
+        .iter()
+        .filter(|(_, f)| {
+            let bound = bound_contract_locals(&f.body);
+            return_exprs(&f.body).iter().any(|r| {
+                let r = r.trim();
+                r.contains(".bind(") || bound.contains(r)
+            })
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+/// Is a method called on what `helper(..)` returns? `(getNFT()).config(id)` counts, which is how a
+/// local holding the helper's result reads once expanded.
+fn reads_through_helper(expr: &str, helper: &str) -> bool {
+    let b = expr.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = expr[from..].find(helper) {
+        let at = from + rel;
+        from = at + helper.len();
+        if at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_' || b[at - 1] == b'.') {
+            continue;
+        }
+        let Some(close) = match_paren(expr, from) else {
+            continue;
+        };
+        let rest = expr[close + 1..].trim_start_matches(|c: char| c == ')' || c.is_whitespace());
+        let Some(after) = rest.strip_prefix('.') else {
+            continue;
+        };
+        let method: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !method.is_empty() && after[method.len()..].trim_start().starts_with('(') {
+            return true;
+        }
+    }
+    false
 }
 
 fn unique_field_owners(schema: &Schema) -> BTreeMap<String, String> {
@@ -4422,7 +4812,7 @@ pub(crate) fn event_handler_for<'a>(
 /// column under a report promising byte-identical, which is #1248's fault in a new place. Refusing
 /// leaves the field reported as reaching no column, which is what it did before this fallback
 /// existed. Raised by review of this change.
-fn plain_local_expr(body: &str, var: &str) -> Option<String> {
+pub(crate) fn plain_local_expr(body: &str, var: &str) -> Option<String> {
     let mut found: Vec<String> = Vec::new();
     let mut i = 0;
     while i < body.len() {
@@ -4648,6 +5038,7 @@ mod tests {
             Mappings {
                 functions,
                 handlers: Vec::new(),
+                declared_handlers: BTreeSet::new(),
             },
         )
     }
@@ -6648,6 +7039,8 @@ type Token @entity { id: ID! leftover: String! }
         let report = Report {
             source: "fixture".into(),
             fields: rows,
+            missing_handlers: Vec::new(),
+            mapping_source: true,
         };
         let text = render_report(&report);
         assert!(text.contains("will not reproduce"));
@@ -6736,6 +7129,8 @@ export function handlePoolCreated(event: PoolCreated): void {
             &Report {
                 source: "t".into(),
                 fields: rows,
+                missing_handlers: Vec::new(),
+                mapping_source: true,
             },
             &mappings,
         );
@@ -6777,6 +7172,8 @@ export function handlePoolCreated(event: PoolCreated): void {
             &Report {
                 source: "t".into(),
                 fields: rows,
+                missing_handlers: Vec::new(),
+                mapping_source: true,
             },
             &mappings,
         );
@@ -6817,6 +7214,8 @@ export function handlePoolCreated(event: PoolCreated): void {
             &Report {
                 source: "t".into(),
                 fields: rows,
+                missing_handlers: Vec::new(),
+                mapping_source: true,
             },
             &mappings,
         );
@@ -6857,6 +7256,8 @@ export function handlePoolCreated(event: PoolCreated): void {
             &Report {
                 source: "t".into(),
                 fields: rows,
+                missing_handlers: Vec::new(),
+                mapping_source: true,
             },
             &mappings,
         );
