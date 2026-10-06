@@ -175,9 +175,34 @@ jobs:
           name: nuthatch-scaled-binary
           path: target/${{ matrix.target }}/release/nuthatch
           retention-days: 1
+      # The **graph** binary (#1950): `--features graph`, which serves a nest's Graph-dialect GraphQL
+      # (RFC-0053) and the RFC-0060 facade. Kept out of the default binary by the 2026-09-21 rule, but
+      # shipped, so an operator serving a stopgap nest does not have to build from source. Built after
+      # the scaled binary was kept, because it overwrites the same path.
+      - name: build (graph)
+        run: cargo build --release --locked --features graph --target ${{ matrix.target }}
+      - name: package (graph)
+        run: |
+          tarball="nuthatch-graph-${{ matrix.target }}.tar.gz"
+          tar czf "$tarball" -C "target/${{ matrix.target }}/release" nuthatch
+          shasum -a 256 "$tarball" > "$tarball.sha256"
+          ls -lh "$tarball"
+      - name: attach graph build to release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            nuthatch-graph-${{ matrix.target }}.tar.gz
+            nuthatch-graph-${{ matrix.target }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+      - name: attest the graph artifact
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: nuthatch-graph-${{ matrix.target }}.tar.gz
       # Hand the *default* Linux binary to the container job so the image ships the same artifact that
       # is attached to the release, rather than a second build nobody diffed. Note this step runs after
-      # the scaled build overwrote the binary, so it re-runs the default build first.
+      # the scaled and graph builds overwrote the binary, so it re-runs the default build first.
       - name: rebuild the default binary for the image
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo build --release --locked --target ${{ matrix.target }}

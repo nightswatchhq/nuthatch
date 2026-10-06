@@ -162,6 +162,10 @@ unused. `-scaled` is deliberately **not** tagged `latest`: the default image sta
 not thinking about it. The release also attaches `nuthatch-scaled-x86_64-unknown-linux-gnu.tar.gz` for
 anyone deploying without containers.
 
+The release also attaches `nuthatch-graph-<target>.tar.gz` for Linux and macOS, built with
+`--features graph`. It is the binary for serving a nest's Graph-dialect GraphQL, as a
+[subgraph stopgap](subgraph-stopgap.md) does; the default binary has no `/graphql` route.
+
 > **Do not use `:0.7.0`.** It is published but cannot start (`GLIBC_2.38 not found`) - the release job
 > pushed before it smoke-tested, so the failing test failed the job without unpublishing the image.
 > `0.7.1` is the first working tag, and the job now tests before it pushes. `:latest` was broken for the
