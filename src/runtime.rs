@@ -2475,14 +2475,15 @@ pub fn lifecycle_routes(
                         StatusCode::CONFLICT,
                         Json(serde_json::json!({
                             "error": format!(
-                                "'{}' is already {} as nid {}; changing a mount's nest is `nest upgrade`",
+                                "'{}' is already {} as nid {}; changing a mount's nest is `POST /_admin/move/{}` with the new nid",
                                 body.name,
                                 match job.phase {
                                     MountPhase::Live => "mounted",
                                     MountPhase::Suspended => "suspended",
                                     _ => "being mounted",
                                 },
-                                job.nid.as_deref().unwrap_or("(unrecorded)")
+                                job.nid.as_deref().unwrap_or("(unrecorded)"),
+                                body.name
                             )
                         })),
                     )
@@ -3093,7 +3094,7 @@ impl std::fmt::Display for MountRefusal {
         match self {
             MountRefusal::AlreadyMounted(n) => write!(
                 f,
-                "nest '{n}' is already mounted - changing a mounted nest is `nest upgrade`, not a mount"
+                "nest '{n}' is already mounted - changing a mounted nest is `POST /_admin/move/{n}`, not a mount"
             ),
             MountRefusal::UndeclaredChain { nest, chain } => write!(
                 f,

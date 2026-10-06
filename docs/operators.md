@@ -239,7 +239,8 @@ determine one, because two workers sharing an id look like a single worker to th
 time. If a writer stalls - long GC, paused container, a host that goes away - its lease expires and
 another writer takes over. When the original wakes up, its writes are **refused by the store**, not
 merely discouraged: every write carries a fence, and a stale fence is rejected inside the same
-transaction as the write. This is why `--scale writer=N` is safe.
+transaction as the write. On its next reconcile tick the stale writer learns the lease is gone, stops
+indexing that cursor and keeps any others it still holds. This is why `--scale writer=N` is safe.
 
 **3. The control plane and the lease are independent, on purpose.** A control-plane outage stops
 *rescheduling*, not *ingestion* - writers keep their leases and keep working. It follows that the two
@@ -1079,7 +1080,7 @@ suspended mount has no series),
 
 A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:
 `nuthatch_publish_sealed_through` (what the published catalogue covers),
-`nuthatch_publish_lag_blocks` (sealed locally, not yet published), `nuthatch_publish_pending_segments`,
+`nuthatch_publish_lag_blocks` (blocks spanned by the final local segments the mirror does not hold, summed over tables; a quiet table's provisional tail is not owed, so a fully published nest reads 0), `nuthatch_publish_pending_segments`,
 `nuthatch_publish_bytes_total`, `nuthatch_publish_errors_total` and `nuthatch_publish_dead_letter`.
 
 Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_screen`,

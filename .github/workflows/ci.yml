@@ -276,7 +276,12 @@ jobs:
         shard: [1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, so bench_commits can resolve every commit docs/bench cites (#1918).
+          fetch-depth: 0
       - uses: ./.github/actions/nextest-shard
+        env:
+          NUTHATCH_REQUIRE_BENCH_COMMITS: "1"
         with:
           archive: nextest-default
           shard: ${{ matrix.shard }}
@@ -1148,6 +1153,8 @@ jobs:
         env:
           BIN: bin/nuthatch
           OUT: backfill-throughput-report.json
+          # Never the merge ref the checkout is at on a pull_request (#1918).
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           chmod +x bin/nuthatch
           bash .github/workflows/backfill-throughput.sh
