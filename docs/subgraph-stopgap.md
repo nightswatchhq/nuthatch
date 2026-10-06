@@ -69,13 +69,15 @@ S0 and S2 are independent and run in parallel. S0 is the slice that can stop the
 - **Mapping logic is not run.** No AssemblyScript, anywhere, per RFC-0038 §8. Pricing and
   accumulated fields are refused permanently, not pending.
 
-## Open decisions
+## Decided
 
-- **Who runs a stopgap nest when the developer cannot.** Nightswatch does not run hosted nests
-  (CLAUDE.md, 2026-09-29), so as things stand the options are the developer, or GraphOps on its own
-  platform. Chief's call. Note that [the fallback forum post](nuthatch-subgraph-fallback-forum-post.md)
-  predates that rule and still offers a hosted temporary endpoint; it must not be posted as written.
+- **Who runs a stopgap nest when the developer cannot: we do.** Chief lifted the 2026-09-29
+  no-hosting rule for this programme on 2026-10-06 (CLAUDE.md, out-of-scope list). Nests are served
+  from the ThinkPad or new VPSes, stock binary, no billing, until an indexer allocates. The
+  [fallback forum post](nuthatch-subgraph-fallback-forum-post.md)'s hosted-endpoint offer is consistent
+  with this again, but scope it to unserved subgraphs before posting.
 
 ## Log
 
 - **2026-10-06** Tracker opened, S0 to S3 filed as #1940 to #1943.
+- **2026-10-06** Chief lifted the no-hosting rule for the stopgap: we serve the nests ourselves.
