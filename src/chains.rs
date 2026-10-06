@@ -1002,7 +1002,11 @@ mod tests {
         assert!(msg.contains("unknown chain 'avalanche'"), "{msg}");
         assert!(msg.contains("--rpc"), "{msg}");
         for c in all() {
-            assert!(msg.contains(c.name), "{} missing from the remedy: {msg}", c.name);
+            assert!(
+                msg.contains(c.name),
+                "{} missing from the remedy: {msg}",
+                c.name
+            );
         }
     }
 
