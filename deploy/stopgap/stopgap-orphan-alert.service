@@ -1,0 +1,16 @@
+# A user unit on the ThinkPad, beside the monitoring stack, posting to the nightswatch webhook.
+# Install, as the monitoring user:
+#   install -D -m 755 deploy/stopgap/orphan-alert.sh ~/.local/bin/stopgap-orphan-alert
+#   install -D -m 644 deploy/stopgap/stopgap-orphan-alert.{service,timer} -t ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now stopgap-orphan-alert.timer
+#   loginctl enable-linger "$USER"   # or the timer stops at logout
+# The first run records the list as a baseline; nothing is posted before 2026-10-08.
+[Unit]
+Description=Page Discord when a bsc or matic deployment joins the stopgap orphan list (#1942)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/stopgap-orphan-alert
+TimeoutStartSec=10min
