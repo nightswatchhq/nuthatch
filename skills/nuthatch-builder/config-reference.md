@@ -256,10 +256,8 @@ beside `[runtime]`), one isolated cursor per chain, and each nest declares its o
 name = "my-runtime"
 max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048); the runtime's
                               # total budget is Σ cursors
-default_tenant = "acme"       # optional; the tenant a mount belongs to when it does not say, served without a tenant segment
-                              # segment in the route (default "default"). It does NOT change which
-                              # tenant a mount without `tenant` belongs to: that is always
-                              # "default", which would then serve at /default/<alias>/…. Opaque -
+default_tenant = "acme"       # optional (default "default"); the tenant a mount without `tenant`
+                              # belongs to, served with no tenant segment in the route. Opaque -
                               # nuthatch refcounts a tenant, nothing more.
 suspended = ["usdc"]          # runtime state: mounts suspended over the admin API. Kept on disk,
                               # neither indexed nor served (503) until `POST /_admin/resume/<name>`.
