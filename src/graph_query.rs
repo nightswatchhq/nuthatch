@@ -1716,7 +1716,13 @@ pub fn compile_with(
         } else {
             order_expr
         };
-        sql.push_str(&format!(" ORDER BY {order_expr} {dir}"));
+        // graph-node breaks ties on the id in the same direction (`relational_queries.rs`, `sort_expr`).
+        let tie = if order_field == "id" {
+            String::new()
+        } else {
+            format!(", {BASE}.\"id\" {dir}")
+        };
+        sql.push_str(&format!(" ORDER BY {order_expr} {dir}{tie}"));
 
         // graph-node's defaults, taken from the recorded reference: first = 100, skip = 0, and
         // §Query semantics caps first at 1000.
@@ -1949,6 +1955,11 @@ fn derived_list_sql(
     } else {
         order_expr
     };
+    let tie = if order == "id" {
+        String::new()
+    } else {
+        format!(", {alias}.\"id\" {direction}")
+    };
     let view = crate::subgraph_import::to_alias(&child.name);
     // No `OFFSET 0`, so an unargumented list lowers to exactly the SQL RFC-0053 always emitted.
     let offset = if skip > 0 {
@@ -1957,7 +1968,7 @@ fn derived_list_sql(
         String::new()
     };
     Ok(format!(
-        "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s FROM \"{view}\" {alias} WHERE {} ORDER BY {order_expr} {direction} LIMIT {first}{offset}) t), '[]')",
+        "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s FROM \"{view}\" {alias} WHERE {} ORDER BY {order_expr} {direction}{tie} LIMIT {first}{offset}) t), '[]')",
         packed.join(", "),
         wheres.join(" AND "),
     ))
@@ -2642,7 +2653,8 @@ type Swap @entity { id: ID! pool: Pool! }
         .unwrap();
         assert_eq!(
             compact(&c.sql),
-            r#"SELECT b."id" FROM "pool" b WHERE b."hooks" = '0xabc' AND KEY(b."liquidity") > KEY(100) ORDER BY KEY(b."liquidity") DESC LIMIT 5 OFFSET 10"#
+            r#"SELECT b."id" FROM "pool" b WHERE b."hooks" = '0xabc' AND KEY(b."liquidity") > KEY(100) ORDER BY KEY(b."liquidity") DESC, b."id" DESC LIMIT 5 OFFSET 10"#,
+            "ties break on the id in the same direction, as graph-node orders"
         );
     }
 
