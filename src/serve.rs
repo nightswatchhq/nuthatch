@@ -2542,49 +2542,65 @@ async fn graph_graphql(
     let byte_cap = crate::engine::SQL_MAX_RESULT_BYTES;
     let mut bytes_left = byte_cap;
     // Rendered at most once, and only if a root asks for it.
-    let mut doc: Option<serde_json::Value> = None;
+    let doc = if roots
+        .iter()
+        .any(|r| matches!(r.name.as_str(), "__schema" | "__type"))
+    {
+        match crate::graph_schema::introspection::render(&schema) {
+            Ok(d) => Some(d),
+            Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+        }
+    } else {
+        None
+    };
+    let no_types = Vec::new();
+    let types = doc
+        .as_ref()
+        .and_then(|d| d["__schema"]["types"].as_array())
+        .unwrap_or(&no_types);
     // **Every root field is answered.** Routing on `any(… == "__schema")` and returning early meant
     // `{ __schema { queryType { name } } pools { id } }` came back without `pools` at all - a field
     // the operation asked for, silently missing from the response (Jules on #1282). Introspection is
     // not an exclusive mode, it is two more root fields.
     for root in &roots {
-        match root.name.as_str() {
+        match (root.name.as_str(), &doc) {
             // The introspection surface a generated client fetches before it sends anything useful.
             // `render` produces `{"__schema": …}`, so the inner value is what belongs under the key.
-            "__schema" => {
-                let d =
-                    doc.get_or_insert_with(|| crate::graph_schema::introspection::render(&schema));
-                data.insert(root.key.clone(), project(&d["__schema"], &root.sel));
+            ("__schema", Some(d)) => {
+                match project_introspection(&d["__schema"], "__Schema", &root.sel, types) {
+                    Ok(v) => data.insert(root.key.clone(), v),
+                    Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+                };
                 continue;
             }
             // The other standard introspection operation. The name comes from the parsed argument,
             // and one the schema does not declare is `null` rather than an error - that is what
             // introspection says, and a client uses it to test whether a type exists.
-            "__type" => {
-                let d =
-                    doc.get_or_insert_with(|| crate::graph_schema::introspection::render(&schema));
+            ("__type", Some(_)) => {
                 let found = root
                     .args
                     .get("name")
                     .and_then(|v| match v {
-                        crate::graph_query::Value::Str(s) => Some(s.clone()),
+                        crate::graph_query::Value::Str(s) => Some(s.as_str()),
                         _ => None,
                     })
-                    .and_then(|want| {
-                        d["__schema"]["types"]
-                            .as_array()?
-                            .iter()
-                            .find(|t| t["name"].as_str() == Some(want.as_str()))
-                            .cloned()
-                    })
-                    .map(|t| project(&t, &root.sel));
-                data.insert(root.key.clone(), found.unwrap_or(serde_json::Value::Null));
+                    .and_then(|want| types.iter().find(|t| t["name"].as_str() == Some(want)));
+                let v = match found {
+                    Some(t) => project_introspection(t, "__Type", &root.sel, types),
+                    None => {
+                        check_introspection("__Type", &root.sel).map(|()| serde_json::Value::Null)
+                    }
+                };
+                match v {
+                    Ok(v) => data.insert(root.key.clone(), v),
+                    Err(e) => return (StatusCode::OK, Json(gql_error(&e.to_string()))),
+                };
                 continue;
             }
             // `_meta` is the nest's own head, not a compiled query. A nest runs no mapping, so
             // `hasIndexingErrors` is false as a fact rather than as a convenience - there is no
             // handler that could have aborted.
-            "_meta" => {
+            ("_meta", _) => {
                 // Its one argument is `block`, and ignoring it answered a past or future block with
                 // today's head.
                 for (name, value) in &root.args {
@@ -2714,7 +2730,10 @@ async fn graph_graphql(
                 };
                 data.insert(root.key.clone(), value);
             }
-            Err(msg) => return (StatusCode::OK, Json(gql_error(&msg))),
+            Err(msg) => {
+                let msg = graph_unserved(&schema, root, &compiled, &msg).unwrap_or(msg);
+                return (StatusCode::OK, Json(gql_error(&msg)));
+            }
         }
     }
     if let Some((generation, sealed)) = history_fence {
@@ -2773,6 +2792,145 @@ fn project(value: &serde_json::Value, sel: &[crate::graph_query::Selection]) -> 
         // object for it.
         _ => value.clone(),
     }
+}
+
+/// The fields graph-node's `introspection.graphql` gives each introspection type, with the
+/// introspection type a composite one returns. `None` for a field the type has not got.
+#[cfg(feature = "graph")]
+fn introspection_field(ty: &str, field: &str) -> Option<Option<&'static str>> {
+    const TYPE: Option<&str> = Some("__Type");
+    Some(match (ty, field) {
+        ("__Schema", "types" | "queryType" | "mutationType" | "subscriptionType") => TYPE,
+        ("__Schema", "directives") => Some("__Directive"),
+        ("__Schema", "description") => None,
+        ("__Type", "fields") => Some("__Field"),
+        ("__Type", "interfaces" | "possibleTypes" | "ofType") => TYPE,
+        ("__Type", "enumValues") => Some("__EnumValue"),
+        ("__Type", "inputFields") => Some("__InputValue"),
+        ("__Type", "kind" | "name" | "description" | "specifiedByURL") => None,
+        ("__Field" | "__InputValue", "type") => TYPE,
+        ("__Field" | "__Directive", "args") => Some("__InputValue"),
+        ("__Field" | "__InputValue" | "__EnumValue" | "__Directive", "name" | "description") => {
+            None
+        }
+        ("__Field" | "__InputValue" | "__EnumValue", "isDeprecated" | "deprecationReason") => None,
+        ("__InputValue", "defaultValue") => None,
+        ("__Directive", "locations" | "isRepeatable") => None,
+        _ => return None,
+    })
+}
+
+/// Refuse a selection naming a field its introspection type has not got, as graph-node's validation
+/// does, before anything is answered.
+#[cfg(feature = "graph")]
+fn check_introspection(
+    ty: &str,
+    sel: &[crate::graph_query::Selection],
+) -> Result<(), crate::graph_query::Unsupported> {
+    for s in sel {
+        if s.name == "__typename" {
+            continue;
+        }
+        match introspection_field(ty, &s.name) {
+            Some(Some(inner)) => check_introspection(inner, &s.sub)?,
+            Some(None) => {}
+            None => {
+                return Err(crate::graph_query::Unsupported::UnknownField {
+                    entity: ty.to_string(),
+                    field: s.name.clone(),
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Narrow an introspection value to `sel`, as `project` does, against the introspection schema.
+///
+/// The rendered document stores the type a field or argument points at as a `{kind, name}`
+/// reference, and `queryType` as `{name}`. Selecting `fields` through one answered `null` (#1941), so
+/// a reference to a named type is answered from that type's own declaration in `types`.
+#[cfg(feature = "graph")]
+fn project_introspection(
+    value: &serde_json::Value,
+    ty: &str,
+    sel: &[crate::graph_query::Selection],
+    types: &[serde_json::Value],
+) -> Result<serde_json::Value, crate::graph_query::Unsupported> {
+    use serde_json::Value;
+    check_introspection(ty, sel)?;
+    fn walk(
+        value: &Value,
+        ty: &str,
+        sel: &[crate::graph_query::Selection],
+        types: &[Value],
+    ) -> Value {
+        if sel.is_empty() {
+            return value.clone();
+        }
+        match value {
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|v| walk(v, ty, sel, types)).collect())
+            }
+            Value::Object(o) => {
+                let decl = match (ty, o.get("name").and_then(Value::as_str)) {
+                    ("__Type", Some(name)) => types.iter().find(|t| t["name"] == name),
+                    _ => None,
+                };
+                let mut out = serde_json::Map::new();
+                for s in sel {
+                    let v = if s.name == "__typename" {
+                        Value::String(ty.to_string())
+                    } else {
+                        match o.get(&s.name).or_else(|| decl.and_then(|d| d.get(&s.name))) {
+                            Some(v) => match introspection_field(ty, &s.name).flatten() {
+                                Some(inner) => walk(v, inner, &s.sub, types),
+                                None => v.clone(),
+                            },
+                            // Declared by the introspection schema, absent from the document: a
+                            // generated subgraph schema deprecates nothing and repeats no directive.
+                            None if matches!(s.name.as_str(), "isDeprecated" | "isRepeatable") => {
+                                Value::Bool(false)
+                            }
+                            None => Value::Null,
+                        }
+                    };
+                    out.insert(s.key.clone(), v);
+                }
+                Value::Object(out)
+            }
+            _ => value.clone(),
+        }
+    }
+    Ok(walk(value, ty, sel, types))
+}
+
+/// The refusal for a query whose engine error is a missing view of an entity the schema declares
+/// (#1941): the collection is named, not the table the engine could not find.
+#[cfg(feature = "graph")]
+fn graph_unserved(
+    schema: &crate::graph_schema::Schema,
+    root: &crate::graph_query::RootField,
+    compiled: &crate::graph_query::Compiled,
+    err: &str,
+) -> Option<String> {
+    let view = crate::analytics::missing_table_of(err)?;
+    let entity = schema
+        .entities
+        .iter()
+        .find(|e| crate::subgraph_import::to_alias(&e.name) == view)?;
+    let what = if entity.name == compiled.entity {
+        &root.name
+    } else {
+        &entity.name
+    };
+    // A view that exists and failed to build is a different fault, and the hint already names it.
+    let built = format!("view `{view}` failed to build");
+    let why = match err.split_once("\n\nhint: ") {
+        Some((_, hint)) if hint.starts_with(&built) => hint.to_string(),
+        _ => format!("it has no `{view}` view"),
+    };
+    Some(format!("`{what}` is not served by this nest: {why}"))
 }
 
 /// Build one response object from one SQL row.
@@ -10800,18 +10958,18 @@ type Signer @entity {
             "including at the `__schema` level"
         );
 
-        // A selected field the document does not carry is `null`, not absent: a client that asked for a
-        // key should find it there.
+        // A field `__Type` does not have is refused by name, as graph-node's validation refuses it, not
+        // answered with a null nobody can tell from a real one.
         let body = graph_ask(
             "/graphql",
             "{ __schema { types { name nope } } }",
             state.clone(),
         )
         .await;
+        assert!(body["data"].is_null(), "{body}");
         assert_eq!(
-            body["data"]["__schema"]["types"][0],
-            serde_json::json!({"name": "String", "nope": null}),
-            "an unknown selected key is null rather than missing: {body}"
+            body["errors"][0]["message"], "`nope` is not a field of `__Type`",
+            "{body}"
         );
 
         // An alias on an introspection field answers under the alias, and projection follows it down.
@@ -10879,6 +11037,193 @@ type Signer @entity {
             serde_json::json!([]),
             "it must run as the filter it is, and no pool has that hook: {body}"
         );
+    }
+
+    /// `__schema.queryType` is a whole `__Type`, as is every type a field or argument points at (#1941).
+    /// The document stores those as `{kind, name}` references, so selecting `fields` through one
+    /// answered a silent `null`.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn an_introspection_type_reference_answers_as_the_type_it_names() {
+        let (_d, state) = graph_fixture();
+        let body = graph_ask(
+            "/graphql",
+            "{ __schema { __typename queryType { name kind fields { name } } } }",
+            state.clone(),
+        )
+        .await;
+        assert!(body["errors"].is_null(), "{body}");
+        let q = &body["data"]["__schema"]["queryType"];
+        assert_eq!(q["kind"], "OBJECT", "{body}");
+        let names: Vec<&str> = q["fields"]
+            .as_array()
+            .unwrap_or_else(|| panic!("queryType.fields answered null: {body}"))
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        for want in ["pool", "pools", "token", "_meta", "_logs"] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+        assert_eq!(body["data"]["__schema"]["__typename"], "__Schema", "{body}");
+
+        // Through a field's type, two wrappers down: `Pool.token0: Token!`.
+        let body = graph_ask(
+            "/graphql",
+            r#"{ __type(name: "Pool") { ofType { name } specifiedByURL
+                 fields { name type { kind ofType { name fields { name } } } } } }"#,
+            state.clone(),
+        )
+        .await;
+        assert!(body["errors"].is_null(), "{body}");
+        let t = &body["data"]["__type"];
+        assert!(t["ofType"].is_null(), "a named type has no ofType: {body}");
+        assert!(t["specifiedByURL"].is_null(), "{body}");
+        let token0 = t["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "token0")
+            .unwrap_or_else(|| panic!("no token0: {body}"));
+        assert_eq!(token0["type"]["kind"], "NON_NULL", "{body}");
+        assert_eq!(token0["type"]["ofType"]["name"], "Token", "{body}");
+        let token_fields: Vec<&str> = token0["type"]["ofType"]["fields"]
+            .as_array()
+            .unwrap_or_else(|| panic!("Token.fields answered null through a reference: {body}"))
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        assert!(token_fields.contains(&"symbol"), "{token_fields:?}");
+
+        // Fields the introspection schema declares and the stored document leaves out.
+        let body = graph_ask(
+            "/graphql",
+            "{ __schema { description directives { name isRepeatable args { name isDeprecated deprecationReason } } } }",
+            state.clone(),
+        )
+        .await;
+        assert!(body["errors"].is_null(), "{body}");
+        assert!(body["data"]["__schema"]["description"].is_null(), "{body}");
+        let skip = &body["data"]["__schema"]["directives"][0];
+        assert_eq!(
+            skip,
+            &serde_json::json!({"name": "skip", "isRepeatable": false,
+                "args": [{"name": "if", "isDeprecated": false, "deprecationReason": null}]}),
+            "{body}"
+        );
+
+        let body = graph_ask("/graphql", "{ __schema { queryType { nope } } }", state).await;
+        assert_eq!(
+            body["errors"][0]["message"], "`nope` is not a field of `__Type`",
+            "{body}"
+        );
+    }
+
+    /// A collection the schema declares but no view serves is refused by name (#1941), not with the
+    /// engine's "table does not exist" and a hint about some other table.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_collection_with_no_view_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Pool @entity { id: ID! token: Token! }\ntype Token @entity { id: ID! }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/pool.sql"),
+            "CREATE VIEW pool AS SELECT 'p' AS id, 't' AS token;",
+        )
+        .unwrap();
+        let state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+
+        let body = graph_ask("/graphql", "{ tokens { id } }", state.clone()).await;
+        assert_eq!(
+            body["errors"][0]["message"],
+            "`tokens` is not served by this nest: it has no `token` view",
+            "{body}"
+        );
+        let body = graph_ask("/graphql", r#"{ token(id: "t") { id } }"#, state.clone()).await;
+        assert_eq!(
+            body["errors"][0]["message"],
+            "`token` is not served by this nest: it has no `token` view",
+            "{body}"
+        );
+        // Reached through a relation, it is the entity that is not served.
+        let body = graph_ask("/graphql", "{ pools { token { id } } }", state.clone()).await;
+        assert_eq!(
+            body["errors"][0]["message"],
+            "`Token` is not served by this nest: it has no `token` view",
+            "{body}"
+        );
+        // And the collection that has a view still answers.
+        let body = graph_ask("/graphql", "{ pools { id } }", state).await;
+        assert_eq!(body["data"]["pools"], json!([{"id": "p"}]), "{body}");
+    }
+
+    /// The S0 schemas whose descriptions hold colons (#1948): every request to the nest panicked in the
+    /// handler and the connection closed with no response.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_schema_whose_descriptions_hold_colons_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            concat!(
+                "\"Examples: AMM protocol fee\"\n",
+                "type Node @entity {\n",
+                "  id: ID!\n",
+                "  \"the node's URL, e.g. http://mynode.com:3000\"\n",
+                "  url: String!\n",
+                "  \"mapping (uint32 => Stake)\"\n",
+                "  stakes: BigInt!\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/node.sql"),
+            "CREATE VIEW node AS SELECT 'n' AS id, 'http://mynode.com:3000' AS url, 7 AS stakes;",
+        )
+        .unwrap();
+        let state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        let body = graph_ask(
+            "/graphql",
+            r#"{ __type(name: "Node") { fields { name } } nodes { id url stakes } }"#,
+            state,
+        )
+        .await;
+        assert!(body["errors"].is_null(), "{body}");
+        assert_eq!(
+            body["data"]["__type"]["fields"],
+            json!([{"name": "id"}, {"name": "url"}, {"name": "stakes"}]),
+            "{body}"
+        );
+        assert_eq!(
+            body["data"]["nodes"],
+            json!([{"id": "n", "url": "http://mynode.com:3000", "stakes": "7"}]),
+            "{body}"
+        );
+    }
+
+    /// A schema the renderer cannot complete is refused in the envelope, never a panic.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_schema_that_cannot_render_is_refused_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "interface Named { id: ID! }\ntype A @entity { id: ID! n: Named! }",
+        )
+        .unwrap();
+        let state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        let body = graph_ask("/graphql", "{ __schema { queryType { name } } }", state).await;
+        let msg = body["errors"][0]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("Named"), "{body}");
     }
 
     /// The **canonical introspection document**, sent verbatim from the recording fixture, answered with

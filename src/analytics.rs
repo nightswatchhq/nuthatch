@@ -3839,7 +3839,7 @@ impl FoldEvaluator {
 /// Format-dependent by necessity - the engine gives no structured error code for it - so it fails soft:
 /// an unrecognised message simply yields `None` and the raw error is reported instead of a
 /// half-parsed one.
-fn missing_table_of(err: &str) -> Option<String> {
+pub(crate) fn missing_table_of(err: &str) -> Option<String> {
     let after = err.split("Table with name ").nth(1)?;
     let name = after.split_whitespace().next()?;
     (!name.is_empty()).then(|| name.to_string())

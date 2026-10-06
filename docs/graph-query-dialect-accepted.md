@@ -250,6 +250,8 @@ after which the whole operation reads as garbage.
 | an operator the schema does not declare for that field's type | `sender_starts_with` on a `Bytes` field: our own generated schema says it does not exist |
 | an empty `and`/`or`, or an empty filter object inside one | "no conditions" has no forced reading, and guessing one would be approximating a predicate |
 | a fragment spread with no definition | treating it as nothing would silently drop every field it carried |
+| a field an introspection type has not got (`__Type { nope }`) | graph-node's validation refuses it, and a `null` there reads as a real answer. Every field `introspection.graphql` declares answers, `queryType { fields }` included |
+| a collection the schema declares and no view serves | `` `tokens` is not served by this nest: it has no `token` view ``, rather than the engine's "table does not exist" and a hint about some other table |
 | `orderBy` that traverses a relation (`token0__symbol`) | needs the same join as a nested selection |
 | `mutation`, `subscription` | a nest has no mappings, so it has nothing to mutate and nothing to stream |
 | more than one operation and no `operationName` | there is no way to know which was meant. `Operation name required`, graph-node's own wording |
