@@ -59,6 +59,7 @@ EOF
 duckdb -f nest.sql
 
 : > sg.csv
+: > capped.txt
 last=0x
 while :; do
   q="{ subgraphDeployments(first: 500, orderBy: id, block: {number: $B},
@@ -69,8 +70,27 @@ while :; do
   [ "$(jq '.errors | length' page.json)" = 0 ] || { jq -c .errors page.json >&2; exit 1; }
   [ "$(jq '.data.subgraphDeployments | length' page.json)" -gt 0 ] || break
   jq -r '.data.subgraphDeployments[] | [.id, (.manifest.network // ""), .signalledTokens, (.indexerAllocations | length)] | @csv' page.json >> sg.csv
+  jq -r '.data.subgraphDeployments[] | select((.indexerAllocations | length) == 1000) | .id' page.json >> capped.txt
   last=$(jq -r '.data.subgraphDeployments[-1].id' page.json)
 done
+
+# A nested list stops at 1,000, so a deployment at the cap is recounted with its own paged query.
+while read -r dep; do
+  [ -n "$dep" ] || continue
+  n=0 after=0x
+  while :; do
+    q="{ allocations(first: 1000, orderBy: id, block: {number: $B},
+         where: {subgraphDeployment: \"$dep\", status: Active, id_gt: \"$after\"}) { id } }"
+    curl -fsS -m 120 -A stopgap-orphans-verify -H 'content-type: application/json' "$subgraph" \
+      -d "$(jq -nc --arg q "$q" '{query: $q}')" -o alloc.json
+    [ "$(jq '.errors | length' alloc.json)" = 0 ] || { jq -c .errors alloc.json >&2; exit 1; }
+    got=$(jq '.data.allocations | length' alloc.json)
+    n=$((n + got))
+    [ "$got" -eq 1000 ] || break
+    after=$(jq -r '.data.allocations[-1].id' alloc.json)
+  done
+  awk -F, -v OFS=, -v d="\"$dep\"" -v n="$n" '$1 == d { $4 = n } { print }' sg.csv > sg.tmp && mv sg.tmp sg.csv
+done < capped.txt
 
 cat > compare.sql <<'EOF'
 .mode list
