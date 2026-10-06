@@ -140,9 +140,12 @@ for net in $networks; do
   joins "$state_dir/fdnonly-$net.ids" "$work/fdnonly-$net.ids" "$work/all-$net.jsonl" "$work/fdnonly.joined"
 done
 
-# Posts $1 followed by the lines of $2, trimmed to fit one Discord message.
-post_list() {
-  local msg=$1 lines=$2 line next
+outbox=$state_dir/outbox
+mkdir -p "$outbox"
+
+# Writes $1 followed by the lines of $2, trimmed to fit one Discord message, to the outbox as $3.
+queue() {
+  local msg=$1 lines=$2 name=$3 line next
   while read -r line; do
     next="$msg"$'\n'"$line"
     if [ "${#next}" -gt 1700 ]; then
@@ -151,11 +154,23 @@ post_list() {
     fi
     msg=$next
   done < "$lines"
-  post "$msg"
+  printf '%s' "$msg" > "$outbox/$name.tmp"
+  mv "$outbox/$name.tmp" "$outbox/$name"
 }
 
-# Each list's state is committed as soon as its own page is accepted, so a failed second page cannot
-# replay the first. Delivery is at least once: only a kill between a post and its mv repeats a page.
+# A page is queued before its list's state is committed and removed once Discord accepts it, so a
+# committed list never pages twice and a failed post is retried from the outbox on the next run.
+# Only a kill between an accepted post and its rm can repeat a page.
+send_outbox() {
+  local f
+  for f in "$outbox"/*; do
+    [ -f "$f" ] || continue
+    case $f in *.tmp) rm -f "$f"; continue ;; esac
+    post "$(cat "$f")" || return 1
+    rm -f "$f"
+  done
+}
+
 commit() {
   local prefix=$1 net
   for net in $networks; do
@@ -164,17 +179,18 @@ commit() {
 }
 
 now=$(date -u +%s)
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
 orphans=$(wc -l < "$work/orphan.joined" | tr -d ' ')
 fdnonly=$(wc -l < "$work/fdnonly.joined" | tr -d ' ')
 if [ "$now" -lt "$from_s" ] && [ $((orphans + fdnonly)) -gt 0 ]; then
   say "$orphans orphan and $fdnonly foundation-only joins before $from; recorded, not posted"
 fi
 if [ "$now" -ge "$from_s" ] && [ "$orphans" -gt 0 ]; then
-  post_list "STOPGAP ORPHAN: $orphans deployment(s) joined the list (signal, no indexer), https://www.lodestar-dashboard.com/subgraphs/migration" "$work/orphan.joined" || exit 1
+  queue "STOPGAP ORPHAN: $orphans deployment(s) joined the list (signal, no indexer), https://www.lodestar-dashboard.com/subgraphs/migration" "$work/orphan.joined" "$stamp-1-orphan"
 fi
 commit ""
 if [ "$now" -ge "$from_s" ] && [ "$fdnonly" -gt 0 ]; then
-  post_list "STOPGAP FOUNDATION-ONLY: $fdnonly deployment(s) now served only by the Foundation's upgrade indexer, which stops by 2026-10-31" "$work/fdnonly.joined" || exit 1
+  queue "STOPGAP FOUNDATION-ONLY: $fdnonly deployment(s) now served only by the Foundation's upgrade indexer, which stops by 2026-10-31" "$work/fdnonly.joined" "$stamp-2-fdnonly"
 fi
 commit "fdnonly-"
 
@@ -183,3 +199,4 @@ for net in $networks; do
     "$(wc -l < "$state_dir/$net.ids" | tr -d ' ')" "$(wc -l < "$state_dir/fdnonly-$net.ids" | tr -d ' ')" >> "$state_dir/sizes.tsv"
 done
 rm -f "$state_dir/failing"
+send_outbox || exit 1
