@@ -1,0 +1,73 @@
+name: arm64-proof
+
+# Temporary (#1961): runs release.yml's aarch64-unknown-linux-gnu leg on a PR, since release.yml only
+# runs on tags. Removed before merge.
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  arm64:
+    runs-on: ubuntu-22.04-arm
+    env:
+      CARGO_TERM_COLOR: always
+      TARGET: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: runner
+        run: uname -m; ldd --version | head -1; gcc --version | head -1; command -v shasum
+      - name: build
+        run: cargo build --release --locked --target $TARGET
+      - name: package
+        run: |
+          tarball="nuthatch-$TARGET.tar.gz"
+          tar czf "$tarball" -C "target/$TARGET/release" nuthatch
+          shasum -a 256 "$tarball" > "$tarball.sha256"
+          ls -lh "$tarball"
+      - name: inspect the default binary
+        run: |
+          b=target/$TARGET/release/nuthatch
+          file "$b"
+          "$b" --version
+          ldd "$b"
+          echo "highest GLIBC symbol:"
+          objdump -T "$b" | grep -oE 'GLIBC_[0-9.]+' | sort -t. -k1,1 -k2,2n -k3,3n -u | tail -3
+          objdump -T "$b" | grep -E 'GLIBC_2\.3[4-9]' || true
+          objdump -p "$b" | grep NEEDED
+      - name: run the default binary in arm64 containers
+        run: |
+          for img in ubuntu:24.04 ubuntu:22.04 debian:bookworm-slim; do
+            echo "--- $img"
+            docker run --rm -v "$PWD/target/$TARGET/release:/b:ro" "$img" sh -c 'uname -m && /b/nuthatch --version'
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nuthatch-aarch64-linux
+          path: |
+            nuthatch-aarch64-unknown-linux-gnu.tar.gz
+            nuthatch-aarch64-unknown-linux-gnu.tar.gz.sha256
+          retention-days: 7
+      - name: build (graph)
+        run: cargo build --release --locked --features graph --target $TARGET
+      - name: package (graph)
+        run: |
+          tarball="nuthatch-graph-$TARGET.tar.gz"
+          tar czf "$tarball" -C "target/$TARGET/release" nuthatch
+          shasum -a 256 "$tarball" > "$tarball.sha256"
+          ls -lh "$tarball"
+      - name: inspect the graph binary
+        run: |
+          b=target/$TARGET/release/nuthatch
+          "$b" --version
+          objdump -T "$b" | grep -oE 'GLIBC_[0-9.]+' | sort -t. -k1,1 -k2,2n -k3,3n -u | tail -1
+          docker run --rm -v "$PWD/target/$TARGET/release:/b:ro" ubuntu:24.04 sh -c 'uname -m && /b/nuthatch --version'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nuthatch-graph-aarch64-linux
+          path: |
+            nuthatch-graph-aarch64-unknown-linux-gnu.tar.gz
+            nuthatch-graph-aarch64-unknown-linux-gnu.tar.gz.sha256
+          retention-days: 7
