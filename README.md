@@ -7,7 +7,7 @@
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
 ```sh
-curl -fsSL https://nuthatch-indexer.com/install.sh | sh                  # macOS Apple Silicon, Linux x86_64
+curl -fsSL https://nuthatch-indexer.com/install.sh | sh                  # macOS Apple Silicon, Linux x86_64 and aarch64
 export PATH="$HOME/.local/bin:$PATH"                                    # the installer's directory; a fresh macOS shell lacks it
 nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --alias weth   # WETH; the chain is detected
 nuthatch dev --backfill 300                                             # the last 300 blocks, then keeps up
@@ -85,7 +85,7 @@ curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 That downloads the prebuilt binary for your platform from the latest release, verifies its SHA-256,
 and installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). **No compiler is
 involved.** A stock macOS shell does not have `~/.local/bin` on its `PATH`, which is why the quickstart
-above exports it; add the same line to `~/.zshrc` (or `~/.bashrc`) to keep it for new terminals. Prebuilt binaries cover macOS Apple Silicon and Linux x86_64 and are attached to every
+above exports it; add the same line to `~/.zshrc` (or `~/.bashrc`) to keep it for new terminals. Prebuilt binaries cover macOS Apple Silicon and Linux x86_64 and aarch64 (aarch64 from the release after 4.11.0) and are attached to every
 release with their checksums, if you would rather fetch one by hand. **No Intel Mac binary is
 published**; the installer says so and points at the source build below.
 

@@ -132,7 +132,8 @@ The default command binds `0.0.0.0:8288` *inside* the container; publish it to `
 as above and put a reverse proxy (TLS + auth) in front, the same posture as bare metal. `docker stop`
 sends SIGTERM, which drains and checkpoints cleanly.
 
-`linux/amd64` only for now - a multi-arch image needs an aarch64-linux build we do not yet produce.
+`linux/amd64` only for now. The release attaches an aarch64 Linux binary, but no multi-arch image is
+built from it yet; on arm64, run the binary directly.
 Pin the version tag rather than `:latest` for anything you care about.
 
 > **The writer pool indexes as of 0.9.3.** Until then it did not: a worker registered, took a lease
@@ -175,7 +176,9 @@ The release also attaches `nuthatch-graph-<target>.tar.gz` for Linux and macOS, 
 4.1.0 artifact; 2.34 up to 4.0.2), so it runs on Ubuntu 22.04+, Debian 12+ and anything newer, and
 not on RHEL 9 or Amazon Linux 2023, which ship 2.34. It is built on a pinned runner rather than
 `ubuntu-latest` precisely so that floor does not drift upward unnoticed - which it had, to 2.39, until
-the container image's smoke test caught it.
+the container image's smoke test caught it. The aarch64 binary is built on `ubuntu-22.04-arm` for the
+same reason and has the same 2.35 floor (`hypot` and `hypotf`, measured on a 4.11.0 build, #1961).
+Only the default and graph builds ship for aarch64; the scaled build is x86_64 only.
 
 To build it yourself instead:
 

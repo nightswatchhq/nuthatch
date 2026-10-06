@@ -13,7 +13,7 @@
 # throwaway ./nuthatch-trial/ directory. It indexes over public RPC, so no API
 # key is required.
 #
-# Requirements: an Apple-Silicon Mac or Linux x86_64 (prebuilt binary targets).
+# Requirements: an Apple-Silicon Mac, or Linux on x86_64 or aarch64 (prebuilt binary targets).
 # On other platforms the installer will tell you to `cargo install nuthatch`.
 #
 # Usage:  ./scripts/try-nuthatch.sh                 # full run
