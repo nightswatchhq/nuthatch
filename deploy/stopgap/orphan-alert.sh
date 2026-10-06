@@ -143,9 +143,11 @@ done
 outbox=$state_dir/outbox
 mkdir -p "$outbox"
 
-# Writes $1 followed by the lines of $2, trimmed to fit one Discord message, to the outbox as $3.
+# Writes $1 followed by the lines of $2, trimmed to fit one Discord message, to the outbox under a
+# name taken from the joins themselves, so a run killed before its commit re-queues the same file.
 queue() {
-  local msg=$1 lines=$2 name=$3 line next
+  local msg=$1 lines=$2 list=$3 line next name
+  name="$list-$(cut -d ' ' -f 1,2 "$lines" | LC_ALL=C sort | cksum | tr -d ' ')"
   while read -r line; do
     next="$msg"$'\n'"$line"
     if [ "${#next}" -gt 1700 ]; then
@@ -179,18 +181,17 @@ commit() {
 }
 
 now=$(date -u +%s)
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
 orphans=$(wc -l < "$work/orphan.joined" | tr -d ' ')
 fdnonly=$(wc -l < "$work/fdnonly.joined" | tr -d ' ')
 if [ "$now" -lt "$from_s" ] && [ $((orphans + fdnonly)) -gt 0 ]; then
   say "$orphans orphan and $fdnonly foundation-only joins before $from; recorded, not posted"
 fi
 if [ "$now" -ge "$from_s" ] && [ "$orphans" -gt 0 ]; then
-  queue "STOPGAP ORPHAN: $orphans deployment(s) joined the list (signal, no indexer), https://www.lodestar-dashboard.com/subgraphs/migration" "$work/orphan.joined" "$stamp-1-orphan"
+  queue "STOPGAP ORPHAN: $orphans deployment(s) joined the list (signal, no indexer), https://www.lodestar-dashboard.com/subgraphs/migration" "$work/orphan.joined" 1-orphan
 fi
 commit ""
 if [ "$now" -ge "$from_s" ] && [ "$fdnonly" -gt 0 ]; then
-  queue "STOPGAP FOUNDATION-ONLY: $fdnonly deployment(s) now served only by the Foundation's upgrade indexer, which stops by 2026-10-31" "$work/fdnonly.joined" "$stamp-2-fdnonly"
+  queue "STOPGAP FOUNDATION-ONLY: $fdnonly deployment(s) now served only by the Foundation's upgrade indexer, which stops by 2026-10-31" "$work/fdnonly.joined" 2-fdnonly
 fi
 commit "fdnonly-"
 
