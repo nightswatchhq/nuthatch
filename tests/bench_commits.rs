@@ -64,9 +64,14 @@ fn bench_artifact_commits_resolve_in_git() {
     if !git_cat_file("HEAD") {
         return;
     }
-    // A merge commit from July 2026 that is on main. If this clone is too shallow to see it,
-    // skip the reachability half rather than fail every PR; CI unshallows for this job.
+    // A merge commit from July 2026 that is on main. A clone too shallow to see it skips the
+    // reachability half, unless NUTHATCH_REQUIRE_BENCH_COMMITS is set: the CI job that checks out
+    // full history sets it, so a shallow checkout there fails instead of passing unseen (#1918).
     if !git_cat_file("8e94f6c") {
+        assert!(
+            std::env::var_os("NUTHATCH_REQUIRE_BENCH_COMMITS").is_none(),
+            "NUTHATCH_REQUIRE_BENCH_COMMITS is set but the clone has no main history (#1918)"
+        );
         eprintln!("skipping reachability: clone does not contain origin/main history (#756)");
         return;
     }

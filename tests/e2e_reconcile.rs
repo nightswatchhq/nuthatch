@@ -278,6 +278,85 @@ async fn draining_one_cursor_leaves_the_others_alone() {
     assert!(sa.current_lease().unwrap().unwrap().expires_in_secs > 0);
 }
 
+/// #1934: a cursor claimed from under its holder - a deliberate handover, or the same worker id
+/// restarting - is learned on the next tick rather than failing it. The chain leaves `held`, the
+/// refusal is recorded, and the other cursor is renewed exactly as before.
+#[tokio::test]
+async fn a_cursor_claimed_by_another_holder_leaves_held_on_the_next_tick() {
+    let Some((cp, scoped)) = fixture("lost") else {
+        return;
+    };
+    cp.declare_nest(&nest("a", "mainnet", 90)).unwrap();
+    cp.declare_nest(&nest("b", "arbitrum-one", 90)).unwrap();
+
+    let (sm, sa) = (store(&scoped, "mainnet"), store(&scoped, "arbitrum-one"));
+    let hosts = Hosts(vec![
+        ("mainnet".into(), sm.clone()),
+        ("arbitrum-one".into(), sa.clone()),
+    ]);
+    let first = tick(&cp, &hosts, "w1", 4096, TTL).unwrap();
+    assert_eq!(first.held, vec!["arbitrum-one", "mainnet"]);
+    let arb_fence = sa.current_fence().unwrap();
+
+    // A second handle on the same cursor takes it, which is what a handover does.
+    let rival = store(&scoped, "mainnet");
+    rival.claim("w2").unwrap();
+
+    let after = tick(&cp, &hosts, "w1", 4096, TTL)
+        .expect("losing one cursor is not a tick failure: the others still need reconciling");
+    assert_eq!(after.lost, vec!["mainnet"]);
+    assert_eq!(after.held, vec!["arbitrum-one"]);
+    assert!(
+        after.acquired.is_empty() && after.released.is_empty(),
+        "{after:?}"
+    );
+    assert_eq!(
+        sa.current_fence().unwrap(),
+        arb_fence,
+        "the surviving cursor was renewed, not re-fenced"
+    );
+    assert!(sa.current_lease().unwrap().unwrap().expires_in_secs > 0);
+    assert_eq!(
+        sm.current_fence().unwrap(),
+        rival.current_fence().unwrap(),
+        "the loser must not take the cursor back"
+    );
+}
+
+/// The other way to lose a cursor: the lease expires and another worker acquires it. Nothing is
+/// refused on this path - the lease record simply names someone else - so `held` must follow the
+/// store rather than the worker's memory of what it once acquired.
+#[tokio::test]
+async fn a_cursor_re_leased_elsewhere_after_expiry_is_no_longer_held() {
+    let Some((cp, scoped)) = fixture("expired") else {
+        return;
+    };
+    cp.declare_nest(&nest("a", "mainnet", 90)).unwrap();
+    cp.declare_nest(&nest("b", "arbitrum-one", 90)).unwrap();
+
+    let (sm, sa) = (store(&scoped, "mainnet"), store(&scoped, "arbitrum-one"));
+    let hosts = Hosts(vec![
+        ("mainnet".into(), sm.clone()),
+        ("arbitrum-one".into(), sa.clone()),
+    ]);
+    // A zero TTL expires the leases on the spot, as a stalled worker's would have by now.
+    let first = tick(&cp, &hosts, "w1", 4096, 0).unwrap();
+    assert_eq!(first.held, vec!["arbitrum-one", "mainnet"]);
+
+    let rival = store(&scoped, "mainnet");
+    rival
+        .acquire_lease("w2", TTL)
+        .expect("an expired lease is free to take");
+
+    let after = tick(&cp, &hosts, "w1", 4096, TTL).unwrap();
+    assert_eq!(after.held, vec!["arbitrum-one"], "{after:?}");
+    assert_eq!(
+        sm.current_lease().unwrap().unwrap().owner,
+        "w2",
+        "the previous holder must not take a live lease back"
+    );
+}
+
 // ---- the worker role, wired (RFC-0022 §2) -----------------------------------------------------
 
 /// **The claim the docs make and the code did not, until now.** `--scale writer=2` is safe because

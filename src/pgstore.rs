@@ -1068,11 +1068,16 @@ impl HotStore for PgStore {
 /// Runs **inside the caller's transaction**, so the check and the write are one atomic decision.
 /// Checking beforehand would leave a window in which the fence moves between the check and the
 /// write - which is exactly the race the fence exists to close.
+///
+/// `FOR SHARE` on the fence row is what makes that true under READ COMMITTED: an acquire takes the
+/// row `FOR UPDATE`, so it waits for this transaction to commit instead of moving the fence between
+/// this read and the write it guards. Share, not update, so one holder's writes do not serialise
+/// against each other.
 fn guard_fence_in_tx(tx: &mut postgres::Transaction<'_>, schema: &str, held: u64) -> Result<()> {
     if held == 0 {
         return Ok(());
     }
-    let sql = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1");
+    let sql = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1 FOR SHARE");
     let current: u64 = tx
         .query_opt(&sql, &[&OWNER_FENCE])?
         .and_then(|r| r.get::<_, String>(0).parse().ok())
