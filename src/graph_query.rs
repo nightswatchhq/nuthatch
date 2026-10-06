@@ -308,6 +308,7 @@ pub fn parse_named(
         i: 0,
         vars,
         defaults: BTreeMap::new(),
+        optional: Default::default(),
         depth: 0,
     };
     // A document is a list of definitions in any order, so fragments are collected as they are met
@@ -537,6 +538,8 @@ struct Cursor<'a> {
     /// forget that a variable existed.
     vars: &'a BTreeMap<String, Value>,
     defaults: BTreeMap<String, Value>,
+    /// Nullable variables declared without a default. Unsupplied, each is an absent argument.
+    optional: std::collections::BTreeSet<String>,
     /// Selection sets and list/object values currently open. Capped so a deeply nested document is a
     /// refusal rather than a stack overflow, which aborts the process (#1581).
     depth: usize,
@@ -822,21 +825,23 @@ impl<'a> Cursor<'a> {
                 return Err(Unsupported::Syntax(format!("`${name}` has no type")));
             }
             self.i += 1;
-            self.type_ref()?;
+            let non_null = self.type_ref()?;
             self.trivia();
             if self.peek() == Some(b'=') {
                 self.i += 1;
                 let v = self.value()?;
                 self.defaults.insert(name, v);
                 self.trivia();
+            } else if !non_null {
+                self.optional.insert(name);
             }
             if self.peek() == Some(b',') {
                 self.i += 1;
             }
         }
     }
-    /// A type reference - `Int`, `[Bytes!]!` - consumed and discarded.
-    fn type_ref(&mut self) -> Result<(), Unsupported> {
+    /// A type reference - `Int`, `[Bytes!]!` - consumed; answers whether it is non-null.
+    fn type_ref(&mut self) -> Result<bool, Unsupported> {
         self.trivia();
         if self.peek() == Some(b'[') {
             self.i += 1;
@@ -849,10 +854,12 @@ impl<'a> Cursor<'a> {
         } else {
             self.ident()?;
         }
+        let mut non_null = false;
         while self.peek() == Some(b'!') {
             self.i += 1;
+            non_null = true;
         }
-        Ok(())
+        Ok(non_null)
     }
     fn args(&mut self) -> Result<BTreeMap<String, Value>, Unsupported> {
         self.i += 1; // '('
@@ -875,9 +882,29 @@ impl<'a> Cursor<'a> {
                 )));
             }
             self.i += 1;
+            if self.absent_variable()? {
+                continue;
+            }
             let v = self.value()?;
             out.insert(name, v);
         }
+    }
+    /// A nullable `$name` the request did not supply and the header gives no default is, by the
+    /// GraphQL spec and in graph-node, an argument or input field that was not provided. Consumed
+    /// here so the caller leaves it out; a non-null one stays a refusal in `value_inner`.
+    fn absent_variable(&mut self) -> Result<bool, Unsupported> {
+        self.trivia();
+        if self.peek() != Some(b'$') {
+            return Ok(false);
+        }
+        let at = self.i;
+        self.i += 1;
+        let name = self.ident()?;
+        if self.optional.contains(&name) && !self.vars.contains_key(&name) {
+            return Ok(true);
+        }
+        self.i = at;
+        Ok(false)
     }
     fn value(&mut self) -> Result<Value, Unsupported> {
         self.nested(Self::value_inner)
@@ -935,6 +962,9 @@ impl<'a> Cursor<'a> {
                         return Err(Unsupported::Syntax(format!("`{k}` has no value")));
                     }
                     self.i += 1;
+                    if self.absent_variable()? {
+                        continue;
+                    }
                     let v = self.value()?;
                     m.insert(k, v);
                 }
@@ -3389,13 +3419,27 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
                 "{q}: refused as {got:?}, which is not the reason"
             );
         }
-        // An unsupplied variable is a refusal at parse time rather than compile time, and it is
-        // refused *as* an unbound variable: this assertion used to mean "variables are not
-        // implemented" and would otherwise have gone on passing for a different reason entirely.
-        let e = parse("query ($n: Int) { pools(first: $n) { id } }").expect_err("no $n");
+        // An unsupplied non-null variable is a refusal at parse time rather than compile time, and
+        // it is refused *as* an unbound variable.
+        let e = parse("query ($n: Int!) { pools(first: $n) { id } }").expect_err("no $n");
         assert!(
             matches!(&e, Unsupported::UnboundVariable(v) if v == "n"),
             "{e:?}"
+        );
+        // An unsupplied nullable one is an argument the client did not give, as graph-node reads it:
+        // BetSwirl's SDK declares `$where: Token_filter` and sends no `where` for its token list.
+        let roots =
+            parse("query ($n: Int, $w: Pool_filter) { pools(first: $n, where: $w) { id } }")
+                .expect("absent nullable variables");
+        assert!(roots[0].args.is_empty(), "{:?}", roots[0].args);
+        let roots = parse("query ($h: String) { pools(where: { hooks: $h, id: \"a\" }) { id } }")
+            .expect("an absent input field");
+        assert_eq!(
+            roots[0].args.get("where"),
+            Some(&Value::Object(BTreeMap::from([(
+                "id".to_string(),
+                Value::Str("a".into())
+            )])))
         );
         // And so is a fragment, because resolving a spread needs the definition.
         // A spread with no definition is refused by name - it is not silently nothing, which would
