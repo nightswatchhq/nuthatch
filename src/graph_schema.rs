@@ -122,9 +122,9 @@ pub fn parse(text: &str) -> Result<Schema> {
     // functions each learning about block strings, and byte offsets are preserved so every slice
     // below still lines up.
     //
-    // Ordinary strings are left alone on purpose: `@derivedFrom(field: "pool")` is one, and its
-    // contents are load-bearing.
-    let blanked = blank_block_strings(text);
+    // Ordinary strings are descriptions too, and are blanked the same way, except inside parentheses:
+    // `@derivedFrom(field: "pool")` is one, and its contents are load-bearing.
+    let blanked = blank_descriptions(text)?;
     let text: &str = &blanked;
     let mut out = Schema::default();
     let b = text.as_bytes();
@@ -264,8 +264,7 @@ fn parse_enum(text: &str, start: usize) -> Result<(String, Vec<String>, usize)> 
     // Whitespace-separated, not line-separated: `enum OrderDirection { asc desc }` is legal, and
     // reading it a line at a time yields the single value `asc desc`.
     let values = text[open + 1..close]
-        .lines()
-        .flat_map(|l| strip_comment(l).split_whitespace())
+        .split_whitespace()
         .filter(|v| !v.is_empty() && *v != ",")
         .map(|v| v.trim_end_matches(',').to_string())
         .filter(|v| !v.is_empty())
@@ -281,12 +280,8 @@ fn parse_enum(text: &str, start: usize) -> Result<(String, Vec<String>, usize)> 
 /// made the generated introspection *omit* fields a client then asks for. The recorded reference
 /// schema happens to be one field per line, so no golden test could see it.
 fn parse_fields(body: &str) -> Vec<Field> {
-    // Comments are the one thing that is line-bounded, so they go first.
-    let cleaned: String = body
-        .lines()
-        .map(strip_comment)
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Comments and descriptions were blanked by `parse`.
+    let cleaned = body;
     let b = cleaned.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -407,39 +402,97 @@ fn derived_target(tail: &str) -> Option<String> {
     Some(inner[q + 1..end].to_string())
 }
 
-fn strip_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(h) => &line[..h],
-        None => line,
-    }
-}
-
-/// Replace the contents of every `"""…"""` block string with spaces, keeping newlines and the
-/// overall byte length so every offset into the text stays valid.
-fn blank_block_strings(text: &str) -> String {
-    let b = text.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i..].starts_with(b"\"\"\"") {
-            out.extend_from_slice(b"\"\"\"");
-            i += 3;
-            while i < b.len() && !b[i..].starts_with(b"\"\"\"") {
-                // Newlines survive, so a line-start test still sees the same lines.
-                out.push(if b[i] == b'\n' { b'\n' } else { b' ' });
-                i += 1;
-            }
-            if i < b.len() {
-                out.extend_from_slice(b"\"\"\"");
-                i += 3;
-            }
-            continue;
+/// Replace comments, block strings and description strings with spaces, keeping newlines and every
+/// byte offset, so nothing a schema author wrote as prose is read as a declaration.
+///
+/// A `"…"` inside parentheses is a directive argument and is kept. Anywhere else it is a description,
+/// and reading one as text made streamr's `"e.g. http://mynode.com:3000"` a field `com: 3000` (#1948).
+/// Lexed rather than line-stripped, so a `#` inside a string is not a comment.
+fn blank_descriptions(text: &str) -> Result<String> {
+    const TRIPLE: &str = "\"\"\"";
+    fn blank(out: &mut String, c: char) {
+        if c == '\n' {
+            out.push('\n');
+        } else {
+            out.extend(std::iter::repeat_n(' ', c.len_utf8()));
         }
-        out.push(b[i]);
-        i += 1;
     }
-    // Only ASCII bytes were substituted, so this cannot split a multi-byte character.
-    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+    let mut out = String::with_capacity(text.len());
+    let mut it = text.char_indices().peekable();
+    let mut depth = 0usize;
+    while let Some((i, c)) = it.next() {
+        match c {
+            '#' => {
+                blank(&mut out, c);
+                while let Some(&(_, n)) = it.peek() {
+                    if n == '\n' || n == '\r' {
+                        break;
+                    }
+                    blank(&mut out, n);
+                    it.next();
+                }
+            }
+            '"' if text[i..].starts_with(TRIPLE) => {
+                out.push_str(TRIPLE);
+                it.nth(1);
+                loop {
+                    let Some((j, n)) = it.next() else {
+                        bail!("unterminated block string in schema.graphql");
+                    };
+                    if text[j..].starts_with(TRIPLE) {
+                        out.push_str(TRIPLE);
+                        it.nth(1);
+                        break;
+                    }
+                    // `\"""` is the one escape a block string has.
+                    if text[j..].starts_with("\\\"\"\"") {
+                        out.push_str("    ");
+                        it.nth(2);
+                        continue;
+                    }
+                    blank(&mut out, n);
+                }
+            }
+            '"' => {
+                out.push('"');
+                let keep = depth > 0;
+                let put = |out: &mut String, n: char| {
+                    if keep {
+                        out.push(n);
+                    } else {
+                        blank(out, n);
+                    }
+                };
+                loop {
+                    match it.next() {
+                        Some((_, '"')) => {
+                            out.push('"');
+                            break;
+                        }
+                        Some((_, '\\')) => {
+                            put(&mut out, '\\');
+                            match it.next() {
+                                Some((_, n)) if n != '\n' && n != '\r' => put(&mut out, n),
+                                _ => bail!("unterminated string in schema.graphql"),
+                            }
+                        }
+                        Some((_, n)) if n != '\n' && n != '\r' => put(&mut out, n),
+                        _ => bail!("unterminated string in schema.graphql"),
+                    }
+                }
+            }
+            '(' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
 }
 
 fn match_brace(text: &str, open: usize) -> Option<usize> {
@@ -844,6 +897,7 @@ impl Schema {
 /// schema author's doc comments there, they are not part of the contract, and the golden diff ignores
 /// them.
 pub mod introspection {
+    use anyhow::{bail, Result};
     use serde_json::{json, Value};
 
     use super::{lower_first, plural, Schema, BUILTIN_SCALARS, GRAPH_SCALARS};
@@ -1004,7 +1058,7 @@ pub mod introspection {
         ]
     }
 
-    pub fn render(s: &Schema) -> Value {
+    pub fn render(s: &Schema) -> Result<Value> {
         let mut types: Vec<Value> = Vec::new();
 
         for name in BUILTIN_SCALARS.iter().chain(GRAPH_SCALARS.iter()) {
@@ -1189,9 +1243,8 @@ pub mod introspection {
         types.push(object_type("Query", roots));
 
         // Every leaf reference's `kind` comes from the declaration it names. A name no declaration
-        // covers leaves the document invalid and there is no sensible way to serve it, so it panics
-        // here rather than reaching a client: only the renderer can create the condition, and the
-        // golden test covers it.
+        // covers leaves the document invalid, so it is an error: a field typed as an interface, which
+        // this parser skips, reaches here from input alone.
         let kinds: std::collections::BTreeMap<String, String> = types
             .iter()
             .filter_map(|t| {
@@ -1239,11 +1292,13 @@ pub mod introspection {
             "directives": directives,
         }});
         let dangling = resolve_kinds(&mut doc, &kinds);
-        assert!(
-            dangling.is_empty(),
-            "the generated schema references types it does not declare: {dangling:?}"
-        );
-        doc
+        if !dangling.is_empty() {
+            bail!(
+                "schema.graphql references types the generated schema does not declare: {}",
+                dangling.join(", ")
+            );
+        }
+        Ok(doc)
     }
 }
 
@@ -1471,6 +1526,79 @@ mod tests {
         );
     }
 
+    /// A description written as an ordinary string is prose, whatever it contains (#1948). streamr's
+    /// `"... e.g. http://mynode.com:3000"` read as a field `com: 3000`, and rendering then panicked.
+    #[test]
+    fn a_description_string_is_not_read_as_a_field() {
+        let s = parse(concat!(
+            "\"Examples: AMM protocol fee\"\n",
+            "type Pool @entity {\n",
+            "  id: ID!\n",
+            "  \"the node URL, e.g. http://mynode.com:3000 # not a comment\"\n",
+            "  url: String!\n",
+            "  \"mapping (uint32 => Stake): see the type Stake @entity { docs }\" stake: BigInt!\n",
+            "  \"\"\"block: \"\"\" weight: Int!\n",
+            "  swaps: [Swap!]! @derivedFrom(field: \"pool\") # trailing: comment\n",
+            "}\n",
+            "type Swap @entity { id: ID! \"a \\\"quoted: colon\\\"\" pool: Pool! }\n",
+        ))
+        .expect("a described schema parses");
+        let fields = |n: &str| {
+            s.entities
+                .iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("no {n} in {:?}", s.entities))
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            s.entities
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Pool", "Swap"]
+        );
+        assert_eq!(fields("Pool"), ["id", "url", "stake", "weight", "swaps"]);
+        assert_eq!(fields("Swap"), ["id", "pool"]);
+        let pool = &s.entities[0];
+        assert_eq!(pool.fields[4].derived_from.as_deref(), Some("pool"));
+        introspection::render(&s).expect("a described schema renders");
+    }
+
+    /// A directive argument is a string too, and its contents are load-bearing even when they hold a
+    /// `#` or a colon.
+    #[test]
+    fn a_directive_argument_string_is_kept() {
+        let s = parse(
+            "type A @entity { id: ID! bs: [B!]! @derivedFrom(field: \"a#b:c\") }\n\
+             type B @entity { id: ID! }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.entities[0].fields[1].derived_from.as_deref(),
+            Some("a#b:c")
+        );
+    }
+
+    /// Malformed input is an error, never a panic: a handler that panics closes the connection with no
+    /// response at all.
+    #[test]
+    fn malformed_schema_input_is_an_error_not_a_panic() {
+        for bad in [
+            "type A @entity { id: ID! \"never closed: x }",
+            "type A @entity { id: ID! \"broken\nacross: lines\" n: Int }",
+            "type A @entity { id: ID! \"\"\"never closed }",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must be refused");
+        }
+        // A reference to a type the schema never declares, such as an interface this parser skips.
+        let s = parse("interface Named { id: ID! }\ntype A @entity { id: ID! n: Named! }").unwrap();
+        let e = introspection::render(&s).expect_err("an undeclared type cannot be rendered");
+        assert!(e.to_string().contains("Named"), "{e}");
+    }
+
     /// Every leaf `kind` in the rendered document is a real GraphQL kind.
     ///
     /// `type_ref` leaves a placeholder for `resolve_kinds` to fill from the type list. One left
@@ -1484,7 +1612,7 @@ mod tests {
             "enum Dir { asc desc }\n",
         ))
         .unwrap();
-        let doc = introspection::render(&s);
+        let doc = introspection::render(&s).unwrap();
         let mut kinds = std::collections::BTreeSet::new();
         fn walk(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
             match v {

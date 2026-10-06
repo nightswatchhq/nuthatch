@@ -466,7 +466,8 @@ fn every_object_type_matches_the_reference_field_for_field() {
 /// to fail when the document is narrower than the reference rather than merely different.
 #[test]
 fn every_introspection_object_carries_the_keys_the_reference_carries() {
-    let ours = nuthatch::graph_schema::introspection::render(&parsed());
+    let ours = nuthatch::graph_schema::introspection::render(&parsed())
+        .expect("the reference schema renders");
     let r = reference();
     let keys = |v: &serde_json::Value| -> Vec<String> {
         let mut k: Vec<String> = v
@@ -527,7 +528,8 @@ fn every_introspection_object_carries_the_keys_the_reference_carries() {
 /// recording asked for, not by what the surface has.
 #[test]
 fn the_schema_level_fields_match_the_reference() {
-    let ours = nuthatch::graph_schema::introspection::render(&parsed());
+    let ours = nuthatch::graph_schema::introspection::render(&parsed())
+        .expect("the reference schema renders");
     let r = reference();
     for field in ["queryType", "mutationType", "subscriptionType"] {
         assert_eq!(
@@ -598,7 +600,8 @@ const DECLARED_FIELD_DIVERGENCES: &[&str] = &[];
 #[test]
 fn generated_introspection_matches_the_reference_shape() {
     let s = parsed();
-    let ours = nuthatch::graph_schema::introspection::render(&s);
+    let ours =
+        nuthatch::graph_schema::introspection::render(&s).expect("the reference schema renders");
     let r = reference();
 
     /// A type reference as a comparable string, **kind included**.
