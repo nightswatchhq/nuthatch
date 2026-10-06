@@ -1912,7 +1912,7 @@ async fn detect_chain_on_rpc(
     })
 }
 
-fn scaffold_ai_surface(
+pub(crate) fn scaffold_ai_surface(
     dir: &Path,
     chain: &str,
     contracts: &[Contract],
@@ -1941,10 +1941,12 @@ fn scaffold_ai_surface(
          - `GET /tables`              every table with its columns\n\
          - `GET /table/{{name}}?limit=N` recent rows of one table (hot + sealed)\n\
          - `GET /entity/{{id}}`         one row by id (`{{block:012}}-{{logindex:06}}`)\n\
-         - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{{alias}}__{{event}}`\n\
+         - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{{alias}}__{{event}}`, and each\n\
+         \x20                            authored view (`views/*.sql`) answers by its own name\n\
          - `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)\n\
          - `GET /balance/{{address}}`   one address's derived balance\n\
-         - `GET /queries`             the nest's named queries (`views/*.sql`); `GET /q/{{name}}` runs one\n\
+         - `GET /queries`             the mount's SQL mode and the queries its operator declared in\n\
+         \x20                            `mounts.toml` (none on an open nest); `GET /q/{{name}}` runs one\n\
          - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{{entity}}` reads one\n\
          \n\
          ## MCP (for coding agents)\n\

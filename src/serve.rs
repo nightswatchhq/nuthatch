@@ -6724,6 +6724,99 @@ mod tests {
         );
     }
 
+    /// #1966: the llms.txt `init` writes sent agents to `/queries` for the nest's `views/*.sql`, which
+    /// lists the mount's declared queries instead. Every route it names must be routed, and a line
+    /// that says it serves the authored views must answer with one.
+    #[tokio::test]
+    async fn the_scaffolded_llms_txt_names_only_routes_that_answer_as_described() {
+        let dir = tempfile::tempdir().unwrap();
+        let contracts: Vec<crate::config::Contract> = vec![serde_json::from_value(json!({
+            "alias": "usdc", "address": "0xa0b8", "abi": "abis/usdc.json"
+        }))
+        .unwrap()];
+        let schema: Vec<crate::registry::TableSchema> = vec![serde_json::from_value(
+            json!({"table": "usdc__transfer", "alias": "usdc", "event": "Transfer", "columns": []}),
+        )
+        .unwrap()];
+        crate::project::scaffold_ai_surface(dir.path(), "mainnet", &contracts, &schema).unwrap();
+        let llms = std::fs::read_to_string(dir.path().join("llms.txt")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-whales.sql"),
+            "CREATE VIEW whales AS SELECT 'from-the-view' AS marker;",
+        )
+        .unwrap();
+
+        let placeholders = |route: &str, with: &str| {
+            route
+                .split('/')
+                .map(|seg| if seg.starts_with('{') { with } else { seg })
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let nest = dir.path();
+        let ask = |path: String| async move {
+            get(router(SharedNest::new(test_state(nest, 4))), &path).await
+        };
+
+        let mut entries: Vec<String> = Vec::new();
+        for line in llms.lines() {
+            match entries.last_mut() {
+                Some(entry) if line.starts_with(' ') => {
+                    entry.push(' ');
+                    entry.push_str(line.trim());
+                }
+                _ => entries.push(line.to_string()),
+            }
+        }
+        let mut routes = 0;
+        let mut views_claimed = false;
+        for line in &entries {
+            let named: Vec<&str> = line
+                .split("`GET ")
+                .skip(1)
+                .filter_map(|rest| rest.split('`').next())
+                .collect();
+            for route in &named {
+                routes += 1;
+                let path = placeholders(route.split('?').next().unwrap(), "x");
+                let (status, body) = ask(path.clone()).await;
+                assert!(
+                    !(status == StatusCode::NOT_FOUND && body.is_empty()),
+                    "llms.txt names `GET {route}`, which no route answers: {line}"
+                );
+            }
+            if !line.contains("views/*.sql") {
+                continue;
+            }
+            views_claimed = true;
+            let mut answered = Vec::new();
+            for route in &named {
+                let path = match route.split_once("?q=") {
+                    Some((path, _)) => format!("{path}?q=SELECT%20*%20FROM%20whales"),
+                    None => placeholders(route, "whales"),
+                };
+                let (status, body) = ask(path.clone()).await;
+                let body = String::from_utf8_lossy(&body).into_owned();
+                answered.push((status, body.contains("from-the-view"), path, body));
+            }
+            assert!(
+                answered
+                    .iter()
+                    .any(|(s, view, ..)| *s == StatusCode::OK && *view),
+                "llms.txt says `{line}`, and no route on it answers with the view: {answered:?}"
+            );
+        }
+        assert!(
+            routes >= 10,
+            "found only {routes} routes in llms.txt:\n{llms}"
+        );
+        assert!(
+            views_claimed,
+            "llms.txt no longer says where views/*.sql are served:\n{llms}"
+        );
+    }
+
     /// #1653: an authored view the engine refuses at define time vanished from `/sql` with a debug
     /// line. `/ready` names it, and stops once it builds.
     #[tokio::test]
