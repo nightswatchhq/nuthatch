@@ -72,6 +72,9 @@ stranded: it is BetSwirl's only BNB deployment, and its Polygon twin is served b
 and boost are old versions whose newer deployments are served (Thena BSC V3 Fusion `QmPBTDjp...` by
 seven indexers, Boost Indexer Production by fourteen). BetSwirl BNB Chain is the first stopgap nest.
 
+The handback package for it, tested by two cold runs from the page alone, is
+[`stopgap/betswirl-bnb.md`](stopgap/betswirl-bnb.md).
+
 **When it is served, a post goes up on [learn-thegraph.com/dispatches](https://learn-thegraph.com/dispatches/)**
 covering the list, the numbers above, what the nest answers and what it refuses (Chief, 2026-10-06).
 
