@@ -194,12 +194,15 @@ type Trade @entity {
   pair: Pair!
 }
 "#;
+    // Both ends need a view with an `id`: the lookup is a subquery over `trade` keyed on `pair`.
     let mapping = r#"
-export function handlePairCreated(event: PairCreated): void {
-  let pair = new Pair(event.params.pair.toHex())
-  pair.id = event.params.pair.toHex()
+export function handlePoolCreated(event: PoolCreated): void {
+  let pair = new Pair(event.params.pool.toHex())
   pair.token0 = event.params.token0.toHex()
   pair.save()
+  let trade = new Trade(event.params.token1.toHex())
+  trade.pair = event.params.pool.toHex()
+  trade.save()
 }
 "#;
     let (nest, result) = emitted_nest(schema, mapping);
@@ -242,6 +245,256 @@ export function handlePairCreated(event: PairCreated): void {
         readme.contains("derived by reverse lookup"),
         "README must carry the clause:\n{readme}"
     );
+}
+
+/// #1947: a reverse lookup over an entity no view answers cannot be asked for. Morpho's line counted all
+/// 75 as answered while `{ accounts { deposits { id } } }` failed with `no table deposit`.
+#[test]
+fn a_derived_from_relation_over_an_entity_with_no_view_is_not_answered() {
+    let schema = r#"
+type Pair @entity {
+  id: ID!
+  token0: String!
+  trades: [Trade!]! @derivedFrom(field: "pair")
+}
+type Trade @entity {
+  id: ID!
+  pair: Pair!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pair = new Pair(event.params.pool.toHex())
+  pair.token0 = event.params.token0.toHex()
+  pair.save()
+}
+"#;
+    let (_nest, result) = emitted_nest(schema, mapping);
+    assert!(!result.views.iter().any(|v| v.entity == "Trade"));
+    assert_eq!(result.coverage.derived, 0, "{}", result.coverage.summary());
+    assert_eq!(
+        result.coverage.unanswered(),
+        1,
+        "`Pair.trades` is promised and unanswerable: {}",
+        result.coverage.summary()
+    );
+}
+
+/// #1947 (S0 defect 4): a view the emitter could not give an `id` binds, and every GraphQL query on it
+/// fails. Its fields are not answers.
+#[test]
+fn a_view_without_an_id_column_does_not_count_as_answered() {
+    let schema = r#"
+type Pool @entity {
+  id: ID!
+  plain: BigInt!
+}
+"#;
+    let mapping = r#"
+export function handlePoolCreated(event: PoolCreated): void {
+  let pool = new Pool(event.transaction.hash.concatI32(event.logIndex.toI32()))
+  pool.plain = event.params.fee
+  pool.save()
+}
+"#;
+    let (nest, result) = emitted_nest(schema, mapping);
+    let view = result
+        .views
+        .iter()
+        .find(|v| v.entity == "Pool")
+        .expect("view");
+    assert!(
+        !view.exact_fields.contains(&"id".to_string()),
+        "the fixture must yield a view without an id: {:?}",
+        view.exact_fields
+    );
+    assert_eq!(result.views_without_id, vec!["Pool".to_string()]);
+    assert_eq!(result.coverage.in_views, 0, "{}", result.coverage.summary());
+    assert!(
+        !result.coverage.summary().contains("(100%)"),
+        "{}",
+        result.coverage.summary()
+    );
+    let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
+    assert!(readme.contains("no `id` column"), "{readme}");
+}
+
+/// #1947: from a deployment CID the subgraph directory holds a manifest, a schema and compiled WASM.
+/// Nothing is classified, so there is no coverage to report and the overlay must refuse, not print 100%.
+#[test]
+fn a_subgraph_with_no_mapping_source_is_refused_without_a_coverage_figure() {
+    let subgraph = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        one_call_dir().join("subgraph.yaml"),
+        subgraph.path().join("subgraph.yaml"),
+    )
+    .unwrap();
+    std::fs::write(
+        subgraph.path().join("schema.graphql"),
+        "type Pair @entity {\n  id: ID!\n  trades: [Trade!]! @derivedFrom(field: \"pair\")\n}\n\
+         type Trade @entity {\n  id: ID!\n  pair: Pair!\n}\n",
+    )
+    .unwrap();
+    let nest = tempfile::tempdir().unwrap();
+    write_imported_nest(nest.path(), false);
+    let before = std::fs::read_to_string(nest.path().join("nuthatch.toml")).unwrap();
+
+    let err = nuthatch::port_emit::emit(subgraph.path(), nest.path())
+        .expect_err("nothing was classified, so emit must fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("no mapping source"), "{msg}");
+    assert!(msg.contains("handlePoolCreated"), "{msg}");
+    assert!(!msg.contains('%'), "no coverage figure: {msg}");
+    assert!(!nest.path().join("README.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(nest.path().join("nuthatch.toml")).unwrap(),
+        before,
+        "the nest must be left as the importer wrote it"
+    );
+}
+
+/// The manifest for a factory that creates `Pool` children, as a deployed subgraph names it.
+const TEMPLATE_MANIFEST: &str = r#"specVersion: 0.0.8
+dataSources:
+  - kind: ethereum/contract
+    name: Factory
+    network: arbitrum-one
+    source:
+      address: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+      abi: Factory
+      startBlock: 1
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.7
+      language: wasm/assemblyscript
+      file: ./src/mappings/core.ts
+      entities: [Token]
+      abis:
+        - name: Factory
+          file: ./abis/factory.json
+      eventHandlers:
+        - event: PoolCreated(indexed address,indexed address,indexed uint24,int24,address)
+          handler: handlePoolCreated
+templates:
+  - kind: ethereum/contract
+    name: Pool
+    network: arbitrum-one
+    source:
+      abi: Pool
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.7
+      language: wasm/assemblyscript
+      file: ./src/mappings/core.ts
+      entities: [Token]
+      abis:
+        - name: Pool
+          file: ./abis/pool.json
+      eventHandlers:
+        - event: Swap(indexed address,indexed address,int256,int256,uint160,uint128,int24)
+          handler: handleSwap
+"#;
+
+/// A nest as `init --from-subgraph` leaves it when it could not pick the creating event: the template
+/// is declared and nothing feeds it.
+fn write_nest_with_unwired_template(dir: &Path) {
+    write_imported_nest(dir, true);
+    let toml = std::fs::read_to_string(dir.join("nuthatch.toml")).unwrap();
+    let (head, _) = toml.split_once("[[factories]]").expect("factory stanza");
+    std::fs::write(dir.join("nuthatch.toml"), head).unwrap();
+}
+
+/// S0 defect 5 (#1941): 9 of 17 templates had no factory rule, and the mapping's
+/// `Template.create(event.params.x)` line that decides it was ignored even when the source was there.
+#[test]
+fn a_template_create_in_the_mapping_wires_the_factory() {
+    let subgraph = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(subgraph.path().join("src/mappings")).unwrap();
+    std::fs::write(subgraph.path().join("subgraph.yaml"), TEMPLATE_MANIFEST).unwrap();
+    std::fs::write(
+        subgraph.path().join("schema.graphql"),
+        "type Token @entity {\n  id: ID!\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        subgraph.path().join("src/mappings/core.ts"),
+        r#"import { Pool as PoolTemplate } from '../../generated/templates'
+
+export function handlePoolCreated(event: PoolCreated): void {
+  let token = new Token(event.params.token0.toHex())
+  token.save()
+  PoolTemplate.create(event.params.pool)
+}
+
+export function handleSwap(event: Swap): void {
+}
+"#,
+    )
+    .unwrap();
+    let nest = tempfile::tempdir().unwrap();
+    write_nest_with_unwired_template(nest.path());
+
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
+    let config = nuthatch::config::Config::load(nest.path()).unwrap();
+    assert_eq!(config.factories.len(), 1, "{:?}", config.factories);
+    let f = &config.factories[0];
+    assert_eq!(
+        (
+            f.watch.as_str(),
+            f.event.as_str(),
+            f.child_param.as_str(),
+            f.template.as_str()
+        ),
+        ("factory", "PoolCreated", "pool", "pool")
+    );
+    assert_eq!(result.factories.len(), 1);
+    assert_eq!(
+        result.factories[0].citation.display(),
+        "src/mappings/core.ts:6"
+    );
+
+    // A second run finds the rule already there and adds nothing.
+    let again = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
+    assert!(again.factories.is_empty());
+    let config = nuthatch::config::Config::load(nest.path()).unwrap();
+    assert_eq!(config.factories.len(), 1, "{:?}", config.factories);
+}
+
+/// A child address that is not a parameter of the handler's own event is named, never guessed.
+#[test]
+fn a_template_create_from_a_value_that_is_not_an_event_param_is_named_not_wired() {
+    let subgraph = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(subgraph.path().join("src/mappings")).unwrap();
+    std::fs::write(subgraph.path().join("subgraph.yaml"), TEMPLATE_MANIFEST).unwrap();
+    std::fs::write(
+        subgraph.path().join("schema.graphql"),
+        "type Token @entity {\n  id: ID!\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        subgraph.path().join("src/mappings/core.ts"),
+        r#"export function handlePoolCreated(event: PoolCreated): void {
+  let token = new Token(event.params.token0.toHex())
+  token.save()
+  Pool.create(Factory.bind(event.address).getPool(event.params.token0))
+}
+"#,
+    )
+    .unwrap();
+    let nest = tempfile::tempdir().unwrap();
+    write_nest_with_unwired_template(nest.path());
+
+    let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).expect("emit");
+    let config = nuthatch::config::Config::load(nest.path()).unwrap();
+    assert!(config.factories.is_empty(), "{:?}", config.factories);
+    assert!(result.factories.is_empty());
+    assert_eq!(
+        result.unwired_templates.len(),
+        1,
+        "{:?}",
+        result.unwired_templates
+    );
+    assert_eq!(result.unwired_templates[0].template, "Pool");
 }
 
 /// The invariant the coverage figure rests on: a view projects exactly the fields it lists.

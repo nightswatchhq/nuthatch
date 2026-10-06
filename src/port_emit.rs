@@ -45,6 +45,27 @@ pub struct EmitResult {
     pub entities_without_views: Vec<String>,
     /// How much of what the report promised the overlay actually answers (#1277).
     pub coverage: Coverage,
+    /// Entities whose view has no `id` column. It binds for SQL, and every GraphQL query on the
+    /// collection fails, so its fields are not counted as answered (#1947).
+    pub views_without_id: Vec<String>,
+    /// `[[factories]]` rules added from a `Template.create(event.params.x)` line in the mapping.
+    pub factories: Vec<EmittedFactory>,
+    /// Template creations that could not be pinned to a creating event and parameter, with why.
+    pub unwired_templates: Vec<UnwiredTemplate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmittedFactory {
+    pub rule: crate::config::Factory,
+    pub citation: Citation,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnwiredTemplate {
+    /// The template's manifest name.
+    pub template: String,
+    pub citation: Citation,
+    pub why: String,
 }
 
 /// Fields answered over fields promised, which is the one number that says whether a port is done.
@@ -68,6 +89,9 @@ pub struct Coverage {
     /// A `@derivedFrom` field stores nothing: it is a reverse lookup that RFC-0053 S2 lowers to a JSON
     /// aggregation over the forward reference. Counting it unanswered understated the overlay by 8 on
     /// the pinned target (#1284) and would have had a porter hunting for columns that must not exist.
+    ///
+    /// Counted only when both entities have a view with an `id` and the target's view projects the
+    /// forward field: the lookup is a subquery over that view, so without it there is no answer (#1947).
     pub derived: usize,
 }
 
@@ -170,6 +194,24 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
             e.fields.join(", ")
         );
     }
+    for f in &result.factories {
+        println!(
+            "  [[factories]] {}.{} → {} via `{}`  ← {}",
+            f.rule.watch,
+            f.rule.event,
+            f.rule.template,
+            f.rule.child_param,
+            f.citation.display()
+        );
+    }
+    for u in &result.unwired_templates {
+        println!(
+            "  ! template `{}` not wired at {} - {}",
+            u.template,
+            u.citation.display(),
+            u.why
+        );
+    }
     for c in &result.calls {
         println!(
             "  [[calls]] {}  {}  ← {}:{}",
@@ -200,6 +242,14 @@ pub fn run(args: PortEmitArgs) -> Result<()> {
             result.entities_without_views.join(", ")
         );
     }
+    if !result.views_without_id.is_empty() {
+        println!(
+            "  ! {} view(s) have no `id` column, so no GraphQL query can reach them and their fields \
+             are not counted: {}",
+            result.views_without_id.len(),
+            result.views_without_id.join(", ")
+        );
+    }
     // Same contract for fields. A field the report calls Exact that reached no column is the one
     // thing a porter must not learn from a gateway diff three days later (#1248).
     for s in &result.skipped_fields {
@@ -225,6 +275,22 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         );
     }
     let report = crate::port_report::classify_dir(subgraph)?;
+    // Before the nest is touched: with nothing classified there is no overlay to write and no
+    // coverage to state, and a figure computed anyway read 100% (#1947).
+    if !report.mapping_source {
+        let named = &report.missing_handlers;
+        let shown: Vec<&str> = named.iter().take(5).map(String::as_str).collect();
+        bail!(
+            "no mapping source in {}: the manifest names {} handler(s) ({}{}) and no `.ts` file there \
+             defines any of them. A deployment CID carries compiled WASM, not the AssemblyScript this \
+             reads, so nothing was classified and there is no coverage to report. Point --dir at the \
+             subgraph's source repository",
+            subgraph.display(),
+            named.len(),
+            shown.join(", "),
+            if named.len() > shown.len() { ", ..." } else { "" }
+        );
+    }
     let report_text = render_report(&report);
     let mappings = crate::port_report::load_mappings(subgraph)?;
     let calls_raw = mapping_calls(subgraph)?;
@@ -234,6 +300,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
 
     let (emitted_calls, skipped_calls) = calls_to_decls(&calls_raw, &mappings, &config)?;
     config.calls = emitted_calls.iter().map(|c| c.decl.clone()).collect();
+    let (factories, unwired_templates) = wire_templates(&mappings, &mut config);
     config.save(nest)?;
     crate::project::regen(crate::cli::SchemaArgs {
         dir: nest.display().to_string(),
@@ -266,42 +333,75 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         .collect();
     let (mut views, view_skipped, entities_without_views) =
         write_exact_views(nest, &report, &mappings, &config, &schema, &totalled)?;
-    // Answered fields, so they count in coverage and get projection checks like any view.
-    views.extend(totals_views);
-    skipped_fields.extend(view_skipped);
-    write_checks(nest, &views)?;
-
+    // Keyed by entity, for the reverse lookups below. A view without `id` is no answer to GraphQL.
+    let queryable: BTreeMap<String, &EmittedView> = views
+        .iter()
+        .filter(|v| v.exact_fields.iter().any(|f| f == "id"))
+        .map(|v| (v.entity.clone(), v))
+        .collect();
+    let views_without_id: Vec<String> = views
+        .iter()
+        .filter(|v| !queryable.contains_key(&v.entity))
+        .map(|v| v.entity.clone())
+        .collect();
     // `in_views` counts distinct (entity, field) pairs a view projection names. `exact_fields` is the
     // key set of the map `exact_select_sql` renders, so this counts the projection rather than a
     // parallel list that could disagree with it - which is what #1248 was and what a metric derived
     // from bookkeeping would have inherited.
+    let in_views = queryable
+        .values()
+        .copied()
+        .chain(totals_views.iter())
+        .flat_map(|v| v.exact_fields.iter().map(|f| (v.entity.clone(), f.clone())))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let derived = report
+        .fields
+        .iter()
+        .filter(|f| f.class == crate::port_report::Class::Exact)
+        .filter(|f| {
+            f.derived_from.as_ref().is_some_and(|(target, back)| {
+                queryable.contains_key(&f.entity)
+                    && queryable
+                        .get(target)
+                        .is_some_and(|v| v.exact_fields.contains(back))
+            })
+        })
+        .count();
+    // Answered fields, so they get projection checks like any view.
+    views.extend(totals_views);
+    skipped_fields.extend(view_skipped);
+    write_checks(nest, &views)?;
+
     let coverage = Coverage {
         classified_exact: report
             .fields
             .iter()
             .filter(|f| f.class == crate::port_report::Class::Exact)
             .count(),
-        in_views: views
-            .iter()
-            .flat_map(|v| v.exact_fields.iter().map(|f| (v.entity.clone(), f.clone())))
-            .collect::<BTreeSet<_>>()
-            .len(),
+        in_views,
         incremental: materialised.len(),
-        // Counted from the report's own reason, which is where the directive is recorded. A reverse
-        // relation is answered by a join at request time and must never become a stored column.
-        derived: report
-            .fields
-            .iter()
-            .filter(|f| f.class == crate::port_report::Class::Exact)
-            .filter(|f| f.reason.contains("@derivedFrom"))
-            .count(),
+        derived,
     };
 
     // **`README.md` carries the figure.** It was the report verbatim, and the report's summary table
     // says `exact 205` - a promise about the mapping, not about this overlay. A porter reading it had
     // every reason to believe the nest answered 205 fields (#1277).
+    let no_id = if views_without_id.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nThese views have no `id` column, so every GraphQL query on them fails and their \
+             fields are counted unanswered: {}. They still bind for SQL.",
+            views_without_id
+                .iter()
+                .map(|e| format!("`{e}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let readme = format!(
-        "{report_text}\n## Overlay coverage\n\n{}\n\n**Before migrating anything, check your own \
+        "{report_text}\n## Overlay coverage\n\n{}{no_id}\n\n**Before migrating anything, check your own \
          queries' fields against the unanswered list below.** One unanswerable field refuses a whole \
          GraphQL query - there is no partial answer - so the percentage here is an upper bound on how \
          many of your queries work, and a loose one. `docs/graph-compatibility-what-it-is.md` says what \
@@ -336,6 +436,98 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
         entities,
         entities_without_views,
         coverage,
+        views_without_id,
+        factories,
+        unwired_templates,
+    })
+}
+
+/// `[[factories]]` rules read off `Template.create(event.params.x)` in an event handler.
+///
+/// The importer has only the manifest, which does not say which event creates a template, so it guesses
+/// from names and leaves the rest unwired: 9 of 17 templates in S0 (#1941). The mapping line says it
+/// outright. Only the handler's own event parameter is taken; anything else is named for a hand rule.
+fn wire_templates(
+    mappings: &crate::port_report::Mappings,
+    config: &mut Config,
+) -> (Vec<EmittedFactory>, Vec<UnwiredTemplate>) {
+    let mut wired = Vec::new();
+    let mut unwired = Vec::new();
+    for func in mappings.functions.values() {
+        for (template, arg, citation) in &func.template_creates {
+            let mut refuse = |why: String| {
+                unwired.push(UnwiredTemplate {
+                    template: template.clone(),
+                    citation: citation.clone(),
+                    why,
+                })
+            };
+            let binding = (func.kind == crate::port_report::HandlerKind::Event)
+                .then(|| mappings.handlers.iter().find(|h| h.handler == func.name))
+                .flatten();
+            let Some(binding) = binding else {
+                refuse(format!(
+                    "created in `{}`, which is not an event handler, so the creating event depends on \
+                     the caller; add the [[factories]] rule by hand",
+                    func.name
+                ));
+                continue;
+            };
+            let Some(param) = event_param(arg, &func.body) else {
+                refuse(format!(
+                    "the child address `{arg}` is not a parameter of `{}`; add the [[factories]] rule \
+                     by hand",
+                    binding.event
+                ));
+                continue;
+            };
+            let Some(name) = config
+                .templates
+                .iter()
+                .find(|t| t.name == to_alias(template))
+                .map(|t| t.name.clone())
+            else {
+                refuse("no [[templates]] entry in nuthatch.toml carries it".into());
+                continue;
+            };
+            let rule = crate::config::Factory {
+                watch: nest_alias(&binding.source, config),
+                event: binding.event.clone(),
+                child_param: param,
+                template: name,
+                start: None,
+            };
+            let known = config.factories.iter().any(|f| {
+                (&f.watch, &f.event, &f.child_param, &f.template)
+                    == (&rule.watch, &rule.event, &rule.child_param, &rule.template)
+            });
+            if !known {
+                config.factories.push(rule.clone());
+                wired.push(EmittedFactory {
+                    rule,
+                    citation: citation.clone(),
+                });
+            }
+        }
+    }
+    (wired, unwired)
+}
+
+/// The event parameter `arg` is, directly or through one local: `event.params.pool`, or `pool` after
+/// `let pool = event.params.pool`.
+fn event_param(arg: &str, body: &str) -> Option<String> {
+    let direct = |e: &str| {
+        crate::port_report::strip_converters(e)
+            .starts_with("event.params.")
+            .then(|| event_column(e))
+            .flatten()
+    };
+    direct(arg).or_else(|| {
+        let ident = arg.trim();
+        if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        crate::port_report::plain_local_expr(body, ident).and_then(|e| direct(&e))
     })
 }
 
