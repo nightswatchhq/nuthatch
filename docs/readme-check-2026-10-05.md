@@ -4,8 +4,8 @@ Every command in `README.md` checked against the published **4.10.1** release (#
 with its exit code and the first lines of what it printed, except the four the tables mark otherwise.
 Two write into the user's home (`claude mcp add`, the skill copy) and were not run; `nuthatch worker`
 and `nuthatch serve` need a Postgres and were checked in `--help` only; one row lists commands
-present in `--help` whose README invocations `tests/doc_command_check.rs` resolves against clap. A record of a moment: it is not rewritten when the
-README changes; the next check is a new file.
+present in `--help` whose README invocations `tests/doc_command_check.rs` resolves against clap. A
+record of a moment: it is not rewritten when the README changes; the next check is a new file.
 
 Binary: `nuthatch-aarch64-apple-darwin.tar.gz` from v4.10.1, sha256
 `714ad73e92b2e9698db135416f3361ea3acf208f823462bb0deb4f77fcef4bce` (equal to the release's `.sha256`);
