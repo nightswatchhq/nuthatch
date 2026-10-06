@@ -52,12 +52,20 @@ further slices of either.
 
 | slice | issue | what | fails if | status |
 | --- | --- | --- | --- | --- |
-| S0 | [#1940](https://github.com/nightswatchhq/nuthatch/issues/1940) | `init --from-subgraph` and `port-emit` on 15-20 published `bsc` and `matic` deployments, mixed shapes; record init success, fields answered, backfill cost | fewer than a third of the sample yield a serving nest with any answered field; the offer then narrows to S2 alone | not started |
+| S0 | [#1940](https://github.com/nightswatchhq/nuthatch/issues/1940) | `init --from-subgraph` and `port-emit` on 15-20 published `bsc` and `matic` deployments, mixed shapes; record init success, fields answered, backfill cost | fewer than half the sample yield a serving nest that answers at least a third of its report-exact fields, or either of the two deployments with recent fees (Thena BSC V3 Fusion, BetSwirl BNB Chain) does not; the offer then narrows to S2 alone | not started |
 | S1 | [#1941](https://github.com/nightswatchhq/nuthatch/issues/1941) | fix what S0 broke; CID to serving GraphQL surface end to end on both chains, golden tests from the sample | a sample deployment that should port does not | waits on S0 |
-| S2 | [#1942](https://github.com/nightswatchhq/nuthatch/issues/1942) | resolve each manifest's `network:` from IPFS; view of `bsc`/`matic` deployments with signal or an indexing agreement and zero active allocations; alert on new entries | the list disagrees with the network subgraph's allocation counts at a pinned block | not started |
+| S2 | [#1942](https://github.com/nightswatchhq/nuthatch/issues/1942) | resolve each manifest's `network:` from IPFS; view of `bsc`/`matic` deployments with signal or an indexing agreement and zero active allocations; alert on new entries | the list disagrees with the network subgraph's allocation counts at a pinned block | done: Lodestar's `/subgraphs/migration` is the list, verified exact at a pinned block; verifier and alert in #1945 |
 | S3 | [#1943](https://github.com/nightswatchhq/nuthatch/issues/1943) | per-subgraph handback package: coverage report, how to run, how to point back at the network | someone who did not build it cannot stand one up from the package alone | waits on S1 |
 
 S0 and S2 are independent and run in parallel. S0 is the slice that can stop the stopgap half.
+
+## What the list says (2026-10-06)
+
+Lodestar's directory: 114 bsc and 161 matic deployments carry signal and have no indexer. Only 3 earned
+query fees in the last 30 days (Thena BSC V3 Fusion 483 GRT, BetSwirl BNB Chain 104 GRT, boost-polygon
+~1 GRT), and 7 hold signal at or above REO's 500 GRT floor. None was created in the last 30 days, so
+the Studio migration has not reached the list yet. How many Studio subgraphs move, and whether all are
+published and curated, is the question for the Foundation.
 
 ## Known limits
 
@@ -81,3 +89,4 @@ S0 and S2 are independent and run in parallel. S0 is the slice that can stop the
 
 - **2026-10-06** Tracker opened, S0 to S3 filed as #1940 to #1943.
 - **2026-10-06** Chief lifted the no-hosting rule for the stopgap: we serve the nests ourselves.
+- **2026-10-06** S2 done (#1945). S0 gate raised from "any answered field" to a third of fields on half the sample, on review.
