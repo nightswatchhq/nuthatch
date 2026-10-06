@@ -2461,7 +2461,9 @@ async fn runtime_index_loop(
                          cursor asks by factory and child address from now on"
                     );
                     topic0_refused = true;
-                    continue;
+                    // Through the retry arm and its pause, so a cursor with nothing to narrow
+                    // to cannot spin on the refusal.
+                    Err(e)
                 }
                 r => r,
             },
