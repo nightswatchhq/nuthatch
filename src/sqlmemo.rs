@@ -6,12 +6,12 @@
 //! a cursor at a five-minute poll interval commits a handful of times an hour.
 //!
 //! This is not a TTL cache and never serves anything stale. An entry is keyed on **every input the
-//! answer depends on**: the nest, the statement and its row cap, the sealed watermark, the hot
-//! store's write generation, each maintained entity's watermark, and the content of the authored
-//! files (`nuthatch.toml`, `views/*.sql`, `labels/*.json`). Same key, same rows, by construction; a
-//! single commit, seal or edited view changes the key and the next request computes. Determinism in
-//! the core is what makes this admissible: the answer is a function of its inputs, so remembering
-//! it is remembering a fact.
+//! answer depends on**: the nest, the statement and its row cap, the sealed segments it is served,
+//! the generation of the hot rows, each maintained entity's watermark, and the content of the
+//! authored files (`nuthatch.toml`, `views/*.sql`, `labels/*.json`). Same key, same rows, by
+//! construction; a committed row, an admitted segment or an edited view changes the key and the next
+//! request computes. Determinism in the core is what makes this admissible: the answer is a
+//! function of its inputs, so remembering it is remembering a fact.
 //!
 //! Bounded by bytes (`NUTHATCH_SQL_MEMO_BYTES`, default 64 MiB, `0` disables), evicted least
 //! recently used, process-local, and cleared by a restart. A degraded answer - a table reduced by an
@@ -135,12 +135,37 @@ pub fn segment_stamps(
     out
 }
 
+/// A digest of the segments a statement served at `sealed_through` reads from: every manifest
+/// segment at or below it, by table, file and content hash. `None` when the manifest will not load.
+///
+/// The watermark itself is not an input. The cold side is these segments and the hot side is every
+/// hot row above the watermark (COR-1), so a watermark that moves without a segment entering this set
+/// moves past no row - a row it passed would have had to be sealed into one. Where rows are sealed
+/// straight to segments with nothing hot (`--seal-direct`), the watermark admitting a written segment
+/// is exactly a change to this set.
+pub fn sealed_segments(dir: &Path, sealed_through: u64) -> Option<String> {
+    let manifest = crate::seal::load_manifest(dir).ok()?;
+    let mut h = Sha256::new();
+    for (table, segs) in &manifest.tables {
+        for seg in segs.iter().filter(|s| s.to_block <= sealed_through) {
+            for part in [table.as_str(), seg.file.as_str(), seg.hash.as_str()] {
+                h.update((part.len() as u64).to_le_bytes());
+                h.update(part.as_bytes());
+            }
+        }
+    }
+    Some(hex::encode(h.finalize()))
+}
+
 pub struct Inputs<'a> {
     pub dir: &'a Path,
     pub sql: &'a str,
     pub max_rows: usize,
-    pub sealed_through: u64,
-    pub write_generation: u64,
+    /// [`sealed_segments`] at the served watermark, not the watermark: on a chain that finalises
+    /// every poll the watermark moves while the segments a statement can read stay the same.
+    pub sealed: &'a str,
+    /// [`crate::store::HotStore::rows_generation`].
+    pub rows_generation: u64,
     pub entity_watermarks: &'a crate::entity_view::Watermarks,
     pub files: &'a BTreeMap<PathBuf, String>,
 }
@@ -156,8 +181,8 @@ impl Inputs<'_> {
         field(self.dir.to_string_lossy().as_bytes());
         field(self.sql.as_bytes());
         field(&(self.max_rows as u64).to_le_bytes());
-        field(&self.sealed_through.to_le_bytes());
-        field(&self.write_generation.to_le_bytes());
+        field(self.sealed.as_bytes());
+        field(&self.rows_generation.to_le_bytes());
         for (name, applied) in self.entity_watermarks {
             field(name.as_bytes());
             field(&applied.through.to_le_bytes());
@@ -176,7 +201,7 @@ impl Inputs<'_> {
 }
 
 /// A remembered answer: the output and the entity watermarks it was answered from, which ride out
-/// in the provenance exactly as they did the first time.
+/// in the provenance exactly as they did the first time. The head it cites is read on the hit.
 pub struct Entry {
     pub out: QueryOutput,
     pub watermarks: crate::entity_view::Watermarks,
@@ -184,12 +209,6 @@ pub struct Entry {
     /// was computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
     pub tables: Option<std::collections::BTreeSet<String>>,
     pub segments: Vec<(PathBuf, u64, i64)>,
-    /// The provenance the rows were computed under - `last_block` and the sealed watermark read in
-    /// the same blocking task as the query. A hit cites these, never the live store: the store may
-    /// have moved between the lookup and the response, and a citation that names a newer state for
-    /// older rows is false even when every row in it is right (Jules on #1189).
-    pub as_of: Option<u64>,
-    pub sealed_through: u64,
     bytes: usize,
 }
 
@@ -254,13 +273,11 @@ impl Memo {
     /// Remember `out` under `key`. Returns whether it was kept: a degraded or tip-less answer is not,
     /// and neither is one larger than a quarter of the ceiling. Evicts least recently used entries
     /// until the total fits.
-    #[allow(clippy::too_many_arguments)]
     pub fn put(
         &self,
         key: Key,
         out: &QueryOutput,
         watermarks: &crate::entity_view::Watermarks,
-        provenance: (Option<u64>, u64),
         segments: Vec<(PathBuf, u64, i64)>,
         cap: usize,
     ) -> bool {
@@ -299,8 +316,6 @@ impl Memo {
                     watermarks: watermarks.clone(),
                     tables: out.referenced_tables.clone(),
                     segments,
-                    as_of: provenance.0,
-                    sealed_through: provenance.1,
                     bytes,
                 }),
                 tick,
@@ -346,10 +361,9 @@ pub fn put(
     key: Key,
     out: &QueryOutput,
     watermarks: &crate::entity_view::Watermarks,
-    provenance: (Option<u64>, u64),
     segments: Vec<(PathBuf, u64, i64)>,
 ) -> bool {
-    GLOBAL.put(key, out, watermarks, provenance, segments, max_bytes())
+    GLOBAL.put(key, out, watermarks, segments, max_bytes())
 }
 pub fn bytes() -> usize {
     GLOBAL.bytes()
@@ -378,6 +392,30 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The served set, not the watermark: moving past no segment keeps the digest, admitting one
+    /// written above the old watermark changes it, and so does a segment replaced under one name.
+    #[test]
+    fn sealed_segments_moves_with_the_served_set_not_the_watermark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |segs: serde_json::Value| {
+            let dir = tmp.path().join(crate::seal::SEGMENTS_DIR);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(crate::seal::MANIFEST_FILE),
+                json!({ "tables": { "t": segs } }).to_string(),
+            )
+            .unwrap();
+        };
+        let seg = |hash: &str, from: u64, to: u64| json!({"hash": hash, "from_block": from, "to_block": to, "rows": 1, "file": format!("t-{hash}.parquet")});
+        write(json!([seg("a", 1, 10), seg("b", 11, 20)]));
+        let at = |s: u64| sealed_segments(tmp.path(), s).expect("manifest loads");
+        assert_eq!(at(10), at(15), "a watermark that passes no segment");
+        assert_ne!(at(15), at(20), "the watermark admitting a written segment");
+        let before = at(20);
+        write(json!([seg("a", 1, 10), seg("c", 11, 20)]));
+        assert_ne!(before, at(20), "a segment replaced over the same range");
+    }
+
     fn inputs<'a>(
         dir: &'a Path,
         sql: &'a str,
@@ -389,8 +427,8 @@ mod tests {
             dir,
             sql,
             max_rows: 100,
-            sealed_through: 10,
-            write_generation: generation,
+            sealed: "s10",
+            rows_generation: generation,
             entity_watermarks: wm,
             files,
         }
@@ -443,11 +481,11 @@ mod tests {
         assert_ne!(
             base,
             inputs(&d, "SELECT 1", 4, &wm, &files).key(),
-            "write generation"
+            "rows generation"
         );
         let mut i = inputs(&d, "SELECT 1", 3, &wm, &files);
-        i.sealed_through = 11;
-        assert_ne!(base, i.key(), "sealed watermark");
+        i.sealed = "s11";
+        assert_ne!(base, i.key(), "sealed segments");
         let mut i = inputs(&d, "SELECT 1", 3, &wm, &files);
         i.max_rows = 101;
         assert_ne!(base, i.key(), "row cap");
@@ -506,10 +544,10 @@ mod tests {
         let wm = BTreeMap::new();
         let mut out = rows(1);
         out.degraded_tables.insert("t".into());
-        assert!(!put(Key([1; 32]), &out, &wm, (None, 0), Vec::new()));
+        assert!(!put(Key([1; 32]), &out, &wm, Vec::new()));
         let mut out = rows(1);
         out.tip_unavailable = true;
-        assert!(!put(Key([2; 32]), &out, &wm, (None, 0), Vec::new()));
+        assert!(!put(Key([2; 32]), &out, &wm, Vec::new()));
         assert!(get(&Key([1; 32])).is_none());
         assert!(get(&Key([2; 32])).is_none());
     }
@@ -525,14 +563,14 @@ mod tests {
         // Room for four entries and a little, never five; each is under a quarter of it.
         let cap = one * 4 + one / 2;
         for n in 1..=4 {
-            assert!(m.put(k(n), &rows(10), &wm, (None, 0), Vec::new(), cap));
+            assert!(m.put(k(n), &rows(10), &wm, Vec::new(), cap));
         }
         assert_eq!(m.entries(), 4);
         assert!(
             m.get(&k(1), cap).is_some(),
             "touching 1 makes 2 the least recently used"
         );
-        assert!(m.put(k(5), &rows(10), &wm, (None, 0), Vec::new(), cap));
+        assert!(m.put(k(5), &rows(10), &wm, Vec::new(), cap));
         assert!(m.bytes() <= cap, "the ceiling holds");
         assert_eq!(m.entries(), 4, "exactly one entry made room");
         assert!(
@@ -553,11 +591,11 @@ mod tests {
         let wm = BTreeMap::new();
         let out = rows(10);
         let cap = size_of(&out) * MAX_ENTRY_SHARE - 1;
-        assert!(!m.put(Key([0xb1; 32]), &out, &wm, (None, 0), Vec::new(), cap));
+        assert!(!m.put(Key([0xb1; 32]), &out, &wm, Vec::new(), cap));
         assert!(m.get(&Key([0xb1; 32]), cap).is_none());
-        assert!(m.put(Key([0xb2; 32]), &out, &wm, (None, 0), Vec::new(), cap + 1));
+        assert!(m.put(Key([0xb2; 32]), &out, &wm, Vec::new(), cap + 1));
         assert!(
-            !m.put(Key([0xb3; 32]), &out, &wm, (None, 0), Vec::new(), 0),
+            !m.put(Key([0xb3; 32]), &out, &wm, Vec::new(), 0),
             "zero disables"
         );
         assert!(

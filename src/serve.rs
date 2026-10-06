@@ -3844,8 +3844,8 @@ async fn run_sql_query(
     run_sql_query_at(s, sql_text, requested_max_rows, None, None).await
 }
 
-/// The memo key for `sql` against the nest as it stands, with the generation, sealed watermark and
-/// entity watermarks it was built from. `None` when the answer is not memoised at all.
+/// The memo key for `sql` against the nest as it stands, with the rows generation, served segments
+/// and entity watermarks it was built from. `None` when the answer is not memoised at all.
 fn memo_identity(
     s: &AppState,
     sql: &str,
@@ -3854,34 +3854,33 @@ fn memo_identity(
 ) -> Option<(
     crate::sqlmemo::Key,
     u64,
-    u64,
+    String,
     crate::entity_view::Watermarks,
 )> {
-    s.store
-        .write_generation()
+    let generation = s
+        .store
+        .rows_generation()
         .filter(|_| historical_block.is_none())
-        .filter(|_| crate::sqlmemo::is_deterministic(sql))
-        .map(|generation| {
-            let watermarks: crate::entity_view::Watermarks = s
-                .entities
-                .iter()
-                .filter(|e| e.unavailable().is_none() && e.fault().is_none())
-                .map(|e| (e.name().to_string(), e.fence_watermark()))
-                .collect();
-            let files = crate::analytics::cache_inputs(&s.dir);
-            let sealed_through = s.store.sealed_through();
-            let key = crate::sqlmemo::Inputs {
-                dir: &s.dir,
-                sql,
-                max_rows,
-                sealed_through,
-                write_generation: generation,
-                entity_watermarks: &watermarks,
-                files: &files,
-            }
-            .key();
-            (key, generation, sealed_through, watermarks)
-        })
+        .filter(|_| crate::sqlmemo::is_deterministic(sql))?;
+    let sealed = crate::sqlmemo::sealed_segments(&s.dir, s.store.sealed_through())?;
+    let watermarks: crate::entity_view::Watermarks = s
+        .entities
+        .iter()
+        .filter(|e| e.unavailable().is_none() && e.fault().is_none())
+        .map(|e| (e.name().to_string(), e.fence_watermark()))
+        .collect();
+    let files = crate::analytics::cache_inputs(&s.dir);
+    let key = crate::sqlmemo::Inputs {
+        dir: &s.dir,
+        sql,
+        max_rows,
+        sealed: &sealed,
+        rows_generation: generation,
+        entity_watermarks: &watermarks,
+        files: &files,
+    }
+    .key();
+    Some((key, generation, sealed, watermarks))
 }
 
 async fn run_sql_query_at(
@@ -3900,12 +3899,12 @@ async fn run_sql_query_at(
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
     let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
     // The deterministic memo (#1186): the identity of this answer is the statement plus every input
-    // it reads - sealed watermark, hot-store write generation, entity watermarks, authored files. A
+    // it reads - the served segments, the hot rows' generation, entity watermarks, authored files. A
     // remembered answer for that identity is the answer, and it is returned before the permit gate,
     // because a hit costs no Burrmill and the gate exists to bound Burrmill. `None` where the store
-    // cannot report a write generation; that backend simply computes every time.
+    // cannot report a rows generation; that backend simply computes every time.
     let memo = memo_identity(&s, &q.q, max_rows, historical_block);
-    if let Some((key, generation, sealed_through, before)) = &memo {
+    if let Some((key, generation, sealed, before)) = &memo {
         if let Some(hit) = crate::sqlmemo::get(key) {
             // Re-read the fence after the lookup, as the computing path does after its query: a
             // commit that landed between building the key and finding the entry has moved the store
@@ -3919,8 +3918,18 @@ async fn run_sql_query_at(
                 .filter(|e| e.unavailable().is_none() && e.fault().is_none())
                 .map(|e| (e.name().to_string(), e.fence_watermark()))
                 .collect();
-            if s.store.write_generation() == Some(*generation)
-                && s.store.sealed_through() == *sealed_through
+            // The head the hit cites is read before the fence, so the fence covers it: a commit that
+            // changed a row by `as_of` has already moved the generation (#1951, Jules on #1955).
+            let as_of = s
+                .store
+                .get_meta("last_block")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok());
+            let sealed_through = s.store.sealed_through();
+            if s.store.rows_generation() == Some(*generation)
+                && crate::sqlmemo::sealed_segments(&s.dir, sealed_through).as_ref()
+                    == Some(sealed)
                 && still == *before
                 // And the cold side the answer was computed over is the one still on disk: a
                 // sealed segment is immutable by construction, so nothing the node does changes
@@ -3930,13 +3939,7 @@ async fn run_sql_query_at(
                 && crate::sqlmemo::segment_stamps(&s.dir, hit.tables.as_ref()) == hit.segments
             {
                 METRICS.inc_sql();
-                return sql_response(
-                    &s,
-                    &hit.out,
-                    &hit.watermarks,
-                    (hit.as_of, hit.sealed_through),
-                    true,
-                );
+                return sql_response(&s, &hit.out, &hit.watermarks, (as_of, sealed_through), true);
             }
         }
     }
@@ -4087,7 +4090,12 @@ async fn run_sql_query_at(
         out.tip_unavailable = tip_unavailable;
         // The state after the query, for the memo: an answer is remembered only if nothing it reads
         // moved while it ran, so a remembered answer always describes exactly the state its key names.
-        let after = (store.write_generation(), store.sealed_through());
+        let sealed_after = store.sealed_through();
+        let after = (
+            store.rows_generation(),
+            sealed_after,
+            crate::sqlmemo::sealed_segments(&dir, sealed_after),
+        );
         // Provenance from the same task as the query, for the same reason as the watermarks: read
         // out on the response path it can name a newer state than the rows came from.
         let as_of = historical_block.or_else(|| {
@@ -4107,11 +4115,11 @@ async fn run_sql_query_at(
         // as of which block, what's sealed, and the registry it decoded with.
         Ok(Ok((out, watermarks, after, as_of))) => {
             let provenance = (as_of, after.1);
-            if let Some((key, generation, sealed_through, before)) = memo {
-                if after == (Some(generation), sealed_through) && watermarks == before {
+            if let Some((key, generation, sealed, before)) = memo {
+                if after.0 == Some(generation) && after.2 == Some(sealed) && watermarks == before {
                     let segments =
                         crate::sqlmemo::segment_stamps(&s.dir, out.referenced_tables.as_ref());
-                    crate::sqlmemo::put(key, &out, &watermarks, provenance, segments);
+                    crate::sqlmemo::put(key, &out, &watermarks, segments);
                 }
             }
             sql_response(&s, &out, &watermarks, provenance, false)
@@ -7308,6 +7316,9 @@ mod tests {
         fn write_generation(&self) -> Option<u64> {
             crate::store::HotStore::write_generation(&self.0)
         }
+        fn rows_generation(&self) -> Option<u64> {
+            crate::store::HotStore::rows_generation(&self.0)
+        }
         fn put_entity(&self, key: &str, json: &str) -> Result<()> {
             crate::store::HotStore::put_entity(&self.0, key, json)
         }
@@ -8974,6 +8985,65 @@ mod tests {
             third["rows"][0]["n"], 3,
             "and the answer is the new state, not the old one"
         );
+    }
+
+    /// #1951: a poll's commit and a watermark that passes no row change nothing a statement reads, so
+    /// the memo keeps its answer; a segment the watermark admits with nothing hot behind it, as
+    /// `--seal-direct` writes them, does change the rows and must be a new identity.
+    #[tokio::test]
+    async fn a_statement_is_remembered_across_commits_that_change_no_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 2);
+        let row = |b: u64| json!({"table": "t", "block_number": b, "log_index": 0}).to_string();
+        for b in [10u64, 11] {
+            state
+                .store
+                .put_entity(&Store::entity_key(b, 0), &row(b))
+                .unwrap();
+        }
+        let q = "SELECT count(*) AS n FROM t";
+        let (st, first) = sql_json(&state, q).await;
+        assert_eq!(st, StatusCode::OK, "{first}");
+        assert_eq!(
+            (first["cached"].clone(), first["rows"][0]["n"].clone()),
+            (json!(false), json!(2))
+        );
+
+        state
+            .store
+            .commit_window(&[], Some((12, "0xaa")), 12)
+            .unwrap();
+        state.store.set_meta("sealed_through", "5").unwrap();
+        let (_, polled) = sql_json(&state, q).await;
+        assert_eq!(
+            polled["cached"], true,
+            "a poll and a watermark that passed no row: {polled}"
+        );
+        assert_eq!(polled["rows"][0]["n"], 2);
+        assert_eq!(
+            (
+                polled["provenance"]["as_of"].clone(),
+                polled["provenance"]["sealed_through"].clone()
+            ),
+            (json!(12), json!(5)),
+            "a hit cites the head it was checked at, not the one it was computed at"
+        );
+
+        let sealed: Vec<String> = (6..=8).map(row).collect();
+        crate::seal::seal_range(tmp.path(), &sealed, 6, 8).unwrap();
+        let (_, written) = sql_json(&state, q).await;
+        assert_eq!(
+            written["rows"][0]["n"], 2,
+            "a segment above the watermark is not served yet"
+        );
+
+        state.store.set_meta("sealed_through", "8").unwrap();
+        let (_, admitted) = sql_json(&state, q).await;
+        assert_eq!(
+            admitted["cached"], false,
+            "the watermark admitted a segment: {admitted}"
+        );
+        assert_eq!(admitted["rows"][0]["n"], 5, "and the answer reads it");
     }
 
     /// A statement whose value is not a function of the indexed state is computed every time: the
