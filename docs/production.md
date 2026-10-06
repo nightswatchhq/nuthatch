@@ -67,11 +67,12 @@ restored is a belief. [Data lifecycle](operators.md#data-lifecycle).
 
 ### 9. Rehearse the upgrade you will eventually do at 2am
 
-`nest diff` and `nest upgrade` against a non-production copy:
-[nest lifecycle operations](operators.md#nest-lifecycle-operations). Each release states
-**in-place safe** or **reseal required**; that line is the one thing to read in release notes before
-upgrading, and what it promises is bounded by the
-[stability contract](operators.md#stability-contract).
+Swap the binary and restart against a non-production copy of the data directory, which is how a
+4.x upgrade goes and the copy is the only way back; `nuthatch migrate --dry-run` is for a pre-2.0
+directory only: [nest lifecycle operations](operators.md#nest-lifecycle-operations). Each release's notes carry a
+**Compatibility and upgrade** section saying whether it is replace-the-binary-and-restart or needs a
+migration or re-index; that section is the one thing to read before upgrading, and what it promises
+is bounded by the [stability contract](operators.md#stability-contract).
 
 ### 10. Prove it, with someone else watching
 
@@ -100,9 +101,9 @@ calendar rather than a monitor.
 ## Two honest gaps
 
 **Scaled mode is the least-verified path.** `verification.md` says which levels have been verified by
-the maintainers and which have not; the compose stack and any multi-machine run are the honest gaps.
-If you are running scaled mode, you are ahead of the verification, and outside evidence is worth
-sending back.
+the maintainers and on which release. CI brings the compose stack up on every change; the last
+multi-machine run was on 2.4.0, and nothing on 3.x or 4.x. If you are running scaled mode, you are
+ahead of the verification, and outside evidence is worth sending back.
 
 **The macOS binary is built but untested.** `aarch64-apple-darwin` is compiled and published, and no
 CI job runs on macOS - see [prod-readiness §8](prod-readiness.md#8-release-engineering). Fine for a

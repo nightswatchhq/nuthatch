@@ -54,9 +54,9 @@ The 2026 capability-freeze items were closed into [frozen-for-2027.md](frozen-fo
 | `help wanted` | Genuinely open to an outside contributor. Two of gallant-gecko's merged PRs came in this way |
 | `good first issue` | Small, self-contained, and does not need the whole architecture in your head first |
 
-**Sprint labels** (`gallant-gecko`, `fastidious-ferret`, and so on) mark membership of one sprint and
+**Sprint labels** (`brisk-bunting`, `temperate-tern`, and so on) mark membership of one sprint and
 remain afterwards as provenance. The current sprint is
-[`temperate-tern`](sprint-temperate-tern.md). A sprint label on any other closed issue is historical;
+[`candid-chaffinch`](sprint-candid-chaffinch.md). A sprint label on any other closed issue is historical;
 do not use it to infer that work remains. The [documentation guide](README.md) separates the live
 sprint from the dated records.
 
@@ -91,7 +91,8 @@ honest tip-lag number, and RFC-0023 tier 3's pinned-block verification.
 **The first DataFusion gate did not meet its bar** (2026-08-02). It measured **1.6-2.7x DuckDB's
 latency** on `net_balances` over sealed segments, widening with segment size, at exact result parity.
 That result remains evidence, not an architectural commandment: [RFC-0042](rfcs/0042-rust-native-without-duckdb.md)
-sets the current bounded re-evaluation path and its acceptance gate.
+closed KEEP DuckDB at its §14 and is parked, and the engine has since been Burrmill, on DataFusion,
+from 4.1.0 ([release notes](releases/v4.1.0.md)); DuckDB is no longer in the binary.
 
 **Turso is double-gated**, not rejected: a production-ready release, and a measured win over redb
 that federation does not already provide. Until both, no.
@@ -101,7 +102,8 @@ The third gate - *a permissive, non-BSL licence* - is **dead, and was wrong when
 checked against the GitHub API on 2026-08-10, so the licence never barred anything. Of the two that
 remain, production-readiness is arguable rather than settled (production use is claimed at several
 organisations, but it is pre-1.0 and some features are marked experimental), and the measured win has
-**never been attempted**. #366 carries the measurement.
+**never been attempted**. #366 carried the measurement and was closed on 2026-08-10 with the decision
+that the one-mental-model case for replacing redb does not survive inspection.
 
 **Scaled mode is no longer infra-blocked.** RFC-0022 turned it into ordinary work - the `HotStore`
 trait, a Postgres backend with a redb-parity suite, the query-FE role, and ownership fencing. The old

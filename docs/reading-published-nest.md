@@ -16,6 +16,7 @@ two disagree, the build fails.
   <dataset>/                  64 lowercase hex characters: the nest's data identity
     publish.json              the provenance envelope, below
     manifest.json             the nest's segments/manifest.json less its provisional entries
+    manifest.json.lock        the publisher's lock on a directory target; empty, not for readers
     schema.json               present when the nest has one
     <table>/
       <hash>.parquet          one object per catalogued, non-provisional segment

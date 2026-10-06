@@ -24,9 +24,12 @@ nothing else - they are rate-limited, shared, and will sometimes return an empty
 error.
 
 Evaluate on a free tier and you will mostly be measuring the free tier. We have measured that
-directly: on a rate-limited endpoint, **12 calls the indexer made became 84 HTTP requests** - a 7x
-retry amplification - because a `429` gets retried up to four times across the endpoint pool. Being
-throttled makes a nest send more, which throttles it harder. You would be benchmarking that loop.
+directly, on RFC-0039's recorded tape (RFC-0040, 2026-08-23, 2.7.x): on a rate-limited endpoint,
+**12 calls the indexer made became 84 HTTP requests** - a 7x retry amplification - because a `429`
+was retried up to four times across the endpoint pool. Being throttled made a nest send more, which
+throttled it harder. Since 4.7.0 an endpoint that answers `429` rests and is routed around, with
+`Retry-After` honoured, so the multiplier should be smaller now; it has not been re-measured, and
+on a free tier you would be benchmarking whatever is left of that loop.
 
 So: **the primary pass is against an endpoint you pay for.** If you want the free-tier numbers too,
 run them as an explicit second arm and label them as such - it is a fair question, and it is not the
@@ -42,10 +45,11 @@ puts a figure on it, and no amount of testing will make that go away.
 
 Not ceremony. We have been caught by this repeatedly, and so will you.
 
-Four identical 90-second runs of the same demo once measured **2, 15, 28 and 198 events**. A figure of
-`289 events/sec` outlived the harness that produced it by five weeks and ended up in a published
-document. A benchmark said seal-direct was 8.7x faster in July, 5.2x one morning and 0.92x that same
-afternoon.
+Four identical 90-second runs of the same demo once measured **2, 15, 28 and 198 events**
+(`docs/sprint-meticulous-magpie.md`, August 2026). A figure of `289 events/sec`, measured 2026-07-16,
+outlived the harness that produced it by five weeks and ended up in a published document
+(`docs/releases/v2.7.0.md`). A benchmark said seal-direct was 8.7x faster in July 2026, 5.2x one
+morning and 0.92x that same afternoon (`docs/benchmarks.md`, settled 2026-08-23).
 
 **Predict the number, then measure it.** Without a prior expectation you will accept whatever you get
 and call it fine - and so did we.
@@ -60,13 +64,14 @@ stopwatch.
 
 ```sh
 nuthatch init 0xYourContract --chain mainnet
-nuthatch dev
+nuthatch dev --backfill 300        # without it, dev backfills from the deployment block
 nuthatch sql "SELECT count(*) FROM <alias>__<event>"
 ```
 
-**Pick a contract we did not pick.** Ours is USDC, which is dense, mainstream and has a
-well-behaved ABI. Yours should be the awkward one: a proxy, an unverified implementation, a contract
-that deployed two years ago, one that emits nothing for months at a stretch.
+**Pick a contract we did not pick.** Ours are WETH in the README and USDC in `verification.md`,
+both dense, mainstream and with a well-behaved ABI. Yours should be the awkward one: a proxy, an
+unverified implementation, a contract that deployed two years ago, one that emits nothing for months
+at a stretch.
 
 Write down every moment of friction as it happens, including the ones you would normally shrug past.
 Those are the findings; the stopwatch is only the headline.
@@ -86,8 +91,9 @@ They either match or they do not.
 
 - Exact matches are the claim.
 - A divergence is interesting **whichever way it falls**. When we did this for a Graph Horizon nest
-  we were wrong on three fields and the reference was wrong on one - its own `stakedIndexersCount`
-  disagreed with its own entity set by nine.
+  (#649, August 2026, `docs/network-snapshot-counts.md`) we were wrong on three fields and the
+  reference was wrong on one - its own `stakedIndexersCount` (88) disagreed with its own entity set
+  (97) by nine.
 - Check totals *and* row counts *and* boundaries. An aggregate can be right while the underlying set
   is wrong.
 
@@ -107,7 +113,8 @@ curl -s localhost:8288/metrics | grep nuthatch_rpc_requests_total
 
 Take that reading, wait an hour, take it again.
 
-Known, measured, on our own reference deployment (issue #750):
+Known, measured, on our own reference deployment (issue #750, audited 2026-08-22, on 2.x; the
+figures are in `docs/operators.md` under *What a nest costs at tip*):
 
 | | |
 |---|---|
@@ -157,8 +164,9 @@ lost data is the worst outcome on this page, and we have shipped one - see the h
 The `/sql` surface is the interesting one, and it has a history:
 
 - **v0.6.2** fixed an **arbitrary file write** via `;`-stacked `COPY ... TO`.
-- **v0.9.3** fixed an **arbitrary file read**: DuckDB accepts a quoted function name and the guard
-  matched only the unquoted form, so `SELECT * FROM "read_csv"('/etc/passwd')` executed.
+- **v0.9.3** fixed an **arbitrary file read**: DuckDB, the engine until 4.0, accepted a quoted
+  function name and the guard matched only the unquoted form, so
+  `SELECT * FROM "read_csv"('/etc/passwd')` executed.
 
 Both were ours. So:
 
@@ -170,9 +178,10 @@ Both were ours. So:
 - If you put it behind a proxy, check the proxy is not the only thing standing between the internet
   and an unauthenticated SQL endpoint.
 - Webhook signatures: `X-Nuthatch-Signature` is HMAC. Verify it actually verifies.
-- **Was an open finding:** [#289](https://github.com/nightswatchhq/nuthatch/issues/289) - DuckDB's
-  `allowed_directories` did nothing unless `enable_external_access` was false at startup. That flag
-  is now passed. Press the denylist anyway; it is still the layer in front.
+- **Was an open finding:** [#289](https://github.com/nightswatchhq/nuthatch/issues/289), closed
+  2026-08-24 - until 4.0, DuckDB's `allowed_directories` did nothing unless `enable_external_access`
+  was false at startup, and that flag was then passed. Since 4.1.0 the engine is Burrmill, and the
+  denylist in front of it is what refuses `read_csv` today, quoted or not. Press it.
 
 **What a bad answer looks like:** a guard that matches on a string. If you can find one, it is
 probably bypassable, and that is the shape both previous holes had.
@@ -192,8 +201,8 @@ The most useful section, and the least comfortable to write.
   and we believed it. When something looks clean, ask what a broken version would have looked like.
 - **Public RPC endpoints are not a test environment.** Ours are bundled so that `init` → `dev` works
   with zero setup. They are rate-limited, shared, and will sometimes return an empty result rather
-  than an error. Measuring nuthatch through one measures the endpoint: we found the **network is
-  99.3% of backfill wall clock**.
+  than an error. Measuring nuthatch through one measures the endpoint: we found the **network was
+  99.3% of backfill wall clock** (`docs/benchmarks.md`, measured 2026-08-23 on RFC-0039's replay rig).
 - **Documentation rots faster than code.** `llms.txt` told coding agents to run `nuthatch roost` for
   five releases after that subcommand was removed. If a doc and the binary disagree, the binary is
   right - and please tell us.

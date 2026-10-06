@@ -11,21 +11,23 @@ Postgres/Docker, no third-party data API, no bill. This skill teaches you to *dr
 `schema`/`sql` tools instead - that's runtime knowledge; this is authoring knowledge.
 
 **Never fight the non-negotiables** (the binary enforces them; working against them is always wrong):
-one writer, one cursor per chain (a second chain = a second process), sealed Parquet segments are
+one writer, one cursor per chain (a second chain = a second cursor, never a shared one), sealed Parquet segments are
 immutable (reorgs only ever touch the hot store), and the `/sql` guards (timeout, row cap, concurrency)
 are node self-protection, not obstacles to remove.
 
 ## The 90-second happy path
 
 ```sh
-nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48   # USDC - chain auto-detected
+nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC - chain auto-detected
 nuthatch dev            # backfill from deployment, follow the tip, serve an API on :8288
 nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT value_overflow"
 ```
 
-- `init` resolves the ABI (Sourcify → Etherscan), writes `nuthatch.toml`, `schema.json`,
-  `semantic.toml`, `llms.txt`, and a `.claude/skills/` scaffold. **Omit `--chain`** - it probes the
-  known chains for the contract's bytecode. Pass several addresses to index them together.
+- `init` resolves the ABI (Sourcify → Etherscan), writes `nuthatch.toml`, `abis/`, `schema.json`,
+  `semantic.toml`, `views/`, `llms.txt`, and a `.claude/skills/` scaffold. **Omit `--chain`** - it
+  probes the known chains for the contract's bytecode. Pass several addresses to index them together.
+  Without `--alias` the table prefix is the contract's name from the ABI (`fiat_token_v2_2__transfer`
+  for USDC), so name it if you want `usdc__transfer`.
 - `dev` shows a live backfill progress line, then "caught up to tip". It *is* the serve command.
 - `nuthatch sql` with no query opens a REPL (`.tables`, `.schema <t>`, history).
 - `sum(value_dec)` is the amounts that fit. A full-width word is NULL and is not a term, so
@@ -37,9 +39,9 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
   subcommand and flag. If a flag isn't here, it doesn't exist - never invent one.
 - **[config-reference.md](config-reference.md)** - every `nuthatch.toml` / `semantic.toml` / `mounts.toml`
   key.
-- **[config-as-code.md](config-as-code.md)** - the `nest.star` (Starlark) front-end, **RETIRED**. Author
-  nests in plain `nuthatch.toml`; the `.star` path stays in the binary for backward compatibility only.
-  Read this only to understand a legacy `nest.star` you've inherited - don't write new ones.
+- **[config-as-code.md](config-as-code.md)** - the `nest.star` (Starlark) front-end, **REMOVED in 2.0**.
+  Author nests in plain `nuthatch.toml`; a directory holding a `nest.star` is refused at load. Read
+  this only to port a legacy `nest.star` you've inherited - don't write new ones.
 - **[workflows.md](workflows.md)** - the recipes: init→dev→sql, add a contract, factories, publish a
   nest (bundle/load), run several nests in one runtime, wire an AI client.
 - **[views.md](views.md)** - a nest's logic layer: authoring `views/*.sql` derivations, describing them
@@ -56,7 +58,8 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
 
 1. **Read `cli-reference.md` before using a flag you're unsure of.** Hallucinated flags are the #1 way
    agents break nuthatch.
-2. **One chain per process.** To index a second chain, run a second `nuthatch dev`. Never try to
+2. **One chain per cursor.** A second chain is a second cursor: a second `nuthatch dev`, or a second
+   `[[chains]]` entry in a runtime's `mounts.toml` (one isolated cursor per chain). Never try to
    multiplex chains behind one cursor.
 3. **Don't touch sealed data.** If a task seems to need mutating `segments/` or the sealed history, the
    approach is wrong - reorgs are handled by the hot store, not by rewriting Parquet.

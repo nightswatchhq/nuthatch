@@ -8,8 +8,9 @@ not to infer work that remains.
 
 - [Backlog guide](backlog.md) - GitHub is the live queue; this explains its labels and settled
   decisions.
-- [Sprint: temperate-tern](sprint-temperate-tern.md) - checkpointed folds into the runtime against
-  their head targets, and the nuthatch release hosted nests depends on.
+- [Sprint: candid-chaffinch](sprint-candid-chaffinch.md) - everything a reader is told about nuthatch,
+  in the README, the site, the guides, the book, `docs/` and the skill, checked against the binary
+  they download.
 - [Frozen for 2027](frozen-for-2027.md) - capability work deliberately deferred during the 2026
   feature freeze. These issues are closed, with an explicit reopening rule.
 - [Parked issues closed, 2026-09-28](parked-closed.md) - the open `parked` queue, closed with the
@@ -39,8 +40,8 @@ not to infer work that remains.
 ## Dated records
 
 - [Progress log](progress-log.md)
-- `sprint-*.md` - completed and historical sprint scopes. `measured-merlin` and `durable-dipper` closed on
-  2026-09-23. Sprint labels remain on GitHub issues as provenance; the documents explain the scope as it stood at the time.
+- `sprint-*.md` - completed and historical sprint scopes. `brisk-bunting` closed on 2026-10-05. Sprint
+  labels remain on GitHub issues as provenance; the documents explain the scope as it stood at the time.
 - [July-August 2026 roadmap](high-level-roadmap-jul-aug-2026.md)
 - [2027 direction](roadmap-2027.md)
 

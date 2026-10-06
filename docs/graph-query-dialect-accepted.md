@@ -1,7 +1,8 @@
 # The Graph query dialect a nest accepts
 
-RFC-0053 S2 (#1266). What `/graphql` lowers to SQL, what it refuses, and why each refusal is a
-refusal rather than an approximation.
+RFC-0053 S2 (#1266). What `/graphql` lowers to Burrmill SQL, what it refuses, and why each refusal is
+a refusal rather than an approximation. The route exists only in a nuthatch built with
+`--features graph`; the published binary is a default build and answers it 404 (see the last section).
 
 **The governing rule is RFC-0053 §Design: "It must never silently approximate a value and call the
 endpoint drop-in."** Applied to a query, that means an argument this compiler does not implement is an
@@ -24,7 +25,7 @@ Every refusal below names the thing refused, so a caller can act on it.
 
 ### Numeric ordering and comparison
 
-A nest stores every big number as canonical text (`analytics.rs:2253`: columns are `UBIGINT`, everything
+A nest stores every big number as canonical text (`analytics.rs:2745`: columns are `UBIGINT`, everything
 else is text), so `ORDER BY "value"` compares **strings**. Text order agrees with numeric order only while
 every value has the same digit count, so `9000351` ranked above `60000353` and a `value_gt` dropped rows it
 should have kept (#1325).
@@ -103,12 +104,12 @@ FROM "pool" b ORDER BY b."id" ASC LIMIT 100 OFFSET 0
 The join key is the schema author's: `@derivedFrom(field: "pool")` says `Swap.pool` holds the parent id.
 
 `to_json(list(struct_pack(…)))` in preference to returning a `LIST` of `STRUCT`, so the column arrives
-as a plain JSON string and nothing depends on how the row serialiser handles a nested DuckDB type. The
+as a plain JSON string and nothing depends on how the row serialiser handles a nested `STRUCT`. The
 inner subquery exists because `ORDER BY` and `LIMIT` cannot sit inside the aggregate.
 
-**`coalesce` is not decoration.** `list()` over zero rows is `NULL` in DuckDB - measured with the CLI
-before any of this was written - so a parent with no children would answer `null` for a field the
-generated schema types `[Swap!]!`.
+**`coalesce` is not decoration.** `list()` over zero rows is `NULL` in Burrmill, as it was in DuckDB
+before 4.1 (re-measured through `/sql` on 4.10.1, 2026-10-05), so a parent with no children would
+answer `null` for a field the generated schema types `[Swap!]!`.
 
 One level, matching the depth `E_orderBy` advertises in the reference: graph-node emits
 `token0__symbol` and no `token0__whitelistPools__id`.
@@ -161,13 +162,16 @@ relation, so refusing it made our own schema validate a query the endpoint then 
 
 ```sql
 WHERE b."liquidity" > '1'
-  AND EXISTS (SELECT 1 FROM "token" n0
-              WHERE n0."id" = b."token0" AND n0."symbol" LIKE '%ET%' ESCAPE '\')
+  AND coalesce(b."token0" IN (SELECT n0."id" FROM "token" n0
+                              WHERE n0."symbol" LIKE '%ET%' ESCAPE '\'), false)
 ```
 
-`EXISTS` rather than a join, so the parent's row count is unchanged and `first` keeps meaning what it
-says. Conditions inside are lowered against the **child** entity, with the child's own operator set, and
-an unknown field there is named against the child.
+A membership subquery rather than a join, so the parent's row count is unchanged and `first` keeps
+meaning what it says. It was a correlated `EXISTS` until #1458, where one combined with a selected
+relation produced an invalid binding on DuckDB; membership is correct either way, and the `coalesce`
+keeps a null reference or a null child id from answering `null` under another boolean. Conditions
+inside are lowered against the **child** entity, with the child's own operator set, and an unknown
+field there is named against the child.
 
 **A nested filter across a `@derivedFrom` list - `swaps_` - is refused by name.** The reference
 advertises those too, but asking the live reference endpoint for one returns **HTTP 504** on this
@@ -258,8 +262,10 @@ after which the whole operation reads as garbage.
 ## With `--features graph` (RFC-0060)
 
 A nuthatch built with `--features graph` serves the Network Subgraph client dialect on top of
-everything above. A default build serves exactly the sections above, and refuses a nest that
-declares `graph/history.toml`. In this build four rows of the refusal table change:
+everything above. A default build registers none of these routes and never reads
+`graph/history.toml` (`serve.rs`: the policy is `None` outside the feature). RFC-0059 and RFC-0060
+were parked on 2026-09-26 with their slices S0 to S3 left in the tree behind the feature, so what
+follows describes that build as it stands. In it four rows of the refusal table change:
 `block: { number: N }` and `block: { hash: … }` are answered in historical mode, a derived list takes
 its own arguments, the two-level shapes below are accepted, and `null` is accepted for equality and
 inequality.
@@ -330,5 +336,5 @@ an existing client's URL can be swapped host-for-host without rewriting the path
 registered only in a build with `--features graph` (#1440); a default build answers them 404.
 
 Queries run through `run_sql_query`, so they inherit the node's admission bounds and row cap rather
-than opening a second unmetered way into DuckDB. An answer `/sql` would flag as truncated, degraded or
+than opening a second unmetered way into Burrmill. An answer `/sql` would flag as truncated, degraded or
 missing its tip is refused here, because a GraphQL response has nowhere to carry the flag.

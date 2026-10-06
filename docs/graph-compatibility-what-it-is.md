@@ -5,9 +5,11 @@ any use to you.*
 
 ## What it is
 
-A nest can serve a **GraphQL endpoint shaped like the subgraph you ported it from**. Your client's
-schema introspection works, its queries parse, its filters and ordering and pagination behave the way
-graph-node's do, and the values come back in graph-node's own wire types.
+A nest can serve a **GraphQL endpoint shaped like the subgraph you ported it from**, when nuthatch is
+built with `--features graph`. The published binary is a default build and answers `/graphql` 404; the
+routes are registered only behind that feature, off by default since 2026-09-21 (#1440). In that build
+your client's schema introspection works, its queries parse, its filters and ordering and pagination
+behave the way graph-node's do, and the values come back in graph-node's own wire types.
 
 It is for the case where **a subgraph has stopped and nobody is going to fix it**. You point a client at
 a nest instead and get back the part of your data that a nest can reproduce from decoded chain events,
@@ -58,7 +60,7 @@ alike.
 fields a nest refuses.
 
 **Find out in one command**, rather than guessing. `nuthatch port-emit` prints a coverage line and writes
-it into the nest's `README.md`:
+it into the nest's `README.md`. For the pinned Uniswap V4 port, measured 2026-09-12:
 
 ```
 coverage: 70 of 184 fields the report calls exact are answered (38%): 54 in views,
@@ -71,8 +73,8 @@ before you migrate anything.** The number at the top is not the number that matt
 fields are in it is.
 
 The outcome depends far more on the shape of your subgraph than on how much of this we have built. A
-subgraph whose entities mirror events ports well - the second pinned target answers 44% with no priced
-fields at all. A subgraph built for analytics does not.
+subgraph whose entities mirror events ports well - the second pinned target, Carbon, answered 44% with
+no priced fields at all when measured on 2026-09-12. A subgraph built for analytics does not.
 
 ## What is accepted and refused, exactly
 

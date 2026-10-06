@@ -5,7 +5,7 @@ The configuration surfaces a nest or a multi-nest runtime uses. Keys mirror the 
 retired the roost), `src/allowlist.rs` (the query ceiling, RFC-0034 phase 2), `src/calls.rs`
 (`[[calls]]`), `src/ipfs.rs` (`[[ipfs]]`), and `src/entities.rs` (`[[entities]]`). CI checks this
 **both ways**: the build fails if this file names a key those structs don't have, and equally if a
-struct grows a key this file never mentions — a shipped key an agent cannot see is one it will never
+struct grows a key this file never mentions: a shipped key an agent cannot see is one it will never
 use.
 
 ## `nuthatch.toml` - a nest
@@ -15,7 +15,8 @@ Written by `init`; edit by hand freely.
 ```toml
 [nest]
 name = "usdc"                 # nest name (also the default mount alias)
-chain = "mainnet"             # mainnet | arbitrum-one | base
+chain = "mainnet"             # a registry name: mainnet | arbitrum-one | base | bsc | polygon |
+                              #   gnosis | optimism | monad | robinhood
 chain_id = 1
 rpc_urls = ["https://…"]      # tried in order, then round-robin failover
 schema_version = 1            # config/data layout version (managed by nuthatch)
@@ -183,13 +184,15 @@ incremental runtime.
 name = "delegated_balance"          # stable entity name, and the SQL file stem
 sql = "entities/delegated_balance.sql" # exactly one file under entities/
 key = ["indexer", "delegator"]     # one or more output columns, in point-read order
-max_rows = 1000                      # refuse a live input batch larger than this
+max_rows = 1000                      # the most rows the relation may hold; crossing it faults
+                                     #   the entity, and admission charges 3,200 bytes per row
 ```
 
 `name` must match the SQL filename, `key` must name output columns, and `max_rows` must be greater
 than zero. An empty manifest is refused rather than quietly meaning that the runtime has no work to
-do. This is the authored declaration surface only: lifecycle, maintained-state storage, and serving
-arrive with the remaining RFC-0041 work.
+do. The relation is maintained as blocks arrive and served at `/derived/{name}`, by key at
+`/derived/{name}/{key}`, and by name from `/sql`; [entities.md](entities.md) has the admitted SQL,
+the cost and the fault semantics.
 
 ## `semantic.toml` - what the data *means* (RFC-0016)
 
@@ -244,47 +247,42 @@ with a pointer to `nuthatch migrate` (which moves data and never re-indexes).
 step.
 
 
-Single-chain form - all mounted nests share ONE chain, ONE cursor:
+One chain or several, the shape is the same: chains are listed under `[[chains]]` (a top-level array
+beside `[runtime]`), one isolated cursor per chain, and each nest declares its own `chain` in its
+`nuthatch.toml`. Nests on the same chain share that chain's cursor:
 
 ```toml
 [runtime]                     # was [roost] before 2.0
 name = "my-runtime"
-chain = "mainnet"             # the one chain (one cursor)
-chain_id = 1
-rpc_urls = ["https://…"]
-max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048)
-default_tenant = "acme"       # optional; the tenant a mount belongs to when it does not say
-                              # (default "default"). Opaque - nuthatch refcounts it, nothing more.
+max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048); the runtime's
+                              # total budget is Σ cursors
+default_tenant = "acme"       # optional (default "default"); the tenant a mount without `tenant`
+                              # belongs to, served with no tenant segment in the route. Opaque -
+                              # nuthatch refcounts a tenant, nothing more.
 suspended = ["usdc"]          # runtime state: mounts suspended over the admin API. Kept on disk,
                               # neither indexed nor served (503) until `POST /_admin/resume/<name>`.
-
-[[mounts]]                    # what is mounted; `nests = [...]` is gone
-alias = "usdc"
-nid = "9f2c…"
-```
-
-Multichain form (RFC-0021) - one isolated cursor per chain. Omit the top-level
-`chain`/`chain_id`/`rpc_urls`; list chains under `[[chains]]` (a top-level array, beside `[runtime]`),
-and let each nest declare its own `chain` in its `nuthatch.toml`:
-
-```toml
-[runtime]
-name = "my-runtime"
-max_rss_mb = 2048             # per-cursor; the runtime's total budget is Σ cursors
+nests = []                    # pre-2.0: the nests resolved at nests/<name>/. Still read, but only
+                              # for an alias no [[mounts]] record names; `migrate` moves them across.
 
 [[chains]]
 chain = "mainnet"
 chain_id = 1
 rpc_urls = ["https://…"]
 
-[[chains]]
-chain = "base"
+[[chains]]                    # a second chain is a second cursor (RFC-0021); a chain with nothing
+chain = "base"                # mounted on it yet starts its cursor on the first mount
 chain_id = 8453
 rpc_urls = ["https://…"]
+
+[[mounts]]                    # what is mounted, by identity
+alias = "usdc"
+nid = "9f2c…"
 ```
 
-Exactly one form: top-level `chain` **or** `[[chains]]`, never both (ambiguous) or neither. The
-single-cursor law holds per chain - never multiplex two chains behind one cursor.
+The pre-2.0 top-level form (`chain`/`chain_id`/`rpc_urls` directly under `[runtime]`) is **refused
+at startup**: `runtime 'my-runtime' uses the pre-2.0 top-level chain form. 2.0 declares chains under
+[[chains]] - one form, one meaning. nuthatch migrate rewrites it for you.` The single-cursor law
+holds per chain - never multiplex two chains behind one cursor.
 
 ### `[[mounts]]` - where a nest's data actually lives (RFC-0032)
 
@@ -308,8 +306,6 @@ them onto one dataset.
 one place in the cursor, one backfill, two routes.
 
 ```toml
-nests = ["acme-usdc", "globex-usdc"]
-
 [[mounts]]
 alias = "acme-usdc"
 nid = "9f2c…"
@@ -339,10 +335,14 @@ nid = "9f2c…"
 sql = "allowlist"               # "open" (default) | "deny" | "allowlist"
 
 [[mounts.queries]]
-name = "top_holders"
-sql = "SELECT addr, net FROM balances WHERE addr = {who} LIMIT {n}"
+name = "recent_to"
+sql = "SELECT \"from\", value FROM usdc__transfer WHERE \"to\" = {who} LIMIT {n}"
 params = { who = "address", n = "int" }
 ```
+
+A named query reads decoded tables, authored views and entities by name. The built-in `balances`
+circuit is not a SQL relation (it is served at `/balances`); `nuthatch recipe add balances` writes a
+`{alias}_balances` view if you want one in SQL.
 
 | `sql` | Behaviour |
 |---|---|
@@ -459,9 +459,9 @@ registry needs and an operator cannot supply for someone else's nest.
 ```toml
 # queries.toml, beside nuthatch.toml
 [[queries]]
-name = "holder_balance"
-sql = "SELECT net FROM balances WHERE addr = {who}"
-params = { who = "address" }
+name = "recent_to"
+sql = "SELECT \"from\", value FROM usdc__transfer WHERE \"to\" = {who} LIMIT {n}"
+params = { who = "address", n = "int" }
 ```
 
 Two ways to widen, both refused **at startup**:
@@ -482,8 +482,8 @@ exactly like `views/`.
 ### Tenants (RFC-0032)
 
 A mount belongs to a **tenant**: an opaque string nuthatch refcounts and knows nothing else about. No
-authz, no quotas, no metering - identity is the gateway's job. Omit it and you get `default`
-(configurable per runtime with `[runtime] default_tenant`).
+authz, no quotas, no metering - identity is the gateway's job. Omit it and the mount belongs to
+`[runtime] default_tenant`, which is `default` unless set.
 
 ```toml
 [[mounts]]
@@ -497,11 +497,14 @@ alias = "usdc"        # the same alias is fine - it is unique WITHIN a tenant
 nid = "9f2c…"         # same nest, one dataset, one backfill
 ```
 
-**Routes carry the tenant unless it is the default one.** A mount of the default tenant (`default`, or
-`[runtime] default_tenant`) serves at `/usdc/…`; any other tenant's at `/acme/usdc/…`. Each mount's
-route depends on its own tenant alone (3.13.1), so adding or removing another tenant never moves it,
-before or after a restart. A runtime whose mounts all belong to the default tenant never shows the
-word in a URL.
+**Routes carry the tenant unless it is the default one.** A mount of the default tenant (`default`,
+or whatever `[runtime] default_tenant` names) serves at `/usdc/…`; any other tenant's at
+`/acme/usdc/…`. Each mount's route depends on its own tenant alone (3.13.1), so adding or removing
+another tenant never moves it, before or after a restart. A runtime whose mounts all belong to the
+default tenant never shows the word in a URL. With `default_tenant = "acme"`, a mount that omits
+`tenant` is an `acme` mount served at `/usdc/…`, and one that says `tenant = "default"` is an ordinary
+other tenant at `/default/usdc/…` (#1933). `GET /nests` reports each mount's `tenant` and
+`base_path`.
 
 Both `tenant` and `alias` are path segments, so both are restricted to letters, digits, `_` and `-`.
 Opaque means nuthatch does not interpret it, not that it may contain `..`.

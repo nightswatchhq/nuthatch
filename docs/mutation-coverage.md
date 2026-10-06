@@ -9,8 +9,10 @@ hole (#725, #745). Two for two is not luck; it is a measurement of how much of a
 
 ## What runs, and when
 
-`.github/workflows/mutants.yml`, nightly at 03:00 UTC and on demand. **Not on pull requests**, and the
-reason is measured rather than assumed. On an 18-core machine:
+`.github/workflows/mutants.yml`, nightly at 03:00 UTC and on demand, as one matrix job per file shard
+(two for `chunker.rs`, eight for `seal.rs`, one for `registry.rs`), each running `cargo mutants
+--file <file> --shard <n/m> -- --lib`. **Not on pull requests**, and the reason is measured rather
+than assumed. On an 18-core machine, when the job landed (2026-08-23):
 
 | | |
 |---|---|
@@ -28,13 +30,15 @@ measurement agreed.
 ## What is in scope
 
 `src/chunker.rs`, `src/seal.rs`, `src/registry.rs` - the paths that decide what gets fetched and what
-reaches stored state, where a decorative test is most expensive. Not the whole crate: that is **4,503
-mutants** against ~300 here, and a signal nobody reads is not a signal.
+reaches stored state, where a decorative test is most expensive. Not the whole crate: that was **4,503
+mutants** against ~300 here when measured on 2026-08-23 (the 2026-10-05 nightly tested 244 across
+its eleven shards), and a signal nobody reads is not a signal.
 
-`src/registry.rs` yields only 3 mutants because #581 moved decode into its own crate. The decode path
-is not skipped, it simply lives elsewhere - `cargo mutants -d decode` is 185 mutants and is the
-obvious next addition once the nightly's real wall-clock is known from a few runs rather than from
-one laptop.
+`src/registry.rs` yields only 3 mutants (still 3 on the 2026-10-05 nightly) because #581 moved decode
+into its own crate. The decode path is not skipped, it simply lives elsewhere - `cargo mutants -d
+decode` was 185 mutants on 2026-08-23 and is the obvious next addition; the nightly's wall-clock is
+now known (two to three hours per 25-mutant shard at `-j 2` on the 2026-10-05 run), and it has not
+been added.
 
 ## The baseline
 

@@ -52,6 +52,7 @@ SELECT * FROM offchain__prices__status;
 
 | column | meaning |
 | --- | --- |
+| `table` | the table name, without its `offchain__` prefix |
 | `source` | the URL, query string redacted |
 | `attempted_at`, `succeeded_at` | `unix:<seconds>`; `succeeded_at` stays at the last success after a failure |
 | `error` | the last attempt's failure, or NULL |

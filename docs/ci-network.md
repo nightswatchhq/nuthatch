@@ -6,7 +6,7 @@ A check which cannot fail is not a check. Every test or job that talks to the ne
 | | Kind | When skip happens |
 |---|---|---|
 | **(a)** | Does not touch the network. Fixtures, tapes, stubs. | It does not. |
-| **(b)** | Touches the network, and a skip in CI is a failure. Locally, absence of the dependency may skip. `NUTHATCH_REQUIRE_PG=1` is the Postgres form; `CI=true` plus a panic on skip is the RPC form. | Local only. |
+| **(b)** | Touches the network, and a skip in CI is a failure. Locally, absence of the dependency may skip. `NUTHATCH_REQUIRE_PG=1` is the Postgres form; `CI` set plus a panic on skip (unless `NUTHATCH_ALLOW_NET_SKIP=1`, the documented override) is the RPC form. | Local only. |
 | **(c)** | `#[ignore]`, or a cron workflow, with a documented command to run it. | Always, until someone runs it. |
 
 **Silent skip is not on the list.** `eprintln!("offline? - nothing to judge, not asserting"); return;`
@@ -25,15 +25,17 @@ Two scripts exist because of that, and they are not the same kind of thing.
 
 | script | kind | runs itself? |
 |---|---|---|
-| `scripts/check-required-contexts.sh` | **(b)** - reads live protection; a skip is a failure | Yes: `required-contexts.yml`, nightly and on any change to `.github/required-checks.txt` |
+| `scripts/check-required-contexts.sh` | **(b)** - reads live protection; a skip is a failure | Yes: `required-contexts.yml`, daily at 06:20 UTC and on any change to `.github/required-checks.txt` |
 | `scripts/protect-branch.sh` | Manual operator tool. Writes protection onto a branch. | **No, and deliberately** |
 
 `check-required-contexts.sh` compares `.github/required-checks.txt` against what GitHub actually
 enforces on `main`. **Without a token it exits 1**, because the comparison is its entire job and a
 tokenless run has compared nothing; `--offline` is how a caller asks for the file-only check and gets
-told, in the output, that no drift check happened. Its Actions job needs
-`permissions: administration: read` - reading `branches/main/protection` is an admin-scoped read that
-the default `GITHUB_TOKEN` does not carry.
+told, in the output, that no drift check happened. Its Actions job needs a PAT or App token with the
+`administration: read` scope, supplied as the `PROTECTION_READ_TOKEN` secret: reading
+`branches/main/protection` is an admin-scoped read that the default `GITHUB_TOKEN` cannot be given,
+and `administration` is not a key the workflow `permissions:` block accepts (#909; written that way,
+the workflow failed validation and never ran a job).
 
 It is **not** a required context, and that is on purpose: it reads a setting rather than the tree, so
 a PR author cannot satisfy it by changing their PR, and a required check nobody can fix is a trap.
@@ -52,7 +54,7 @@ used for this: it PUTs a whole protection object, so on `main` it would also wri
 Together the three are read, write-new-branch, write-main - and the committed list is the source of
 truth for all of them. The drift checker does run in CI: the `PROTECTION_READ_TOKEN` secret exists (#1095, closed
 2026-09-03), and the daily `required-contexts.yml` runs have been green since, with `GH_TOKEN`
-set from the secret.
+set from the secret (last checked 2026-10-05: the eight scheduled runs to that date all `success`).
 
 Since 2026-08-20 sprint work has gone straight to `main` (a sprint is a labelled set of issues, not a
 branch - #810), so in practice this script is only needed if that changes back.

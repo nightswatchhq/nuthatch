@@ -6,15 +6,18 @@ keys in [config-reference.md](config-reference.md).
 ## Index one contract (the happy path)
 
 ```sh
-nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48   # chain auto-detected
+nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # chain auto-detected
 nuthatch dev
 nuthatch sql "SELECT count(*) FROM usdc__transfer"
 ```
 
-If auto-detect can't find the contract (or you want a specific chain), pass `--chain mainnet |
-arbitrum-one | base`. To index only recent history instead of from deployment: `nuthatch dev
---backfill 100000` (last 100k blocks). Point at your own node with `--rpc https://…` to dodge
-public-RPC limits.
+Without `--alias` the prefix is the contract's name from the ABI (`fiat_token_v2_2__transfer` for
+USDC). If auto-detect can't find the contract (or you want a specific chain), pass `--chain` with a
+registry name: `mainnet`, `arbitrum-one`, `base`, `bsc`, `polygon`, `gnosis`, `optimism`, `monad`,
+`robinhood`. `init` ends by printing the `nuthatch dev` line to run next and, for a long history, the
+same line with `--backfill N` for the recent window only. To index only recent history instead of
+from deployment: `nuthatch dev --backfill 100000` (last 100k blocks). Point at your own node with
+`--rpc https://…` to dodge public-RPC limits.
 
 ## Index several contracts together
 
@@ -78,15 +81,17 @@ You can also `init --from <git-url|dir>` to start from a published nest instead 
 
 ## Run many nests in one process (RFC-0032)
 
-One runtime hosts several nests **on the same chain** behind one API, sharing one cursor and one getLogs
-per window - N nests for roughly one nest's RPC cost. Create a `mounts.toml` (see config-reference) and:
+One runtime hosts several nests behind one API, **one isolated cursor per chain**: nests on the same
+chain share that cursor and one getLogs per window - N nests for roughly one nest's RPC cost - and a
+second chain gets a second cursor. Create a `mounts.toml` (see config-reference) and:
 
 ```sh
-nuthatch dev --dir .            # serves /nests + each nest under /<name>/…
+nuthatch dev --dir .            # serves /nests + each nest under /<name>/… (/<tenant>/<name>/… once a second tenant mounts)
 ```
 
-Each nest is isolated (own store, own reorg blast radius) but shares the finality view. A per-runtime
-RAM budget (`max_rss_mb`, default 2048) refuses a mount projected to blow it.
+Each nest is isolated (own store, own reorg blast radius) but shares its cursor's finality view. A
+per-cursor RAM budget (`max_rss_mb`, default 2048) refuses a mount projected to blow it; `GET /nests`
+reports the projection per runtime and per mount.
 
 ## Wire an AI client to a running nest
 
