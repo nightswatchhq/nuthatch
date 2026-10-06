@@ -3055,7 +3055,10 @@ dataSources:
             "no contract may index the ABI's events: {:?}",
             config.contracts
         );
-        assert!(config.extract.blocks, "the block handler becomes block rows");
+        assert!(
+            config.extract.blocks,
+            "the block handler becomes block rows"
+        );
     }
 
     /// polygon-blocks (`QmdNFXbQooUNuy2UQGciY5Lzb3LgoKegfkn96Le6gio78p`): a block-handler-only source

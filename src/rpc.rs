@@ -2790,11 +2790,7 @@ mod tests {
                 async move {
                     let addrs: Vec<String> = req["params"][0]["address"]
                         .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .map(|v| v.as_str().unwrap().to_string())
-                                .collect()
-                        })
+                        .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
                         .unwrap_or_default();
                     asked.lock().unwrap().push(addrs.len());
                     if addrs.len() >= 10 {

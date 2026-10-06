@@ -11621,7 +11621,10 @@ template = "pool"
     }
 
     /// [`build_factory_test_nest`], with `template_extra` appended to the `[[templates]]` entry.
-    async fn build_factory_test_nest_with(dir: &std::path::Path, template_extra: &str) -> NestIngest {
+    async fn build_factory_test_nest_with(
+        dir: &std::path::Path,
+        template_extra: &str,
+    ) -> NestIngest {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
