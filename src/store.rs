@@ -303,9 +303,17 @@ pub trait HotStore: Send + Sync {
     /// A counter that moves on every committed write and never otherwise, or `None` where the
     /// backend cannot say - including, for the redb store, the moment a commit is in flight. Two
     /// reads that both return `Some(g)`, one before a query and one after, prove no commit began
-    /// between them, which is what lets the analytical memo (#1186) remember that query's answer as
-    /// the answer for generation `g`. A backend that returns `None` simply has no memo.
+    /// between them. The memo (#1186) fences on the narrower [`HotStore::rows_generation`].
     fn write_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// [`HotStore::write_generation`] counting only the commits that add or remove a hot row, the
+    /// only ones a `/sql` answer can see. A cursor also commits on every poll to move `last_block` and
+    /// its checkpoints, which on a two-second chain moved the memo's key faster than a whole-history
+    /// view can be computed, so nothing was ever remembered (#1951). A backend that returns `None`
+    /// simply has no memo.
+    fn rows_generation(&self) -> Option<u64> {
         None
     }
 
@@ -505,10 +513,10 @@ pub struct Store {
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
     /// the same owner. `0` means unclaimed, which disables enforcement entirely.
     held: Arc<std::sync::atomic::AtomicU64>,
-    /// Committed write transactions since this store was opened, shared across clones. The
-    /// analytical memo keys on it (#1186): two `/sql` requests separated by no commit read the
-    /// same hot rows, and it is this counter rather than a scan of them that says so.
+    /// Committed write transactions since this store was opened, shared across clones.
     writes: Arc<std::sync::atomic::AtomicU64>,
+    /// [`Store::writes`] for the commits that change a hot row; see [`HotStore::rows_generation`].
+    rows: Arc<std::sync::atomic::AtomicU64>,
     /// Held for the whole of a blocking-pool commit, which outlives an abort of the task that
     /// started it (#1767). [`HotStore::settle_commits`] waits on it.
     commit_gate: Arc<tokio::sync::Mutex<()>>,
@@ -694,6 +702,7 @@ impl Store {
             released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rows: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             commit_gate: Arc::default(),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -731,6 +740,18 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::commit`] for a transaction that may add or remove hot rows: when `changed`, the rows
+    /// counter is bracketed around it exactly as `writes` is, for the same reason.
+    fn commit_rows(&self, wtx: redb::WriteTransaction, changed: bool) -> Result<()> {
+        if !changed {
+            return self.commit(wtx);
+        }
+        self.rows.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.commit(wtx)?;
+        self.rows.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     fn from_db(db: Database) -> Result<Store> {
         // Materialise all four tables up front so read txns never hit a missing one. Only `open`
         // (the creating path) goes through this - `open_existing` takes no write txn, see #471.
@@ -762,6 +783,7 @@ impl Store {
             released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rows: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             commit_gate: Arc::default(),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -889,7 +911,7 @@ impl Store {
             let mut t = wtx.open_table(ENTITIES)?;
             t.insert(key, json)?;
         }
-        self.commit(wtx)?;
+        self.commit_rows(wtx, true)?;
         Ok(())
     }
 
@@ -930,7 +952,7 @@ impl Store {
             named
         };
         if named {
-            self.commit(wtx)?;
+            self.commit_rows(wtx, !entries.is_empty())?;
         } else {
             wtx.abort()?;
         }
@@ -1008,7 +1030,7 @@ impl Store {
             }
             m.insert("last_block", last_block.to_string().as_str())?;
         }
-        self.commit(wtx)?;
+        self.commit_rows(wtx, !entities.is_empty())?;
         Ok(())
     }
 
@@ -1461,7 +1483,7 @@ impl Store {
                 }
             }
         }
-        self.commit(wtx)?;
+        self.commit_rows(wtx, removed > 0)?;
         Ok(removed)
     }
 
@@ -1518,7 +1540,7 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        self.commit(wtx)?;
+        self.commit_rows(wtx, removed > 0)?;
         Ok(removed)
     }
 
@@ -1544,7 +1566,7 @@ impl Store {
                 removed += 1;
             }
         }
-        self.commit(wtx)?;
+        self.commit_rows(wtx, removed > 0)?;
         Ok(removed)
     }
 
@@ -1580,7 +1602,7 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        self.commit(wtx)?;
+        self.commit_rows(wtx, removed > 0)?;
         Ok(removed)
     }
 
@@ -1682,6 +1704,11 @@ impl HotStore for Store {
     fn write_generation(&self) -> Option<u64> {
         // Odd means a commit is in flight: see `Store::commit`.
         let g = self.writes.load(std::sync::atomic::Ordering::SeqCst);
+        g.is_multiple_of(2).then_some(g)
+    }
+
+    fn rows_generation(&self) -> Option<u64> {
+        let g = self.rows.load(std::sync::atomic::Ordering::SeqCst);
         g.is_multiple_of(2).then_some(g)
     }
 
@@ -2293,6 +2320,61 @@ mod tests {
             .writes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(store.write_generation(), Some(g1 + 2));
+    }
+
+    /// #1951: the commits a cursor makes on every poll - `last_block`, checkpoints, a prune or
+    /// rollback that finds nothing - leave the rows generation alone, and every commit that adds or
+    /// removes a hot row moves it by two.
+    #[test]
+    fn rows_generation_moves_only_with_hot_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let rows = |s: &Store| s.rows_generation().expect("at rest");
+        let g0 = rows(&store);
+        store.commit_window(&[], Some((5, "0xaa")), 5).unwrap();
+        store.set_meta("sealed_through", "4").unwrap();
+        assert_eq!(
+            store
+                .prune_and_set_meta(1, 4, "sealed_through", "4")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.prune_range(1, 4).unwrap(), 0);
+        assert_eq!(store.rollback_to(9).unwrap(), 0);
+        assert_eq!(
+            store
+                .rollback_to_and_set_meta(9, "last_block", "9")
+                .unwrap(),
+            0
+        );
+        assert_eq!(rows(&store), g0, "no commit above touched a hot row");
+        assert!(
+            store.write_generation().unwrap() > g0,
+            "though each one committed"
+        );
+
+        let row = |b: u64| {
+            (
+                Store::entity_key(b, 0),
+                format!(r#"{{"table":"t","block_number":{b}}}"#),
+            )
+        };
+        store
+            .commit_window(&[row(6)], Some((6, "0xbb")), 6)
+            .unwrap();
+        assert_eq!(rows(&store), g0 + 2, "a window with a row");
+        let (k, v) = row(7);
+        store.put_entity(&k, &v).unwrap();
+        assert_eq!(rows(&store), g0 + 4, "an entity put");
+        assert_eq!(store.rollback_to(6).unwrap(), 1);
+        assert_eq!(rows(&store), g0 + 6, "a rollback that removed a row");
+        assert_eq!(
+            store
+                .prune_and_set_meta(6, 6, "sealed_through", "6")
+                .unwrap(),
+            1
+        );
+        assert_eq!(rows(&store), g0 + 8, "a prune that removed a row");
     }
 
     fn temp_store() -> (Store, tempfile::TempDir) {
