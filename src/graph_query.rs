@@ -1109,6 +1109,8 @@ pub enum Shape {
         /// preserves the distinction between a scalar value and a JSON-packed entity list when the
         /// response is shaped.
         lists: Vec<(String, String)>,
+        /// A to-one relation selected below this one, joined in the same statement.
+        objects: Vec<Nested>,
     },
     /// A `@derivedFrom` list, aggregated into one JSON array by a correlated subquery.
     List {
@@ -1117,6 +1119,24 @@ pub enum Shape {
         /// The column alias the JSON array arrives under.
         col: String,
     },
+    /// A `@derivedFrom` field typed as one entity. It arrives as a JSON array of at most two, and
+    /// graph-node answers `null` for none, the entity for one, and an error for more.
+    DerivedOne {
+        key: String,
+        col: String,
+        /// The field's name, the child type and its back-reference, for graph-node's error text.
+        field: String,
+        child: String,
+        back: String,
+    },
+}
+
+/// A to-one relation two levels down: `gameToken { token { symbol } }`'s `token`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nested {
+    pub key: String,
+    pub marker: String,
+    pub fields: Vec<(String, String)>,
 }
 
 /// A compiled query: the SQL, and the shape of the object each row becomes.
@@ -1311,6 +1331,47 @@ pub fn compile_with(
         if !sel.args.is_empty() {
             return Err(Unsupported::NestedSelection(sel.name.clone()));
         }
+        // Two children are fetched so a third state, more than one, can be refused as graph-node does.
+        if let (graph_schema::FieldType::Entity(target), Some(back), true) =
+            (&field.ty, &field.derived_from, caps.list_args)
+        {
+            let child = schema
+                .entities
+                .iter()
+                .find(|e| &e.name == target)
+                .ok_or_else(|| Unsupported::UnknownField {
+                    entity: entity.clone(),
+                    field: sel.name.clone(),
+                })?;
+            if !child.fields.iter().any(|f| &f.name == back) {
+                return Err(Unsupported::UnknownField {
+                    entity: target.clone(),
+                    field: back.clone(),
+                });
+            }
+            let mut probe = sel.clone();
+            probe.args = BTreeMap::from([("first".to_string(), Value::Int(2))]);
+            let alias = format!("c{i}");
+            let col = format!("{alias}__{}", sel.name);
+            let packed = derived_list_sql(
+                schema,
+                child,
+                back,
+                &format!("{BASE}.\"id\""),
+                &alias,
+                &probe,
+                caps,
+            )?;
+            cols.push(format!("{packed} AS \"{col}\""));
+            shape.push(Shape::DerivedOne {
+                key: sel.key.clone(),
+                col,
+                field: sel.name.clone(),
+                child: target.clone(),
+                back: back.clone(),
+            });
+            continue;
+        }
         // A **to-one** reference is a join on the id this row already holds, and because the target's
         // id is unique the join cannot multiply rows - so `first` still means what it says. Anything
         // else - a stored array of ids, which the reference has as `Token.whitelistPools` - needs
@@ -1342,6 +1403,7 @@ pub fn compile_with(
         cols.push(format!("{alias}.\"id\" AS \"{marker}\""));
         let mut sub = Vec::new();
         let mut lists = Vec::new();
+        let mut objects = Vec::new();
         for (sub_i, s) in sel.sub.iter().enumerate() {
             // RFC-0053 checks a nested field's arguments before looking it up; core keeps that order.
             if !caps.nested_lists && !s.args.is_empty() {
@@ -1394,6 +1456,59 @@ pub fn compile_with(
                 lists.push((s.key.clone(), col));
                 continue;
             }
+            // A second to-one join: the target's id is unique, so it cannot multiply rows either.
+            if let (true, true, graph_schema::FieldType::Entity(inner), None) = (
+                caps.max_traversal >= 2,
+                s.args.is_empty() && !s.sub.is_empty(),
+                &cf.ty,
+                &cf.derived_from,
+            ) {
+                let ient = schema
+                    .entities
+                    .iter()
+                    .find(|e| &e.name == inner)
+                    .ok_or_else(|| Unsupported::UnknownField {
+                        entity: target.clone(),
+                        field: s.name.clone(),
+                    })?;
+                let ialias = format!("{alias}o{sub_i}");
+                joins.push_str(&format!(
+                    " LEFT JOIN \"{}\" {ialias} ON {ialias}.\"id\" = {alias}.\"{}\"",
+                    crate::subgraph_import::to_alias(inner),
+                    s.name
+                ));
+                let imarker = format!("{ialias}__present");
+                cols.push(format!("{ialias}.\"id\" AS \"{imarker}\""));
+                let mut ifields = Vec::new();
+                for (leaf_i, leaf) in s.sub.iter().enumerate() {
+                    let Some(lf) = ient.fields.iter().find(|x| x.name == leaf.name) else {
+                        return Err(Unsupported::UnknownField {
+                            entity: inner.clone(),
+                            field: leaf.name.clone(),
+                        });
+                    };
+                    if !leaf.args.is_empty()
+                        || !leaf.sub.is_empty()
+                        || lf.ty.entity_name().is_some()
+                    {
+                        return Err(Unsupported::NestedSelection(leaf.name.clone()));
+                    }
+                    let col = format!("{ialias}__{leaf_i}");
+                    let expr = if wire_string_cast(&lf.ty) {
+                        format!("CAST({ialias}.\"{}\" AS VARCHAR)", leaf.name)
+                    } else {
+                        format!("{ialias}.\"{}\"", leaf.name)
+                    };
+                    cols.push(format!("{expr} AS \"{col}\""));
+                    ifields.push((leaf.key.clone(), col));
+                }
+                objects.push(Nested {
+                    key: s.key.clone(),
+                    marker: imarker,
+                    fields: ifields,
+                });
+                continue;
+            }
             if !s.args.is_empty() || !s.sub.is_empty() {
                 return Err(Unsupported::NestedSelection(s.name.clone()));
             }
@@ -1425,6 +1540,7 @@ pub fn compile_with(
             marker,
             fields: sub,
             lists,
+            objects,
         });
     }
     // An entity root with no selection set is not a legal GraphQL query - a composite type must be
@@ -2633,6 +2749,7 @@ type Swap @entity { id: ID! pool: Pool! }
                     marker: "j1__present".into(),
                     fields: vec![("symbol".into(), "j1__symbol".into())],
                     lists: vec![],
+                    objects: vec![],
                 },
             ],
             "only the shape knows `j1__symbol` belongs under `token0`"
@@ -3010,6 +3127,7 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
                 marker: "j0__present".into(),
                 fields: vec![("s".into(), "j0__symbol".into())],
                 lists: vec![],
+                objects: vec![],
             }],
             "the join is still on token0, the answer is still under t"
         );
@@ -3501,5 +3619,83 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
             "_meta { block { number } } }"
         );
         operation_bounds(&schema(), &parse(q).unwrap()).unwrap();
+    }
+
+    /// BetSwirl's published client selects `gameToken { token { symbol } }` and
+    /// `weightedGameBet { config { id } }`; both were refused, which refused its whole query.
+    #[test]
+    fn a_second_to_one_and_a_derived_single_lower_in_the_network_dialect() {
+        let schema = graph_schema::parse(
+            r#"
+type Bet @entity { id: ID! gameToken: GameToken! weightedGameBet: WeightedGameBet @derivedFrom(field: "bet") }
+type GameToken @entity { id: ID! token: Token! }
+type Token @entity { id: Bytes! symbol: String! decimals: Int! supply: BigInt! }
+type WeightedGameBet @entity { id: ID! bet: Bet! config: Config! }
+type Config @entity { id: ID! weights: [BigInt!]! }
+"#,
+        )
+        .unwrap();
+        let q = one("{ bets { gameToken { id token { a: id symbol supply } } } }");
+        assert!(matches!(
+            compile(&schema, &q),
+            Err(Unsupported::NestedSelection(_))
+        ));
+        let c = compile_with(&schema, &q, &Capabilities::NETWORK).unwrap();
+        assert!(
+            c.sql
+                .contains(r#"LEFT JOIN "token" j0o1 ON j0o1."id" = j0."token""#),
+            "{}",
+            c.sql
+        );
+        assert!(
+            c.sql
+                .contains(r#"CAST(j0o1."supply" AS VARCHAR) AS "j0o1__2""#),
+            "the wire type is the schema's two levels down too: {}",
+            c.sql
+        );
+        assert!(
+            matches!(&c.shape[0], Shape::Object { objects, .. } if objects == &vec![Nested {
+                key: "token".into(),
+                marker: "j0o1__present".into(),
+                fields: vec![
+                    ("a".into(), "j0o1__0".into()),
+                    ("symbol".into(), "j0o1__1".into()),
+                    ("supply".into(), "j0o1__2".into()),
+                ],
+            }]),
+            "{:?}",
+            c.shape
+        );
+        let q = one("{ bets { gameToken { token(first: 1) { symbol } } } }");
+        assert!(matches!(
+            compile_with(&schema, &q, &Capabilities::NETWORK),
+            Err(Unsupported::NestedSelection(n)) if n == "token"
+        ));
+
+        let q = one("{ bets { weightedGameBet { config { id weights } } } }");
+        assert!(matches!(
+            compile(&schema, &q),
+            Err(Unsupported::NestedSelection(_))
+        ));
+        let c = compile_with(&schema, &q, &Capabilities::NETWORK).unwrap();
+        assert!(
+            c.sql.contains(
+                r#"FROM "weighted_game_bet" c0 WHERE c0."bet" = b."id" ORDER BY c0."id" ASC LIMIT 2"#
+            ),
+            "two rows are fetched so a second one can be refused: {}",
+            c.sql
+        );
+        assert_eq!(
+            c.shape,
+            vec![Shape::DerivedOne {
+                key: "weightedGameBet".into(),
+                col: "c0__weightedGameBet".into(),
+                field: "weightedGameBet".into(),
+                child: "WeightedGameBet".into(),
+                back: "bet".into(),
+            }]
+        );
+        let q = one("{ bets { weightedGameBet(first: 1) { id } } }");
+        assert!(compile_with(&schema, &q, &Capabilities::NETWORK).is_err());
     }
 }

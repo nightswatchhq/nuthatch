@@ -2820,16 +2820,62 @@ fn graph_shape(
                 };
                 out.insert(key.clone(), list);
             }
+            Shape::DerivedOne {
+                key,
+                col,
+                field,
+                child,
+                back,
+            } => {
+                let items = match row.get(col) {
+                    Some(serde_json::Value::Array(a)) => a.clone(),
+                    Some(serde_json::Value::String(t)) => match serde_json::from_str(t) {
+                        Ok(serde_json::Value::Array(a)) => a,
+                        _ => return Err(format!("`{key}` did not come back as a JSON array: {t}")),
+                    },
+                    other => return Err(format!("`{key}` is missing from the row: {other:?}")),
+                };
+                if items.len() > 1 {
+                    // graph-node's wording, `graph/src/data/query/error.rs` AmbiguousDerivedFromResult.
+                    return Err(format!(
+                        "Ambiguous result for derived field `{field}`: Multiple `{child}` entities refer back via `{back}`"
+                    ));
+                }
+                out.insert(
+                    key.clone(),
+                    items.into_iter().next().unwrap_or(serde_json::Value::Null),
+                );
+            }
             Shape::Object {
                 key,
                 marker,
                 fields,
                 lists,
+                objects,
             } => {
                 let mut inner = serde_json::Map::new();
                 for (sub_key, col) in fields {
                     let v = row.get(col).cloned().unwrap_or(serde_json::Value::Null);
                     inner.insert(sub_key.clone(), v);
+                }
+                for o in objects {
+                    let present = row.get(&o.marker).is_some_and(|v| !v.is_null());
+                    let v = if present {
+                        serde_json::Value::Object(
+                            o.fields
+                                .iter()
+                                .map(|(k, c)| {
+                                    (
+                                        k.clone(),
+                                        row.get(c).cloned().unwrap_or(serde_json::Value::Null),
+                                    )
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    inner.insert(o.key.clone(), v);
                 }
                 for (sub_key, col) in lists {
                     let list = match row.get(col) {
@@ -4839,6 +4885,58 @@ mod tests {
 
     #[cfg(feature = "graph")]
     #[test]
+    fn a_derived_single_and_a_second_to_one_shape_as_graph_node_answers() {
+        use crate::graph_query::{Compiled, Nested, Shape};
+
+        let compiled = Compiled {
+            sql: String::new(),
+            shape: vec![
+                Shape::Object {
+                    key: "gameToken".into(),
+                    marker: "gt".into(),
+                    fields: vec![],
+                    lists: vec![],
+                    objects: vec![Nested {
+                        key: "token".into(),
+                        marker: "t".into(),
+                        fields: vec![("symbol".into(), "t_symbol".into())],
+                    }],
+                },
+                Shape::DerivedOne {
+                    key: "weightedGameBet".into(),
+                    col: "w".into(),
+                    field: "weightedGameBet".into(),
+                    child: "WeightedGameBet".into(),
+                    back: "bet".into(),
+                },
+            ],
+            entity: "Bet".into(),
+            singular: false,
+            min_block: None,
+        };
+        let shape = |row: serde_json::Value| graph_shape(&compiled, row.as_object().unwrap());
+        assert_eq!(
+            shape(serde_json::json!({"gt": "Dice-0x0", "t": "0x0", "t_symbol": "ETH", "w": "[]"}))
+                .unwrap(),
+            serde_json::json!({"gameToken": {"token": {"symbol": "ETH"}}, "weightedGameBet": null})
+        );
+        assert_eq!(
+            shape(serde_json::json!({"gt": "Dice-0x0", "t": null, "t_symbol": null, "w": r#"[{"id":"7"}]"#}))
+                .unwrap(),
+            serde_json::json!({"gameToken": {"token": null}, "weightedGameBet": {"id": "7"}}),
+            "an absent second relation is null, not an object of nulls"
+        );
+        let err =
+            shape(serde_json::json!({"gt": null, "t": null, "w": r#"[{"id":"7"},{"id":"8"}]"#}))
+                .unwrap_err();
+        assert_eq!(
+            err,
+            "Ambiguous result for derived field `weightedGameBet`: Multiple `WeightedGameBet` entities refer back via `bet`"
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
     fn a_related_derived_list_is_shaped_inside_its_parent_object() {
         use crate::graph_query::{Compiled, Shape};
 
@@ -4849,6 +4947,7 @@ mod tests {
                 marker: "payer_present".into(),
                 fields: vec![("id".into(), "payer_id".into())],
                 lists: vec![("signers".into(), "payer_signers".into())],
+                objects: vec![],
             }],
             entity: "PaymentsEscrowAccount".into(),
             singular: false,
