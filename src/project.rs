@@ -486,6 +486,8 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     let mut fetched: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut contracts: Vec<Contract> = Vec::new();
     let mut address_params: Vec<sg::AddressParam> = Vec::new();
+    // Sources whose only handlers are block handlers: no event of theirs was ever decoded (#1941).
+    let mut block_only: Vec<&sg::ManifestSource> = Vec::new();
 
     // ── dataSources → [[contracts]] ──────────────────────────────────────
     for ds in &manifest.data_sources {
@@ -495,6 +497,10 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
                  hash as a column value rather than fetching what it points at",
                 ds.name, ds.kind
             ));
+            continue;
+        }
+        if ds.events.is_empty() && ds.has_block_handlers && !ds.has_call_handlers {
+            block_only.push(ds);
             continue;
         }
         let Some(address) = ds.address.clone() else {
@@ -564,12 +570,12 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         // An empty allowlist means "every event in the ABI" (see `config::Contract::events`),
         // so a source whose handlers are all block/call handlers lands in exactly the state the
         // comment above says it should not - silently, unless we say so.
-        if events.is_empty() && ds.has_non_event_handlers {
+        if events.is_empty() && ds.has_call_handlers {
             notes.push(format!(
-                "`{}` declares only block/call handlers. A block handler has no equivalent; a \
-                 call handler is `[extract] top_level_calls = true`. This contract will index \
-                 **every** event its ABI defines; narrow it with `events = [...]` in \
-                 nuthatch.toml if that is not what you want",
+                "`{}` declares only block/call handlers. A block handler's nearest equivalent is \
+                 `[extract] blocks = true`; a call handler is `[extract] top_level_calls = true`. \
+                 This contract will index **every** event its ABI defines; narrow it with \
+                 `events = [...]` in nuthatch.toml if that is not what you want",
                 ds.name
             ));
         }
@@ -600,7 +606,33 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         last.abi = format!("abis/{}.json", last.alias);
     }
 
-    if contracts.is_empty() {
+    // A subgraph made only of block handlers gets block rows, the one thing such a handler can be
+    // reading from the manifest's point of view. Beside event sources it is dropped instead: block
+    // rows cost a header per block, which the rest of the nest did not ask for.
+    let blocks = contracts.is_empty() && !block_only.is_empty();
+    for ds in &block_only {
+        let start = ds
+            .start_block
+            .map(|b| format!(" from block {b}"))
+            .unwrap_or_default();
+        notes.push(if blocks {
+            format!(
+                "`{}` has only block handlers, so this nest indexes block rows (`[extract] blocks \
+                 = true`) rather than its ABI's events. The subgraph ran{start}; with no contract \
+                 there is no start block, so give `dev --backfill <blocks>` to reach back",
+                ds.name
+            )
+        } else {
+            format!(
+                "skipped `{}` - it has only block handlers, and what they read lives in the \
+                 mapping. `[extract] blocks = true` adds a row per block{start} if the header \
+                 fields are what it needs",
+                ds.name
+            )
+        });
+    }
+
+    if contracts.is_empty() && !blocks {
         bail!(
             "no indexable dataSources in this manifest - {} source(s) were all skipped:\n  {}",
             manifest.data_sources.len(),
@@ -728,7 +760,10 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         templates,
         factories,
         webhooks: Vec::new(),
-        extract: Extract::default(),
+        extract: Extract {
+            blocks,
+            ..Extract::default()
+        },
         calls: Vec::new(),
     };
     config.save(&dir)?;
@@ -2954,6 +2989,121 @@ dataSources:
             vendored.contains("Transfer"),
             "the vendored ABI is not the repository's: {vendored}"
         );
+    }
+
+    /// Write a repository manifest (and a one-event ABI per source) and scaffold from it.
+    async fn scaffold_repository(manifest: &str, abis: &[&str]) -> (tempfile::TempDir, Result<()>) {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("abis")).unwrap();
+        for name in abis {
+            std::fs::write(repo.path().join(format!("abis/{name}.json")), POOL_ABI).unwrap();
+        }
+        std::fs::write(repo.path().join("subgraph.yaml"), manifest).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = repo
+            .path()
+            .join("subgraph.yaml")
+            .to_string_lossy()
+            .into_owned();
+        let args = InitArgs {
+            explorer: None,
+            addresses: vec![],
+            from: None,
+            from_subgraph: Some(source.clone()),
+            ipfs: vec!["http://127.0.0.1:1/never/".into()],
+            alias: vec![],
+            abi: vec![],
+            start_block: vec![],
+            chain: None,
+            rpc: vec![],
+            dir: dir.path().to_string_lossy().into_owned(),
+            no_timestamps: false,
+        };
+        let r = init_from_subgraph(&source, &args).await;
+        (dir, r)
+    }
+
+    /// #1941: thena-blocks (`QmenTzjuovnYnptb6tMpwLPvzvyiH7zGtWUMxCJaHupXJF`) is one dataSource with
+    /// one block handler. It must become a blocks nest, not a contract indexing every ABI event.
+    #[tokio::test]
+    async fn a_block_handler_only_subgraph_scaffolds_a_blocks_nest() {
+        let (dir, r) = scaffold_repository(
+            r#"
+specVersion: 0.0.4
+dataSources:
+  - kind: ethereum/contract
+    name: blocks
+    network: bsc
+    source:
+      abi: blocks
+      address: "0x0000000000000000000000000000000000001000"
+      startBlock: 24468802
+    mapping:
+      abis:
+        - name: blocks
+          file: ./abis/blocks.json
+      blockHandlers:
+        - handler: handleBlock
+"#,
+            &["blocks"],
+        )
+        .await;
+        r.expect("a blocks subgraph scaffolds");
+        let config = Config::load(dir.path()).unwrap();
+        assert!(
+            config.contracts.is_empty(),
+            "no contract may index the ABI's events: {:?}",
+            config.contracts
+        );
+        assert!(config.extract.blocks, "the block handler becomes block rows");
+    }
+
+    /// polygon-blocks (`QmdNFXbQooUNuy2UQGciY5Lzb3LgoKegfkn96Le6gio78p`): a block-handler-only source
+    /// beside event sources is dropped rather than indexing its ABI's every event, and block rows
+    /// are not switched on for the whole nest on its account.
+    #[tokio::test]
+    async fn a_block_handler_only_source_beside_event_sources_is_not_a_contract() {
+        let (dir, r) = scaffold_repository(
+            r#"
+specVersion: 0.0.5
+dataSources:
+  - kind: ethereum
+    name: SystemData
+    network: matic
+    source:
+      abi: Registry
+      address: "0x0000000000000000000000000000000000000001"
+      startBlock: 10
+    mapping:
+      abis:
+        - name: Registry
+          file: ./abis/Registry.json
+      blockHandlers:
+        - handler: handleBlock
+  - kind: ethereum
+    name: Registry
+    network: matic
+    source:
+      abi: Registry
+      address: "0x0000000000000000000000000000000000000001"
+      startBlock: 10
+    mapping:
+      abis:
+        - name: Registry
+          file: ./abis/Registry.json
+      eventHandlers:
+        - event: Transfer(indexed address,indexed address,uint256)
+          handler: handleTransfer
+"#,
+            &["Registry"],
+        )
+        .await;
+        r.expect("scaffolds");
+        let config = Config::load(dir.path()).unwrap();
+        let aliases: Vec<&str> = config.contracts.iter().map(|c| c.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["registry"]);
+        assert_eq!(config.contracts[0].events, vec!["Transfer".to_string()]);
+        assert!(!config.extract.blocks);
     }
 
     /// A local repository may have a file whose name is also a CID. The two links render to the

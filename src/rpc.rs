@@ -201,6 +201,9 @@ pub(crate) enum FailureClass {
     /// This endpoint keeps no blocks this old (#1607). Not about width, so never narrowed, and not
     /// about its health at the tip, which it may serve perfectly well.
     HistoryUnavailable,
+    /// The endpoint refused the getLogs filter's address list: none at all, or too many (#1941).
+    /// Not a width and not a credential, so the caller changes the list and asks again.
+    FilterRefused,
     /// This endpoint will not serve us until something changes outside the process. Long cooldown,
     /// and say so loudly.
     Terminal,
@@ -321,6 +324,11 @@ pub(crate) fn escalated_from_rate_limit(err: &anyhow::Error) -> bool {
     )
 }
 
+/// Did an endpoint refuse this getLogs for its address list (#1941)?
+pub(crate) fn filter_refused(err: &anyhow::Error) -> bool {
+    matches!(class_of(err), Some(FailureClass::FilterRefused))
+}
+
 /// The classification carried by `err`, if it came from the RPC client.
 ///
 /// Walks the whole `anyhow` chain rather than only the outermost error, because callers add
@@ -422,6 +430,7 @@ fn class_label(class: Option<&FailureClass>) -> &'static str {
         Some(FailureClass::Transient) => "Transient",
         Some(FailureClass::Terminal) => "Terminal",
         Some(FailureClass::HistoryUnavailable) => "HistoryUnavailable",
+        Some(FailureClass::FilterRefused) => "FilterRefused",
         None => "unclassified",
     }
 }
@@ -472,6 +481,8 @@ pub(crate) fn looks_like_cap(body: &str) -> bool {
         // Monad public endpoints, 2026-09-03 (RFC-0051): Ankr and QuickNode respectively.
         "exceeds size limit",
         "is limited to a",
+        // 1rpc.io/bnb, 2026-10-06 (#1941): "eth_getLogs is limited to 0 - 50 blocks range".
+        "blocks range",
         // GraphOps, 2026-09-29.
         "exceeded max allowed range",
     ];
@@ -538,6 +549,8 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         // classify the same way whatever status a provider wraps them in.
         "exceeds size limit",
         "is limited to a",
+        // 1rpc.io/bnb, 2026-10-06 (#1941): "eth_getLogs is limited to 0 - 50 blocks range".
+        "blocks range",
         // Robinhood Chain's public endpoint, 2026-09-04 (RFC-0050 addendum, item 8): HTTP 200
         // `-32000 "logs matched by query exceeds limit of 10000"`. The phrase was in the text
         // fallback's cap list and not here, so the JSON-RPC classifier called it `Transient` and
@@ -596,9 +609,17 @@ pub(crate) fn classify_rpc_error(err: &Value) -> FailureClass {
         };
     }
     // eth.drpc.org, 2026-10-01 (#1607): HTTP 400, code 27, for every block below its pruning horizon.
-    const HISTORY: &[&str] = &["first available state"];
+    // publicnode, 2026-10-06: HTTP 403 "Archive requests require a personal token" about 10,000
+    // blocks back on BSC, where the status alone reads as a credentials refusal.
+    const HISTORY: &[&str] = &["first available state", "archive requests require"];
     if HISTORY.iter().any(|p| msg.contains(p)) {
         return FailureClass::HistoryUnavailable;
+    }
+    // publicnode on BSC and Polygon, 2026-10-06: `-32701 "Please specify an address…"` without an
+    // address list, and HTTP 403 `-32602 "Request blocked"` naming ten or more.
+    const FILTER: &[&str] = &["specify an address", "request blocked"];
+    if FILTER.iter().any(|p| msg.contains(p)) {
+        return FailureClass::FilterRefused;
     }
     if NARROWABLE.iter().any(|p| msg.contains(p)) {
         return FailureClass::Narrowable {
@@ -795,6 +816,9 @@ pub struct RpcClient {
     header_width: usize,
     /// [`GETLOGS_BODY_CAP`], or a smaller one a test sets.
     logs_body_cap: usize,
+    /// The most addresses one getLogs names, lowered when an endpoint refuses a list (#1941). One
+    /// value for the pool: the strictest endpoint sets it, at the cost of extra requests elsewhere.
+    log_address_cap: AtomicUsize,
 }
 
 impl RpcClient {
@@ -831,6 +855,7 @@ impl RpcClient {
             timestamps: std::sync::Mutex::new(HashMap::new()),
             header_width,
             logs_body_cap: GETLOGS_BODY_CAP,
+            log_address_cap: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -2053,8 +2078,50 @@ impl RpcClient {
         Ok(Some((hash.to_string(), ts)))
     }
 
-    /// One combined `eth_getLogs` across all `addresses`, matching any of `topic0s`.
+    /// Every log from `addresses` matching any of `topic0s`: one `eth_getLogs`, or one per group of
+    /// addresses once an endpoint has refused the whole list (#1941).
     pub async fn get_logs(
+        &self,
+        addresses: &[String],
+        topic0s: &[String],
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Log>> {
+        if addresses.is_empty() {
+            return self.get_logs_once(addresses, topic0s, from, to).await;
+        }
+        let mut logs = Vec::new();
+        let mut groups = 0usize;
+        let mut done = 0usize;
+        while done < addresses.len() {
+            let cap = self.log_address_cap.load(Ordering::Relaxed);
+            let group = &addresses[done..addresses.len().min(done.saturating_add(cap))];
+            match self.get_logs_once(group, topic0s, from, to).await {
+                Ok(mut l) => {
+                    logs.append(&mut l);
+                    done += group.len();
+                    groups += 1;
+                }
+                Err(e) if group.len() > 1 && filter_refused(&e) => {
+                    let half = group.len().div_ceil(2);
+                    if self.log_address_cap.fetch_min(half, Ordering::Relaxed) > half {
+                        tracing::info!(
+                            "eth_getLogs naming {} addresses was refused ({e:#}); asking in \
+                             groups of at most {half}",
+                            group.len()
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if groups > 1 {
+            logs.sort_by_key(|l| (l.block_number, l.log_index));
+        }
+        Ok(logs)
+    }
+
+    async fn get_logs_once(
         &self,
         addresses: &[String],
         topic0s: &[String],
@@ -2663,6 +2730,138 @@ mod tests {
             "{body} must be narrowable, not transient"
         );
         assert!(super::looks_like_cap(body));
+    }
+
+    /// `1rpc.io/bnb`, as S0 recorded it (#1941): the cap names a range, not "a 100 range".
+    #[test]
+    fn a_zero_to_fifty_blocks_range_cap_is_narrowable() {
+        let body = r#"{"code":-32602,"message":"eth_getLogs is limited to 0 - 50 blocks range"}"#;
+        let err: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            matches!(
+                super::classify_rpc_error(&err),
+                super::FailureClass::Narrowable { .. }
+            ),
+            "{body} must be narrowable, not transient"
+        );
+        assert!(super::looks_like_cap(body));
+    }
+
+    /// publicnode, measured on BSC and Polygon 2026-10-06: both refusals are about the filter's
+    /// address list, so neither is a width to narrow nor a credential to cool down for.
+    #[test]
+    fn publicnode_address_refusals_are_about_the_filter() {
+        for body in [
+            r#"{"code":-32602,"message":"Request blocked"}"#,
+            r#"{"code":-32701,"message":"Please specify an address in your request or, to remove restrictions, order a dedicated full node here: https://www.allnodes.com/bnb/host"}"#,
+        ] {
+            let err: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                super::classify_rpc_error(&err),
+                super::FailureClass::FilterRefused,
+                "{body}"
+            );
+            assert!(!super::looks_like_cap(body), "{body} is not a range cap");
+        }
+    }
+
+    /// publicnode answers anything about 10,000 blocks back with this, at HTTP 403.
+    #[test]
+    fn publicnode_archive_refusal_is_history_unavailable() {
+        let body = r#"{"code":-32602,"message":"Archive requests require a personal token. Get one at: https://www.allnodes.com/publicnode"}"#;
+        let err: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            super::classify_rpc_error(&err),
+            super::FailureClass::HistoryUnavailable
+        );
+    }
+
+    /// An endpoint that refuses a getLogs naming ten or more addresses with publicnode's 403, and
+    /// otherwise answers one log per address it was asked for, newest address first.
+    async fn address_capped_rpc(
+        asked: Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let asked = asked.clone();
+                async move {
+                    let addrs: Vec<String> = req["params"][0]["address"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|v| v.as_str().unwrap().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    asked.lock().unwrap().push(addrs.len());
+                    if addrs.len() >= 10 {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({"jsonrpc":"2.0","id":1,
+                                "error":{"code":-32602,"message":"Request blocked"}})),
+                        );
+                    }
+                    let logs: Vec<Value> = addrs
+                        .iter()
+                        .rev()
+                        .map(|a| {
+                            let n = u64::from_str_radix(&a[2..], 16).unwrap();
+                            json!({"address": a, "topics": [], "data": "0x",
+                                "blockNumber": format!("0x{:x}", 100 + n % 3),
+                                "transactionHash": "0x01",
+                                "logIndex": format!("0x{n:x}")})
+                        })
+                        .collect();
+                    (
+                        StatusCode::OK,
+                        Json(json!({"jsonrpc":"2.0","id":1,"result": logs})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// #1941: BetSwirl names 34 contracts, and the BSC preset refuses ten or more in one getLogs.
+    /// The list is split into groups the endpoint takes, the group size is remembered, and the
+    /// endpoint is not cooled down as if its credentials had been refused.
+    #[tokio::test]
+    async fn a_getlogs_refused_for_its_address_count_is_split_and_remembered() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, server) = address_capped_rpc(asked.clone()).await;
+        let c = super::RpcClient::new(vec![url]).unwrap();
+        let addrs: Vec<String> = (1..=34u64).map(|i| format!("0x{i:040x}")).collect();
+
+        let logs = c.get_logs(&addrs, &[], 100, 102).await.unwrap();
+        assert_eq!(logs.len(), 34, "every address answered once");
+        let keys: Vec<(u64, u64)> = logs.iter().map(|l| (l.block_number, l.log_index)).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "merged groups come back in chain order");
+        let first = asked.lock().unwrap().clone();
+        assert_eq!(first, vec![34, 17, 9, 9, 9, 7]);
+        assert!(
+            c.health[0].load(Ordering::Relaxed)
+                <= super::now_millis() + super::ENDPOINT_COOLDOWN_MS,
+            "an address-count refusal must not earn the credentials cooldown"
+        );
+
+        asked.lock().unwrap().clear();
+        c.get_logs(&addrs, &[], 100, 102).await.unwrap();
+        server.abort();
+        assert_eq!(
+            asked.lock().unwrap().clone(),
+            vec![9, 9, 9, 7],
+            "the next call starts at the group size that worked"
+        );
     }
 
     /// **The guard that makes the timestamp cache sound at all** (RFC-0029 §6d).
