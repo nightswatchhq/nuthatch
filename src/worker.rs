@@ -79,12 +79,31 @@ impl CursorHosts for Hosts {
 /// Keyed by **chain**, not by nest, because the lease is per cursor: losing one cursor stops exactly
 /// the nests that cursor authorised and leaves the others running. That is the isolation RFC-0021
 /// promises, expressed as the shape of this map rather than as care taken at each call site.
-#[derive(Default)]
-struct Running {
-    by_chain: std::collections::HashMap<String, Vec<crate::indexer::NestRuntime>>,
+struct Running<N = crate::indexer::NestRuntime> {
+    by_chain: std::collections::HashMap<String, Vec<N>>,
 }
 
-impl Running {
+impl<N> Default for Running<N> {
+    fn default() -> Self {
+        Running {
+            by_chain: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// All `Running` asks of a nest. A trait so a test can stand a bare task in for a `NestRuntime`,
+/// which cannot be built without a whole serving state.
+trait Ingesting {
+    fn abort(&self);
+}
+
+impl Ingesting for crate::indexer::NestRuntime {
+    fn abort(&self) {
+        self.ingest.abort();
+    }
+}
+
+impl<N: Ingesting> Running<N> {
     /// Stop everything a cursor authorised. Called when its lease is lost or released.
     ///
     /// The store's fence already refuses writes from a stale holder, so nothing here protects
@@ -93,10 +112,10 @@ impl Running {
     fn stop(&mut self, chain: &str) {
         if let Some(rts) = self.by_chain.remove(chain) {
             for rt in &rts {
-                rt.ingest.abort();
+                rt.abort();
             }
             if !rts.is_empty() {
-                tracing::info!(chain = %chain, nests = rts.len(), "stopped nests - cursor released");
+                tracing::info!(chain = %chain, nests = rts.len(), "stopped nests - cursor no longer held");
             }
         }
     }
@@ -438,15 +457,11 @@ pub async fn run(
 
         match tick(&cp, &hosts, worker_id, budget_mb, ttl) {
             Ok(outcome) => {
-                let before = held.clone();
-                held = apply(&outcome, held);
+                held = settle(&outcome, &held, &mut running, worker_id);
                 report(&outcome, worker_id);
 
-                // **The half that was missing (issue #250).** Holding a cursor now means indexing the
-                // nests it authorises; losing one stops exactly those and leaves the rest running.
-                for chain in before.iter().filter(|c| !held.contains(c)) {
-                    running.stop(chain);
-                }
+                // **The half that was missing (issue #250).** Holding a cursor means indexing the
+                // nests it authorises.
                 for chain in &held {
                     if let Some((_, store)) = hosts.stores.iter().find(|(c, _)| c == chain) {
                         if let Err(e) =
@@ -475,15 +490,25 @@ pub async fn run(
     }
 }
 
-/// Track what we hold, from what the tick actually did rather than from what it intended.
-fn apply(outcome: &TickOutcome, mut held: Vec<String>) -> Vec<String> {
-    for c in &outcome.acquired {
-        if !held.contains(c) {
-            held.push(c.clone());
+/// Take what the tick saw in the leases as what we hold, and stop the nests of every cursor that
+/// dropped out - exactly those, leaving the rest running.
+fn settle<N: Ingesting>(
+    outcome: &TickOutcome,
+    before: &[String],
+    running: &mut Running<N>,
+    worker_id: &str,
+) -> Vec<String> {
+    let held = outcome.held.clone();
+    for chain in before.iter().filter(|c| !held.contains(c)) {
+        if !outcome.released.contains(chain) {
+            tracing::warn!(
+                worker = %worker_id,
+                chain = %chain,
+                "lost the lease on this cursor to another holder - stopping its nests"
+            );
         }
+        running.stop(chain);
     }
-    held.retain(|c| !outcome.released.contains(c));
-    held.sort();
     held
 }
 
@@ -711,38 +736,91 @@ mod tests {
         }
     }
 
-    fn outcome(acq: &[&str], rel: &[&str]) -> TickOutcome {
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn outcome(held: &[&str], acq: &[&str], rel: &[&str]) -> TickOutcome {
         TickOutcome {
-            acquired: acq.iter().map(|s| s.to_string()).collect(),
-            released: rel.iter().map(|s| s.to_string()).collect(),
+            held: strings(held),
+            acquired: strings(acq),
+            released: strings(rel),
             ..Default::default()
         }
     }
 
-    /// Held state tracks what a tick *did*, so a contended cursor is never counted as held - which is
-    /// what would make a worker release a lease it never had, or report ownership it lost.
-    #[test]
-    fn held_state_follows_what_actually_happened() {
-        let held = apply(&outcome(&["mainnet"], &[]), vec![]);
-        assert_eq!(held, vec!["mainnet"]);
-
-        // Acquiring the same cursor twice must not duplicate it.
-        let held = apply(&outcome(&["mainnet"], &[]), held);
-        assert_eq!(held, vec!["mainnet"]);
-
-        let held = apply(&outcome(&["arbitrum-one"], &[]), held);
-        assert_eq!(held, vec!["arbitrum-one", "mainnet"], "and stays sorted");
-
-        let held = apply(&outcome(&[], &["mainnet"]), held);
-        assert_eq!(held, vec!["arbitrum-one"], "a release drops it");
+    impl Ingesting for tokio::task::AbortHandle {
+        fn abort(&self) {
+            tokio::task::AbortHandle::abort(self);
+        }
     }
 
-    /// A cursor that was contended is not held, so shutdown will not try to release it.
+    /// Held state is what the tick saw in the leases, never what this worker remembers acquiring: a
+    /// lease can be taken from under a worker between ticks, and a memory cannot see that.
     #[test]
-    fn contention_does_not_count_as_ownership() {
-        let mut o = outcome(&[], &[]);
-        o.contended = vec!["mainnet".into()];
-        assert!(apply(&o, vec![]).is_empty());
+    fn held_state_follows_what_the_tick_saw() {
+        let mut running = Running::<tokio::task::AbortHandle>::default();
+        let held = settle(
+            &outcome(&["mainnet"], &["mainnet"], &[]),
+            &[],
+            &mut running,
+            "w1",
+        );
+        assert_eq!(held, vec!["mainnet"]);
+
+        let held = settle(
+            &outcome(&["arbitrum-one", "mainnet"], &["arbitrum-one"], &[]),
+            &held,
+            &mut running,
+            "w1",
+        );
+        assert_eq!(held, vec!["arbitrum-one", "mainnet"]);
+
+        let held = settle(
+            &outcome(&["arbitrum-one"], &[], &["mainnet"]),
+            &held,
+            &mut running,
+            "w1",
+        );
+        assert_eq!(held, vec!["arbitrum-one"], "a release drops it");
+
+        // Contended is not held, so shutdown will not try to release a lease this worker never had.
+        let mut o = outcome(&[], &[], &[]);
+        o.contended = strings(&["mainnet"]);
+        assert!(settle(&o, &[], &mut running, "w1").is_empty());
+    }
+
+    /// #1934: a cursor the tick no longer holds - its lease taken by another worker, with or without
+    /// a refused renewal - leaves `held` on that tick and its ingestion task is aborted, while the
+    /// cursor this worker still holds keeps running.
+    #[tokio::test]
+    async fn a_lost_cursor_is_dropped_and_its_nests_stopped() {
+        let mut running = Running::<tokio::task::AbortHandle>::default();
+        let mainnet = tokio::spawn(std::future::pending::<()>());
+        let arb = tokio::spawn(std::future::pending::<()>());
+        running
+            .by_chain
+            .insert("mainnet".into(), vec![mainnet.abort_handle()]);
+        running
+            .by_chain
+            .insert("arbitrum-one".into(), vec![arb.abort_handle()]);
+
+        let before = strings(&["arbitrum-one", "mainnet"]);
+        let mut o = outcome(&["arbitrum-one"], &[], &[]);
+        o.lost = strings(&["mainnet"]);
+        let held = settle(&o, &before, &mut running, "w1");
+
+        assert_eq!(held, vec!["arbitrum-one"]);
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), mainnet)
+            .await
+            .expect("the lost cursor's task must be aborted on this tick");
+        assert!(stopped.unwrap_err().is_cancelled());
+        assert!(!running.by_chain.contains_key("mainnet"));
+
+        tokio::task::yield_now().await;
+        assert!(!arb.is_finished(), "the cursor still held keeps running");
+        assert!(running.by_chain.contains_key("arbitrum-one"));
+        arb.abort();
     }
 
     /// The lease must outlive several missed ticks, or one control-plane blip hands a cursor away from
