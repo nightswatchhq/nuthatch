@@ -7,6 +7,10 @@
 # first page is a deployment that joined after the migration began. A deployment that leaves and
 # comes back pages again: an indexer dropping one is the case worth knowing about.
 #
+# It keeps a second list the same way: signalled deployments whose only active allocation is the
+# Foundation's upgrade indexer, which stops serving them by 2026-10-31. Joining that list is the
+# warning weeks ahead; joining the orphan list is the deployment going dark.
+#
 #   0  ran; any joins were posted (or printed, with ORPHAN_ALERT_DRY_RUN=1)
 #   1  could not read a complete list or could not post; the state file is left as it was
 #
@@ -17,6 +21,8 @@
 #   ORPHAN_ALERT_STATE_DIR    (default ${XDG_STATE_HOME:-$HOME/.local/state}/stopgap-orphans)
 #   ORPHAN_ALERT_WEBHOOK_FILE (default ~/.config/nightswatch/discord-webhook)
 #   ORPHAN_ALERT_DRY_RUN      1 prints the message instead of posting it
+#   ORPHAN_ALERT_SUBGRAPH     network subgraph GraphQL (default https://network.thenightswatch.dev/graphql)
+#   ORPHAN_ALERT_UPGRADE      the Foundation's upgrade indexer (default 0xbdfb5ee5a2abf4fc7bb1bd1221067aef7f9de491)
 set -euo pipefail
 
 api=${ORPHAN_ALERT_API:-https://api.lodestar-dashboard.com}
@@ -25,6 +31,8 @@ from=${ORPHAN_ALERT_FROM:-2026-10-08}
 state_dir=${ORPHAN_ALERT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/stopgap-orphans}
 hook_file=${ORPHAN_ALERT_WEBHOOK_FILE:-$HOME/.config/nightswatch/discord-webhook}
 dry=${ORPHAN_ALERT_DRY_RUN:-0}
+subgraph=${ORPHAN_ALERT_SUBGRAPH:-https://network.thenightswatch.dev/graphql}
+upgrade=${ORPHAN_ALERT_UPGRADE:-0xbdfb5ee5a2abf4fc7bb1bd1221067aef7f9de491}
 page_size=100
 
 say() { echo "stopgap-orphan-alert: $*" >&2; }
@@ -59,56 +67,107 @@ fail() {
   exit 1
 }
 
-for net in $networks; do
-  : > "$work/$net.jsonl"
-  skip=0
+# Pages the directory for one network into $3; $2 is any extra filter.
+read_dir() {
+  local net=$1 extra=$2 out=$3 skip=0 url got want
+  : > "$out"
   while :; do
-    url="$api/api/subgraph-directory?network=$net&indexersMax=0&signalMin=1&sort=signal&first=$page_size&skip=$skip"
+    url="$api/api/subgraph-directory?network=$net$extra&signalMin=1&sort=signal&first=$page_size&skip=$skip"
     curl -fsS -m 60 -A stopgap-orphan-alert "$url" -o "$work/page.json" || fail "$net: $url did not answer"
     jq -e '.data | type == "array"' "$work/page.json" >/dev/null || fail "$net: no data array from $url"
-    [ "$skip" -gt 0 ] || jq -r '.total' "$work/page.json" > "$work/$net.total"
-    jq -c '.data[]' "$work/page.json" >> "$work/$net.jsonl"
+    [ "$skip" -gt 0 ] || jq -r '.total' "$work/page.json" > "$out.total"
+    jq -c '.data[]' "$work/page.json" >> "$out"
     [ "$(jq '.data | length' "$work/page.json")" -eq "$page_size" ] || break
     skip=$((skip + page_size))
   done
   # The directory is a cached set paged by skip; a total that moved between pages is a torn read.
-  got=$(jq -r '.id' "$work/$net.jsonl" | sort -u | wc -l | tr -d ' ')
-  want=$(cat "$work/$net.total")
+  got=$(jq -r '.id' "$out" | sort -u | wc -l | tr -d ' ')
+  want=$(cat "$out.total")
   [ "$got" = "$want" ] || fail "$net: read $got distinct rows of a total of $want"
+}
+
+# Active allocations on the deployments listed in $2, as {i, d} lines into $3.
+read_allocs() {
+  local net=$1 ids=$2 out=$3 chunk skip n q
+  : > "$out"
+  rm -f "$work/chunk."*
+  split -l 100 "$ids" "$work/chunk."
+  for chunk in "$work/chunk."*; do
+    [ -s "$chunk" ] || continue
+    skip=0
+    while :; do
+      q=$(jq -nc --argjson ids "$(jq -R . "$chunk" | jq -sc .)" --argjson skip "$skip" \
+        '{query: "query($ids:[String!],$skip:Int){allocations(first:1000,skip:$skip,where:{status:Active,subgraphDeployment_in:$ids}){indexer{id} subgraphDeployment{id}}}", variables: {ids: $ids, skip: $skip}}')
+      curl -fsS -m 60 -A stopgap-orphan-alert -H 'Content-Type: application/json' -d "$q" "$subgraph" -o "$work/alloc.json" \
+        || fail "$net: $subgraph did not answer"
+      jq -e '.data.allocations | type == "array"' "$work/alloc.json" >/dev/null || fail "$net: no allocations array from $subgraph"
+      jq -c '.data.allocations[] | {i: .indexer.id, d: .subgraphDeployment.id}' "$work/alloc.json" >> "$out"
+      n=$(jq '.data.allocations | length' "$work/alloc.json")
+      [ "$n" -eq 1000 ] || break
+      skip=$((skip + 1000))
+    done
+  done
+}
+
+for net in $networks; do
+  read_dir "$net" "&indexersMax=0" "$work/$net.jsonl"
   jq -r --arg net "$net" 'select(.network == $net) | .id' "$work/$net.jsonl" | LC_ALL=C sort -u > "$work/$net.ids"
+
+  read_dir "$net" "" "$work/all-$net.jsonl"
+  jq -r --arg net "$net" 'select(.network == $net) | .id' "$work/all-$net.jsonl" | LC_ALL=C sort -u > "$work/all-$net.ids"
+  read_allocs "$net" "$work/all-$net.ids" "$work/allocs-$net.jsonl"
+  jq -rs --arg u "$upgrade" 'group_by(.d)[] | select(([.[].i | ascii_downcase] | unique) == [$u]) | .[0].d' \
+    "$work/allocs-$net.jsonl" | LC_ALL=C sort -u > "$work/fdnonly-$net.ids"
 done
 
-joined=()
-for net in $networks; do
-  known=$state_dir/$net.ids
+# Lines for ids in $2 that are not in $1, described from the directory rows in $3, appended to $4.
+joins() {
+  local known=$1 current=$2 rows=$3 out=$4 id
   # A first run is the baseline, wherever the date stands; otherwise installing late pages the lot.
-  [ -f "$known" ] || { say "$net: no earlier list in $state_dir, recording a baseline"; continue; }
+  [ -f "$known" ] || { say "no earlier list at $known, recording a baseline"; return 0; }
   while read -r id; do
     [ -n "$id" ] || continue
-    joined+=("$(jq -r --arg id "$id" 'select(.id == $id) |
+    jq -r --arg id "$id" 'select(.id == $id) |
       "\(.network) \(.ipfsHash) \(.displayName // "unnamed"), \((.signalledTokens | tonumber / 1e18 | floor)) GRT, \(.curatorCount) curators"' \
-      "$work/$net.jsonl" | head -n 1)")
-  done < <(LC_ALL=C comm -13 "$known" "$work/$net.ids")
+      "$rows" | head -n 1 >> "$out"
+  done < <(LC_ALL=C comm -13 "$known" "$current")
+}
+
+: > "$work/orphan.joined"
+: > "$work/fdnonly.joined"
+for net in $networks; do
+  joins "$state_dir/$net.ids" "$work/$net.ids" "$work/$net.jsonl" "$work/orphan.joined"
+  joins "$state_dir/fdnonly-$net.ids" "$work/fdnonly-$net.ids" "$work/all-$net.jsonl" "$work/fdnonly.joined"
 done
 
-now=$(date -u +%s)
-if [ "${#joined[@]}" -gt 0 ] && [ "$now" -ge "$from_s" ]; then
-  msg="STOPGAP ORPHAN: ${#joined[@]} deployment(s) joined the list (signal, no indexer), https://www.lodestar-dashboard.com/subgraphs/migration"
-  for line in "${joined[@]}"; do
+# Posts $1 followed by the lines of $2, trimmed to fit one Discord message.
+post_list() {
+  local msg=$1 lines=$2 line next
+  while read -r line; do
     next="$msg"$'\n'"$line"
     if [ "${#next}" -gt 1700 ]; then
       msg="$msg"$'\n'"and more"
       break
     fi
     msg=$next
-  done
-  post "$msg" || exit 1
-elif [ "${#joined[@]}" -gt 0 ]; then
-  say "${#joined[@]} joined before $from; recorded, not posted"
+  done < "$lines"
+  post "$msg"
+}
+
+now=$(date -u +%s)
+orphans=$(wc -l < "$work/orphan.joined" | tr -d ' ')
+fdnonly=$(wc -l < "$work/fdnonly.joined" | tr -d ' ')
+if [ "$now" -ge "$from_s" ]; then
+  [ "$orphans" -eq 0 ] || post_list "STOPGAP ORPHAN: $orphans deployment(s) joined the list (signal, no indexer), https://www.lodestar-dashboard.com/subgraphs/migration" "$work/orphan.joined" || exit 1
+  [ "$fdnonly" -eq 0 ] || post_list "STOPGAP FOUNDATION-ONLY: $fdnonly deployment(s) now served only by the Foundation's upgrade indexer, which stops by 2026-10-31" "$work/fdnonly.joined" || exit 1
+elif [ $((orphans + fdnonly)) -gt 0 ]; then
+  say "$orphans orphan and $fdnonly foundation-only joins before $from; recorded, not posted"
 fi
 
 for net in $networks; do
   mv "$work/$net.ids" "$state_dir/$net.ids"
-  printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$net" "$(wc -l < "$state_dir/$net.ids" | tr -d ' ')" >> "$state_dir/sizes.tsv"
+  mv "$work/fdnonly-$net.ids" "$state_dir/fdnonly-$net.ids"
+  printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$net" \
+    "$(wc -l < "$state_dir/$net.ids" | tr -d ' ')" "$(wc -l < "$state_dir/fdnonly-$net.ids" | tr -d ' ')" >> "$state_dir/sizes.tsv"
 done
 rm -f "$state_dir/failing"
