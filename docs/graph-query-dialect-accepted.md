@@ -255,7 +255,7 @@ after which the whole operation reads as garbage.
 | more than one operation and no `operationName` | there is no way to know which was meant. `Operation name required`, graph-node's own wording |
 | an `operationName` no operation in the document carries | `Operation name not found `X``, likewise. An anonymous operation carries no name, so it is never what a name selects |
 | directives on an operation | skipping one silently is the same class of mistake as a dropped filter |
-| an unbound `$name` | neither the request nor the header supplies a value. Dropping the argument would widen the filter |
+| an unbound non-null `$name` (`$first: Int!`) | neither the request nor the header supplies a value, and graph-node refuses it too. A *nullable* `$name` the request leaves out is an argument or input field that was not given, as the GraphQL spec and graph-node read it: BetSwirl's SDK declares `$where: Token_filter` and sends no `where` |
 | a `null` filter value, as a literal or through `variables` | in a filter it could mean `IS NULL` or the absence of the condition, and those select different rows. It used to parse as the enum `null` and compile to `= 'null'`, matching rows whose value is that four-character string |
 | a fractional number in `variables` | `BigInt` and `BigDecimal` travel as strings over GraphQL precisely because a float loses them, so a fractional JSON number is refused rather than rounded into a filter |
 
@@ -283,8 +283,14 @@ This is the bounded two-level shape the Horizon escrow client uses:
 
 Top-level derived lists accept the same filtering and pagination arguments. They may also select a
 to-one relation with scalar children, as in `subgraphDeployments { indexerAllocations { indexer { id } } }`.
-Both shapes remain one SQL statement, not a parent-by-parent request loop. Further traversal is not
-accepted.
+Two more shapes come from BetSwirl's published client. A to-one relation below a to-one relation,
+`gameToken { token { symbol } }`, is a second `LEFT JOIN` with scalar children. A `@derivedFrom` field
+typed as one entity, `weightedGameBet: WeightedGameBet @derivedFrom(field: "bet")`, fetches at most two
+children: none answers `null`, one answers the object, and two answer graph-node's own
+`Ambiguous result for derived field` error. All of these remain one SQL statement, not a
+parent-by-parent request loop. Further traversal is not accepted.
+
+A stored list of scalars, `rolled: [BigInt!]`, travels as `to_json` text and is answered as the array.
 
 Null equality and inequality lower to `IS NULL` and `IS NOT NULL`, including the Rust monitor's
 `closedAt_not: null`. Null is not the string `"null"`, and never removes a filter condition. `null`

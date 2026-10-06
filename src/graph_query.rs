@@ -308,6 +308,7 @@ pub fn parse_named(
         i: 0,
         vars,
         defaults: BTreeMap::new(),
+        optional: Default::default(),
         depth: 0,
     };
     // A document is a list of definitions in any order, so fragments are collected as they are met
@@ -537,6 +538,8 @@ struct Cursor<'a> {
     /// forget that a variable existed.
     vars: &'a BTreeMap<String, Value>,
     defaults: BTreeMap<String, Value>,
+    /// Nullable variables declared without a default. Unsupplied, each is an absent argument.
+    optional: std::collections::BTreeSet<String>,
     /// Selection sets and list/object values currently open. Capped so a deeply nested document is a
     /// refusal rather than a stack overflow, which aborts the process (#1581).
     depth: usize,
@@ -822,21 +825,23 @@ impl<'a> Cursor<'a> {
                 return Err(Unsupported::Syntax(format!("`${name}` has no type")));
             }
             self.i += 1;
-            self.type_ref()?;
+            let non_null = self.type_ref()?;
             self.trivia();
             if self.peek() == Some(b'=') {
                 self.i += 1;
                 let v = self.value()?;
                 self.defaults.insert(name, v);
                 self.trivia();
+            } else if !non_null {
+                self.optional.insert(name);
             }
             if self.peek() == Some(b',') {
                 self.i += 1;
             }
         }
     }
-    /// A type reference - `Int`, `[Bytes!]!` - consumed and discarded.
-    fn type_ref(&mut self) -> Result<(), Unsupported> {
+    /// A type reference - `Int`, `[Bytes!]!` - consumed; answers whether it is non-null.
+    fn type_ref(&mut self) -> Result<bool, Unsupported> {
         self.trivia();
         if self.peek() == Some(b'[') {
             self.i += 1;
@@ -849,10 +854,12 @@ impl<'a> Cursor<'a> {
         } else {
             self.ident()?;
         }
+        let mut non_null = false;
         while self.peek() == Some(b'!') {
             self.i += 1;
+            non_null = true;
         }
-        Ok(())
+        Ok(non_null)
     }
     fn args(&mut self) -> Result<BTreeMap<String, Value>, Unsupported> {
         self.i += 1; // '('
@@ -875,9 +882,29 @@ impl<'a> Cursor<'a> {
                 )));
             }
             self.i += 1;
+            if self.absent_variable()? {
+                continue;
+            }
             let v = self.value()?;
             out.insert(name, v);
         }
+    }
+    /// A nullable `$name` the request did not supply and the header gives no default is, by the
+    /// GraphQL spec and in graph-node, an argument or input field that was not provided. Consumed
+    /// here so the caller leaves it out; a non-null one stays a refusal in `value_inner`.
+    fn absent_variable(&mut self) -> Result<bool, Unsupported> {
+        self.trivia();
+        if self.peek() != Some(b'$') {
+            return Ok(false);
+        }
+        let at = self.i;
+        self.i += 1;
+        let name = self.ident()?;
+        if self.optional.contains(&name) && !self.vars.contains_key(&name) {
+            return Ok(true);
+        }
+        self.i = at;
+        Ok(false)
     }
     fn value(&mut self) -> Result<Value, Unsupported> {
         self.nested(Self::value_inner)
@@ -935,6 +962,9 @@ impl<'a> Cursor<'a> {
                         return Err(Unsupported::Syntax(format!("`{k}` has no value")));
                     }
                     self.i += 1;
+                    if self.absent_variable()? {
+                        continue;
+                    }
                     let v = self.value()?;
                     m.insert(k, v);
                 }
@@ -1109,6 +1139,8 @@ pub enum Shape {
         /// preserves the distinction between a scalar value and a JSON-packed entity list when the
         /// response is shaped.
         lists: Vec<(String, String)>,
+        /// A to-one relation selected below this one, joined in the same statement.
+        objects: Vec<Nested>,
     },
     /// A `@derivedFrom` list, aggregated into one JSON array by a correlated subquery.
     List {
@@ -1117,6 +1149,27 @@ pub enum Shape {
         /// The column alias the JSON array arrives under.
         col: String,
     },
+    /// A stored list of scalars (`[BigInt!]`), sent by the SQL as JSON text and answered as the
+    /// array it encodes, or `null`.
+    Json { key: String, col: String },
+    /// A `@derivedFrom` field typed as one entity. It arrives as a JSON array of at most two, and
+    /// graph-node answers `null` for none, the entity for one, and an error for more.
+    DerivedOne {
+        key: String,
+        col: String,
+        /// The field's name, the child type and its back-reference, for graph-node's error text.
+        field: String,
+        child: String,
+        back: String,
+    },
+}
+
+/// A to-one relation two levels down: `gameToken { token { symbol } }`'s `token`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nested {
+    pub key: String,
+    pub marker: String,
+    pub fields: Vec<(String, String)>,
 }
 
 /// A compiled query: the SQL, and the shape of the object each row becomes.
@@ -1242,6 +1295,21 @@ pub fn compile_with(
             // Cast here rather than in the view, so `where` and `orderBy` still compare the numeric
             // column. Casting in the view made `orderBy: value` lexicographic and ranked 9000351 above
             // 60000353.
+            // A stored scalar list has no row encoding of its own, so it travels as JSON text.
+            if let graph_schema::FieldType::List(inner) = &field.ty {
+                let col = format!("a{i}");
+                let list = if wire_string_cast(inner) {
+                    format!("CAST({BASE}.\"{}\" AS VARCHAR[])", sel.name)
+                } else {
+                    format!("{BASE}.\"{}\"", sel.name)
+                };
+                cols.push(format!("to_json({list}) AS \"{col}\""));
+                shape.push(Shape::Json {
+                    key: sel.key.clone(),
+                    col,
+                });
+                continue;
+            }
             let cast = wire_string_cast(&field.ty);
             let expr = if cast {
                 format!("CAST({BASE}.\"{}\" AS VARCHAR)", sel.name)
@@ -1311,6 +1379,47 @@ pub fn compile_with(
         if !sel.args.is_empty() {
             return Err(Unsupported::NestedSelection(sel.name.clone()));
         }
+        // Two children are fetched so a third state, more than one, can be refused as graph-node does.
+        if let (graph_schema::FieldType::Entity(target), Some(back), true) =
+            (&field.ty, &field.derived_from, caps.list_args)
+        {
+            let child = schema
+                .entities
+                .iter()
+                .find(|e| &e.name == target)
+                .ok_or_else(|| Unsupported::UnknownField {
+                    entity: entity.clone(),
+                    field: sel.name.clone(),
+                })?;
+            if !child.fields.iter().any(|f| &f.name == back) {
+                return Err(Unsupported::UnknownField {
+                    entity: target.clone(),
+                    field: back.clone(),
+                });
+            }
+            let mut probe = sel.clone();
+            probe.args = BTreeMap::from([("first".to_string(), Value::Int(2))]);
+            let alias = format!("c{i}");
+            let col = format!("{alias}__{}", sel.name);
+            let packed = derived_list_sql(
+                schema,
+                child,
+                back,
+                &format!("{BASE}.\"id\""),
+                &alias,
+                &probe,
+                caps,
+            )?;
+            cols.push(format!("{packed} AS \"{col}\""));
+            shape.push(Shape::DerivedOne {
+                key: sel.key.clone(),
+                col,
+                field: sel.name.clone(),
+                child: target.clone(),
+                back: back.clone(),
+            });
+            continue;
+        }
         // A **to-one** reference is a join on the id this row already holds, and because the target's
         // id is unique the join cannot multiply rows - so `first` still means what it says. Anything
         // else - a stored array of ids, which the reference has as `Token.whitelistPools` - needs
@@ -1342,6 +1451,7 @@ pub fn compile_with(
         cols.push(format!("{alias}.\"id\" AS \"{marker}\""));
         let mut sub = Vec::new();
         let mut lists = Vec::new();
+        let mut objects = Vec::new();
         for (sub_i, s) in sel.sub.iter().enumerate() {
             // RFC-0053 checks a nested field's arguments before looking it up; core keeps that order.
             if !caps.nested_lists && !s.args.is_empty() {
@@ -1394,6 +1504,59 @@ pub fn compile_with(
                 lists.push((s.key.clone(), col));
                 continue;
             }
+            // A second to-one join: the target's id is unique, so it cannot multiply rows either.
+            if let (true, true, graph_schema::FieldType::Entity(inner), None) = (
+                caps.max_traversal >= 2,
+                s.args.is_empty() && !s.sub.is_empty(),
+                &cf.ty,
+                &cf.derived_from,
+            ) {
+                let ient = schema
+                    .entities
+                    .iter()
+                    .find(|e| &e.name == inner)
+                    .ok_or_else(|| Unsupported::UnknownField {
+                        entity: target.clone(),
+                        field: s.name.clone(),
+                    })?;
+                let ialias = format!("{alias}o{sub_i}");
+                joins.push_str(&format!(
+                    " LEFT JOIN \"{}\" {ialias} ON {ialias}.\"id\" = {alias}.\"{}\"",
+                    crate::subgraph_import::to_alias(inner),
+                    s.name
+                ));
+                let imarker = format!("{ialias}__present");
+                cols.push(format!("{ialias}.\"id\" AS \"{imarker}\""));
+                let mut ifields = Vec::new();
+                for (leaf_i, leaf) in s.sub.iter().enumerate() {
+                    let Some(lf) = ient.fields.iter().find(|x| x.name == leaf.name) else {
+                        return Err(Unsupported::UnknownField {
+                            entity: inner.clone(),
+                            field: leaf.name.clone(),
+                        });
+                    };
+                    if !leaf.args.is_empty()
+                        || !leaf.sub.is_empty()
+                        || lf.ty.entity_name().is_some()
+                    {
+                        return Err(Unsupported::NestedSelection(leaf.name.clone()));
+                    }
+                    let col = format!("{ialias}__{leaf_i}");
+                    let expr = if wire_string_cast(&lf.ty) {
+                        format!("CAST({ialias}.\"{}\" AS VARCHAR)", leaf.name)
+                    } else {
+                        format!("{ialias}.\"{}\"", leaf.name)
+                    };
+                    cols.push(format!("{expr} AS \"{col}\""));
+                    ifields.push((leaf.key.clone(), col));
+                }
+                objects.push(Nested {
+                    key: s.key.clone(),
+                    marker: imarker,
+                    fields: ifields,
+                });
+                continue;
+            }
             if !s.args.is_empty() || !s.sub.is_empty() {
                 return Err(Unsupported::NestedSelection(s.name.clone()));
             }
@@ -1425,6 +1588,7 @@ pub fn compile_with(
             marker,
             fields: sub,
             lists,
+            objects,
         });
     }
     // An entity root with no selection set is not a legal GraphQL query - a composite type must be
@@ -1557,7 +1721,13 @@ pub fn compile_with(
         } else {
             order_expr
         };
-        sql.push_str(&format!(" ORDER BY {order_expr} {dir}"));
+        // graph-node breaks ties on the id in the same direction (`relational_queries.rs`, `sort_expr`).
+        let tie = if order_field == "id" {
+            String::new()
+        } else {
+            format!(", {BASE}.\"id\" {dir}")
+        };
+        sql.push_str(&format!(" ORDER BY {order_expr} {dir}{tie}"));
 
         // graph-node's defaults, taken from the recorded reference: first = 100, skip = 0, and
         // §Query semantics caps first at 1000.
@@ -1790,6 +1960,11 @@ fn derived_list_sql(
     } else {
         order_expr
     };
+    let tie = if order == "id" {
+        String::new()
+    } else {
+        format!(", {alias}.\"id\" {direction}")
+    };
     let view = crate::subgraph_import::to_alias(&child.name);
     // No `OFFSET 0`, so an unargumented list lowers to exactly the SQL RFC-0053 always emitted.
     let offset = if skip > 0 {
@@ -1798,7 +1973,7 @@ fn derived_list_sql(
         String::new()
     };
     Ok(format!(
-        "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s FROM \"{view}\" {alias} WHERE {} ORDER BY {order_expr} {direction} LIMIT {first}{offset}) t), '[]')",
+        "coalesce((SELECT to_json(list(t.s)) FROM (SELECT struct_pack({}) AS s FROM \"{view}\" {alias} WHERE {} ORDER BY {order_expr} {direction}{tie} LIMIT {first}{offset}) t), '[]')",
         packed.join(", "),
         wheres.join(" AND "),
     ))
@@ -2483,7 +2658,8 @@ type Swap @entity { id: ID! pool: Pool! }
         .unwrap();
         assert_eq!(
             compact(&c.sql),
-            r#"SELECT b."id" FROM "pool" b WHERE b."hooks" = '0xabc' AND KEY(b."liquidity") > KEY(100) ORDER BY KEY(b."liquidity") DESC LIMIT 5 OFFSET 10"#
+            r#"SELECT b."id" FROM "pool" b WHERE b."hooks" = '0xabc' AND KEY(b."liquidity") > KEY(100) ORDER BY KEY(b."liquidity") DESC, b."id" DESC LIMIT 5 OFFSET 10"#,
+            "ties break on the id in the same direction, as graph-node orders"
         );
     }
 
@@ -2633,6 +2809,7 @@ type Swap @entity { id: ID! pool: Pool! }
                     marker: "j1__present".into(),
                     fields: vec![("symbol".into(), "j1__symbol".into())],
                     lists: vec![],
+                    objects: vec![],
                 },
             ],
             "only the shape knows `j1__symbol` belongs under `token0`"
@@ -3010,6 +3187,7 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
                 marker: "j0__present".into(),
                 fields: vec![("s".into(), "j0__symbol".into())],
                 lists: vec![],
+                objects: vec![],
             }],
             "the join is still on token0, the answer is still under t"
         );
@@ -3258,13 +3436,40 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
                 "{q}: refused as {got:?}, which is not the reason"
             );
         }
-        // An unsupplied variable is a refusal at parse time rather than compile time, and it is
-        // refused *as* an unbound variable: this assertion used to mean "variables are not
-        // implemented" and would otherwise have gone on passing for a different reason entirely.
-        let e = parse("query ($n: Int) { pools(first: $n) { id } }").expect_err("no $n");
+        // An unsupplied non-null variable is a refusal at parse time rather than compile time, and
+        // it is refused *as* an unbound variable.
+        let e = parse("query ($n: Int!) { pools(first: $n) { id } }").expect_err("no $n");
         assert!(
             matches!(&e, Unsupported::UnboundVariable(v) if v == "n"),
             "{e:?}"
+        );
+        // An unsupplied nullable one is an argument the client did not give, as graph-node reads it:
+        // BetSwirl's SDK declares `$where: Token_filter` and sends no `where` for its token list.
+        let roots =
+            parse("query ($n: Int, $w: Pool_filter) { pools(first: $n, where: $w) { id } }")
+                .expect("absent nullable variables");
+        assert!(roots[0].args.is_empty(), "{:?}", roots[0].args);
+        // Only the outer `!` makes a variable required; `[ID!]` is a nullable list.
+        let roots = parse("query ($ids: [ID!]) { pools(where: { id_in: $ids }) { id } }")
+            .expect("an absent nullable list of non-null elements");
+        assert_eq!(
+            roots[0].args.get("where"),
+            Some(&Value::Object(BTreeMap::new()))
+        );
+        let e = parse("query ($ids: [ID!]!) { pools(where: { id_in: $ids }) { id } }")
+            .expect_err("no $ids");
+        assert!(
+            matches!(&e, Unsupported::UnboundVariable(v) if v == "ids"),
+            "{e:?}"
+        );
+        let roots = parse("query ($h: String) { pools(where: { hooks: $h, id: \"a\" }) { id } }")
+            .expect("an absent input field");
+        assert_eq!(
+            roots[0].args.get("where"),
+            Some(&Value::Object(BTreeMap::from([(
+                "id".to_string(),
+                Value::Str("a".into())
+            )])))
         );
         // And so is a fragment, because resolving a spread needs the definition.
         // A spread with no definition is refused by name - it is not silently nothing, which would
@@ -3501,5 +3706,99 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
             "_meta { block { number } } }"
         );
         operation_bounds(&schema(), &parse(q).unwrap()).unwrap();
+    }
+
+    /// BetSwirl's published client selects `gameToken { token { symbol } }` and
+    /// `weightedGameBet { config { id } }`; both were refused, which refused its whole query.
+    #[test]
+    fn a_second_to_one_and_a_derived_single_lower_in_the_network_dialect() {
+        let schema = graph_schema::parse(
+            r#"
+type Bet @entity { id: ID! gameToken: GameToken! weightedGameBet: WeightedGameBet @derivedFrom(field: "bet") }
+type GameToken @entity { id: ID! token: Token! }
+type Token @entity { id: Bytes! symbol: String! decimals: Int! supply: BigInt! }
+type WeightedGameBet @entity { id: ID! bet: Bet! config: Config! }
+type Config @entity { id: ID! weights: [BigInt!]! }
+"#,
+        )
+        .unwrap();
+        let q = one("{ bets { gameToken { id token { a: id symbol supply } } } }");
+        assert!(matches!(
+            compile(&schema, &q),
+            Err(Unsupported::NestedSelection(_))
+        ));
+        let c = compile_with(&schema, &q, &Capabilities::NETWORK).unwrap();
+        assert!(
+            c.sql
+                .contains(r#"LEFT JOIN "token" j0o1 ON j0o1."id" = j0."token""#),
+            "{}",
+            c.sql
+        );
+        assert!(
+            c.sql
+                .contains(r#"CAST(j0o1."supply" AS VARCHAR) AS "j0o1__2""#),
+            "the wire type is the schema's two levels down too: {}",
+            c.sql
+        );
+        assert!(
+            matches!(&c.shape[0], Shape::Object { objects, .. } if objects == &vec![Nested {
+                key: "token".into(),
+                marker: "j0o1__present".into(),
+                fields: vec![
+                    ("a".into(), "j0o1__0".into()),
+                    ("symbol".into(), "j0o1__1".into()),
+                    ("supply".into(), "j0o1__2".into()),
+                ],
+            }]),
+            "{:?}",
+            c.shape
+        );
+        let q = one("{ bets { gameToken { token(first: 1) { symbol } } } }");
+        assert!(matches!(
+            compile_with(&schema, &q, &Capabilities::NETWORK),
+            Err(Unsupported::NestedSelection(n)) if n == "token"
+        ));
+
+        let q = one("{ bets { weightedGameBet { config { id weights } } } }");
+        assert!(matches!(
+            compile(&schema, &q),
+            Err(Unsupported::NestedSelection(_))
+        ));
+        let c = compile_with(&schema, &q, &Capabilities::NETWORK).unwrap();
+        assert!(
+            c.sql.contains(
+                r#"FROM "weighted_game_bet" c0 WHERE c0."bet" = b."id" ORDER BY c0."id" ASC LIMIT 2"#
+            ),
+            "two rows are fetched so a second one can be refused: {}",
+            c.sql
+        );
+        assert_eq!(
+            c.shape,
+            vec![Shape::DerivedOne {
+                key: "weightedGameBet".into(),
+                col: "c0__weightedGameBet".into(),
+                field: "weightedGameBet".into(),
+                child: "WeightedGameBet".into(),
+                back: "bet".into(),
+            }]
+        );
+        let q = one("{ bets { weightedGameBet(first: 1) { id } } }");
+        assert!(compile_with(&schema, &q, &Capabilities::NETWORK).is_err());
+
+        let q = one("{ configs { w: weights } }");
+        let c = compile(&schema, &q).unwrap();
+        assert!(
+            c.sql
+                .contains(r#"to_json(CAST(b."weights" AS VARCHAR[])) AS "a0""#),
+            "{}",
+            c.sql
+        );
+        assert_eq!(
+            c.shape,
+            vec![Shape::Json {
+                key: "w".into(),
+                col: "a0".into()
+            }]
+        );
     }
 }
