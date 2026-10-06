@@ -3449,6 +3449,19 @@ type Signer @entity { id: ID! payer: Payer! authorized: Boolean! }
             parse("query ($n: Int, $w: Pool_filter) { pools(first: $n, where: $w) { id } }")
                 .expect("absent nullable variables");
         assert!(roots[0].args.is_empty(), "{:?}", roots[0].args);
+        // Only the outer `!` makes a variable required; `[ID!]` is a nullable list.
+        let roots = parse("query ($ids: [ID!]) { pools(where: { id_in: $ids }) { id } }")
+            .expect("an absent nullable list of non-null elements");
+        assert_eq!(
+            roots[0].args.get("where"),
+            Some(&Value::Object(BTreeMap::new()))
+        );
+        let e = parse("query ($ids: [ID!]!) { pools(where: { id_in: $ids }) { id } }")
+            .expect_err("no $ids");
+        assert!(
+            matches!(&e, Unsupported::UnboundVariable(v) if v == "ids"),
+            "{e:?}"
+        );
         let roots = parse("query ($h: String) { pools(where: { hooks: $h, id: \"a\" }) { id } }")
             .expect("an absent input field");
         assert_eq!(
@@ -3775,7 +3788,8 @@ type Config @entity { id: ID! weights: [BigInt!]! }
         let q = one("{ configs { w: weights } }");
         let c = compile(&schema, &q).unwrap();
         assert!(
-            c.sql.contains(r#"to_json(CAST(b."weights" AS VARCHAR[])) AS "a0""#),
+            c.sql
+                .contains(r#"to_json(CAST(b."weights" AS VARCHAR[])) AS "a0""#),
             "{}",
             c.sql
         );
