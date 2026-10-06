@@ -1,7 +1,10 @@
 # README check, 2026-10-05
 
-Every command in `README.md` run as written against the published **4.10.1** release (#1923), with its
-exit code and the first lines of what it printed. A record of a moment: it is not rewritten when the
+Every command in `README.md` checked against the published **4.10.1** release (#1923): run as written,
+with its exit code and the first lines of what it printed, except the four the tables mark otherwise.
+Two write into the user's home (`claude mcp add`, the skill copy) and were not run; `nuthatch worker`
+and `nuthatch serve` need a Postgres and were checked in `--help` only; one row lists commands
+present in `--help` whose README invocations `tests/doc_command_check.rs` resolves against clap. A record of a moment: it is not rewritten when the
 README changes; the next check is a new file.
 
 Binary: `nuthatch-aarch64-apple-darwin.tar.gz` from v4.10.1, sha256
