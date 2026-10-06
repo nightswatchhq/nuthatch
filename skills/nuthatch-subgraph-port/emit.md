@@ -23,6 +23,12 @@ does **not** apply on this path: the manifest pinned implementation ABIs.
 
 The README is the S1 port report, verbatim. entities.toml is S5; emit `views/*.sql` now.
 
+A `Template.create(event.params.x)` in an event handler becomes a `[[factories]]` rule for that
+template; a creation it cannot pin to the handler's own event parameter is named, not guessed.
+
+`--dir` must hold the mapping **source**. From a deployment CID alone (IPFS has compiled WASM)
+nothing is classified, so `port-emit` refuses and prints no coverage figure.
+
 ## `[[calls]]` must trace
 
 Every stanza comes from a specific `.try_*` / `.bind` / `ethereum.call` in the mapping. The

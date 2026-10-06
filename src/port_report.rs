@@ -853,11 +853,8 @@ fn template_imports(text: &str) -> BTreeMap<String, String> {
     out
 }
 
-/// `let bribe = getBribe(..)` makes `bribe` whatever `getBribe` is declared to return.
-///
-/// The getOrCreate shape: the helper initialises every field and the handler then sets the real values
-/// on the returned entity. Without the binding those handler writes reached no entity, and the field was
-/// reported from the helper's `ZERO_INT` (Bunni's `Bribe.amount`, S0 #1941).
+/// `let bribe = getBribe(..)` makes `bribe` whatever `getBribe` is declared to return. Without it a
+/// getOrCreate helper's `= ZERO_INT` was the only write seen (Bunni's `Bribe.amount`, S0 #1941).
 fn bind_helper_returns(functions: &mut BTreeMap<String, FunctionInfo>) {
     let returns: BTreeMap<String, String> = functions
         .iter()
@@ -1094,12 +1091,8 @@ fn match_class(text: &str, i: usize) -> Option<(String, usize)> {
     Some((name, open))
 }
 
-/// The methods of one class, each as a function named `Class.method`.
-///
-/// The Messari SDK keeps every write in a manager class (`this._market.borrowCount += INT_ONE`), so a
-/// classifier that reads only `function` declarations saw none of them: 395 morpho fields read "no
-/// mapping writes this field" in S0 (#1941). A property's declared type binds `this.<prop>` the way a
-/// `let` binds a local, so the receiver resolves to its entity.
+/// The methods of one class, each as a function named `Class.method`. The Messari SDK writes only from
+/// these (395 morpho fields unseen in S0, #1941); a property's declared type binds `this.<prop>`.
 fn parse_class_methods(
     text: &str,
     class: &str,

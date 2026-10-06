@@ -90,8 +90,8 @@ pub struct Coverage {
     /// aggregation over the forward reference. Counting it unanswered understated the overlay by 8 on
     /// the pinned target (#1284) and would have had a porter hunting for columns that must not exist.
     ///
-    /// Counted only when both entities have a view with an `id` and the target's view projects the
-    /// forward field: the lookup is a subquery over that view, so without it there is no answer (#1947).
+    /// Counted only when both entities have a view with an `id` and the target's projects the forward
+    /// field, since the lookup is a subquery over it (#1947).
     pub derived: usize,
 }
 
@@ -442,11 +442,9 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
     })
 }
 
-/// `[[factories]]` rules read off `Template.create(event.params.x)` in an event handler.
-///
-/// The importer has only the manifest, which does not say which event creates a template, so it guesses
-/// from names and leaves the rest unwired: 9 of 17 templates in S0 (#1941). The mapping line says it
-/// outright. Only the handler's own event parameter is taken; anything else is named for a hand rule.
+/// `[[factories]]` rules read off `Template.create(event.params.x)` in an event handler, which the
+/// importer cannot see from the manifest (9 of 17 templates unwired in S0, #1941). Anything other than
+/// the handler's own event parameter is named for a hand rule.
 fn wire_templates(
     mappings: &crate::port_report::Mappings,
     config: &mut Config,
