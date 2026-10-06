@@ -9444,6 +9444,34 @@ mod tests {
 
     #[cfg(feature = "graph")]
     #[tokio::test]
+    async fn a_bigint_list_answers_its_elements_as_strings() {
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Bet @entity { id: ID! rolled: [BigInt!]! weights: [Int!]! }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/bet.sql"),
+            "CREATE VIEW bet AS SELECT '1' AS id, \
+             [CAST(9007199254740993 AS BIGINT), CAST(5 AS BIGINT)] AS rolled, [1, 2] AS weights;",
+        )
+        .unwrap();
+        let state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        let answer = graph_ask("/graphql", "{ bets { rolled weights } }", state).await;
+        assert_eq!(
+            answer["data"]["bets"][0],
+            serde_json::json!({"rolled": ["9007199254740993", "5"], "weights": [1, 2]}),
+            "graph-node sends BigInt as a string, inside a list too: {answer}"
+        );
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test]
     async fn a_graphql_operation_refuses_too_many_roots() {
         reset_graph_budget();
         let _guard = GraphBudgetGuard;

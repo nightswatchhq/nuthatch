@@ -1296,9 +1296,14 @@ pub fn compile_with(
             // column. Casting in the view made `orderBy: value` lexicographic and ranked 9000351 above
             // 60000353.
             // A stored scalar list has no row encoding of its own, so it travels as JSON text.
-            if matches!(field.ty, graph_schema::FieldType::List(_)) {
+            if let graph_schema::FieldType::List(inner) = &field.ty {
                 let col = format!("a{i}");
-                cols.push(format!("to_json({BASE}.\"{}\") AS \"{col}\"", sel.name));
+                let list = if wire_string_cast(inner) {
+                    format!("CAST({BASE}.\"{}\" AS VARCHAR[])", sel.name)
+                } else {
+                    format!("{BASE}.\"{}\"", sel.name)
+                };
+                cols.push(format!("to_json({list}) AS \"{col}\""));
                 shape.push(Shape::Json {
                     key: sel.key.clone(),
                     col,
@@ -3770,7 +3775,7 @@ type Config @entity { id: ID! weights: [BigInt!]! }
         let q = one("{ configs { w: weights } }");
         let c = compile(&schema, &q).unwrap();
         assert!(
-            c.sql.contains(r#"to_json(b."weights") AS "a0""#),
+            c.sql.contains(r#"to_json(CAST(b."weights" AS VARCHAR[])) AS "a0""#),
             "{}",
             c.sql
         );
