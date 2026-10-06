@@ -18,14 +18,15 @@ in `~/.zshrc` (or `~/.bashrc`) to keep it for new terminals. Many Linux distribu
 directory when it exists; if yours does not, the same line applies. The installer itself is served from
 the website and lives in its own repository, so this is documented here rather than changed there.
 
-Prebuilt binaries are published for two targets, attached to every release with their checksums:
+Prebuilt binaries are published for three targets, attached to every release with their checksums:
 
 | Platform | Target | Prebuilt |
 |---|---|---|
 | macOS, Apple Silicon | `aarch64-apple-darwin` | yes |
 | Linux x86_64 | `x86_64-unknown-linux-gnu` | yes |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` | yes, from the release after 4.11.0 |
 | macOS, Intel | `x86_64-apple-darwin` | **no** - build from source |
-| Linux aarch64, anything else | - | **no** - build from source |
+| anything else | - | **no** - build from source |
 
 On a platform without a prebuilt binary the installer stops and prints the source-build command
 below rather than installing something that will not run.
@@ -42,6 +43,9 @@ also the glibc the release is *built* on (`ubuntu-22.04` in `.github/workflows/r
 a coincidence and not the reason: up to 4.0.2 the binary referenced nothing newer than `GLIBC_2.34`
 and ran on RHEL 9, and stating the build baseline as the requirement once wrongly excluded it
 ([#978](https://github.com/nightswatchhq/nuthatch/issues/978)). The floor is what the loader checks.
+The aarch64 binary has the same floor: built on `ubuntu-22.04-arm` (glibc 2.35), it references `hypot`
+and `hypotf` at `GLIBC_2.35` and nothing newer, read the same way off a 4.11.0 build on 2026-10-06
+([#1961](https://github.com/nightswatchhq/nuthatch/issues/1961)).
 
 **No C++ runtime.** The binary links `libc`, `libm` and `libgcc`. Releases before 4.1 embedded DuckDB,
 which is C++, and also needed libstdc++ from GCC 11 (`GLIBCXX_3.4.29`).
