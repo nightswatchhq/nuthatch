@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the stopgap orphan list every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+RandomizedDelaySec=1min
+
+[Install]
+WantedBy=timers.target
