@@ -120,9 +120,10 @@ pub struct Mount {
     /// Always a real value, never `Option<String>` and never null. Single-tenant is `N=1` with
     /// [`DEFAULT_TENANT`], not a special case, so there is one code path rather than two - and the
     /// one almost every user is on is the one that would otherwise rot.
-    /// Empty only inside deserialisation; [`MountTable`]'s `Deserialize` fills in the configured
-    /// default, which a serde default on this field cannot see.
-    #[serde(default)]
+    /// [`UNSAID_TENANT`] only inside deserialisation; [`MountTable`]'s `Deserialize` fills in the
+    /// configured default, which a serde default on this field cannot see. A written `tenant = ""`
+    /// is kept, so validation still refuses it.
+    #[serde(default = "unsaid_tenant")]
     pub tenant: String,
     /// The name this mount is served under. Free-form, unique **within a tenant**, and *not* part of
     /// the nest's identity.
@@ -208,7 +209,7 @@ impl<'de> Deserialize<'de> for MountTable {
         let mut table = MountTable::deserialize(d)?;
         let tenant = table.tenant_default();
         for m in &mut table.mounts {
-            if m.tenant.is_empty() {
+            if m.tenant == UNSAID_TENANT {
                 m.tenant = tenant.clone();
             }
         }
@@ -225,6 +226,13 @@ impl Serialize for MountTable {
 /// The tenant a mount belongs to when nobody said otherwise. Operator-configurable per mounts via
 /// `[mounts] default_tenant`.
 pub const DEFAULT_TENANT: &str = "default";
+
+// A NUL cannot come from a TOML author by accident and is refused as a path segment anyway.
+const UNSAID_TENANT: &str = "\u{0}";
+
+fn unsaid_tenant() -> String {
+    UNSAID_TENANT.to_string()
+}
 
 fn default_tenant() -> String {
     DEFAULT_TENANT.to_string()
