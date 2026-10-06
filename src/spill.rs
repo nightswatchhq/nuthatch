@@ -119,11 +119,15 @@ pub(crate) fn new_spill_dir() -> Result<SpillDir> {
         std::fs::create_dir_all(&parent)
             .with_context(|| format!("creating the spill parent {}", parent.display()))?;
     }
+    create_exclusive(&parent, &SPILL_SEQ)
+}
+
+fn create_exclusive(parent: &Path, seq: &AtomicU64) -> Result<SpillDir> {
     loop {
         let path = parent.join(format!(
             "{PREFIX}{}-{}",
             std::process::id(),
-            SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
+            seq.fetch_add(1, Ordering::Relaxed)
         ));
         match std::fs::create_dir(&path) {
             Ok(()) => return Ok(SpillDir(path)),
@@ -164,20 +168,25 @@ mod tests {
     /// be reused, and two instances would share one spill directory again. A name that exists is
     /// refused and the sequence advances; the pre-made directories stand in for the dead process's.
     /// Mutation-checked: with `create_dir_all` back in place this fails.
+    ///
+    /// Its own parent and counter (#1956): every Burrmill session in the test binary draws from
+    /// `SPILL_SEQ`, and one that took a planted name deleted the planted file when it dropped.
     #[test]
     fn a_spill_directory_that_already_exists_is_never_reused() {
-        let _env = crate::analytics_budget::tests::env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let next = SPILL_SEQ.load(Ordering::Relaxed);
-        let planted: Vec<PathBuf> = (next..next + 8)
-            .map(|n| spill_parent().join(format!("{PREFIX}{}-{n}", std::process::id())))
+        let parent = tempfile::tempdir().unwrap();
+        let seq = AtomicU64::new(0);
+        let planted: Vec<PathBuf> = (0..8)
+            .map(|n| {
+                parent
+                    .path()
+                    .join(format!("{PREFIX}{}-{n}", std::process::id()))
+            })
             .collect();
         for p in &planted {
-            std::fs::create_dir_all(p).unwrap();
+            std::fs::create_dir(p).unwrap();
             std::fs::write(p.join("someone-elses.tmp"), b"x").unwrap();
         }
-        let mine = new_spill_dir().unwrap();
+        let mine = create_exclusive(parent.path(), &seq).unwrap();
         assert!(
             !planted.contains(&mine.0),
             "an existing directory was handed out as a fresh spill directory: {}",
@@ -189,7 +198,6 @@ mod tests {
                 p.join("someone-elses.tmp").exists(),
                 "the other process's spill file was disturbed"
             );
-            let _ = std::fs::remove_dir_all(p);
         }
     }
 }
