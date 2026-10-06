@@ -47,14 +47,6 @@ file = "src/seal.rs"
 mutation = "replace > with >= in verify_and_quarantine"
 reason = "Only gates the summary error line; the returned count and the quarantine moves are unchanged."
 
-[[survivor]]
-file = "src/seal.rs"
-mutation = "replace match guard e.kind() == std::io::ErrorKind::NotFound with false in verify_and_quarantine"
-reason = """
-A missing segment then takes the "unreadable" arm, whose rename fails on the absent file and is
-logged; the count and every segment are unchanged. The one other trace is an empty `quarantine/`.
-"""
-
 # --- Equivalent. ---------------------------------------------------------------------------------
 
 [[survivor]]

@@ -3382,6 +3382,35 @@ mod tests {
         assert_eq!(both.segments, 3);
     }
 
+    /// `nuthatch seed` (#1952): the installed catalogue is the publisher's, byte for byte, in a nest
+    /// that had no `segments/` before.
+    #[test]
+    fn an_installed_catalogue_reads_back_as_the_one_it_was_given() {
+        let publisher = tempfile::tempdir().unwrap();
+        seal_range(publisher.path(), &[transfer(100, 0, "1")], 100, 100).unwrap();
+        let catalogue = load_manifest(publisher.path()).unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        let rx = manifest_changes(fresh.path());
+
+        install_manifest(fresh.path(), &catalogue).unwrap();
+
+        let installed = load_manifest(fresh.path()).unwrap();
+        assert_eq!(
+            installed.tables["usdc__transfer"][0].hash,
+            catalogue.tables["usdc__transfer"][0].hash
+        );
+        assert_eq!(
+            catalogue_hash(fresh.path()).unwrap(),
+            catalogue_hash(publisher.path()).unwrap()
+        );
+        assert!(fresh.path().join(SEGMENTS_DIR).is_dir());
+        assert_eq!(
+            *rx.borrow(),
+            1,
+            "a mirror waiting on this nest was not woken"
+        );
+    }
+
     #[test]
     fn every_installed_manifest_bumps_the_change_count() {
         let dir = tempfile::tempdir().unwrap();
