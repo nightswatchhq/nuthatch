@@ -110,11 +110,12 @@ pub struct ManifestSource {
     /// exists to be *reported* - diverging from the manifest silently is the thing this module
     /// is not allowed to do.
     pub end_block: Option<u64>,
-    /// True when the source declares `blockHandlers` or `callHandlers`. A block handler has no
-    /// equivalent and a call handler is `[extract] top_level_calls`, neither of which the import
-    /// writes - and a source carrying only them parses to an empty event list, which in
-    /// `[[contracts]]` means "index every event in the ABI", the opposite of what the subgraph did.
-    pub has_non_event_handlers: bool,
+    /// True when the source declares `blockHandlers` or `callHandlers`. A block handler's nearest
+    /// equivalent is `[extract] blocks` and a call handler's is `[extract] top_level_calls` - and a
+    /// source carrying only them parses to an empty event list, which in `[[contracts]]` means
+    /// "index every event in the ABI", the opposite of what the subgraph did.
+    pub has_block_handlers: bool,
+    pub has_call_handlers: bool,
     /// Event signatures with whitespace removed, e.g.
     /// `Transfer(indexedaddress,indexedaddress,uint256)` - folded scalars are collapsed so the
     /// signature matches the ABI-derived one character for character. Only [`event_name`] reads
@@ -661,6 +662,14 @@ fn sanitise(s: &str) -> String {
     out
 }
 
+/// Whether `mapping.<key>` lists at least one handler.
+fn declares(mapping: Option<&Yaml>, key: &str) -> bool {
+    mapping
+        .and_then(|m| get(m, key))
+        .and_then(|h| h.as_vec())
+        .is_some_and(|v| !v.is_empty())
+}
+
 fn parse_source(y: &Yaml) -> ManifestSource {
     let source = get(y, "source");
     let mapping = get(y, "mapping");
@@ -716,15 +725,8 @@ fn parse_source(y: &Yaml) -> ManifestSource {
                 Yaml::Integer(i) if *i >= 0 => Some(*i as u64),
                 other => as_str(other).and_then(|s| s.parse().ok()),
             }),
-        has_non_event_handlers: mapping
-            .map(|m| {
-                ["blockHandlers", "callHandlers"].iter().any(|k| {
-                    get(m, k)
-                        .and_then(|h| h.as_vec())
-                        .is_some_and(|v| !v.is_empty())
-                })
-            })
-            .unwrap_or(false),
+        has_block_handlers: declares(mapping, "blockHandlers"),
+        has_call_handlers: declares(mapping, "callHandlers"),
         events,
     }
 }
@@ -1835,7 +1837,8 @@ dataSources:
             Some(500),
             "endBlock must be carried to report it"
         );
-        assert!(ds.has_non_event_handlers, "blockHandlers must be noticed");
+        assert!(ds.has_block_handlers, "blockHandlers must be noticed");
+        assert!(!ds.has_call_handlers);
         assert!(
             ds.events.is_empty(),
             "no eventHandlers means an empty allowlist"

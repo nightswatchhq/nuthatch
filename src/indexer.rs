@@ -1263,47 +1263,91 @@ async fn refetch_address_filtered(
     topics: &[String],
     block: u64,
 ) -> Result<Vec<crate::rpc::Log>> {
-    use std::collections::HashSet;
-    // Discovery decodes without timestamps, as the backfill's pass-1 decode does: these rows are
-    // thrown away, and the stamped decode happens later in `process_window`.
-    let empty_ts = std::collections::HashMap::new();
-    let mut fetched: HashSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
-    let mut all: Vec<crate::rpc::Log> = Vec::new();
-    // COR-5 recovery narrows a wide fetch to `base u discovered children`, so it always has an
-    // address half; the `?` on a filter that cannot be built would be a bug in that reasoning rather
-    // than a runtime condition, and the caller only reaches here with addresses to narrow to.
-    let Some(filter) = LogFilter::new(addresses, topics) else {
-        return Ok(Vec::new());
-    };
-    let mut batch = source.logs(&filter, block, block).await?;
-    loop {
-        let mut new: Vec<String> = Vec::new();
+    fetch_discovering_union(source, nests, live, addresses, topics, block, block).await
+}
+
+/// [`fetch_discovering`] for a runtime cursor: discovery runs into every live factory nest.
+async fn fetch_discovering_union(
+    source: &dyn Source,
+    nests: &mut [Option<NestIngest>],
+    live: &[usize],
+    addresses: &[String],
+    topics: &[String],
+    from: u64,
+    to: u64,
+) -> Result<Vec<crate::rpc::Log>> {
+    fetch_discovering(source, addresses, topics, from, to, |batch| {
+        let mut known = Vec::new();
         for &i in live {
             let n = live_nest(nests, i);
             let Some(fs) = n.factory.clone() else {
                 continue;
             };
             let registry = n.registry.clone();
-            let _ = decode_window(&registry, Some(&fs), &mut n.children, &batch, &empty_ts);
-            for c in n.children.addresses() {
-                if !fetched.contains(&c.to_ascii_lowercase()) && !addr_in(&new, c) {
-                    new.push(c.to_string());
-                }
-            }
+            known.extend(discover_children(&registry, &fs, &mut n.children, batch));
         }
+        known
+    })
+    .await
+}
+
+/// Decode `batch` for the children it announces, returning every child now known. The rows are
+/// discarded; the stamped decode happens later in `process_window`, as after the backfill's pass 1.
+fn discover_children(
+    registry: &DecodeRegistry,
+    factory: &FactorySet,
+    children: &mut ChildRegistry,
+    batch: &[crate::rpc::Log],
+) -> Vec<String> {
+    let _ = decode_window(
+        registry,
+        Some(factory),
+        children,
+        batch,
+        &std::collections::HashMap::new(),
+    );
+    children
+        .addresses()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `from..=to` address-filtered, then refetched for the children each round discovers until a round
+/// finds none: the backfill's pass 1 and pass 2 fixpoint, for the tip loops.
+///
+/// `discover` decodes a batch into the child registries and returns every child they now hold. A
+/// child created in the range announces itself from its factory's address, which round 1 fetched, so
+/// its own logs in the same range arrive in round 2.
+async fn fetch_discovering(
+    source: &dyn Source,
+    addresses: &[String],
+    topics: &[String],
+    from: u64,
+    to: u64,
+    mut discover: impl FnMut(&[crate::rpc::Log]) -> Vec<String>,
+) -> Result<Vec<crate::rpc::Log>> {
+    use std::collections::HashSet;
+    let mut fetched: HashSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
+    let mut all: Vec<crate::rpc::Log> = Vec::new();
+    let Some(filter) = LogFilter::new(addresses, topics) else {
+        return Ok(Vec::new());
+    };
+    let mut batch = source.logs(&filter, from, to).await?;
+    loop {
+        let new: Vec<String> = discover(&batch)
+            .into_iter()
+            .filter(|c| fetched.insert(c.to_ascii_lowercase()))
+            .collect();
         all.append(&mut batch);
+        // An empty `new` would make the filter below address-less, so it returns first.
         if new.is_empty() {
             return Ok(all);
         }
-        for c in &new {
-            fetched.insert(c.to_ascii_lowercase());
-        }
-        // `new` is non-empty here (the loop returns above when it is not), so the narrowed child
-        // fetch always carries an address filter.
         let Some(child_filter) = LogFilter::new(&new, topics) else {
             return Ok(all);
         };
-        batch = source.logs(&child_filter, block, block).await?;
+        batch = source.logs(&child_filter, from, to).await?;
     }
 }
 
@@ -1344,10 +1388,12 @@ async fn recover_over_cap_block(
     block: u64,
     tip: u64,
     cause: &anyhow::Error,
+    // The failed fetch was already `base ∪ children`, so the refetch would only repeat it.
+    already_narrowed: bool,
 ) -> Result<()> {
     let narrowed = narrowed_union_addresses(live.iter().map(|&i| live_ref(nests, i)));
     // Empty means "any address" to `getLogs` - the identical fetch, so there is nothing to try.
-    if !narrowed.is_empty() {
+    if !narrowed.is_empty() && !already_narrowed {
         match refetch_address_filtered(source, nests, live, &narrowed, topics, block).await {
             Ok(logs) => {
                 tracing::warn!(
@@ -2190,6 +2236,7 @@ async fn runtime_index_loop(
     // cursor's shared `global_next` - the position every co-tenant on this chain has cleared.
     let mut heartbeat = crate::progress::TipHeartbeat::new();
     let mut reorg_gate = ReorgGate::default();
+    let mut topic0_refused = false;
     loop {
         // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
         // only point at which the nest set is quiescent and "every live nest has committed the same
@@ -2378,11 +2425,50 @@ async fn runtime_index_loop(
             })
             .min()
             .unwrap_or(global_next);
-        let filter = LogFilter::new(&u_addrs, &u_topics);
-        let fetched = match &filter {
+        // A live factory nest makes `union_filter` clear `u_addrs`, static co-tenants included.
+        // Below the flip threshold the cursor asks every live nest's `base ∪ children` instead,
+        // with discovery, the rule `backfill_direct_factory` uses (#1941).
+        let factories: Vec<&FactorySet> = live
+            .iter()
+            .filter_map(|&i| live_ref(&nests, i).factory.as_deref())
+            .collect();
+        let narrowed = if factories.is_empty() {
+            None
+        } else {
+            let narrowed = narrowed_union_addresses(live.iter().map(|&i| live_ref(&nests, i)));
+            let wide = !topic0_refused
+                && (narrowed.len() > FACTORY_FLIP_THRESHOLD
+                    || factories.iter().any(|f| f.force_topic0()));
+            (!narrowed.is_empty() && !wide).then_some(narrowed)
+        };
+        let fetched = match (&narrowed, LogFilter::new(&u_addrs, &u_topics)) {
+            (Some(addrs), _) => {
+                fetch_discovering_union(
+                    source.as_ref(),
+                    &mut nests,
+                    &live,
+                    addrs,
+                    &u_topics,
+                    fetch_from,
+                    to,
+                )
+                .await
+            }
             // Same tail as the solo loop (#1144). A short answer is filled in on the next window.
-            Some(f) => source.logs(f, fetch_from, to).await,
-            None => Ok(Vec::new()),
+            (None, Some(f)) => match source.logs(&f, fetch_from, to).await {
+                Err(e) if u_addrs.is_empty() && crate::rpc::filter_refused(&e) => {
+                    tracing::warn!(
+                        "the endpoint refuses getLogs without an address list ({e:#}); this \
+                         cursor asks by factory and child address from now on"
+                    );
+                    topic0_refused = true;
+                    // Through the retry arm and its pause, so a cursor with nothing to narrow
+                    // to cannot spin on the refusal.
+                    Err(e)
+                }
+                r => r,
+            },
+            (None, None) => Ok(Vec::new()),
         };
         match fetched {
             Ok(logs) => {
@@ -2424,7 +2510,8 @@ async fn runtime_index_loop(
                     // filter only when a live nest is a factory nest, so a topic0-only union is the
                     // factory nests' doing and a static nest's addresses cannot have caused it. They
                     // are the nests `recover_over_cap_block` narrows for, and the ones it faults if
-                    // the narrowed fetch cannot clear the cap either.
+                    // the narrowed fetch cannot clear the cap either. Below the flip threshold the
+                    // fetch that failed was the narrowed one, which faults them as it always did.
                     let factories =
                         topic0_only_culprits(live.iter().map(|&i| (i, live_ref(&nests, i))));
                     if factories.is_empty() {
@@ -2443,6 +2530,7 @@ async fn runtime_index_loop(
                         global_next,
                         tip,
                         &e,
+                        narrowed.is_some(),
                     )
                     .await?;
                     continue;
@@ -2930,26 +3018,25 @@ async fn build_nest(
     }
 
     // Factory rules (RFC-0009): validated at load. A factory nest discovers child contracts at
-    // runtime, so the tip loop fetches topic0-only (empty address filter) - a child created and
-    // traded in the same block is then already in hand, no extra RPC.
+    // runtime: every loop fetches `base ∪ children` and refetches for children found in the window,
+    // flipping to topic0-only past FACTORY_FLIP_THRESHOLD children.
     let factory = {
         let fs = FactorySet::build(config)?;
         if fs.is_empty() {
             None
         } else {
             tracing::info!(
-                "factory nest: {} template(s), {} rule(s) - topic0-only tip fetch, children discovered at runtime",
+                "factory nest: {} template(s), {} rule(s) - children discovered at runtime",
                 config.templates.len(),
                 config.factories.len()
             );
             if let Some(chain) = crate::chains::lookup(&config.nest.chain) {
                 if !chain.topic0_only_getlogs {
-                    tracing::warn!(
-                        "chain '{}' shipped RPC refuses address-less eth_getLogs (the factory \
-                         flip after {FACTORY_FLIP_THRESHOLD} children, and the tip fetch from \
-                         the first window). A factory nest on the default endpoint will fail \
-                         with an address-required error. Pass --rpc at an archive endpoint that \
-                         allows topic0-only getLogs.",
+                    tracing::info!(
+                        "chain '{}' shipped RPC refuses address-less eth_getLogs, so past \
+                         {FACTORY_FLIP_THRESHOLD} children this nest keeps asking by address \
+                         rather than flipping to topic0-only. --rpc at an endpoint that allows \
+                         topic0-only getLogs is cheaper for a factory with many children.",
                         chain.name
                     );
                 }
@@ -2958,8 +3045,8 @@ async fn build_nest(
         }
     };
 
-    // The combined `eth_getLogs` filter: contract addresses (empty for a factory nest → topic0-only),
-    // matching any registered topic0 (contract + template events).
+    // The `eth_getLogs` filter: contract addresses, or empty for a factory nest, which marks it for
+    // the union and demux and is asked by address in `NestIngest::fetch_window` instead.
     let addresses: Vec<String> = if factory.is_some() {
         Vec::new()
     } else {
@@ -3186,6 +3273,7 @@ async fn build_nest(
         },
         addresses,
         topic0s,
+        topic0_refused: false,
         start_block,
         ipfs_gate,
         ipfs_resolver: None,
@@ -5367,7 +5455,10 @@ async fn logs_with_retry(
             // A result cap is not transient - hand it back so the caller shrinks the window. A
             // pool-wide 429 at a single block is not one of those (#916): there is nothing for the
             // caller to shrink, so it belongs in the backoff arm below like any other throttle.
-            Err(e) if narrowing_can_help(&e, from, to) => return Err(e),
+            // A refused filter is the caller's to change too (#1941); asking again is refused again.
+            Err(e) if narrowing_can_help(&e, from, to) || crate::rpc::filter_refused(&e) => {
+                return Err(e)
+            }
             Err(e) => {
                 let backoff = backfill_backoff(base, attempt);
                 log_backfill_retry(
@@ -5923,6 +6014,7 @@ pub async fn backfill_direct_factory_with(
     let mut next = from;
     let mut total = 0u64;
     let mut flipped_logged = false;
+    let mut topic0_refused = false;
     // A blocks nest pays per *block*, not per log, so its window ceiling is different (RFC-0036).
     let mut chunker = tip_window(
         extras.ipfs.is_some(),
@@ -5945,7 +6037,8 @@ pub async fn backfill_direct_factory_with(
 
         // Filter flip (RFC-0009 §4): a forced override or a discovered set past the threshold switches
         // this chunk from the address-list two-pass to a single topic0-only fetch + local filtering.
-        let use_topic0 = force_topic0 || base.len() + children.len() > FACTORY_FLIP_THRESHOLD;
+        let use_topic0 = !topic0_refused
+            && (force_topic0 || base.len() + children.len() > FACTORY_FLIP_THRESHOLD);
         if use_topic0 && !flipped_logged {
             tracing::info!(
                 "factory backfill filter flipped to topic0-only + local filter ({} children)",
@@ -5977,6 +6070,14 @@ pub async fn backfill_direct_factory_with(
                                 return Err(e).with_context(|| single_block_over_cap(next));
                             }
                             chunker.too_large();
+                            continue;
+                        }
+                        Err(e) if crate::rpc::filter_refused(&e) => {
+                            tracing::warn!(
+                                "the endpoint refuses getLogs without an address list ({e:#}); \
+                                 the factory backfill asks by address from now on"
+                            );
+                            topic0_refused = true;
                             continue;
                         }
                         Err(e) => {
@@ -6275,6 +6376,9 @@ pub struct NestIngest {
     folds: Option<Arc<crate::folds::Writer>>,
     addresses: Vec<String>,
     topic0s: Vec<String>,
+    /// Set once an endpoint refuses this factory nest's topic0-only getLogs (#1941): it is asked by
+    /// address from then on, past the flip threshold or not.
+    topic0_refused: bool,
     /// The nest's earliest vendored deployment block (the min of the contracts' `start_block`s), or
     /// `None`. Used only by [`prepare`]'s cold-start origin computation.
     start_block: Option<u64>,
@@ -6316,6 +6420,50 @@ pub struct NestIngest {
 }
 
 impl NestIngest {
+    /// This window's logs. A factory nest is asked by `base ∪ children` until it has more than
+    /// [`FACTORY_FLIP_THRESHOLD`] children, the rule the seal-direct factory backfill follows (#1941).
+    async fn fetch_window(
+        &mut self,
+        source: &dyn Source,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<crate::rpc::Log>> {
+        let Some(fs) = self.factory.clone() else {
+            return match LogFilter::new(&self.addresses, &self.topic0s) {
+                Some(f) => source.logs(&f, from, to).await,
+                None => Ok(Vec::new()),
+            };
+        };
+        let known: Vec<String> = self
+            .registry
+            .addresses()
+            .iter()
+            .map(|a| format!("0x{}", hex::encode(a)))
+            .chain(self.children.addresses().into_iter().map(str::to_string))
+            .collect();
+        let wide = fs.force_topic0() || known.len() > FACTORY_FLIP_THRESHOLD;
+        if wide && !self.topic0_refused {
+            let Some(f) = LogFilter::new(&[], &self.topic0s) else {
+                return Ok(Vec::new());
+            };
+            match source.logs(&f, from, to).await {
+                Err(e) if crate::rpc::filter_refused(&e) => {
+                    tracing::warn!(
+                        "the endpoint refuses getLogs without an address list ({e:#}); asking by \
+                         factory and child address from now on"
+                    );
+                    self.topic0_refused = true;
+                }
+                r => return r,
+            }
+        }
+        let (registry, children) = (&self.registry, &mut self.children);
+        fetch_discovering(source, &known, &self.topic0s, from, to, |batch| {
+            discover_children(registry, &fs, children, batch)
+        })
+        .await
+    }
+
     /// The policy a seal-direct pass resolves its documents on.
     fn seal_direct_policy(&self) -> crate::ipfs_resolve::Policy {
         crate::ipfs_resolve::Policy::seal_direct_within(self.ipfs_window_deadline)
@@ -7528,13 +7676,11 @@ async fn index_loop(
         // currently include: `process_window` derives its block list from `logs`, so a blocks nest
         // writes no rows for a window nothing matched. That is #447, not this fix, and it is why the
         // fall-through matters more once #447 lands than it does today.
-        let filter = LogFilter::new(&nest.addresses, &nest.topic0s);
-        let fetched = match &filter {
-            // The tail of the previous window is asked for again (#1144); `process_window` drops
-            // the rows the store already holds before anything is folded into a view.
-            Some(f) => source.logs(f, overlap_from(next, range_floor), to).await,
-            None => Ok(Vec::new()),
-        };
+        // The tail of the previous window is asked for again (#1144); `process_window` drops the
+        // rows the store already holds before anything is folded into a view.
+        let fetched = nest
+            .fetch_window(source.as_ref(), overlap_from(next, range_floor), to)
+            .await;
         match fetched {
             Ok(logs) => {
                 chunker.observed(logs.len() as u64);
@@ -11472,15 +11618,25 @@ template = "pool"
     /// A nest with one `[[factories]]` rule, so `FactorySet::build` is non-empty and `build_nest`
     /// marks it a factory nest - the state that forces the union topic0-only.
     async fn build_factory_test_nest(dir: &std::path::Path) -> NestIngest {
+        build_factory_test_nest_with(dir, "").await
+    }
+
+    /// [`build_factory_test_nest`], with `template_extra` appended to the `[[templates]]` entry.
+    async fn build_factory_test_nest_with(
+        dir: &std::path::Path,
+        template_extra: &str,
+    ) -> NestIngest {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
-            "[nest]\nname = \"f\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
-             [[contracts]]\nalias = \"fac\"\naddress = \"0x0000000000000000000000000000000000000022\"\n\
-             abi = \"abis/fac.json\"\n\n\
-             [[templates]]\nname = \"child\"\nabi = \"abis/child.json\"\n\n\
-             [[factories]]\nwatch = \"fac\"\nevent = \"ChildCreated\"\nchild_param = \"child\"\n\
-             template = \"child\"\n",
+            format!(
+                "[nest]\nname = \"f\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"fac\"\naddress = \"0x0000000000000000000000000000000000000022\"\n\
+                 abi = \"abis/fac.json\"\n\n\
+                 [[templates]]\nname = \"child\"\nabi = \"abis/child.json\"\n{template_extra}\n\
+                 [[factories]]\nwatch = \"fac\"\nevent = \"ChildCreated\"\nchild_param = \"child\"\n\
+                 template = \"child\"\n"
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -12731,6 +12887,250 @@ template = "pool"
         }
     }
 
+    /// publicnode's shape (#1941): a getLogs with no address list is refused for want of one, and
+    /// anything address-filtered is answered.
+    struct AddressRequiredSource {
+        logs: Vec<crate::rpc::Log>,
+        calls: std::sync::Mutex<Vec<(Vec<String>, u64, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for AddressRequiredSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let addrs = filter.addresses();
+            self.calls.lock().unwrap().push((addrs.to_vec(), from, to));
+            if addrs.is_empty() {
+                return Err(anyhow::Error::new(crate::rpc::ClassifiedError {
+                    class: crate::rpc::FailureClass::FilterRefused,
+                    detail: "rpc error: {\"code\":-32701,\"message\":\"Please specify an address \
+                             in your request\"}"
+                        .into(),
+                }));
+            }
+            let allow: std::collections::HashSet<String> =
+                addrs.iter().map(|a| a.to_ascii_lowercase()).collect();
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .filter(|l| allow.contains(&l.address.to_ascii_lowercase()))
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// A factory that creates a child at block 7, the child pinging in the same block.
+    fn factory_child_logs(fact: &NestIngest) -> Vec<crate::rpc::Log> {
+        let child = "0x0000000000000000000000000000000000000033";
+        vec![
+            crate::rpc::Log {
+                address: "0x0000000000000000000000000000000000000022".into(),
+                topics: vec![
+                    nest_topic0(fact, "fac__child_created"),
+                    format!("0x{:0>64}", child.trim_start_matches("0x")),
+                ],
+                data: "0x".into(),
+                block_number: 7,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt1".into(),
+                log_index: 0,
+            },
+            crate::rpc::Log {
+                address: child.into(),
+                topics: vec![nest_topic0(fact, "child__ping")],
+                data: "0x".into(),
+                block_number: 7,
+                block_hash: "0xbh".into(),
+                tx_hash: "0xt2".into(),
+                log_index: 1,
+            },
+        ]
+    }
+
+    /// Run a solo `index_loop` over `source` until block 7's child ping is stored, or 20 s pass.
+    async fn solo_rows_at_seven(
+        source: Arc<AddressRequiredSource>,
+        fact: NestIngest,
+    ) -> Vec<String> {
+        let store = fact.store.clone();
+        let task = tokio::spawn(index_loop(
+            source as Arc<dyn Source>,
+            fact,
+            Some(5),
+            false,
+            1,
+            50,
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut rows = Vec::new();
+        while std::time::Instant::now() < deadline && !task.is_finished() {
+            rows = store.entities_in_range(7, 7).unwrap();
+            if rows.iter().any(|r| r.contains("child__ping")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        task.abort();
+        rows
+    }
+
+    /// #1941: a factory nest on an endpoint that refuses address-less getLogs. The hot path follows
+    /// the seal-direct backfill's rule, `base ∪ children` until the flip threshold, so with one child
+    /// it never asks without an address, and the child created in block 7 is still found in block 7.
+    #[tokio::test]
+    async fn a_factory_nest_fetches_by_address_below_the_flip_threshold() {
+        let df = tempfile::tempdir().unwrap();
+        let fact = build_factory_test_nest(df.path()).await;
+        let source = Arc::new(AddressRequiredSource {
+            logs: factory_child_logs(&fact),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let rows = solo_rows_at_seven(source.clone(), fact).await;
+        assert!(
+            rows.iter().any(|r| r.contains("child__ping")),
+            "the child must be discovered and indexed: {rows:?}"
+        );
+        let calls = source.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().all(|(a, _, _)| !a.is_empty()),
+            "no getLogs may go out without an address list: {calls:?}"
+        );
+    }
+
+    /// A template that asks for the topic0-only fetch still indexes on such an endpoint: the first
+    /// refusal latches the nest onto the address-filtered fetch rather than retrying until it exits.
+    #[tokio::test]
+    async fn a_refused_topic0_only_fetch_falls_back_to_addresses_and_stays_there() {
+        let df = tempfile::tempdir().unwrap();
+        let fact = build_factory_test_nest_with(df.path(), "filter = \"topic0\"\n").await;
+        let source = Arc::new(AddressRequiredSource {
+            logs: factory_child_logs(&fact),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let rows = solo_rows_at_seven(source.clone(), fact).await;
+        assert!(
+            rows.iter().any(|r| r.contains("child__ping")),
+            "the nest must index after the refusal: {rows:?}"
+        );
+        let calls = source.calls.lock().unwrap().clone();
+        let wide = calls.iter().filter(|(a, _, _)| a.is_empty()).count();
+        assert_eq!(wide, 1, "one refusal, then never again: {calls:?}");
+    }
+
+    /// The seal-direct factory backfill takes the same fallback when its flip is refused.
+    #[tokio::test]
+    async fn the_factory_backfill_falls_back_to_addresses_when_topic0_only_is_refused() {
+        let df = tempfile::tempdir().unwrap();
+        let fact = build_factory_test_nest(df.path()).await;
+        let source = AddressRequiredSource {
+            logs: factory_child_logs(&fact),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = tempfile::tempdir().unwrap();
+        let mut children = ChildRegistry::new();
+        let sealed = backfill_direct_factory(
+            &source,
+            &fact.registry,
+            fact.factory.as_deref().unwrap(),
+            &mut children,
+            out.path(),
+            &fact.topic0s,
+            &[],
+            None,
+            0,
+            0,
+            10,
+            64,
+            SPAN_OFF,
+            true,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .expect("a refused flip must fall back, not abort");
+        assert_eq!(sealed, 2, "the factory event and the child's ping");
+        let wide = source
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(a, _, _)| a.is_empty())
+            .count();
+        assert_eq!(wide, 1, "refused once, then address-filtered");
+    }
+
+    /// The runtime cursor follows the same rule as the solo loop: a factory co-tenant no longer
+    /// clears the union's address filter while it has fewer children than the flip threshold.
+    #[tokio::test]
+    async fn the_runtime_cursor_fetches_a_factory_nest_by_address() {
+        let ds = tempfile::tempdir().unwrap();
+        let df = tempfile::tempdir().unwrap();
+        let stat = build_test_nest(ds.path(), "0x0000000000000000000000000000000000000011").await;
+        let fact = build_factory_test_nest(df.path()).await;
+        let fact_store = fact.store.clone();
+        let source = Arc::new(AddressRequiredSource {
+            logs: factory_child_logs(&fact),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let task = tokio::spawn(runtime_index_loop(
+            source.clone() as Arc<dyn Source>,
+            vec![stat, fact],
+            Some(5),
+            false,
+            1,
+            50,
+            health,
+            false,
+            None,
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut rows = Vec::new();
+        while std::time::Instant::now() < deadline && !task.is_finished() {
+            rows = fact_store.entities_in_range(7, 7).unwrap();
+            if rows.iter().any(|r| r.contains("child__ping")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        task.abort();
+        assert!(
+            rows.iter().any(|r| r.contains("child__ping")),
+            "the child must be discovered and indexed: {rows:?}"
+        );
+        let calls = source.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().all(|(a, _, _)| !a.is_empty()),
+            "no getLogs may go out without an address list: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(a, _, _)| {
+                a.iter()
+                    .any(|x| x == "0x0000000000000000000000000000000000000011")
+                    && a.iter()
+                        .any(|x| x == "0x0000000000000000000000000000000000000022")
+            }),
+            "one fetch serves the static co-tenant and the factory together: {calls:?}"
+        );
+    }
+
     /// The topic0 of a nest's table, from its own built registry (never a hand-copied hash).
     fn nest_topic0(nest: &NestIngest, table: &str) -> String {
         format!(
@@ -12837,6 +13237,7 @@ template = "pool"
             7,
             7,
             &cause,
+            false,
         )
         .await
         .unwrap();
@@ -13066,6 +13467,7 @@ template = "pool"
             7,
             7,
             &cause,
+            false,
         )
         .await
         .unwrap();

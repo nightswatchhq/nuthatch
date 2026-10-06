@@ -52,7 +52,8 @@ pub struct Chain {
     pub log_window: u64,
     /// Whether a `getLogs` with an empty address list (topic0-only, the factory flip) is accepted.
     /// `false` means the shipped default returns an error such as "Please specify an address"; a
-    /// factory nest on that chain must not discover the refusal mid-backfill.
+    /// factory nest on that chain keeps asking by address past the flip threshold, and is told so
+    /// at load.
     pub topic0_only_getlogs: bool,
     /// **The longest block span a finalized range may be held unsealed** (#1199).
     ///
@@ -192,21 +193,29 @@ const BASE: Chain = Chain {
     block_time_ms: 2_000,
 };
 
-/// BNB Smart Chain. **Tip-following of a static contract works out of the box; a from-deployment
-/// backfill does not; a factory nest does not.**
+/// BNB Smart Chain. **Tip-following works out of the box; any history older than about 75 minutes
+/// does not.**
 ///
 /// Re-measured 2026-08-23 (#761), confirmed 2026-08-24. `bsc-rpc.publicnode.com` is still the only
-/// keyless endpoint that answers address-filtered getLogs at all, and historical getLogs at block
-/// 1,000,000 is HTTP 403 - **archive depth no**. `bsc-dataseed.binance.org` fails a 10-block getLogs
-/// (`limit exceeded`) and has no trie state ~1M behind tip; `bsc.drpc.org` 429s the public plan;
-/// `1rpc.io/bnb` is over quota; `binance.llamarpc.com` does not connect.
+/// keyless endpoint that answers address-filtered getLogs at all. `bsc-dataseed.binance.org` fails a
+/// 10-block getLogs (`limit exceeded`) and has no trie state ~1M behind tip; `bsc.drpc.org` 429s the
+/// public plan; `binance.llamarpc.com` does not connect.
 ///
-/// It also **refuses address-less getLogs** (`-32701 Please specify an address`) - the shape
-/// RFC-0009 §4's factory flip issues. A pancakeswap-style nest works until 500 children and then
-/// fails every window. `topic0_only_getlogs` is false so `build_nest` names that at load.
+/// Re-measured 2026-10-06 for #1941, and publicnode is narrower than it was:
 ///
-/// So this is shipped honestly: tip-follow a static contract on the default; history and factories
-/// need `--rpc <your archive endpoint>`.
+/// - **History: about 10,000 blocks.** A getLogs 9,000 blocks behind tip is served; 10,500, 12,000
+///   and 20,000 are HTTP 403 `-32602 Archive requests require a personal token`, which classifies
+///   as history unavailable. It used to be recorded at block 1,000,000.
+/// - **At most nine addresses per getLogs.** Ten or more is HTTP 403 `-32602 Request blocked`. The
+///   client splits the address list into groups the endpoint takes and remembers the size.
+/// - **No address-less getLogs** (`-32701 Please specify an address`). A factory nest asks by
+///   `base ∪ children` until RFC-0009 §4's flip at 500 children, and on this endpoint stays there
+///   past it. `topic0_only_getlogs` is false so `build_nest` says so at load.
+/// - `1rpc.io/bnb` caps a range at 50 blocks (`-32602 eth_getLogs is limited to 0 - 50 blocks
+///   range`, narrowed for) and rate-limits within minutes; over its quota again on the day.
+///
+/// So this is shipped honestly: tip-follow on the default; a backfill needs `--rpc <your archive
+/// endpoint>`.
 const BSC: Chain = Chain {
     name: "bsc",
     chain_id: 56,
@@ -235,6 +244,11 @@ const BSC: Chain = Chain {
 /// Archive depth is the binding constraint for backfill; the archive endpoint goes first so a new
 /// nest does not open against a non-archive URL. The wider endpoint is kept as a secondary for
 /// tip-following fallover once an initial backfill completes.
+///
+/// Measured 2026-10-06 (#1941): `polygon-bor-rpc.publicnode.com` now refuses an address-less
+/// getLogs over a range (`-32701 Please specify an address`) and ten or more addresses (HTTP 403
+/// `Request blocked`; nine served), as its BSC sibling does. `polygon.drpc.org` takes both, so
+/// `topic0_only_getlogs` stays true and a refusal fails over to it.
 const POLYGON: Chain = Chain {
     name: "polygon",
     chain_id: 137,
