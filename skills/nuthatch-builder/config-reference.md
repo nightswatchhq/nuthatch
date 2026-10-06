@@ -483,7 +483,7 @@ exactly like `views/`.
 
 A mount belongs to a **tenant**: an opaque string nuthatch refcounts and knows nothing else about. No
 authz, no quotas, no metering - identity is the gateway's job. Omit it and the mount belongs to
-`default`.
+`[runtime] default_tenant`, which is `default` unless set.
 
 ```toml
 [[mounts]]
@@ -501,9 +501,10 @@ nid = "9f2c…"         # same nest, one dataset, one backfill
 or whatever `[runtime] default_tenant` names) serves at `/usdc/…`; any other tenant's at
 `/acme/usdc/…`. Each mount's route depends on its own tenant alone (3.13.1), so adding or removing
 another tenant never moves it, before or after a restart. A runtime whose mounts all belong to the
-default tenant never shows the word in a URL. A mount that omits `tenant` belongs to the default
-tenant, so with `default_tenant = "acme"` it is served at `/usdc/…` and a mount that says
-`tenant = "default"` at `/default/usdc/…` (#1933). `GET /nests` reports each mount's `tenant` and `base_path`.
+default tenant never shows the word in a URL. With `default_tenant = "acme"`, a mount that omits
+`tenant` is an `acme` mount served at `/usdc/…`, and one that says `tenant = "default"` is an ordinary
+other tenant at `/default/usdc/…` (#1933). `GET /nests` reports each mount's `tenant` and
+`base_path`.
 
 Both `tenant` and `alias` are path segments, so both are restricted to letters, digits, `_` and `-`.
 Opaque means nuthatch does not interpret it, not that it may contain `..`.
