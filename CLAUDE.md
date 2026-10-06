@@ -157,7 +157,7 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 
 - MCP server compiled into the binary: schema discovery, SQL execution, entity lookup,
   streaming subscribe. Works fully offline against the local instance.
-- `nuthatch init 0xAddr` scaffolds schema + views + handlers + tests from the ABI.
+- `nuthatch init 0xAddr` scaffolds schema, ABIs, views, llms.txt and a skill from the ABI.
 - Ship `llms.txt`, docs-as-MCP, and a `.claude/skills/` directory in scaffolded projects so
   coding agents get real syntax instead of hallucinating.
 - Local-first AI: Ollama support and BYO-key. Any AI feature must have a documented

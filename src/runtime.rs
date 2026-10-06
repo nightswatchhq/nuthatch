@@ -120,7 +120,10 @@ pub struct Mount {
     /// Always a real value, never `Option<String>` and never null. Single-tenant is `N=1` with
     /// [`DEFAULT_TENANT`], not a special case, so there is one code path rather than two - and the
     /// one almost every user is on is the one that would otherwise rot.
-    #[serde(default = "default_tenant")]
+    /// [`UNSAID_TENANT`] only inside deserialisation; [`MountTable`]'s `Deserialize` fills in the
+    /// configured default, which a serde default on this field cannot see. A written `tenant = ""`
+    /// is kept, so validation still refuses it.
+    #[serde(default = "unsaid_tenant")]
     pub tenant: String,
     /// The name this mount is served under. Free-form, unique **within a tenant**, and *not* part of
     /// the nest's identity.
@@ -199,9 +202,37 @@ impl MountPublish {
     }
 }
 
+// A `[[mounts]]` record that names no tenant belongs to the configured default, the same as a legacy
+// `nests` entry, so the two forms cannot disagree (RFC-0032 §6).
+impl<'de> Deserialize<'de> for MountTable {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut table = MountTable::deserialize(d)?;
+        let tenant = table.tenant_default();
+        for m in &mut table.mounts {
+            if m.tenant == UNSAID_TENANT {
+                m.tenant = tenant.clone();
+            }
+        }
+        Ok(table)
+    }
+}
+
+impl Serialize for MountTable {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        MountTable::serialize(self, s)
+    }
+}
+
 /// The tenant a mount belongs to when nobody said otherwise. Operator-configurable per mounts via
 /// `[mounts] default_tenant`.
 pub const DEFAULT_TENANT: &str = "default";
+
+// A NUL cannot come from a TOML author by accident and is refused as a path segment anyway.
+const UNSAID_TENANT: &str = "\u{0}";
+
+fn unsaid_tenant() -> String {
+    UNSAID_TENANT.to_string()
+}
 
 fn default_tenant() -> String {
     DEFAULT_TENANT.to_string()
@@ -244,6 +275,7 @@ impl MountRef {
 /// `[[chains]]` and lets each nest declare its own chain. The single-cursor law holds **per chain**:
 /// never multiplex two chains behind one cursor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct MountTable {
     /// Serialised as `[runtime]`. Was `[roost]` until 2.0, when the roost was retired as a concept
     /// (RFC-0032 slice 5); `migrate` rewrites the section along with everything else.
@@ -5652,6 +5684,15 @@ mod tests {
             refs(&configured),
             vec!["usdc"],
             "a configured default tenant keeps its routes"
+        );
+        let unsaid: MountTable = toml::from_str(
+            "[runtime]\nname = \"r\"\ndefault_tenant = \"acme\"\n\n\
+             [[mounts]]\nalias = \"usdc\"\nnid = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unsaid.mounts[0].tenant, "acme",
+            "a record that names no tenant takes the configured default, as a nests entry does"
         );
 
         let suspended: MountTable = toml::from_str(
