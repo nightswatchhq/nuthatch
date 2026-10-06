@@ -567,9 +567,10 @@ pub async fn resolve(name: &str, rpc_urls: &[String]) -> anyhow::Result<Resolved
         return Ok(c.into());
     }
     if rpc_urls.is_empty() {
+        let known = all().iter().map(|c| c.name).collect::<Vec<_>>().join(", ");
         anyhow::bail!(
-            "unknown chain '{name}' (try: mainnet, arbitrum-one, base, optimism, polygon, gnosis, \
-             bsc) - or pass --rpc <url> to point nuthatch at a chain it doesn't ship built-in"
+            "unknown chain '{name}' (try: {known}) - or pass --rpc <url> to point nuthatch at a \
+             chain it doesn't ship built-in"
         );
     }
     let chain_id = crate::rpc::RpcClient::new(rpc_urls.to_vec())?
@@ -1000,6 +1001,13 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown chain 'avalanche'"), "{msg}");
         assert!(msg.contains("--rpc"), "{msg}");
+        for c in all() {
+            assert!(
+                msg.contains(c.name),
+                "{} missing from the remedy: {msg}",
+                c.name
+            );
+        }
     }
 
     /// The fix for #535: an unregistered chain name is accepted once `--rpc` names where it lives,
