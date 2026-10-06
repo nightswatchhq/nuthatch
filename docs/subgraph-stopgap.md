@@ -1,6 +1,6 @@
 # Subgraph stopgap: nests for subgraphs the network does not serve
 
-**Opened 2026-10-06. Status: S0 not started.** This file is the central tracker. Issues carry the
+**Opened 2026-10-06. Status: S0 in progress, S2 done.** This file is the central tracker. Issues carry the
 detail and are labelled [`subgraph-stopgap`](https://github.com/nightswatchhq/nuthatch/labels/subgraph-stopgap).
 
 ## Why
@@ -52,7 +52,7 @@ further slices of either.
 
 | slice | issue | what | fails if | status |
 | --- | --- | --- | --- | --- |
-| S0 | [#1940](https://github.com/nightswatchhq/nuthatch/issues/1940) | `init --from-subgraph` and `port-emit` on 15-20 published `bsc` and `matic` deployments, mixed shapes; record init success, fields answered, backfill cost | fewer than half the sample yield a serving nest that answers at least a third of its report-exact fields, or either of the two deployments with recent fees (Thena BSC V3 Fusion, BetSwirl BNB Chain) does not; the offer then narrows to S2 alone | not started |
+| S0 | [#1940](https://github.com/nightswatchhq/nuthatch/issues/1940) | `init --from-subgraph` and `port-emit` on 15-20 published `bsc` and `matic` deployments, mixed shapes; record init success, fields answered, backfill cost | fewer than half the sample yield a serving nest that answers at least a third of its report-exact fields, or BetSwirl BNB Chain does not; the offer then narrows to S2 alone | not started |
 | S1 | [#1941](https://github.com/nightswatchhq/nuthatch/issues/1941) | fix what S0 broke; CID to serving GraphQL surface end to end on both chains, golden tests from the sample | a sample deployment that should port does not | waits on S0 |
 | S2 | [#1942](https://github.com/nightswatchhq/nuthatch/issues/1942) | resolve each manifest's `network:` from IPFS; view of `bsc`/`matic` deployments with signal or an indexing agreement and zero active allocations; alert on new entries | the list disagrees with the network subgraph's allocation counts at a pinned block | done: Lodestar's `/subgraphs/migration` is the list, verified exact at a pinned block; verifier and alert in #1945 |
 | S3 | [#1943](https://github.com/nightswatchhq/nuthatch/issues/1943) | per-subgraph handback package: coverage report, how to run, how to point back at the network | someone who did not build it cannot stand one up from the package alone | waits on S1 |
@@ -66,6 +66,14 @@ query fees in the last 30 days (Thena BSC V3 Fusion 483 GRT, BetSwirl BNB Chain 
 ~1 GRT), and 7 hold signal at or above REO's 500 GRT floor. None was created in the last 30 days, so
 the Studio migration has not reached the list yet. How many Studio subgraphs move, and whether all are
 published and curated, is the question for the Foundation.
+
+Of the three, only **BetSwirl BNB Chain** (`Qmd5oqyojVx5wWSFuWfKz3YVLPHdE3KU5458Qqq3SVeGEB`) is genuinely
+stranded: it is BetSwirl's only BNB deployment, and its Polygon twin is served by three indexers. Thena
+and boost are old versions whose newer deployments are served (Thena BSC V3 Fusion `QmPBTDjp...` by
+seven indexers, Boost Indexer Production by fourteen). BetSwirl BNB Chain is the first stopgap nest.
+
+**When it is served, a post goes up on [learn-thegraph.com/dispatches](https://learn-thegraph.com/dispatches/)**
+covering the list, the numbers above, what the nest answers and what it refuses (Chief, 2026-10-06).
 
 ## Known limits
 
@@ -90,3 +98,4 @@ published and curated, is the question for the Foundation.
 - **2026-10-06** Tracker opened, S0 to S3 filed as #1940 to #1943.
 - **2026-10-06** Chief lifted the no-hosting rule for the stopgap: we serve the nests ourselves.
 - **2026-10-06** S2 done (#1945). S0 gate raised from "any answered field" to a third of fields on half the sample, on review.
+- **2026-10-06** Orphan alert live on the ThinkPad (user timer, 15 min, its own webhook). BetSwirl BNB Chain chosen as the first stopgap nest.
