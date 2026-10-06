@@ -1119,6 +1119,9 @@ pub enum Shape {
         /// The column alias the JSON array arrives under.
         col: String,
     },
+    /// A stored list of scalars (`[BigInt!]`), sent by the SQL as JSON text and answered as the
+    /// array it encodes, or `null`.
+    Json { key: String, col: String },
     /// A `@derivedFrom` field typed as one entity. It arrives as a JSON array of at most two, and
     /// graph-node answers `null` for none, the entity for one, and an error for more.
     DerivedOne {
@@ -1262,6 +1265,16 @@ pub fn compile_with(
             // Cast here rather than in the view, so `where` and `orderBy` still compare the numeric
             // column. Casting in the view made `orderBy: value` lexicographic and ranked 9000351 above
             // 60000353.
+            // A stored scalar list has no row encoding of its own, so it travels as JSON text.
+            if matches!(field.ty, graph_schema::FieldType::List(_)) {
+                let col = format!("a{i}");
+                cols.push(format!("to_json({BASE}.\"{}\") AS \"{col}\"", sel.name));
+                shape.push(Shape::Json {
+                    key: sel.key.clone(),
+                    col,
+                });
+                continue;
+            }
             let cast = wire_string_cast(&field.ty);
             let expr = if cast {
                 format!("CAST({BASE}.\"{}\" AS VARCHAR)", sel.name)
@@ -3697,5 +3710,20 @@ type Config @entity { id: ID! weights: [BigInt!]! }
         );
         let q = one("{ bets { weightedGameBet(first: 1) { id } } }");
         assert!(compile_with(&schema, &q, &Capabilities::NETWORK).is_err());
+
+        let q = one("{ configs { w: weights } }");
+        let c = compile(&schema, &q).unwrap();
+        assert!(
+            c.sql.contains(r#"to_json(b."weights") AS "a0""#),
+            "{}",
+            c.sql
+        );
+        assert_eq!(
+            c.shape,
+            vec![Shape::Json {
+                key: "w".into(),
+                col: "a0".into()
+            }]
+        );
     }
 }

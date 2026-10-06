@@ -2820,6 +2820,15 @@ fn graph_shape(
                 };
                 out.insert(key.clone(), list);
             }
+            Shape::Json { key, col } => {
+                let v = match row.get(col) {
+                    None | Some(serde_json::Value::Null) => serde_json::Value::Null,
+                    Some(serde_json::Value::String(t)) => serde_json::from_str(t)
+                        .map_err(|_| format!("`{key}` did not come back as JSON: {t}"))?,
+                    Some(other) => other.clone(),
+                };
+                out.insert(key.clone(), v);
+            }
             Shape::DerivedOne {
                 key,
                 col,
@@ -4925,6 +4934,28 @@ mod tests {
                 .unwrap(),
             serde_json::json!({"gameToken": {"token": null}, "weightedGameBet": {"id": "7"}}),
             "an absent second relation is null, not an object of nulls"
+        );
+        let lists = Compiled {
+            sql: String::new(),
+            shape: vec![Shape::Json {
+                key: "rolled".into(),
+                col: "a0".into(),
+            }],
+            entity: "Bet".into(),
+            singular: false,
+            min_block: None,
+        };
+        let list_row = |v: serde_json::Value| {
+            graph_shape(&lists, serde_json::json!({ "a0": v }).as_object().unwrap()).unwrap()
+        };
+        assert_eq!(
+            list_row(serde_json::json!(r#"["3","5"]"#)),
+            serde_json::json!({"rolled": ["3", "5"]}),
+            "a stored list is an array, not the JSON text it travelled as"
+        );
+        assert_eq!(
+            list_row(serde_json::Value::Null),
+            serde_json::json!({"rolled": null})
         );
         let err =
             shape(serde_json::json!({"gt": null, "t": null, "w": r#"[{"id":"7"},{"id":"8"}]"#}))
