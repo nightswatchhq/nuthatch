@@ -2425,20 +2425,21 @@ async fn runtime_index_loop(
             })
             .min()
             .unwrap_or(global_next);
-        // A factory co-tenant clears `u_addrs`; below the flip threshold the cursor asks by address
-        // anyway, the rule `backfill_direct_factory` uses (#1941).
-        let narrowed = if u_addrs.is_empty() {
-            let factories: Vec<&FactorySet> = live
-                .iter()
-                .filter_map(|&i| live_ref(&nests, i).factory.as_deref())
-                .collect();
+        // A live factory nest makes `union_filter` clear `u_addrs`, static co-tenants included.
+        // Below the flip threshold the cursor asks every live nest's `base ∪ children` instead,
+        // with discovery, the rule `backfill_direct_factory` uses (#1941).
+        let factories: Vec<&FactorySet> = live
+            .iter()
+            .filter_map(|&i| live_ref(&nests, i).factory.as_deref())
+            .collect();
+        let narrowed = if factories.is_empty() {
+            None
+        } else {
             let narrowed = narrowed_union_addresses(live.iter().map(|&i| live_ref(&nests, i)));
             let wide = !topic0_refused
                 && (narrowed.len() > FACTORY_FLIP_THRESHOLD
                     || factories.iter().any(|f| f.force_topic0()));
-            (!factories.is_empty() && !narrowed.is_empty() && !wide).then_some(narrowed)
-        } else {
-            None
+            (!narrowed.is_empty() && !wide).then_some(narrowed)
         };
         let fetched = match (&narrowed, LogFilter::new(&u_addrs, &u_topics)) {
             (Some(addrs), _) => {
@@ -13118,6 +13119,13 @@ template = "pool"
         assert!(
             calls.iter().all(|(a, _, _)| !a.is_empty()),
             "no getLogs may go out without an address list: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(a, _, _)| {
+                a.iter().any(|x| x == "0x0000000000000000000000000000000000000011")
+                    && a.iter().any(|x| x == "0x0000000000000000000000000000000000000022")
+            }),
+            "one fetch serves the static co-tenant and the factory together: {calls:?}"
         );
     }
 
