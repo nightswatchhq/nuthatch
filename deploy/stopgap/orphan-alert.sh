@@ -154,19 +154,31 @@ post_list() {
   post "$msg"
 }
 
+# Each list's state is committed as soon as its own page is accepted, so a failed second page cannot
+# replay the first. Delivery is at least once: only a kill between a post and its mv repeats a page.
+commit() {
+  local prefix=$1 net
+  for net in $networks; do
+    mv "$work/$prefix$net.ids" "$state_dir/$prefix$net.ids"
+  done
+}
+
 now=$(date -u +%s)
 orphans=$(wc -l < "$work/orphan.joined" | tr -d ' ')
 fdnonly=$(wc -l < "$work/fdnonly.joined" | tr -d ' ')
-if [ "$now" -ge "$from_s" ]; then
-  [ "$orphans" -eq 0 ] || post_list "STOPGAP ORPHAN: $orphans deployment(s) joined the list (signal, no indexer), https://www.lodestar-dashboard.com/subgraphs/migration" "$work/orphan.joined" || exit 1
-  [ "$fdnonly" -eq 0 ] || post_list "STOPGAP FOUNDATION-ONLY: $fdnonly deployment(s) now served only by the Foundation's upgrade indexer, which stops by 2026-10-31" "$work/fdnonly.joined" || exit 1
-elif [ $((orphans + fdnonly)) -gt 0 ]; then
+if [ "$now" -lt "$from_s" ] && [ $((orphans + fdnonly)) -gt 0 ]; then
   say "$orphans orphan and $fdnonly foundation-only joins before $from; recorded, not posted"
 fi
+if [ "$now" -ge "$from_s" ] && [ "$orphans" -gt 0 ]; then
+  post_list "STOPGAP ORPHAN: $orphans deployment(s) joined the list (signal, no indexer), https://www.lodestar-dashboard.com/subgraphs/migration" "$work/orphan.joined" || exit 1
+fi
+commit ""
+if [ "$now" -ge "$from_s" ] && [ "$fdnonly" -gt 0 ]; then
+  post_list "STOPGAP FOUNDATION-ONLY: $fdnonly deployment(s) now served only by the Foundation's upgrade indexer, which stops by 2026-10-31" "$work/fdnonly.joined" || exit 1
+fi
+commit "fdnonly-"
 
 for net in $networks; do
-  mv "$work/$net.ids" "$state_dir/$net.ids"
-  mv "$work/fdnonly-$net.ids" "$state_dir/fdnonly-$net.ids"
   printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$net" \
     "$(wc -l < "$state_dir/$net.ids" | tr -d ' ')" "$(wc -l < "$state_dir/fdnonly-$net.ids" | tr -d ' ')" >> "$state_dir/sizes.tsv"
 done
