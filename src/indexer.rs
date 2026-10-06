@@ -13122,8 +13122,10 @@ template = "pool"
         );
         assert!(
             calls.iter().any(|(a, _, _)| {
-                a.iter().any(|x| x == "0x0000000000000000000000000000000000000011")
-                    && a.iter().any(|x| x == "0x0000000000000000000000000000000000000022")
+                a.iter()
+                    .any(|x| x == "0x0000000000000000000000000000000000000011")
+                    && a.iter()
+                        .any(|x| x == "0x0000000000000000000000000000000000000022")
             }),
             "one fetch serves the static co-tenant and the factory together: {calls:?}"
         );
