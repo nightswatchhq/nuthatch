@@ -201,7 +201,7 @@ impl Inputs<'_> {
 }
 
 /// A remembered answer: the output and the entity watermarks it was answered from, which ride out
-/// in the provenance exactly as they did the first time.
+/// in the provenance exactly as they did the first time. The head it cites is read on the hit.
 pub struct Entry {
     pub out: QueryOutput,
     pub watermarks: crate::entity_view::Watermarks,
@@ -209,12 +209,6 @@ pub struct Entry {
     /// was computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
     pub tables: Option<std::collections::BTreeSet<String>>,
     pub segments: Vec<(PathBuf, u64, i64)>,
-    /// The provenance the rows were computed under - `last_block` and the sealed watermark read in
-    /// the same blocking task as the query. A hit cites these, never the live store: the store may
-    /// have moved between the lookup and the response, and a citation that names a newer state for
-    /// older rows is false even when every row in it is right (Jules on #1189).
-    pub as_of: Option<u64>,
-    pub sealed_through: u64,
     bytes: usize,
 }
 
@@ -279,13 +273,11 @@ impl Memo {
     /// Remember `out` under `key`. Returns whether it was kept: a degraded or tip-less answer is not,
     /// and neither is one larger than a quarter of the ceiling. Evicts least recently used entries
     /// until the total fits.
-    #[allow(clippy::too_many_arguments)]
     pub fn put(
         &self,
         key: Key,
         out: &QueryOutput,
         watermarks: &crate::entity_view::Watermarks,
-        provenance: (Option<u64>, u64),
         segments: Vec<(PathBuf, u64, i64)>,
         cap: usize,
     ) -> bool {
@@ -324,8 +316,6 @@ impl Memo {
                     watermarks: watermarks.clone(),
                     tables: out.referenced_tables.clone(),
                     segments,
-                    as_of: provenance.0,
-                    sealed_through: provenance.1,
                     bytes,
                 }),
                 tick,
@@ -371,10 +361,9 @@ pub fn put(
     key: Key,
     out: &QueryOutput,
     watermarks: &crate::entity_view::Watermarks,
-    provenance: (Option<u64>, u64),
     segments: Vec<(PathBuf, u64, i64)>,
 ) -> bool {
-    GLOBAL.put(key, out, watermarks, provenance, segments, max_bytes())
+    GLOBAL.put(key, out, watermarks, segments, max_bytes())
 }
 pub fn bytes() -> usize {
     GLOBAL.bytes()
@@ -555,10 +544,10 @@ mod tests {
         let wm = BTreeMap::new();
         let mut out = rows(1);
         out.degraded_tables.insert("t".into());
-        assert!(!put(Key([1; 32]), &out, &wm, (None, 0), Vec::new()));
+        assert!(!put(Key([1; 32]), &out, &wm, Vec::new()));
         let mut out = rows(1);
         out.tip_unavailable = true;
-        assert!(!put(Key([2; 32]), &out, &wm, (None, 0), Vec::new()));
+        assert!(!put(Key([2; 32]), &out, &wm, Vec::new()));
         assert!(get(&Key([1; 32])).is_none());
         assert!(get(&Key([2; 32])).is_none());
     }
@@ -574,14 +563,14 @@ mod tests {
         // Room for four entries and a little, never five; each is under a quarter of it.
         let cap = one * 4 + one / 2;
         for n in 1..=4 {
-            assert!(m.put(k(n), &rows(10), &wm, (None, 0), Vec::new(), cap));
+            assert!(m.put(k(n), &rows(10), &wm, Vec::new(), cap));
         }
         assert_eq!(m.entries(), 4);
         assert!(
             m.get(&k(1), cap).is_some(),
             "touching 1 makes 2 the least recently used"
         );
-        assert!(m.put(k(5), &rows(10), &wm, (None, 0), Vec::new(), cap));
+        assert!(m.put(k(5), &rows(10), &wm, Vec::new(), cap));
         assert!(m.bytes() <= cap, "the ceiling holds");
         assert_eq!(m.entries(), 4, "exactly one entry made room");
         assert!(
@@ -602,11 +591,11 @@ mod tests {
         let wm = BTreeMap::new();
         let out = rows(10);
         let cap = size_of(&out) * MAX_ENTRY_SHARE - 1;
-        assert!(!m.put(Key([0xb1; 32]), &out, &wm, (None, 0), Vec::new(), cap));
+        assert!(!m.put(Key([0xb1; 32]), &out, &wm, Vec::new(), cap));
         assert!(m.get(&Key([0xb1; 32]), cap).is_none());
-        assert!(m.put(Key([0xb2; 32]), &out, &wm, (None, 0), Vec::new(), cap + 1));
+        assert!(m.put(Key([0xb2; 32]), &out, &wm, Vec::new(), cap + 1));
         assert!(
-            !m.put(Key([0xb3; 32]), &out, &wm, (None, 0), Vec::new(), 0),
+            !m.put(Key([0xb3; 32]), &out, &wm, Vec::new(), 0),
             "zero disables"
         );
         assert!(

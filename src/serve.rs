@@ -3918,8 +3918,17 @@ async fn run_sql_query_at(
                 .filter(|e| e.unavailable().is_none() && e.fault().is_none())
                 .map(|e| (e.name().to_string(), e.fence_watermark()))
                 .collect();
+            // The head the hit cites is read before the fence, so the fence covers it: a commit that
+            // changed a row by `as_of` has already moved the generation (#1951, Jules on #1955).
+            let as_of = s
+                .store
+                .get_meta("last_block")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok());
+            let sealed_through = s.store.sealed_through();
             if s.store.rows_generation() == Some(*generation)
-                && crate::sqlmemo::sealed_segments(&s.dir, s.store.sealed_through()).as_ref()
+                && crate::sqlmemo::sealed_segments(&s.dir, sealed_through).as_ref()
                     == Some(sealed)
                 && still == *before
                 // And the cold side the answer was computed over is the one still on disk: a
@@ -3930,13 +3939,7 @@ async fn run_sql_query_at(
                 && crate::sqlmemo::segment_stamps(&s.dir, hit.tables.as_ref()) == hit.segments
             {
                 METRICS.inc_sql();
-                return sql_response(
-                    &s,
-                    &hit.out,
-                    &hit.watermarks,
-                    (hit.as_of, hit.sealed_through),
-                    true,
-                );
+                return sql_response(&s, &hit.out, &hit.watermarks, (as_of, sealed_through), true);
             }
         }
     }
@@ -4116,7 +4119,7 @@ async fn run_sql_query_at(
                 if after.0 == Some(generation) && after.2 == Some(sealed) && watermarks == before {
                     let segments =
                         crate::sqlmemo::segment_stamps(&s.dir, out.referenced_tables.as_ref());
-                    crate::sqlmemo::put(key, &out, &watermarks, provenance, segments);
+                    crate::sqlmemo::put(key, &out, &watermarks, segments);
                 }
             }
             sql_response(&s, &out, &watermarks, provenance, false)
@@ -9017,6 +9020,14 @@ mod tests {
             "a poll and a watermark that passed no row: {polled}"
         );
         assert_eq!(polled["rows"][0]["n"], 2);
+        assert_eq!(
+            (
+                polled["provenance"]["as_of"].clone(),
+                polled["provenance"]["sealed_through"].clone()
+            ),
+            (json!(12), json!(5)),
+            "a hit cites the head it was checked at, not the one it was computed at"
+        );
 
         let sealed: Vec<String> = (6..=8).map(row).collect();
         crate::seal::seal_range(tmp.path(), &sealed, 6, 8).unwrap();
