@@ -90,6 +90,10 @@ covering the list, the numbers above, what the nest answers and what it refuses 
 
 ## Decided
 
+- **The stopgap runs on demand (Chief, 2026-10-07).** A nest is stood up when someone whose Studio
+  subgraph lost service asks for one, not ahead of demand. The orphan alert keeps watching the chains Studio
+  drops so we know who is at risk; the offer in the forum post and the dispatch is how they reach us. A hosted
+  nest that goes unused is retired with a dated note, as BetSwirl was.
 - **Who runs a stopgap nest when the developer cannot: we do.** Chief lifted the 2026-09-29
   no-hosting rule for this programme on 2026-10-06 (CLAUDE.md, out-of-scope list). Nests are served
   from the ThinkPad or new VPSes, stock binary, no billing, until an indexer allocates. The
