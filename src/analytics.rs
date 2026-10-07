@@ -1196,14 +1196,13 @@ fn attempt(
                 .as_ref()
                 .and_then(|r| reachable_tables(session, dir, r))
             {
-                let sealed =
-                    crate::sqlmemo::sealed_segments(dir, sealed_through).unwrap_or_default();
                 let engine = session.engine_version();
                 for v in maintained.iter().filter(|v| full.contains(*v)) {
                     let one = std::collections::BTreeSet::from([v.clone()]);
                     let Some(closure) = reachable_tables(session, dir, &one) else {
                         continue;
                     };
+                    let sealed = crate::maintained::sealed_inputs(dir, sealed_through, &closure);
                     let id = crate::maintained::identity(
                         v,
                         &engine,

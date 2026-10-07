@@ -57,6 +57,27 @@ pub(crate) fn identity(
     hex::encode(h.finalize())
 }
 
+/// The sealed segments at or below `sealed_through` of the tables in `closure` only, so a segment
+/// sealed for a table the view never reads does not move its identity.
+pub(crate) fn sealed_inputs(dir: &Path, sealed_through: u64, closure: &BTreeSet<String>) -> String {
+    let Ok(manifest) = crate::seal::load_manifest(dir) else {
+        return String::new();
+    };
+    let mut h = Sha256::new();
+    for (table, segs) in &manifest.tables {
+        if !closure.contains(&table.to_ascii_lowercase()) {
+            continue;
+        }
+        for seg in segs.iter().filter(|s| s.to_block <= sealed_through) {
+            for part in [table.as_str(), seg.file.as_str(), seg.hash.as_str()] {
+                h.update((part.len() as u64).to_le_bytes());
+                h.update(part.as_bytes());
+            }
+        }
+    }
+    hex::encode(h.finalize())
+}
+
 pub(crate) fn path(dir: &Path, view: &str, id: &str) -> PathBuf {
     dir.join("maintained").join(view).join(format!("{id}.parquet"))
 }
