@@ -263,7 +263,7 @@ fn the_page_names_the_disagreement_not_a_known_difference() {
     out(
         &r,
         "sealed",
-        "    9 nest-only rows are self-collections (payer == collector) KNOWN-DIFF (#1114)\n  deposits nest=4 subgraph=5 matched=4 DIFF\n",
+        "    12 nest-only rows were not collected by GraphTallyCollector, which the subgraph does not record KNOWN-DIFF (#1114, #1983)\n  deposits nest=4 subgraph=5 matched=4 DIFF\n",
     );
     let (code, text) = run(&r);
     assert_eq!(code, 1, "{text}");

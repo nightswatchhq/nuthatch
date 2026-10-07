@@ -7,7 +7,7 @@
 #
 # Exit status:
 #   0  parity CLEAN - every comparison ran and agreed
-#   2  parity NOT CLEAN - every gated comparison agreed, known differences remain (#1116, #1114)
+#   2  parity NOT CLEAN - every gated comparison agreed, known differences remain (#1116, #1114, #1983)
 #   1  anything else, including a genuine disagreement and any failure to compare
 #   3  head mode only: the subgraph could not be asked at the nest's head, so nothing was compared
 #   4  the subgraph side did not answer (auth or GraphQL error, HTTP error, timeout, malformed
@@ -859,11 +859,10 @@ print("  nest types: %s" % ", ".join("%s=%s" % (t["type"], t["n"]) for t in type
 # 70,000+ rows is well past the node's 50,000-row result cap, so this pages by block. The count is
 # taken first and asserted against the assembled set: a page boundary that dropped or double-counted
 # rows would otherwise look exactly like a parity difference, and get reported as one.
-self_collected = set()
 escrow_known_diff = False
 
 def nest_escrow_ids(table):
-    """Paged read of one escrow source table, keyed the way the subgraph keys it.
+    """Paged read of one escrow source table, keyed the way the subgraph keys it, to each row's collector.
 
     70,000+ rows is well past the node's 50,000-row result cap, so this pages by block. The count is
     taken first and asserted against the assembled set: a page boundary that dropped or double-counted
@@ -879,17 +878,14 @@ def nest_escrow_ids(table):
     # Half the cap per page, so a dense block range still lands inside it.
     pages = max(1, (expect // 25000) + 1)
     step = ((hi - lo) // pages) + 1
-    out, cur = set(), lo
+    out, cur = {}, lo
     while cur <= hi:
         for r in nest_sql(
             "SELECT tx_hash, log_index, payer, collector FROM %s"
             " WHERE block_number >= %s AND block_number < %s AND block_number <= %s"
             % (table, cur, cur + step, block)
         ):
-            key = (r["tx_hash"].lower(), int(r["log_index"]))
-            out.add(key)
-            if str(r["payer"]).lower() == str(r["collector"]).lower():
-                self_collected.add(key)
+            out[(r["tx_hash"].lower(), int(r["log_index"]))] = str(r["collector"]).lower()
         cur += step
     if len(out) != expect:
         raise SystemExit(
@@ -956,7 +952,7 @@ if unknown_types:
     print("    subgraph has unmodelled escrow types not compared: %s" % ", ".join(sorted(unknown_types)))
 
 collected_off, nest_collected = derive_offset("collected/redeem", nest_collected_raw, sg_collected)
-self_collected = {(t, l + collected_off) for t, l in self_collected}
+collector_of = {(t, l + collected_off): c for (t, l), c in nest_collected_raw.items()}
 only_nest = sorted(nest_collected - sg_collected)
 only_sg = sorted(sg_collected - nest_collected)
 status = "OK" if not only_nest and not only_sg else "DIFF"
@@ -964,24 +960,40 @@ print(
     "  collected/redeem nest=%s subgraph=%s matched=%s %s"
     % (len(nest_collected), len(sg_collected), len(nest_collected & sg_collected), status)
 )
-# #1114: the nest-only rows are `EscrowCollected` events where one address collects from itself.
-# The subgraph drops them, and the nest is the one that is right. That is a KNOWN-DIFF, but it is
-# recorded as a *rule* rather than a list of ids: a nest-only row whose payer differs from its
-# collector is not explained by it and is a hard failure. A hardcoded list of nine hashes would
-# have absorbed the tenth.
-known_self = [k for k in only_nest if k in self_collected]
-unexplained = [k for k in only_nest if k not in self_collected]
-if known_self:
+# The subgraph's redeems come from GraphTallyCollector's `PaymentCollected`, one log after the escrow
+# event (the +1 base above); handleEscrowCollected records none (graph-network-subgraph
+# src/mappings/paymentsEscrow.ts:76, graphTallyCollector.ts:47). A collection by any other collector,
+# an EOA collecting from itself (#1114) or from another payer (#1983), is therefore nest-only and
+# KNOWN-DIFF, recorded as a *rule* rather than a list of ids: a nest-only row collected by
+# GraphTallyCollector fails. A hardcoded list of nine hashes would have absorbed the tenth.
+# Arbitrum One, from @graphprotocol/address-book horizon/addresses.json, which the subgraph builds from.
+GRAPH_TALLY_COLLECTOR = "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e"
+# The rule is only as good as the address, so every matched row must prove it.
+not_tally = sorted(k for k in nest_collected & sg_collected if collector_of[k] != GRAPH_TALLY_COLLECTOR)
+if not_tally:
+    failed = True
+    print(
+        "    %s matched collections were not collected by GraphTallyCollector %s, so the rule is unexplained:"
+        % (len(not_tally), GRAPH_TALLY_COLLECTOR)
+    )
+    for k in not_tally[:20]:
+        print("      %s log_index=%s collector=%s" % (k[0], k[1] - collected_off, collector_of[k]))
+known_other = [k for k in only_nest if collector_of[k] != GRAPH_TALLY_COLLECTOR]
+unexplained = [k for k in only_nest if collector_of[k] == GRAPH_TALLY_COLLECTOR]
+if known_other:
     escrow_known_diff = True
     print(
-        "    %s nest-only rows are self-collections (payer == collector) KNOWN-DIFF (#1114)"
-        % len(known_self)
+        "    %s nest-only rows were not collected by GraphTallyCollector, which the subgraph does not"
+        " record KNOWN-DIFF (#1114, #1983)" % len(known_other)
     )
-    for tx, li in known_self[:5]:
-        print("      %s log_index=%s" % (tx, li - collected_off))
+    for tx, li in known_other[:5]:
+        print("      %s log_index=%s collector=%s" % (tx, li - collected_off, collector_of[(tx, li)]))
 if unexplained:
     failed = True
-    print("    %s nest-only rows are NOT self-collections and are unexplained:" % len(unexplained))
+    print(
+        "    %s nest-only rows were collected by GraphTallyCollector and are unexplained:"
+        % len(unexplained)
+    )
     for tx, li in unexplained[:20]:
         print("      %s log_index=%s" % (tx, li - collected_off))
 if only_sg:
@@ -1010,7 +1022,7 @@ if unmodelled:
 
 known = list(epoch_known_names)
 if escrow_known_diff:
-    known.append("escrow_self_collections")
+    known.append("escrow_non_tally_collections")
 with open(os.environ["EPOCH_SUMMARY"], "w") as fh:
     fh.write("%s %s\n" % (epoch_gated_n, ",".join(known) or "-"))
 
@@ -1072,6 +1084,6 @@ fi
 # Every gated comparison agreed, and three epoch fields still do not. Reporting that as OK would be
 # the same fault this script was rewritten to remove, one level up: a known absence of proof reading
 # as proof. Distinct exit status, so an operator can tell "agrees" from "agrees on what we check".
-echo "  NOT proved: ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1116, #1114 and #1819"
+echo "  NOT proved: ${EPOCH_KNOWN} remain KNOWN-DIFF, see #1116, #1114, #1819 and #1983"
 echo "parity NOT CLEAN at block $BLOCK ($MODE): gated comparisons agree, known differences outstanding"
 exit 2
