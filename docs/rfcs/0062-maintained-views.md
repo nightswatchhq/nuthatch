@@ -1,8 +1,9 @@
 # RFC-0062: Maintained views - a join-heavy view answered from a stored copy of its own evaluation
 
-- Status: **Accepted by Chief 2026-10-07 (#1975). S1 (lazy maintained views) built; S2 to S4 not
-  started.** Tracking #1973. The S0 spike lives on the throwaway branch `pete/rfc-0062-s0-spike` and is
-  never merged; S1's measured results are in §8a.
+- Status: **Accepted by Chief 2026-10-07 (#1975). S1 (lazy maintained views, #1977) and S2 (eager
+  builds and the reorg, #1979) built; S3 and S4 not started.** Tracking #1973. The S0 spike lives on
+  the throwaway branch `pete/rfc-0062-s0-spike` and is never merged; S1's measured results are in §8a,
+  S2's in §8b.
 - Author: Pete (cargopete)
 - Date: 2026-10-07
 - Depends on: RFC-0018 §1 (authored views, evaluated per request over hot ∪ sealed), #1186 and #1955
@@ -242,6 +243,8 @@ Builds are idempotent: two builds of one identity write equal rows, and the last
 - **S2, eager:** after each commit and each seal that changes a maintained view's identity, the builder
   queues it. Latest wins: a queued build whose identity is no longer current is dropped before it runs.
   Builds never run inside the commit or the seal, and S2's acceptance checks tip lag is unchanged.
+  As built, a window that ends below the tip (a backfill or a catch-up) marks nothing, and a process
+  that commits nothing (`serve`) plans from the store when a request finds no copy.
 
 A block that carries no rows for any table in a view's closure does not change its identity and causes
 no build. On BetSwirl today that is every block.
@@ -484,6 +487,75 @@ altered is S3's verification.
 eager builds. S1's queue keeps one pending build per view, the newest request's, so a stale identity
 can still be built once before S2's latest-wins drops it. Copies of a view no longer declared stay on
 disk until deleted by hand.
+
+## §8b - S2 measured
+
+**Verdict: S2's criteria 3 and 6 pass, tip lag's after-seen p50 is unchanged, the Lodestar gate
+passes, and every named mutation goes red.** PR #1979, merged 2026-10-07 as 9b825819. The ThinkPad
+binaries were built at b7900a7b, whose `src/` is main's as merged (the later commits are tests).
+
+**What was built.** The indexer marks a nest after each commit and each seal of a window that reaches
+the tip; nothing is read or built on that path. The cursor's builder reads the store's hot rows and
+watermark through a feed registered in `build_nest`, works out each declared view's identity, and
+queues a build for each whose copy is missing, replacing whatever was queued for the nest. Latest
+wins: a queued build whose nest has been marked again is dropped before it takes a permit, and a
+request on a fed nest asks for a plan rather than queueing the inputs it read. The feed holds the
+store weakly, so a stopped nest's redb lock is not kept. Copies of a view no longer declared are
+handed to the read leases when the declaration is loaded, and the directory goes with them.
+
+**Criterion 3, a forced reorg** (`tests/e2e_maintained_reorg.rs`). Two nests follow one scripted
+chain, one declaring two views maintained (an aggregate, and a left join with a window over it), the
+other declaring nothing. The chain seals 20,000 rows, then reorgs 1, 3 and 5 blocks deep, each
+followed by a block past the reorg. At every head, five shapes answer byte-identically on both nests,
+first on whatever path the request took and then once every shape is served from a copy. The seal is
+rebuilt before any request asks for it. 18 copies were written over the run and none was modified;
+`received` answered 38 times from a copy, `transfer_seen` 16.
+
+**Criterion 6, an hour following BSC.** Three seeded copies (dataset `f00657c7`) followed BSC side
+by side with production's flags (60 s poll, the keyed endpoint), memo off: S2 and S1 declaring the
+seven views, 4.13.0 declaring nothing. The head moved 7,896 blocks (126,299,021 to 126,306,917).
+No block in the hour carried a BetSwirl row (`nuthatch_rows_decoded_total` stayed at 0), and S2
+built nothing: its seven copies, built once on the first start after the seed, stayed current, and
+all 106 rounds of a skip-0 `bets` page and `tokens` were served from them (0 fallbacks).
+
+| | builds in the hour | skip-0 p50 / max | `tokens` p50 / max | RSS max | high-water |
+|---|---:|---:|---:|---:|---:|
+| S2 | 0 | 0.240 / 0.277 s | 0.056 / 0.080 s | 129 MB | 176 MB |
+| S1 | 7, lazily, on the first request | 0.242 / 2.036 s | 0.057 / 0.980 s | 168 MB | 1,358 MB |
+| 4.13.0 | - | 2.102 / 2.346 s | 0.937 / 1.060 s | 227 MB | 881 MB |
+
+Tip lag stayed at 0 blocks in 316 of 316 S2 samples. S1's high-water is its lazy build of all seven
+views beside the request that asked; S2 paid that on its first start, before the hour.
+
+**Tip lag, after seen.** The CI fixture (`.github/workflows/tip-lag.sh`), on the ThinkPad, with S1
+and S2 declaring a maintained view over every block's four rows, so S2 builds after every commit
+(107 builds per run) while the samples read the event table. Three interleaved rounds of 100 samples:
+
+| build | after-seen p50, three rounds | builds per run |
+|---|---|---:|
+| 4.13.0, nothing declared | 29, 28, 28 ms | - |
+| S1 | 30, 28, 28 ms | 0 |
+| S2 | 29, 27, 27 ms | 107 |
+
+**Criterion 4 again, the Lodestar release gate** (`scripts/release-gate.sh`, the alloc-nest copy as
+it stood, v4.13.0 measured first): **PASS**. 75 of 75 answered, 0 regressed, 0 answers differ; p99
+2,623 ms against 2,602 ms; peak RSS 1,913 MiB against 1,897 MiB, inside 2,048.
+
+**Mutations, each red on its named test.** Dropping the hot rows from the identity
+(`a_maintained_view_is_its_definition_at_every_head_through_reorgs`, criterion 3's test); no mark
+after a seal, and no feed (the same test, which waits for the seal's build with no request); marking
+nothing at all (`an_eager_build_needs_no_request`); building a superseded job
+(`a_queued_build_of_old_inputs_is_never_run`); a request queueing the inputs it read
+(`a_request_never_queues_the_old_inputs_it_read`); a plan keeping the nest's earlier jobs
+(`inputs_that_return_to_a_built_state_build_nothing`); keeping an undeclared view's copies
+(`copies_of_a_view_no_longer_declared_are_removed`).
+
+**What the hour did not show.** A data-bearing BSC block: BetSwirl has placed no bet since March, so
+the hour can only show that blocks without rows build nothing. That a block with rows builds once per
+affected view is shown by the reorg test and the tip-lag fixture, not on BSC. S3 counts it there.
+
+**Moves to S3.** `check --maintained`, and the second build a data-bearing block costs when its rows
+seal (§3.8).
 
 ## §9 - Risks
 
