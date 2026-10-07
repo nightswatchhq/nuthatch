@@ -244,6 +244,14 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > indexer-service-rs and tap-agent only, and the "not a drop-in replacement" rule stands. Reopening
 > is Chief's call on whether that is worth the remaining sprints. The trackers are #1441 and #1442.
 >
+> **RFC-0062 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0062](docs/rfcs/0062-maintained-views.md) (maintained views) on 2026-10-07 after its S0 spike put
+> every BetSwirl SDK shape under 1 s cold with byte-identical answers. It is new capability in the
+> default binary, opt-in per nest through `maintained.toml`, which stays outside the data identity. A
+> maintained copy is the request-time view evaluated by the same engine and reused only when every
+> input hashes the same, so it adds no second implementation and nothing to the data path that
+> determinism forbids. Each slice is gated on byte-identical answers and the Lodestar release gate.
+>
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
 > the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred
