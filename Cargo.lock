@@ -1549,7 +1549,7 @@ dependencies = [
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nightswatchhq/burrmill?rev=d8f79e44126dc2ff1fd1af4a629f793b5d73b1ed#d8f79e44126dc2ff1fd1af4a629f793b5d73b1ed"
+source = "git+https://github.com/nightswatchhq/burrmill?rev=0777d7620a862ae55cbce09938199f32324b3112#0777d7620a862ae55cbce09938199f32324b3112"
 dependencies = [
  "arrow 59.3.0",
  "arrow-schema 59.3.0",
@@ -1580,6 +1580,7 @@ dependencies = [
  "object_store 0.12.5",
  "parquet 59.3.0",
  "rayon",
+ "recursive",
  "regex",
  "rustc-hash",
  "serde_json",

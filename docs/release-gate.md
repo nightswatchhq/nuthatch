@@ -153,8 +153,8 @@ its answers reported as not compared. A run writing a baseline and the run readi
 `tests/release_gate_script.rs` runs the script against a nest sealed from the fixture chain: a
 refused query fails and is named, an answered set passes and writes a baseline, a regression fails
 past the bound and passes inside it, and a candidate answering differently from its baseline (a view
-edited between the runs) fails with the first differing row, while rows reordered under no `ORDER
-BY`, a float 1e-13 off (as a number or as text) and a volatile statement's new
+edited between the runs) fails with the first differing row, while rows reordered under no top-level `ORDER
+BY` (none at all, or one in a subquery), a float 1e-13 off (as a number or as text) and a volatile statement's new
 answer pass.
 
 ## What it does not catch
