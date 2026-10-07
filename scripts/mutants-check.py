@@ -124,7 +124,14 @@ def main():
     # A timeout is judged against the same baseline: it is an outcome the suite failed to produce a
     # verdict for, which is the same thing a survivor is, arrived at more slowly.
     new_timeouts = [t for t in timed_out if t not in known]
-    gone = [k for k in known if k not in found and k not in timed_out]
+    # Only a mutant this run enumerated can be stale. A shard runs an eighth of a file, and judging
+    # the rest of the file's baseline from it told #1971 to remove four entries that still survive.
+    tested = set(survivors("\n".join(
+        (o.get("scenario") or {}).get("Mutant", {}).get("name", "")
+        for o in json.loads(OUTCOMES.read_text()).get("outcomes") or []
+        if isinstance(o.get("scenario"), dict)
+    )))
+    gone = [k for k in known if k in tested and k not in found and k not in timed_out]
 
     for f, m in gone:
         print(f"note: baseline entry no longer survives, remove it: {f}: {m}")
