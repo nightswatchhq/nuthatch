@@ -204,6 +204,17 @@ would otherwise have been served from copies made by 4.2.x as if nothing had hap
 The hot rows are in it by content, not by `rows_generation`, because a generation counter restarts with
 the process and a copy outlives it.
 
+**The hot rows' serialization is canonical.** Tables in name order. Within a table, rows in order of
+their canonical bytes below, so a table without a `log_index` (a `[[calls]]` result) is ordered as
+surely as an event table. Each row as JSON with its
+keys in sorted order and its values exactly as the hot store holds them, which is already canonical
+text for every column but the four `UBIGINT` counters (`seal::rows_to_batch`), and `null` for an absent
+value. Each table and each row is length-prefixed, as the memo's fields are. The spike hashed rows in
+the store's iteration order; S1 replaces that with this. The failure it prevents is a spurious rebuild
+when the same rows come back in another order after a restart or a reorg. A non-canonical encoding can
+never cause a wrong answer, because two different row sets still serialize differently: it can only miss
+a copy that exists.
+
 ### 3.3 Reading
 
 In `analytics::attempt`, after the security walk and before views are defined:
