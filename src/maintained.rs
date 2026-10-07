@@ -73,6 +73,16 @@ pub(crate) fn refusal(
     bodies: &BTreeMap<String, String>,
     entities: &BTreeSet<String>,
 ) -> Option<String> {
+    // The name becomes a directory under `maintained/`.
+    if view.is_empty()
+        || !view
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Some(format!(
+            "`{view}` is not a plain view name (lowercase letters, digits and `_`)"
+        ));
+    }
     if !bodies.contains_key(view) {
         return Some(format!("`{view}` is not an authored view in views/*.sql"));
     }
@@ -972,6 +982,13 @@ mod tests {
         assert!(refusal("v", None, &bodies, &entities)
             .unwrap()
             .contains("could not be worked out"));
+        // A name that is not a plain identifier never becomes a path, even if a body had it.
+        let mut odd = bodies.clone();
+        for name in ["..", "../escape", "/tmp/cache", "a/b", "."] {
+            odd.insert(name.to_string(), "SELECT 1".to_string());
+            let why = refusal(name, Some(&closure(&[name])), &odd, &entities).unwrap();
+            assert!(why.contains("not a plain view name"), "{name}: {why}");
+        }
     }
 
     /// No file, no declaration, nothing held: the deletion test's first half.
@@ -1010,6 +1027,21 @@ mod tests {
         );
         let err = load(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("A: declared twice"), "{err}");
+
+        // A quoted view name that is a path: never an authored view, never declared.
+        std::fs::write(
+            tmp.path().join("views/b.sql"),
+            "CREATE VIEW \"../escape\" AS SELECT 1 AS id;",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(DECLARATION_FILE),
+            "[[view]]\nname = \"../escape\"\n",
+        )
+        .unwrap();
+        let err = load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("not a plain view name"), "{err}");
+        assert!(!is_declared(tmp.path()));
 
         std::fs::write(
             tmp.path().join(DECLARATION_FILE),
