@@ -7,8 +7,9 @@ is visible, diffable, and agent-legible instead of living in ad-hoc REPL queries
 ## What a view is (and isn't)
 
 - A view is a read-only `CREATE VIEW …` over the nest's tables. It's **recomputed per query** over the
-  live tip ∪ sealed history (one surface) - never materialised, never written back, never in the
-  ingest/decode/seal path. Adding a view can't corrupt data or slow indexing.
+  live tip ∪ sealed history (one surface) - never written back, never in the ingest/decode/seal path,
+  and not materialised unless you declare it maintained (below). Adding a view can't corrupt data or
+  slow indexing.
 - It is **not** an incrementally-maintained entity. A view is just SQL that runs when you query it.
   The shipped IVM relations are the three built-in circuits (`balances`, `exposure`, `velocity`) and,
   since 3.0.0, whatever a nest declares in `entities.toml` - see [entities.md](entities.md). Choose a
@@ -60,6 +61,25 @@ nuthatch sql "SELECT * FROM top_recipients"
    columns are bools.
 4. **The hot/cold seam.** A view sees the whole hot ∪ cold surface, so results are current - but it's
    recomputed each query, not a maintained snapshot. `schema` shows `sealed_through` vs the tip.
+
+## When a view is too slow: `maintained.toml` (RFC-0062)
+
+A view is recomputed on every request. When one is expensive (a page of a join-heavy view over the
+whole history takes seconds) and its tables change less often than it is asked, declare it in
+`maintained.toml` at the nest root:
+
+```toml
+[[view]]
+name = "top_recipients"
+```
+
+The nest then answers it from a stored copy of its own evaluation, rebuilt whenever anything it reads
+changes, and from the definition until the rebuild lands. Answers are identical either way. It
+suits a view that is asked often and whose whole history evaluates in the analytics pool; it does not
+suit one whose tables gain rows every block, which is never current and simply answers as before. A
+view that calls `now()` or reads `labels`, an `offchain__*` view or an entity cannot be maintained and
+refuses the nest at startup. [config-reference.md](config-reference.md) has the file;
+[entities.md](entities.md) is the alternative for an aggregate that must cost only the new rows.
 
 ## Validation is loud (RFC-0018 §1)
 

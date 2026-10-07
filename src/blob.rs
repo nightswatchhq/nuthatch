@@ -134,6 +134,11 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
             if EXCLUDE.iter().any(|x| *x == name) {
                 continue;
             }
+            // RFC-0062's copies are derived state written beside `segments/`. Only that directory, at
+            // the root, so a deeper authored one keeps its place in the identity.
+            if dir == root && name == crate::maintained::COPIES_DIR && entry.file_type()?.is_dir() {
+                continue;
+            }
             if let Some(skip) = skip {
                 if path == skip {
                     continue;
@@ -230,6 +235,9 @@ const NON_DATA_INPUTS: &[&str] = &[
     "graph/history.toml",
     // RFC-0059: folds are read at query time over stored facts and never change a stored byte.
     "folds/",
+    // RFC-0062: which views are answered from copies. A copy is a cache of a view's answer, so
+    // declaring one changes no stored byte and must not stop a nest seeding from a mirror without it.
+    crate::maintained::DECLARATION_FILE,
     "entities.toml",
     "semantic.toml",
     "llms.txt",
@@ -1251,6 +1259,7 @@ abi = "abis/c.json"
             "llms.txt",
             "README.md",
             ".claude/skills/x.md",
+            "maintained.toml",
         ] {
             assert!(!affects_data(excluded), "{excluded} should be excluded");
         }
@@ -1264,9 +1273,43 @@ abi = "abis/c.json"
             "my-views/x.sql",
             "semantic.toml.bak",
             "docs/README.md",
+            "maintained.toml.bak",
         ] {
             assert!(affects_data(included), "{included} must affect data");
         }
+    }
+
+    /// RFC-0062: declaring a maintained view moves the NID, as any authored input does, and not the
+    /// data identity, so a nest that declares one still seeds from a mirror published without it.
+    /// The copies are derived state and move neither; a deeper directory of the same name is authored.
+    #[test]
+    fn maintained_views_move_the_nid_and_not_the_data() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let plain = build_manifest(a.path(), None).unwrap();
+        std::fs::write(
+            a.path().join("maintained.toml"),
+            "[[view]]\nname = \"bet\"\n",
+        )
+        .unwrap();
+        let declared = build_manifest(a.path(), None).unwrap();
+        assert_ne!(plain.nid(), declared.nid());
+        assert_eq!(plain.data_identity(), declared.data_identity());
+
+        let copies = a.path().join("maintained").join("bet");
+        std::fs::create_dir_all(&copies).unwrap();
+        std::fs::write(copies.join("ab.parquet"), b"PAR1").unwrap();
+        let built = build_manifest(a.path(), None).unwrap();
+        assert_eq!(built.nid(), declared.nid(), "a copy is not an input");
+        assert_eq!(built.data_identity(), declared.data_identity());
+
+        std::fs::create_dir_all(a.path().join("views").join("maintained")).unwrap();
+        std::fs::write(a.path().join("views/maintained/x.sql"), "SELECT 1").unwrap();
+        assert_ne!(
+            build_manifest(a.path(), None).unwrap().nid(),
+            declared.nid(),
+            "an authored directory of the same name below the root"
+        );
     }
 
     #[test]

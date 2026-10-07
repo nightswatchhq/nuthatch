@@ -501,7 +501,8 @@ impl Drop for ReadLease {
 
 /// Hand replaced files to the lease registry. Called after the manifest that stops naming them is
 /// installed, so a lease taken after this call reads that manifest and never plans against them.
-fn retire(dir: &Path, files: Vec<PathBuf>) {
+/// Maintained-view copies use it the same way, with their own record standing in for the manifest.
+pub(crate) fn retire(dir: &Path, files: Vec<PathBuf>) {
     if files.is_empty() {
         return;
     }
@@ -532,10 +533,7 @@ fn remove_retired(files: Vec<PathBuf>) {
     for old in files {
         if let Err(e) = std::fs::remove_file(&old) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    "folded provisional segment {} not removed: {e}",
-                    old.display()
-                );
+                tracing::warn!("retired file {} not removed: {e}", old.display());
             }
         }
     }

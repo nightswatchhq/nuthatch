@@ -38,6 +38,10 @@ pub fn check(args: CheckArgs) -> Result<()> {
         crate::allowlist::CEILING_FILE,
     )?;
     crate::config::refuse_unknown_file::<crate::semantic::Semantic>(&dir, "semantic.toml")?;
+    crate::config::refuse_unknown_file::<crate::maintained::Declaration>(
+        &dir,
+        crate::maintained::DECLARATION_FILE,
+    )?;
 
     // Grafting (RFC-0033) is reported **before** the parity checks, and before the no-checks bail: a
     // nest with no `checks/*.sql` is the common case, and its author still deserves to know which of
@@ -91,6 +95,12 @@ pub fn check(args: CheckArgs) -> Result<()> {
         println!("✗ incremental entity {}: {}", issue.name, issue.error);
         failures += 1;
     }
+    let maintained = crate::maintained::refusals(&dir)?;
+    for (view, why) in &maintained {
+        println!("✗ maintained view {view}: {why}");
+        failures += 1;
+    }
+    let has_maintained = crate::maintained::read(&dir)?.is_some_and(|d| !d.view.is_empty());
 
     if checks.is_empty() {
         let has_views = !analytics::nest_view_files(&dir).is_empty();
@@ -98,7 +108,7 @@ pub fn check(args: CheckArgs) -> Result<()> {
         // Only truly nothing to check - no checks, and either no views or no schema to validate them
         // against - keeps the original bail. A nest with views that were actually validated above
         // got a real answer instead, even with `checks/` empty.
-        if (!has_views || views_validated.is_none()) && !has_entities {
+        if (!has_views || views_validated.is_none()) && !has_entities && !has_maintained {
             bail!(
                 "no checks found in {} (expected checks/*.sql)",
                 dir.join("checks").display()

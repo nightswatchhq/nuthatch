@@ -1,8 +1,8 @@
 # RFC-0062: Maintained views - a join-heavy view answered from a stored copy of its own evaluation
 
-- Status: **Draft, S0 reported 2026-10-07: continue.** Awaiting Chief's acceptance. Tracking #1973,
-  approved for an RFC and an S0 spike on 2026-10-07. Nothing here is built on `main`; the spike lives on
-  the throwaway branch `pete/rfc-0062-s0-spike` and is never merged.
+- Status: **Accepted by Chief 2026-10-07 (#1975). S1 (lazy maintained views) built; S2 to S4 not
+  started.** Tracking #1973. The S0 spike lives on the throwaway branch `pete/rfc-0062-s0-spike` and is
+  never merged; S1's measured results are in §8a.
 - Author: Pete (cargopete)
 - Date: 2026-10-07
 - Depends on: RFC-0018 §1 (authored views, evaluated per request over hot ∪ sealed), #1186 and #1955

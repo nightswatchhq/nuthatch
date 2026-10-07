@@ -2037,12 +2037,39 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         }
         body
     };
+    // RFC-0062: absent unless the nest declares a maintained view.
+    let mut body = body;
+    if crate::maintained::is_declared(&s.dir) {
+        body["maintained"] = maintained_status(&s.dir);
+    }
     let code = if stalled {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
     };
     (code, Json(body)).into_response()
+}
+
+/// Each maintained view's copies and counters. A fact, not a verdict: a view with no copy still
+/// answers, from its definition.
+fn maintained_status(dir: &std::path::Path) -> Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::maintained::report(dir)
+        .into_iter()
+        .map(|(view, s, copies, bytes)| {
+            json!({
+                "view": view,
+                "copies": copies,
+                "copy_bytes": bytes,
+                "hits": s.hits.load(Relaxed),
+                "fallbacks": s.fallbacks.load(Relaxed),
+                "builds": s.builds.load(Relaxed),
+                "build_failures": s.build_failures.load(Relaxed),
+                "last_build_ms": s.last_build_ms.load(Relaxed),
+                "last_error": s.last_error(),
+            })
+        })
+        .collect()
 }
 
 /// The live status payload - nest identity, tip/sealed watermarks, and the IVM view counts. Built once
@@ -6684,6 +6711,40 @@ mod tests {
             json!(false),
             "the seal-direct fields describe a pass that never started, and always did"
         );
+    }
+
+    /// RFC-0062: `/ready` names each maintained view's copies and counters, and carries no such key
+    /// for a nest that declares none.
+    #[tokio::test]
+    async fn ready_reports_maintained_views_only_where_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, declare) in [("plain-ready", false), ("maintained-ready", true)] {
+            let nest = dir.path().join(name);
+            std::fs::create_dir_all(nest.join("views")).unwrap();
+            std::fs::write(
+                nest.join("views/v.sql"),
+                "CREATE VIEW bet AS SELECT 1 AS id;",
+            )
+            .unwrap();
+            if declare {
+                std::fs::write(
+                    nest.join(crate::maintained::DECLARATION_FILE),
+                    "[[view]]\nname = \"bet\"\n",
+                )
+                .unwrap();
+            }
+            crate::maintained::load(&nest).unwrap();
+            let app = router(SharedNest::new(test_state(&nest, 2)));
+            let (_, body) = get(app, "/ready").await;
+            let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+            if declare {
+                assert_eq!(json["maintained"][0]["view"], json!("bet"), "{json}");
+                assert_eq!(json["maintained"][0]["copies"], json!(0), "{json}");
+                assert_eq!(json["maintained"][0]["last_error"], Value::Null, "{json}");
+            } else {
+                assert!(json.get("maintained").is_none(), "{json}");
+            }
+        }
     }
 
     /// #1399: with one `--rpc`, `--seal-direct --concurrency 6` ran one window at a time, and the only

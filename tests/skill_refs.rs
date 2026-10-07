@@ -275,6 +275,8 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     ("src/calls.rs", Some(&["CallDecl"])),
     ("src/ipfs.rs", Some(&["IpfsDecl"])),
     ("src/entities.rs", Some(&["EntityFile", "EntityDecl"])),
+    // RFC-0062: `maintained.toml`, the views a nest answers from stored copies.
+    ("src/maintained.rs", Some(&["Declaration", "DeclaredView"])),
     // RFC-0046 S2's optional counter. Feature-gated off by default, but `[counter]` under a mount is
     // operator config like any other when the feature is on, and an undocumented price is exactly
     // the key an operator most needs to find.

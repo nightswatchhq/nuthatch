@@ -3137,6 +3137,10 @@ async fn build_nest(
             graft.uncanonical.join(", ")
         );
     }
+    // RFC-0062: a declared view that cannot be maintained refuses the nest, by name. The others are
+    // answered from copies this cursor's builder writes, under the cursor's own analytical gate.
+    crate::maintained::load(&dir)?;
+    crate::maintained::attach(&dir, sql_gate.clone());
 
     // A nest that vendors deployment blocks backfills from the earliest one (full history from
     // deployment); otherwise a cold start falls back to the `--backfill` tip offset.

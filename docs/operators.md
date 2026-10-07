@@ -312,6 +312,7 @@ runtime-dir/
       nuthatch.toml       # contracts, events, factories, webhooks, alerts
       semantic.toml       # what the data means (drives MCP + SQL hints)
       queries.toml        # optional: the author's sanctioned query surface (RFC-0034)
+      maintained.toml     # optional: views answered from a stored copy (RFC-0062)
       schema.json         # generated: registry hash + table list
       abis/               # vendored ABIs (no runtime resolution)
       views/              # authored SQL views
@@ -319,6 +320,7 @@ runtime-dir/
       nuthatch.redb       # hot store (mutable, reorg-affected)
       segments/
         manifest.json     # this dataset's segment catalogue + sealed watermark
+      maintained/         # copies of maintained views, derived and safe to delete (RFC-0062)
 ```
 
 The nest directory is the *entire* state. Move it, copy it, snapshot it.
@@ -453,6 +455,53 @@ would not scan) is never remembered, and an answer larger than a quarter of the 
 rather than evicting everything else. `NUTHATCH_SQL_MEMO_BYTES` sets the ceiling; `0` disables it.
 The memo lives inside the same RSS budget as everything else - 64 MiB by default, which is why the
 default is what it is and not larger.
+
+### Maintained views
+
+The memo helps a statement that repeats. A nest whose authored view is expensive whatever the
+statement (a join-heavy view over the whole history, paged or filtered differently by each caller)
+can instead declare that view **maintained** in `maintained.toml` (RFC-0062):
+
+```toml
+[[view]]
+name = "bet"
+```
+
+The nest then answers that view from a Parquet copy of its own request-time evaluation, stored at
+`maintained/<view>/<identity>.parquet` beside `segments/`. The identity is a hash of everything the
+evaluation reads: the binary (its version and a digest of the executable) and the engine, the content
+of `nuthatch.toml` and `views/*.sql` and the other authored inputs, the schema of the tables the view
+reaches, their sealed segments and their hot rows. A copy is served only to a request whose inputs
+hash to the same identity, so it cannot be stale and never differs from the view: a commit, a seal or
+an edit that touches what the view reads, or an upgrade, simply finds no copy. That request answers
+from the definition, at today's cost, and the copy for its inputs is built behind it. A block that
+carries no rows for the view's tables changes nothing, and the copy stays current.
+
+What it costs:
+
+- **One build per identity**: one evaluation of the view, the work of one cold request reaching it.
+  Builds run one at a time per cursor, each holding one of the cursor's `/sql` permits and the
+  dataset's analytics pool while it runs, so a build is admitted exactly as a query is. A build waits
+  behind requests for a permit rather than ahead of them.
+- **Disk**: a copy is roughly the size of the view's rows. Each view keeps the copy just built and the
+  four most recently built before it, so a reorg back to a recent state answers at once; `recent = N`
+  at the top of `maintained.toml` changes the four. Copies are derived: deleting `maintained/` loses
+  nothing but the time to rebuild them, and they are not published to a mirror.
+- **Nothing for a nest that declares nothing.** No file, no directory, no metric, no `/ready` field.
+
+`maintained.toml` is an authored input, so it is in the NID, and it is outside the data identity, so a
+nest that declares a view still seeds from a mirror published without it. A view that cannot be
+maintained refuses the nest at startup, by name, and fails `nuthatch check`: one that is not in
+`views/*.sql`, one whose definition calls a volatile function such as `now()`, and in this release one
+that reads an incremental entity, an offchain snapshot view, `labels` or a `{template}__children`
+view, whose rows the identity does not cover yet. A historical read (`as_of`), a declared query and
+`/explain` always answer from the definition.
+
+`/ready` carries a `maintained` list, one entry per view with its copies on disk, their bytes, the
+requests it answered from a copy (`hits`) and from the definition (`fallbacks`), its builds, build
+failures, the last build's duration and the last error. `/metrics` has the same per nest and view as
+`nuthatch_maintained_*`. A view whose fallbacks keep rising while its builds do not is one whose
+inputs change faster than it can be built; it is answered exactly as before, just not faster.
 
 ## What a nest costs at tip
 
