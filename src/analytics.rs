@@ -9860,6 +9860,41 @@ FROM bet GROUP BY player;
         );
     }
 
+    /// Inputs that move away and come back before their builds run, as a short reorg does, leave
+    /// nothing queued for the state they passed through: every view's copy is already current.
+    #[test]
+    fn inputs_that_return_to_a_built_state_build_nothing() {
+        let dir = nest(Some(BOTH));
+        let gate = held(dir.path(), 1);
+        let built = tip(&[placed(4, "carol", 13, 20)]);
+        let passing = tip(&[placed(4, "carol", 13, 20), resolved(4, 26, 21)]);
+        let inputs = fed(dir.path(), built.clone(), 10);
+        crate::maintained::wait_idle(dir.path());
+        let builds = (
+            counts(dir.path(), "bet").2,
+            counts(dir.path(), "player_total").2,
+        );
+        assert_eq!(builds, (1, 1));
+
+        let busy = gate.clone().try_acquire_owned().unwrap();
+        *inputs.lock().unwrap() = (passing, 10);
+        crate::maintained::changed(dir.path());
+        wait_queued(dir.path(), 2);
+        *inputs.lock().unwrap() = (built, 10);
+        crate::maintained::changed(dir.path());
+        drop(busy);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(
+            (
+                counts(dir.path(), "bet").2,
+                counts(dir.path(), "player_total").2
+            ),
+            builds,
+            "nothing built for the state passed through"
+        );
+        assert_eq!(copies(dir.path(), "player_total").len(), 1);
+    }
+
     /// Copies of a view no longer declared are removed when the declaration is next read; the
     /// declared view's copies stay.
     #[test]
