@@ -3381,6 +3381,25 @@ async fn build_nest(
         admin_token,
         nest_info: Arc::new(nest_info),
     };
+    // The same rows and watermark `/sql` reads, so an eager copy's identity is a request's.
+    // Weak: the feed outlives the nest in the module's registry, and must not hold its redb lock.
+    let feed_store = Arc::downgrade(&app_state.store);
+    crate::maintained::feed(
+        &dir,
+        crate::maintained::Feed {
+            read: Box::new(move || {
+                let feed_store = feed_store.upgrade().context("the nest has stopped")?;
+                let hot = feed_store
+                    .hot_rows_by_table_bounded_with_bytes(
+                        serve::SQL_MAX_HOT_ROWS,
+                        serve::SQL_MAX_HOT_BYTES,
+                    )?
+                    .rows;
+                Ok((hot, feed_store.sealed_through()))
+            }),
+            declared: app_state.tables.clone(),
+        },
+    );
 
     // Spawned last: a `?` above would detach it with its store clone (#1768).
     let alert_worker = alert_store.map(|store| {
@@ -7403,6 +7422,11 @@ impl NestIngest {
                 entity.apply(batch, to);
             }
         }
+        // RFC-0062 S2. Not while catching up: a build per backfill window is history-sized work
+        // that the next window makes nobody's.
+        if to >= tip {
+            crate::maintained::changed(&self.dir);
+        }
         if let Some(why) = checkpoint_missed {
             let n = self.metrics.inc_checkpoints_missed();
             if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
@@ -7477,6 +7501,9 @@ impl NestIngest {
         .await
         {
             tracing::warn!("sealing failed: {e:#}");
+        }
+        if to >= tip {
+            crate::maintained::changed(&self.dir);
         }
         // Deliver user webhooks for whatever just sealed (RFC-0010 Part B) - enqueue only,
         // the background worker POSTs; a slow endpoint never blocks the loop.

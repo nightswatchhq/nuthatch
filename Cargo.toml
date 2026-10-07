@@ -54,6 +54,10 @@ name = "e2e_warm_restart"
 path = "tests/e2e_warm_restart.rs"
 
 [[test]]
+name = "e2e_maintained_reorg"
+path = "tests/e2e_maintained_reorg.rs"
+
+[[test]]
 name = "memory_gauges_are_published"
 path = "tests/memory_gauges_are_published.rs"
 
