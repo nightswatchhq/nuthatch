@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# stopgap-orphan-alert - posts one Discord message when a bsc or matic deployment joins the orphan
+# stopgap-orphan-alert - posts one Discord message when a watched deployment joins the orphan
 # list (#1942): over 1 GRT of signal, no active allocation, as Lodestar's /subgraphs/migration shows
 # it from kittiwake's /api/subgraph-directory. Started by stopgap-orphan-alert.timer.
 #
@@ -16,7 +16,7 @@
 #
 # Environment (all optional):
 #   ORPHAN_ALERT_API          (default https://api.lodestar-dashboard.com)
-#   ORPHAN_ALERT_NETWORKS     (default "bsc matic")
+#   ORPHAN_ALERT_NETWORKS     (default bsc, matic and the EVM chains Studio drops on 2026-10-21 and 11-02)
 #   ORPHAN_ALERT_FROM         ISO date posting starts (default 2026-10-08)
 #   ORPHAN_ALERT_STATE_DIR    (default ${XDG_STATE_HOME:-$HOME/.local/state}/stopgap-orphans)
 #   ORPHAN_ALERT_WEBHOOK_FILE (default ~/.config/nightswatch/discord-webhook)
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 api=${ORPHAN_ALERT_API:-https://api.lodestar-dashboard.com}
-networks=${ORPHAN_ALERT_NETWORKS:-bsc matic}
+networks=${ORPHAN_ALERT_NETWORKS:-bsc matic arbitrum-nova soneium kaia botanix monad-testnet}
 from=${ORPHAN_ALERT_FROM:-2026-10-08}
 state_dir=${ORPHAN_ALERT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/stopgap-orphans}
 hook_file=${ORPHAN_ALERT_WEBHOOK_FILE:-$HOME/.config/nightswatch/discord-webhook}

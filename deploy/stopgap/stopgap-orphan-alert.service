@@ -6,7 +6,7 @@
 #   loginctl enable-linger "$USER"   # or the timer stops at logout
 # The first run records the list as a baseline; nothing is posted before 2026-10-08.
 [Unit]
-Description=Page Discord when a bsc or matic deployment joins the stopgap orphan list (#1942)
+Description=Page Discord when a watched deployment joins the stopgap orphan list (#1942)
 Wants=network-online.target
 After=network-online.target
 
