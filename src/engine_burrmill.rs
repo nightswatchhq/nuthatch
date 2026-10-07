@@ -1165,6 +1165,31 @@ mod tests {
         );
     }
 
+    /// #1984: an authored view's ORDER BY orders the rows read straight out of it, as DuckDB's did.
+    #[test]
+    fn an_authored_views_order_by_orders_what_is_read_from_it() {
+        use crate::engine::Session;
+        let dir = tempfile::tempdir().unwrap();
+        let s = sorting_session(dir.path(), &[("t", 2_000)]);
+        s.execute("CREATE VIEW by_n AS SELECT n, block_number FROM t ORDER BY n DESC")
+            .unwrap();
+        for sql in [
+            "SELECT * FROM by_n",
+            "SELECT n FROM (SELECT n FROM t ORDER BY n DESC)",
+        ] {
+            let mut seen = Vec::new();
+            s.for_each_row(sql, &mut |r| {
+                seen.push(r[0].as_str().unwrap().to_string());
+                Ok(())
+            })
+            .unwrap();
+            let mut want = seen.clone();
+            want.sort_by(|a, b| b.cmp(a));
+            assert_eq!(seen.len(), 2_000, "{sql}");
+            assert!(seen == want, "{sql} came back out of the view's order");
+        }
+    }
+
     /// Burrmill #10: `__raw`, `__hot` and `__union` are not names a statement can reach.
     #[test]
     fn a_hidden_registration_name_is_refused() {

@@ -340,8 +340,8 @@ fn a_regression_past_the_bound_fails_and_one_inside_it_does_not() {
 impl Case {
     /// Defines `gate_probe` over the fixture table and `gate_rows` over literals. `wrong` stands
     /// in for a candidate that answers block 5 as 50, sorts on `s` the other way round, is 1e-13
-    /// off on a float, and returns `gate_rows` in the reverse order: a view's own ORDER BY is not
-    /// kept, but a VALUES list's order is. `gate_numbers` answers 2^53 + 1 as 2^53 and 1 as 1.0.
+    /// off on a float, and returns `gate_rows` in the reverse order, as a VALUES list keeps its
+    /// order. `gate_numbers` answers 2^53 + 1 as 2^53 and 1 as 1.0.
     fn probe(&self, wrong: bool) {
         let views = self.nest.join("views");
         std::fs::create_dir_all(&views).unwrap();
@@ -411,7 +411,8 @@ impl Case {
 /// #1772: a statement that answers, but not what production answered, fails and is named, with
 /// the first row at which the two differ. Row order is part of the answer only under a top-level
 /// ORDER BY: a statement without one passes with its rows reversed (the quoted ORDER BY is a
-/// literal, not a clause). A float 1e-13 off differs too, as a number or cast to text (#1883).
+/// literal, not a clause), and so does one whose ORDER BY is in a subquery (#1984). A float 1e-13
+/// off differs too, as a number or cast to text (#1883).
 #[test]
 fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row() {
     let c = case();
@@ -424,6 +425,11 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
         (
             "unordered",
             "SELECT k, label FROM gate_rows WHERE 'ORDER BY' <> ''".to_string(),
+        ),
+        (
+            "nested",
+            "SELECT block FROM (SELECT block, s FROM gate_probe WHERE block NOT IN (5, 50) ORDER BY s)"
+                .to_string(),
         ),
         (
             "float",
@@ -459,6 +465,10 @@ fn an_answer_that_differs_from_the_baseline_fails_with_its_first_differing_row()
     assert!(
         line_for(&text, "unordered").starts_with("ok "),
         "only the order differs, and it has no top-level ORDER BY:\n{text}"
+    );
+    assert!(
+        line_for(&text, "nested").starts_with("ok "),
+        "only the order differs, and its ORDER BY is not top-level:\n{text}"
     );
     let float = line_for(&text, "float");
     assert!(
