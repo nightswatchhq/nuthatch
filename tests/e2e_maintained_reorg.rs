@@ -138,12 +138,12 @@ fn encode(sql: &str) -> String {
     out
 }
 
-/// The answer's columns and rows, as bytes: provenance differs between two nests and is not the
+/// The answer's columns and rows, as JSON text: provenance differs between two nests and is not the
 /// answer.
-async fn answer(rt: &indexer::NestRuntime, sql: &str) -> Vec<u8> {
+async fn answer(rt: &indexer::NestRuntime, sql: &str) -> String {
     let (status, body) = get_json(rt, &format!("/sql?q={}", encode(sql))).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{sql}: {body}");
-    serde_json::to_vec(&(&body["columns"], &body["rows"])).unwrap()
+    serde_json::to_string(&(&body["columns"], &body["rows"])).unwrap()
 }
 
 /// Per maintained view: hits, fallbacks, builds.
