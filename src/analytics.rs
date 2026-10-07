@@ -674,6 +674,31 @@ pub fn plan_hot_cold(
 enum Want {
     Rows,
     Plan,
+    /// RFC-0062 S0: write the view `maintained::writing()` names to its file.
+    Write,
+}
+
+/// RFC-0062 S0: evaluate `view` exactly as a request reaching it would, into the file
+/// `maintained::WRITE_TO` names on this thread.
+pub(crate) fn materialise(
+    dir: &Path,
+    view: &str,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+) -> Result<()> {
+    run(
+        dir,
+        &format!("SELECT * FROM \"{view}\""),
+        None,
+        hot,
+        sealed_through,
+        declared,
+        None,
+        None,
+        Want::Write,
+    )
+    .map(|_| ())
 }
 
 /// Historical evaluation filters stored facts before authored views aggregate them. Filtering the
@@ -1145,6 +1170,7 @@ fn attempt(
     }
     let mut slot = slot.expect("just inserted");
     slot.last_used = SESSION_USE.fetch_add(1, Ordering::Relaxed);
+    let inputs_now = slot.inputs.clone();
     let (referenced, offchain, degraded_tables, interrupted, spilled, outcome, cap, scan) = {
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
@@ -1161,12 +1187,55 @@ fn attempt(
         // A statement that reaches into a catalogue schema, or calls an enumerating table function
         // such as DuckDB's `duckdb_tables()`, is asking *what tables exist* - so every view has to exist
         // for it to answer. Those keep the old whole-nest definition; everything else is narrowed.
+        // RFC-0062 S0: the maintained views this statement reaches that have a current copy are
+        // bound to it, and their definitions are not expanded. A missing copy is built behind it.
+        let mut copies: Vec<(String, PathBuf)> = Vec::new();
+        let maintained = crate::maintained::declared();
+        if !surveys && as_of.is_none() && !matches!(want, Want::Write) && !maintained.is_empty() {
+            if let Some(full) = referenced
+                .as_ref()
+                .and_then(|r| reachable_tables(session, dir, r))
+            {
+                let sealed =
+                    crate::sqlmemo::sealed_segments(dir, sealed_through).unwrap_or_default();
+                let engine = session.engine_version();
+                for v in maintained.iter().filter(|v| full.contains(*v)) {
+                    let one = std::collections::BTreeSet::from([v.clone()]);
+                    let Some(closure) = reachable_tables(session, dir, &one) else {
+                        continue;
+                    };
+                    let id = crate::maintained::identity(
+                        v,
+                        &engine,
+                        &inputs_now,
+                        &sealed,
+                        &closure,
+                        hot,
+                    );
+                    let file = crate::maintained::path(dir, v, &id);
+                    if file.exists() {
+                        copies.push((v.clone(), file));
+                    } else {
+                        crate::maintained::spawn_build(
+                            dir,
+                            v,
+                            file,
+                            hot.clone(),
+                            sealed_through,
+                            declared.to_vec(),
+                        );
+                    }
+                }
+            }
+        }
+        let leaves: std::collections::BTreeSet<String> =
+            copies.iter().map(|(v, _)| v.clone()).collect();
         let wanted = if surveys {
             None
         } else {
             referenced
                 .as_ref()
-                .and_then(|r| reachable_tables(session, dir, r))
+                .and_then(|r| reachable_tables_stopping(session, dir, r, &leaves))
         };
         let defined = define_views_bound(
             session,
@@ -1186,7 +1255,16 @@ fn attempt(
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
-        define_nest_views(session, dir, wanted.as_ref());
+        for v in &maintained {
+            let _ = session.drop_relation(v);
+        }
+        let authored: Option<std::collections::BTreeSet<String>> = wanted
+            .as_ref()
+            .map(|w| w.difference(&leaves).cloned().collect());
+        define_nest_views(session, dir, authored.as_ref());
+        for (v, file) in &copies {
+            session.bind_snapshots(v, std::slice::from_ref(file))?;
+        }
         let offchain = if as_of.is_none() {
             define_offchain_views(session, dir, wanted.as_ref())?
         } else {
@@ -1294,6 +1372,17 @@ fn attempt(
         let _live = LiveQuery::register(dir, session.interrupt_handle());
         let outcome = evaluate.then(|| match want {
             Want::Rows => session.collect(sql, cap),
+            Want::Write => match crate::maintained::writing() {
+                Some((view, path)) => session
+                    .write_parquet(&view, &path)
+                    .map(|()| Collected {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                        truncated: false,
+                    })
+                    .map_err(Died::Executing),
+                None => Err(Died::Executing(anyhow::anyhow!("no maintained target"))),
+            },
             Want::Plan => session
                 .describe(sql)
                 .map(|columns| Collected {
@@ -1864,6 +1953,16 @@ fn reachable_tables(
     dir: &Path,
     referenced: &std::collections::BTreeSet<String>,
 ) -> Option<std::collections::BTreeSet<String>> {
+    reachable_tables_stopping(session, dir, referenced, &Default::default())
+}
+
+/// [`reachable_tables`], not expanding the bodies of `leaves` (RFC-0062 S0: views bound to a copy).
+fn reachable_tables_stopping(
+    session: &dyn Session,
+    dir: &Path,
+    referenced: &std::collections::BTreeSet<String>,
+    leaves: &std::collections::BTreeSet<String>,
+) -> Option<std::collections::BTreeSet<String>> {
     if referenced.iter().any(|n| n.ends_with("__children")) {
         return None;
     }
@@ -1876,6 +1975,9 @@ fn reachable_tables(
     while !frontier.is_empty() {
         let mut next = Vec::new();
         for name in frontier.drain(..) {
+            if leaves.contains(&name) {
+                continue;
+            }
             let Some(body) = bodies.get(&name) else {
                 continue;
             };

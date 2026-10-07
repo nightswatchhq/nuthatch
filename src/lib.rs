@@ -71,6 +71,7 @@ pub mod ipfs_resolve;
 pub mod labels;
 pub mod lifecycle;
 pub mod lists;
+pub(crate) mod maintained;
 pub mod mcp;
 pub mod metadata;
 pub mod metrics;
