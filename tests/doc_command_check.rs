@@ -282,6 +282,12 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "RFC-0059 S2 ships `nuthatch check --folds` in a `folds` build only; a default build has no \
          such flag, so there the mention is expected",
     ),
+    (
+        "docs/rfcs/0062-maintained-views.md",
+        "--maintained",
+        2,
+        "RFC-0062 proposes `nuthatch check --maintained` for its S3; a draft design, not a shipped flag",
+    ),
 ];
 
 /// A finding: an unresolved subcommand word or flag, where it was found, and what was wrong.
