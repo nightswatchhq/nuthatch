@@ -1,5 +1,10 @@
 # Stopgap handback: BetSwirl BNB Chain
 
+> **Retired 2026-10-07.** The hosted endpoint is stopped: in the day it ran it served no one but us (BetSwirl's
+> last bet on BNB Chain was on 20 March 2026, and nobody got in touch). Everything below still works for
+> anyone who wants to run it: the nest, the mirror and the release downloads are unchanged. Kept as
+> written otherwise.
+
 The package for one stopgap nest: what it answers, how to run it yourself, and how to go back to The
 Graph network. It is written for someone who did not build the nest. The programme is in
 [docs/subgraph-stopgap.md](https://github.com/nightswatchhq/nuthatch/blob/main/docs/subgraph-stopgap.md).

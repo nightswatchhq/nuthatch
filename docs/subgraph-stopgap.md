@@ -102,3 +102,4 @@ covering the list, the numbers above, what the nest answers and what it refuses 
 - **2026-10-06** Chief lifted the no-hosting rule for the stopgap: we serve the nests ourselves.
 - **2026-10-06** S2 done (#1945). S0 gate raised from "any answered field" to a third of fields on half the sample, on review.
 - **2026-10-06** Orphan alert live on the ThinkPad (user timer, 15 min, its own webhook). BetSwirl BNB Chain chosen as the first stopgap nest.
+- **2026-10-07** BetSwirl BNB Chain retired by Chief: no users in its first day (about 198 requests in five hours, about 180 of them our own cache warm-up), no bet since March. Service stopped and disabled on the ThinkPad, data and mirror kept; the hosted URL answers 410 once `.deploy/helsinki-caddy-retire.sh` runs on Helsinki. The orphan alert keeps running.
