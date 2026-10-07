@@ -3,7 +3,7 @@
 //!
 //! One HTTP server plays both the nest and the gateway for a whole sealed run. The fixture is built so
 //! that every other comparison passes and every measured boundary holds, so the exit status turns on
-//! the epoch value fields alone.
+//! the epoch value fields alone, or on the escrow collections the tests at the end add (#1114, #1983).
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -93,7 +93,14 @@ struct Fixture {
     deltas: BTreeMap<(u32, &'static str), i64>,
     /// The source of epoch 1391's start.
     source_1391: &'static str,
+    /// Collector of the one collection both sides hold.
+    matched_collector: &'static str,
+    /// (tx hash, log_index, payer, collector) of collections only the nest holds.
+    nest_only: Vec<(String, u32, &'static str, &'static str)>,
 }
+
+/// GraphTallyCollector on Arbitrum One, the one collector whose collections the subgraph records.
+const GTC: &str = "0x8f69f5c07477ac46fbc491b1e6d91e2bb0111a9e";
 
 impl Fixture {
     /// Every boundary above epoch 1 disagrees just below itself and nowhere above; signal and curator
@@ -111,7 +118,25 @@ impl Fixture {
         Fixture {
             deltas,
             source_1391: "observed",
+            matched_collector: GTC,
+            nest_only: Vec::new(),
         }
+    }
+
+    fn nest_only(
+        mut self,
+        tx: u8,
+        log_index: u32,
+        payer: &'static str,
+        collector: &'static str,
+    ) -> Self {
+        self.nest_only.push((
+            format!("0x{}", format!("{tx:02x}").repeat(32)),
+            log_index,
+            payer,
+            collector,
+        ));
+        self
     }
 
     /// `net` and `curators` of epoch 1391's collections filed in 1390 instead.
@@ -156,6 +181,14 @@ impl Fixture {
         let n = |n: usize| rows(json!([{"n": n}]));
         let tx_a = format!("0x{}", "aa".repeat(32));
         let tx_b = format!("0x{}", "bb".repeat(32));
+        let mut collected = vec![
+            json!({"tx_hash": tx_a, "log_index": 5, "payer": "0x01", "collector": self.matched_collector}),
+        ];
+        for (tx, li, payer, collector) in &self.nest_only {
+            collected.push(
+                json!({"tx_hash": tx, "log_index": li, "payer": payer, "collector": collector}),
+            );
+        }
         let srv = serve(vec![
             (
                 "GET /ready",
@@ -185,17 +218,15 @@ impl Fixture {
             ),
             (
                 "SELECT type, count(*)",
-                rows(json!([{"type": "Deposit", "n": 1}, {"type": "EscrowCollected", "n": 1}])),
+                rows(json!([{"type": "Deposit", "n": 1}, {"type": "EscrowCollected", "n": collected.len()}])),
             ),
             (
                 "AS n FROM escrow__escrow_collected",
-                rows(json!([{"lo": 100, "hi": 100, "n": 1}])),
+                rows(json!([{"lo": 100, "hi": 100, "n": collected.len()}])),
             ),
             (
                 "collector FROM escrow__escrow_collected",
-                rows(
-                    json!([{"tx_hash": tx_a, "log_index": 5, "payer": "0x01", "collector": "0x02"}]),
-                ),
+                rows(json!(collected)),
             ),
             (
                 "AS n FROM escrow__deposit",
@@ -405,4 +436,69 @@ fn a_signalled_tokens_adjacent_pair_fails() {
         "{text}"
     );
     assert!(text.contains("epoch 1 nest=1000007"), "{text}");
+}
+
+const SELF_COLLECTOR: &str = "0xd4b1775640d9c4ba2ce5bf2b3201b35c4031aa47";
+const EOA_PAYER: &str = "0xdde4cffd3d9052a9cb618fc05a1cd02be1f2f467";
+const EOA_COLLECTOR: &str = "0x709ec1920bec7702ab3af63dcbf93e9d1f299e09";
+
+/// #1114: an EOA that collects from its own escrow is nest-only, and the subgraph is the one that
+/// skips it.
+#[test]
+fn a_self_collection_is_a_known_difference() {
+    let (code, text) = Fixture::new()
+        .nest_only(0xc1, 11, SELF_COLLECTOR, SELF_COLLECTOR)
+        .run();
+    assert_eq!(code, 2, "{text}");
+    assert!(
+        text.contains("1 nest-only rows were not collected by GraphTallyCollector, which the subgraph does not record KNOWN-DIFF (#1114, #1983)"),
+        "{text}"
+    );
+    assert!(text.contains("escrow_non_tally_collections"), "{text}");
+}
+
+/// #1983: an EOA collecting from a different payer falls under the same rule as #1114.
+#[test]
+fn a_collection_by_another_eoa_is_a_known_difference() {
+    let (code, text) = Fixture::new()
+        .nest_only(0xc1, 11, SELF_COLLECTOR, SELF_COLLECTOR)
+        .nest_only(0xc2, 51, EOA_PAYER, EOA_COLLECTOR)
+        .run();
+    assert_eq!(code, 2, "{text}");
+    assert!(
+        text.contains("2 nest-only rows were not collected by GraphTallyCollector"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("collector={EOA_COLLECTOR}")),
+        "{text}"
+    );
+}
+
+/// A GraphTallyCollector collection the subgraph lacks is what parity exists to catch, even beside
+/// rows the rule explains.
+#[test]
+fn a_nest_only_tally_collection_fails() {
+    let (code, text) = Fixture::new()
+        .nest_only(0xc2, 51, EOA_PAYER, EOA_COLLECTOR)
+        .nest_only(0xc3, 7, EOA_PAYER, GTC)
+        .run();
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("1 nest-only rows were collected by GraphTallyCollector and are unexplained"),
+        "{text}"
+    );
+}
+
+/// The rule rests on the address: a matched redeem from any other collector means it is wrong.
+#[test]
+fn a_matched_collection_by_another_collector_fails() {
+    let mut f = Fixture::new();
+    f.matched_collector = EOA_COLLECTOR;
+    let (code, text) = f.run();
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("1 matched collections were not collected by GraphTallyCollector"),
+        "{text}"
+    );
 }
