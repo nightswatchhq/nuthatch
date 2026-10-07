@@ -6,7 +6,12 @@
 //! files, the sealed segments and hot rows of the tables its closure reaches, and the schema those
 //! tables are bound with. If `maintained/<view>/<identity>.parquet` exists the view is bound to it
 //! and its body is never expanded; otherwise the request answers from the definition exactly as it
-//! would without this module, and a build of that identity is queued behind it (S1 is lazy).
+//! would without this module.
+//!
+//! Builds are eager (S2): the indexer calls [`changed`] after each commit and seal at the tip,
+//! and the cursor's builder reads the nest's current inputs through its [`Feed`] and builds each
+//! view whose copy at them is missing. Latest wins: a queued build is dropped once newer inputs
+//! arrive, before it runs. A process with no feed builds what a request found missing.
 //!
 //! A copy is never served at inputs it was not computed from, so it cannot be stale: the same
 //! argument the answer memo (#1186) rests on, one level up. The request-time view is the oracle.
@@ -356,6 +361,17 @@ struct Nest {
     /// Copies retention has handed to the read leases and not yet seen deleted. Never served,
     /// because a request holding a newer lease would not keep one alive.
     retired: HashSet<PathBuf>,
+    feed: Option<Arc<Feed>>,
+}
+
+/// The nest's current inputs, read as a request reads them: its hot rows and served watermark.
+pub type ReadInputs = dyn Fn() -> Result<(HotRows, u64)> + Send + Sync;
+
+/// How the builder reads a nest's inputs for an eager build.
+pub struct Feed {
+    pub read: Box<ReadInputs>,
+    /// The tables the nest declares, as its requests bind them.
+    pub declared: Arc<Vec<crate::registry::TableSchema>>,
 }
 
 fn nests() -> &'static Mutex<HashMap<PathBuf, Nest>> {
@@ -389,6 +405,7 @@ pub fn load(dir: &Path) -> Result<()> {
         .iter()
         .map(|v| v.name.to_ascii_lowercase())
         .collect();
+    remove_undeclared(dir, &views);
     let mut all = lock_nests();
     if views.is_empty() {
         all.remove(dir);
@@ -414,9 +431,37 @@ pub fn load(dir: &Path) -> Result<()> {
             stats,
             failed: HashMap::new(),
             retired: HashSet::new(),
+            feed: None,
         },
     );
     Ok(())
+}
+
+/// Copies of views `dir` no longer declares, handed to the read leases; the directory of each goes
+/// once it is empty. Nothing can be served from them again, and a declaration brought back rebuilds.
+fn remove_undeclared(dir: &Path, views: &BTreeSet<String>) {
+    let root = dir.join(COPIES_DIR);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if views.contains(&name) || !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let files: Vec<PathBuf> = std::fs::read_dir(e.path())
+            .map(|rd| rd.flatten().map(|f| f.path()).collect())
+            .unwrap_or_default();
+        tracing::info!(
+            "removing {} copies of `{name}`, which {DECLARATION_FILE} no longer declares",
+            files.len()
+        );
+        crate::seal::retire(dir, files);
+        let _ = std::fs::remove_dir(e.path());
+    }
+    if views.is_empty() {
+        let _ = std::fs::remove_dir(&root);
+    }
 }
 
 /// Each declared view that cannot be maintained, with why. `Err` for a file that will not parse.
@@ -561,8 +606,24 @@ struct Cursor {
 struct CursorState {
     /// At most one waiting build per view; a newer request's replaces it.
     pending: BTreeMap<(PathBuf, String), Job>,
+    /// Nests whose inputs moved since the builder last read them. Planned before any build runs.
+    dirty: BTreeSet<PathBuf>,
     building: Option<(PathBuf, String, String)>,
     running: bool,
+}
+
+impl CursorState {
+    /// Start the builder thread unless it is already draining.
+    fn wake(&mut self, cursor: &Arc<Cursor>) {
+        if !self.running {
+            self.running = true;
+            let c = cursor.clone();
+            std::thread::Builder::new()
+                .name("nuthatch-maintained".into())
+                .spawn(move || drain(c))
+                .expect("spawn the maintained-view builder");
+        }
+    }
 }
 
 fn cursors() -> &'static Mutex<Vec<Arc<Cursor>>> {
@@ -600,12 +661,43 @@ pub(crate) fn wants_build(dir: &Path, view: &str, id: &str) -> bool {
         .is_some_and(|n| n.cursor.is_some() && n.failed.get(view).is_none_or(|failed| failed != id))
 }
 
-/// Queue `job` on its nest's cursor. A build already running for the same identity, or a copy
-/// already present, makes this a no-op.
-pub(crate) fn request_build(job: Job) {
-    let Some(cursor) = lock_nests().get(&job.dir).and_then(|n| n.cursor.clone()) else {
+/// Give `dir`'s builder a way to read its inputs, and plan its first builds. From here on its builds
+/// are eager: [`changed`] plans them, and a request that finds no copy asks for a plan rather than
+/// queueing the inputs it read, which may already be older than the store's.
+pub fn feed(dir: &Path, feed: Feed) {
+    if let Some(n) = lock_nests().get_mut(dir) {
+        n.feed = Some(Arc::new(feed));
+    }
+    changed(dir);
+}
+
+/// `dir`'s inputs may have moved: a commit or a seal. Marks the nest for the builder to read
+/// again and returns at once; nothing is read or built on the caller's thread.
+pub fn changed(dir: &Path) {
+    let Some(cursor) = lock_nests()
+        .get(dir)
+        .filter(|n| n.feed.is_some())
+        .and_then(|n| n.cursor.clone())
+    else {
         return;
     };
+    let mut st = cursor.state.lock().unwrap_or_else(|p| p.into_inner());
+    st.dirty.insert(dir.to_path_buf());
+    st.wake(&cursor);
+}
+
+/// Queue `job` on its nest's cursor. A build already running for the same identity, or a copy
+/// already present, makes this a no-op. A fed nest plans from its current inputs instead.
+pub(crate) fn request_build(job: Job) {
+    let Some((cursor, fed)) = lock_nests()
+        .get(&job.dir)
+        .and_then(|n| Some((n.cursor.clone()?, n.feed.is_some())))
+    else {
+        return;
+    };
+    if fed {
+        return changed(&job.dir);
+    }
     let mut st = cursor.state.lock().unwrap_or_else(|p| p.into_inner());
     if st
         .building
@@ -615,31 +707,52 @@ pub(crate) fn request_build(job: Job) {
         return;
     }
     st.pending.insert((job.dir.clone(), job.view.clone()), job);
-    if !st.running {
-        st.running = true;
-        let c = cursor.clone();
-        std::thread::Builder::new()
-            .name("nuthatch-maintained".into())
-            .spawn(move || drain(c))
-            .expect("spawn the maintained-view builder");
-    }
+    st.wake(&cursor);
+}
+
+enum Next {
+    Plan(PathBuf),
+    Build(Job),
 }
 
 fn drain(cursor: Arc<Cursor>) {
     loop {
-        let job = {
+        let next = {
             let mut st = cursor.state.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(key) = st.pending.keys().next().cloned() else {
+            if let Some(dir) = st.dirty.pop_first() {
+                Next::Plan(dir)
+            } else if let Some(key) = st.pending.keys().next().cloned() {
+                let job = st.pending.remove(&key).expect("just found");
+                st.building = Some((job.dir.clone(), job.view.clone(), job.id.clone()));
+                Next::Build(job)
+            } else {
                 st.running = false;
                 st.building = None;
                 return;
-            };
-            let job = st.pending.remove(&key).expect("just found");
-            st.building = Some((job.dir.clone(), job.view.clone(), job.id.clone()));
-            job
+            }
+        };
+        let job = match next {
+            Next::Plan(dir) => {
+                plan(&cursor, &dir);
+                continue;
+            }
+            Next::Build(job) => job,
+        };
+        // Newer inputs make this job's identity nobody's: drop it, and the plan they wait on
+        // queues whatever is current.
+        let superseded = || {
+            cursor
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .dirty
+                .contains(&job.dir)
         };
         // Polled, not awaited: a waiting build yields every permit to the requests it is behind.
         let permit = loop {
+            if superseded() {
+                break None;
+            }
             match cursor.gate.clone().try_acquire_owned() {
                 Ok(p) => break Some(p),
                 Err(tokio::sync::TryAcquireError::Closed) => break None,
@@ -648,7 +761,7 @@ fn drain(cursor: Arc<Cursor>) {
                 }
             }
         };
-        if permit.is_some() {
+        if permit.is_some() && !superseded() {
             build(&job);
         }
         drop(permit);
@@ -657,6 +770,61 @@ fn drain(cursor: Arc<Cursor>) {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .building = None;
+    }
+}
+
+/// Read `dir`'s inputs through its feed and queue a build of every declared view with no copy at
+/// them, replacing whatever was queued for the nest before. A view whose inputs did not move keeps
+/// its copy and costs no build.
+fn plan(cursor: &Arc<Cursor>, dir: &Path) {
+    let Some((views, failed, feed)) = lock_nests()
+        .get(dir)
+        .and_then(|n| Some((n.views.clone(), n.failed.clone(), n.feed.clone()?)))
+    else {
+        return;
+    };
+    let current = (feed.read)().and_then(|(hot, sealed_through)| {
+        let ids = crate::analytics::maintained_identities(
+            dir,
+            &views,
+            &hot,
+            sealed_through,
+            &feed.declared,
+        )?;
+        Ok((hot, sealed_through, ids))
+    });
+    let (hot, sealed_through, ids) = match current {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(
+                "maintained views of {}: inputs not read: {e:#}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    let mut jobs = Vec::new();
+    for (view, id, closure) in ids {
+        if failed.get(&view) == Some(&id) || servable(dir, &copy_path(dir, &view, &id)) {
+            continue;
+        }
+        jobs.push(Job {
+            dir: dir.to_path_buf(),
+            view,
+            id,
+            hot: hot
+                .iter()
+                .filter(|(t, _)| closure.contains(&t.to_ascii_lowercase()))
+                .map(|(t, rows)| (t.clone(), rows.clone()))
+                .collect(),
+            sealed_through,
+            declared: feed.declared.to_vec(),
+        });
+    }
+    let mut st = cursor.state.lock().unwrap_or_else(|p| p.into_inner());
+    st.pending.retain(|(d, _), _| d != dir);
+    for job in jobs {
+        st.pending.insert((job.dir.clone(), job.view.clone()), job);
     }
 }
 
@@ -769,6 +937,26 @@ fn retain(dir: &Path, view: &str, current: &Path) {
     crate::seal::retire(dir, doomed);
 }
 
+/// The identities of `dir`'s builds that are queued or waiting to run.
+#[cfg(test)]
+pub(crate) fn queued(dir: &Path) -> Vec<String> {
+    let Some(cursor) = lock_nests().get(dir).and_then(|n| n.cursor.clone()) else {
+        return Vec::new();
+    };
+    let st = cursor.state.lock().unwrap();
+    st.building
+        .iter()
+        .filter(|(d, ..)| d == dir)
+        .map(|(_, _, id)| id.clone())
+        .chain(
+            st.pending
+                .iter()
+                .filter(|((d, _), _)| d == dir)
+                .map(|(_, j)| j.id.clone()),
+        )
+        .collect()
+}
+
 /// Wait until `dir`'s cursor has no build queued or running.
 #[cfg(test)]
 pub(crate) fn wait_idle(dir: &Path) {
@@ -779,7 +967,7 @@ pub(crate) fn wait_idle(dir: &Path) {
     loop {
         {
             let st = cursor.state.lock().unwrap();
-            if !st.running && st.pending.is_empty() {
+            if !st.running && st.pending.is_empty() && st.dirty.is_empty() {
                 return;
             }
         }

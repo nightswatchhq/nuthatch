@@ -758,6 +758,34 @@ fn maintained_identity(
     Some((id, closure))
 }
 
+/// Each of `views` that can be maintained, with its identity and closure at these inputs: what a
+/// request reaching it would compute, for the eager builder (RFC-0062 S2).
+pub(crate) fn maintained_identities(
+    dir: &Path,
+    views: &std::collections::BTreeSet<String>,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+) -> Result<Vec<(String, String, std::collections::BTreeSet<String>)>> {
+    let session = engine().open_bare()?;
+    let files = cache_inputs(dir);
+    Ok(views
+        .iter()
+        .filter_map(|view| {
+            let (id, closure) = maintained_identity(
+                session.as_ref(),
+                dir,
+                view,
+                &files,
+                hot,
+                sealed_through,
+                declared,
+            )?;
+            Some((view.clone(), id, closure))
+        })
+        .collect())
+}
+
 /// The build half of [`Want::Write`]: the copy is written only while the inputs still hash to `id`,
 /// and kept only if it binds with the view's own columns and types.
 #[allow(clippy::too_many_arguments)]
@@ -9686,5 +9714,176 @@ FROM bet GROUP BY player;
             "{err}"
         );
         assert!(!crate::maintained::is_declared(dir.path()));
+    }
+
+    /// What the indexer's feed reads: hot rows and the served watermark, moved by a test as a commit
+    /// or a seal would move them.
+    type Inputs = Arc<std::sync::Mutex<(HotRows, u64)>>;
+
+    fn fed(dir: &Path, hot: HotRows, sealed_through: u64) -> Inputs {
+        let state: Inputs = Arc::new(std::sync::Mutex::new((hot, sealed_through)));
+        let read = state.clone();
+        crate::maintained::feed(
+            dir,
+            crate::maintained::Feed {
+                read: Box::new(move || Ok(read.lock().unwrap().clone())),
+                declared: Arc::new(Vec::new()),
+            },
+        );
+        state
+    }
+
+    fn wait_queued(dir: &Path, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while crate::maintained::queued(dir).len() != n {
+            assert!(std::time::Instant::now() < deadline, "never queued {n}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// S2: a commit or a seal that moves a view's inputs builds its copy before anyone asks, and one
+    /// that moves nothing it reads builds nothing.
+    #[test]
+    fn an_eager_build_needs_no_request() {
+        let dir = nest(Some(BOTH));
+        held(dir.path(), 2);
+        let hot = tip(&[placed(4, "carol", 13, 20), resolved(3, 22, 21)]);
+        let inputs = fed(dir.path(), hot.clone(), 10);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(copies(dir.path(), "bet").len(), 1);
+        assert_eq!(copies(dir.path(), "player_total").len(), 1);
+        let asked = |hot: &HotRows, sealed: u64| {
+            for sql in SHAPES {
+                let want = oracle(dir.path(), sql, hot, sealed);
+                assert_eq!(ask(dir.path(), sql, hot, sealed), want, "{sql}");
+            }
+        };
+        asked(&hot, 10);
+        assert_eq!(counts(dir.path(), "bet").1, 0, "no request fell back");
+        assert_eq!(counts(dir.path(), "player_total").1, 0);
+
+        // A commit of rows the views read.
+        let hot = tip(&[
+            placed(4, "carol", 13, 20),
+            resolved(3, 22, 21),
+            placed(5, "dave", 17, 22),
+        ]);
+        *inputs.lock().unwrap() = (hot.clone(), 10);
+        crate::maintained::changed(dir.path());
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(counts(dir.path(), "bet").2, 2);
+        assert_eq!(counts(dir.path(), "player_total").2, 2);
+        asked(&hot, 10);
+        assert_eq!(counts(dir.path(), "bet").1, 0, "built before the request");
+
+        // A commit of rows no maintained view reads.
+        let mut unrelated = hot.clone();
+        unrelated.insert(
+            "other__thing".into(),
+            vec![
+                json!({"table": "other__thing", "k": "x", "block_number": 23,
+                        "tx_hash": "0x9", "log_index": 0}),
+            ],
+        );
+        *inputs.lock().unwrap() = (unrelated, 10);
+        crate::maintained::changed(dir.path());
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(
+            counts(dir.path(), "bet").2,
+            2,
+            "nothing the view reads moved"
+        );
+
+        // A seal of rows the views read.
+        seal(dir.path(), &[resolved(4, 40, 13)], 13, 14);
+        *inputs.lock().unwrap() = (hot.clone(), 14);
+        crate::maintained::changed(dir.path());
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(counts(dir.path(), "bet").2, 3);
+        asked(&hot, 14);
+        assert_eq!(counts(dir.path(), "bet").1, 0, "built before the request");
+    }
+
+    /// S2's latest wins: a build queued for inputs that have since moved is dropped before it runs,
+    /// and only the current inputs are built.
+    #[test]
+    fn a_queued_build_of_old_inputs_is_never_run() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        let gate = held(dir.path(), 1);
+        let busy = gate.clone().try_acquire_owned().unwrap();
+        let old = tip(&[placed(4, "carol", 13, 20)]);
+        let new = tip(&[placed(4, "carol", 13, 20), resolved(4, 26, 21)]);
+        let inputs = fed(dir.path(), old.clone(), 10);
+        wait_queued(dir.path(), 1);
+        *inputs.lock().unwrap() = (new.clone(), 10);
+        crate::maintained::changed(dir.path());
+        drop(busy);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(
+            counts(dir.path(), "bet").2,
+            1,
+            "only the current inputs built"
+        );
+        assert_eq!(copies(dir.path(), "bet").len(), 1);
+        let sql = SHAPES[0];
+        assert_eq!(
+            ask(dir.path(), sql, &new, 10),
+            oracle(dir.path(), sql, &new, 10)
+        );
+        assert_eq!(counts(dir.path(), "bet").0, 1, "served from the copy");
+    }
+
+    /// A request on a fed nest that read older inputs than the store now holds asks for a plan, and
+    /// never queues its own: the store's current inputs are what get built.
+    #[test]
+    fn a_request_never_queues_the_old_inputs_it_read() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        let gate = held(dir.path(), 1);
+        let busy = gate.clone().try_acquire_owned().unwrap();
+        let old = tip(&[placed(4, "carol", 13, 20)]);
+        let new = tip(&[placed(4, "carol", 13, 20), resolved(4, 26, 21)]);
+        fed(dir.path(), new.clone(), 10);
+        wait_queued(dir.path(), 1);
+        ask(dir.path(), SHAPES[0], &old, 10);
+        drop(busy);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(counts(dir.path(), "bet").2, 1);
+        let sql = SHAPES[0];
+        assert_eq!(
+            ask(dir.path(), sql, &new, 10),
+            oracle(dir.path(), sql, &new, 10)
+        );
+        assert_eq!(
+            counts(dir.path(), "bet").0,
+            1,
+            "the store's inputs were built"
+        );
+    }
+
+    /// Copies of a view no longer declared are removed when the declaration is next read; the
+    /// declared view's copies stay.
+    #[test]
+    fn copies_of_a_view_no_longer_declared_are_removed() {
+        let dir = nest(Some(BOTH));
+        held(dir.path(), 2);
+        fed(dir.path(), tip(&[placed(4, "carol", 13, 20)]), 10);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(copies(dir.path(), "player_total").len(), 1);
+        let kept = copies(dir.path(), "bet");
+        assert_eq!(kept.len(), 1);
+
+        std::fs::write(
+            dir.path().join(crate::maintained::DECLARATION_FILE),
+            "[[view]]\nname = \"bet\"\n",
+        )
+        .unwrap();
+        crate::maintained::load(dir.path()).unwrap();
+        let root = dir.path().join(crate::maintained::COPIES_DIR);
+        assert!(!root.join("player_total").exists());
+        assert_eq!(copies(dir.path(), "bet"), kept);
+
+        std::fs::remove_file(dir.path().join(crate::maintained::DECLARATION_FILE)).unwrap();
+        crate::maintained::load(dir.path()).unwrap();
+        assert!(!root.exists(), "nothing declared, nothing kept");
     }
 }
