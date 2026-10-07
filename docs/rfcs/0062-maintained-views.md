@@ -1,7 +1,7 @@
 # RFC-0062: Maintained views - a join-heavy view answered from a stored copy of its own evaluation
 
-- Status: **Accepted by Chief 2026-10-07 (#1975). S1 (lazy maintained views, #1977) and S2 (eager
-  builds and the reorg, #1979) built; S3 and S4 not started.** Tracking #1973. The S0 spike lives on
+- Status: **Accepted; S1 and S2 built; S3 and S4 not pursued (Chief, 2026-10-07): no nest needs them
+  yet.** Accepted 2026-10-07 (#1975); S1 is #1977, S2 #1979. Tracking #1973. The S0 spike lives on
   the throwaway branch `pete/rfc-0062-s0-spike` and is never merged; S1's measured results are in §8a,
   S2's in §8b.
 - Author: Pete (cargopete)
@@ -351,6 +351,10 @@ and on the Lodestar release gate before a release carries it (Chief, #1973).
   unchanged and it still seeds from the mirror; retire the warm timer. *Accept:* through the public
   endpoint, the first SDK `bets` query under 1 s, answers byte-identical to before.
 
+S3 and S4 are not pursued (Chief, 2026-10-07): no nest besides BetSwirl needs a maintained view, and
+BetSwirl has no users. They stay as written for whoever reopens this RFC, with S2's §8b as the state
+they would start from.
+
 ## §8 - S0 measured
 
 **Verdict: continue.** Every number S0 was asked for is below. Two things it did not measure are said
@@ -552,10 +556,11 @@ nothing at all (`an_eager_build_needs_no_request`); building a superseded job
 
 **What the hour did not show.** A data-bearing BSC block: BetSwirl has placed no bet since March, so
 the hour can only show that blocks without rows build nothing. That a block with rows builds once per
-affected view is shown by the reorg test and the tip-lag fixture, not on BSC. S3 counts it there.
+affected view is shown by the reorg test and the tip-lag fixture, not on BSC. S3 would have counted
+it there.
 
-**Moves to S3.** `check --maintained`, and the second build a data-bearing block costs when its rows
-seal (§3.8).
+**Left for S3, which is not pursued (§7).** `check --maintained`, and the second build a data-bearing
+block costs when its rows seal (§3.8).
 
 ## §9 - Risks
 
