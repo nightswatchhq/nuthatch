@@ -1628,6 +1628,73 @@ impl Metrics {
                     &|m| u64::from(m.publish_dead_letter.load(Relaxed)),
                 );
             }
+            // RFC-0062. Only nests that declare a maintained view, for the same reason.
+            let maintained: Vec<(&String, Vec<_>)> = per
+                .iter()
+                .filter_map(|(nest, m)| {
+                    let dir = m.dataset.lock().unwrap().clone()?;
+                    let views = crate::maintained::report(&dir);
+                    (!views.is_empty()).then_some((nest, views))
+                })
+                .collect();
+            if !maintained.is_empty() {
+                let mut series = |name: &str,
+                                  help: &str,
+                                  typ: &str,
+                                  get: &dyn Fn(&crate::maintained::ViewStats, u64, u64) -> u64| {
+                    s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {typ}\n"));
+                    for (nest, views) in &maintained {
+                        for (view, stats, copies, bytes) in views {
+                            s.push_str(&format!(
+                                "{name}{{nest=\"{nest}\",view=\"{view}\"}} {}\n",
+                                get(stats, *copies, *bytes)
+                            ));
+                        }
+                    }
+                };
+                series(
+                    "nuthatch_maintained_hits_total",
+                    "Requests that read a maintained view from its copy, since start.",
+                    "counter",
+                    &|v, _, _| v.hits.load(Relaxed),
+                );
+                series(
+                    "nuthatch_maintained_fallbacks_total",
+                    "Requests that reached a maintained view with no copy at their inputs and answered from its definition, since start.",
+                    "counter",
+                    &|v, _, _| v.fallbacks.load(Relaxed),
+                );
+                series(
+                    "nuthatch_maintained_builds_total",
+                    "Copies of a maintained view written, since start.",
+                    "counter",
+                    &|v, _, _| v.builds.load(Relaxed),
+                );
+                series(
+                    "nuthatch_maintained_build_failures_total",
+                    "Builds of a maintained view that failed, since start. /ready names the last error.",
+                    "counter",
+                    &|v, _, _| v.build_failures.load(Relaxed),
+                );
+                series(
+                    "nuthatch_maintained_last_build_milliseconds",
+                    "How long the last successful build of a maintained view took.",
+                    "gauge",
+                    &|v, _, _| v.last_build_ms.load(Relaxed),
+                );
+                series(
+                    "nuthatch_maintained_copies",
+                    "Copies of a maintained view on disk, the current one and those retention keeps.",
+                    "gauge",
+                    &|_, copies, _| copies,
+                );
+                series(
+                    "nuthatch_maintained_copy_bytes",
+                    "Bytes of a maintained view's copies on disk.",
+                    "gauge",
+                    &|_, _, bytes| bytes,
+                );
+            }
         }
         s
     }
@@ -1998,6 +2065,44 @@ mod tests {
         ] {
             assert!(out.contains(line), "missing {line:?} in:\n{out}");
         }
+    }
+
+    /// RFC-0062: a nest declaring a maintained view gets its series, labelled by view; one that
+    /// declares none adds no line at all.
+    #[test]
+    fn maintained_series_appear_only_for_a_nest_that_declares_one() {
+        let declares = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(declares.path().join("views")).unwrap();
+        std::fs::write(
+            declares.path().join("views/v.sql"),
+            "CREATE VIEW bet AS SELECT 1 AS id;",
+        )
+        .unwrap();
+        std::fs::write(
+            declares.path().join(crate::maintained::DECLARATION_FILE),
+            "[[view]]\nname = \"bet\"\n",
+        )
+        .unwrap();
+        crate::maintained::load(declares.path()).unwrap();
+        let copies = declares.path().join("maintained/bet");
+        std::fs::create_dir_all(&copies).unwrap();
+        std::fs::write(copies.join("a.parquet"), [0u8; 7]).unwrap();
+        crate::maintained::note_hit(declares.path(), "bet");
+        let plain = tempfile::tempdir().unwrap();
+
+        let m = Metrics::new();
+        m.nest("plain").set_dataset_dir(plain.path().to_path_buf());
+        let none = m.render();
+        assert!(!none.contains("nuthatch_maintained_"), "{none}");
+
+        m.nest("bets")
+            .set_dataset_dir(declares.path().to_path_buf());
+        let out = m.render();
+        assert!(out.contains("# TYPE nuthatch_maintained_hits_total counter"));
+        assert!(out.contains("nuthatch_maintained_hits_total{nest=\"bets\",view=\"bet\"} 1"));
+        assert!(out.contains("nuthatch_maintained_copies{nest=\"bets\",view=\"bet\"} 1"));
+        assert!(out.contains("nuthatch_maintained_copy_bytes{nest=\"bets\",view=\"bet\"} 7"));
+        assert!(!out.contains("nest=\"plain\",view="), "{out}");
     }
 
     #[test]

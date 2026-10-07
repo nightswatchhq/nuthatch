@@ -669,11 +669,212 @@ pub fn plan_hot_cold(
     )
 }
 
-/// Whether a statement is run for its rows or only planned.
+/// Whether a statement is run for its rows, only planned, or written to a maintained view's copy.
 #[derive(Clone, Copy)]
-enum Want {
+enum Want<'a> {
     Rows,
     Plan,
+    Write {
+        view: &'a str,
+        id: &'a str,
+        to: &'a Path,
+    },
+}
+
+/// The inputs of a maintained view moved between the request that asked for its copy and the build:
+/// that identity is no longer anyone's, which is not a fault.
+#[derive(Debug)]
+pub(crate) struct InputsMoved;
+
+impl std::fmt::Display for InputsMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the view's inputs moved before its copy was written")
+    }
+}
+
+impl std::error::Error for InputsMoved {}
+
+/// Evaluate the maintained view `view` exactly as a request reaching it would, and write its rows to
+/// `to` (RFC-0062 §3.4). Refused unless the inputs it reads hash to `id` before and after.
+pub(crate) fn write_maintained(
+    dir: &Path,
+    view: &str,
+    id: &str,
+    to: &Path,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+) -> Result<()> {
+    run(
+        dir,
+        &format!("SELECT * FROM \"{view}\""),
+        None,
+        hot,
+        sealed_through,
+        declared,
+        None,
+        None,
+        Want::Write { view, id, to },
+    )
+    .map(|_| ())
+}
+
+/// The identity of `view` at these inputs and the closure it was taken over, or `None` when the view
+/// cannot be maintained as its files now stand or its inputs cannot be read.
+fn maintained_identity(
+    session: &dyn Session,
+    dir: &Path,
+    view: &str,
+    files: &std::collections::BTreeMap<PathBuf, InputStamp>,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+) -> Option<(String, std::collections::BTreeSet<String>)> {
+    let closure = view_closure(session, dir, view);
+    // Checked per request as well as at load: the files can be edited under a running nest.
+    if let Some(why) = crate::maintained::refusal(
+        view,
+        closure.as_ref(),
+        &nest_view_bodies(dir),
+        &declared_relations(dir),
+    ) {
+        tracing::debug!("maintained view {view} answers from its definition: {why}");
+        return None;
+    }
+    let closure = closure?;
+    let sealed = crate::maintained::sealed_digest(dir, sealed_through, &closure)?;
+    let schema = crate::maintained::schema_digest(dir, declared, &closure);
+    let engine = session.engine_version();
+    let id = crate::maintained::Inputs {
+        view,
+        engine: &engine,
+        files,
+        schema: &schema,
+        sealed: &sealed,
+        closure: &closure,
+        hot,
+    }
+    .identity(dir)?;
+    Some((id, closure))
+}
+
+/// The build half of [`Want::Write`]: the copy is written only while the inputs still hash to `id`,
+/// and kept only if it binds with the view's own columns and types.
+#[allow(clippy::too_many_arguments)]
+fn write_copy(
+    session: &dyn Session,
+    dir: &Path,
+    (view, id, to): (&str, &str, &Path),
+    files: &std::collections::BTreeMap<PathBuf, InputStamp>,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+    degraded: &std::collections::BTreeSet<String>,
+) -> Result<Collected, Died> {
+    if !degraded.is_empty() {
+        return Err(Died::Binding(anyhow::anyhow!(
+            "the tables under `{view}` could not be read in full: {}",
+            degraded.iter().cloned().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    let current = |files: &std::collections::BTreeMap<PathBuf, InputStamp>| {
+        maintained_identity(session, dir, view, files, hot, sealed_through, declared)
+            .map(|(id, _)| id)
+    };
+    if current(files).as_deref() != Some(id) {
+        return Err(Died::Binding(InputsMoved.into()));
+    }
+    session.write_parquet(view, to).map_err(Died::Executing)?;
+    // Read back before it is named a copy. Not compared with `describe` of the view: that reports an
+    // aggregate's planned type (`sum` of a BIGINT as BIGINT) where execution, and so the file, holds
+    // DECIMAL(38,0); the answers agree, `typeof` included.
+    const CHECK: &str = "__maintained_copy";
+    session
+        .bind_snapshots(CHECK, &[to.to_path_buf()])
+        .map_err(Died::Executing)?;
+    let read_back = session.collect(&format!("SELECT count(*) AS n FROM \"{CHECK}\""), None);
+    let _ = session.drop_relation(CHECK);
+    read_back?;
+    if current(&cache_inputs(dir)).as_deref() != Some(id) {
+        return Err(Died::Binding(InputsMoved.into()));
+    }
+    Ok(Collected {
+        rows: Vec::new(),
+        columns: Vec::new(),
+        truncated: false,
+    })
+}
+
+/// RFC-0062 §3.3: bind each maintained view the statement reaches to its copy at the identity of
+/// this request's inputs, and queue a build for each that has none. Returns the copies bound and the
+/// views they stand for, whose bodies are then neither expanded nor defined. With `allowed` false, or
+/// on a nest that declares nothing, it binds nothing and the request is today's.
+#[allow(clippy::too_many_arguments)]
+fn bind_maintained_copies(
+    session: &dyn Session,
+    dir: &Path,
+    referenced: Option<&std::collections::BTreeSet<String>>,
+    files: &std::collections::BTreeMap<PathBuf, InputStamp>,
+    hot: &HotRows,
+    sealed_through: u64,
+    declared: &[crate::registry::TableSchema],
+    allowed: bool,
+) -> (Vec<PathBuf>, std::collections::BTreeSet<String>) {
+    let mut copies = Vec::new();
+    let mut leaves = std::collections::BTreeSet::new();
+    let maintained = crate::maintained::declared(dir);
+    if maintained.is_empty() {
+        return (copies, leaves);
+    }
+    // A pooled session may hold a copy an earlier request bound under the view's name.
+    for v in &maintained {
+        let _ = session.drop_relation(v);
+    }
+    if !allowed {
+        return (copies, leaves);
+    }
+    let Some(reach) = referenced.and_then(|r| reachable_tables(session, dir, r)) else {
+        return (copies, leaves);
+    };
+    for view in maintained.iter().filter(|v| reach.contains(*v)) {
+        let Some((id, closure)) =
+            maintained_identity(session, dir, view, files, hot, sealed_through, declared)
+        else {
+            continue;
+        };
+        let path = crate::maintained::copy_path(dir, view, &id);
+        if crate::maintained::servable(dir, &path) {
+            match session.bind_snapshots(view, std::slice::from_ref(&path)) {
+                Ok(()) => {
+                    crate::maintained::note_hit(dir, view);
+                    leaves.insert(view.clone());
+                    copies.push(path);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!("maintained copy {} will not bind: {e:#}", path.display());
+                    let _ = session.drop_relation(view);
+                    crate::maintained::discard(dir, std::slice::from_ref(&path));
+                }
+            }
+        }
+        crate::maintained::note_fallback(dir, view);
+        if crate::maintained::wants_build(dir, view, &id) {
+            crate::maintained::request_build(crate::maintained::Job {
+                dir: dir.to_path_buf(),
+                view: view.clone(),
+                id,
+                hot: hot
+                    .iter()
+                    .filter(|(t, _)| closure.contains(&t.to_ascii_lowercase()))
+                    .map(|(t, rows)| (t.clone(), rows.clone()))
+                    .collect(),
+                sealed_through,
+                declared: declared.to_vec(),
+            });
+        }
+    }
+    (copies, leaves)
 }
 
 /// Historical evaluation filters stored facts before authored views aggregate them. Filtering the
@@ -745,6 +946,8 @@ enum Attempt {
         /// when the statement would not parse for its tables, i.e. when we do not know what it reached;
         /// see `run` for why that skips the sweep rather than widening it.
         tables: Option<std::collections::BTreeSet<String>>,
+        /// Maintained-view copies the statement read (RFC-0062); any could be what failed.
+        copies: Vec<PathBuf>,
     },
 }
 
@@ -913,7 +1116,7 @@ fn run(
     declared: &[crate::registry::TableSchema],
     named: Option<&NamedAdmission>,
     as_of: Option<u64>,
-    want: Want,
+    want: Want<'_>,
 ) -> Result<QueryOutput> {
     // One deadline for the whole call, computed once - not a fresh `guard.timeout` handed to each
     // `attempt` (#476). Before this, the watchdog only ever bounded a single `attempt`: the first
@@ -926,7 +1129,7 @@ fn run(
     // before the rows are read (`seal::ReadLease`).
     let _lease = crate::seal::read_lease(dir);
     let nothing_excluded = std::collections::BTreeSet::new();
-    let first = attempt(
+    let mut first = attempt(
         dir,
         sql,
         guard,
@@ -938,7 +1141,33 @@ fn run(
         named,
         as_of,
         want,
+        true,
     );
+    // A maintained-view copy is derivable, so one that dies under a statement is answered around
+    // from the definition. Only if that succeeds was the copy at fault, and it is then discarded.
+    if let Ok(Attempt::DiedExecuting { copies, .. }) = &first {
+        if !copies.is_empty() {
+            let copies = copies.clone();
+            let again = attempt(
+                dir,
+                sql,
+                guard,
+                hot,
+                sealed_through,
+                &nothing_excluded,
+                deadline,
+                declared,
+                named,
+                as_of,
+                want,
+                false,
+            );
+            if matches!(again, Ok(Attempt::Ok(_))) {
+                crate::maintained::discard(dir, &copies);
+            }
+            first = again;
+        }
+    }
     // A segment the plan named was gone by execution (#1162). Nothing is corrupt and nothing is
     // missing: a seal replaced the file under the query, and planning again reads the manifest as it
     // now is. Once - a second vanish inside one query is not a race, and the ordinary error then
@@ -969,6 +1198,7 @@ fn run(
             named,
             as_of,
             want,
+            true,
         )? {
             Attempt::Ok(out) => Ok(out),
             Attempt::DiedExecuting { error, .. } => Err(error),
@@ -976,7 +1206,7 @@ fn run(
     }
     let (e, tables) = match first? {
         Attempt::Ok(out) => return Ok(out),
-        Attempt::DiedExecuting { error, tables } => (error, tables),
+        Attempt::DiedExecuting { error, tables, .. } => (error, tables),
     };
     #[cfg(test)]
     {
@@ -1041,6 +1271,7 @@ fn run(
         named,
         as_of,
         want,
+        true,
     )? {
         Attempt::Ok(out) => Ok(out),
         Attempt::DiedExecuting { error, .. } => Err(error),
@@ -1070,7 +1301,9 @@ fn attempt(
     declared: &[crate::registry::TableSchema],
     named: Option<&NamedAdmission>,
     as_of: Option<u64>,
-    want: Want,
+    want: Want<'_>,
+    // RFC-0062: whether a maintained view may be answered from its copy on this attempt.
+    copies_allowed: bool,
 ) -> Result<Attempt> {
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. The engine gets the original text.
@@ -1156,6 +1389,21 @@ fn attempt(
         // it" on both counts.
         let surveys = walked.as_ref().map(|(_, sv)| *sv).unwrap_or(true);
         let referenced = walked.map(|(r, _)| r);
+        let (copies, leaves) = bind_maintained_copies(
+            session,
+            dir,
+            referenced.as_ref(),
+            &slot.inputs,
+            hot,
+            sealed_through,
+            declared,
+            copies_allowed
+                && !surveys
+                && matches!(want, Want::Rows)
+                && named.is_none()
+                && as_of.is_none()
+                && excluded.is_empty(),
+        );
         // Define views only for what this statement can reach (#896). `None` - an unparsed statement
         // or a shape `reachable_tables` will not vouch for - defines everything, as before.
         // A statement that reaches into a catalogue schema, or calls an enumerating table function
@@ -1166,7 +1414,7 @@ fn attempt(
         } else {
             referenced
                 .as_ref()
-                .and_then(|r| reachable_tables(session, dir, r))
+                .and_then(|r| reachable_tables_stopping(session, dir, r, &leaves))
         };
         let defined = define_views_bound(
             session,
@@ -1186,7 +1434,12 @@ fn attempt(
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
-        define_nest_views(session, dir, wanted.as_ref());
+        if leaves.is_empty() {
+            define_nest_views(session, dir, wanted.as_ref());
+        } else {
+            let authored = wanted.as_ref().map(|w| w - &leaves);
+            define_nest_views(session, dir, authored.as_ref());
+        }
         let offchain = if as_of.is_none() {
             define_offchain_views(session, dir, wanted.as_ref())?
         } else {
@@ -1302,6 +1555,16 @@ fn attempt(
                     truncated: false,
                 })
                 .map_err(Died::Binding),
+            Want::Write { view, id, to } => write_copy(
+                session,
+                dir,
+                (view, id, to),
+                &slot.inputs,
+                hot,
+                sealed_through,
+                declared,
+                &degraded_tables,
+            ),
         });
 
         // Stop the watchdog before interpreting the result: a value arriving before the deadline makes
@@ -1311,7 +1574,7 @@ fn attempt(
             let _ = join.join();
         }
         (
-            referenced,
+            (referenced, copies),
             offchain,
             degraded_tables,
             interrupted,
@@ -1321,6 +1584,7 @@ fn attempt(
             scan,
         )
     };
+    let (referenced, copies) = referenced;
     if interrupted.load(Ordering::SeqCst) {
         drop(slot);
     } else {
@@ -1360,6 +1624,15 @@ fn attempt(
             if interrupted.load(Ordering::SeqCst) {
                 return Err(stopped(guard, &spilled));
             }
+            // A copy is planned lazily, so one that will not read can fail here too; `run` answers
+            // around it from the definition, where a fault of the statement's own fails again.
+            if !copies.is_empty() {
+                return Ok(Attempt::DiedExecuting {
+                    error: e,
+                    tables: referenced,
+                    copies,
+                });
+            }
             return Err(e);
         }
         Err(Died::Executing(e)) => {
@@ -1373,6 +1646,7 @@ fn attempt(
             return Ok(Attempt::DiedExecuting {
                 error: e,
                 tables: referenced,
+                copies,
             });
         }
     };
@@ -1864,6 +2138,16 @@ fn reachable_tables(
     dir: &Path,
     referenced: &std::collections::BTreeSet<String>,
 ) -> Option<std::collections::BTreeSet<String>> {
+    reachable_tables_stopping(session, dir, referenced, &Default::default())
+}
+
+/// [`reachable_tables`], not expanding the bodies of `leaves`: maintained views bound to a copy.
+fn reachable_tables_stopping(
+    session: &dyn Session,
+    dir: &Path,
+    referenced: &std::collections::BTreeSet<String>,
+    leaves: &std::collections::BTreeSet<String>,
+) -> Option<std::collections::BTreeSet<String>> {
     if referenced.iter().any(|n| n.ends_with("__children")) {
         return None;
     }
@@ -1876,6 +2160,9 @@ fn reachable_tables(
     while !frontier.is_empty() {
         let mut next = Vec::new();
         for name in frontier.drain(..) {
+            if leaves.contains(&name) {
+                continue;
+            }
             let Some(body) = bodies.get(&name) else {
                 continue;
             };
@@ -1891,6 +2178,19 @@ fn reachable_tables(
         frontier = next;
     }
     Some(out)
+}
+
+/// Every name one authored view reads, through the views it reads, itself included (RFC-0062).
+pub(crate) fn view_closure(
+    session: &dyn Session,
+    dir: &Path,
+    view: &str,
+) -> Option<std::collections::BTreeSet<String>> {
+    reachable_tables(
+        session,
+        dir,
+        &std::collections::BTreeSet::from([view.to_string()]),
+    )
 }
 
 /// Each authored view's name and body, from `views/*.sql` on disk.
@@ -2804,6 +3104,10 @@ fn relation_types(dir: &Path, name: &str) -> Vec<(String, &'static str)> {
         .get(&(dir.to_path_buf(), name.to_ascii_lowercase()))
         .cloned()
         .unwrap_or_default()
+}
+
+pub(crate) fn declared_entity_names(dir: &Path) -> std::collections::BTreeSet<String> {
+    declared_relations(dir)
 }
 
 /// The entity names `entities.toml` declares in `dir`, lowercased, as last read successfully. A running
@@ -8964,5 +9268,423 @@ mod schema_only_binding {
         let whole = describe(false);
         assert!(whole.iter().any(|(c, _)| c == "more"), "{whole:?}");
         assert_eq!(describe(true), whole);
+    }
+}
+
+#[cfg(test)]
+mod maintained_views {
+    //! RFC-0062 S1: every answer read from a copy is compared byte for byte with the request-time
+    //! view over the same inputs, on a nest that declares nothing.
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    const VIEWS: &str = "\
+CREATE VIEW bet AS
+SELECT p.\"id\" AS id, p.\"player\" AS player, p.\"amount\" AS amount, r.\"payout\" AS payout,
+       p.block_number AS placed_block
+FROM \"bs__placed\" p LEFT JOIN \"bs__resolved\" r ON r.\"id\" = p.\"id\";
+CREATE VIEW player_total AS
+SELECT player, count(*) AS bets, sum(CAST(amount AS BIGINT)) AS staked,
+       sum(CAST(payout AS BIGINT)) AS paid
+FROM bet GROUP BY player;
+";
+
+    fn placed(id: u64, player: &str, amount: u64, block: u64) -> Value {
+        json!({"table": "bs__placed", "id": id.to_string(), "player": player,
+               "amount": amount.to_string(), "block_number": block,
+               "tx_hash": format!("0x{id:x}"), "log_index": id})
+    }
+
+    fn resolved(id: u64, payout: u64, block: u64) -> Value {
+        json!({"table": "bs__resolved", "id": id.to_string(), "payout": payout.to_string(),
+               "block_number": block, "tx_hash": format!("0x{id:x}"), "log_index": 100 + id})
+    }
+
+    fn seal(dir: &Path, rows: &[Value], from: u64, to: u64) {
+        let rows: Vec<String> = rows.iter().map(Value::to_string).collect();
+        crate::seal::seal_range(dir, &rows, from, to).unwrap();
+    }
+
+    /// Three bets sealed through block 10, two of them resolved.
+    fn nest(declare: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(dir.path().join("views/10-bets.sql"), VIEWS).unwrap();
+        seal(
+            dir.path(),
+            &[
+                placed(1, "alice", 5, 3),
+                placed(2, "bob", 7, 4),
+                placed(3, "alice", 11, 9),
+                resolved(1, 10, 5),
+                resolved(2, 0, 6),
+            ],
+            1,
+            10,
+        );
+        if let Some(toml) = declare {
+            std::fs::write(dir.path().join(crate::maintained::DECLARATION_FILE), toml).unwrap();
+        }
+        dir
+    }
+
+    const BOTH: &str = "[[view]]\nname = \"bet\"\n\n[[view]]\nname = \"player_total\"\n";
+
+    /// Load the declaration and give the nest a builder over a gate of `permits`.
+    fn held(dir: &Path, permits: usize) -> Arc<tokio::sync::Semaphore> {
+        crate::maintained::load(dir).unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(permits));
+        crate::maintained::attach(dir, gate.clone());
+        gate
+    }
+
+    fn tip(rows: &[Value]) -> HotRows {
+        let mut hot = HotRows::new();
+        for r in rows {
+            hot.entry(r["table"].as_str().unwrap().to_string())
+                .or_default()
+                .push(r.clone());
+        }
+        hot
+    }
+
+    fn guard() -> QueryGuard {
+        QueryGuard {
+            timeout: Duration::from_secs(60),
+            max_rows: 10_000,
+        }
+    }
+
+    /// The answer's bytes: its columns in order, then its rows.
+    fn ask(dir: &Path, sql: &str, hot: &HotRows, sealed_through: u64) -> Vec<u8> {
+        let out = query_hot_cold(dir, sql, guard(), hot, sealed_through, &[]).unwrap();
+        assert!(!out.degraded(), "{sql}: {:?}", out.degraded_tables);
+        serde_json::to_vec(&(out.columns, out.rows)).unwrap()
+    }
+
+    /// The same statement over a copy of the nest that declares nothing and holds no copies.
+    fn oracle(dir: &Path, sql: &str, hot: &HotRows, sealed_through: u64) -> Vec<u8> {
+        let plain = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name();
+            if name == crate::maintained::COPIES_DIR || name == crate::maintained::DECLARATION_FILE
+            {
+                continue;
+            }
+            let to = plain.path().join(&name);
+            if entry.file_type().unwrap().is_dir() {
+                crate::project::copy_dir(&entry.path(), &to).unwrap();
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+        ask(plain.path(), sql, hot, sealed_through)
+    }
+
+    fn counts(dir: &Path, view: &str) -> (u64, u64, u64) {
+        let (_, s, _, _) = crate::maintained::report(dir)
+            .into_iter()
+            .find(|(v, ..)| v == view)
+            .expect("a declared view");
+        (
+            s.hits.load(Relaxed),
+            s.fallbacks.load(Relaxed),
+            s.builds.load(Relaxed),
+        )
+    }
+
+    fn copies(dir: &Path, view: &str) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> =
+            std::fs::read_dir(dir.join(crate::maintained::COPIES_DIR).join(view))
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    const SHAPES: &[&str] = &[
+        "SELECT * FROM bet ORDER BY id",
+        "SELECT id, payout FROM bet WHERE payout IS NULL ORDER BY id",
+        "SELECT * FROM player_total ORDER BY player",
+        "SELECT b.id, t.staked FROM bet b JOIN player_total t ON t.player = b.player ORDER BY b.id",
+        "SELECT count(*) AS n FROM bet",
+        "SELECT player, staked + 1 AS s1, staked * 2 AS s2, CAST(staked AS VARCHAR) AS s3, \
+         staked / 3 AS s4, paid - staked AS s5, typeof(staked) AS t FROM player_total ORDER BY player",
+    ];
+
+    /// The first request answers from the definition and queues the builds; every later one reads
+    /// the copies, and each answer is the request-time view's to the byte.
+    #[test]
+    fn a_maintained_view_answers_from_its_copy_byte_for_byte() {
+        let dir = nest(Some(BOTH));
+        held(dir.path(), 2);
+        let hot = tip(&[placed(4, "carol", 13, 20), resolved(3, 22, 21)]);
+        for sql in SHAPES {
+            let want = oracle(dir.path(), sql, &hot, 10);
+            assert_eq!(
+                ask(dir.path(), sql, &hot, 10),
+                want,
+                "before any copy: {sql}"
+            );
+        }
+        crate::maintained::wait_idle(dir.path());
+        let errors: Vec<_> = crate::maintained::report(dir.path())
+            .into_iter()
+            .map(|(v, s, ..)| (v, s.last_error()))
+            .collect();
+        assert_eq!(copies(dir.path(), "bet").len(), 1, "{errors:?}");
+        assert_eq!(copies(dir.path(), "player_total").len(), 1, "{errors:?}");
+        let before = (
+            counts(dir.path(), "bet"),
+            counts(dir.path(), "player_total"),
+        );
+        for sql in SHAPES {
+            let want = oracle(dir.path(), sql, &hot, 10);
+            assert_eq!(
+                ask(dir.path(), sql, &hot, 10),
+                want,
+                "from the copies: {sql}"
+            );
+        }
+        let (bet, total) = (
+            counts(dir.path(), "bet"),
+            counts(dir.path(), "player_total"),
+        );
+        assert!(bet.0 > before.0 .0, "bet answered from its copy: {bet:?}");
+        assert!(
+            total.0 > before.1 .0,
+            "player_total answered from its copy: {total:?}"
+        );
+        assert_eq!(
+            (bet.1, total.1),
+            (before.0 .1, before.1 .1),
+            "no fallback once built"
+        );
+        assert_eq!((bet.2, total.2), (1, 1), "one build each");
+    }
+
+    /// A copy built at one set of hot rows is not served at another: the request answers from the
+    /// definition, the old copy stays where it was, and the new state gets its own.
+    #[test]
+    fn a_copy_is_never_served_for_other_hot_rows() {
+        let dir = nest(Some(BOTH));
+        held(dir.path(), 2);
+        let sql = SHAPES[0];
+        let first = tip(&[placed(4, "carol", 13, 20)]);
+        ask(dir.path(), sql, &first, 10);
+        crate::maintained::wait_idle(dir.path());
+        let old = ask(dir.path(), sql, &first, 10);
+        let built = copies(dir.path(), "bet");
+        assert_eq!(built.len(), 1);
+
+        let second = tip(&[placed(4, "carol", 13, 20), resolved(4, 26, 21)]);
+        let want = oracle(dir.path(), sql, &second, 10);
+        assert_ne!(old, want, "the fixture must change the answer");
+        let (hits, fallbacks, _) = counts(dir.path(), "bet");
+        assert_eq!(ask(dir.path(), sql, &second, 10), want);
+        assert_eq!(
+            counts(dir.path(), "bet").0,
+            hits,
+            "not served from the old copy"
+        );
+        assert_eq!(counts(dir.path(), "bet").1, fallbacks + 1);
+        assert!(built[0].exists(), "the old copy is untouched");
+    }
+
+    /// Another binary never reads this one's copies: an upgrade answers from the definition and
+    /// builds its own.
+    #[test]
+    fn an_upgrade_does_not_read_the_old_binarys_copies() {
+        let dir = nest(Some(BOTH));
+        held(dir.path(), 2);
+        let sql = SHAPES[0];
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        crate::maintained::test_set_binary(dir.path(), "nuthatch 4.13.0 aaaa");
+        ask(dir.path(), sql, &hot, 10);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(
+            ask(dir.path(), sql, &hot, 10),
+            oracle(dir.path(), sql, &hot, 10)
+        );
+        let (hits, fallbacks, builds) = counts(dir.path(), "bet");
+        assert!(hits > 0, "the copy serves its own binary");
+
+        crate::maintained::test_set_binary(dir.path(), "nuthatch 4.14.0 bbbb");
+        assert_eq!(
+            ask(dir.path(), sql, &hot, 10),
+            oracle(dir.path(), sql, &hot, 10)
+        );
+        assert_eq!(
+            counts(dir.path(), "bet").0,
+            hits,
+            "not served across an upgrade"
+        );
+        assert_eq!(counts(dir.path(), "bet").1, fallbacks + 1);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(
+            counts(dir.path(), "bet").2,
+            builds + 1,
+            "the new binary builds its own"
+        );
+        assert_eq!(copies(dir.path(), "bet").len(), 2);
+    }
+
+    /// A seal that admits a segment of a table the view reads changes its identity; one of a table
+    /// it does not read leaves the copy current.
+    #[test]
+    fn a_seal_moves_the_identity_only_through_the_closure() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        held(dir.path(), 2);
+        let sql = SHAPES[0];
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        ask(dir.path(), sql, &hot, 10);
+        crate::maintained::wait_idle(dir.path());
+        let old = ask(dir.path(), sql, &hot, 10);
+        let (hits, fallbacks, _) = counts(dir.path(), "bet");
+        assert!(hits > 0);
+
+        seal(
+            dir.path(),
+            &[
+                json!({"table": "other__thing", "k": "x", "block_number": 12,
+                     "tx_hash": "0x1", "log_index": 0}),
+            ],
+            11,
+            12,
+        );
+        assert_eq!(ask(dir.path(), sql, &hot, 12), old);
+        assert_eq!(
+            counts(dir.path(), "bet").0,
+            hits + 1,
+            "a seal outside the closure"
+        );
+
+        seal(dir.path(), &[resolved(3, 30, 13)], 13, 14);
+        let want = oracle(dir.path(), sql, &hot, 14);
+        assert_ne!(old, want, "the fixture must change the answer");
+        assert_eq!(ask(dir.path(), sql, &hot, 14), want);
+        assert_eq!(
+            counts(dir.path(), "bet").0,
+            hits + 1,
+            "not served past the seal"
+        );
+        assert_eq!(counts(dir.path(), "bet").1, fallbacks + 1);
+    }
+
+    /// Retention keeps the copy just built and `recent` others, and leaves no partial file.
+    #[test]
+    fn retention_keeps_the_current_copy_and_recent_others() {
+        let dir = nest(Some("recent = 1\n[[view]]\nname = \"bet\"\n"));
+        held(dir.path(), 2);
+        let sql = SHAPES[0];
+        for n in 0..4u64 {
+            let hot = tip(&[placed(4, "carol", 13 + n, 20)]);
+            ask(dir.path(), sql, &hot, 10);
+            crate::maintained::wait_idle(dir.path());
+            assert_eq!(
+                ask(dir.path(), sql, &hot, 10),
+                oracle(dir.path(), sql, &hot, 10)
+            );
+        }
+        let left = copies(dir.path(), "bet");
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left
+            .iter()
+            .all(|p| p.extension().is_some_and(|x| x == "parquet")));
+        // The current copy is one of the two kept, and it still serves.
+        let (hits, ..) = counts(dir.path(), "bet");
+        let hot = tip(&[placed(4, "carol", 16, 20)]);
+        ask(dir.path(), sql, &hot, 10);
+        assert_eq!(counts(dir.path(), "bet").0, hits + 1);
+    }
+
+    /// A build is admitted like a query: it waits for one of the cursor's permits.
+    #[test]
+    fn a_build_waits_for_a_permit() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        let gate = held(dir.path(), 1);
+        let held_permit = gate.clone().try_acquire_owned().unwrap();
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        ask(dir.path(), SHAPES[0], &hot, 10);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            copies(dir.path(), "bet").is_empty(),
+            "built without a permit"
+        );
+        drop(held_permit);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(copies(dir.path(), "bet").len(), 1);
+    }
+
+    /// A copy that will not read is answered around, from the definition, and built again.
+    #[test]
+    fn a_copy_that_will_not_read_is_answered_around_and_rebuilt() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        held(dir.path(), 2);
+        let sql = SHAPES[0];
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        ask(dir.path(), sql, &hot, 10);
+        crate::maintained::wait_idle(dir.path());
+        let copy = copies(dir.path(), "bet").pop().unwrap();
+        std::fs::write(&copy, b"not parquet").unwrap();
+        let want = oracle(dir.path(), sql, &hot, 10);
+        assert_eq!(ask(dir.path(), sql, &hot, 10), want);
+        // Gone once no request holds it; the next request queues it again.
+        assert_eq!(ask(dir.path(), sql, &hot, 10), want);
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(ask(dir.path(), sql, &hot, 10), want);
+        assert!(
+            std::fs::read(&copy).unwrap().starts_with(b"PAR1"),
+            "rebuilt"
+        );
+    }
+
+    /// A nest that declares nothing writes nothing and holds nothing.
+    #[test]
+    fn a_nest_that_declares_nothing_is_unchanged() {
+        let dir = nest(None);
+        crate::maintained::load(dir.path()).unwrap();
+        crate::maintained::attach(dir.path(), Arc::new(tokio::sync::Semaphore::new(2)));
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        for sql in SHAPES {
+            ask(dir.path(), sql, &hot, 10);
+        }
+        assert!(!dir.path().join(crate::maintained::COPIES_DIR).exists());
+        assert!(!crate::maintained::is_declared(dir.path()));
+    }
+
+    /// Refused at load, by name, with the relation that makes it so.
+    #[test]
+    fn a_view_reading_an_uncovered_relation_is_refused_at_load() {
+        let dir = nest(None);
+        std::fs::write(
+            dir.path().join("views/20-more.sql"),
+            "CREATE VIEW priced AS SELECT b.id, o.usd FROM bet b JOIN offchain__prices o ON o.id = b.id;\n\
+             CREATE VIEW stamped AS SELECT id, now() AS at FROM bet;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(crate::maintained::DECLARATION_FILE),
+            "[[view]]\nname = \"priced\"\n[[view]]\nname = \"stamped\"\n\
+             [[view]]\nname = \"nope\"\n[[view]]\nname = \"bet\"\n",
+        )
+        .unwrap();
+        let err = crate::maintained::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("3 view(s)"), "{err}");
+        assert!(
+            err.contains("priced: `priced` reads `offchain__prices`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("stamped: `stamped` calls a volatile function"),
+            "{err}"
+        );
+        assert!(
+            err.contains("nope: `nope` is not an authored view"),
+            "{err}"
+        );
+        assert!(!crate::maintained::is_declared(dir.path()));
     }
 }
