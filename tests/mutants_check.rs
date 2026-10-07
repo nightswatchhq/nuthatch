@@ -68,6 +68,8 @@ fn workspace(outcomes: Option<&str>, missed: Option<&str>) -> tempfile::TempDir 
 const COMPLETE: &str =
     r#"{"total_mutants": 39, "outcomes": [], "end_time": "2026-08-24T08:00:00Z"}"#;
 const TRUNCATED: &str = r#"{"total_mutants": 39, "outcomes": [], "end_time": null}"#;
+/// A completed run that enumerated the baseline's chunker mutant and did not report it surviving.
+const TESTED_CHUNKER: &str = r#"{"total_mutants": 1, "end_time": "2026-08-24T08:00:00Z", "outcomes": [{"scenario": {"Mutant": {"name": "src/chunker.rs:134:14: replace < with <= in AdaptiveWindow::served_by_splitting"}}, "summary": "CaughtMutant"}]}"#;
 const EMPTY_SWEEP: &str =
     r#"{"total_mutants": 0, "outcomes": [], "end_time": "2026-08-24T08:00:00Z"}"#;
 
@@ -135,7 +137,7 @@ fn a_survivor_outside_the_baseline_fails_and_is_named() {
 fn the_file_scope_keeps_a_matrix_job_from_judging_another_files_baseline() {
     // The per-file matrix (#841) means the seal.rs job never sees chunker.rs survivors. Without
     // `--file` it would report every chunker baseline entry as newly stale on every run.
-    let w = workspace(Some(COMPLETE), Some("src/seal.rs:1:1: something\n"));
+    let w = workspace(Some(TESTED_CHUNKER), Some("src/seal.rs:1:1: something\n"));
     let (_, unscoped) = check(w.path(), None);
     assert!(
         unscoped.contains("no longer survives"),
@@ -198,4 +200,23 @@ fn a_baselined_timeout_is_accepted_like_a_baselined_survivor() {
     );
     let (ok, out) = check(w.path(), None);
     assert!(ok, "a timeout already in the baseline is not new:\n{out}");
+}
+
+#[test]
+fn a_shard_judges_only_the_baseline_entries_it_ran() {
+    // #1971: a seal.rs shard runs an eighth of the file, and the note told the reader to remove four
+    // entries that still survived in the shards that ran them.
+    let w = workspace(Some(COMPLETE), Some(""));
+    let (ok, out) = check(w.path(), None);
+    assert!(ok, "{out}");
+    assert!(
+        !out.contains("no longer survives"),
+        "an entry this run did not mutate was judged stale:\n{out}"
+    );
+    let w = workspace(Some(TESTED_CHUNKER), Some(""));
+    let (_, out) = check(w.path(), None);
+    assert!(
+        out.contains("no longer survives"),
+        "an entry this run mutated and caught is stale:\n{out}"
+    );
 }

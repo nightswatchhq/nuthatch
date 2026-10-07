@@ -3542,6 +3542,22 @@ mod tests {
         assert!(dir.path().join("quarantine").join(&seg.file).exists());
     }
 
+    /// #1971: a missing segment is skipped before the quarantine arm, so `quarantine/` is never made.
+    /// The count alone cannot see this: the arm's rename fails on the absent file and counts nothing.
+    #[test]
+    fn a_missing_segment_is_skipped_without_making_a_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        std::fs::remove_file(segment_path(dir.path(), &seg.file, &seg.hash)).unwrap();
+
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        assert!(
+            !dir.path().join("quarantine").exists(),
+            "a missing segment took the unreadable arm"
+        );
+    }
+
     #[test]
     fn check_catalogue_reports_an_unreadable_segment_as_a_mismatch_not_missing() {
         let dir = tempfile::tempdir().unwrap();
