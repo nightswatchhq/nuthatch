@@ -430,6 +430,61 @@ applied resolutions are in a later block than their placement.
 - **The Lodestar gate.** The spike's request path is unchanged when nothing is declared (the
   declaration is read and found empty), but a gate run is S1's criterion 4, not an argument.
 
+## §8a - S1 measured
+
+**Verdict: S1's criteria 1, 2, 4 and 5 pass, and its three mutations go red.** PR #1977, 2026-10-07,
+measured on the ThinkPad at 972a9c27; the one later commit only adds the plain-name refusal.
+
+**What was built.** §3.1 to §3.5 as written, lazily: `maintained.toml` and its load-time refusals, the
+§3.2 identity (the binary is its version and a sha256 of the executable; the closure's schema is in
+it too, the registry's declared columns and `schema.json`, which decide empty typed views and `*_dec`
+columns), the §3.3 read path for `/sql` and GraphQL row reads (not `as_of`, `/explain`, a declared
+query, or a statement that surveys the catalogue), one builder per cursor holding one `/sql` permit
+per build, retention through the seal read leases, and per-view counters on `/ready` and `/metrics`
+only for a nest that declares one. A copy that will not read is answered around from the definition
+and rebuilt. One finding on the way: `describe` of an aggregate view reports `sum` of a BIGINT as
+BIGINT while execution yields DECIMAL(38,0), so the build checks that the copy reads back rather than
+comparing its types with `describe`; the answers, `typeof` included, agree.
+
+**Method.** BetSwirl seeded from the public mirror (dataset `f00657c7`) in `~/stopgap-perf/w1973`,
+copied twice: `nest-s1` declaring the seven entity views, `nest-s1-base` declaring nothing. Both
+binaries `--features graph`: S1 against `nuthatch-base` (main at 8fce5fac, 4.13.0). `serve`, memo
+off, default 512 MB. Production's unit, directory and warm timer untouched.
+
+| shape | 20-run p50 | first request, 5 fresh processes |
+|---|---:|---:|
+| `first: 20`, skip 0 | 0.185 | 0.239 to 0.261 |
+| skip 100 | 0.184 | 0.231 to 0.262 |
+| skip 5,000 | 0.221 | 0.274 to 0.293 |
+| skip 150,000 | 0.763 | 0.829 to 0.850 |
+| orderBy betTimestamp desc | 0.311 | 0.368 to 0.386 |
+| where user, betTimestamp desc | 0.171 | 0.234 to 0.240 |
+| `tokens` | 0.023 | 0.071 to 0.080 |
+| `bet(id)` | 0.086 | 0.138 to 0.168 |
+
+- **Criterion 1:** every shape under 1 s, slowest single request 0.850 s.
+- **Criterion 2:** all eight shapes' JSON and every row of the seven views (167,540 rows; `bet`
+  160,802 rows, 140,922,340 bytes) byte-identical to 4.13.0's, the dump read from the copies
+  (`/ready` counted every request a hit, no fallback).
+- **Criterion 5:** three runs from an empty `maintained/`, a skip 150,000 request running beside
+  the builds: all seven copies in 3.88 to 3.90 s, `bet` built in 2.47 to 2.49 s, pool peak 345 to
+  358 MB, process high-water 1,309 to 1,344 MB; 43,414,973 bytes on disk.
+- **Criterion 4, the Lodestar release gate** (`scripts/release-gate.sh`, the alloc-nest copy on the
+  ThinkPad as it stood, kittiwake's 75 statements, production's environment, 3 passes at concurrency
+  2, v4.13.0 measured first as the baseline): **PASS**. 75 of 75 answered, 0 regressed, 0 answers
+  differ; p99 2,601 ms against 2,593 ms; peak RSS 1,905 MiB against 4.13.0's 1,899 MiB, inside 2,048.
+- **Criterion 7, S1's mutations**, each red on its named test: dropping the closure's segments
+  (`a_seal_moves_the_identity_only_through_the_closure` serves the stale copy), dropping the binary
+  (`an_upgrade_does_not_read_the_old_binarys_copies`), and serving a copy present for another
+  identity (`a_copy_is_never_served_for_other_hot_rows`). Also red: dropping the hot rows, keying the
+  sealed digest on every table, and not sorting the hot rows. Catching a copy whose own rows were
+altered is S3's verification.
+
+**Moves to S2 and S3.** Criterion 3 (a forced reorg) and 6 (an hour following BSC) are S2's, as are
+eager builds. S1's queue keeps one pending build per view, the newest request's, so a stale identity
+can still be built once before S2's latest-wins drops it. Copies of a view no longer declared stay on
+disk until deleted by hand.
+
 ## §9 - Risks
 
 - **History grows, and the build with it.** 3.6 s today is O(history). A nest writing view rows more
