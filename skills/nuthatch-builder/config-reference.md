@@ -31,9 +31,6 @@ start_block = 6082465         # optional; deployment block (init detects it)
 abi = "abis/usdc.json"        # vendored ABI path
 events = ["Transfer"]         # optional allowlist; omit to decode every event
 
-[screening]                   # optional (RFC-0008)
-lists = ["<list-hash>"]       # sanctions/watch-list snapshots to screen against
-
 [flags]                       # optional (RFC-0008 C3); amounts are base units as strings
 threshold = "1000000000000"       # single-transfer flag ≥ this
 velocity_amount = "5000000000000" # windowed-volume flag ≥ this
@@ -67,9 +64,9 @@ since = "registration"        # optional: "genesis" | "registration" | a block n
 secret = "…"                  # optional HMAC signing secret
 
 [[alerts]]                    # optional (RFC-0008 C5)
-kinds = ["threshold_flag", "sanction_hit", "entity_fault"]
-                              # what to deliver. The first two are compliance annotations (RFC-0008
-                              # C5) and must match the emitted annotation's kind. `entity_fault` is
+kinds = ["threshold_flag", "entity_fault"]
+                              # what to deliver. `threshold_flag` is a compliance annotation (RFC-0008
+                              # C5) and must match the emitted kind. `entity_fault` is
                               # operational: an authored incremental entity's circuit has stopped,
                               # which is terminal and quarantines the nest. Nothing validates this
                               # list, so a typo is a sink that silently never fires.

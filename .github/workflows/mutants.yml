@@ -1,6 +1,7 @@
 # Mutation coverage on the delightful core (#768), split per file so it finishes (#841).
 #
-# **Nightly, not per-PR, and the reason is measured rather than assumed.** On an 18-core box:
+# **Weekly, not per-PR, and the reason is measured rather than assumed.** (Weekly rather than nightly
+# since #1999: a sweep costs about 1,600 runner-minutes.) On an 18-core box:
 #
 #   - unmutated baseline: 114s build + 154s test (all targets), or 122s + 28s with `--lib`
 #   - each mutant needs its own rebuild, so ~150s apiece even with the test phase scoped
@@ -39,12 +40,12 @@ name: mutants (delightful core)
 
 on:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * 0"
   workflow_dispatch:
 
 jobs:
   mutants:
-    name: mutation coverage (nightly, advisory) - ${{ matrix.file }} ${{ matrix.shard }}
+    name: mutation coverage (weekly, advisory) - ${{ matrix.file }} ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -78,8 +79,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # One shared cache across the three jobs - they build the identical baseline.
-          shared-key: mutants
+          # Restores main's default build and never saves: a sweep's own entry evicted the caches
+          # every PR restores from (#1999).
+          shared-key: check-default-check-default
+          save-if: false
       # SIGBUS from `ld` is the disk, not the code (#1387). All three matrix jobs died the same way
       # on the 2026-09-14 scheduled run - `collect2: fatal error: ld terminated with signal 7 [Bus
       # error]` - which is the fault `ci.yml` already carries this exact step for, added after it

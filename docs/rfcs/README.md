@@ -27,7 +27,7 @@ history that earned it. Deferred means deferred and recorded, in the sense of
 | [0005](0005-release-engineering-v0.1.0.md) | Release engineering: v0.1.0 | 0001, 0002 | **Implemented** (v0.3.0 shipped) |
 | [0006](0006-grant-funding.md) | Grant funding: NLnet and EF ESP applications | 0002 (demo), 0003-0005 (roadmap) | **Withdrawn 2026-10-04: nuthatch takes no grants.** Never applied for; the drafts in `docs/grants/` are deleted |
 | [0007](0007-launch-and-validation.md) | Launch and validation | 0005 | Accepted - launch kit shipped; launch ongoing |
-| [0008](0008-compliance-pack.md) | Compliance pack (screening, flags, exposure, audit) | P0 (i128), slice 4, 0006 M1 | **Implemented** |
+| [0008](0008-compliance-pack.md) | Compliance pack (screening, flags, exposure, audit) | P0 (i128), slice 4, 0006 M1 | **Implemented**; screening and its WASM component removed 2026-10-08 (#1999) |
 | [0009](0009-factory-and-dynamic-contract-discovery.md) | Factory and dynamic contract discovery | 0001, 0004 | **Implemented** |
 | [0010](0010-admin-ui-and-webhooks.md) | The admin UI and webhooks - ease-of-use parity | 0001, 0005 | **Implemented** |
 | [0011](0011-graph-network-nest-lodestar-migration.md) | The graph-network nest and the Lodestar migration | 0001, 0002, 0004, 0005 | **Parked after pilot** - wedge proven in prod; full migration not done |

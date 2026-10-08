@@ -83,7 +83,7 @@ Conversation #1 is DONE and recorded: profile "infrastructure operator," outcome
    it validates the newest RFC rather than re-validating the oldest thesis).
 
 Script unchanged (demo, then the three exact questions; verbatim answers, anonymized).
-One addition to the script for #5: show `nuthatch audit replay` - the compliance
+One addition to the script for #5: show `audit replay` (since removed) - the compliance
 pack's "prove it" command is the demo for that audience even in its design-doc state.
 
 ## Pre-registered thresholds (judged once at day 30) - v1 thresholds stand, one added

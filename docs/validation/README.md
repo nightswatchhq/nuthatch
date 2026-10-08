@@ -10,8 +10,7 @@ retrofitted into a success it wasn't.
 
 Each conversation follows the same script:
 
-1. **Demo** - a live nuthatch instance: `init → dev → /sql` on a real contract, and (for the
-   compliance profile) `nuthatch audit replay`. No slides.
+1. **Demo** - a live nuthatch instance: `init → dev → /sql` on a real contract. No slides.
 2. **Three questions, asked verbatim, in this order:**
    1. *"If this didn't exist, what would you use instead - and what does that cost you today
       (money, ops time, or a dependency you'd rather not have)?"*

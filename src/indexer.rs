@@ -20,7 +20,6 @@ use crate::labels::{self, LabelSet};
 use crate::metrics::METRICS;
 use crate::registry::DecodeRegistry;
 use crate::rpc::RpcClient;
-use crate::screen::{self, LiveScreener, TransferRow};
 use crate::seal;
 use crate::serve;
 use crate::source::{LogFilter, Source};
@@ -2021,7 +2020,7 @@ fn drain_lifecycle(
                 }
                 match sup.index_of(&name) {
                     // Retire *and release*: dropping the `NestIngest` drops this cursor's `Store`
-                    // clone, its view handles and its screener. redb only lets go of the file when
+                    // clone and its view handles. redb only lets go of the file when
                     // every clone has, so this is one of three that must (RFC-0027 §6).
                     Some(i) => {
                         sup.retire(i);
@@ -2957,13 +2956,6 @@ async fn build_nest(
     // The exposure view joins transfers against the labeled set - with no labels it can only ever be
     // empty, so don't spend a DBSP circuit + dedicated thread on it (deadlock-review finding L10).
     let exposure = ExposureView::start(!labels.is_empty())?;
-    // Optional live sanctions screening (RFC-0008 C2). Absent unless the nest configures
-    // `[screening].lists`; when present, every window's transfers are screened against the pure
-    // component and `sanction_hit` annotations are stored + sealed alongside the transfers.
-    let screener = Arc::new(screen::LiveScreener::from_config(
-        &dir,
-        &config.screening.lists,
-    )?);
 
     // Optional threshold & velocity flags (RFC-0008 C3). Threshold flags are per-transfer stored
     // annotations (block-keyed → roll back with their transfer); velocity is a DBSP windowed view
@@ -3227,7 +3219,6 @@ async fn build_nest(
         #[cfg(feature = "folds")]
         folds: None,
         labels: labels.clone(),
-        screener: screener.clone(),
         threshold,
         velocity_cfg,
         router: router.clone(),
@@ -6378,7 +6369,6 @@ pub struct NestIngest {
     /// writer, one observable failure boundary. Empty for the ordinary nest that declares none.
     entities: Arc<Vec<EntityView>>,
     labels: Arc<LabelSet>,
-    screener: Arc<Option<LiveScreener>>,
     threshold: Option<i128>,
     velocity_cfg: Option<(i128, u64)>,
     router: Arc<AlertRouter>,
@@ -7014,7 +7004,7 @@ impl NestIngest {
         self.velocity.retract(vel_deltas);
     }
 
-    /// Decode, store, IVM-feed, screen, checkpoint, seal and deliver webhooks for one fetched window
+    /// Decode, store, IVM-feed, checkpoint, seal and deliver webhooks for one fetched window
     /// `[next, to]` (with `tip` the current chain tip, used for the finality ceiling). Returns
     /// `Ok(Some(stored))` - the row count, caller advances the cursor - or `Ok(None)` when block
     /// timestamps were unavailable and the window must be retried WITHOUT advancing (the cursor stays
@@ -7171,8 +7161,6 @@ impl NestIngest {
         let mut deltas = Vec::new();
         let mut exp_deltas = Vec::new();
         let mut vel_deltas = Vec::new();
-        // Transfers to screen this window (only collected when screening is on).
-        let mut to_screen: Vec<TransferRow> = Vec::new();
         // PERF-2: accumulate every write and commit the whole window in ONE redb txn at the end,
         // instead of a `begin_write`/`commit` (fsync) per row. `(key, json)` for rows + annotations.
         let mut to_store: Vec<(String, String)> = Vec::with_capacity(rows.len());
@@ -7232,16 +7220,6 @@ impl NestIngest {
                         "transfer value has more than 38 digits; excluded from balances (#814)"
                     );
                 }
-                if self.screener.is_some() {
-                    to_screen.push(TransferRow {
-                        block_number: row.block_number,
-                        log_index: row.log_index,
-                        from: from.to_ascii_lowercase(),
-                        to: to_addr.to_ascii_lowercase(),
-                        value: value.unwrap_or_default(),
-                        tx_hash: row.tx_hash.clone(),
-                    });
-                }
             }
             // Every row is stored uniformly as typed JSON with a `table` field; per-table
             // sealing groups by it.
@@ -7292,23 +7270,6 @@ impl NestIngest {
         // IVM threads that were previously exempt).
         self.ensure_views_healthy()?;
 
-        // Live sanctions screening (RFC-0008 C2): screen this window's transfers against the
-        // configured list snapshots and store `sanction_hit` annotations. They share the
-        // transfers' block keys, so they seal and roll back with the same range. Stored before
-        // `maybe_seal` below so a freshly-finalized window seals its hits alongside its rows.
-        if let Some(s) = self.screener.as_ref() {
-            let hits = s.screen_window(&to_screen);
-            for (key, ann) in &hits {
-                to_store.push((key.clone(), ann.to_string()));
-                alerts::enqueue(&self.store, &self.router, "flag", "sanction_hit", ann)?;
-            }
-            if !hits.is_empty() {
-                tracing::warn!(
-                    "sanctions screening: {} hit(s) in {next}..={to}",
-                    hits.len()
-                );
-            }
-        }
         // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
         // from the same runtime, so a contended commit here would surface as latency on unrelated
         // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
@@ -16065,7 +16026,7 @@ template = "pool"
         // `balances.apply` posts a batch to the view's channel and the circuit folds it on its own
         // thread; `flush` is what waits for that. Reading the balance straight after
         // `process_window` returns is a race a fast machine wins and a loaded runner loses - seen as
-        // `recipient was credited` failing on CI's `exex` leg while passing locally every time.
+        // `recipient was credited` failing on one CI leg while passing locally every time.
         nest.balances.flush();
         let after_first = nest
             .balances
@@ -18531,9 +18492,9 @@ template="pool"
     /// reds because `block_hash_calls` stops being 1.
     ///
     /// The floor is 1, not 0: every window - `[[calls]]` or not - fetches the window boundary's
-    /// hash once for the reorg checkpoint (`src/indexer.rs`, the `block_hash(to)` call after
-    /// screening). Confirmed against the pre-fix code before writing this assertion: it reported 4,
-    /// the checkpoint's 1 plus one unbatched call per sampled block (three, for `every = 1` over
+    /// hash once for the reorg checkpoint (the `block_hash(to)` call in `process_window`).
+    /// Confirmed against the pre-fix code before writing this assertion: it reported 4, the
+    /// checkpoint's 1 plus one unbatched call per sampled block (three, for `every = 1` over
     /// blocks 1..=3) - proving the defect was reachable through the real constructor before fixing
     /// it, not just reasoned about.
     #[tokio::test]

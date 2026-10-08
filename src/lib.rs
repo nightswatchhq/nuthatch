@@ -1,9 +1,9 @@
 //! nuthatch - be your own indexer.
 //!
-//! The crate's modules are exposed as a library so a second front-end - notably `nuthatch-node`,
-//! the colocated reth ExEx build (RFC-0003) - can reuse the *same* indexing core (decode → hot
-//! store → seal → IVM → serve) rather than fork it. The `nuthatch` binary (`main.rs`) is one such
-//! front-end; a reth-driven one is another, and both drive the pipeline through the `Source` trait.
+//! The crate's modules are exposed as a library so a second front-end - such as a colocated reth
+//! build (RFC-0003, not built) - could reuse the *same* indexing core (decode → hot store → seal →
+//! IVM → serve) rather than fork it. The `nuthatch` binary (`main.rs`) is one such front-end, and
+//! drives the pipeline through the `Source` trait.
 
 pub mod abi;
 pub mod alerts;
@@ -37,7 +37,6 @@ pub mod counter;
 pub mod crash;
 pub mod distribution;
 pub mod doctor;
-pub mod effectful;
 pub(crate) mod engine;
 pub(crate) mod engine_burrmill;
 pub mod entities;
@@ -103,7 +102,6 @@ pub mod rpc;
 pub mod runtime;
 /// Cursor placement for scaled mode (RFC-0022 §2) - pure decision logic, no I/O.
 pub mod scheduler;
-pub mod screen;
 pub mod seal;
 pub mod sealed_audit;
 pub mod seed;
@@ -120,7 +118,6 @@ pub mod sqlmemo;
 pub mod store;
 pub mod subgraph_import;
 pub mod tape;
-pub mod transform;
 pub mod velocity;
 pub mod views;
 pub mod webhooks;

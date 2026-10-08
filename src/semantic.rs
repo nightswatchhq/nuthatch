@@ -634,8 +634,6 @@ VIEWS (incrementally maintained; reorgs retract automatically)
 COMPLIANCE (RFC-0008; amounts are i128 base units as decimal strings)
   exposure       - an address's direct exposure to the labeled set (tool `exposure`).
   flags          - threshold and velocity flags (tool `flags`).
-  screen_status  - sanctions-screening hits + the list-snapshot version (tool `screen_status`);
-                   also the `sanction_hit` SQL table (each row carries its list_snapshot hash).
 
 FACTORIES (RFC-0009; only in a nest with templates/factories)
   Children of a template share tables (`pool__swap`, …), distinguished by the `address` column. Each

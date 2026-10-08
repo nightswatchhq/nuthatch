@@ -1,6 +1,6 @@
 ---
 name: nuthatch-builder
-description: Build, configure, run, or debug a nuthatch indexer (a "nest", one or many in a runtime). Use when the user wants to index a smart contract's events into a local SQL database with nuthatch - scaffolding from an address, editing nuthatch.toml/semantic.toml, adding contracts, factories, compliance screening, packaging/mounting nests, running several nests in one runtime, or troubleshooting a running indexer.
+description: Build, configure, run, or debug a nuthatch indexer (a "nest", one or many in a runtime). Use when the user wants to index a smart contract's events into a local SQL database with nuthatch - scaffolding from an address, editing nuthatch.toml/semantic.toml, adding contracts, factories, compliance labels and flags, packaging/mounting nests, running several nests in one runtime, or troubleshooting a running indexer.
 ---
 
 # Building with nuthatch
@@ -50,7 +50,7 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
 - **[entities.md](entities.md)** - `entities.toml`: a relation the indexer *maintains* as blocks
   arrive rather than recomputing per query (RFC-0041, 3.0.0). Read it with `views.md` - the two look
   almost identical in the file and are completely different at runtime.
-- **[compliance.md](compliance.md)** - labels, sanctions lists, screening, flags, exposure, the signed
+- **[compliance.md](compliance.md)** - labels, flags, exposure and the signed
   audit pack (only relevant if the user asks for compliance features).
 - **[troubleshooting.md](troubleshooting.md)** - symptom → `/metrics` series → remedy for tip lag, RPC
   failover, reorgs, guard rejections, and the RAM budget.

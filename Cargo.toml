@@ -18,7 +18,7 @@ categories = ["command-line-utilities", "database", "cryptography::cryptocurrenc
 # Keep the published crate lean: the 1.2 MB example WASM component and its guest source aren't
 # needed to build the host (only a skipped test loads it), the scratch/docs aren't either, and
 # fuzz/ is dev-only tooling (its own package, nightly-only, never in the data path per CLAUDE.md §4).
-exclude = ["/components", "/scratchpad", "/fuzz", "/decode", "/tools", "/count"]
+exclude = ["/scratchpad", "/fuzz", "/decode", "/tools", "/count"]
 
 [[bin]]
 name = "nuthatch"
@@ -94,7 +94,7 @@ alloy-dyn-abi = "1.6"
 alloy-primitives = "1.6"
 base64 = { version = "0.22", optional = true }
 k256 = { version = "0.13", optional = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "io-std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 # The parser role: entities and lowering read its AST.
@@ -126,8 +126,6 @@ dbsp = "0.320"
 # dbsp itself - these pin the same versions as direct dependencies so the derives are reachable.
 size-of = { package = "feldera-size-of", version = "0.1.7" }
 rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }
-wasmtime = { version = "48", features = ["component-model"] }
-wasmtime-wasi = "48"
 sha2 = "0.10"
 # RFC-0052 S4: an S3 ETag is an MD5, so a shallow `publish verify` can see replaced bytes. Already in
 # the tree via object_store at this version; MIT OR Apache-2.0.
@@ -172,9 +170,6 @@ url = { version = "2", optional = true }
 # tree, because `object_store` is already compiled (via dbsp/feldera-storage) and `url` is already
 # present; the feature only adds the `aws` transport on top of a crate we were building anyway.
 default = ["object-store"]
-# ExEx tip-ingestion source (colocated reth). Stubbed today - see docs/exex-design.md - so the
-# default build never pulls the (enormous) reth dependency.
-exex = []
 # Object-store (S3-compatible) nest-registry backend (RFC-0019 slice 2). Kept as a named feature so a
 # build that genuinely wants it gone can `--no-default-features`.
 object-store = ["dep:object_store", "dep:url"]

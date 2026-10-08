@@ -5,14 +5,14 @@
 //! Unlike velocity, a threshold flag needs no aggregation: it is a pure per-transfer predicate, so it
 //! becomes an append-only `threshold_flag` annotation keyed by its transfer's `{block}-{log}`. That
 //! makes reorg handling free - the annotation is block-keyed, so it rolls back (retracts) with its
-//! transfer exactly like a `sanction_hit`. Comparison is on the shipped **i128** path, so a value past
+//! transfer. Comparison is on the shipped **i128** path, so a value past
 //! i64 is flagged, not silently truncated (a threshold view on i64 would be a compliance liability).
 
 use serde_json::{json, Value};
 
 /// Build the `threshold_flag` annotation for a transfer, or `None` if it is below `threshold`. The
 /// key is the transfer's `{block:012}-{log:06}` plus a `-thr` discriminator (distinct from the
-/// transfer row and from a `sanction_hit` at the same log), so all coexist and roll back together.
+/// transfer row at the same log), so both coexist and roll back together.
 pub fn threshold_annotation(
     from: &str,
     to: &str,

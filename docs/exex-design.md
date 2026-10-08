@@ -1,6 +1,7 @@
 # ExEx tip-ingestion - design
 
-**Status:** designed + stubbed (`feature = "exex"`), reth wiring deferred to a node environment.
+**Status:** designed, not built. The `exex` feature and its stub were removed (#1999); nothing
+below exists in the tree. RFC-0003 is deferred.
 **Why deferred:** reth is an enormous compile and an ExEx can only be exercised against a synced
 node, so it can't be end-to-end verified in the same loop as the RPC path. The `Source` trait
 (`src/source.rs`) is in place so this lands as a new impl, never a fork of the indexing logic.
@@ -20,8 +21,8 @@ A reth **Execution Extension** is compiled *into* the reth binary and runs in-pr
 ## The push→pull bridge (the one real design point)
 
 ExEx is **push** (reth calls us as blocks commit); the indexer's `Source` is **pull** (the single
-cursor asks for `[from, to]`). `ExExSource` (in `src/source.rs`, `feature = "exex"`) bridges them
-with a bounded in-memory buffer keyed by block number:
+cursor asks for `[from, to]`). An `ExExSource` would bridge them with a
+bounded in-memory buffer keyed by block number:
 
 ```
 reth ExEx handler                         ExExSource (Source impl)        indexer loop

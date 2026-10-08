@@ -149,7 +149,6 @@ async fn scaffold(args: InitArgs) -> Result<()> {
             block_timestamps: !args.no_timestamps,
         },
         contracts,
-        screening: crate::config::Screening::default(),
         flags: crate::config::Flags::default(),
         alerts: Vec::new(),
         templates: Vec::new(),
@@ -208,7 +207,7 @@ async fn scaffold(args: InitArgs) -> Result<()> {
 }
 
 /// `nuthatch add 0xAnother` - grow an existing nest with more contracts without re-`init`. This is
-/// the natural "one or many contracts" flow (RFC-0001): the chain, RPC endpoints, and screening
+/// the natural "one or many contracts" flow (RFC-0001): the chain, RPC endpoints and the rest of the
 /// config are already settled by `init`, so `add` only resolves each new contract's ABI, vendors it,
 /// appends it to `nuthatch.toml`, and regenerates the derived artifacts (schema.json + the AI
 /// surface). The next `dev` backfills the new contract from its own deployment block - the existing
@@ -761,7 +760,6 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             block_timestamps: !args.no_timestamps,
         },
         contracts,
-        screening: crate::config::Screening::default(),
         flags: crate::config::Flags::default(),
         alerts: Vec::new(),
         templates,

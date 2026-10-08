@@ -258,7 +258,7 @@ pub fn seal_range_with_snapshot(
         let hash = hex::encode(Sha256::digest(&bytes));
         let segments = manifest.tables.entry(table.clone()).or_default();
         // Content-addressed idempotency: an identical segment (same table + hash) is already
-        // catalogued, so re-sealing the same rows - e.g. re-running `nuthatch screen` over a range to
+        // catalogued, so re-sealing the same rows - e.g. a re-run over a range to
         // re-audit - is a no-op rather than a double-listed (double-counted) segment. Checked on the
         // incoming rows alone, before any fold. A fold's file hash is the folded bytes, so the
         // incoming hash is kept beside it (#1631).
@@ -3135,7 +3135,7 @@ mod tests {
 
     #[test]
     fn re_sealing_identical_rows_into_a_provisional_table_is_still_a_no_op() {
-        // The idempotency rule `nuthatch screen` re-audits rely on, checked before the fold: the
+        // The content-addressed idempotency rule, checked before the fold: the
         // same rows again must not be folded in a second time as if they were new.
         let dir = tempfile::tempdir().unwrap();
         let rows = vec![transfer(10, 0, "1"), transfer(10, 1, "2")];

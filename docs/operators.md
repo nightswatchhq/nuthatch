@@ -664,7 +664,7 @@ returns a substitute. Backfill is unaffected - the dial only applies once the cu
 ## Configuration surface
 
 **Files:** `mounts.toml` (chains, mounted nests, budget), `nuthatch.toml` per nest (contracts, events,
-factories, screening, flags, webhooks, alerts), `semantic.toml` per nest (descriptions for the AI and
+factories, flags, webhooks, alerts), `semantic.toml` per nest (descriptions for the AI and
 SQL surfaces). Full key reference:
 [`config-reference.md`](../skills/nuthatch-builder/config-reference.md).
 
@@ -1172,9 +1172,6 @@ A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest
 `nuthatch_publish_lag_blocks` (blocks spanned by the final local segments the mirror does not hold, summed over tables; a quiet table's provisional tail is not owed, so a fully published nest reads 0), `nuthatch_publish_pending_segments`,
 `nuthatch_publish_bytes_total`, `nuthatch_publish_errors_total` and `nuthatch_publish_dead_letter`.
 
-Transform-runtime counters: `nuthatch_transform_stage`, `nuthatch_transform_screen`,
-`nuthatch_transform_effectful`.
-
 ### What to alert on
 
 | Alert | Condition | Why |
@@ -1213,8 +1210,9 @@ nuthatch dev --dir . --audit-rpc https://another-provider.example/KEY
 - **Sampling.** Each sample is `--span` (`--audit-span`) blocks, 1,000 by default, between the
   first block a compared table covers (or the contracts' `start_block`) and the nest's
   `sealed_through`, the one boundary the indexer cuts every table at. A stretch past the last
-  event segment was sealed empty, and is sampled like any other. `sanction_hit`, which `nuthatch
-  screen` seals over a range of your choosing, does not move the boundary. The background audit
+  event segment was sealed empty, and is sampled like any other. `sanction_hit`, which the
+  screening command removed on 2026-10-08 sealed over an operator-named range, does not move the
+  boundary. The background audit
   reads `sealed_through` from the running nest; `nuthatch audit sealed` reads it from the hot
   store when the nest is stopped, and otherwise uses the furthest sealed segment, which can only
   fall short of it. Even-numbered samples land in a segment picked in proportion to its rows, where an omission
@@ -1380,7 +1378,6 @@ duplicates.
 | Webhook backlog | `nuthatch_alert_outbox_depth`, sink availability | a drain posts eight deliveries at once with a 10 s timeout each, so one slow sink delays its own alerts, not the others'; past 10,000 undelivered alerts the oldest are shed, loudly |
 | Chain-id mismatch at startup | the startup error names the endpoint | an endpoint in the pool is on the wrong network. Every endpoint is verified at boot, on purpose |
 | Suspect data | `nuthatch check --dir <nest>` | runs the nest's committed invariant and parity checks against recorded fixtures |
-| Need to prove a compliance result | `nuthatch audit replay --from --to` | re-runs screening over sealed segments and confirms stored hits reproduce exactly |
 
 ---
 
@@ -1580,17 +1577,13 @@ hands it a NID and it does the rest, with no restart and no co-tenant interrupte
 Tenants are opaque labels the runtime refcounts; sign-in, plans, billing and per-tenant authorisation
 belong to the gateway in front of it. The walkthrough is [admin-api.md](admin-api.md).
 
-**Compliance operations** (RFC-0008), if you serve regulated customers:
+**Labels and flags** (RFC-0008):
 
 ```sh
-nuthatch lists fetch ofac-sdn --dir <nest>      # content-addressed list snapshot
-nuthatch screen --list <hash> --from --to       # replayable screening over sealed segments
-nuthatch audit replay --from --to               # re-prove the stored hits reproduce exactly
-nuthatch audit report --from --to --json        # summarise hits and flags
-nuthatch pack build --key <keypair>             # signed compliance manifest
+nuthatch labels import addrs.csv --dir <nest>   # labeled set, feeds the exposure view
+nuthatch audit report --from --to --json        # summarise threshold flags
+nuthatch pack build --key <keypair>             # signed manifest of the registry, flags and alerts
 ```
-
-Screening is deterministic: the same list hash, range and component always produce identical hits.
 
 ---
 
@@ -1675,7 +1668,7 @@ unit file, a scrape config or a dashboard gets longer.
 Stated because a platform team will ask, and because a vague promise is worse than a narrow one.
 
 - **Downgrades**, above. Upgrade only.
-- **Off-by-default cargo features: `graph`, `folds`, `counter` and `exex`.**
+- **Off-by-default cargo features: `graph`, `folds` and `counter`.**
   None is in the published binaries or images, and all are experimental: their config keys, routes,
   on-disk state and behaviour may change or go in any 4.x release. A build that enables one is not
   covered by any line above for what that feature adds. (`graph` is RFC-0053's partial read surface

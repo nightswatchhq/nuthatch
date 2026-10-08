@@ -634,7 +634,7 @@ async function loadEntities(){
       { key: 'available', fmt: v => ({ html: v ? '<span class="tag good">available</span>' : '<span class="tag bad">unavailable</span>' }) },
     ], d.entities || [], { empty: 'This nest declares no entities (entities.toml). Head is ' + num(d.head) + '.', click: { key: r => r.name, go: openEntity } }) + '</div></div><div id="entityrows"></div>';
     h += '<h2>Built-in views</h2><div class="grid">' + (S.summary?.views || []).map(v => stat('view', v)).join('')
-      + (shape ? stat('transfers shape', shape.transfers ? 'yes' : 'no', 'balances apply') + stat('compliance', shape.compliance ? 'yes' : 'no', 'screening pack') : '') + '</div>';
+      + (shape ? stat('transfers shape', shape.transfers ? 'yes' : 'no', 'balances apply') + stat('compliance', shape.compliance ? 'yes' : 'no', 'labels and flags') : '') + '</div>';
     if (flags) {
       h += '<h2>Flags</h2><div class="grid">';
       for (const [k, v] of Object.entries(flags)) if (v && typeof v === 'object') h += stat(k, v.configured == null ? 'not configured' : String(v.configured), (v.flags || []).length + ' raised');
