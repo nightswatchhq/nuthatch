@@ -62,7 +62,7 @@ fi
 echo
 echo "other version mentions - review by eye, most are legitimate history:"
 grep -rnoE "\b[0-9]+\.[0-9]+\.[0-9]+\b" --include="*.md" --include="*.toml" . 2>/dev/null \
-  | grep -v "^./target" | grep -v "/rfcs/" | grep -v "progress-log" | grep -v "^./docs/sprint-" \
+  | grep -v "^./target" | grep -v "/rfcs/" \
   | grep -vE ":${WANT//./\\.}$" \
   | grep -viE "1\.95\.0|1\.85\.0|0\.0\.0|127\.0\.0|glibc|2\.3[0-9]\.[0-9]" \
   | sed 's/^/  /' | head -25

@@ -28,7 +28,7 @@
   path nearly free). Stage 0/1 (`RpcForkSource` MVP) is buildable now against a user-supplied archive
   RPC; Stages 2-3 are designed-now-built-later.
 - Origin: roadmap thread 1 raw note - *"an eth_call-optimized EVM executor that's **not** a generic
-  archive node; strip everything but call handling."* (`docs/high-level-roadmap-jul-aug-2026.md`).
+  archive node; strip everything but call handling."* ([`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)).
 
 ## Abstract
 

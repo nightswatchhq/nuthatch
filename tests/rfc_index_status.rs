@@ -79,8 +79,7 @@ fn rfc_index_agrees_with_each_rfc_doc_header() {
 
     assert!(
         offenders.is_empty(),
-        "the RFC index and these RFCs' own headers disagree - fix whichever is stale \
-         (the index is reconciled against docs/progress-log.md; a doc header is not):\n{}",
+        "the RFC index and these RFCs' own headers disagree - fix whichever is stale:\n{}",
         offenders.join("\n")
     );
 }

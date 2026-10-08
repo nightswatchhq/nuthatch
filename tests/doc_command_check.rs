@@ -54,57 +54,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
          faster than code. Naming the incident is the point, so this is a fact about a past release \
          rather than an instruction. Fittingly, this check caught it in the very page that cites it",
     ),
-    (
-        "docs/progress-log.md",
-        "roost",
-        2,
-        "dated progress-log entries describe RFC-0012 as it was built, before RFC-0032 retired the \
-         roost - it's a record of the past, not current usage. Two mentions: the 2026-07-16 slice-1 \
-         entry (line ~954) and the 2026-07-18 slice-1 recap (line ~989)",
-    ),
-    (
-        "docs/sprint-languid-lapwing.md",
-        "roost",
-        1,
-        "the sprint doc that fixed the incident names the removed command as the regression it \
-         closes - it would be a strange irony for this check to make that sentence unwritable",
-    ),
-    (
-        "docs/sprint-nocturnal-nightjar.md",
-        "roost",
-        1,
-        "this sprint doc's own #769 entry states the regression test this file is - \"reintroducing \
-         `nuthatch roost` into any documented file must fail the build\" - same reasoning as the \
-         sprint-languid-lapwing.md entry above",
-    ),
-    (
-        "docs/progress-log.md",
-        "upgrade",
-        1,
-        "the 2026-07-21 entry documents `nuthatch nest upgrade` as it was that day (RFC-0020); the \
-         file's own header warns no entry is kept in step with the binary - it does not exist in \
-         2.2.0+",
-    ),
-    (
-        "docs/progress-log.md",
-        "diff",
-        1,
-        "same RFC-0020 entry, `nuthatch nest diff` - dated progress-log writing, not current usage",
-    ),
-    (
-        "docs/progress-log.md",
-        "mount",
-        1,
-        "the 2026-07-18 RFC-0012 slice 6 entry documents `nuthatch nest mount` as shipped that day; \
-         dated progress-log writing describing history, same as the roost entries above",
-    ),
-    (
-        "docs/progress-log.md",
-        "pack",
-        1,
-        "the 2026-07-18 RFC-0012 slice 5 entry documents `nuthatch nest pack` as shipped that day - \
-         the verb was later folded into `nuthatch nest bundle`",
-    ),
 ];
 
 /// A finding: an unresolved subcommand word or flag, where it was found, and what was wrong.

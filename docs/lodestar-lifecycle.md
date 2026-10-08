@@ -96,7 +96,7 @@ segments where the rows say to, not where the clock says to, so the sealed outpu
 either side of the change. What it costs is freshness, and the ceiling is stated below.
 
 The right-hand column is a clean 54-minute window taken after a rolling restart, with no traffic of
-mine in it. `docs/sprint-frugal-finch.md` step 2 asks for this repeated across a full day before the
+mine in it. [`docs/sprint-frugal-finch.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/sprint-frugal-finch.md) step 2 asks for this repeated across a full day before the
 number is written down, and that has not been done.
 
 Every nest, over the same 54 minutes:

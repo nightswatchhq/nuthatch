@@ -25,7 +25,7 @@ and a job for your own RPC (`--rpc`).
 
 Those five lines, run as written on the 4.10.1 release on 2026-10-05, took 13 s from the `curl` to a
 non-zero count in a clean macOS shell on an M5 Pro, and 21 s in a fresh `ubuntu:24.04` container
-([docs/readme-check-2026-10-05.md](docs/readme-check-2026-10-05.md), which records every command in
+([docs/readme-check-2026-10-05.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/readme-check-2026-10-05.md), which records every command in
 this file).
 
 | | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
@@ -626,7 +626,7 @@ the findings we closed as *not ours to fix* and why, is in
 - **Design** lives in [RFCs](docs/rfcs/) (0001-0061, statuses in the
   [index](docs/rfcs/README.md)); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
-  [`docs/backlog.md`](docs/backlog.md); the running log is [`docs/progress-log.md`](docs/progress-log.md).
+  [`docs/backlog.md`](docs/backlog.md); what each release changed is in [`docs/releases/`](docs/releases/).
 - **Governance:** a self-funded public good, maintained by one person; everything is open source. No
   hosted service, no token, no phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing
   design brief [`CLAUDE.md`](CLAUDE.md).

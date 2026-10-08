@@ -2,13 +2,13 @@
 
 **Status: superseded in part on 2026-09-08.** The feature freeze this document set out ended that
 day, lifted in full by Chief, and the work chosen is RFC-0044 through RFC-0048 built in full
-(`CLAUDE.md`, build-order status; sprint [halcyon-hoopoe](sprint-halcyon-hoopoe.md)). The five
+(`CLAUDE.md`, build-order status; sprint [halcyon-hoopoe](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/sprint-halcyon-hoopoe.md)). The five
 workstreams below stand as direction and the thesis is unrepudiated - the freeze ended because there
 was design worth building, not because the discipline failed. The parked list below is **not**
 reopened by this: [frozen-for-2027.md](frozen-for-2027.md) keeps its own one-at-a-time rule.
 
 **Status: agreed 2026-08-20.** Direction doc, not an RFC slate. Companion to
-[high-level-roadmap-jul-aug-2026.md](high-level-roadmap-jul-aug-2026.md), which covered the previous
+[high-level-roadmap-jul-aug-2026.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md), which covered the previous
 window and is now historical record.
 
 **2026-08-31 update.** The capability items deferred by this direction were closed into

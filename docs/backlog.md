@@ -55,10 +55,8 @@ The 2026 capability-freeze items were closed into [frozen-for-2027.md](frozen-fo
 | `good first issue` | Small, self-contained, and does not need the whole architecture in your head first |
 
 **Sprint labels** (`brisk-bunting`, `temperate-tern`, and so on) mark membership of one sprint and
-remain afterwards as provenance. The current sprint is
-[`candid-chaffinch`](sprint-candid-chaffinch.md). A sprint label on any other closed issue is historical;
-do not use it to infer that work remains. The [documentation guide](README.md) separates the live
-sprint from the dated records.
+remain afterwards as provenance. No sprint is open; the last, `candid-chaffinch`, closed on
+2026-10-06. A sprint label on a closed issue is historical; do not use it to infer that work remains.
 
 The queries that matter:
 
@@ -124,6 +122,7 @@ you finish; a bullet in a document gets closed when someone remembers.
 
 Dated records, not live plans. Read them for *why*, never for *what is left*:
 
-- [progress-log.md](progress-log.md) - what happened, when
-- `sprint-*.md` - completed sprint scopes as they stood; see the [documentation guide](README.md)
-- [high-level-roadmap-jul-aug-2026.md](high-level-roadmap-jul-aug-2026.md) - the architecture session that produced RFCs 0032-0035
+- [progress-log.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/progress-log.md) - what happened, when
+- `sprint-*.md` - completed sprint scopes as they stood, kept at
+  [`ede03ca7`](https://github.com/nightswatchhq/nuthatch/tree/ede03ca7/docs)
+- [high-level-roadmap-jul-aug-2026.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md) - the architecture session that produced RFCs 0032-0035
