@@ -2432,10 +2432,10 @@ abi = "abis/c.json"
     /// `eth_getBlockByNumber` header (timestamps, and the per-block hash fetch `resolve_calls_for_
     /// window` still makes pre-#720). One server serves both the ingestion and archive endpoints -
     /// nothing here cares which role asked.
-    /// Two calls-bench tests stand up stub HTTP servers and a work dir. Under `cargo test
-    /// --features exex` they share a process with a larger sibling set, and a race on the stub
-    /// becoming reachable showed up as `calls_resolved = 0` on one leg only (#789). They take this
-    /// lock so they cannot share a server, a port, or a work dir with each other.
+    /// Two calls-bench tests stand up stub HTTP servers and a work dir. In a feature build they
+    /// share a process with a larger sibling set, and a race on the stub becoming reachable showed
+    /// up as `calls_resolved = 0` on one leg only (#789). They take this lock so they cannot share a
+    /// server, a port, or a work dir with each other.
     static CALLS_BENCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn stub_full_rpc() -> (String, tokio::task::JoinHandle<()>) {

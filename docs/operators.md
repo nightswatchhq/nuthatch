@@ -1675,7 +1675,7 @@ unit file, a scrape config or a dashboard gets longer.
 Stated because a platform team will ask, and because a vague promise is worse than a narrow one.
 
 - **Downgrades**, above. Upgrade only.
-- **Off-by-default cargo features: `graph`, `folds`, `counter` and `exex`.**
+- **Off-by-default cargo features: `graph`, `folds` and `counter`.**
   None is in the published binaries or images, and all are experimental: their config keys, routes,
   on-disk state and behaviour may change or go in any 4.x release. A build that enables one is not
   covered by any line above for what that feature adds. (`graph` is RFC-0053's partial read surface

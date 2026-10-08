@@ -9,7 +9,7 @@ hole (#725, #745). Two for two is not luck; it is a measurement of how much of a
 
 ## What runs, and when
 
-`.github/workflows/mutants.yml`, nightly at 03:00 UTC and on demand, as one matrix job per file shard
+`.github/workflows/mutants.yml`, weekly (Sundays 03:00 UTC) and on demand, as one matrix job per file shard
 (two for `chunker.rs`, eight for `seal.rs`, one for `registry.rs`), each running `cargo mutants
 --file <file> --shard <n/m> -- --lib`. **Not on pull requests**, and the reason is measured rather
 than assumed. On an 18-core machine, when the job landed (2026-08-23):
@@ -36,7 +36,7 @@ its eleven shards), and a signal nobody reads is not a signal.
 
 `src/registry.rs` yields only 3 mutants (still 3 on the 2026-10-05 nightly) because #581 moved decode
 into its own crate. The decode path is not skipped, it simply lives elsewhere - `cargo mutants -d
-decode` was 185 mutants on 2026-08-23 and is the obvious next addition; the nightly's wall-clock is
+decode` was 185 mutants on 2026-08-23 and is the obvious next addition; the sweep's wall-clock is
 now known (two to three hours per 25-mutant shard at `-j 2` on the 2026-10-05 run), and it has not
 been added.
 
@@ -65,7 +65,7 @@ red-capable on `main`, *then* decide whether it becomes required. **Adding a con
 is worse than adding no context**, and this repo has installed one of those before - the review
 signature check was red and required on nothing, so it blocked nothing.
 
-Deciding to make it required is a board call, and it should be made after a few nightly runs have
+Deciding to make it required is a board call, and it should be made after a few weekly runs have
 shown what it actually costs and how noisy it actually is.
 
 ## The first survivor
