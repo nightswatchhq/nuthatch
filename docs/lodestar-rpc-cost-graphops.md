@@ -80,9 +80,10 @@ allocations nest they are 11% of the line.
 |---|---:|---:|---|
 | 5 m (deployed) | ~52,000 | ~227,000 | Starter |
 | 1 m | ~260,000 | ~1.04 M | Starter, just |
-| 2 s (the block-time default) | ~7.8 M | ~31 M | beyond Growth |
+| 2 s (the default before 4.15.2) | ~7.8 M | ~31 M | beyond Growth |
 
-A nest started without `--poll-interval` on a credit-metered endpoint is a $600-a-month mistake.
+Before 4.15.2, a nest started without `--poll-interval` on a credit-metered endpoint was a $600-a-month
+mistake. Since 4.15.2 the default is 5 minutes, the deployed row above.
 
 ## Backfill (computed)
 

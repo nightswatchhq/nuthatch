@@ -1492,8 +1492,8 @@ pub struct DevArgs {
     pub window: Option<u64>,
 
     /// How long a caught-up cursor waits before asking for the tip again (RFC-0040 §3 knob 1).
-    /// `2s`, `5m`, `1h`, or bare seconds. The default is the chain's block time, never under 2s:
-    /// the registry's figure for a shipped chain, measured at startup for any other. Every poll is
+    /// `2s`, `5m`, `1h`, or bare seconds. The default is 5 minutes: new rows can take that long to appear,
+    /// so pass a shorter interval for a nest that must follow the tip closely. Every poll is
     /// paid for - a tip call, a reorg check, a checkpoint and a `finalized` probe per window,
     /// whether or not a block carried an event. A nest whose readers refresh on a cron of minutes
     /// can wait minutes here and index the same rows for roughly a hundredth of the requests.

@@ -174,7 +174,7 @@ TOML
 echo "fixture: 1 nest, 10-event V4 ABI, ${LOGS_PER_BLOCK} logs/block, blocks $(( TIP - BACKFILL_BLOCKS ))..$TIP"
 echo "         expecting $EXPECT rows, of which $HOT_EXPECT stay hot past sealing"
 
-"$BIN" dev --dir "$DIR" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" >"$DIR/dev.log" 2>&1 &
+"$BIN" dev --dir "$DIR" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" --poll-interval 12s >"$DIR/dev.log" 2>&1 &
 DEV_PID=$!
 trap 'kill "$DEV_PID" 2>/dev/null || true; kill "$RPC_PID" 2>/dev/null || true' EXIT
 # Generous, and generous for a stated reason: this fixture indexes 50x the rows the old one did, and
