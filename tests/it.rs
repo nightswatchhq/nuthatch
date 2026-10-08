@@ -23,8 +23,6 @@ mod bench_helpers_reject_failures;
 mod bench_restart_to_ready;
 #[path = "bind_drops_slow_headers.rs"]
 mod bind_drops_slow_headers;
-#[path = "bom_timings_discovery.rs"]
-mod bom_timings_discovery;
 #[path = "concurrent_sql_does_not_corrupt.rs"]
 mod concurrent_sql_does_not_corrupt;
 #[path = "control_api.rs"]

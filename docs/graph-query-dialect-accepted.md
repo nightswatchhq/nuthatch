@@ -335,7 +335,7 @@ It does not make a partial schema or incomplete entity derivation a Network Subg
 - A canonical client query against the reference schema returns rows that match the reference
   deployment, modulo the declared divergence list.
 - A mutation that drops any single argument, operator, default or bound above makes a test fail.
-  `mut/m-s2-http.sh` is the current set.
+  [`mut/m-s2-http.sh`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/mut/m-s2-http.sh) was the set.
 
 ## Where the surface is reachable
 
