@@ -210,7 +210,8 @@ was.
   candidate is enough to have it gated within the quarter hour.
 - `<tag>` by hand, to gate or re-gate one release.
 - `--binary PATH --sha SHA` for a local build, which is how a burrmill rev bump is gated before
-  anything is tagged.
+  anything is tagged. Build it with `cargo build --profile dist --locked`, the fat-LTO profile the
+  release ships, so the gate measures what an operator downloads.
 
 For each run it downloads and checksums the candidate's Linux binary
 (`nuthatch-x86_64-unknown-linux-gnu.tar.gz`) and the production release's, measures production

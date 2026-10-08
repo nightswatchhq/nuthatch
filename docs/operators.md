@@ -195,8 +195,8 @@ Only the default and graph builds ship for aarch64; the scaled build is x86_64 o
 To build it yourself instead:
 
 ```sh
-cargo build --release
-cp target/release/nuthatch . && docker build -t nuthatch .
+cargo build --profile dist --locked
+cp target/dist/nuthatch . && docker build -t nuthatch .
 ```
 
 ---

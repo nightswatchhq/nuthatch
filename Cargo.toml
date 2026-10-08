@@ -207,6 +207,13 @@ debug = "line-tables-only"
 lto = "thin"
 strip = true
 
+# What the release workflow ships. CI and the footprint gates build the thin `release` profile.
+# No `panic = "abort"`: dbsp and folds rely on catch_unwind.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
