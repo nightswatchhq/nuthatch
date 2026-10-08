@@ -1,0 +1,16 @@
+[Unit]
+Description=nuthatch head-count receiver (RFC-0054)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/nuthatch-count-receiver --listen 127.0.0.1:8290 --store /var/lib/nuthatch-count/tallies.json
+StateDirectory=nuthatch-count
+DynamicUser=yes
+Restart=always
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

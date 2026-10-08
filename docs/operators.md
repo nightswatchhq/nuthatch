@@ -38,9 +38,21 @@ per-nest health and metrics, and signals rich enough to alert, capacity-plan, an
 metering, billing, and TLS. There are no accounts and no tenancy inside the binary, and there will not
 be: `CLAUDE.md` puts hosted-SaaS multi-tenancy out of scope permanently.
 
-**What it never does:** phone home. No telemetry, no mandatory API tokens, no gated data service.
-Every outbound connection is one you configured - your RPC endpoints, your webhook sinks, and (only
-when you run them by hand) the ABI resolvers and sanctions-list fetchers.
+**What it never does:** phone home unasked. No telemetry by default, no mandatory API tokens, no gated
+data service. Every outbound connection is one you configured - your RPC endpoints, your webhook
+sinks, and (only when you run them by hand) the ABI resolvers and sanctions-list fetchers - with one
+exception you have to say yes to: the head count below.
+
+### The head count (RFC-0054)
+
+After the first successful `nuthatch init` on a machine with a terminal, nuthatch asks once whether
+it may count you, and shows the exact object it would send. The default is no, and the answer is
+stored in `~/.config/nuthatch/count.toml` (or under `$XDG_CONFIG_HOME`), so it is never asked
+again. With a yes, each later `init` sends one object - nuthatch version, OS, architecture, a
+built-in chain id (anything else is sent as 0) and which kind of `init` it was - with no identifier
+and no addresses, under a two-second ceiling, and nothing about a failure is ever printed. Nothing
+is asked or sent when `CI` or `NUTHATCH_NO_COUNT` is set. `nuthatch count` shows the state,
+`nuthatch count payload` prints the objects, and `nuthatch count off` stops it.
 
 ---
 
