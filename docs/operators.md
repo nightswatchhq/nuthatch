@@ -582,7 +582,7 @@ paid Alchemy - 1.1M requests to serve a single HTTP request over the audit windo
 figure quoted for it in #750.
 
 Pricing the steady-state load against a metered endpoint (e.g. Alchemy), for a cursor polling every ~2 s,
-the default before 4.16.0. Since 4.16.0 a cursor polls every 5 minutes unless told otherwise, and the
+the default before 4.15.2. Since 4.15.2 a cursor polls every 5 minutes unless told otherwise, and the
 polling terms below shrink by a factor of about 150; the next section has the measurement.
 
 - **Block headers** (`eth_getBlockByNumber`): 20 CU. On Arbitrum (~4 blocks/s), 345,600 blocks/day = ~6.91M CU/day.
@@ -624,7 +624,7 @@ Both are `nuthatch dev` flags, never `nuthatch.toml` fields: how often you ask i
 and two nests differing only in cadence hold identical rows under one content address.
 
 ```sh
-# The default since 4.16.0: same rows, up to five minutes later, for roughly a hundredth of the
+# The default since 4.15.2: same rows, up to five minutes later, for roughly a hundredth of the
 # requests of a two-second cursor.
 nuthatch dev --dir .
 
@@ -636,7 +636,7 @@ nuthatch dev --dir . --poll-interval 5m --finality-only
 ```
 
 - **`--poll-interval <DURATION>`** (`5m`, `1h`, or bare seconds) is how long a caught-up cursor waits
-  before asking for the tip again. Unset, it is **5 minutes** (since 4.16.0; before that, the chain's
+  before asking for the tip again. Unset, it is **5 minutes** (since 4.15.2; before that, the chain's
   block time, never under 2 s), so a new row can take up to five minutes to appear. Pass a shorter
   interval for a nest whose readers need the tip closely. Polling faster than blocks arrive finds
   nothing new and is still billed. Every poll costs a tip call and, when a window commits,
