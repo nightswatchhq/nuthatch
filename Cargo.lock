@@ -4926,7 +4926,7 @@ dependencies = [
 
 [[package]]
 name = "nuthatch"
-version = "4.15.0"
+version = "4.15.1"
 dependencies = [
  "Inflector",
  "alloy-dyn-abi",
