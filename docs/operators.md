@@ -581,7 +581,9 @@ as "rate-limited and shared" and "not fine for real work." `horizon-nest` is the
 paid Alchemy - 1.1M requests to serve a single HTTP request over the audit window, with no invoice
 figure quoted for it in #750.
 
-Pricing the steady-state load against a metered endpoint (e.g. Alchemy):
+Pricing the steady-state load against a metered endpoint (e.g. Alchemy), for a cursor polling every ~2 s,
+the default before 4.16.0. Since 4.16.0 a cursor polls every 5 minutes unless told otherwise, and the
+polling terms below shrink by a factor of about 150; the next section has the measurement.
 
 - **Block headers** (`eth_getBlockByNumber`): 20 CU. On Arbitrum (~4 blocks/s), 345,600 blocks/day = ~6.91M CU/day.
 - **Tip polling** (`eth_blockNumber`): 10 CU. Polling every ~2 s = 43,200 calls/day = ~0.43M CU/day.
@@ -622,18 +624,22 @@ Both are `nuthatch dev` flags, never `nuthatch.toml` fields: how often you ask i
 and two nests differing only in cadence hold identical rows under one content address.
 
 ```sh
-# Same rows, five minutes later, for roughly a hundredth of the requests.
-nuthatch dev --dir . --poll-interval 5m
+# The default since 4.16.0: same rows, up to five minutes later, for roughly a hundredth of the
+# requests of a two-second cursor.
+nuthatch dev --dir .
+
+# Follow the tip closely, and pay for every poll.
+nuthatch dev --dir . --poll-interval 2s
 
 # Never index past the chain's finality boundary: nothing you hold can reorg.
 nuthatch dev --dir . --poll-interval 5m --finality-only
 ```
 
 - **`--poll-interval <DURATION>`** (`5m`, `1h`, or bare seconds) is how long a caught-up cursor waits
-  before asking for the tip again. Unset, it is the chain's block time in whole seconds, never under
-  `2s`: 12 s on mainnet, 5 s on Gnosis, 2 s on the L2s and faster chains. A chain outside the registry
-  has its block time measured once at startup, over the last hundred blocks. Polling faster than blocks
-  arrive finds nothing new and is still billed. Every poll costs a tip call and, when a window commits,
+  before asking for the tip again. Unset, it is **5 minutes** (since 4.16.0; before that, the chain's
+  block time, never under 2 s), so a new row can take up to five minutes to appear. Pass a shorter
+  interval for a nest whose readers need the tip closely. Polling faster than blocks arrive finds
+  nothing new and is still billed. Every poll costs a tip call and, when a window commits,
   a reorg check, a checkpoint and a `finalized` probe, whether or not a block carried an event. At five
   minutes the allocations nest above drops from ~9,900 CU a minute to the order of **100** - a few
   dollars a month - and holds exactly the same rows. Match it to your consumers: a dashboard on a
@@ -645,7 +651,7 @@ nuthatch dev --dir . --poll-interval 5m --finality-only
 
 **Nothing about this is silent.** `/ready` carries a `freshness` object - `{"mode": "tip" | "finality",
 "poll_interval_secs": N, "poll_interval_source": "block_time" | "flag"}` - and `lag_blocks` is then
-the distance you chose. Its stall thresholds scale with the interval (at least three intervals), so a quiet
+the distance you chose. `block_time` means the interval was defaulted rather than flagged. Its stall thresholds scale with the interval (at least three intervals), so a quiet
 five-minute cursor is not reported as a dead one, and a dead pool is still reported inside a
 quarter of an hour.
 
