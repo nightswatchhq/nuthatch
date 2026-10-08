@@ -166,10 +166,11 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
     Some((method, path, body))
 }
 
+/// Any origin may read: the totals are public by design, and the site reads them from the browser.
 fn respond(stream: &mut TcpStream, status: &str, body: &[u8], kind: &str) {
     let _ = write!(
         stream,
-        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\naccess-control-allow-origin: *\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(body);
@@ -321,6 +322,12 @@ mod tests {
             c.read_to_string(&mut reply).unwrap();
             assert!(reply.starts_with("HTTP/1.1 204"), "{reply}");
         }
+        let mut c = TcpStream::connect(addr).unwrap();
+        write!(c, "GET /totals HTTP/1.1\r\nhost: count\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        c.read_to_string(&mut reply).unwrap();
+        assert!(reply.contains("access-control-allow-origin: *"), "{reply}");
+        assert!(reply.contains("\"init\": 1000"), "{reply}");
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("10."), "{saved}");
         assert!(
