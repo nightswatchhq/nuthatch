@@ -152,6 +152,8 @@ fn dev_with(nest: &Path, port: u16, crash_at: Option<&str>, log: &Path, extra: &
     cmd.args(["dev", "--dir"])
         .arg(nest)
         .args(["--listen", &format!("127.0.0.1:{port}"), "--seal-direct"])
+        // The fixture chain advances while the nest runs; the 5-minute default would sit out the test.
+        .args(["--poll-interval", "1s"])
         .args(extra)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(log).unwrap());
