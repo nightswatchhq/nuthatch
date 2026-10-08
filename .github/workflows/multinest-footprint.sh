@@ -244,7 +244,7 @@ for _ in $(seq 1 40); do
 done
 
 write_runtime "$WORK" "$NESTS"
-"$BIN" dev --dir "$WORK" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" \
+"$BIN" dev --dir "$WORK" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" --poll-interval 12s \
   >"$WORK/dev.log" 2>&1 &
 DEV_PID=$!
 

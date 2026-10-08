@@ -177,6 +177,8 @@ fn the_authoring_scenario_is_achievable_and_its_criteria_are_exact() {
                 "--listen",
                 &format!("127.0.0.1:{api_port}"),
                 "--seal-direct",
+                "--poll-interval",
+                "1s",
             ])
             .stdout(Stdio::from(log.reopen().expect("reopen")))
             .stderr(Stdio::null())
