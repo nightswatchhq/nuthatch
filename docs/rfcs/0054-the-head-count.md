@@ -1,8 +1,13 @@
 # RFC-0054: The head count - an opt-in ping at `nuthatch init`, and the word in non-negotiable 3 it asks to change
 
-**Status:** **Draft - design only, blocked on §1.** This RFC proposes a change to `CLAUDE.md`
-non-negotiable 3 and does not start any work until Chief has recorded a decision on that change,
-one way or the other. If the answer is no, §10 option A is what remains.
+**Status:** **Accepted 2026-10-08 (Chief).** Non-negotiable 3 is amended with §1's wording in
+`CLAUDE.md`, and the acceptance is recorded in its build-order block. §11 is settled with this RFC's
+leanings: (1) a single-purpose `count.toml`; (2) the receiver is the one-file binary on the Helsinki
+host, and Vercel holds nothing; (3) `chain` is sent, under the registry-only rule; (4) the number is
+published from the first week with §5.6's caveat. Slices: S1 the binary (`src/count.rs`, `count`
+subcommand, `maybe_ask`, A1-A4, A6), S2 the receiver (`count/receiver/`, A5), S3 publishing (weekly
+action, `docs/count/`, `/count`, README line, A7). Previously **draft - design only, blocked on §1**
+from 2026-09-11.
 
 **Date:** 2026-09-11
 
