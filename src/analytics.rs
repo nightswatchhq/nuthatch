@@ -4354,6 +4354,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "graph")]
     #[test]
     fn relation_membership_preserves_existence_with_nulls_and_duplicates() {
         crate::engine::on_bare(
@@ -4361,6 +4362,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "graph")]
     fn relation_membership_preserves_existence_with_nulls_and_duplicates_on(
         conn: &dyn crate::engine::Session,
     ) {

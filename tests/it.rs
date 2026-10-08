@@ -114,6 +114,7 @@ mod gate_refresh_script;
 #[cfg(feature = "graph")]
 #[path = "graph_over_indexed_data.rs"]
 mod graph_over_indexed_data;
+#[cfg(feature = "graph")]
 #[path = "graph_schema_golden.rs"]
 mod graph_schema_golden;
 #[path = "ivm_claims.rs"]
