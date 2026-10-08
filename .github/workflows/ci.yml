@@ -43,8 +43,9 @@ jobs:
   # each again for `exex`, into one `target/` - four artifact sets, ~69G, ENOSPC on a docs-only
   # PR. The hostedtoolcache reclaim (#639) bought back a few gigabytes and did not change the
   # shape. Splitting the feature sets onto two runners is option 3 on that issue: two disks, two
-  # rust-cache keys, clippy+test still sharing artifacts *within* a feature set. A third job
-  # keeps the required name so the ruleset does not have to move.
+  # rust-cache keys, clippy+test still sharing artifacts *within* a feature set. (The `exex` leg
+  # went with the stub in #1999.) This job keeps the required name so the ruleset does not have
+  # to move.
   #
   # Each leg is a build job (fmt, clippy, a nextest archive) and a matrix of shards that run that
   # archive by `--partition`, so the suite's wall time divides by the shard count instead of
@@ -56,7 +57,7 @@ jobs:
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
-    needs: [check-default, test-default, check-exex, test-exex, check-no-count, test-no-count]
+    needs: [check-default, test-default, check-no-count, test-no-count]
     if: always()
     timeout-minutes: 5
     steps:
@@ -64,18 +65,15 @@ jobs:
         run: |
           echo "default build: ${{ needs.check-default.result }}"
           echo "default shards: ${{ needs.test-default.result }}"
-          echo "exex build: ${{ needs.check-exex.result }}"
-          echo "exex shards: ${{ needs.test-exex.result }}"
           echo "head-count-deleted build: ${{ needs.check-no-count.result }}"
           echo "head-count-deleted shards: ${{ needs.test-no-count.result }}"
           # A shard reads `skipped` when its build did not succeed, so no test of that leg ran. That
           # has happened with no step of the build executed, when GitHub assigned it no runner inside
           # its window (#1920, during an Actions incident): a cancelled build, skipped shards, and
           # nothing red of its own. This job is what makes it red.
-          for leg in default exex no-count; do
+          for leg in default no-count; do
             case "$leg" in
               default) build="${{ needs.check-default.result }}" shards="${{ needs.test-default.result }}" ;;
-              exex) build="${{ needs.check-exex.result }}" shards="${{ needs.test-exex.result }}" ;;
               no-count) build="${{ needs.check-no-count.result }}" shards="${{ needs.test-no-count.result }}" ;;
             esac
             if [ "$shards" = skipped ]; then
@@ -84,11 +82,9 @@ jobs:
           done
           if [ "${{ needs.check-default.result }}" != success ] \
             || [ "${{ needs.test-default.result }}" != success ] \
-            || [ "${{ needs.check-exex.result }}" != success ] \
-            || [ "${{ needs.test-exex.result }}" != success ] \
             || [ "${{ needs.check-no-count.result }}" != success ] \
             || [ "${{ needs.test-no-count.result }}" != success ]; then
-            echo "::error::fmt · clippy · test needs every leg green, builds and shards (see check-default, test-default, check-exex, test-exex, check-no-count, test-no-count)"
+            echo "::error::fmt · clippy · test needs every leg green, builds and shards (see check-default, test-default, check-no-count, test-no-count)"
             exit 1
           fi
 
@@ -148,16 +144,16 @@ jobs:
           # Proven step-level on run 31824503060: rust-cache's post step was *skipped* while
           # checkout's succeeded in the same grace window.
           cache-on-failure: true
-          # #733: this key is the default-feature pair only. The exex pair has its own job and key.
-          # Mixing them in one cache is how four artifact sets landed on one disk.
+          # #733: this key is the default-feature pair only. Mixing feature sets in one cache is how
+          # four artifact sets landed on one disk.
           key: check-default
           # #1396: only main writes caches. GitHub's 10 GB per-repo store evicts least-recently-used
           # entries, and 14-16 Sep every leg of 69% of runs started cold (no entry of any age under
           # its prefix) and took ~45m instead of ~8m. PR-scoped saves only ever help a later push to
           # the same PR; their cost is evicting main's, which every PR restores from.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # #733 moved the `exex` pair onto its own runner. This job holds clippy + test for the
-      # default feature set, plus the decode crate's own checks. Two compiles, one `target/`.
+      # #733 moved the other feature sets onto their own runners. This job holds clippy + test for
+      # the default feature set, plus the decode crate's own checks. Two compiles, one `target/`.
       #
       # The `df` lines stay. The ENOSPC on this job (#464, then #733 on a docs-only PR) had to be
       # inferred from SIGBUS the first two times because nothing measured the disk. `if: always()`
@@ -264,30 +260,12 @@ jobs:
       - name: disk after the builds
         if: always()
         run: df -h /
-      # #525: `cancelled` is what GitHub reports for a human cancel, a `pull_request` supersede,
-      # AND an expired `timeout-minutes` - one word, three causes, and the checks list gives a
-      # reader nothing to tell them apart. There is no separate conclusion for an expired timeout,
-      # and no way to make the checks list itself say something else - only this job's own log
-      # can. So: do the subtraction here and print it, rather than leaving a reader to open the
-      # job and do it by hand. A run cancelled seconds after it started is plainly a real
-      # cancel/supersede; one that ran to (or past) the ceiling below is plainly an expiry. If it
-      # lands in between, that's the genuinely ambiguous case, and the numbers are what let a
-      # reader judge it instead of guessing from the icon.
+      # #525: `cancelled` covers a human cancel, a supersede and an expired timeout alike.
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
-        run: |
-          # An unset start time is not a missing answer, it is one. Shell arithmetic reads an
-          # empty variable as 0, so the subtraction below would print the epoch itself as the
-          # elapsed time (measured on the probe run: 1786623050, i.e. 29,777,050m) and the
-          # sentence would then read as a confident expiry. The only way to reach this step
-          # without a start time is to be cut before the job's first step finished, which is
-          # seconds in, and therefore the one case that cannot be an expiry.
-          if [ -z "${JOB_START_EPOCH:-}" ]; then
-            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 90m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
-            exit 0
-          fi
-          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
-          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
+        uses: ./.github/actions/timeout-or-cancel
+        with:
+          ceiling: 90
 
   # No toolchain and no rust-cache: the shards run prebuilt binaries and never compile. The archive
   # extracts over the checkout at the path it was built at (see .github/actions/nextest-shard).
@@ -313,80 +291,6 @@ jobs:
           shard: ${{ matrix.shard }}
           of: 2
           name: default-${{ matrix.shard }}
-
-  check-exex:
-    name: fmt · clippy · build (exex)
-    runs-on: ubuntu-latest
-    # Same 90m ceiling as the default leg (#584). Cold-cache is a full clippy+test of the exex
-    # feature set from scratch; this used to share a disk with that pair and lose.
-    timeout-minutes: 90
-    steps:
-      - name: record start time
-        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          cache-on-failure: true
-          key: check-exex
-          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
-      # Feature-gated code is invisible to the default lint, and `exex` had never been built
-      # here at all - so its only test had been failing `-D warnings` unnoticed (#423). A
-      # feature nobody lints is a feature that rots silently. It now has its own runner so it
-      # cannot fill the disk the default pair is using (#733).
-      # In the background: a fresh runner has 75G free and the build takes about 10G of it, so
-      # nothing needs to wait the two minutes the delete takes. The trailing `df` still reports it.
-      - name: reclaim runner disk
-        run: |
-          df -h /
-          sudo nohup rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
-            /opt/hostedtoolcache >/dev/null 2>&1 &
-      - name: clippy (exex)
-        run: cargo clippy --features exex --all-targets -- -D warnings
-      - uses: ./.github/actions/install-nextest
-      - name: build the test archive
-        run: cargo nextest archive --features exex --locked --archive-file "$RUNNER_TEMP/nextest-exex.tar.zst"
-      - name: doctests
-        run: cargo test --doc --features exex --locked
-      - name: upload the test archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nextest-exex
-          path: ${{ runner.temp }}/nextest-exex.tar.zst
-          compression-level: 0
-          retention-days: 1
-      - name: disk after the builds
-        if: always()
-        run: df -h /
-      - name: distinguish an expired timeout from a cancel or supersede
-        if: always() && cancelled()
-        run: |
-          if [ -z "${JOB_START_EPOCH:-}" ]; then
-            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 90m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
-            exit 0
-          fi
-          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
-          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
-
-  test-exex:
-    name: test (exex, ${{ matrix.shard }}/2)
-    needs: check-exex
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/nextest-shard
-        with:
-          archive: nextest-exex
-          shard: ${{ matrix.shard }}
-          of: 2
-          name: exex-${{ matrix.shard }}
 
   # RFC-0054 A4. The head count is the one network call the binary makes about its operator, and
   # non-negotiable 3 allows it only while deleting it costs a self-hoster nothing. This leg deletes
@@ -466,21 +370,15 @@ jobs:
           filter: not test(/doc_command_check/)
           name: no-count-${{ matrix.shard }}
 
-  check-counter:
-    name: fmt · clippy · build (counter)
+  # The off-by-default features (#423: a feature nobody lints rots silently). Each is linted alone,
+  # since `folds` without `graph` and `counter` without either are builds of their own, and the suite
+  # runs once with all of them on rather than once per feature (#1999). `crash-points` is inert
+  # unless NUTHATCH_CRASH_AT names a point, so it does not change what the other tests see.
+  # RFC-0054's deleted-head-count leg and RFC-0046's payment-absent tests are the default and
+  # no-count legs above, not this one.
+  check-features:
+    name: fmt · clippy · build (optional features)
     runs-on: ubuntu-latest
-    # The exact lesson `check-exex` above was created for (#423), applied to the second
-    # feature-gated surface: **a feature nobody lints is a feature that rots silently.** RFC-0046's
-    # counter shipped behind an off-by-default flag that no CI job built, and the state that left it
-    # in was not theoretical - the test suite did not compile under `--features counter` at all
-    # (`Mount` gained a gated field that six test literals never set), clippy had an unnoticed
-    # `-D warnings` failure, and both doc-drift gates were red because the feature's operator config
-    # was undocumented. None of it was visible on a green pull request. This job is the reason it
-    # cannot happen twice.
-    #
-    # Not in `.github/required-checks.txt` yet: making it required is a branch-protection change and
-    # that is the board's call, not this PR's. It runs on every PR regardless, which is the part that
-    # stops the rot.
     timeout-minutes: 90
     steps:
       - name: record start time
@@ -492,48 +390,63 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
-          key: check-counter
+          # The graph leg's entry, the closest existing build to this one.
+          shared-key: graph-facade
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
-      # In the background: a fresh runner has 75G free and the build takes about 10G of it, so
-      # nothing needs to wait the two minutes the delete takes. The trailing `df` still reports it.
       - name: reclaim runner disk
         run: |
           df -h /
           sudo nohup rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
             /opt/hostedtoolcache >/dev/null 2>&1 &
+      - name: clippy (graph)
+        run: cargo clippy --locked --features graph --all-targets -- -D warnings
+      - name: clippy (folds alone)
+        run: cargo clippy --locked --features folds --all-targets -- -D warnings
       - name: clippy (counter)
-        run: cargo clippy --features counter --all-targets -- -D warnings
+        run: cargo clippy --locked --features counter --all-targets -- -D warnings
+      - name: clippy (crash-points)
+        run: cargo clippy --locked --features crash-points --all-targets -- -D warnings
       - uses: ./.github/actions/install-nextest
       - name: build the test archive
-        run: cargo nextest archive --features counter --locked --archive-file "$RUNNER_TEMP/nextest-counter.tar.zst"
+        run: cargo nextest archive --locked --features graph,counter,crash-points --archive-file "$RUNNER_TEMP/nextest-features.tar.zst"
       - name: doctests
-        run: cargo test --doc --features counter --locked
+        run: cargo test --doc --locked --features graph,counter,crash-points
       - name: upload the test archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nextest-counter
-          path: ${{ runner.temp }}/nextest-counter.tar.zst
+          name: nextest-features
+          path: ${{ runner.temp }}/nextest-features.tar.zst
           compression-level: 0
           retention-days: 1
       - name: disk after the builds
         if: always()
         run: df -h /
+      - name: distinguish an expired timeout from a cancel or supersede
+        if: always() && cancelled()
+        uses: ./.github/actions/timeout-or-cancel
+        with:
+          ceiling: 90
 
-  # One shard: this leg is not required and finishes inside the graph leg, so a second runner here
-  # only adds to the queue every other run waits in.
-  test-counter:
-    name: test (counter)
-    needs: check-counter
+  # The parked RFC-0060 replays (network_contract and serve's network_* tests) run nightly in
+  # network-contract.yml instead; this filter must stay the complement of that one.
+  test-features:
+    name: test (optional features, ${{ matrix.shard }}/3)
+    needs: check-features
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/nextest-shard
         with:
-          archive: nextest-counter
-          shard: 1
-          of: 1
-          name: counter
+          archive: nextest-features
+          shard: ${{ matrix.shard }}
+          of: 3
+          filter: not (binary(network_contract) | (binary_id(nuthatch) & test(/^serve::tests::.*network/)))
+          name: features-${{ matrix.shard }}
 
   pg-parity:
     name: scaled mode (parity · control plane · reconcile)
@@ -603,143 +516,11 @@ jobs:
           cargo test --locked --features postgres-store --test it control_api -- --test-threads=1
           cargo test --locked --features postgres-store --test it secret_isolation -- --test-threads=1
           cargo test --locked --features postgres-store --test it e2e_resolution -- --test-threads=1
-      # See the identical step in `check` above for why this exists: `cancelled` alone cannot
-      # tell a reader an expired `timeout-minutes` apart from a human cancel or a concurrency
-      # supersede (#584 hit exactly this - it read as a plain cancel until someone did the
-      # subtraction by hand).
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
-        run: |
-          if [ -z "${JOB_START_EPOCH:-}" ]; then
-            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 60m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
-            exit 0
-          fi
-          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
-          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 60m timeout-minutes ceiling. Close to 60m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
-
-  # RFC-0060 §5.6 (#1438). The network facade is off by default, so no other job compiles it: without
-  # this leg it rots out of sight, exactly as `pg-parity` guards the Postgres store.
-  graph-facade:
-    name: graph facade (--features graph)
-    runs-on: ubuntu-latest
-    # 45 minutes on 2026-10-02, cold: the network views plan slowly on an unoptimised Burrmill, and
-    # `network_contract` alone ran 1,183 s. It was 13 minutes on DuckDB, whose C++ was always optimised.
-    timeout-minutes: 90
-    steps:
-      - name: record start time
-        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: ./.github/actions/timeout-or-cancel
         with:
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
-      # Clippy first, as in `pg-parity`: it compiles `--all-targets` under the feature and warms the
-      # cache the test step then reuses.
-      - name: clippy (graph)
-        run: cargo clippy --features graph --all-targets -- -D warnings
-      # `folds` without `graph` is a build of its own (RFC-0059 packaging); nothing else compiles it.
-      - name: clippy (folds alone)
-        run: cargo clippy --features folds --all-targets -- -D warnings
-      # The whole suite, not only the facade's own: the feature changes what the Graph surface
-      # serves, so every test that reaches it has to hold in this build too.
-      - uses: ./.github/actions/install-nextest
-      - name: build the test archive
-        run: cargo nextest archive --locked --features graph --archive-file "$RUNNER_TEMP/nextest-graph.tar.zst"
-      - name: doctests
-        run: cargo test --doc --locked --features graph
-      - name: upload the test archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nextest-graph
-          path: ${{ runner.temp }}/nextest-graph.tar.zst
-          compression-level: 0
-          retention-days: 1
-      - name: distinguish an expired timeout from a cancel or supersede
-        if: always() && cancelled()
-        run: |
-          if [ -z "${JOB_START_EPOCH:-}" ]; then
-            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 90m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
-            exit 0
-          fi
-          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
-          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 90m timeout-minutes ceiling. Close to 90m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
-
-  test-graph:
-    name: test (graph, ${{ matrix.shard }}/3)
-    needs: graph-facade
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/nextest-shard
-        with:
-          archive: nextest-graph
-          shard: ${{ matrix.shard }}
-          of: 3
-          filter: not binary(network_contract)
-          name: graph-${{ matrix.shard }}
-
-  # The replays run one at a time (.config/nextest.toml), and an exclusive test waits for every
-  # running test to drain first, so in a mixed shard they queued behind the 500 s lib tests. Here
-  # they have runners of their own, split by measured time: a named heavy set and its complement,
-  # so a new or renamed replay always lands in the second job and none can be dropped.
-  test-network-contract:
-    name: test (graph, network_contract ${{ matrix.part }})
-    needs: graph-facade
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      HEAVY: >-
-        test(=indexer_registration_migration_and_stake_are_reconstructed_at_each_block)
-        | test(=network_clock_refreshes_on_token_events_but_not_unrelated_logs)
-        | test(=capacity_uses_the_last_refresh_event_and_its_protocol_parameters)
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [heavy, rest]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/nextest-shard
-        with:
-          archive: nextest-graph
-          shard: 1
-          of: 1
-          filter: binary(network_contract) & ${{ matrix.part == 'rest' && 'not ' || '' }}(${{ env.HEAVY }})
-          name: graph-network-contract-${{ matrix.part }}
-
-  # #1717. Kills the real binary at named instants in the seal path and restarts it on the same
-  # directory. The points exist only under `--features crash-points`, so no other job reaches them.
-  crash-points:
-    name: crash points (seal path)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: record start time
-        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
-      - name: clippy (crash-points)
-        run: cargo clippy --features crash-points --all-targets -- -D warnings
-      - name: kill, restart, count
-        run: cargo test --locked --features crash-points --test crash_points
-      - name: distinguish an expired timeout from a cancel or supersede
-        if: always() && cancelled()
-        run: |
-          if [ -z "${JOB_START_EPOCH:-}" ]; then
-            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 60m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
-            exit 0
-          fi
-          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
-          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 60m timeout-minutes ceiling. Close to 60m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
+          ceiling: 60
 
   # #1343. RFC-0052 S1's closed acceptance asked for a reconciler proof "over FsStore and S3 (MinIO
   # in CI)" - MinIO itself was withdrawn upstream in 2026 (#1492), so the server is now versitygw, but #1335 shipped the S3 mirror with every sync test run against `memory://` and no job
@@ -802,13 +583,9 @@ jobs:
         run: cargo test --locked --test it e2e_minio_publish
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
-        run: |
-          if [ -z "${JOB_START_EPOCH:-}" ]; then
-            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 30m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
-            exit 0
-          fi
-          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
-          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 30m timeout-minutes ceiling. Close to 30m: almost certainly an expiry. Well under it: almost certainly a real cancel or supersede."
+        uses: ./.github/actions/timeout-or-cancel
+        with:
+          ceiling: 30
       - name: stop the S3 server
         if: always()
         run: |
@@ -899,13 +676,9 @@ jobs:
         run: scripts/trino-contract.sh "$RUNNER_TEMP/trino-fixture.json"
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
-        run: |
-          if [ -z "${JOB_START_EPOCH:-}" ]; then
-            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 45m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
-            exit 0
-          fi
-          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
-          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 45m timeout-minutes ceiling. Close to 45m: almost certainly an expiry. Well under it: almost certainly a real cancel or supersede."
+        uses: ./.github/actions/timeout-or-cancel
+        with:
+          ceiling: 45
       - name: stop Trino and the S3 server
         if: always()
         run: |
@@ -959,7 +732,12 @@ jobs:
       #
       # Every one of them is a *composition* failure - the parts were individually correct. Nothing
       # short of standing the thing up finds those.
+      # Release without LTO: this job tests topology, not speed, and thin LTO was 15 to 23 minutes of
+      # it (#1999). Step-level so rust-cache's key, which hashes CARGO_* env, does not move.
       - name: build the scaled binary
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
         run: cargo build --release --locked --features postgres-store
       - name: build the scaled image
         run: |
@@ -1107,19 +885,11 @@ jobs:
           name: nuthatch-release
           path: target/release/nuthatch
           retention-days: 1
-      # See the identical step in `check` above for why this exists: `cancelled` alone cannot
-      # tell a reader an expired `timeout-minutes` apart from a human cancel or a concurrency
-      # supersede (#584 hit exactly this - it read as a plain cancel until someone did the
-      # subtraction by hand).
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
-        run: |
-          if [ -z "${JOB_START_EPOCH:-}" ]; then
-            echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the 45m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
-            exit 0
-          fi
-          elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
-          echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's 45m timeout-minutes ceiling. Close to 45m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
+        uses: ./.github/actions/timeout-or-cancel
+        with:
+          ceiling: 45
 
   footprint:
     name: footprint (RAM budget)

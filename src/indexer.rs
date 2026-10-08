@@ -16065,7 +16065,7 @@ template = "pool"
         // `balances.apply` posts a batch to the view's channel and the circuit folds it on its own
         // thread; `flush` is what waits for that. Reading the balance straight after
         // `process_window` returns is a race a fast machine wins and a loaded runner loses - seen as
-        // `recipient was credited` failing on CI's `exex` leg while passing locally every time.
+        // `recipient was credited` failing on one CI leg while passing locally every time.
         nest.balances.flush();
         let after_first = nest
             .balances

@@ -1,0 +1,83 @@
+# The parked RFC-0060 replays (#1441, #1442), off the per-push path since #1999: about twenty runner
+# minutes a run for a surface nobody is changing. Per push, ci.yml still lints and tests `graph`
+# with these excluded; its filter there must stay the complement of REPLAYS below.
+name: network contract replays (nightly)
+
+on:
+  schedule:
+    - cron: "40 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build the graph test archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # ci.yml's optional-features entry, restored and never written, so the archive below uses
+          # the same feature set to reuse it.
+          shared-key: graph-facade
+          save-if: false
+      - name: reclaim runner disk
+        run: |
+          df -h /
+          sudo nohup rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+            /opt/hostedtoolcache >/dev/null 2>&1 &
+      - uses: ./.github/actions/install-nextest
+      - name: build the test archive
+        run: cargo nextest archive --locked --features graph,counter,crash-points --archive-file "$RUNNER_TEMP/nextest-network.tar.zst"
+      - name: upload the test archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-network
+          path: ${{ runner.temp }}/nextest-network.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  # The replays run one at a time (.config/nextest.toml), so they are split by measured time: a
+  # named heavy set and its complement, so a new or renamed replay always lands in `rest`.
+  replays:
+    name: network replays (${{ matrix.part }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      REPLAYS: binary(network_contract) | (binary_id(nuthatch) & test(/^serve::tests::.*network/))
+      HEAVY: >-
+        test(=indexer_registration_migration_and_stake_are_reconstructed_at_each_block)
+        | test(=network_clock_refreshes_on_token_events_but_not_unrelated_logs)
+        | test(=capacity_uses_the_last_refresh_event_and_its_protocol_parameters)
+        | test(=serve::tests::network_rust_allocation_pages_keep_the_first_page_snapshot_when_the_tip_advances)
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [heavy, rest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/nextest-shard
+        with:
+          archive: nextest-network
+          shard: 1
+          of: 1
+          filter: (${{ env.REPLAYS }}) & ${{ matrix.part == 'rest' && 'not ' || '' }}(${{ env.HEAVY }})
+          name: network-${{ matrix.part }}
+
+  # #1130: a scheduled run attaches to no PR, so a red one files an issue or nobody sees it.
+  report-scheduled-failure:
+    name: surface a failed scheduled run
+    needs: [build, replays]
+    if: always() && github.event_name == 'schedule' && (failure() || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/report-scheduled-failure

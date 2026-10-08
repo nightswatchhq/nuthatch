@@ -1,0 +1,29 @@
+name: Distinguish an expired timeout from a cancel or supersede
+description: >
+  GitHub reports `cancelled` identically for a human cancel, a concurrency supersede and an expired
+  timeout-minutes (#525). Print how long the job ran against its ceiling so a reader can tell which.
+  Call it with `if: always() && cancelled()`; the job must set JOB_START_EPOCH in its first step.
+
+inputs:
+  ceiling:
+    description: The job's timeout-minutes, which a step cannot read for itself.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: distinguish an expired timeout from a cancel or supersede
+      # A composite step's own default is success(), which is false once the job is cancelled.
+      if: always()
+      shell: bash
+      env:
+        CEILING: ${{ inputs.ceiling }}
+      run: |
+        # Unset means the job was cut before its first step finished, seconds in: never an expiry.
+        # Shell arithmetic would read it as 0 and print the epoch as the elapsed time.
+        if [ -z "${JOB_START_EPOCH:-}" ]; then
+          echo "::warning::This job's conclusion is 'cancelled' and it was cut before its first step recorded a start time - seconds in, so an expiry of the ${CEILING}m timeout-minutes ceiling is not what happened. This is a human cancel or a concurrency supersede."
+          exit 0
+        fi
+        elapsed_s=$(( $(date +%s) - JOB_START_EPOCH ))
+        echo "::warning::This job's conclusion is 'cancelled' - GitHub reports that identically for a human cancel, a concurrency supersede, and an expired timeout-minutes, with no separate conclusion for the third. This run's steps ran for $((elapsed_s / 60))m$((elapsed_s % 60))s against this job's ${CEILING}m timeout-minutes ceiling. Close to ${CEILING}m: almost certainly an expiry, not a cancel. Well under it: almost certainly a real cancel or supersede."
