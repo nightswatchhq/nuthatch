@@ -22,20 +22,12 @@ Add another contract to an existing nest - resolve its ABI and grow the config, 
 
 ## `nuthatch audit`
 
-Audit the compliance annotations: `replay` re-proves them, `report` summarises them (C6)
+Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a second endpoint
 
-
-## `nuthatch audit replay`
-
-Re-run screening over the sealed segments and confirm the stored hits reproduce exactly
-
-- `--dir <DIR>` - Nest directory
-- `--from <FROM>` - First block of the range (inclusive)
-- `--to <TO>` - Last block of the range (inclusive)
 
 ## `nuthatch audit report`
 
-Summarise the hits and flags in a block range (markdown or `--json`)
+Summarise the threshold flags in a block range (markdown or `--json`)
 
 - `--dir <DIR>` - Nest directory
 - `--from <FROM>` - First block of the range (inclusive)
@@ -420,15 +412,6 @@ Regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml` foo
 
 - `--dir <DIR>` - Nest directory (must contain a `nuthatch.toml`)
 
-## `nuthatch screen`
-
-Screen sealed transfers against a list snapshot, recording `sanction_hit` annotations (RFC-0008 C2). Replayable: same list hash + range + component → identical hits
-
-- `--list <LIST>` - The list snapshot hash to screen against (from `nuthatch lists fetch`)
-- `--from <FROM>` - First block of the range to screen (inclusive)
-- `--to <TO>` - Last block of the range to screen (inclusive)
-- `--dir <DIR>` - Nest directory (must contain a `nuthatch.toml` and sealed segments over the range)
-
 ## `nuthatch seed`
 
 Fill a nest that has not indexed from a published mirror, instead of backfilling over RPC
@@ -466,14 +449,6 @@ Query a nest's data with SQL - the live tip and sealed history, one surface. Pri
 - `--dir <DIR>` - Nest directory. Queried directly when it holds a store no `nuthatch dev` has open; never created by the query, so a directory without one falls back to --url
 - `--url <URL>` - The running instance's API, used when --dir holds no store or `nuthatch dev` has it open
 - `--json` - Emit newline-delimited JSON instead of a table (for piping to jq etc.)
-
-## `nuthatch transform`
-
-Run a WASM transform component over a project's stored transfers
-
-- `<COMPONENT>` - Path to the transform component (.wasm, wasm32-wasip2)
-- `--dir <DIR>` - Project directory (must contain a nuthatch.redb with indexed transfers)
-- `--limit <LIMIT>` - How many of the most-recent transfers to feed the transform
 
 ## `nuthatch worker`
 

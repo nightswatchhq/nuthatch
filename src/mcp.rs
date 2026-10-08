@@ -240,7 +240,7 @@ async fn read_resource(uri: &str, client: &reqwest::Client, base: &str) -> Resul
 struct Shape {
     /// A transfer-shaped decoder exists (the balance view's own gate) - `balance`/`top_balances`.
     transfers: bool,
-    /// RFC-0008 compliance is configured - `flags`/`exposure`/`screen_status` and `investigate-address`.
+    /// RFC-0008 compliance is configured - `flags`/`exposure` and `investigate-address`.
     compliance: bool,
 }
 
@@ -266,7 +266,7 @@ async fn fetch_shape(client: &reqwest::Client, base: &str) -> Shape {
 
 /// The argument-taking prompts (RFC-0016 §6) - canned analysis flows that name real tools. Rendered
 /// entirely client-side (no network), so they work the instant a client lists them. `investigate-address`
-/// is compliance-shaped (exposure/flags/screening), so it's advertised only where that surface is live
+/// is compliance-shaped (exposure/flags), so it's advertised only where that surface is live
 /// (RFC-0025) - otherwise following it would walk an agent into no-ops.
 fn prompt_specs(shape: &Shape) -> Value {
     let mut prompts = vec![
@@ -274,7 +274,7 @@ fn prompt_specs(shape: &Shape) -> Value {
           "arguments": [] }),
     ];
     if shape.compliance {
-        prompts.push(json!({ "name": "investigate-address", "description": "Balances, exposure, flags, and screening for one address.",
+        prompts.push(json!({ "name": "investigate-address", "description": "Balances, exposure and flags for one address.",
           "arguments": [ { "name": "address", "description": "The 0x address to investigate.", "required": true } ] }));
     }
     prompts.push(json!({ "name": "verify-a-number", "description": "Re-derive a figure from scratch with provenance.",
@@ -294,8 +294,8 @@ fn render_prompt(name: &str, args: &Value) -> Option<Value> {
             let a = args.get("address").and_then(Value::as_str).unwrap_or("<address>");
             format!(
                 "Investigate the address {a}. Use `balance` for its token balance, `exposure` for its \
-                 exposure to labeled addresses, `flags` for threshold/velocity flags, and \
-                 `screen_status` for sanctions hits. Then summarise the risk picture, citing blocks."
+                 exposure to labeled addresses, and `flags` for threshold/velocity flags. Then \
+                 summarise the risk picture, citing blocks."
             )
         }
         "verify-a-number" => {
@@ -351,8 +351,6 @@ fn tool_specs(shape: &Shape) -> Value {
         tools.push(json!({ "name": "flags", "description": "Compliance flags (RFC-0008 C3): `kind=threshold` (single transfers over the configured amount) or `kind=velocity` (addresses over the windowed-volume threshold). Amounts are i128 base units as decimal strings.",
           "inputSchema": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["threshold", "velocity"] }, "limit": { "type": "integer", "default": 50 } } } }));
         tools.push(json!({ "name": "exposure", "description": "Direct counterparty-exposure of an address to the labeled set (RFC-0008 C1): inbound/outbound count + summed amount per label.",
-          "inputSchema": { "type": "object", "properties": { "address": { "type": "string" } }, "required": ["address"] } }));
-        tools.push(json!({ "name": "screen_status", "description": "Sanctions-screening result for an address (RFC-0008 C2): the `sanction_hit` annotations against it, with the list-snapshot version each was screened against. Answers 'was X flagged, and against which list version?'",
           "inputSchema": { "type": "object", "properties": { "address": { "type": "string" } }, "required": ["address"] } }));
     }
     Value::Array(tools)
@@ -427,22 +425,6 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
                 .as_str()
                 .ok_or_else(|| anyhow!("`address` is required"))?;
             get(client, &format!("{base}/exposure/{a}")).await
-        }
-        "screen_status" => {
-            // Query the sealed sanction_hit annotations for this address, with the list version.
-            // Escape `'` → `''` before interpolating into the SQL literal (SEC review): the read-only
-            // gate already blocks writes and Burrmill `prepare` blocks stacking, but an unescaped quote is
-            // still a real injection bug - close it at the source.
-            let a = args["address"]
-                .as_str()
-                .ok_or_else(|| anyhow!("`address` is required"))?
-                .to_ascii_lowercase()
-                .replace('\'', "''");
-            let q = format!(
-                "SELECT block_number, side, counterparty, value, list_snapshot FROM sanction_hit \
-                 WHERE lower(address) = '{a}' ORDER BY block_number LIMIT 100"
-            );
-            get_query(client, &format!("{base}/sql"), &[("q", &q)]).await
         }
         other => bail!("unknown tool `{other}`"),
     }
@@ -781,14 +763,13 @@ mod tests {
         let tools = resp["result"]["tools"].as_array().unwrap();
         // The base is unreachable here, so `fetch_shape` fails its probe and falls back to advertising
         // everything (RFC-0025) - the safe default, identical to the pre-RFC-0025 unconditional surface.
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 11);
         assert!(tools.iter().any(|t| t["name"] == "sql"));
         assert!(tools.iter().any(|t| t["name"] == "explain"));
         assert!(tools.iter().any(|t| t["name"] == "tables"));
         // The compliance tools (RFC-0008 C6).
         assert!(tools.iter().any(|t| t["name"] == "flags"));
         assert!(tools.iter().any(|t| t["name"] == "exposure"));
-        assert!(tools.iter().any(|t| t["name"] == "screen_status"));
     }
 
     #[test]
@@ -809,13 +790,7 @@ mod tests {
         };
         let t = names(&tool_specs(&bare));
         assert_eq!(t.len(), 7);
-        for hidden in [
-            "balance",
-            "top_balances",
-            "flags",
-            "exposure",
-            "screen_status",
-        ] {
+        for hidden in ["balance", "top_balances", "flags", "exposure"] {
             assert!(
                 !t.contains(&hidden.to_string()),
                 "{hidden} must be hidden on a bare nest"
@@ -834,12 +809,12 @@ mod tests {
         assert!(t.contains(&"balance".to_string()) && t.contains(&"top_balances".to_string()));
         assert!(!t.contains(&"flags".to_string()));
 
-        // Compliance-configured token nest: the full 12, and `investigate-address` returns.
+        // Compliance-configured token nest: the full 11, and `investigate-address` returns.
         let full = Shape {
             transfers: true,
             compliance: true,
         };
-        assert_eq!(names(&tool_specs(&full)).len(), 12);
+        assert_eq!(names(&tool_specs(&full)).len(), 11);
         assert!(names(&prompt_specs(&full)).contains(&"investigate-address".to_string()));
     }
 
@@ -883,7 +858,7 @@ mod tests {
             text.contains("0xBEEF"),
             "renders the address into the prompt"
         );
-        assert!(text.contains("screen_status"), "names real tools");
+        assert!(text.contains("`exposure`"), "names real tools");
 
         // Unknown prompt → a clean error, not a panic.
         let bad = json!({ "jsonrpc": "2.0", "id": 2, "method": "prompts/get", "params": { "name": "nope" } });

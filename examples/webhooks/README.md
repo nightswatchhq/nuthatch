@@ -41,7 +41,7 @@ For alerts, the shape is smaller because the selector is the annotation kind:
 
 ```toml
 [[alerts]]
-kinds = ["sanction_hit", "threshold_flag"]
+kinds = ["threshold_flag"]
 url   = "http://127.0.0.1:8099/"
 ```
 

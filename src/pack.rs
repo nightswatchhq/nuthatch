@@ -1,10 +1,6 @@
-//! The compliance-pack manifest (RFC-0008 C6): a signed, content-addressed declaration of exactly
-//! which artifacts produced a nest's compliance annotations - the trust interface between an operator
-//! and its customer/auditor. `pack build` assembles it from the nest's config and the real artifact
-//! hashes; `pack verify` checks the signature, re-hashes the referenced artifacts, and confirms each
-//! component's capability grants still bound its actual imports. A customer can thus confirm *which*
-//! pack (component hashes, grants, list snapshots) generated their alerts without trusting the source,
-//! and `audit replay` reproduces the results - operated convenience with customer-verifiable outputs.
+//! The compliance-pack manifest (RFC-0008 C6): a signed declaration of a nest's decode registry,
+//! flag thresholds and alert sinks - the trust interface between an operator and its auditor.
+//! `pack build` assembles it from the nest's config; `pack verify` checks the signature.
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -24,26 +20,20 @@ pub struct Manifest {
 
 /// The signed portion. Field order is fixed (serde serialises structs in declaration order), so its
 /// canonical JSON encoding - what we sign - is deterministic.
+///
+/// Unknown fields are refused: an older manifest can carry `screening` and `components`
+/// entries this build no longer checks, and verifying it while ignoring them would overstate it.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Body {
     pub name: String,
     pub created: String,
     /// The decode-registry content hash - the data model the annotations were computed against.
     pub registry_hash: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub screening: Vec<ScreeningEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flags: Option<FlagsEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub components: Vec<ComponentEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<AlertEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ScreeningEntry {
-    pub list_snapshot: String,
-    pub addresses: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,16 +44,6 @@ pub struct FlagsEntry {
     pub velocity_amount: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub velocity_window: Option<u64>,
-}
-
-/// A WASM component the pack uses, by content hash, with the capabilities it is granted. A pure stage
-/// (like `screen`) has an empty grant set - verifiable from its imports.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ComponentEntry {
-    pub name: String,
-    pub hash: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub grants: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,33 +102,11 @@ fn signing_bytes(body: &Body) -> Result<Vec<u8>> {
     serde_json::to_vec(body).context("failed to canonicalise manifest body")
 }
 
-/// `nuthatch pack build [--key <file>]` - assemble the manifest from the nest's config + real artifact
-/// hashes, sign it if a key is given, and write `compliance-pack.toml`.
+/// `nuthatch pack build [--key <file>]` - assemble the manifest from the nest's config, sign it if a
+/// key is given, and write `compliance-pack.toml`.
 pub fn build(dir: &Path, key: Option<&Path>, created: &str) -> Result<()> {
     let config = crate::config::Config::load(dir)?;
     let registry = crate::registry::from_nest(dir, &config)?;
-
-    // Screening list snapshots (hash + address count) actually present in the nest.
-    let mut screening = Vec::new();
-    for hash in &config.screening.lists {
-        let addresses = crate::lists::load(dir, hash).map(|a| a.len()).unwrap_or(0);
-        screening.push(ScreeningEntry {
-            list_snapshot: hash.clone(),
-            addresses,
-        });
-    }
-
-    // Components by content hash. The screening component (pure → no grants) when screening is on.
-    let mut components = Vec::new();
-    if !config.screening.lists.is_empty() {
-        if let Ok(rt) = crate::screen::load_runtime(dir) {
-            components.push(ComponentEntry {
-                name: "screen".into(),
-                hash: rt.component_hash().to_string(),
-                grants: Vec::new(),
-            });
-        }
-    }
 
     let flags = if config.flags.threshold.is_some()
         || config.flags.velocity_amount.is_some()
@@ -176,9 +134,7 @@ pub fn build(dir: &Path, key: Option<&Path>, created: &str) -> Result<()> {
         name: config.nest.name.clone(),
         created: created.to_string(),
         registry_hash: hex::encode(registry.hash()),
-        screening,
         flags,
-        components,
         alerts,
     };
 
@@ -223,8 +179,7 @@ impl VerifyReport {
     }
 }
 
-/// `nuthatch pack verify` - check the signature, re-hash referenced artifacts, and confirm each
-/// component's actual imports stay within its declared grants. Returns a structured report.
+/// `nuthatch pack verify` - check the signature over the manifest body. Returns a structured report.
 pub fn verify(dir: &Path) -> Result<VerifyReport> {
     let path = dir.join(PACK_FILE);
     let raw = std::fs::read_to_string(&path)
@@ -237,46 +192,6 @@ pub fn verify(dir: &Path) -> Result<VerifyReport> {
         report.signature = Some(check_signature(&manifest.pack, sig).unwrap_or(false));
         if report.signature == Some(false) {
             report.problems.push("signature does not verify".into());
-        }
-    }
-
-    // 2. Screening list snapshots still present with the recorded address counts.
-    for s in &manifest.pack.screening {
-        match crate::lists::load(dir, &s.list_snapshot) {
-            Ok(addrs) if addrs.len() == s.addresses => {}
-            Ok(addrs) => report.problems.push(format!(
-                "list snapshot {} has {} addresses, manifest says {}",
-                &s.list_snapshot[..12.min(s.list_snapshot.len())],
-                addrs.len(),
-                s.addresses
-            )),
-            Err(_) => report.problems.push(format!(
-                "list snapshot {} is missing",
-                &s.list_snapshot[..12.min(s.list_snapshot.len())]
-            )),
-        }
-    }
-
-    // 3. Components: content hash still matches, and imports stay within declared grants.
-    for c in &manifest.pack.components {
-        if c.name == "screen" {
-            match crate::screen::load_runtime(dir) {
-                Ok(rt) if rt.component_hash() == c.hash => {}
-                Ok(rt) => report.problems.push(format!(
-                    "component `screen` hash drifted: manifest {}, actual {}",
-                    &c.hash[..12],
-                    &rt.component_hash()[..12]
-                )),
-                Err(e) => report
-                    .problems
-                    .push(format!("component `screen` could not be loaded: {e}")),
-            }
-            // A pure stage must declare no grants.
-            if !c.grants.is_empty() {
-                report
-                    .problems
-                    .push("component `screen` is pure but declares grants".into());
-            }
         }
     }
 
@@ -313,13 +228,6 @@ pub fn run(args: crate::cli::PackArgs, created: &str) -> Result<()> {
                 Some(false) => println!("✗ signature does NOT verify"),
                 None => println!("· unsigned manifest (no signature to check)"),
             }
-            if report.problems.is_empty() {
-                println!("✓ all referenced artifacts match the manifest");
-            } else {
-                for p in &report.problems {
-                    println!("✗ {p}");
-                }
-            }
             if report.ok() {
                 println!("PASS");
                 Ok(())
@@ -346,12 +254,7 @@ mod tests {
             name: "t".into(),
             created: "unix:1".into(),
             registry_hash: "abcd".into(),
-            screening: vec![ScreeningEntry {
-                list_snapshot: "deadbeef".into(),
-                addresses: 3,
-            }],
             flags: None,
-            components: vec![],
             alerts: vec![],
         }
     }
@@ -384,7 +287,6 @@ mod tests {
     #[test]
     fn build_then_verify_a_signed_pack() {
         let dir = tempfile::tempdir().unwrap();
-        // Minimal nest: a config + a list snapshot, no contracts needed for the pack surface we test.
         std::fs::write(
             dir.path().join(crate::config::CONFIG_FILE),
             r#"
@@ -399,31 +301,18 @@ alias = "usdc"
 address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 abi = "abis/usdc.json"
 
-[screening]
-lists = ["PLACEHOLDER"]
+[flags]
+threshold = "1000"
 "#,
         )
         .unwrap();
-        // A vendored ABI so the registry builds.
         std::fs::create_dir_all(dir.path().join("abis")).unwrap();
         std::fs::write(
             dir.path().join("abis/usdc.json"),
             r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#,
         )
         .unwrap();
-        // A real list snapshot; rewrite the config to reference its hash.
-        let lf = dir.path().join("l.csv");
-        std::fs::write(&lf, "0x1111111111111111111111111111111111111111,ofac\n").unwrap();
-        let (hash, _) = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async { crate::lists::fetch(dir.path(), "ofac-sdn", None, Some(&lf)).await })
-            .unwrap();
-        let cfg = std::fs::read_to_string(dir.path().join(crate::config::CONFIG_FILE))
-            .unwrap()
-            .replace("PLACEHOLDER", &hash);
-        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), cfg).unwrap();
 
-        // Keygen → build (signed) → verify.
         let keyfile = dir.path().join("key.json");
         keygen(&keyfile).unwrap();
         build(dir.path(), Some(&keyfile), "unix:1").unwrap();
@@ -432,20 +321,33 @@ lists = ["PLACEHOLDER"]
         assert_eq!(report.signature, Some(true), "signed pack verifies");
         assert!(report.ok(), "problems: {:?}", report.problems);
 
-        // Delete the referenced list snapshot → the signature is still valid, but the artifact the
-        // manifest points at is gone, so conformance fails (drift the signature can't catch alone).
-        std::fs::remove_file(
-            dir.path()
-                .join(crate::lists::LISTS_DIR)
-                .join(format!("{hash}.json")),
+        let path = dir.path().join(PACK_FILE);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"1000\""), "{raw}");
+        std::fs::write(&path, raw.replace("\"1000\"", "\"999\"")).unwrap();
+        let report = verify(dir.path()).unwrap();
+        assert_eq!(report.signature, Some(false), "an edited body fails");
+        assert!(!report.ok());
+    }
+
+    #[test]
+    fn a_manifest_with_screening_entries_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(PACK_FILE),
+            r#"
+[pack]
+name = "t"
+created = "unix:1"
+registry_hash = "abcd"
+
+[[pack.screening]]
+list_snapshot = "deadbeef"
+addresses = 3
+"#,
         )
         .unwrap();
-        let report = verify(dir.path()).unwrap();
-        assert_eq!(report.signature, Some(true), "signature still valid");
-        assert!(
-            !report.ok(),
-            "a missing referenced artifact must fail verification"
-        );
-        assert!(report.problems.iter().any(|p| p.contains("missing")));
+        let err = format!("{:#}", verify(dir.path()).unwrap_err());
+        assert!(err.contains("screening"), "{err}");
     }
 }

@@ -55,7 +55,7 @@ RFC-0005 §6:
   the answer is the pointer to this paragraph.
 - **The manifest is the trust interface between the two.** `nuthatch pack verify`
   lets an operator's *customer* independently confirm which pack (component hashes,
-  grants, list snapshots) produced their alerts - and `nuthatch audit replay` lets
+  grants, list snapshots) produced their alerts - and `audit replay` (removed 2026-10-08) lets
   them reproduce the results on their own hardware. That combination - operated
   convenience with customer-verifiable outputs - is the pack's differentiator versus
   API-based screening vendors, and it only works because rules 1-4 keep the core
@@ -102,6 +102,6 @@ line above.
 
 `nuthatch init <token> && nuthatch lists fetch ofac-sdn && nuthatch dev` on live
 mainnet USDC: screening + threshold flags + exposure views active, webhook alert
-fires on a fixture-injected hit in test, `nuthatch audit replay` reproduces stored
+fires on a fixture-injected hit in test, `audit replay` reproduces stored
 annotations bit-identically, peak RAM within budget, all tests green, README status
 table and progress log updated in the house style.

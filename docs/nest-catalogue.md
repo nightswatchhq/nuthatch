@@ -83,8 +83,7 @@ Before the tiers, the rubric that produced them. This is the reusable filter for
 - **Churning upgradeable proxies** - if the ABI moves under a proxy, decode needs EIP-1967 proxy
   introspection (a known [backlog](backlog.md) item, RFC-0001 leftover). Fine eventually, friction now.
 - **Value lives in `eth_call` state, not logs** - e.g. a price that's only readable via a view
-  function. Enrichment belongs in *effectful* components producing annotations, never canonical
-  entities (the purity rule).
+  function. That is a declared `[[calls]]` read pinned to a block, so it stays deterministic.
 - **Heavy off-chain math presented as "the data"** - APR→APY, USD pricing from `sqrtPriceX96`. Not
   disqualifying (Aave and Uniswap both need it) but it's real view-layer work - grade the complexity
   honestly rather than pretending it's a Transfer log.

@@ -103,44 +103,16 @@ change requires mutating sealed segments, the design is wrong - go back.
   Lodestar nest: the panel it replaces went p50 2.15 s to 87.7 ms, and one block's update is flat at
   ~285 µs against 309,548 groups. RFC-0033's durable grafting (#357) is **not** in v1 - per-entity
   reuse across an NID change is still a whole-nest local rebuild.
-- Imperative (escape hatch): WASM component handlers, per the transform layer below.
+- Imperative (escape hatch): **removed 2026-10-08 by Chief.** There is no WASM handler layer;
+  derivation is the built-in IVM, `views/*.sql` and `entities.toml`.
 
-## The transform layer: lessons from liminal (nightswatchhq/liminal)
+## The transform layer: removed 2026-10-08
 
-Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`, `wit/`, and
-`liminal-sdk/` before writing any transform-layer code. Port the design, not just the idea.
-
-**Adopt directly:**
-- WIT-first workflow: define/modify WIT interfaces before touching host or component code.
-  Typed channels between stages; the WIT files are the API contract and get reviewed first.
-- Per-component capability injection at composition time. The host grants `wasi:http`,
-  key-value, filesystem per component, never per pipeline.
-- **Purity by construction:** a component granted zero capabilities is deterministic by
-  definition. Enforce the rule in the host: only zero-capability components may feed entity
-  derivation / stored state. Effectful components (HTTP enrichers etc.) produce annotations
-  only, never canonical entities. Purity must be checkable from the composition manifest -
-  no code inspection required.
-- Single cursor, single process, one observable failure boundary. Never introduce a second
-  cursor or a reconciliation layer.
-- Host owns orchestration, retries, and state; components are stateless pure stages.
-- Optional sinks warn-and-skip when unconfigured (liminal's `--database-url` pattern) - apply
-  this graceful-degradation pattern to every optional integration.
-- Examples-as-documentation: every capability ships with a runnable example pipeline, in the
-  style of liminal's `examples/uni-v3-swaps`.
-- Wasmtime pinned, WASIp2 (`wasm32-wasip2`) now; track WASIp3 but do not adopt until stable
-  in Wasmtime. Keep WIT interfaces p3-migratable (avoid patterns that only make sense in p2).
-
-**Change from liminal (its known gaps for this workload):**
-- **Batch the boundary.** Liminal's per-event component calls won't survive backfill targets
-  (≥10K events/sec floor, aim 30K). WIT interfaces take batches - lists of events or
-  serialized Arrow IPC buffers - never one event per call. Arrow is the interchange format
-  everywhere; don't invent bespoke serialization.
-- **Stateless components as a hard contract:** components are pure functions
-  `batch of blocks → batch of facts`. All state lives host-side. Components never see reorgs
-  and have no rollback interface; the host handles reorg via hot-store rollback and IVM
-  retractions.
-- Components are the escape hatch, not the front door: the `init` flow must produce a working
-  indexer with zero user-written components (generated decode + declarative views).
+Chief removed the WASM transform layer outright on 2026-10-08 (#1999): `transform`, `screen` and
+`effectful`, `wit/`, `components/`, live `[screening]` and the wasmtime dependencies. Do not rebuild
+it or write WASM components; reopening it is Chief's call. A nest that still declares `[screening]`
+is refused at load, by name. One rule from it outlives it: optional integrations warn-and-skip when
+unconfigured.
 
 ## Correctness rules
 
@@ -299,7 +271,7 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
    slice alone must hit the <2-minute demo.
 2. Parquet sealing past finality + DuckDB (Burrmill since 4.1) read-only analytical SQL + reorg property tests.
 3. DBSP declarative views (the IVM core) replacing hand-rolled entity updates.
-4. Transform runtime ported from liminal with batched Arrow WIT interfaces.
+4. ~~Transform runtime ported from liminal with batched Arrow WIT interfaces.~~ Shipped, then removed 2026-10-08 by Chief.
 5. MCP server + scaffolded skills + llms.txt.
 6. ExEx ingestion mode (colocated reth), then scaled mode (Postgres/DataFusion).
 
@@ -332,6 +304,6 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
 - Token, staking, decentralized network features (a possible future Graph Horizon data
   service is explicitly deferred).
 - Non-EVM chains before EVM is airtight.
-- TEE attestation, zk proofs (verifiability = deterministic re-execution of pure components
+- TEE attestation, zk proofs (verifiability = deterministic re-execution of the core
   + content-addressed segments; nothing heavier).
 - Kubernetes manifests, Helm charts, or any deployment story beyond binary + compose.
