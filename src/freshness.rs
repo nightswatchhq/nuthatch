@@ -19,8 +19,10 @@
 
 use std::time::Duration;
 
-/// The shortest interval a defaulted poll takes, and the default when a chain's block time is unknown.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a caught-up cursor waits by default, and the shortest a defaulted interval takes. Five
+/// minutes, not the block time: every poll is billed whether or not a block carried an event, and an
+/// idle nest on a metered endpoint spent most of its cost polling (2026-10-08). `--poll-interval` overrides.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Blocks averaged over when measuring an unregistered chain's block time at startup.
 const BLOCK_TIME_SAMPLE: u64 = 100;
@@ -48,9 +50,8 @@ impl Default for Freshness {
     }
 }
 
-/// The interval a chain gets when the operator names none (#1497): its block time in whole seconds,
-/// never under [`DEFAULT_POLL_INTERVAL`]. Polling faster than blocks arrive finds nothing new and is
-/// still billed; a block cannot be seen before it exists.
+/// The interval a chain gets when the operator names none: [`DEFAULT_POLL_INTERVAL`], or the chain's block
+/// time in whole seconds if that is longer, since a block cannot be seen before it exists (#1497).
 pub fn default_poll_interval(block_time: Option<Duration>) -> Duration {
     block_time.map_or(DEFAULT_POLL_INTERVAL, |t| {
         Duration::from_secs(t.as_secs()).max(DEFAULT_POLL_INTERVAL)
@@ -229,23 +230,21 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_the_block_time_in_whole_seconds_floored_at_two() {
+    fn the_default_is_five_minutes_unless_blocks_are_slower() {
         let ms = Duration::from_millis;
-        assert_eq!(default_poll_interval(None), Duration::from_secs(2));
+        let five_min = Duration::from_secs(300);
+        assert_eq!(default_poll_interval(None), five_min);
+        for block in [0, 500, 2_000, 5_088, 12_050] {
+            assert_eq!(
+                default_poll_interval(Some(ms(block))),
+                five_min,
+                "{block} ms blocks"
+            );
+        }
         assert_eq!(
-            default_poll_interval(Some(ms(12_050))),
-            Duration::from_secs(12)
+            default_poll_interval(Some(Duration::from_secs(600))),
+            Duration::from_secs(600)
         );
-        assert_eq!(
-            default_poll_interval(Some(ms(5_088))),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            default_poll_interval(Some(ms(2_000))),
-            Duration::from_secs(2)
-        );
-        assert_eq!(default_poll_interval(Some(ms(500))), Duration::from_secs(2));
-        assert_eq!(default_poll_interval(Some(ms(0))), Duration::from_secs(2));
     }
 
     #[test]
@@ -257,7 +256,7 @@ mod tests {
 
         let defaulted =
             Freshness::from_flags(None, true).for_block_time(Some(Duration::from_secs(12)));
-        assert_eq!(defaulted.poll_interval, Duration::from_secs(12));
+        assert_eq!(defaulted.poll_interval, DEFAULT_POLL_INTERVAL);
         assert!(
             defaulted.finality_only,
             "settling the interval keeps the other knob"
