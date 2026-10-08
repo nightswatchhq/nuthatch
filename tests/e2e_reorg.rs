@@ -41,10 +41,12 @@ fn replacement_block(b: u64) -> BlockFixture {
 }
 
 /// Index a fresh nest over `tape` until it reaches `last_block == tip`, returning `(runtime, store)`.
+/// `within` bounds the wait: a fixture padded to seal decodes a full seal batch on the way (#1989).
 async fn spawn_indexed(
     dir: &std::path::Path,
     tape: Arc<TapeSource>,
     tip: u64,
+    within: std::time::Duration,
 ) -> (
     indexer::NestRuntime,
     std::sync::Arc<dyn nuthatch::store::HotStore>,
@@ -65,7 +67,7 @@ async fn spawn_indexed(
     .expect("spawn_nest");
     let store = rt.state.store.clone();
     let tip_str = tip.to_string();
-    let landed = wait_until(POLL_TIMEOUT, || {
+    let landed = wait_until(within, || {
         store.get_meta("last_block").ok().flatten().as_deref() == Some(tip_str.as_str())
     })
     .await;
@@ -97,7 +99,8 @@ async fn converge_after_reorg(fork: u64) {
         tape.insert_block(b, canonical_block(b));
     }
     tape.advance_tip_to(CHAIN_LEN);
-    let (rt, store) = spawn_indexed(reorged_dir.path(), tape.clone(), CHAIN_LEN).await;
+    let (rt, store) =
+        spawn_indexed(reorged_dir.path(), tape.clone(), CHAIN_LEN, POLL_TIMEOUT).await;
 
     // Rewrite blocks (fork, CHAIN_LEN] with the replacement chain.
     let replacement: Vec<BlockFixture> = ((fork + 1)..=CHAIN_LEN).map(replacement_block).collect();
@@ -130,7 +133,8 @@ async fn converge_after_reorg(fork: u64) {
         clean_tape.insert_block(b, replacement_block(b));
     }
     clean_tape.advance_tip_to(CHAIN_LEN);
-    let (clean_rt, clean_store) = spawn_indexed(clean_dir.path(), clean_tape, CHAIN_LEN).await;
+    let (clean_rt, clean_store) =
+        spawn_indexed(clean_dir.path(), clean_tape, CHAIN_LEN, POLL_TIMEOUT).await;
     let clean_rows = clean_store.entities_in_range(1, CHAIN_LEN).unwrap();
     shutdown(clean_rt);
 
@@ -254,7 +258,7 @@ async fn nest_with_a_sealed_range(
         tape.insert_block(b, fx);
     }
     tape.advance_tip_to(10);
-    let (rt, store) = spawn_indexed(dir, tape.clone(), 10).await;
+    let (rt, store) = spawn_indexed(dir, tape.clone(), 10, SEAL_POLL_TIMEOUT).await;
 
     tape.advance_finalized_to(8);
     for b in 11..=14u64 {
@@ -562,8 +566,8 @@ async fn reorg_on_one_chain_leaves_the_other_untouched() {
     tape_a.advance_tip_to(10);
     tape_b.advance_tip_to(10);
 
-    let (rt_a, store_a) = spawn_indexed(dir_a.path(), tape_a.clone(), 10).await;
-    let (rt_b, store_b) = spawn_indexed(dir_b.path(), tape_b.clone(), 10).await;
+    let (rt_a, store_a) = spawn_indexed(dir_a.path(), tape_a.clone(), 10, POLL_TIMEOUT).await;
+    let (rt_b, store_b) = spawn_indexed(dir_b.path(), tape_b.clone(), 10, POLL_TIMEOUT).await;
 
     // Snapshot chain B before touching chain A.
     let b_before = store_b.entities_in_range(1, 10).unwrap();
