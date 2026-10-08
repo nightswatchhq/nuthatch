@@ -81,7 +81,8 @@ jobs:
         run: |
           set -euo pipefail
           gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid' > head.sha
-          gh pr diff "$PR" --repo "$REPO" > pr.diff
+          # gh refuses a diff that carries ANSI escapes (a deleted terminal log does); keep it, minus ESC.
+          gh pr diff "$PR" --repo "$REPO" --allow-escape-sequences | tr -d '\033' > pr.diff
           gh pr view "$PR" --repo "$REPO" --json title --jq '.title' > pr.title
           gh pr view "$PR" --repo "$REPO" --json body --jq '.body' > pr.body
           # The commit range, not just the diff (#1056). Reviewing the 3.1.0 release PR, Jules
