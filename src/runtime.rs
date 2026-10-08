@@ -457,7 +457,7 @@ const NEST_VIEW_RSS_MB: u64 = 40; // each extra load: exposure view, velocity vi
 /// that made the multi-nest regression figure agree across machines - but criterion 12's artifact is
 /// a *cursor* measurement, not this one.
 ///
-/// **Corroborated 2026-08-27 at real scale** (`tests/seed_scale.rs` against a Horizon nest on the
+/// **Corroborated 2026-08-27 at real scale** (`tests/seed_scale.rs` at `ede03ca7`, against a Horizon nest on the
 /// ThinkPad), which is what the 889-row caveat above was asking for. Two shapes, same 346,288
 /// sealed source rows:
 ///

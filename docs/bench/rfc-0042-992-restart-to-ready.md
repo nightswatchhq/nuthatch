@@ -1,7 +1,7 @@
 # RFC-0042 §11: restart-to-ready (#992)
 
 Measured 2026-08-30 on Apple Silicon, in-process, medians of 3, 1 ms poll interval. Harness:
-`tests/bench_restart_to_ready.rs`, `#[ignore]`d and run explicitly:
+[`tests/bench_restart_to_ready.rs`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/tests/bench_restart_to_ready.rs), `#[ignore]`d and run explicitly:
 
 ```
 cargo test --test bench_restart_to_ready -- --ignored --nocapture

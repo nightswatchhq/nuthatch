@@ -57,7 +57,7 @@ asserted numbers this month.
 
 ## The prototype was built, and it settles it the other way
 
-**Measured 2026-08-31, `tests/bench_compact_rows.rs`.** Two redb stores, 1,600,000 identical
+**Measured 2026-08-31, [`tests/bench_compact_rows.rs`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/tests/bench_compact_rows.rs).** Two redb stores, 1,600,000 identical
 synthetic rows each - one holding today's JSON strings, one holding the compact encoding modelled
 above - written in 5,000-row windows as `commit_window` writes them. Each configuration is then read
 back **in its own process**, because `VmRSS` is process-wide and that is exactly the correction
@@ -214,7 +214,7 @@ and kept here because what they were expected to show is part of the record.)*
   faster on Linux.** It was the one expectation that held, and it is the only benefit left standing.
 - ~~**redb's own overhead, exactly.**~~ **Measured: it does not shrink with the payload.** A 3.1x
   payload cut is a 2.00x file cut, and a 0x RSS cut once the cache is set.
-- ~~**Any prototype.** No encoder exists.~~ One exists now, in `tests/bench_compact_rows.rs`, and it
+- ~~**Any prototype.** No encoder exists.~~ One exists now, in [`tests/bench_compact_rows.rs`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/tests/bench_compact_rows.rs), and it
   falsified the hypothesis it was built to confirm.
 
 ## The contracts on the table

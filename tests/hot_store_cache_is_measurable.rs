@@ -5,7 +5,7 @@
 //! preads into `Vec<u8>` - so every cached page is heap and lands in `VmRSS`, which is what
 //! non-negotiable 2 bounds.
 //!
-//! Measured in `tests/bench_compact_rows.rs` (#296/#1045) against a 2.16 GB store on Linux: RSS
+//! Measured by `tests/bench_compact_rows.rs` at `ede03ca7` (#296/#1045) against a 2.16 GB store on Linux: RSS
 //! tracks the cache setting almost one-for-one and is **independent of the file**, while a point
 //! read costs +0.6 us going from 1 GiB to 256 MiB. The two live Lodestar cursors sit at 1.44 and
 //! 1.42 GB against their 2 GB, and the *larger* store has the *smaller* RSS - which a linear

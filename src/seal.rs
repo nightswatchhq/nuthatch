@@ -744,7 +744,7 @@ pub fn read_table_rows(
 ///
 /// The whole-history `Vec` is a large transient of a restart seed, and it is one nothing else
 /// bounds: mount admission prices an entity's *maintained* relation, not the historical facts it
-/// folds to build one. Measured against a real Horizon nest (2026-08-26, `tests/seed_scale.rs`,
+/// folds to build one. Measured against a real Horizon nest (2026-08-26, `tests/seed_scale.rs` at `ede03ca7`,
 /// 346,288 sealed rows across 2,985 segments):
 ///
 /// | seed             | peak RSS | wall |

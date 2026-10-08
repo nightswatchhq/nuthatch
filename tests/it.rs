@@ -15,14 +15,12 @@ mod authoring_runner_self_test;
 mod bench_citations;
 #[path = "bench_commits.rs"]
 mod bench_commits;
-#[path = "bench_compact_rows.rs"]
-mod bench_compact_rows;
 #[path = "bench_helpers_reject_failures.rs"]
 mod bench_helpers_reject_failures;
-#[path = "bench_restart_to_ready.rs"]
-mod bench_restart_to_ready;
 #[path = "bind_drops_slow_headers.rs"]
 mod bind_drops_slow_headers;
+#[path = "compact_rows_prototype.rs"]
+mod compact_rows_prototype;
 #[path = "concurrent_sql_does_not_corrupt.rs"]
 mod concurrent_sql_does_not_corrupt;
 #[path = "control_api.rs"]
@@ -33,8 +31,6 @@ mod control_plane;
 mod core_stays_pristine;
 #[path = "cors_reaches_the_bind.rs"]
 mod cors_reaches_the_bind;
-#[path = "dbsp_step_cost.rs"]
-mod dbsp_step_cost;
 #[path = "deploy_nest_script.rs"]
 mod deploy_nest_script;
 #[path = "doc_command_check.rs"]
@@ -162,17 +158,10 @@ mod roll_helsinki_script;
 mod rpc_pool_rate_limit;
 #[path = "scheduled_workflow_failure_is_reported.rs"]
 mod scheduled_workflow_failure_is_reported;
-#[path = "seal_batching_asymmetry.rs"]
-mod seal_batching_asymmetry;
-#[cfg(feature = "folds")]
-#[path = "seal_latency_with_folds.rs"]
-mod seal_latency_with_folds;
 #[path = "sealed_audit.rs"]
 mod sealed_audit;
 #[path = "secret_isolation.rs"]
 mod secret_isolation;
-#[path = "seed_scale.rs"]
-mod seed_scale;
 #[path = "semantic_layer.rs"]
 mod semantic_layer;
 #[path = "tape_clean.rs"]
