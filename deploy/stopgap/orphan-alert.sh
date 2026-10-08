@@ -83,6 +83,7 @@ fetch() {
     fi
     [ "$try" -lt 3 ] || return 1
     wait=$(tr -d '\r' < "$work/headers" 2>/dev/null | awk 'tolower($1) == "retry-after:" { print $2 }' | tail -n 1)
+    # Kittiwake sends delta-seconds; an HTTP-date form falls back to 5 s.
     case $wait in "" | *[!0-9]*) wait=5 ;; esac
     [ "$wait" -le 30 ] || wait=30
     say "attempt $try: $why; retrying in ${wait}s"
