@@ -54,7 +54,9 @@ chain, no telemetry unless you opt in, no account. The built-in MCP server lets 
 - **It's just SQL.** Your contract's events become per-event tables you query with real analytical SQL -
   the live tip *and* sealed history, one surface.
 - **It's yours, and it's small.** ≤2 GB RAM for single-chain tip-following, CI-enforced. No telemetry by
-  default, no mandatory API token, ever: the one opt-in is a head count at `init` (`nuthatch count`).
+  default, no mandatory API token, ever: the one opt-in is a head count at `init` (`nuthatch count`),
+  and [its totals are public](https://www.nuthatch-indexer.com/count). Most people say no or are never asked, so
+  they are floors.
 
 ---
 
