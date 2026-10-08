@@ -29,7 +29,7 @@ comment, and "queries take the mutex" is true of the map operations only. This d
 **Measured on the product's own path** (`nuthatch::analytics::query_guarded`, one `Mutex<()>` the only
 variable between arms, `horizon-nest`, 32 clients, >= 15 repeats): **14.7 qps flat with a held mutex,
 up to 81.5 qps without one - 5.5x.** Harness and raw log at
-`tools/slice6-20260830T182428Z-ec26929f/`, `raw/a1a-conc.raw.log`.
+[`tools/slice6-20260830T182428Z-ec26929f/`](https://github.com/nightswatchhq/nuthatch/tree/ede03ca7/tools/slice6-20260830T182428Z-ec26929f), `raw/a1a-conc.raw.log`.
 
 The specialised operator (#987) has no shared connection, so N callers genuinely overlap. That remains
 true - but it was never being compared against DuckDB. It was being compared against a serialisation

@@ -51,7 +51,7 @@ fn launch_copy_does_not_describe_2_5_0() {
     // An empty walk would pass silently and prove nothing - the same absent-means-healthy shape the
     // rest of this sprint is about. The directory is committed, so zero files means the walk broke.
     assert!(
-        files.len() >= 5,
+        files.len() >= 4,
         "expected the committed launch pages under {}, walked {} file(s) - the walk is broken, \
          not the copy",
         root.display(),

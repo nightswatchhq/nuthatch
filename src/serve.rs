@@ -4277,7 +4277,7 @@ async fn run_sql_query_at(
         // 7's separate term, and it is what this seam is: `hot` is the map `analytics::run` defines
         // its views from.
         //
-        // **Measured, and it is not the term that matters** (2026-08-27, `tests/seed_scale.rs`
+        // **Measured, and it is not the term that matters** (2026-08-27, `tests/seed_scale.rs` at `ede03ca7`,
         // against a 38,428-segment Horizon nest). A top-20 over a relation of 309,549 maintained
         // rows took 2,487 ms; `SELECT 1`, which reads nothing at all, took 2,465 ms on the same
         // nest. The copy is the 22 ms difference. What the request actually pays for is

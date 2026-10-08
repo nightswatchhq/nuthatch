@@ -39,204 +39,11 @@ fn repo_root() -> PathBuf {
 /// no longer needs to exist as a separate check - a stale entry is just the actual-count-0 case).
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
-        "docs/releases/v4.1.0.md",
-        "emit",
-        1,
-        "the 4.1.0 notes list what left with DuckDB; a removed command is named in the release that removed it",
-    ),
-    (
-        "docs/releases/v4.1.0.md",
-        "authored-entity",
-        1,
-        "the 4.1.0 notes list what left with DuckDB; a removed command is named in the release that removed it",
-    ),
-    (
-        "docs/rfcs/0055-the-dune-view-emitter.md",
-        "emit",
-        3,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/rfcs/0055-the-dune-view-emitter.md",
-        "--source",
-        1,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/rfcs/0056-the-dune-row-insert-sidecar.md",
-        "--source",
-        1,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/rfcs/0042-slice0-bom.md",
-        "emit",
-        1,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/rfcs/README.md",
-        "emit",
-        2,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/bench/rfc-0041-slice-zero.md",
-        "authored-entity",
-        3,
-        "`nuthatch bench authored-entity` measured the RFC-0041 spike, which left with DuckDB in 4.1; this is the dated record of that measurement",
-    ),
-    (
-        "docs/bench/rfc-0041-slice-zero.md",
-        "--batch-rows",
-        1,
-        "`nuthatch bench authored-entity` measured the RFC-0041 spike, which left with DuckDB in 4.1; this is the dated record of that measurement",
-    ),
-    (
-        "docs/bench/rfc-0041-slice-zero.md",
-        "--max-rows",
-        3,
-        "`nuthatch bench authored-entity` measured the RFC-0041 spike, which left with DuckDB in 4.1; this is the dated record of that measurement",
-    ),
-    (
-        "docs/bench/rfc-0041-slice-zero.md",
-        "--segments",
-        2,
-        "`nuthatch bench authored-entity` measured the RFC-0041 spike, which left with DuckDB in 4.1; this is the dated record of that measurement",
-    ),
-    (
-        "docs/releases/v3.7.0.md",
-        "emit",
-        3,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/releases/v3.7.0.md",
-        "--source",
-        1,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/releases/v3.8.3.md",
-        "emit",
-        2,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/rfcs/0056-the-dune-row-insert-sidecar.md",
-        "emit",
-        7,
-        "`nuthatch emit dune` left with DuckDB in 4.1; this is dated writing about the release or design that had it",
-    ),
-    (
-        "docs/rfcs/0052-the-mirrored-nest.md",
-        "--from-mirror",
-        1,
-        "RFC-0052 §8 names a future cold-start follow-on and explicitly says it needs its own RFC",
-    ),
-    (
         "docs/operators.md",
         "roost",
         1,
         "the pre-2.0 -> 2.0 migration table maps the retired `nuthatch roost dev` to its \
          replacement; the mapping needs both names",
-    ),
-    (
-        "docs/progress-log.md",
-        "roost",
-        2,
-        "dated progress-log entries describe RFC-0012 as it was built, before RFC-0032 retired the \
-         roost - it's a record of the past, not current usage. Two mentions: the 2026-07-16 slice-1 \
-         entry (line ~954) and the 2026-07-18 slice-1 recap (line ~989)",
-    ),
-    (
-        "docs/rfcs/0012-multi-nest-runtime-and-nest-packaging.md",
-        "roost",
-        1,
-        "RFC-0012 is the design doc that introduced `nuthatch roost dev`; RFC-0032 retired it and \
-         RFCs are dated writing, not current docs (same exemption `version-check.sh` gives them)",
-    ),
-    (
-        "docs/rfcs/0027-the-live-roost.md",
-        "roost",
-        2,
-        "RFC-0027 is titled around the roost and designs its CLI; dated writing, same as 0012. Two \
-         mentions on one line (~181): `nuthatch roost mount` and `nuthatch roost unmount`",
-    ),
-    (
-        "docs/sprint-languid-lapwing.md",
-        "roost",
-        1,
-        "the sprint doc that fixed the incident names the removed command as the regression it \
-         closes - it would be a strange irony for this check to make that sentence unwritable",
-    ),
-    (
-        "docs/sprint-nocturnal-nightjar.md",
-        "roost",
-        1,
-        "this sprint doc's own #769 entry states the regression test this file is - \"reintroducing \
-         `nuthatch roost` into any documented file must fail the build\" - same reasoning as the \
-         sprint-languid-lapwing.md entry above",
-    ),
-    (
-        "docs/progress-log.md",
-        "upgrade",
-        1,
-        "the 2026-07-21 entry documents `nuthatch nest upgrade` as it was that day (RFC-0020); the \
-         file's own header warns no entry is kept in step with the binary - it does not exist in \
-         2.2.0+",
-    ),
-    (
-        "docs/progress-log.md",
-        "diff",
-        1,
-        "same RFC-0020 entry, `nuthatch nest diff` - dated progress-log writing, not current usage",
-    ),
-    (
-        "docs/progress-log.md",
-        "mount",
-        1,
-        "the 2026-07-18 RFC-0012 slice 6 entry documents `nuthatch nest mount` as shipped that day; \
-         dated progress-log writing describing history, same as the roost entries above",
-    ),
-    (
-        "docs/progress-log.md",
-        "pack",
-        1,
-        "the 2026-07-18 RFC-0012 slice 5 entry documents `nuthatch nest pack` as shipped that day - \
-         the verb was later folded into `nuthatch nest bundle`",
-    ),
-    (
-        "docs/rfcs/0012-multi-nest-runtime-and-nest-packaging.md",
-        "pack",
-        1,
-        "RFC-0012 §5 designs `nuthatch nest pack`, the verb `nest bundle` later replaced; dated \
-         design writing, same exemption `version-check.sh` gives docs/rfcs/",
-    ),
-    (
-        "docs/rfcs/0012-multi-nest-runtime-and-nest-packaging.md",
-        "mount",
-        1,
-        "RFC-0012 §6 designs `nuthatch nest mount`, since removed; dated design writing",
-    ),
-    (
-        "docs/rfcs/0001-generalized-decode-and-nests.md",
-        "build",
-        1,
-        "\"a future `nuthatch build --aot` could revisit\" - explicitly a proposal for later, never \
-         built; the RFC says so itself",
-    ),
-    (
-        "docs/rfcs/0001-generalized-decode-and-nests.md",
-        "--aot",
-        1,
-        "the same never-built proposal - see the `build` entry above",
-    ),
-    (
-        "docs/rfcs/0016-governed-semantic-layer-and-agent-grade-mcp.md",
-        "eval",
-        1,
-        "RFC-0016 §1 proposes a `nuthatch eval` harness; not a shipped top-level subcommand",
     ),
     (
         "docs/kicking-the-tyres.md",
@@ -246,40 +53,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
          roost` for five releases after 2.0 removed it, as a worked example of documentation rotting \
          faster than code. Naming the incident is the point, so this is a fact about a past release \
          rather than an instruction. Fittingly, this check caught it in the very page that cites it",
-    ),
-    (
-        "docs/rfcs/0024-eth-call-execution-engine.md",
-        "state-cache",
-        2,
-        "RFC-0024 proposes `nuthatch state-cache clear` for the L3 call-result cache; not a shipped \
-         subcommand. Two mentions (lines ~175, ~255)",
-    ),
-    (
-        "docs/rfcs/0054-the-head-count.md",
-        "has",
-        1,
-        "RFC-0054's opt-in prompt is product copy that opens `nuthatch has no idea how many people \
-         use it`; the fence is a prompt, not a subcommand",
-    ),
-    (
-        "docs/rfcs/0059-checkpointed-folds.md",
-        "fold",
-        if cfg!(feature = "folds") { 0 } else { 1 },
-        "RFC-0059 S1 ships `nuthatch fold build` in a `folds` build only; a default build has no \
-         `fold` command, so there the mention is expected",
-    ),
-    (
-        "docs/rfcs/0059-checkpointed-folds.md",
-        "--folds",
-        if cfg!(feature = "folds") { 0 } else { 1 },
-        "RFC-0059 S2 ships `nuthatch check --folds` in a `folds` build only; a default build has no \
-         such flag, so there the mention is expected",
-    ),
-    (
-        "docs/rfcs/0062-maintained-views.md",
-        "--maintained",
-        2,
-        "RFC-0062 proposes `nuthatch check --maintained` for its S3; a draft design, not a shipped flag",
     ),
 ];
 
@@ -300,8 +73,10 @@ impl Finding {
     }
 }
 
-/// Doc files in scope: `README.md`, every `.md` under `docs/`, and the authored files of
+/// Doc files in scope: `README.md`, the product docs under `docs/`, and the authored files of
 /// `skills/nuthatch-builder/` and `skills/nuthatch-subgraph-port/` (RFC-0017 / RFC-0044).
+/// RFCs, release notes, benchmarks, decisions, validation logs and date-named files are records of
+/// what was true when written, so a command they name may since have gone.
 /// `cli-reference.md` itself is excluded: it's rendered from `Cli::command()` by `src/skill.rs`,
 /// the same ground truth this file checks against, so it can't drift by construction -
 /// `tests/skill_refs.rs::committed_cli_reference_is_not_stale` is the gate for that file
@@ -316,7 +91,53 @@ fn doc_files() -> Vec<PathBuf> {
         collect_md(&root.join(dir), &mut out);
     }
     out.retain(|p| p.file_name().and_then(|n| n.to_str()) != Some("cli-reference.md"));
+    out.retain(|p| is_product_doc(&rel(&root, p)));
     out
+}
+
+const RECORD_DIRS: [&str; 5] = [
+    "docs/rfcs/",
+    "docs/releases/",
+    "docs/bench/",
+    "docs/decisions/",
+    "docs/validation/",
+];
+
+fn is_product_doc(rel: &str) -> bool {
+    if RECORD_DIRS.iter().any(|d| rel.starts_with(d)) {
+        return false;
+    }
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    !has_date(name)
+}
+
+/// A `YYYY-MM-DD` anywhere in the name, as in `security-audit-2026-07-31.md`.
+fn has_date(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.windows(10).any(|w| {
+        w.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        })
+    })
+}
+
+#[test]
+fn records_are_out_of_scope_and_product_docs_are_in() {
+    assert!(is_product_doc("README.md"));
+    assert!(is_product_doc("docs/operators.md"));
+    assert!(is_product_doc("docs/launch/show-hn.md"));
+    assert!(is_product_doc("skills/nuthatch-builder/SKILL.md"));
+    assert!(!is_product_doc(
+        "docs/rfcs/0012-multi-nest-runtime-and-nest-packaging.md"
+    ));
+    assert!(!is_product_doc("docs/releases/v4.1.0.md"));
+    assert!(!is_product_doc("docs/security-audit-2026-07-31.md"));
+    let files: Vec<String> = doc_files().iter().map(|p| rel(&repo_root(), p)).collect();
+    assert!(
+        files.iter().any(|f| f == "docs/operators.md") && files.iter().any(|f| f == "README.md"),
+        "the product docs must still be walked: {files:?}"
+    );
 }
 
 fn collect_md(dir: &Path, out: &mut Vec<PathBuf>) {

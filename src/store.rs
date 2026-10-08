@@ -31,7 +31,7 @@ use std::sync::Arc;
 /// does **not** mmap - `file_backend/unix.rs` preads into `Vec<u8>` - so every cached page is heap
 /// and lands in `VmRSS`, which is what non-negotiable 2 bounds.
 ///
-/// Measured in `tests/bench_compact_rows.rs` against a 2.16 GB store, on Linux: RSS tracks this
+/// Measured by `tests/bench_compact_rows.rs` (at `ede03ca7`) against a 2.16 GB store, on Linux: RSS tracks this
 /// number almost one-for-one (1.00 GB at 1 GiB, 0.50 at 512 MiB, 0.25 at 256 MiB) and is
 /// **independent of the file**, while a point read costs +0.6 us going from 1 GiB to 256 MiB. The
 /// two live Lodestar cursors sit at 1.44 and 1.42 GB against their 2 GB, and the *larger* store has

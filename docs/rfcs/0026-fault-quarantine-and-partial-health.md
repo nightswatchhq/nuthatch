@@ -21,7 +21,7 @@
   questions (§3-§6); everything else is implementation detail.
 - Origin: [issue #147](https://github.com/nightswatchhq/nuthatch/issues/147), found in the full-repo
   audit (concurrency dimension). Sprint
-  [amiable-axolotl](../sprint-amiable-axolotl.md), tier 1.
+  [amiable-axolotl](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/sprint-amiable-axolotl.md), tier 1.
 
 ## Abstract
 

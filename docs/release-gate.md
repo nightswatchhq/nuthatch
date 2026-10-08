@@ -123,7 +123,7 @@ can show the row that differs. The canonical form decides what counts as the sam
 - Every value compares exactly as served, floats included: a float one bit off, or an integer that
   comes back as a float, is a different answer. Floats were rounded to 12 significant digits until
   #1883, when two fresh 4.7.0 servers answered every production set alike to the last bit
-  ([the record](reproducibility-2026-10-05.md)). A baseline from a binary before 4.6.0, which summed
+  ([the record](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/reproducibility-2026-10-05.md)). A baseline from a binary before 4.6.0, which summed
   DOUBLE in arrival order, can differ from a later one in the last digit.
   The rows go through jq, and only jq 1.7 or later keeps each number's digits and form: an older one parses
   every number to a double, so 9007199254740993 would match 9007199254740992 and 1.0 would match 1.

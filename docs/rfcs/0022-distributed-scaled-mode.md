@@ -34,7 +34,7 @@
   RFC-0021's per-chain cursor), **not hardware-gated**. It's a distributed multi-service stack we
   build and integration-test under docker-compose on the MacBook/VPSes; **GraphOps runs it at scale**
   (see the roadmap's Execution-context note). Never blocked on a node to exist.
-- Origin: roadmap thread 2, Decision B (`docs/high-level-roadmap-jul-aug-2026.md`), authorized
+- Origin: roadmap thread 2, Decision B ([`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)), authorized
   2026-07-21.
 
 ## ⚠️ Brief amendment required (see §0)

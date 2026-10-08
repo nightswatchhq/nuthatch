@@ -46,7 +46,7 @@ puts a figure on it, and no amount of testing will make that go away.
 Not ceremony. We have been caught by this repeatedly, and so will you.
 
 Four identical 90-second runs of the same demo once measured **2, 15, 28 and 198 events**
-(`docs/sprint-meticulous-magpie.md`, August 2026). A figure of `289 events/sec`, measured 2026-07-16,
+([`docs/sprint-meticulous-magpie.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/sprint-meticulous-magpie.md), August 2026). A figure of `289 events/sec`, measured 2026-07-16,
 outlived the harness that produced it by five weeks and ended up in a published document
 (`docs/releases/v2.7.0.md`). A benchmark said seal-direct was 8.7x faster in July 2026, 5.2x one
 morning and 0.92x that same afternoon (`docs/benchmarks.md`, settled 2026-08-23).

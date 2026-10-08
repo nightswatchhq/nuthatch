@@ -238,7 +238,7 @@ ingestion path you cannot name.
 
 ## 6a. The seam is not only the ingestion layer
 
-`docs/audits/2026-09-plan.md` §6 states the architecture as:
+[`docs/audits/2026-09-plan.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/audits/2026-09-plan.md) §6 states the architecture as:
 
 ```
 subgraph APIs  ->  scripts/cron-runner.ts (droplet, system cron)  ->  Postgres  ->  Next.js UI
