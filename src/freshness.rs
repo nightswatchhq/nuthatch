@@ -19,10 +19,14 @@
 
 use std::time::Duration;
 
-/// How long a caught-up cursor waits by default, and the shortest a defaulted interval takes. Five
-/// minutes, not the block time: every poll is billed whether or not a block carried an event, and an
-/// idle nest on a metered endpoint spent most of its cost polling (2026-10-08). `--poll-interval` overrides.
+/// How long a caught-up cursor waits when `--poll-interval` is not given. Every poll is billed whether
+/// or not a block carried an event, and an idle nest on a metered endpoint spent most of its cost
+/// polling (2026-10-08).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The floor of a [`Freshness`] built in code rather than from flags: a cursor that follows the tip
+/// as closely as blocks arrive.
+pub const TIP_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Blocks averaged over when measuring an unregistered chain's block time at startup.
 const BLOCK_TIME_SAMPLE: u64 = 100;
@@ -43,23 +47,21 @@ pub struct Freshness {
 impl Default for Freshness {
     fn default() -> Self {
         Freshness {
-            poll_interval: DEFAULT_POLL_INTERVAL,
+            poll_interval: TIP_POLL_INTERVAL,
             finality_only: false,
             poll_interval_explicit: false,
         }
     }
 }
 
-/// The interval a chain gets when the operator names none: [`DEFAULT_POLL_INTERVAL`], or the chain's block
-/// time in whole seconds if that is longer, since a block cannot be seen before it exists (#1497).
-pub fn default_poll_interval(block_time: Option<Duration>) -> Duration {
-    block_time.map_or(DEFAULT_POLL_INTERVAL, |t| {
-        Duration::from_secs(t.as_secs()).max(DEFAULT_POLL_INTERVAL)
-    })
+/// A defaulted interval settled on a chain: `floor`, or the block time in whole seconds if that is longer.
+/// Polling faster than blocks arrive finds nothing new and is still billed (#1497).
+pub fn default_poll_interval(floor: Duration, block_time: Option<Duration>) -> Duration {
+    block_time.map_or(floor, |t| Duration::from_secs(t.as_secs()).max(floor))
 }
 
 impl Freshness {
-    /// The dial as `dev`'s flags set it. `None` leaves the interval to the chain's block time.
+    /// The dial as `dev`'s flags set it. `None` is [`DEFAULT_POLL_INTERVAL`], or the block time if longer.
     pub fn from_flags(poll_interval: Option<Duration>, finality_only: bool) -> Self {
         Freshness {
             poll_interval: poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL),
@@ -74,7 +76,7 @@ impl Freshness {
             return self;
         }
         Freshness {
-            poll_interval: default_poll_interval(block_time),
+            poll_interval: default_poll_interval(self.poll_interval, block_time),
             ..self
         }
     }
@@ -230,20 +232,56 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_five_minutes_unless_blocks_are_slower() {
+    fn the_default_is_the_block_time_in_whole_seconds_floored_at_two() {
         let ms = Duration::from_millis;
-        let five_min = Duration::from_secs(300);
-        assert_eq!(default_poll_interval(None), five_min);
-        for block in [0, 500, 2_000, 5_088, 12_050] {
-            assert_eq!(
-                default_poll_interval(Some(ms(block))),
-                five_min,
-                "{block} ms blocks"
-            );
-        }
+        let tip = TIP_POLL_INTERVAL;
+        assert_eq!(default_poll_interval(tip, None), Duration::from_secs(2));
         assert_eq!(
-            default_poll_interval(Some(Duration::from_secs(600))),
-            Duration::from_secs(600)
+            default_poll_interval(tip, Some(ms(12_050))),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            default_poll_interval(tip, Some(ms(5_088))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            default_poll_interval(tip, Some(ms(2_000))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            default_poll_interval(tip, Some(ms(500))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            default_poll_interval(tip, Some(ms(0))),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// No flag means five minutes on every chain whose blocks come faster than that, and every registry
+    /// chain does. Only an explicit `--poll-interval` goes below it.
+    #[test]
+    fn without_a_flag_a_cursor_polls_every_five_minutes() {
+        let unset = Freshness::from_flags(None, false);
+        assert_eq!(unset.poll_interval, Duration::from_secs(300));
+        for chain in crate::chains::all() {
+            let settled = unset.for_block_time(Some(chain.block_time()));
+            assert_eq!(
+                settled.poll_interval,
+                Duration::from_secs(300),
+                "{}",
+                chain.name
+            );
+            assert_eq!(settled.poll_interval_source(), "block_time");
+        }
+        let slow = unset.for_block_time(Some(Duration::from_secs(600)));
+        assert_eq!(slow.poll_interval, Duration::from_secs(600));
+        let flagged = Freshness::from_flags(Some(Duration::from_secs(2)), false);
+        assert_eq!(
+            flagged
+                .for_block_time(Some(Duration::from_secs(12)))
+                .poll_interval,
+            Duration::from_secs(2)
         );
     }
 
