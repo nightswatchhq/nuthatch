@@ -1,6 +1,6 @@
 //! Sanctions / watch lists as **content-addressed data** (RFC-0008 C2). A list snapshot is exactly a
 //! set of EVM addresses, written as `lists/<sha256>.json` - the hash is a reproducible name for that
-//! set, so a screening decision traces to `(list-snapshot hash, block range, component hash)`.
+//! set.
 //!
 //! Fetching is **host-side and out-of-band** - never in the data path, never a phone-home during
 //! indexing. `lists fetch` downloads (or reads a local `--file`) whatever the source returns - OFAC's

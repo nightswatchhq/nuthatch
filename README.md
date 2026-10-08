@@ -447,9 +447,8 @@ who need more - none of it in the way of the happy path:
   blocks arrive, served from `/derived` and queryable by name from `/sql`, with reorgs handled as
   retractions like the built-ins. On a copy of the Lodestar nest that took the `indexer_rewards` panel
   from a p50 of 2.15 s to 87.7 ms ([`docs/bench/3.0.0-alpha-live.md`](docs/bench/3.0.0-alpha-live.md)).
-  A WASM transform layer remains the imperative escape hatch.
-- **Compliance pack** (RFC-0008). Address labels, sanctions/watch-list screening, threshold & velocity
-  flags, counterparty-exposure views, and a signed, replayable audit manifest.
+- **Labels and flags** (RFC-0008). Address labels, threshold & velocity flags and
+  counterparty-exposure views.
 - **Alerts & webhooks** (RFC-0010). HMAC-signed egress with a durable at-least-once outbox; a slow
   endpoint never blocks indexing.
 - **Built-in admin UI.** A self-contained page at `/_admin/` - status, tables, view/nest inspector.

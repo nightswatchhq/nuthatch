@@ -1579,7 +1579,7 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   wit`) takes a transfers batch + a sanctioned-address batch over the Arrow boundary and emits
   `sanction_hit` facts; the host stamps each with the list + component hashes the sandbox never sees.
   Two paths: a **live stage** (`[screening] lists = [...]` in `nuthatch.toml`) that screens each
-  window, and the audit-grade **backfill** `nuthatch screen --list <hash> --from --to` that re-screens
+  window, and the audit-grade **backfill** `screen --list <hash> --from --to` that re-screens
   *sealed* transfers over immutable segments. Hits become append-only `sanction_hit` annotations -
   block-keyed (so they seal + roll back with their transfers), sealed to their own Parquet table,
   queryable at `/sql`. Segment sealing is now **content-addressed idempotent** (re-auditing a range is
@@ -1914,7 +1914,7 @@ upgrade`, which was real that day and does not exist in 2.2.0.
   the host (wasmtime 44) loads it with **zero capabilities** - base WASI only, no http/kv/filesystem
   - so it's deterministic by construction and its purity is checkable from the component's imports
   alone (`wasm-tools component wit`), no code inspection. Ships a pure example component
-  (`large-transfers`: keeps transfers ≥ 1,000 USDC) and a `nuthatch transform <component.wasm>` CLI.
+  (`large-transfers`: keeps transfers ≥ 1,000 USDC) and a `transform <component.wasm>` CLI.
   Verified: 16 tests green incl. an end-to-end host-loads-real-wasm test; live run fed 2,470 USDC
   transfers → 525 filtered facts, deterministic. _Deferred: effectful worlds (http/kv-granted,
   annotations-only), wiring transforms as a live indexing stage, and signed pipeline manifests._

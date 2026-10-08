@@ -359,7 +359,7 @@ impl Catalogue {
     }
 }
 
-/// Tables sealed outside the indexer's cut: `nuthatch screen` seals hits over a range the operator names.
+/// Tables sealed outside the indexer's cut: the removed screening command sealed hits over a named range.
 const OWN_BOUNDARY: &[&str] = &["sanction_hit"];
 
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -675,7 +675,7 @@ events = ["Transfer"]
     }
 
     /// Transfers sealed with rows only at block 10, in the cut 1..=20; the cut 21..=1000 held only a
-    /// blocks row, so the event table sealed it empty; `nuthatch screen` sealed a hit over 21..=5000.
+    /// blocks row, so the event table sealed it empty; a screening run sealed a hit over 21..=5000.
     fn empty_tail(d: &Path) -> Auditor {
         let auditor = nest(d, "\n[extract]\nblocks = true\n");
         let event = auditor.registry.decode(&transfer_at(&auditor, 10)).unwrap();

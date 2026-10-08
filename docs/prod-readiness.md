@@ -208,8 +208,6 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   feature or run actix as a server). The wasmtime-wasi `FilePerms` bypass this row used to name as
   "tracked for a runtime bump" is no longer ignored at all - it's fixed, cleared by the wasmtime 44→46
   bump.*
-- [ ] ✅ Effectful (capability-granted) components can only produce **annotations**, never canonical
-  entities - purity checkable from the composition manifest. *(transform layer)*
 
 ## 5. The ≤2 GB budget under realistic load
 

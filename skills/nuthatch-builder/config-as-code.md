@@ -35,7 +35,7 @@ network, or randomness access - a `nest.star` is a description, not a program.
   - `chain_id` (int) - **optional**; for a known chain it is derived from `chain` exactly as `init`
     does. Pass it explicitly only for a custom chain nuthatch doesn't know.
   - `contracts`, `templates`, `factories`, `alerts`, `webhooks` - lists of the builtins below.
-  - `screening`, `flags` - dicts matching the `[screening]` / `[flags]` TOML tables.
+  - `flags` - a dict matching the `[flags]` TOML table.
 - **`contract(alias, address, abi, start_block=None, events=[])`** - one contract to index. `events`
   is the optional per-contract event allowlist (same as `[[contracts]].events`).
 - **`template(name, abi, filter=None)`** - a child-contract template (factory pattern, RFC-0009).
@@ -132,4 +132,4 @@ library/entry split being enforced, not a bug. Keep instantiation in the entry.
    resolved config and neither know nor care that it came from Starlark.
 
 If you find yourself wanting logic a `nest.star` can't express, that's the signal you're reaching past
-config into *transform* territory - that's the WASM/handler layer, not this one.
+config into derivation territory - that is `views/*.sql` or `entities.toml`, not this one.

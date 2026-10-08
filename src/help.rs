@@ -22,22 +22,11 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         &["serve", "doctor", "check", "schema", "bench", "settle"],
     ),
     ("SCALED", &["worker", "control"]),
-    (
-        "COMPLIANCE",
-        &["labels", "lists", "screen", "pack", "audit"],
-    ),
+    ("COMPLIANCE", &["labels", "lists", "pack", "audit"]),
     (
         "ADVANCED",
         &[
-            "recipe",
-            "metadata",
-            "transform",
-            "offchain",
-            "publish",
-            "seed",
-            "nest",
-            "migrate",
-            "prune",
+            "recipe", "metadata", "offchain", "publish", "seed", "nest", "migrate", "prune",
             "count", // RFC-0054 hook
         ],
     ),

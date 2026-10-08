@@ -27,7 +27,7 @@ static MALLOC_CONF: &u8 = &b"thp:never,narenas:8,dirty_decay_ms:1000,background_
 
 use nuthatch::{
     analytics, audit, bench, blob, check, cli, config, distribution, doctor, help, indexer, labels,
-    lists, mcp, offchain, pack, project, publish, runtime, screen, store, transform,
+    lists, mcp, offchain, pack, project, publish, runtime, store,
 };
 
 use anyhow::{Context, Result};
@@ -198,7 +198,6 @@ async fn main() -> Result<()> {
              is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
         ),
         cli::Command::Sql(args) => run_sql(args).await,
-        cli::Command::Transform(args) => run_transform(args),
         cli::Command::Offchain(args) => match args.what {
             cli::OffchainWhat::Drop(args) => offchain::drop_file(
                 std::path::Path::new(&args.dir),
@@ -269,7 +268,6 @@ async fn main() -> Result<()> {
         cli::Command::Doctor(args) => doctor::run(args).await,
         cli::Command::Labels(args) => run_labels(args),
         cli::Command::Lists(args) => run_lists(args).await,
-        cli::Command::Screen(args) => screen::backfill(args),
         cli::Command::Pack(args) => pack::run(args, &now_stamp()),
         cli::Command::Audit(args) => audit::run(args).await,
         cli::Command::Nest(args) => match args.what {
@@ -377,9 +375,6 @@ async fn run_lists(args: cli::ListsArgs) -> Result<()> {
             println!(
                 "✓ fetched {count} sanctioned address(es) → lists/{}.json",
                 &hash[..16]
-            );
-            println!(
-                "  screen a range with:  nuthatch screen --list {hash} --from <block> --to <block>"
             );
             Ok(())
         }
@@ -931,38 +926,6 @@ fn print_table(out: &analytics::QueryOutput) {
     }
     let n = rows.len();
     println!("({n} row{})", if n == 1 { "" } else { "s" });
-}
-
-/// `nuthatch transform` - run a WASM transform component over a project's stored transfers.
-fn run_transform(args: cli::TransformArgs) -> Result<()> {
-    use std::path::{Path, PathBuf};
-    let dir = PathBuf::from(&args.dir);
-    // Non-creating, for the reason `nuthatch sql` is (#413): this reads a nest's stored transfers, so
-    // a directory with no store has none to run over. Creating one got the same three things wrong -
-    // it reported `0 transfers` and `✓ 0 facts out` for what is really "there is no nest here", and it
-    // left an empty `nuthatch.redb` behind for a later `holds_data` to misread.
-    let store = store::Store::open_existing(&dir.join(config::DB_FILE))
-        .with_context(|| format!("no nest to transform at {}", dir.display()))?;
-    let entities = store.recent(args.limit)?;
-    println!(
-        "→ running {} over {} transfers…",
-        args.component,
-        entities.len()
-    );
-
-    let input = transform::transfers_to_ipc(&entities)?;
-    let runtime = transform::TransformRuntime::load(Path::new(&args.component))?;
-    let output = runtime.run(&input)?;
-    let facts = transform::ipc_to_json(&output)?;
-
-    println!(
-        "✓ {} facts out (pure, deterministic, sandboxed)",
-        facts.len()
-    );
-    for f in facts.iter().take(5) {
-        println!("    {f}");
-    }
-    Ok(())
 }
 
 /// A worker's identity, from the hostname.

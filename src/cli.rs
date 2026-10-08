@@ -87,17 +87,15 @@ pub enum Command {
     /// commands a worker or waits for one.
     Control(ControlArgs),
 
-    // --- COMPLIANCE: the labeling/screening/audit substrate (RFC-0008). ---
+    // --- COMPLIANCE: the labeling/flags/audit substrate (RFC-0008). ---
     /// Manage labeled address sets - the compliance annotation substrate (RFC-0008 C1).
     Labels(LabelsArgs),
     /// Manage sanctions/watch lists as content-addressed snapshots (RFC-0008 C2).
     Lists(ListsArgs),
-    /// Screen sealed transfers against a list snapshot, recording `sanction_hit` annotations
-    /// (RFC-0008 C2). Replayable: same list hash + range + component → identical hits.
-    Screen(ScreenArgs),
     /// Build, sign, and verify the signed compliance-pack manifest (RFC-0008 C6).
     Pack(PackArgs),
-    /// Audit the compliance annotations: `replay` re-proves them, `report` summarises them (C6).
+    /// Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a
+    /// second endpoint.
     Audit(AuditArgs),
 
     // --- ADVANCED: authoring extras, packaging, and one-off dataset lifecycle. ---
@@ -107,8 +105,6 @@ pub enum Command {
     /// Fetch + cache a token's immutable metadata - `decimals`/`symbol`/`name` (RFC-0023 tier 2). Called
     /// once (they never change) and remembered in `metadata.json`; the constants tier 1 can't derive.
     Metadata(MetadataArgs),
-    /// Run a WASM transform component over a project's stored transfers.
-    Transform(TransformArgs),
     /// Seal a local file into the explicitly non-chain offchain namespace (RFC-0045 stage 1).
     Offchain(OffchainArgs),
     /// Mirror sealed segments to an object-store prefix (RFC-0052).
@@ -731,9 +727,7 @@ pub struct AuditArgs {
 
 #[derive(Subcommand)]
 pub enum AuditWhat {
-    /// Re-run screening over the sealed segments and confirm the stored hits reproduce exactly.
-    Replay(AuditReplayArgs),
-    /// Summarise the hits and flags in a block range (markdown or `--json`).
+    /// Summarise the threshold flags in a block range (markdown or `--json`).
     Report(AuditReportArgs),
     /// Re-fetch a sample of sealed ranges from a second endpoint and compare them row by row.
     Sealed(AuditSealedArgs),
@@ -762,19 +756,6 @@ pub struct AuditSealedArgs {
     pub from: Option<u64>,
     #[arg(long, requires = "from")]
     pub to: Option<u64>,
-}
-
-#[derive(Args)]
-pub struct AuditReplayArgs {
-    /// Nest directory.
-    #[arg(long, default_value = ".")]
-    pub dir: String,
-    /// First block of the range (inclusive).
-    #[arg(long)]
-    pub from: u64,
-    /// Last block of the range (inclusive).
-    #[arg(long)]
-    pub to: u64,
 }
 
 #[derive(Args)]
@@ -830,25 +811,6 @@ pub struct ListsFetchArgs {
 #[derive(Args)]
 pub struct ListsListArgs {
     /// Nest directory to read list snapshots from.
-    #[arg(long, default_value = ".")]
-    pub dir: String,
-}
-
-#[derive(Args)]
-pub struct ScreenArgs {
-    /// The list snapshot hash to screen against (from `nuthatch lists fetch`).
-    #[arg(long)]
-    pub list: String,
-
-    /// First block of the range to screen (inclusive).
-    #[arg(long)]
-    pub from: u64,
-
-    /// Last block of the range to screen (inclusive).
-    #[arg(long)]
-    pub to: u64,
-
-    /// Nest directory (must contain a `nuthatch.toml` and sealed segments over the range).
     #[arg(long, default_value = ".")]
     pub dir: String,
 }
@@ -1106,20 +1068,6 @@ pub struct SqlArgs {
     /// Emit newline-delimited JSON instead of a table (for piping to jq etc.).
     #[arg(long)]
     pub json: bool,
-}
-
-#[derive(Args)]
-pub struct TransformArgs {
-    /// Path to the transform component (.wasm, wasm32-wasip2).
-    pub component: String,
-
-    /// Project directory (must contain a nuthatch.redb with indexed transfers).
-    #[arg(long, default_value = ".")]
-    pub dir: String,
-
-    /// How many of the most-recent transfers to feed the transform.
-    #[arg(long, default_value_t = 5_000)]
-    pub limit: usize,
 }
 
 #[derive(Args)]

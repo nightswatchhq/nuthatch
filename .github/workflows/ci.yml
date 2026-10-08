@@ -233,28 +233,6 @@ jobs:
           cargo fmt --check --manifest-path count/receiver/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path count/receiver/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path count/receiver/Cargo.toml
-      # `components/*` are standalone crates (a wasm32-wasip2 cdylib only links for that target), so
-      # neither the archive above nor the decode steps reach them. Their logic is plain Rust over
-      # Arrow, so the unit tests run on the host target; no wasm toolchain is needed (#1722).
-      - name: fmt (components)
-        run: |
-          for c in large-transfers recurrence screen; do
-            cargo fmt --check --manifest-path components/$c/Cargo.toml
-          done
-      - name: clippy (components)
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          for c in large-transfers recurrence screen; do
-            cargo clippy --locked --all-targets --manifest-path components/$c/Cargo.toml -- -D warnings
-          done
-      - name: test (components)
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          for c in large-transfers recurrence screen; do
-            cargo test --locked --manifest-path components/$c/Cargo.toml
-          done
       # What was left when the longest step finished, or when it died. A job that can fail of
       # exhaustion has to report what it had, or the next failure is guessed at like the last two.
       - name: disk after the builds
@@ -485,7 +463,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       # Clippy runs **first**, deliberately. It compiles `--all-targets` under this feature, which is a
       # superset of what the test step needs, so running it first warms the shared cache and the test
-      # step reuses it. In the other order both steps did a near-full build of datafusion, wasmtime and
+      # step reuses it. In the other order both steps did a near-full build of datafusion and
       # dbsp - the job's first run took ~30 minutes, most of it compiling the same crates twice.
       #
       # It also fails faster on the common breakage: a lint error surfaces before a database is
@@ -1204,7 +1182,7 @@ jobs:
     # sanitizer-instrumented build (SanitizerCoverage), which only exists on nightly, so this
     # deliberately does not share the pinned-1.95.0 toolchain the rest of CI uses. That pin is about
     # keeping the *shipped binary* reproducible (Cargo.toml's rust-version comment); fuzz/ is dev-only
-    # tooling excluded from the published crate, same as components/ and scratchpad/.
+    # tooling excluded from the published crate, same as scratchpad/.
     #
     # The decode path (nuthatch-decode crate, PR #607) no longer links dbsp, so the rustc ICE
     # computing a vtable slot for dbsp's `StarJoinFuncTrait`/`DynClone` under sanitizer

@@ -479,7 +479,7 @@ fn walk_invocation(
     }
 }
 
-/// The invocation path from `root` down to `cmd`, e.g. " audit replay", for error messages.
+/// The invocation path from `root` down to `cmd`, e.g. " audit report", for error messages.
 fn invocation_path(root: &clap::Command, cmd: &clap::Command) -> String {
     if std::ptr::eq(root, cmd) {
         return String::new();
@@ -769,7 +769,7 @@ fn a_real_multi_level_invocation_is_clean() {
     let real = real_flags();
     let mut findings = Vec::new();
     check_text(
-        "```sh\nnuthatch audit replay --dir . --from 100 --to 200\nnuthatch labels import addrs.csv --alias sanctioned\n```",
+        "```sh\nnuthatch audit report --dir . --from 100 --to 200\nnuthatch labels import addrs.csv --alias sanctioned\n```",
         "docs/example.md",
         &real,
         &mut findings,

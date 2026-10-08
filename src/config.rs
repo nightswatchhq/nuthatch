@@ -48,6 +48,21 @@ fn refuse_feature_only_files(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ignoring the table would leave a nest that was screening every transfer quietly screening none.
+fn refuse_removed_screening(raw: &str) -> Result<()> {
+    let declared = raw
+        .parse::<toml::Table>()
+        .is_ok_and(|t| t.contains_key("screening"));
+    if declared {
+        bail!(
+            "this nest declares [screening], and live sanctions screening was removed from nuthatch \
+             on 2026-10-08 along with the WASM transform layer. Delete the [screening] table to load \
+             it; sealed `sanction_hit` rows already indexed stay queryable from /sql"
+        );
+    }
+    Ok(())
+}
+
 /// An absent `schema_version` means **1**, not "current".
 ///
 /// Every nest written before the field existed is a v1 nest, and treating it as current would mean a
@@ -132,11 +147,6 @@ pub struct Config {
     pub ipfs: Vec<crate::ipfs::IpfsDecl>,
     #[serde(default)]
     pub contracts: Vec<Contract>,
-    /// Optional sanctions-screening stage (RFC-0008 C2). When present with a non-empty `lists`, the
-    /// indexer screens every transfer against those list snapshots live and records `sanction_hit`
-    /// annotations. Absent → no screening, zero cost. Not serialised when empty (keeps nests clean).
-    #[serde(default, skip_serializing_if = "Screening::is_empty")]
-    pub screening: Screening,
     /// Optional threshold & velocity flags (RFC-0008 C3). Absent → no flags, zero cost.
     #[serde(default, skip_serializing_if = "Flags::is_empty")]
     pub flags: Flags,
@@ -209,7 +219,7 @@ pub struct Webhook {
 /// One alert webhook sink: annotations whose kind is in `kinds` are POSTed to `url` (RFC-0008 C5).
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Alert {
-    /// Annotation kinds to deliver, e.g. `["sanction_hit", "threshold_flag"]`.
+    /// Annotation kinds to deliver, e.g. `["threshold_flag", "entity_fault"]`.
     pub kinds: Vec<String>,
     /// The webhook endpoint. The operator configures it - it is the delivery allowlist (a sink only
     /// ever POSTs to the URLs a nest declares here).
@@ -281,20 +291,6 @@ pub struct Factory {
     /// Optional: only honour discoveries at or after this block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<u64>,
-}
-
-/// One alert webhook sink: annotations whose kind is in `kinds` are POSTed to `url` (RFC-0008 C5).
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
-pub struct Screening {
-    /// Content-addressed list-snapshot hashes to screen against (see `nuthatch lists fetch`).
-    #[serde(default)]
-    pub lists: Vec<String>,
-}
-
-impl Screening {
-    fn is_empty(&self) -> bool {
-        self.lists.is_empty()
-    }
 }
 
 /// Threshold & velocity flag configuration (RFC-0008 C3). Amounts are token **base units** as decimal
@@ -624,6 +620,7 @@ impl Config {
         }
         cfg.refuse_tip_finality_webhooks()?;
         refuse_feature_only_files(dir)?;
+        refuse_removed_screening(&raw)?;
         Ok(cfg)
     }
 
@@ -816,7 +813,6 @@ impl Config {
                 abi: ABI_FILE.to_string(),
                 events: Vec::new(),
             }],
-            screening: Screening::default(),
             flags: Flags::default(),
             alerts: Vec::new(),
             templates: Vec::new(),
@@ -1089,7 +1085,6 @@ mod tests {
                     events: vec!["Transfer".into()],
                 },
             ],
-            screening: Screening::default(),
             flags: Flags::default(),
             alerts: Vec::new(),
             templates: Vec::new(),
@@ -1352,6 +1347,26 @@ finality = "tip"
             err.contains("sealed"),
             "a refusal should name the working alternative: {err}"
         );
+    }
+
+    #[test]
+    fn a_screening_table_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = r#"
+[nest]
+name = "t"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+"#;
+        let path = dir.path().join(CONFIG_FILE);
+        std::fs::write(&path, base).unwrap();
+        Config::load(dir.path()).expect("the same nest without [screening] loads");
+
+        std::fs::write(&path, format!("{base}\n[screening]\nlists = [\"ab\"]\n")).unwrap();
+        let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
+        assert!(err.contains("[screening]"), "name the table: {err}");
+        assert!(err.contains("removed"), "say why: {err}");
     }
 
     /// The default (`finality` omitted) and the explicit `"sealed"` both load clean - only `"tip"`
