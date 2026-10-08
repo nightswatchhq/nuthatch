@@ -67,13 +67,37 @@ fail() {
   exit 1
 }
 
+# Fetches into $1 with the remaining curl arguments. A kittiwake cache refill can answer 503 for a
+# second or two, so a failure is retried twice before it pages; the last one leaves its reason in $why.
+fetch() {
+  local out=$1 try=1 code wait
+  shift
+  while :; do
+    code=$(curl -sS -m 60 -A stopgap-orphan-alert -D "$work/headers" -o "$out" -w '%{http_code}' "$@" 2>"$work/curl.err") \
+      || code=000
+    case $code in 2??) return 0 ;; esac
+    if [ "$code" = 000 ]; then
+      why=$(head -c 200 "$work/curl.err")
+    else
+      why="HTTP $code: $(head -c 200 "$out" 2>/dev/null)"
+    fi
+    [ "$try" -lt 3 ] || return 1
+    wait=$(tr -d '\r' < "$work/headers" 2>/dev/null | awk 'tolower($1) == "retry-after:" { print $2 }' | tail -n 1)
+    case $wait in "" | *[!0-9]*) wait=5 ;; esac
+    [ "$wait" -le 30 ] || wait=30
+    say "attempt $try: $why; retrying in ${wait}s"
+    sleep "$wait"
+    try=$((try + 1))
+  done
+}
+
 # Pages the directory for one network into $3; $2 is any extra filter.
 read_dir() {
   local net=$1 extra=$2 out=$3 skip=0 url got want
   : > "$out"
   while :; do
     url="$api/api/subgraph-directory?network=$net$extra&signalMin=1&sort=signal&first=$page_size&skip=$skip"
-    curl -fsS -m 60 -A stopgap-orphan-alert "$url" -o "$work/page.json" || fail "$net: $url did not answer"
+    fetch "$work/page.json" "$url" || fail "$net: $url did not answer ($why)"
     jq -e '.data | type == "array"' "$work/page.json" >/dev/null || fail "$net: no data array from $url"
     [ "$skip" -gt 0 ] || jq -r '.total' "$work/page.json" > "$out.total"
     jq -c '.data[]' "$work/page.json" >> "$out"
@@ -98,8 +122,8 @@ read_allocs() {
     while :; do
       q=$(jq -nc --argjson ids "$(jq -R . "$chunk" | jq -sc .)" --argjson skip "$skip" \
         '{query: "query($ids:[String!],$skip:Int){allocations(first:1000,skip:$skip,where:{status:Active,subgraphDeployment_in:$ids}){indexer{id} subgraphDeployment{id}}}", variables: {ids: $ids, skip: $skip}}')
-      curl -fsS -m 60 -A stopgap-orphan-alert -H 'Content-Type: application/json' -d "$q" "$subgraph" -o "$work/alloc.json" \
-        || fail "$net: $subgraph did not answer"
+      fetch "$work/alloc.json" -H 'Content-Type: application/json' -d "$q" "$subgraph" \
+        || fail "$net: $subgraph did not answer ($why)"
       jq -e '.data.allocations | type == "array"' "$work/alloc.json" >/dev/null || fail "$net: no allocations array from $subgraph"
       jq -c '.data.allocations[] | {i: .indexer.id, d: .subgraphDeployment.id}' "$work/alloc.json" >> "$out"
       n=$(jq '.data.allocations | length' "$work/alloc.json")
