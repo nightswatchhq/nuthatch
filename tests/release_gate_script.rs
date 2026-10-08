@@ -123,6 +123,8 @@ fn template() -> &'static (tempfile::TempDir, String) {
                 .args(["dev", "--dir"])
                 .arg(&nest)
                 .args(["--listen", &format!("127.0.0.1:{port}"), "--seal-direct"])
+                // The fixture chain advances while the nest runs; the 5-minute default would sit it out.
+                .args(["--poll-interval", "1s"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()

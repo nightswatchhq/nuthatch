@@ -84,7 +84,7 @@ measure() {
   local dir peak=0 rss last rows pid
   dir="$(mktemp -d)"
   write_nest "$dir"
-  "$BIN" dev --dir "$dir" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" >"$dir/dev.log" 2>&1 &
+  "$BIN" dev --dir "$dir" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" --poll-interval 12s >"$dir/dev.log" 2>&1 &
   pid=$!
   for _ in $(seq 1 80); do
     sleep 1
