@@ -109,8 +109,8 @@ yaml-rust2 = "0.11"
 toml = "0.8"
 serde_ignored = "0.1"
 redb = "2"
-arrow = { version = "58", features = ["ipc"] }
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
+arrow = { version = "59", features = ["ipc"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Already in the tree via parquet; an offchain snapshot is parsed from the same bytes it was hashed from.
 bytes = "1"
 # Already in the tree via parquet and arrow-buffer; declared directly so `graph_decimal` can name it.
