@@ -11,6 +11,13 @@ use crate::config::{Config, Contract, Extract, Nest};
 use crate::rpc::RpcClient;
 
 pub async fn init(args: InitArgs) -> Result<()> {
+    let count = crate::count::Pending::of(&args); // RFC-0054 hook
+    scaffold(args).await?;
+    count.ask().await; // RFC-0054 hook
+    Ok(())
+}
+
+async fn scaffold(args: InitArgs) -> Result<()> {
     // Three ways to start a nest: clone/copy a published one (`--from`), port a subgraph
     // (`--from-subgraph`), or resolve from addresses.
     if let Some(source) = args.from.clone() {

@@ -133,6 +133,7 @@ pub enum Command {
     /// exists to avoid, so unmount/remount is free. This is the explicit way to get the disk back.
     /// It LISTS by default; `--yes` is what deletes.
     Prune(PruneArgs),
+    Count(crate::count::CountArgs), // RFC-0054 hook
 
     /// Regenerate the builder skill's machine-generated references from clap metadata (RFC-0017).
     /// Hidden: a dev/authoring tool, not part of the user-facing two-command story.
