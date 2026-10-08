@@ -1616,9 +1616,18 @@ pub fn compile_with(
                 if matches!(value, Value::Null) {
                     return Err(Unsupported::NullValue("id".into()));
                 }
-                let lit = value
-                    .sql_literal()
-                    .ok_or_else(|| Unsupported::Argument("id must be a string".into()))?;
+                let lit = if ent
+                    .fields
+                    .iter()
+                    .find(|f| f.name == "id")
+                    .is_some_and(|f| holds_bytes(schema, &f.ty))
+                {
+                    lower_hex(value)
+                } else {
+                    value.clone()
+                }
+                .sql_literal()
+                .ok_or_else(|| Unsupported::Argument("id must be a string".into()))?;
                 wheres.push(format!("{BASE}.\"id\" = {lit}"));
             }
             "where" => {
@@ -2014,6 +2023,30 @@ struct Pred<'a> {
     caps: &'a Capabilities,
 }
 
+/// Whether a filter value on this field is hex: a `Bytes` scalar, or a reference to an entity whose id is one.
+fn holds_bytes(schema: &Schema, ty: &graph_schema::FieldType) -> bool {
+    match ty {
+        graph_schema::FieldType::Scalar(s) => s == "Bytes",
+        graph_schema::FieldType::Entity(t) => schema
+            .entities
+            .iter()
+            .find(|e| &e.name == t)
+            .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
+            .is_some_and(|id| matches!(&id.ty, graph_schema::FieldType::Scalar(s) if s == "Bytes")),
+        _ => false,
+    }
+}
+
+/// graph-node decodes a `Bytes` input as hex, so its case means nothing, and nests store hex lowercase.
+/// Compared as text, a checksummed address from a wallet matched no row and answered an empty list.
+fn lower_hex(v: &Value) -> Value {
+    match v {
+        Value::Str(s) => Value::Str(s.to_ascii_lowercase()),
+        Value::List(items) => Value::List(items.iter().map(lower_hex).collect()),
+        other => other.clone(),
+    }
+}
+
 fn lower_predicate(p: &Pred<'_>, key: &str, v: &Value) -> Result<String, Unsupported> {
     let Pred {
         schema,
@@ -2199,6 +2232,13 @@ fn lower_predicate(p: &Pred<'_>, key: &str, v: &Value) -> Result<String, Unsuppo
         if !allowed.contains(suffix) {
             return Err(Unsupported::Operator(key.to_string()));
         }
+        let hex;
+        let v = if holds_bytes(schema, &f.ty) {
+            hex = lower_hex(v);
+            &hex
+        } else {
+            v
+        };
         let col = format!("{base}.\"{field}\"");
         if caps.null_filters && matches!(v, Value::Null) && matches!(*suffix, "" | "_not") {
             return Ok(format!(
@@ -2411,6 +2451,55 @@ type Swap @entity { id: ID! pool: Pool! }
 
     fn one(q: &str) -> RootField {
         parse(q).expect("parse").into_iter().next().expect("a root")
+    }
+
+    /// A wallet hands an app a checksummed address. graph-node decodes `Bytes` as hex and finds the row;
+    /// compared as text it found none, and the client got an empty list rather than an error.
+    #[test]
+    fn a_checksummed_address_filters_a_bytes_field() {
+        let c = compile(
+            &schema(),
+            &one(r#"{ pools(where: { sender: "0xAbCd", sender_in: ["0xEF01"] }) { id } }"#),
+        )
+        .unwrap();
+        assert!(
+            c.sql.contains("'0xabcd'") && c.sql.contains("'0xef01'"),
+            "{}",
+            c.sql
+        );
+        assert!(
+            !c.sql.contains("AbCd") && !c.sql.contains("EF01"),
+            "{}",
+            c.sql
+        );
+    }
+
+    #[test]
+    fn a_string_filter_keeps_its_case() {
+        let c = compile(
+            &schema(),
+            &one(r#"{ pools(where: { hooks: "AbCd" }) { id } }"#),
+        )
+        .unwrap();
+        assert!(c.sql.contains("'AbCd'"), "{}", c.sql);
+        let c = compile(&schema(), &one(r#"{ pool(id: "AbCd") { id } }"#)).unwrap();
+        assert!(c.sql.contains("'AbCd'"), "{}", c.sql);
+    }
+
+    #[test]
+    fn a_bytes_id_and_a_reference_to_one_ignore_case() {
+        let s = graph_schema::parse(
+            "type Medal @entity { id: Bytes! owner: Bytes! }\ntype Holder @entity { id: ID! medal: Medal! }",
+        )
+        .unwrap();
+        let c = compile(&s, &one(r#"{ medal(id: "0xABCD") { id } }"#)).unwrap();
+        assert!(c.sql.contains("'0xabcd'"), "{}", c.sql);
+        let c = compile(
+            &s,
+            &one(r#"{ holders(where: { medal: "0xABCD" }) { id } }"#),
+        )
+        .unwrap();
+        assert!(c.sql.contains("'0xabcd'"), "{}", c.sql);
     }
 
     /// graph-node decodes GraphQL string escapes; this parser skipped over them and then took the
