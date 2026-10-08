@@ -38,6 +38,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "nest",
             "migrate",
             "prune",
+            "count", // RFC-0054 hook
         ],
     ),
 ];

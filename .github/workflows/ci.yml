@@ -427,6 +427,12 @@ jobs:
           path: ${{ runner.temp }}/nextest-no-count.tar.zst
           compression-level: 0
           retention-days: 1
+      - name: upload the regenerated skill reference
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: no-count-skill-reference
+          path: skills/nuthatch-builder/cli-reference.md
+          retention-days: 1
 
   test-no-count:
     name: test (head count deleted, ${{ matrix.shard }}/2)
@@ -445,6 +451,11 @@ jobs:
       # from: tests that read src/ would otherwise see the file the build never had.
       - name: delete the head count
         run: scripts/delete-count.sh
+      # skill_refs compares the committed reference with the binary; the build regenerated it.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: no-count-skill-reference
+          path: skills/nuthatch-builder
       - uses: ./.github/actions/nextest-shard
         env:
           NUTHATCH_REQUIRE_BENCH_COMMITS: "1"
