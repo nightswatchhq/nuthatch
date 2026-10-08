@@ -107,11 +107,11 @@ jobs:
           # yet each release spent ~1.6 GB of the 10 GB store CI restores from, evicting CI's entries.
           save-if: false
       - name: build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --target ${{ matrix.target }}
       - name: package
         run: |
           tarball="nuthatch-${{ matrix.target }}.tar.gz"
-          tar czf "$tarball" -C "target/${{ matrix.target }}/release" nuthatch
+          tar czf "$tarball" -C "target/${{ matrix.target }}/dist" nuthatch
           shasum -a 256 "$tarball" > "$tarball.sha256"
           ls -lh "$tarball"
       - name: attach to release
@@ -132,12 +132,12 @@ jobs:
       # Without this, scaled mode was build-from-source only, which is not a deployment story.
       - name: build (scaled)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --locked --features postgres-store --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --features postgres-store --target ${{ matrix.target }}
       - name: package (scaled)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           tarball="nuthatch-scaled-${{ matrix.target }}.tar.gz"
-          tar czf "$tarball" -C "target/${{ matrix.target }}/release" nuthatch
+          tar czf "$tarball" -C "target/${{ matrix.target }}/dist" nuthatch
           shasum -a 256 "$tarball" > "$tarball.sha256"
           ls -lh "$tarball"
       - name: attach scaled build to release
@@ -178,18 +178,18 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nuthatch-scaled-binary
-          path: target/${{ matrix.target }}/release/nuthatch
+          path: target/${{ matrix.target }}/dist/nuthatch
           retention-days: 1
       # The **graph** binary (#1950): `--features graph`, which serves a nest's Graph-dialect GraphQL
       # (RFC-0053) and the RFC-0060 facade. Kept out of the default binary by the 2026-09-21 rule, but
       # shipped, so an operator serving a stopgap nest does not have to build from source. Built after
       # the scaled binary was kept, because it overwrites the same path.
       - name: build (graph)
-        run: cargo build --release --locked --features graph --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --features graph --target ${{ matrix.target }}
       - name: package (graph)
         run: |
           tarball="nuthatch-graph-${{ matrix.target }}.tar.gz"
-          tar czf "$tarball" -C "target/${{ matrix.target }}/release" nuthatch
+          tar czf "$tarball" -C "target/${{ matrix.target }}/dist" nuthatch
           shasum -a 256 "$tarball" > "$tarball.sha256"
           ls -lh "$tarball"
       - name: attach graph build to release
@@ -210,13 +210,13 @@ jobs:
       # the scaled and graph builds overwrote the binary, so it re-runs the default build first.
       - name: rebuild the default binary for the image
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --target ${{ matrix.target }}
       - name: keep the linux binary for the image
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nuthatch-linux-binary
-          path: target/${{ matrix.target }}/release/nuthatch
+          path: target/${{ matrix.target }}/dist/nuthatch
           retention-days: 1
 
   # Publish the container image (RFC-0005 release engineering). "Build it yourself from this Dockerfile"

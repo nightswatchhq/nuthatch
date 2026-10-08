@@ -109,8 +109,8 @@ yaml-rust2 = "0.11"
 toml = "0.8"
 serde_ignored = "0.1"
 redb = "2"
-arrow = { version = "58", features = ["ipc"] }
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd"] }
+arrow = { version = "59", features = ["ipc"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Already in the tree via parquet; an offchain snapshot is parsed from the same bytes it was hashed from.
 bytes = "1"
 # Already in the tree via parquet and arrow-buffer; declared directly so `graph_decimal` can name it.
@@ -206,6 +206,13 @@ debug = "line-tables-only"
 [profile.release]
 lto = "thin"
 strip = true
+
+# What the release workflow ships. CI and the footprint gates build the thin `release` profile.
+# No `panic = "abort"`: dbsp and folds rely on catch_unwind.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = "0.6"
