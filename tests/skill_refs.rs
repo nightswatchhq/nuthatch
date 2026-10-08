@@ -293,6 +293,7 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 /// operator-authored nest/runtime config. A reason is required: an empty excuse is how the next
 /// config file lands on this list by accident.
 const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
+    ("src/count.rs", "the per-machine head-count answer, not nest config"), // RFC-0054 hook
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
     (
         "src/mount_jobs.rs",

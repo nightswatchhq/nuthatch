@@ -57,8 +57,9 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   now its own **required** CI gate too - `per-cursor RAM budget (dense multi-nest)`, 20 nests on one
   cursor against the 2048 MB budget, mutation-checked (§3/§5, #284/#391). Two ceilings, two scenarios,
   neither subsumes the other.*
-- [ ] ✅ **No phone-home.** No telemetry, no mandatory tokens, AI degrades offline. - *Verify per
-  release: grep for outbound calls not gated behind explicit user config / BYO-key.*
+- [ ] ✅ **No phone-home.** No telemetry by default, no mandatory tokens, AI degrades offline. - *Verify
+  per release: grep for outbound calls not gated behind explicit user config / BYO-key; the head
+  count is the one call about the operator, opt-in, and the head-count-deleted CI leg must be green.*
 - [ ] ✅ **Determinism in the core.** Decode, reorg, entity derivation re-executable; no LLM output in
   the runtime data path. - *Golden tests + the RFC-0016/0017 hard fence. Re-assert on any new
   data-path code.*

@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         cli::Command::Init(args) => project::init(args).await,
+        cli::Command::Count(a) => nuthatch::count::run(a).await, // RFC-0054 hook
         cli::Command::Add(args) => project::add(args).await,
         // **One command for 1..N nests** (RFC-0032). The runtime hosts a single nest or many; which
         // one you get is a property of the directory, not a decision an operator has to make before

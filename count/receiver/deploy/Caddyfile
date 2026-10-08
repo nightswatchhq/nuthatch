@@ -1,0 +1,7 @@
+# No `log` directive, deliberately: Caddy keeps no access log for a site without one (RFC-0054 §5.5).
+count.nuthatch-indexer.com {
+	request_body {
+		max_size 1KB
+	}
+	reverse_proxy 127.0.0.1:8290
+}

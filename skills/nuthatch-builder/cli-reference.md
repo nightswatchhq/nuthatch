@@ -108,6 +108,31 @@ Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet
 - `--listen <LISTEN>` - Address to bind the control-plane API to. Off-localhost requires NUTHATCH_CONTROL_TOKEN and refuses to start without it
 - `--db <DB>` - The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state, **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's outage are different events
 
+## `nuthatch count`
+
+Opt in to, or out of, the head count (RFC-0054). Off until you say yes
+
+
+## `nuthatch count forget`
+
+Delete the stored answer, so the next `init` may ask again
+
+
+## `nuthatch count off`
+
+Say no. Nothing is sent, ever, until you say `on`
+
+
+## `nuthatch count on`
+
+Say yes. Sends one `counted` event now, with no chain and no source
+
+
+## `nuthatch count payload`
+
+Print both objects this machine can send, populated
+
+
 ## `nuthatch dev`
 
 Run the indexer: poll logs, store entities, and serve the API

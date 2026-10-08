@@ -18,7 +18,12 @@ non-negotiables below, stop and flag it instead of proceeding.
    is per-cursor and shared across the nests on that cursor - density is RAM-bounded, not free.
    Treat this as a CI-enforced budget (per cursor), not an aspiration. If a design decision
    threatens it, surface the tradeoff before implementing.
-3. **No phone-home.** No telemetry, no mandatory API tokens, no gated data services. AI
+3. **No phone-home.** The binary makes no network call about the operator that the operator did
+   not explicitly turn on. No telemetry by default and none required; no mandatory API tokens; no
+   gated data services. The one permitted exception is the opt-in head count of RFC-0054, which is
+   off until a person answers yes, carries no identifier, and must pass RFC-0046 §1's deletion test
+   at every release: remove it from the tree and a self-hoster loses nothing. *(Amended 2026-10-08
+   by Chief, from "No telemetry, no mandatory API tokens, no gated data services.")* AI
    features use local models (Ollama) or BYO API key, and degrade gracefully offline.
 4. **Determinism in the core.** ABI decoding, reorg handling, entity derivation, and anything
    feeding stored state must be deterministic and re-executable. LLMs generate code and tests;
@@ -251,6 +256,15 @@ Liminal is the prototype for Nuthatch's transform runtime. Study `liminal-host/`
 > maintained copy is the request-time view evaluated by the same engine and reused only when every
 > input hashes the same, so it adds no second implementation and nothing to the data path that
 > determinism forbids. Each slice is gated on byte-identical answers and the Lodestar release gate.
+>
+> **RFC-0054 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0054](docs/rfcs/0054-the-head-count.md) (the head count) on 2026-10-08 and amended
+> non-negotiable 3 above with its §1 wording. It is the first network call the binary makes *about*
+> an operator rather than *for* one, which is why it needed the amendment and not a reading: off until
+> a person types `y` after a successful `init`, two events, no identifier, tallies not records, the
+> tally public. §11 is settled with the RFC's own leanings: a single-purpose `count.toml`, the
+> receiver on the Helsinki host where we own the ingress log, `chain` kept under the registry-only
+> rule, and the number published early with its caveat in the same sentence.
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming

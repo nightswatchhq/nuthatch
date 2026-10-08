@@ -1,0 +1,11 @@
+[package]
+name = "nuthatch-count-receiver"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The RFC-0054 head-count receiver: increments day-grained tallies and keeps nothing else"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

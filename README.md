@@ -42,7 +42,7 @@ of indexers, while a nest puts a contract's history in a database on your own ma
 **Why.** Getting at a contract's history usually means writing a subgraph or handler code, running a
 database, or renting someone else's copy. nuthatch generates the tables from the ABI, runs as one
 process with nothing else to install, and keeps the data on your machine: at most 2 GB of RAM per
-chain, no telemetry, no account. The built-in MCP server lets Claude or any MCP client query it.
+chain, no telemetry unless you opt in, no account. The built-in MCP server lets Claude or any MCP client query it.
 
 ---
 
@@ -53,8 +53,10 @@ chain, no telemetry, no account. The built-in MCP server lets Claude or any MCP 
 - **No infra.** A single Rust binary. Embedded mode needs no Postgres, no Docker, no IPFS.
 - **It's just SQL.** Your contract's events become per-event tables you query with real analytical SQL -
   the live tip *and* sealed history, one surface.
-- **It's yours, and it's small.** ≤2 GB RAM for single-chain tip-following, CI-enforced. No telemetry, no
-  phone-home, no mandatory API token, ever.
+- **It's yours, and it's small.** ≤2 GB RAM for single-chain tip-following, CI-enforced. No telemetry by
+  default, no mandatory API token, ever: the one opt-in is a head count at `init` (`nuthatch count`),
+  and [its totals are public](https://www.nuthatch-indexer.com/count). Most people say no or are never asked, so
+  they are floors.
 
 ---
 
@@ -599,7 +601,7 @@ A major version is a promise about **stability**, not a claim of completeness.
   Scaled mode is built and verified across real machines, but younger: until 0.9.3 its writer pool
   did not index at all. If one process per box is enough, that is still the shape to reach for.
 
-**What is deliberately not here:** a hosted service, a token, telemetry, non-EVM chains before EVM is
+**What is deliberately not here:** a hosted service, a token, telemetry on by default, non-EVM chains before EVM is
 airtight, or any deployment story beyond binary + compose. Those are not backlog items; they are out
 of scope.
 

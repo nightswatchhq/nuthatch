@@ -256,13 +256,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "docs/rfcs/0054-the-head-count.md",
-        "count",
-        7,
-        "RFC-0054 proposes the not-yet-shipped `nuthatch count` command family; it is a dated \
-         design contract, not executable operator guidance",
-    ),
-    (
-        "docs/rfcs/0054-the-head-count.md",
         "has",
         1,
         "RFC-0054's opt-in prompt is product copy that opens `nuthatch has no idea how many people \
