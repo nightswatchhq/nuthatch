@@ -950,6 +950,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got.len(), 4, "one item per block, not a truncated page");
+
+        // A single block that still answers a full page cannot be split further, and is refused.
+        let full = script(|_, _| Ok(Value::Array(vec![json!(1); SUSPICIOUSLY_FULL])));
+        let err = ranged(
+            &full,
+            &Window::new(1),
+            7,
+            7,
+            "eth_getLogs",
+            |s, e| json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}") }]),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("truncated page"), "{err:#}");
     }
 
     #[test]
@@ -1217,6 +1231,26 @@ mod tests {
         let d = Discoverer::new(code_from(10_000), blind());
         let err = d.discover(&h, A, 100, 199).await.unwrap_err();
         assert!(format!("{err:#}").contains("by its nonce"), "{err:#}");
+    }
+
+    /// A removed log in a range past finality means the provider's view moved under us: the window
+    /// fails rather than quietly losing the row.
+    #[tokio::test]
+    async fn a_removed_log_fails_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, trace) = chain(false);
+        let removed = json!({"address": "0xT0KEN", "topics": [TRANSFER, padded(A), padded(A)],
+            "data": format!("0x{:0>64}", "1"), "blockNumber": "0x10", "blockTimestamp": "0x20",
+            "transactionHash": "0xHH", "transactionIndex": "0x1", "logIndex": "0x1",
+            "blockHash": "0xBB", "removed": true});
+        let main = script(move |m, p| match m {
+            "eth_getLogs" => Ok(json!([removed])),
+            _ => (main.answer)(m, p),
+        });
+        let d = Discoverer::new(main, trace);
+        let err = d.discover(&h, A, 0, 63).await.unwrap_err();
+        assert!(format!("{err:#}").contains("removed log"), "{err:#}");
     }
 
     #[tokio::test]
