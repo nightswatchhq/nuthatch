@@ -11,18 +11,12 @@ implementation plan.
   it must remain opt-in and preserve the no-phone-home rule.
 - **#271 - factory-child retirement.** Add an end/expiry shape only when long-lived factory demand
   justifies managing an unbounded watch set.
-- **#272 - wildcard-address decode.** Needs a separate volume and RAM-budget design before decoding
-  all topic-matching contracts.
 - **#276 - real reth ExEx tip mode.** Requires a colocated node, the node binary, and an honest
   tip-latency result.
-- **#277 - trace and state-diff extraction.** Own-node/ExEx work, sequenced after #276; public-RPC
-  `debug_*` remains a non-goal unless deliberately revisited.
 - **#278 - revm demand-driven state engine.** Reconsider only after derive-first and simple RPC
   tier-3 evidence leaves a material residue.
 - **#280 - Turso hot store.** Requires a permissive production-ready release and a measured win over
   redb that federation does not already provide.
-- **#308 - blocks and transactions tables.** The unfinished OBIB cases need a scoped volume-bound
-  design and published artefacts.
 - **#309 - OBIB traces.** Re-decide the `debug_*` non-goal before treating trace benchmark coverage as
   a missing implementation task.
 - **#357 - whole-derivation reuse.** Revisit when durable materialised entity checkpoints make reuse
@@ -48,3 +42,10 @@ Reopen one issue, rather than treating this document as a batch. The reopening p
 the new demand or evidence, its compatibility with the then-current roadmap, and an acceptance
 criterion that can fail. A feature freeze is not a substitute for thought, but it is an excellent
 way to stop a backlog from disguising speculation as an order book.
+
+## Reopened
+
+- **#272, #277 and #308, reopened 2026-10-09 by Chief** for rotki (rotki/rotki#13335), as slices of
+  [RFC-0063](rfcs/0063-address-history.md): token transfers by watched address, internal transactions
+  from remote traces (so #276 is no longer a prerequisite), and bounded transactions, withdrawals and
+  timestamp lookup. Each issue names the slice that closes it.
