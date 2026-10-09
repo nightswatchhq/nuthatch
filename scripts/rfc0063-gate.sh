@@ -45,6 +45,10 @@ stop() { [ -n "$PID" ] && { kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/
 trap 'stop; rm -rf "$WORK"' EXIT
 FAILED=0
 
+rows() { # manifest: its case rows, or fail when it is missing or has none, so a phase cannot pass unrun
+  grep -v '^#' "$CASES/$1" > "$WORK/$1.rows" || { echo "FAIL: no cases in $CASES/$1"; exit 1; }
+}
+
 start() { # name address from to: start a nest watching one address over [from, to]
   mkdir -p "$WORK/$1"
   cat > "$WORK/$1/nuthatch.toml" <<EOF
@@ -210,6 +214,7 @@ stop
 fi
 
 if [[ $PHASES == *3* ]]; then
+rows cases.tsv
 # Phase 3: one single-block nest per case.
 while IFS=$'\t' read -r name address block hash _; do
   start "$name" "$address" "$block" "$block"
@@ -229,7 +234,7 @@ while IFS=$'\t' read -r name address block hash _; do
     COLD_DONE=1
   fi
   stop
-done < <(grep -v '^#' "$CASES/cases.tsv")
+done < "$WORK/cases.tsv.rows"
 fi
 
 if [[ $PHASES == *4* ]]; then
@@ -252,6 +257,7 @@ stop
 fi
 
 if [[ $PHASES == *5* ]]; then
+rows mined.tsv
 # Phase 5: produced blocks, one nest per case.
 while IFS=$'\t' read -r name address from to _; do
   start "$name" "$address" "$from" "$to"
@@ -260,7 +266,7 @@ while IFS=$'\t' read -r name address from to _; do
   same_rows "$name" '{blockNumber,timeStamp,blockReward}' "$WORK/$name.jsonl" "$CASES/$name.jsonl"
   echo "$name: $(wc -l < "$WORK/$name.jsonl" | tr -d ' ') blocks, reward $(jq -r .blockReward "$WORK/$name.jsonl" | head -1)"
   stop
-done < <(grep -v '^#' "$CASES/mined.tsv")
+done < "$WORK/mined.tsv.rows"
 fi
 
 if [ "$FAILED" -ne 0 ]; then
