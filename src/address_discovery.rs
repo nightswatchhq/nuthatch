@@ -402,9 +402,10 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             }
             let action = f.get("action").unwrap_or(&Value::Null);
             let sender = action.get("from").and_then(Value::as_str).unwrap_or("");
-            let receiver = action.get("to").and_then(Value::as_str).unwrap_or("");
             let outgoing = sender.eq_ignore_ascii_case(a);
-            if !outgoing && !receiver.eq_ignore_ascii_case(a) {
+            // The toAddress side matches a creation by the address it made, and Etherscan lists the
+            // creating transaction for that contract.
+            if !outgoing && !frame_side_is(f, "toAddress", a) {
                 continue;
             }
             let block = hex_u64(f.get("blockNumber").unwrap_or(&Value::Null))?;
@@ -1234,6 +1235,37 @@ mod tests {
                 .any(|m| m == "eth_getTransactionByHash" || m == "eth_getTransactionReceipt"),
             "{again:?}"
         );
+    }
+
+    /// A contract's txlist starts with the transaction that deployed it, a root frame with no `to`
+    /// that names the contract only in `result.address`; one made by a factory is internal.
+    #[tokio::test]
+    async fn a_contract_created_by_a_transaction_lists_its_creation() {
+        let (main, _) = chain(false);
+        let main = script(move |m, p| match m {
+            "eth_getCode" => Ok(json!("0x6080")),
+            _ => (main.answer)(m, p),
+        });
+        let trace = script(|m, p| {
+            Ok(match m {
+                "trace_filter" if p[0].get("toAddress").is_some() => json!([
+                    {"transactionHash": "0xcc", "blockNumber": 400, "traceAddress": [], "type": "create",
+                     "action": {"from": "0x02", "value": "0x0", "init": "0x6080"},
+                     "result": {"address": A, "code": "0x6080"}},
+                    {"transactionHash": "0xdd", "blockNumber": 450, "traceAddress": [0], "type": "create",
+                     "action": {"from": "0x03", "value": "0x0", "init": "0x6080"},
+                     "result": {"address": A, "code": "0x6080"}},
+                ]),
+                "trace_filter" => json!([]),
+                "trace_block" => json!([{"x": 1}]),
+                other => bail!("unexpected {other}"),
+            })
+        });
+        let d = Discoverer::new(main, trace);
+        let roots = d.normal_transactions(A, 400, 499).await.unwrap();
+        let hashes: Vec<&str> = roots.iter().map(|r| r.hash.as_str()).collect();
+        assert_eq!(hashes, ["0xcc"]);
+        assert!(!roots[0].outgoing);
     }
 
     /// Two providers that disagree about where a transaction is give no row, not a mixture.
