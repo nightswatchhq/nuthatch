@@ -1574,7 +1574,14 @@ mod tests {
         let first = q("1", None);
         let seen = first["generation"].as_str().unwrap().to_string();
         assert_eq!(hashes(&q("2", Some(&seen))).len(), 1);
-        h.invalidate_above(11).unwrap();
+        // The reorg is refetched before page 2, so coverage is whole again and only the generation
+        // shows that page 1 was cut from rows that no longer exist.
+        h.invalidate_above(10).unwrap();
+        let g = h.generation().unwrap();
+        let refetched: Vec<Row> = (0..3).map(|i| tx(11 + i, 1)).collect();
+        h.record(Action::TxList, ALICE, &refetched, (11, 20), g)
+            .unwrap();
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(0, 20)]);
         let second = q("2", Some(&seen));
         assert!(
             second["result"]
