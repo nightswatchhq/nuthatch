@@ -625,6 +625,7 @@ pub async fn run(args: &crate::cli::PartitionsArgs) -> Result<()> {
         vec![args.rpc.clone()],
         Vec::new(),
     )?);
+    rpc.inner().verify_chain_ids(args.chain_id).await?;
     let started = std::time::Instant::now();
     let built = build(
         &rpc,

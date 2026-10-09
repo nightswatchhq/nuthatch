@@ -429,6 +429,7 @@ pub struct PartitionsArgs {
     /// The RPC to read blocks from. Its finalized block bounds what may be built.
     #[arg(long, env = "NUTHATCH_RPC", hide_env_values = true)]
     pub rpc: String,
+    /// The chain the RPC must be on, checked before anything is read.
     #[arg(long, default_value_t = 1)]
     pub chain_id: u64,
     /// First block, a multiple of 10,000.

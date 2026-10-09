@@ -346,6 +346,17 @@ Verify a pack: signature, artifact hashes, and grant conformance
 
 - `--dir <DIR>` - Nest directory (must contain a `compliance-pack.toml`)
 
+## `nuthatch partitions`
+
+Build verifiable block partitions for address-history nests (RFC-0063 §8)
+
+- `--rpc <RPC>` - The RPC to read blocks from. Its finalized block bounds what may be built
+- `--chain-id <CHAIN_ID>` - The chain the RPC must be on, checked before anything is read
+- `--from <FROM>` - First block, a multiple of 10,000
+- `--to <TO>` - Last block, one less than a multiple of 10,000
+- `--out <OUT>` - A directory, or `s3://bucket/prefix`
+- `--concurrency <CONCURRENCY>` - Blocks fetched at once
+
 ## `nuthatch prune`
 
 Reclaim the disk of datasets nothing mounts any more (RFC-0032 §5)

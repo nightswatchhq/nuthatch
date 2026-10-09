@@ -297,6 +297,10 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/count.rs", "the per-machine head-count answer, not nest config"), // RFC-0054 hook
     ("src/address_mode.rs", "the /api/watch request body, not nest config"),
+    (
+        "src/address_partitions.rs",
+        "the partition manifest a publisher writes, not nest config",
+    ),
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
     (
         "src/mount_jobs.rs",
