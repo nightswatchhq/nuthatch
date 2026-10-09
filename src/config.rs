@@ -187,6 +187,9 @@ pub struct Config {
     /// exist: they keep the zero-dependency default intact for everyone who does not need this.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<crate::calls::CallDecl>,
+    /// RFC-0063: watched accounts whose history the nest serves Etherscan-shaped at `/api`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_history: Option<crate::address_history::AddressHistoryConfig>,
 }
 
 /// A user webhook subscription (RFC-0010 Part B): rows of `table` matching `where` are POSTed to `url`.
@@ -608,6 +611,9 @@ impl Config {
         for i in &cfg.ipfs {
             i.validate()?;
         }
+        if let Some(h) = &cfg.address_history {
+            h.validate()?;
+        }
         let mut ipfs_tables = std::collections::HashSet::new();
         for t in cfg
             .ipfs
@@ -820,6 +826,7 @@ impl Config {
             webhooks: Vec::new(),
             extract: Extract::default(),
             calls: Vec::new(),
+            address_history: None,
         })
     }
 
@@ -1092,6 +1099,7 @@ mod tests {
             webhooks: Vec::new(),
             extract: Extract::default(),
             calls: Vec::new(),
+            address_history: None,
         };
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();
@@ -1476,6 +1484,46 @@ block_timestamps = false
         .unwrap();
         let cfg = Config::load(dir.path()).unwrap();
         assert!(!cfg.nest.block_timestamps);
+    }
+
+    /// RFC-0063: a rotki-mode nest watches accounts and declares no contract, and must still load.
+    #[test]
+    fn an_address_history_nest_with_no_contracts_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let nest = r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+schema_version = 2
+"#;
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            format!(
+                "{nest}\n[address_history]\naddresses = [\"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\"]\n"
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert!(cfg.contracts.is_empty());
+        let h = cfg.address_history.expect("[address_history] read");
+        assert_eq!(
+            h.poll_interval().unwrap(),
+            crate::address_history::DEFAULT_POLL_INTERVAL
+        );
+        assert!(Config::unknown_keys(
+            &std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap()
+        )
+        .is_empty());
+
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            format!("{nest}\n[address_history]\naddresses = [\"0xD8dA6BF26964aF9D7eEd9e03E53415D37aA96045\"]\n"),
+        )
+        .unwrap();
+        let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
+        assert!(err.contains("checksum"), "{err}");
     }
 
     /// A pre-slice-4 nest - no `schema_version`, no `block_timestamps` - still loads as v1 with

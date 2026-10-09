@@ -169,6 +169,25 @@ l1_blocks = true              # Arbitrum-family chains only (arbitrum-one, robin
                               # every block. Off: no table, no header fetched.
 ```
 
+### `[address_history]` - an account's history for rotki (RFC-0063)
+
+A nest with this table and no `[[contracts]]` watches accounts instead of contracts, and serves their
+history Etherscan-shaped at `GET /api`, so rotki can use it as an indexer. It runs on its own light
+path: no SQL engine, no sealing, one cursor polling the chain head.
+
+```toml
+[address_history]
+addresses = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"]  # the accounts to watch; seeds the stored set
+start_block = 0               # optional: history before it is never fetched, and reads incomplete
+end_block = 20000000          # optional: stop here
+poll_interval = "5m"          # optional, default 5m; `--poll-interval` overrides it
+```
+
+The table stays out of the nest's identity and its bundle: the accounts are private and change at
+runtime through `POST /api/watch` and `POST /api/unwatch` with `{"address": "0x…"}`, accepted only on
+a loopback bind. A range the nest has not fetched answers `NUTHATCH_INCOMPLETE`, never an empty list.
+Discovery is not built yet, so today every range reads incomplete.
+
 ## `entities.toml` - authored incremental relations (RFC-0041)
 
 An entity is a maintained keyed relation. Its declaration is authored input, included in the nest

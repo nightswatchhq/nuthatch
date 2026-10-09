@@ -1648,6 +1648,12 @@ impl Store {
 /// and the same tests: a guarantee that only one implementation can express is a guarantee nobody
 /// can verify.
 impl Store {
+    /// The redb file itself, for RFC-0063's address-history tables, which live beside the hot store
+    /// so the content address already excludes them.
+    pub(crate) fn database(&self) -> &Database {
+        &self.db
+    }
+
     /// Read the persisted fence inside an already-open write transaction.
     fn fence_in_txn(wtx: &redb::WriteTransaction) -> Result<u64> {
         let t = wtx.open_table(META)?;

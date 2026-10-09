@@ -1,0 +1,1686 @@
+//! Address history (RFC-0063): the transactions, internal transactions, token transfers, withdrawals
+//! and produced blocks that touch a watched address, served Etherscan-shaped at `/api` so rotki can
+//! use a nest as one of its indexers.
+//!
+//! The rows live in the nest's own `nuthatch.redb`, beside the hot store, so they are derived state
+//! that the content address already excludes. Keys are fixed-width binary, `address | block | tx
+//! index | position`, all big-endian, so byte order is history order and a page is one range read
+//! over one address. Coverage is kept per (address, action) as block intervals: a range the nest has
+//! not finished is answered `NUTHATCH_INCOMPLETE`, never as an empty list, because rotki falls
+//! through to its next indexer only on a failure.
+//!
+//! The watched set lives in the store, seeded from `[address_history]`, so an address added while
+//! the nest runs simply has no coverage until it is backfilled.
+
+use anyhow::{anyhow, bail, Context, Result};
+use redb::{ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::time::Duration;
+
+use crate::store::Store;
+
+/// Rotki reads history rather than the tip, so an idle rotki-mode nest polls rarely (Chief, 2026-10-09).
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Etherscan's largest page.
+pub const MAX_OFFSET: u64 = 10_000;
+pub const DEFAULT_OFFSET: u64 = 1_000;
+
+/// The `[address_history]` table of `nuthatch.toml`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AddressHistoryConfig {
+    pub addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_block: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_block: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<String>,
+}
+
+impl AddressHistoryConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.addresses.is_empty() {
+            bail!(
+                "[address_history] names no addresses - list the accounts to watch in `addresses`"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for a in &self.addresses {
+            let key =
+                parse_address(a).with_context(|| format!("[address_history] address `{a}`"))?;
+            if !seen.insert(key) {
+                bail!("[address_history] lists `{a}` twice");
+            }
+        }
+        if let (Some(s), Some(e)) = (self.start_block, self.end_block) {
+            if e < s {
+                bail!("[address_history] end_block {e} is before start_block {s}");
+            }
+        }
+        self.poll_interval()?;
+        Ok(())
+    }
+
+    pub fn poll_interval(&self) -> Result<Duration> {
+        match &self.poll_interval {
+            None => Ok(DEFAULT_POLL_INTERVAL),
+            Some(s) => crate::freshness::parse_duration(s)
+                .map_err(|e| anyhow!("[address_history] poll_interval `{s}`: {e}")),
+        }
+    }
+}
+
+pub type Address = [u8; 20];
+
+/// A mixed-case address must carry a valid EIP-55 checksum: one mistyped character would otherwise
+/// watch someone else's account.
+pub fn parse_address(address: &str) -> Result<Address> {
+    let hex = address
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow!("not a 0x-prefixed address"))?;
+    if hex.len() != 40 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("not a 20-byte hex address");
+    }
+    let mixed =
+        hex.bytes().any(|b| b.is_ascii_lowercase()) && hex.bytes().any(|b| b.is_ascii_uppercase());
+    if mixed {
+        alloy_primitives::Address::parse_checksummed(address, None)
+            .map_err(|_| anyhow!("fails its EIP-55 checksum"))?;
+    }
+    let mut out = [0u8; 20];
+    for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+    }
+    Ok(out)
+}
+
+fn address_hex(a: &Address) -> String {
+    format!("0x{}", alloy_primitives::hex::encode(a))
+}
+
+/// The account actions a rotki-mode nest answers from its own rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    TxList,
+    TxListInternal,
+    TokenTx,
+    BeaconWithdrawals,
+    MinedBlocks,
+}
+
+impl Action {
+    pub const ALL: [Action; 5] = [
+        Action::TxList,
+        Action::TxListInternal,
+        Action::TokenTx,
+        Action::BeaconWithdrawals,
+        Action::MinedBlocks,
+    ];
+
+    pub fn from_etherscan(action: &str) -> Option<Action> {
+        Some(match action {
+            "txlist" => Action::TxList,
+            "txlistinternal" => Action::TxListInternal,
+            "tokentx" => Action::TokenTx,
+            "txsBeaconWithdrawal" => Action::BeaconWithdrawals,
+            "getminedblocks" => Action::MinedBlocks,
+            _ => return None,
+        })
+    }
+
+    pub fn etherscan(self) -> &'static str {
+        match self {
+            Action::TxList => "txlist",
+            Action::TxListInternal => "txlistinternal",
+            Action::TokenTx => "tokentx",
+            Action::BeaconWithdrawals => "txsBeaconWithdrawal",
+            Action::MinedBlocks => "getminedblocks",
+        }
+    }
+
+    /// Stored in coverage keys, so these numbers are on disk and must never be reassigned.
+    fn code(self) -> u8 {
+        match self {
+            Action::TxList => 1,
+            Action::TxListInternal => 2,
+            Action::TokenTx => 3,
+            Action::BeaconWithdrawals => 4,
+            Action::MinedBlocks => 5,
+        }
+    }
+
+    fn table(self) -> TableDefinition<'static, &'static [u8], &'static [u8]> {
+        match self {
+            Action::TxList => TXLIST,
+            Action::TxListInternal => TXLIST_INTERNAL,
+            Action::TokenTx => TOKENTX,
+            Action::BeaconWithdrawals => WITHDRAWALS,
+            Action::MinedBlocks => MINED_BLOCKS,
+        }
+    }
+}
+
+const TXLIST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_txlist");
+const TXLIST_INTERNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_txlistinternal");
+const TOKENTX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tokentx");
+const WITHDRAWALS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_withdrawals");
+const MINED_BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_minedblocks");
+/// `address | action code` -> `[from, to]` pairs, inclusive, sorted and merged, 16 bytes each.
+const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverage");
+const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
+/// Addresses removed at runtime, so a restart does not re-seed them from the config.
+const UNWATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_unwatched");
+const META: TableDefinition<&str, u64> = TableDefinition::new("ah_meta");
+const HEAD: &str = "head";
+const GENERATION: &str = "generation";
+
+const KEY_LEN: usize = 20 + 8 * 3;
+
+fn row_key(a: &Address, block: u64, tx_index: u64, position: u64) -> [u8; KEY_LEN] {
+    let mut k = [0u8; KEY_LEN];
+    k[..20].copy_from_slice(a);
+    k[20..28].copy_from_slice(&block.to_be_bytes());
+    k[28..36].copy_from_slice(&tx_index.to_be_bytes());
+    k[36..].copy_from_slice(&position.to_be_bytes());
+    k
+}
+
+fn coverage_key(a: &Address, action: Action) -> [u8; 21] {
+    let mut k = [0u8; 21];
+    k[..20].copy_from_slice(a);
+    k[20] = action.code();
+    k
+}
+
+/// One stored record and where it sorts.
+#[derive(Debug, Clone)]
+pub struct Row {
+    pub block: u64,
+    pub tx_index: u64,
+    pub position: u64,
+    pub record: Map<String, Value>,
+}
+
+/// What a page request comes back as.
+#[derive(Debug, PartialEq)]
+pub enum Answer {
+    Rows(Vec<Value>),
+    Incomplete(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sort {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone)]
+pub struct PageRequest {
+    pub address: String,
+    pub start_block: Option<u64>,
+    pub end_block: Option<u64>,
+    pub sort: Sort,
+    pub page: u64,
+    pub offset: u64,
+    /// The generation page 1 was cut from. Pages after the first carry it, so a reorg or unwatch
+    /// between pages reads incomplete instead of silently shifting rows across a page boundary.
+    pub generation: Option<u64>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Rows the last `page` call on this thread read from its table, so a test can see the index
+    /// was used rather than a scan.
+    static ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone)]
+pub struct AddressHistory {
+    store: Store,
+    chain_id: u64,
+}
+
+impl AddressHistory {
+    /// Open the tables, and add `seed` (the configured addresses) to the watched set. Addresses
+    /// already watched are left alone, none are removed, and one unwatched at runtime is not brought
+    /// back by the config that first seeded it.
+    pub fn open(store: Store, chain_id: u64, seed: &[String]) -> Result<AddressHistory> {
+        let seed: Vec<Address> = seed
+            .iter()
+            .map(|a| parse_address(a))
+            .collect::<Result<_>>()?;
+        let db = store.database();
+        let wtx = db.begin_write()?;
+        for a in Action::ALL {
+            wtx.open_table(a.table())?;
+        }
+        wtx.open_table(COVERAGE)?;
+        wtx.open_table(META)?;
+        {
+            let dropped = wtx.open_table(UNWATCHED)?;
+            let mut w = wtx.open_table(WATCHED)?;
+            for a in &seed {
+                if dropped.get(a.as_slice())?.is_none() {
+                    w.insert(a.as_slice(), 1)?;
+                }
+            }
+        }
+        wtx.commit()?;
+        Ok(AddressHistory { store, chain_id })
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Bumped by every change that removes rows or coverage. A fetch records the generation it
+    /// started under, and [`AddressHistory::record`] refuses its result if a reorg or unwatch came
+    /// in between, so rows a reorg dropped are never re-marked complete.
+    pub fn generation(&self) -> Result<u64> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx
+            .open_table(META)?
+            .get(GENERATION)?
+            .map_or(0, |v| v.value()))
+    }
+
+    pub fn watched(&self) -> Result<Vec<String>> {
+        let rtx = self.store.database().begin_read()?;
+        let t = rtx.open_table(WATCHED)?;
+        t.iter()?
+            .map(|e| {
+                let (k, _) = e?;
+                let a: Address = k
+                    .value()
+                    .try_into()
+                    .context("watched key is not 20 bytes")?;
+                Ok(address_hex(&a))
+            })
+            .collect()
+    }
+
+    /// Start watching `address`. It has no coverage until a backfill records some, so `/api` reads
+    /// incomplete for it meanwhile.
+    pub fn watch(&self, address: &str) -> Result<()> {
+        let a = parse_address(address)?;
+        let wtx = self.store.database().begin_write()?;
+        wtx.open_table(WATCHED)?.insert(a.as_slice(), 1)?;
+        wtx.open_table(UNWATCHED)?.remove(a.as_slice())?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Stop watching `address`, dropping its rows and coverage.
+    pub fn unwatch(&self, address: &str) -> Result<()> {
+        let a = parse_address(address)?;
+        let wtx = self.store.database().begin_write()?;
+        {
+            wtx.open_table(WATCHED)?.remove(a.as_slice())?;
+            wtx.open_table(UNWATCHED)?.insert(a.as_slice(), 1)?;
+            let lo = row_key(&a, 0, 0, 0);
+            let hi = row_key(&a, u64::MAX, u64::MAX, u64::MAX);
+            for action in Action::ALL {
+                let mut t = wtx.open_table(action.table())?;
+                drain(&mut t, &lo, &hi)?;
+                wtx.open_table(COVERAGE)?
+                    .remove(coverage_key(&a, action).as_slice())?;
+            }
+            bump_generation(&wtx)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Store a fetch's result: `rows` and the claim that `[from, to]` is complete for (address,
+    /// action), in one transaction. Refused if the address is not watched or the generation moved
+    /// since the fetch began, because either way the claim no longer describes what is stored.
+    pub fn record(
+        &self,
+        action: Action,
+        address: &str,
+        rows: &[Row],
+        (from, to): (u64, u64),
+        generation: u64,
+    ) -> Result<()> {
+        if to < from {
+            bail!("coverage interval [{from}, {to}] is empty");
+        }
+        let a = parse_address(address)?;
+        let wtx = self.store.database().begin_write()?;
+        {
+            if wtx.open_table(WATCHED)?.get(a.as_slice())?.is_none() {
+                bail!("{} is not watched", address_hex(&a));
+            }
+            let now = wtx
+                .open_table(META)?
+                .get(GENERATION)?
+                .map_or(0, |v| v.value());
+            if now != generation {
+                bail!("address history changed during the fetch (generation {generation} -> {now}); refetch");
+            }
+            if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
+                bail!("a row at block {} lies outside [{from}, {to}]", r.block);
+            }
+            put_rows(&wtx, action, &a, rows)?;
+            cover(&wtx, action, &a, from, to)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    pub fn coverage(&self, action: Action, address: &str) -> Result<Vec<(u64, u64)>> {
+        let a = parse_address(address)?;
+        let rtx = self.store.database().begin_read()?;
+        let t = rtx.open_table(COVERAGE)?;
+        match t.get(coverage_key(&a, action).as_slice())? {
+            Some(v) => decode_spans(v.value()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The newest block the cursor has seen. An `endblock` past it is answered up to it, as
+    /// Etherscan answers rotki's `99999999`.
+    pub fn set_head(&self, block: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        wtx.open_table(META)?.insert(HEAD, block)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    pub fn head(&self) -> Result<Option<u64>> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx.open_table(META)?.get(HEAD)?.map(|v| v.value()))
+    }
+
+    /// A reorg back to `block`: rows above it are dropped, and so is every claim of coverage above
+    /// it, so the range reads incomplete until the cursor refetches it.
+    pub fn invalidate_above(&self, block: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut c = wtx.open_table(COVERAGE)?;
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = c
+                .iter()?
+                .map(|e| e.map(|(k, v)| (k.value().to_vec(), v.value().to_vec())))
+                .collect::<std::result::Result<_, _>>()?;
+            // Rows can outlive their coverage (a fetch stored them, then a reorg cut the span), so
+            // the addresses to drain are every watched one and every covered one, not coverage alone.
+            let mut holders: std::collections::BTreeSet<Address> = wtx
+                .open_table(WATCHED)?
+                .iter()?
+                .map(|e| e.map(|(k, _)| k.value().try_into().expect("watched keys are 20 bytes")))
+                .collect::<std::result::Result<_, _>>()?;
+            holders.extend(entries.iter().map(|(k, _)| -> Address {
+                k[..20].try_into().expect("coverage keys are 21 bytes")
+            }));
+            if let Some(above) = block.checked_add(1) {
+                for a in &holders {
+                    for action in Action::ALL {
+                        drain(
+                            &mut wtx.open_table(action.table())?,
+                            &row_key(a, above, 0, 0),
+                            &row_key(a, u64::MAX, u64::MAX, u64::MAX),
+                        )?;
+                    }
+                }
+            }
+            for (key, spans) in entries {
+                let kept: Vec<(u64, u64)> = decode_spans(&spans)?
+                    .into_iter()
+                    .filter(|(from, _)| *from <= block)
+                    .map(|(from, to)| (from, to.min(block)))
+                    .collect();
+                if kept.is_empty() {
+                    c.remove(key.as_slice())?;
+                } else {
+                    c.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
+            }
+            {
+                let mut m = wtx.open_table(META)?;
+                let head = m.get(HEAD)?.map(|v| v.value());
+                if head.is_some_and(|h| h > block) {
+                    m.insert(HEAD, block)?;
+                }
+            }
+            bump_generation(&wtx)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    pub fn page(&self, action: Action, req: &PageRequest) -> Result<Answer> {
+        Ok(self.page_at(action, req)?.0)
+    }
+
+    /// A page, and the generation it was read at, from one read transaction.
+    pub fn page_at(&self, action: Action, req: &PageRequest) -> Result<(Answer, u64)> {
+        let a = parse_address(&req.address)?;
+        let rtx = self.store.database().begin_read()?;
+        let meta = rtx.open_table(META)?;
+        let generation = meta.get(GENERATION)?.map_or(0, |v| v.value());
+        let answer = |a: Answer| Ok((a, generation));
+        if req.generation.is_some_and(|g| g != generation) {
+            return answer(Answer::Incomplete(
+                "address history changed between pages; start again from page 1".into(),
+            ));
+        }
+        let start = req.start_block.unwrap_or(0);
+        let head = meta.get(HEAD)?.map(|v| v.value());
+        let spans = match rtx
+            .open_table(COVERAGE)?
+            .get(coverage_key(&a, action).as_slice())?
+        {
+            Some(v) => decode_spans(v.value())?,
+            None => Vec::new(),
+        };
+        if req.end_block.is_some_and(|e| e < start) {
+            return answer(Answer::Rows(Vec::new()));
+        }
+        let Some(&(_, covered_to)) = spans.iter().find(|(f, t)| *f <= start && start <= *t) else {
+            return answer(Answer::Incomplete(format!(
+                "{} for {} is not indexed at block {start}",
+                action.etherscan(),
+                address_hex(&a)
+            )));
+        };
+        // Etherscan reads an absent or far-future `endblock` as "up to now". The nest's now is the
+        // head it has seen; without one it cannot say where history ends.
+        let end = match (req.end_block, head) {
+            (Some(e), Some(h)) => e.min(h),
+            (Some(e), None) => e,
+            (None, Some(h)) => h,
+            (None, None) => {
+                return answer(Answer::Incomplete("the chain head is not known yet".into()));
+            }
+        };
+        if end < start || end > covered_to {
+            return answer(Answer::Incomplete(format!(
+                "{} for {} is indexed through block {covered_to}, not {}",
+                action.etherscan(),
+                address_hex(&a),
+                req.end_block.unwrap_or(end)
+            )));
+        }
+        let t = rtx.open_table(action.table())?;
+        let lo = row_key(&a, start, 0, 0);
+        let hi = row_key(&a, end, u64::MAX, u64::MAX);
+        let range = t.range(lo.as_slice()..=hi.as_slice())?;
+        let skip = usize::try_from(req.page.saturating_sub(1).saturating_mul(req.offset))
+            .unwrap_or(usize::MAX);
+        let take = usize::try_from(req.offset).unwrap_or(usize::MAX);
+        let read: Box<dyn Iterator<Item = _>> = match req.sort {
+            Sort::Asc => Box::new(range),
+            Sort::Desc => Box::new(range.rev()),
+        };
+        #[cfg(test)]
+        let read = read.inspect(|_| ROWS_READ.with(|n| n.set(n.get() + 1)));
+        #[cfg(test)]
+        ROWS_READ.with(|n| n.set(0));
+        let rows = read
+            .skip(skip)
+            .take(take)
+            .map(|e| {
+                let (_, v) = e?;
+                decode_record(v.value()).map(Value::Object)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        answer(Answer::Rows(rows))
+    }
+
+    /// Raw writes for tests that need a store in a state `record` would refuse to produce.
+    #[cfg(test)]
+    fn insert(&self, action: Action, address: &str, rows: &[Row]) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        put_rows(&wtx, action, &parse_address(address)?, rows)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mark_covered(&self, action: Action, address: &str, from: u64, to: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        cover(&wtx, action, &parse_address(address)?, from, to)?;
+        wtx.commit()?;
+        Ok(())
+    }
+}
+
+fn put_rows(wtx: &redb::WriteTransaction, action: Action, a: &Address, rows: &[Row]) -> Result<()> {
+    let mut t = wtx.open_table(action.table())?;
+    let mut buf = Vec::new();
+    for r in rows {
+        let claimed = r.record.get("blockNumber").and_then(Value::as_str);
+        if claimed != Some(r.block.to_string().as_str()) {
+            bail!(
+                "{} row at block {} carries blockNumber {claimed:?}",
+                action.etherscan(),
+                r.block
+            );
+        }
+        buf.clear();
+        encode_record(&r.record, &mut buf)?;
+        t.insert(
+            row_key(a, r.block, r.tx_index, r.position).as_slice(),
+            buf.as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+fn cover(
+    wtx: &redb::WriteTransaction,
+    action: Action,
+    a: &Address,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    let mut t = wtx.open_table(COVERAGE)?;
+    let key = coverage_key(a, action);
+    let mut spans = match t.get(key.as_slice())? {
+        Some(v) => decode_spans(v.value())?,
+        None => Vec::new(),
+    };
+    spans.push((from, to));
+    t.insert(key.as_slice(), encode_spans(&merge(spans)).as_slice())?;
+    Ok(())
+}
+
+fn bump_generation(wtx: &redb::WriteTransaction) -> Result<()> {
+    let mut m = wtx.open_table(META)?;
+    let next = m.get(GENERATION)?.map_or(0, |v| v.value()) + 1;
+    m.insert(GENERATION, next)?;
+    Ok(())
+}
+
+fn drain(t: &mut redb::Table<&'static [u8], &'static [u8]>, lo: &[u8], hi: &[u8]) -> Result<()> {
+    let keys: Vec<Vec<u8>> = t
+        .range(lo..=hi)?
+        .map(|e| e.map(|(k, _)| k.value().to_vec()))
+        .collect::<std::result::Result<_, _>>()?;
+    for k in keys {
+        t.remove(k.as_slice())?;
+    }
+    Ok(())
+}
+
+/// Sort and join intervals that overlap or touch: `[1, 5]` and `[6, 9]` cover `[1, 9]`.
+fn merge(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    spans.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (from, to) in spans {
+        match out.last_mut() {
+            Some(last) if from <= last.1.saturating_add(1) => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+fn encode_spans(spans: &[(u64, u64)]) -> Vec<u8> {
+    spans
+        .iter()
+        .flat_map(|(f, t)| f.to_be_bytes().into_iter().chain(t.to_be_bytes()))
+        .collect()
+}
+
+fn decode_spans(raw: &[u8]) -> Result<Vec<(u64, u64)>> {
+    if !raw.len().is_multiple_of(16) {
+        bail!(
+            "address-history coverage is {} bytes, not pairs of u64",
+            raw.len()
+        );
+    }
+    Ok(raw
+        .chunks_exact(16)
+        .map(|c| {
+            (
+                u64::from_be_bytes(c[..8].try_into().expect("16-byte chunk")),
+                u64::from_be_bytes(c[8..].try_into().expect("16-byte chunk")),
+            )
+        })
+        .collect())
+}
+
+/// Etherscan's record keys, by stored index. Append only: the index is on disk.
+const KNOWN_KEYS: &[&str] = &[
+    "blockNumber",
+    "timeStamp",
+    "hash",
+    "nonce",
+    "blockHash",
+    "transactionIndex",
+    "from",
+    "to",
+    "value",
+    "gas",
+    "gasPrice",
+    "isError",
+    "txreceipt_status",
+    "input",
+    "contractAddress",
+    "cumulativeGasUsed",
+    "gasUsed",
+    "confirmations",
+    "methodId",
+    "functionName",
+    "traceId",
+    "type",
+    "errCode",
+    "callType",
+    "logIndex",
+    "tokenName",
+    "tokenSymbol",
+    "tokenDecimal",
+    "tokenID",
+    "tokenValue",
+    "withdrawalIndex",
+    "validatorIndex",
+    "address",
+    "amount",
+    "blockReward",
+    "timestamp",
+    "L1FeesPaid",
+    "authorizationList",
+];
+const OTHER_KEY: u8 = 0xff;
+
+const V_TEXT: u8 = 0;
+const V_HEX: u8 = 1;
+const V_DECIMAL: u8 = 2;
+const V_NULL: u8 = 3;
+const V_FALSE: u8 = 4;
+const V_TRUE: u8 = 5;
+/// A JSON number, kept as its literal so it prints back exactly.
+const V_NUMBER: u8 = 6;
+const V_ARRAY: u8 = 7;
+const V_OBJECT: u8 = 8;
+
+/// A record as rotki reads it: Etherscan's mostly hex and decimal strings, packed so a hash costs 32
+/// bytes and a block number a few. Every value round-trips to the exact string it was given; anything
+/// that would not (odd-length or uppercase hex, a decimal with a leading zero) is kept as text.
+fn encode_record(record: &Map<String, Value>, out: &mut Vec<u8>) -> Result<()> {
+    put_varint(out, record.len() as u128);
+    for (k, v) in record {
+        match KNOWN_KEYS.iter().position(|known| known == k) {
+            Some(i) => out.push(u8::try_from(i).expect("fewer than 255 known keys")),
+            None => {
+                out.push(OTHER_KEY);
+                put_bytes(out, k.as_bytes());
+            }
+        }
+        encode_value(v, out);
+    }
+    Ok(())
+}
+
+fn encode_value(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::String(s) => encode_string(s, out),
+        Value::Null => out.push(V_NULL),
+        Value::Bool(false) => out.push(V_FALSE),
+        Value::Bool(true) => out.push(V_TRUE),
+        Value::Number(n) => {
+            out.push(V_NUMBER);
+            put_bytes(out, n.to_string().as_bytes());
+        }
+        Value::Array(items) => {
+            out.push(V_ARRAY);
+            put_varint(out, items.len() as u128);
+            for item in items {
+                encode_value(item, out);
+            }
+        }
+        Value::Object(fields) => {
+            out.push(V_OBJECT);
+            put_varint(out, fields.len() as u128);
+            for (k, item) in fields {
+                put_bytes(out, k.as_bytes());
+                encode_value(item, out);
+            }
+        }
+    }
+}
+
+fn decode_value(raw: &mut &[u8]) -> Result<Value> {
+    Ok(match take_u8(raw)? {
+        V_TEXT => Value::String(String::from_utf8(take_bytes(raw)?.to_vec())?),
+        V_HEX => Value::String(format!(
+            "0x{}",
+            alloy_primitives::hex::encode(take_bytes(raw)?)
+        )),
+        V_DECIMAL => Value::String(take_varint(raw)?.to_string()),
+        V_NULL => Value::Null,
+        V_FALSE => Value::Bool(false),
+        V_TRUE => Value::Bool(true),
+        V_NUMBER => Value::Number(std::str::from_utf8(take_bytes(raw)?)?.parse()?),
+        V_ARRAY => {
+            let n = take_varint(raw)?;
+            let mut items = Vec::new();
+            for _ in 0..n {
+                items.push(decode_value(raw)?);
+            }
+            Value::Array(items)
+        }
+        V_OBJECT => {
+            let n = take_varint(raw)?;
+            let mut fields = Map::new();
+            for _ in 0..n {
+                let k = String::from_utf8(take_bytes(raw)?.to_vec())?;
+                fields.insert(k, decode_value(raw)?);
+            }
+            Value::Object(fields)
+        }
+        t => bail!("unknown record value tag {t}"),
+    })
+}
+
+fn encode_string(s: &str, out: &mut Vec<u8>) {
+    if let Some(hex) = s.strip_prefix("0x") {
+        let canonical = hex.len() % 2 == 0
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if canonical {
+            if let Ok(bytes) = alloy_primitives::hex::decode(hex) {
+                out.push(V_HEX);
+                put_bytes(out, &bytes);
+                return;
+            }
+        }
+    }
+    let canonical_decimal =
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
+    if canonical_decimal {
+        if let Ok(n) = s.parse::<u128>() {
+            out.push(V_DECIMAL);
+            put_varint(out, n);
+            return;
+        }
+    }
+    out.push(V_TEXT);
+    put_bytes(out, s.as_bytes());
+}
+
+fn decode_record(mut raw: &[u8]) -> Result<Map<String, Value>> {
+    let n = take_varint(&mut raw)?;
+    let mut out = Map::new();
+    for _ in 0..n {
+        let tag = take_u8(&mut raw)?;
+        let key = if tag == OTHER_KEY {
+            String::from_utf8(take_bytes(&mut raw)?.to_vec())?
+        } else {
+            KNOWN_KEYS
+                .get(usize::from(tag))
+                .ok_or_else(|| anyhow!("unknown record key {tag}"))?
+                .to_string()
+        };
+        let value = decode_value(&mut raw)?;
+        out.insert(key, value);
+    }
+    if !raw.is_empty() {
+        bail!("{} trailing bytes after a record", raw.len());
+    }
+    Ok(out)
+}
+
+fn put_varint(out: &mut Vec<u8>, mut n: u128) {
+    loop {
+        let low = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_varint(out, b.len() as u128);
+    out.extend_from_slice(b);
+}
+
+fn take_u8(raw: &mut &[u8]) -> Result<u8> {
+    let (&b, rest) = raw
+        .split_first()
+        .ok_or_else(|| anyhow!("record ends early"))?;
+    *raw = rest;
+    Ok(b)
+}
+
+fn take_varint(raw: &mut &[u8]) -> Result<u128> {
+    let mut n: u128 = 0;
+    for shift in (0..128).step_by(7) {
+        let b = take_u8(raw)?;
+        // The 19th byte has room for 2 bits; anything more would be shifted out silently.
+        if shift == 126 && b > 0x03 {
+            bail!("varint overflows 128 bits");
+        }
+        n |= u128::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Ok(n);
+        }
+    }
+    bail!("varint longer than 128 bits")
+}
+
+fn take_bytes<'a>(raw: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let len = usize::try_from(take_varint(raw)?)?;
+    if raw.len() < len {
+        bail!("record ends early");
+    }
+    let (b, rest) = raw.split_at(len);
+    *raw = rest;
+    Ok(b)
+}
+
+/// The Etherscan envelope for `/api`. `generation` is ours: a client paging past page 1 sends it
+/// back, and Etherscan clients that do not know it ignore an extra key.
+pub fn ok(result: Value, generation: u64) -> Value {
+    serde_json::json!({
+        "status": "1",
+        "message": "OK",
+        "result": result,
+        "generation": generation.to_string(),
+    })
+}
+
+pub fn unsupported(why: &str) -> Value {
+    serde_json::json!({ "status": "0", "message": "NOTOK", "result": format!("NUTHATCH_UNSUPPORTED: {why}") })
+}
+
+pub fn incomplete(why: &str) -> Value {
+    serde_json::json!({ "status": "0", "message": "NOTOK", "result": format!("NUTHATCH_INCOMPLETE: {why}") })
+}
+
+fn error(why: impl std::fmt::Display) -> Value {
+    serde_json::json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {why}") })
+}
+
+/// Answer one `/api` request. `history` is `None` on a nest with no `[address_history]`.
+pub fn respond(
+    history: Option<&AddressHistory>,
+    params: &std::collections::HashMap<String, String>,
+) -> Value {
+    let get = |k: &str| params.get(k).map(String::as_str);
+    let module = get("module").unwrap_or("");
+    let action = get("action").unwrap_or("");
+    let Some(act) = Action::from_etherscan(action).filter(|_| module == "account") else {
+        return unsupported(&format!("{module}/{action} is not served by this nest"));
+    };
+    let Some(history) = history else {
+        return unsupported("this nest has no [address_history]");
+    };
+    if let Some(c) = get("chainid") {
+        if c.parse::<u64>().ok() != Some(history.chain_id) {
+            return unsupported(&format!(
+                "chainid {c} is not this nest's chain {}",
+                history.chain_id
+            ));
+        }
+    }
+    if get("txhash").is_some() {
+        return unsupported("txhash-scoped lookups are not served yet");
+    }
+    match parse_request(params) {
+        Err(e) => error(e),
+        Ok(req) => match history.page_at(act, &req) {
+            Ok((Answer::Rows(rows), generation)) => ok(Value::Array(rows), generation),
+            Ok((Answer::Incomplete(why), _)) => incomplete(&why),
+            Err(e) => error(format!("{e:#}")),
+        },
+    }
+}
+
+fn parse_request(params: &std::collections::HashMap<String, String>) -> Result<PageRequest> {
+    let get = |k: &str| params.get(k).map(String::as_str).filter(|s| !s.is_empty());
+    let address = get("address").ok_or_else(|| anyhow!("Missing Or invalid Address"))?;
+    parse_address(address).map_err(|_| anyhow!("Missing Or invalid Address"))?;
+    let num = |k: &str| -> Result<Option<u64>> {
+        get(k)
+            .map(|s| s.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{s}`")))
+            .transpose()
+    };
+    let sort = match get("sort") {
+        None | Some("asc") => Sort::Asc,
+        Some("desc") => Sort::Desc,
+        Some(s) => bail!("invalid sort `{s}`"),
+    };
+    let page = num("page")?.unwrap_or(1);
+    let offset = num("offset")?.unwrap_or(DEFAULT_OFFSET);
+    if page == 0 || offset == 0 {
+        bail!("page and offset start at 1");
+    }
+    if offset > MAX_OFFSET {
+        bail!("offset {offset} is over the maximum of {MAX_OFFSET}");
+    }
+    Ok(PageRequest {
+        address: address.to_string(),
+        start_block: num("startblock")?,
+        end_block: num("endblock")?,
+        sort,
+        page,
+        offset,
+        generation: num("generation")?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeSet, HashMap};
+
+    const ALICE: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+    const BOB: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
+
+    fn history() -> (tempfile::TempDir, AddressHistory) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        (
+            dir,
+            AddressHistory::open(store, 1, &[ALICE.into()]).unwrap(),
+        )
+    }
+
+    fn tx(block: u64, tx_index: u64) -> Row {
+        let mut record = Map::new();
+        record.insert("blockNumber".into(), Value::String(block.to_string()));
+        record.insert(
+            "hash".into(),
+            Value::String(format!("0x{block:04x}{tx_index:060x}")),
+        );
+        record.insert(
+            "timeStamp".into(),
+            Value::String((1_700_000_000 + block).to_string()),
+        );
+        Row {
+            block,
+            tx_index,
+            position: 0,
+            record,
+        }
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn hashes(v: &Value) -> Vec<String> {
+        v["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("not a list: {v}"))
+            .iter()
+            .map(|r| r["hash"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn req(start: u64, end: u64, page: u64, offset: u64) -> PageRequest {
+        PageRequest {
+            address: ALICE.into(),
+            start_block: Some(start),
+            end_block: Some(end),
+            sort: Sort::Asc,
+            page,
+            offset,
+            generation: None,
+        }
+    }
+
+    #[test]
+    fn a_thousand_and_one_rows_in_one_block_page_through_exactly() {
+        let (_d, h) = history();
+        let rows: Vec<Row> = (0..1_001).map(|i| tx(500, i)).collect();
+        h.insert(Action::TxList, ALICE, &rows).unwrap();
+        h.mark_covered(Action::TxList, ALICE, 0, 600).unwrap();
+        let q = |page: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "txlist"),
+                    ("address", ALICE),
+                    ("startblock", "500"),
+                    ("endblock", "500"),
+                    ("page", page),
+                    ("offset", "1000"),
+                ]),
+            )
+        };
+        let first = hashes(&q("1"));
+        let second = hashes(&q("2"));
+        let third = hashes(&q("3"));
+        assert_eq!(first.len(), 1_000, "a full first page");
+        assert_eq!(second.len(), 1, "the 1,001st row on its own page");
+        assert!(third.is_empty(), "nothing past the last row");
+        let all: Vec<String> = first.iter().chain(&second).cloned().collect();
+        let distinct: BTreeSet<&String> = all.iter().collect();
+        assert_eq!(distinct.len(), 1_001, "no row twice");
+        let want: Vec<String> = rows
+            .iter()
+            .map(|r| r.record["hash"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(all, want, "every row, in transaction order");
+    }
+
+    /// A page is one range read over one address: with 50,000 of another account's rows in the same
+    /// blocks, a 1,000-row page reads exactly 1,000 rows.
+    #[test]
+    fn a_page_reads_only_its_own_addresses_rows() {
+        let (_d, h) = history();
+        h.watch(BOB).unwrap();
+        let mine: Vec<Row> = (0..2_000).map(|i| tx(100 + i / 10, i % 10)).collect();
+        let theirs: Vec<Row> = (0..50_000).map(|i| tx(100 + i / 250, i % 250)).collect();
+        h.insert(Action::TxList, ALICE, &mine).unwrap();
+        h.insert(Action::TxList, BOB, &theirs).unwrap();
+        h.mark_covered(Action::TxList, ALICE, 0, 400).unwrap();
+
+        let mut times = Vec::new();
+        for _ in 0..21 {
+            let t = std::time::Instant::now();
+            let Answer::Rows(rows) = h.page(Action::TxList, &req(0, 400, 1, 1_000)).unwrap() else {
+                panic!("covered")
+            };
+            times.push(t.elapsed());
+            assert_eq!(rows.len(), 1_000);
+            assert_eq!(ROWS_READ.with(|n| n.get()), 1_000, "read past its own page");
+        }
+        times.sort();
+        eprintln!("1,000-row page p50 {:?}", times[times.len() / 2]);
+
+        h.page(Action::TxList, &req(0, 400, 2, 1_000)).unwrap();
+        assert_eq!(
+            ROWS_READ.with(|n| n.get()),
+            2_000,
+            "page 2 reads its own address's first two pages and nothing of the other's"
+        );
+    }
+
+    #[test]
+    fn descending_pages_are_the_ascending_order_reversed() {
+        let (_d, h) = history();
+        let rows: Vec<Row> = (0..5).map(|i| tx(10 + i, 0)).collect();
+        h.insert(Action::TxList, ALICE, &rows).unwrap();
+        h.mark_covered(Action::TxList, ALICE, 0, 20).unwrap();
+        let q = |sort: &str, page: &str| {
+            hashes(&respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "txlist"),
+                    ("address", ALICE),
+                    ("endblock", "20"),
+                    ("sort", sort),
+                    ("page", page),
+                    ("offset", "2"),
+                ]),
+            ))
+        };
+        let asc: Vec<String> = ["1", "2", "3"].iter().flat_map(|p| q("asc", p)).collect();
+        let mut desc: Vec<String> = ["1", "2", "3"].iter().flat_map(|p| q("desc", p)).collect();
+        desc.reverse();
+        assert_eq!(asc.len(), 5);
+        assert_eq!(asc, desc);
+    }
+
+    #[test]
+    fn a_range_not_wholly_covered_is_incomplete_not_empty() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TokenTx, ALICE, 100, 200).unwrap();
+        let q = |start: &str, end: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "tokentx"),
+                    ("address", ALICE),
+                    ("startblock", start),
+                    ("endblock", end),
+                ]),
+            )
+        };
+        let covered = q("100", "200");
+        assert_eq!(covered["status"], "1", "{covered}");
+        assert_eq!(
+            covered["result"],
+            serde_json::json!([]),
+            "covered and empty is an empty list"
+        );
+        for (start, end) in [("99", "150"), ("150", "201"), ("0", "50"), ("201", "300")] {
+            let a = q(start, end);
+            assert_eq!(a["status"], "0", "[{start}, {end}]: {a}");
+            assert!(
+                a["result"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("NUTHATCH_INCOMPLETE:"),
+                "[{start}, {end}]: {a}"
+            );
+        }
+        let other = respond(
+            Some(&h),
+            &params(&[
+                ("module", "account"),
+                ("action", "txlist"),
+                ("address", ALICE),
+                ("startblock", "100"),
+                ("endblock", "200"),
+            ]),
+        );
+        assert!(
+            other["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "coverage is per action: {other}"
+        );
+    }
+
+    #[test]
+    fn a_gap_between_covered_spans_is_incomplete() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 99).unwrap();
+        h.mark_covered(Action::TxList, ALICE, 101, 200).unwrap();
+        assert_eq!(
+            h.coverage(Action::TxList, ALICE).unwrap(),
+            vec![(0, 99), (101, 200)]
+        );
+        let r = req(0, 200, 1, 10);
+        assert!(matches!(
+            h.page(Action::TxList, &r).unwrap(),
+            Answer::Incomplete(_)
+        ));
+        assert_eq!(
+            h.page(Action::TxList, &req(150, 160, 1, 10)).unwrap(),
+            Answer::Rows(vec![]),
+            "a range inside the second span is covered"
+        );
+        h.mark_covered(Action::TxList, ALICE, 100, 100).unwrap();
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(0, 200)]);
+        assert_eq!(h.page(Action::TxList, &r).unwrap(), Answer::Rows(vec![]));
+    }
+
+    #[test]
+    fn an_endblock_past_the_head_is_answered_to_the_head() {
+        let (_d, h) = history();
+        h.insert(Action::TxList, ALICE, &[tx(50, 0)]).unwrap();
+        h.mark_covered(Action::TxList, ALICE, 0, 100).unwrap();
+        h.set_head(100).unwrap();
+        let a = respond(
+            Some(&h),
+            &params(&[
+                ("module", "account"),
+                ("action", "txlist"),
+                ("address", ALICE),
+                ("endblock", "99999999"),
+            ]),
+        );
+        assert_eq!(hashes(&a).len(), 1, "{a}");
+    }
+
+    #[test]
+    fn an_unknown_action_or_module_is_unsupported() {
+        let (_d, h) = history();
+        for (module, action) in [
+            ("account", "balancemulti"),
+            ("contract", "getabi"),
+            ("block", "getblocknobytime"),
+            ("logs", "txlist"),
+        ] {
+            let a = respond(
+                Some(&h),
+                &params(&[("module", module), ("action", action), ("address", ALICE)]),
+            );
+            assert_eq!(a["status"], "0", "{module}/{action}");
+            assert!(
+                a["result"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("NUTHATCH_UNSUPPORTED:"),
+                "{module}/{action}: {a}"
+            );
+        }
+        let none = respond(
+            None,
+            &params(&[
+                ("module", "account"),
+                ("action", "txlist"),
+                ("address", ALICE),
+            ]),
+        );
+        assert!(
+            none["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn a_reorg_drops_rows_and_coverage_above_the_block() {
+        let (_d, h) = history();
+        let rows: Vec<Row> = [90, 100, 101, 150].iter().map(|b| tx(*b, 0)).collect();
+        h.insert(Action::TxList, ALICE, &rows).unwrap();
+        h.insert(Action::TokenTx, ALICE, &[tx(120, 3)]).unwrap();
+        h.mark_covered(Action::TxList, ALICE, 0, 200).unwrap();
+        h.mark_covered(Action::TokenTx, ALICE, 110, 200).unwrap();
+        h.set_head(200).unwrap();
+
+        h.invalidate_above(100).unwrap();
+
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(0, 100)]);
+        assert!(
+            h.coverage(Action::TokenTx, ALICE).unwrap().is_empty(),
+            "a span wholly above goes"
+        );
+        assert_eq!(h.head().unwrap(), Some(100));
+        let Answer::Rows(kept) = h.page(Action::TxList, &req(0, 100, 1, 100)).unwrap() else {
+            panic!("covered through 100")
+        };
+        let blocks: Vec<&str> = kept
+            .iter()
+            .map(|r| r["blockNumber"].as_str().unwrap())
+            .collect();
+        assert_eq!(blocks, ["90", "100"]);
+        h.mark_covered(Action::TxList, ALICE, 101, 200).unwrap();
+        h.mark_covered(Action::TokenTx, ALICE, 0, 200).unwrap();
+        let Answer::Rows(after) = h.page(Action::TxList, &req(0, 200, 1, 100)).unwrap() else {
+            panic!("re-covered")
+        };
+        assert_eq!(
+            after.len(),
+            2,
+            "rows above the reorg are gone, not merely hidden"
+        );
+        let Answer::Rows(tokens) = h.page(Action::TokenTx, &req(0, 200, 1, 100)).unwrap() else {
+            panic!("re-covered")
+        };
+        assert!(
+            tokens.is_empty(),
+            "the token row above the reorg went too: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn an_address_watched_later_reads_incomplete_until_backfilled() {
+        let (_d, h) = history();
+        assert_eq!(h.watched().unwrap(), vec![ALICE.to_lowercase()]);
+        h.watch(BOB).unwrap();
+        let mut w = h.watched().unwrap();
+        w.sort();
+        assert_eq!(w, vec![BOB.to_string(), ALICE.to_lowercase()]);
+        let bob = PageRequest {
+            address: BOB.into(),
+            ..req(0, 10, 1, 10)
+        };
+        assert!(matches!(
+            h.page(Action::TxList, &bob).unwrap(),
+            Answer::Incomplete(_)
+        ));
+
+        h.insert(Action::TxList, BOB, &[tx(5, 0)]).unwrap();
+        h.mark_covered(Action::TxList, BOB, 0, 10).unwrap();
+        h.unwatch(BOB).unwrap();
+        assert_eq!(h.watched().unwrap(), vec![ALICE.to_lowercase()]);
+        assert!(h.coverage(Action::TxList, BOB).unwrap().is_empty());
+        h.mark_covered(Action::TxList, BOB, 0, 10).unwrap();
+        assert_eq!(
+            h.page(Action::TxList, &bob).unwrap(),
+            Answer::Rows(vec![]),
+            "unwatching drops the rows, not just the coverage"
+        );
+    }
+
+    #[test]
+    fn reopening_with_a_different_seed_keeps_the_watched_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+            h.watch(BOB).unwrap();
+        }
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[]).unwrap();
+        assert_eq!(h.watched().unwrap().len(), 2);
+
+        // Unwatching a configured address survives a restart with the same config.
+        h.unwatch(ALICE).unwrap();
+        drop(h);
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+        assert_eq!(h.watched().unwrap(), vec![BOB.to_string()]);
+        h.watch(ALICE).unwrap();
+        drop(h);
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[]).unwrap();
+        assert_eq!(
+            h.watched().unwrap().len(),
+            2,
+            "watching again clears the removal"
+        );
+    }
+
+    #[test]
+    fn records_round_trip_exactly_and_pack_small() {
+        let raw = serde_json::json!({
+            "blockNumber": "19000000",
+            "timeStamp": "1704067211",
+            "hash": "0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060",
+            "from": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+            "to": "",
+            "value": "0",
+            "input": "0x",
+            "isError": "0",
+            "nonce": "007",
+            "gas": "0x0",
+            "functionName": "transfer(address _to, uint256 _value)",
+            "tokenValue": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+            "authorizationList": [{"chainId": "1", "yParity": 0, "nested": [true, false, null, 1.5, -3]}],
+            "someNewField": "0xABCD",
+        });
+        let Value::Object(record) = raw.clone() else {
+            unreachable!()
+        };
+        let mut buf = Vec::new();
+        encode_record(&record, &mut buf).unwrap();
+        assert_eq!(Value::Object(decode_record(&buf).unwrap()), raw);
+        assert!(
+            !buf.windows(10).any(|w| w == b"{\"chainId\""),
+            "a nested value is packed, not stored as JSON text"
+        );
+
+        // An Etherscan txlist row as it arrives: hashes and addresses dominate, and pack to bytes.
+        let row = serde_json::json!({
+            "blockNumber": "19000000", "timeStamp": "1704067211",
+            "hash": "0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060",
+            "nonce": "1234",
+            "blockHash": "0x2e9e5d5e3b0e2a6a3e1a0c6c1c7b8b3f5f4f7d9c1d0a6b4e7e3f2a1b0c9d8e7f",
+            "transactionIndex": "42", "from": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+            "to": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "value": "0", "gas": "65000",
+            "gasPrice": "21000000000", "isError": "0", "txreceipt_status": "1",
+            "input": "0xa9059cbb000000000000000000000000ab5801a7d398351b8be11c439e05c5b3259aec9b0000000000000000000000000000000000000000000000000000000005f5e100",
+            "contractAddress": "", "cumulativeGasUsed": "4012345", "gasUsed": "41309",
+            "confirmations": "1000000", "methodId": "0xa9059cbb",
+            "functionName": "transfer(address _to, uint256 _value)",
+        });
+        let Value::Object(row) = row.clone() else {
+            unreachable!()
+        };
+        buf.clear();
+        encode_record(&row, &mut buf).unwrap();
+        let json_len = serde_json::to_string(&row).unwrap().len();
+        assert!(
+            buf.len() * 2 < json_len,
+            "{} bytes packed against {json_len} as JSON",
+            buf.len()
+        );
+    }
+
+    #[test]
+    fn a_row_whose_blocknumber_disagrees_with_its_key_is_refused() {
+        let (_d, h) = history();
+        let mut r = tx(10, 0);
+        r.block = 11;
+        assert!(h.insert(Action::TxList, ALICE, &[r]).is_err());
+    }
+
+    #[test]
+    fn addresses_are_matched_case_insensitively_but_a_bad_checksum_is_refused() {
+        let (_d, h) = history();
+        h.insert(Action::TxList, &ALICE.to_lowercase(), &[tx(5, 0)])
+            .unwrap();
+        h.mark_covered(Action::TxList, ALICE, 0, 10).unwrap();
+        let a = respond(
+            Some(&h),
+            &params(&[
+                ("module", "account"),
+                ("action", "txlist"),
+                ("address", ALICE),
+                ("endblock", "10"),
+            ]),
+        );
+        assert_eq!(hashes(&a).len(), 1, "{a}");
+        assert!(parse_address("0xD8dA6BF26964aF9D7eEd9e03E53415D37aA96045").is_err());
+    }
+
+    #[test]
+    fn config_validation() {
+        let ok = AddressHistoryConfig {
+            addresses: vec![ALICE.into()],
+            start_block: None,
+            end_block: None,
+            poll_interval: None,
+        };
+        ok.validate().unwrap();
+        assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);
+        let bad = |c: AddressHistoryConfig| assert!(c.validate().is_err(), "{c:?}");
+        bad(AddressHistoryConfig {
+            addresses: vec![],
+            ..ok.clone()
+        });
+        bad(AddressHistoryConfig {
+            addresses: vec![ALICE.into(), ALICE.to_lowercase()],
+            ..ok.clone()
+        });
+        bad(AddressHistoryConfig {
+            start_block: Some(10),
+            end_block: Some(5),
+            ..ok.clone()
+        });
+        bad(AddressHistoryConfig {
+            poll_interval: Some("0s".into()),
+            ..ok.clone()
+        });
+    }
+
+    fn open_ended(h: &AddressHistory) -> Answer {
+        h.page(
+            Action::TxList,
+            &PageRequest {
+                end_block: None,
+                ..req(0, 0, 1, 10)
+            },
+        )
+        .unwrap()
+    }
+
+    /// An absent `endblock` means up to the head, and coverage short of the head is incomplete,
+    /// not a shorter history.
+    #[test]
+    fn an_absent_endblock_needs_coverage_through_the_head() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 99).unwrap();
+        assert!(
+            matches!(open_ended(&h), Answer::Incomplete(_)),
+            "no head, no end"
+        );
+        h.set_head(200).unwrap();
+        assert!(matches!(open_ended(&h), Answer::Incomplete(_)));
+        h.mark_covered(Action::TxList, ALICE, 101, 200).unwrap();
+        assert!(
+            matches!(open_ended(&h), Answer::Incomplete(_)),
+            "a gap at 100"
+        );
+        h.mark_covered(Action::TxList, ALICE, 100, 100).unwrap();
+        assert_eq!(open_ended(&h), Answer::Rows(vec![]));
+    }
+
+    #[test]
+    fn a_range_starting_past_the_head_is_incomplete_not_empty() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 100).unwrap();
+        h.set_head(100).unwrap();
+        assert!(matches!(
+            h.page(Action::TxList, &req(150, 99_999_999, 1, 10))
+                .unwrap(),
+            Answer::Incomplete(_)
+        ));
+        assert_eq!(
+            h.page(Action::TxList, &req(50, 40, 1, 10)).unwrap(),
+            Answer::Rows(vec![]),
+            "an endblock before the startblock asks for nothing"
+        );
+    }
+
+    /// A row stored without coverage (a fetch interrupted, or one whose span a reorg cut) must not
+    /// survive a reorg and resurface once the range is covered again.
+    #[test]
+    fn a_reorg_drops_rows_that_had_no_coverage() {
+        let (_d, h) = history();
+        h.insert(Action::TxList, ALICE, &[tx(120, 0)]).unwrap();
+        h.invalidate_above(100).unwrap();
+        let g = h.generation().unwrap();
+        h.record(Action::TxList, ALICE, &[], (0, 150), g).unwrap();
+        assert_eq!(
+            h.page(Action::TxList, &req(0, 150, 1, 10)).unwrap(),
+            Answer::Rows(vec![])
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_straddles_a_reorg_or_unwatch_is_refused() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        h.invalidate_above(100).unwrap();
+        let err = h
+            .record(Action::TxList, ALICE, &[tx(90, 0)], (0, 100), g)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed during the fetch"),
+            "{err}"
+        );
+        assert!(h.coverage(Action::TxList, ALICE).unwrap().is_empty());
+
+        h.watch(BOB).unwrap();
+        let g = h.generation().unwrap();
+        h.unwatch(BOB).unwrap();
+        assert!(
+            h.record(Action::TxList, BOB, &[], (0, 1), g).is_err(),
+            "unwatched"
+        );
+        let g = h.generation().unwrap();
+        h.watch(BOB).unwrap();
+        assert!(
+            h.record(Action::TxList, BOB, &[tx(5, 0)], (6, 9), g)
+                .is_err(),
+            "a row outside the span it claims"
+        );
+        h.record(Action::TxList, BOB, &[tx(5, 0)], (0, 9), g)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_later_page_from_an_older_generation_is_incomplete() {
+        let (_d, h) = history();
+        let rows: Vec<Row> = (0..3).map(|i| tx(10 + i, 0)).collect();
+        let g = h.generation().unwrap();
+        h.record(Action::TxList, ALICE, &rows, (0, 20), g).unwrap();
+        let q = |page: &str, generation: Option<&str>| {
+            let mut p = vec![
+                ("module", "account"),
+                ("action", "txlist"),
+                ("address", ALICE),
+                ("startblock", "0"),
+                ("endblock", "20"),
+                ("offset", "2"),
+                ("page", page),
+            ];
+            if let Some(g) = generation {
+                p.push(("generation", g));
+            }
+            respond(Some(&h), &params(&p))
+        };
+        let first = q("1", None);
+        let seen = first["generation"].as_str().unwrap().to_string();
+        assert_eq!(hashes(&q("2", Some(&seen))).len(), 1);
+        // The reorg is refetched before page 2, so coverage is whole again and only the generation
+        // shows that page 1 was cut from rows that no longer exist.
+        h.invalidate_above(10).unwrap();
+        let g = h.generation().unwrap();
+        let refetched: Vec<Row> = (0..3).map(|i| tx(11 + i, 1)).collect();
+        h.record(Action::TxList, ALICE, &refetched, (11, 20), g)
+            .unwrap();
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(0, 20)]);
+        let second = q("2", Some(&seen));
+        assert!(
+            second["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn a_chainid_for_another_chain_is_unsupported() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 10).unwrap();
+        let q = |chain: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("chainid", chain),
+                    ("module", "account"),
+                    ("action", "txlist"),
+                    ("address", ALICE),
+                    ("endblock", "10"),
+                ]),
+            )
+        };
+        assert_eq!(q("1")["status"], "1");
+        for other in ["8453", "x"] {
+            let a = q(other);
+            assert!(
+                a["result"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("NUTHATCH_UNSUPPORTED:"),
+                "{other}: {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_varint_past_128_bits_is_refused() {
+        let mut max = Vec::new();
+        put_varint(&mut max, u128::MAX);
+        assert_eq!(take_varint(&mut max.as_slice()).unwrap(), u128::MAX);
+        let mut over = vec![0x80u8; 18];
+        over.push(0x04);
+        assert!(take_varint(&mut over.as_slice()).is_err());
+    }
+
+    /// Writes a rotki-mode nest holding about 10,000 rows into `$NUTHATCH_AH_FIXTURE`, for measuring
+    /// a real process: `NUTHATCH_AH_FIXTURE=/tmp/nest cargo test --lib write_measurement_fixture -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_measurement_fixture() {
+        let dir = std::path::PathBuf::from(std::env::var("NUTHATCH_AH_FIXTURE").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"rotki\"\nchain = \"mainnet\"\nchain_id = 1\n\
+                 rpc_urls = [\"https://ethereum-rpc.publicnode.com\"]\n\n\
+                 [address_history]\naddresses = [\"{ALICE}\", \"{BOB}\"]\n"
+            ),
+        )
+        .unwrap();
+        let store = Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
+        let h = AddressHistory::open(store, 1, &[ALICE.into(), BOB.into()]).unwrap();
+        for (who, action, n) in [
+            (ALICE, Action::TxList, 4_000u64),
+            (ALICE, Action::TokenTx, 3_000),
+            (ALICE, Action::TxListInternal, 1_000),
+            (BOB, Action::TxList, 2_000),
+        ] {
+            let rows: Vec<Row> = (0..n).map(|i| tx(18_000_000 + i * 97, i % 7)).collect();
+            h.insert(action, who, &rows).unwrap();
+            h.mark_covered(action, who, 0, 20_000_000).unwrap();
+        }
+        h.set_head(20_000_000).unwrap();
+    }
+}

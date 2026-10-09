@@ -6586,6 +6586,7 @@ mod tests {
             counter: None,
             nid: None,
             runtime_health: None,
+            address_history: None,
         }
     }
 
