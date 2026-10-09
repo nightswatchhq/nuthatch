@@ -86,26 +86,86 @@ impl<R: Rpc> Rpc for Counted<R> {
 }
 
 /// A block span a provider accepts per call, learned from its refusals.
-pub struct Window(AtomicU64);
+///
+/// A limit the provider states becomes a ceiling. A refusal that only looks range-shaped halves the
+/// span, and a run of successes doubles it back towards the ceiling, so one bad minute does not
+/// leave a backfill crawling for good. Any other error is not about the range and shrinks nothing.
+pub struct Window {
+    size: AtomicU64,
+    ceiling: AtomicU64,
+    streak: AtomicU64,
+}
+
+/// Successes at one span before it is tried doubled.
+const REGROW_AFTER: u64 = 32;
 
 impl Window {
     pub fn new(start: u64) -> Window {
-        Window(AtomicU64::new(start.max(1)))
+        Window {
+            size: AtomicU64::new(start.max(1)),
+            ceiling: AtomicU64::new(start.max(1)),
+            streak: AtomicU64::new(0),
+        }
     }
 
     pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.size.load(Ordering::Relaxed)
     }
 
-    /// Shrink after a refusal: to the limit the error names, if it names one below the current
-    /// span, else by half.
-    fn shrink(&self, error: &str) -> u64 {
+    /// Shrink after a refusal, returning the new span, or `None` when the error says nothing about
+    /// the range and the call should fail as it is.
+    fn shrink(&self, error: &str) -> Option<u64> {
         let now = self.get();
-        let named = stated_limit(error).filter(|n| *n >= 1 && *n < now);
-        let next = named.unwrap_or(now / 2).max(1);
-        self.0.store(next, Ordering::Relaxed);
-        next
+        self.streak.store(0, Ordering::Relaxed);
+        let next = match stated_limit(error).filter(|n| *n >= 1) {
+            Some(n) => {
+                self.ceiling.fetch_min(n, Ordering::Relaxed);
+                if n < now {
+                    n
+                } else {
+                    now / 2
+                }
+            }
+            None if range_shaped(error) => now / 2,
+            None => return None,
+        }
+        .max(1);
+        self.size.store(next, Ordering::Relaxed);
+        Some(next)
     }
+
+    fn succeeded(&self) {
+        if self.streak.fetch_add(1, Ordering::Relaxed) + 1 < REGROW_AFTER {
+            return;
+        }
+        self.streak.store(0, Ordering::Relaxed);
+        let ceiling = self.ceiling.load(Ordering::Relaxed);
+        let now = self.get();
+        self.size.store(
+            now.saturating_mul(2).min(ceiling).max(now),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Whether an error reads like a span the provider would not serve, as opposed to one it could not
+/// reach or would not authorise.
+fn range_shaped(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "range",
+        "limit",
+        "too many",
+        "too large",
+        "exceed",
+        "response size",
+        "timeout",
+        "timed out",
+        "504",
+        "more than",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
 }
 
 /// The block-span limit an error message states, in the forms providers use:
@@ -147,20 +207,27 @@ async fn ranged<R: Rpc>(
         let span = window.get();
         let end = start.saturating_add(span - 1).min(to);
         match rpc.call(method, params(start, end)).await {
-            Ok(Value::Array(items)) if items.len() >= SUSPICIOUSLY_FULL && end > start => {
-                window.shrink("");
+            Ok(Value::Array(items)) if items.len() >= SUSPICIOUSLY_FULL => {
+                if end == start {
+                    bail!(
+                        "{method} at block {start} answered {} items, which may be a truncated page",
+                        items.len()
+                    );
+                }
+                window.shrink("too many results");
             }
             Ok(Value::Array(items)) => {
+                window.succeeded();
                 out.extend(items);
                 start = end + 1;
             }
             Ok(other) => bail!("{method} [{start}, {end}] answered a non-list: {other}"),
-            Err(e) if end > start => {
-                let next = window.shrink(&format!("{e:#}"));
-                tracing::debug!(
+            Err(e) if end > start => match window.shrink(&format!("{e:#}")) {
+                Some(next) => tracing::debug!(
                     "{method} [{start}, {end}] refused, retrying in spans of {next}: {e:#}"
-                );
-            }
+                ),
+                None => return Err(e).with_context(|| format!("{method} [{start}, {end}]")),
+            },
             Err(e) => {
                 return Err(e).with_context(|| format!("{method} at block {start}"));
             }
@@ -212,6 +279,16 @@ struct Pending {
     timestamps: Mutex<Vec<(u64, u64)>>,
 }
 
+/// A normal transaction a trace root names: its hash, its block, whether the watched address sent
+/// it, and whether it failed, which pre-Byzantium receipts do not say.
+#[derive(Debug, Clone)]
+struct TxRef {
+    hash: String,
+    block: u64,
+    outgoing: bool,
+    failed: bool,
+}
+
 /// What one window found for one address, ready to record.
 #[derive(Debug, Default)]
 pub struct Found {
@@ -219,6 +296,9 @@ pub struct Found {
     pub tokentx: Vec<Row>,
     pub tokennfttx: Vec<Row>,
     pub token1155tx: Vec<Row>,
+    /// Hydrated transactions and block timestamps the window fetched, written with its rows.
+    cached_txs: Vec<CachedTx>,
+    cached_timestamps: Vec<(u64, u64)>,
 }
 
 /// Discovery over a main endpoint pool (logs, hydration, nonces) and a trace one, which may be the
@@ -228,9 +308,6 @@ pub struct Discoverer<M, T> {
     pub trace: T,
     pub trace_window: Window,
     pub log_window: Window,
-    /// Every this-many empty trace windows, one is checked against `trace_block`; the first always.
-    pub empty_sample: u64,
-    empties: AtomicU64,
 }
 
 impl<M: Rpc, T: Rpc> Discoverer<M, T> {
@@ -240,8 +317,6 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             trace,
             trace_window: Window::new(100_000),
             log_window: Window::new(100_000),
-            empty_sample: 8,
-            empties: AtomicU64::new(0),
         }
     }
 
@@ -267,13 +342,13 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         for log in &logs {
             transfer_rows(log, &a, &timestamps, &mut found)?;
         }
-        history.cache_txs(&pending.txs.into_inner().expect("pending lock"))?;
-        history.cache_block_timestamps(&pending.timestamps.into_inner().expect("pending lock"))?;
+        found.cached_txs = pending.txs.into_inner().expect("pending lock");
+        found.cached_timestamps = pending.timestamps.into_inner().expect("pending lock");
         Ok(found)
     }
 
-    /// Hashes of root frames from or to `a`, with their block.
-    async fn normal_transactions(&self, a: &str, from: u64, to: u64) -> Result<Vec<(String, u64)>> {
+    /// The root frames from or to `a`.
+    async fn normal_transactions(&self, a: &str, from: u64, to: u64) -> Result<Vec<TxRef>> {
         let mut frames = Vec::new();
         for side in ["fromAddress", "toAddress"] {
             frames.extend(
@@ -286,7 +361,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         if frames.is_empty() {
             self.check_empty_traces(from, to).await?;
         }
-        let mut roots: BTreeMap<String, (u64, bool)> = BTreeMap::new();
+        let mut roots: BTreeMap<String, TxRef> = BTreeMap::new();
         for f in &frames {
             let root = f
                 .get("traceAddress")
@@ -306,40 +381,45 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 continue;
             }
             let block = hex_u64(f.get("blockNumber").unwrap_or(&Value::Null))?;
-            let e = roots
-                .entry(hash.to_ascii_lowercase())
-                .or_insert((block, false));
-            e.1 |= outgoing;
+            let hash = hash.to_ascii_lowercase();
+            let e = roots.entry(hash.clone()).or_insert(TxRef {
+                hash,
+                block,
+                outgoing: false,
+                failed: f.get("error").is_some_and(|e| !e.is_null()),
+            });
+            e.outgoing |= outgoing;
         }
-        let outgoing = roots.values().filter(|(_, out)| *out).count() as u64;
+        let outgoing = roots.values().filter(|r| r.outgoing).count() as u64;
         self.check_nonce(a, from, to, outgoing).await?;
-        Ok(roots.into_iter().map(|(h, (b, _))| (h, b)).collect())
+        Ok(roots.into_values().collect())
     }
 
     /// An empty answer from a filter is only believed if the trace source demonstrably has traces
     /// for the range: some providers answer `[]` for blocks they never traced.
     async fn check_empty_traces(&self, from: u64, to: u64) -> Result<()> {
-        let n = self.empties.fetch_add(1, Ordering::Relaxed);
-        if !n.is_multiple_of(self.empty_sample.max(1)) {
-            return Ok(());
-        }
-        let probe = from + (to - from) / 2;
-        let traced = self
-            .trace
-            .call("trace_block", json!([format!("0x{probe:x}")]))
-            .await
-            .context("trace_block, checking an empty trace_filter window")?;
-        if traced.as_array().is_some_and(|t| !t.is_empty()) {
-            return Ok(());
-        }
-        let count = self
-            .main
-            .call(
-                "eth_getBlockTransactionCountByNumber",
-                json!([format!("0x{probe:x}")]),
-            )
-            .await?;
-        if hex_u64(&count)? > 0 {
+        // Every empty window is probed, a block with transactions at a time, so a refused probe
+        // cannot be skipped on the retry.
+        let mid = from + (to - from) / 2;
+        for probe in [mid, from, to] {
+            let count = self
+                .main
+                .call(
+                    "eth_getBlockTransactionCountByNumber",
+                    json!([format!("0x{probe:x}")]),
+                )
+                .await?;
+            if hex_u64(&count)? == 0 {
+                continue;
+            }
+            let traced = self
+                .trace
+                .call("trace_block", json!([format!("0x{probe:x}")]))
+                .await
+                .context("trace_block, checking an empty trace_filter window")?;
+            if traced.as_array().is_some_and(|t| !t.is_empty()) {
+                return Ok(());
+            }
             bail!(
                 "the trace source returned no traces for block {probe}, which holds transactions; \
                  not recording [{from}, {to}] as covered"
@@ -401,7 +481,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .await?;
             for log in got {
                 if log.get("removed").and_then(Value::as_bool) == Some(true) {
-                    continue;
+                    bail!("a removed log in finalized range [{from}, {to}]: {log}");
                 }
                 let key = (
                     str_field(&log, "transactionHash")?.to_ascii_lowercase(),
@@ -473,10 +553,10 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     async fn hydrate_one(
         &self,
         history: &AddressHistory,
-        hash: String,
-        block: u64,
+        r: TxRef,
         pending: &Pending,
     ) -> Result<Map<String, Value>> {
+        let hash = r.hash;
         let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x"))?;
         if let Some(r) = history.cached_tx(&key)? {
             return Ok(r);
@@ -484,12 +564,25 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         let (tx, receipt, ts) = futures::try_join!(
             self.main.call("eth_getTransactionByHash", json!([hash])),
             self.main.call("eth_getTransactionReceipt", json!([hash])),
-            self.block_timestamp(history, block, pending)
+            self.block_timestamp(history, r.block, pending)
         )?;
         if tx.is_null() || receipt.is_null() {
             bail!("{hash} has no transaction or receipt at the main endpoint");
         }
-        let record = txlist_record(&tx, &receipt, ts)?;
+        // Traces and the main endpoint are separate providers: refuse a transaction they place
+        // differently rather than record a mixture.
+        let tx_block = hex_u64(tx.get("blockNumber").unwrap_or(&Value::Null))?;
+        let tx_block_hash = str_field(&tx, "blockHash")?;
+        if tx_block != r.block
+            || !str_field(&receipt, "blockHash")?.eq_ignore_ascii_case(tx_block_hash)
+        {
+            bail!(
+                "{hash}: the trace source puts it in block {}, the main endpoint in {tx_block}, and \
+                 its receipt in another block; not recording a mixture",
+                r.block
+            );
+        }
+        let record = txlist_record(&tx, &receipt, ts, r.failed)?;
         pending
             .txs
             .lock()
@@ -503,11 +596,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     async fn hydrate(
         &self,
         history: &AddressHistory,
-        txs: &[(String, u64)],
+        txs: &[TxRef],
         pending: &Pending,
     ) -> Result<Vec<Row>> {
         let records: Vec<Result<Map<String, Value>>> = futures::stream::iter(txs.iter().cloned())
-            .map(|(hash, block)| self.hydrate_one(history, hash, block, pending))
+            .map(|r| self.hydrate_one(history, r, pending))
             .buffer_unordered(HYDRATE_CONCURRENCY)
             .collect()
             .await;
@@ -536,8 +629,14 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
 
 /// The `txlist` fields Etherscan prints, in its order, from a transaction and its receipt.
 /// `functionName` needs the callee's ABI and `confirmations` changes by the block, so neither is
-/// kept. `gasPrice` is what the sender paid: the receipt's effective price.
-pub fn txlist_record(tx: &Value, receipt: &Value, timestamp: u64) -> Result<Map<String, Value>> {
+/// kept. `gasPrice` is what the sender paid: the receipt's effective price. A receipt from before
+/// Byzantium has no status, so whether it failed comes from its trace.
+pub fn txlist_record(
+    tx: &Value,
+    receipt: &Value,
+    timestamp: u64,
+    trace_failed: bool,
+) -> Result<Map<String, Value>> {
     let dec = |v: &Value, k: &str| -> Result<String> { decimal(str_field(v, k)?) };
     let status = receipt.get("status").and_then(Value::as_str);
     let input = str_field(tx, "input")?.to_string();
@@ -590,14 +689,11 @@ pub fn txlist_record(tx: &Value, receipt: &Value, timestamp: u64) -> Result<Map<
         },
     );
     put("gasUsed", dec(receipt, "gasUsed")?);
-    put(
-        "isError",
-        if status.is_some_and(|s| decimal(s).is_ok_and(|d| d == "0")) {
-            "1".into()
-        } else {
-            "0".into()
-        },
-    );
+    let failed = match status {
+        Some(s) => decimal(s)? == "0",
+        None => trace_failed,
+    };
+    put("isError", if failed { "1".into() } else { "0".into() });
     Ok(r)
 }
 
@@ -620,6 +716,9 @@ fn transfer_rows(
     let block = hex_u64(log.get("blockNumber").unwrap_or(&Value::Null))?;
     let tx_index = hex_u64(log.get("transactionIndex").unwrap_or(&Value::Null))?;
     let log_index = hex_u64(log.get("logIndex").unwrap_or(&Value::Null))?;
+    if log_index >= 1 << 47 {
+        bail!("log index {log_index} is past the row key's room");
+    }
     let ts = timestamps
         .get(&block)
         .ok_or_else(|| anyhow!("no timestamp for block {block}"))?;
@@ -689,6 +788,12 @@ fn transfer_rows(
         }
         (Some(TRANSFER_BATCH), 4) => {
             let (ids, values) = batch_arrays(data)?;
+            if ids.len() > 1 << 16 {
+                bail!(
+                    "a TransferBatch of {} ids is past the row key's room",
+                    ids.len()
+                );
+            }
             for (i, (id, value)) in ids.iter().zip(&values).enumerate() {
                 let mut r = base()?;
                 r.insert("from".into(), Value::String(party(topics[2])));
@@ -760,6 +865,8 @@ pub fn record(
     found: Found,
     generation: u64,
 ) -> Result<()> {
+    history.cache_txs(&found.cached_txs)?;
+    history.cache_block_timestamps(&found.cached_timestamps)?;
     for (action, rows) in [
         (Action::TxList, found.txlist),
         (Action::TokenTx, found.tokentx),
@@ -792,13 +899,29 @@ mod tests {
         );
         assert_eq!(stated_limit("timeout"), None);
         let w = Window::new(100_000);
-        assert_eq!(w.shrink("currently limited to 100 blocks"), 100);
-        assert_eq!(w.shrink("timeout"), 50);
+        assert_eq!(w.shrink("currently limited to 100 blocks"), Some(100));
+        assert_eq!(w.shrink("timeout"), Some(50));
         assert_eq!(
             w.shrink("limited to 500 blocks"),
-            25,
-            "a stated limit above now is ignored"
+            Some(25),
+            "a stated limit above now halves instead"
         );
+        assert_eq!(
+            w.shrink("401 Unauthorized: invalid API key"),
+            None,
+            "not about the range"
+        );
+        assert_eq!(w.get(), 25);
+
+        // Successes grow the span back, never past the stated ceiling.
+        for _ in 0..REGROW_AFTER {
+            w.succeeded();
+        }
+        assert_eq!(w.get(), 50);
+        for _ in 0..3 * REGROW_AFTER {
+            w.succeeded();
+        }
+        assert_eq!(w.get(), 100, "capped at the stated limit");
     }
 
     /// A provider that silently truncates at 10,000 results: a span answering that many is split
@@ -849,7 +972,7 @@ mod tests {
             "status": "0x0", "gasUsed": "0x5208", "cumulativeGasUsed": "0x10",
             "effectiveGasPrice": "0x47a9e8d5c", "contractAddress": "0xBEEF",
         });
-        let r = txlist_record(&tx, &receipt, 1_693_067_255).unwrap();
+        let r = txlist_record(&tx, &receipt, 1_693_067_255, false).unwrap();
         assert_eq!(r["blockNumber"], "18000030");
         assert_eq!(r["nonce"], "71");
         assert_eq!(r["to"], "", "a creation has an empty to");
@@ -859,6 +982,14 @@ mod tests {
         assert_eq!(r["txreceipt_status"], "0");
         assert_eq!(r["methodId"], "0x60806040");
         assert_eq!(r["timeStamp"], "1693067255");
+
+        // Before Byzantium a receipt has no status, and a failure is the trace's to report.
+        let mut old = receipt.clone();
+        old.as_object_mut().unwrap().remove("status");
+        let r = txlist_record(&tx, &old, 1, true).unwrap();
+        assert_eq!(r["isError"], "1");
+        assert_eq!(r["txreceipt_status"], "");
+        assert_eq!(txlist_record(&tx, &old, 1, false).unwrap()["isError"], "0");
     }
 
     type Answer = dyn Fn(&str, &Value) -> Result<Value> + Send + Sync;
@@ -900,7 +1031,7 @@ mod tests {
 
     fn receipt_json() -> Value {
         json!({"status": "0x1", "gasUsed": "0x5208", "cumulativeGasUsed": "0x5208",
-               "effectiveGasPrice": "0x1", "contractAddress": null})
+               "effectiveGasPrice": "0x1", "contractAddress": null, "blockHash": "0xbb"})
     }
 
     /// A chain where `A` sends one transaction at block 150 (nonce 0 -> 1), with a trace source
@@ -989,7 +1120,8 @@ mod tests {
             "learned from the log source's refusal"
         );
 
-        // Hydrated once: a second pass over the window asks for no transaction again.
+        // Hydrated once: after the window is recorded, a second pass asks for no transaction again.
+        record(&h, A, (0, 499), found, h.generation().unwrap()).unwrap();
         let before = d.main.asked.lock().unwrap().len();
         d.discover(&h, A, 0, 499).await.unwrap();
         let again: Vec<String> = d.main.asked.lock().unwrap()[before..]
@@ -1001,6 +1133,24 @@ mod tests {
                 .iter()
                 .any(|m| m == "eth_getTransactionByHash" || m == "eth_getTransactionReceipt"),
             "{again:?}"
+        );
+    }
+
+    /// Two providers that disagree about where a transaction is give no row, not a mixture.
+    #[tokio::test]
+    async fn a_transaction_the_providers_place_differently_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, trace) = chain(false);
+        let main = script(move |m, p| match m {
+            "eth_getTransactionByHash" => Ok(tx_json(p[0].as_str().unwrap(), 151, 0)),
+            _ => (main.answer)(m, p),
+        });
+        let d = Discoverer::new(main, trace);
+        let err = d.discover(&h, A, 100, 199).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not recording a mixture"),
+            "{err:#}"
         );
     }
 

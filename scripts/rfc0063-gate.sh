@@ -21,7 +21,13 @@ TO=20000000
 PORT=${PORT:-18364}
 URL="http://127.0.0.1:$PORT"
 
-mask() { sed -e "s#${MAIN_RPC}#<main-rpc>#g" -e "s#${TRACE_RPC}#<trace-rpc>#g"; }
+mask() { # literal replacement: a URL is not a safe regular expression
+  local line
+  while IFS= read -r line; do
+    line=${line//"$MAIN_RPC"/<main-rpc>}
+    printf '%s\n' "${line//"$TRACE_RPC"/<trace-rpc>}"
+  done
+}
 
 WORK=$(mktemp -d)
 trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
