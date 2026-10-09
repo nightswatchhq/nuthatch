@@ -972,6 +972,77 @@ pub(crate) mod tests {
         );
     }
 
+    /// A reward is computed only from a body that hashes to the verified header: an extra
+    /// transaction, receipt or ommer the RPC slips in is refused, not counted.
+    #[tokio::test]
+    async fn a_reward_is_refused_unless_the_body_matches_the_header() {
+        let chain = synthetic(0, 0);
+        let block = &verify(&published(&chain), 0, 0, chain[0].0.hash_slow()).unwrap()[0];
+        let honest = chain_rpc(0);
+        assert_eq!(
+            verified_reward(&honest, block).await.unwrap().to_string(),
+            "5000000000000000000",
+            "block 0: the frontier issuance and nothing else"
+        );
+        let tx = json!({"type": "0x0", "nonce": "0x0", "gasPrice": "0x9", "gas": "0x5208",
+            "to": format!("{PAID:#x}"), "value": "0x0", "input": "0x", "v": "0x1b", "r": "0x1",
+            "s": "0x1", "hash": format!("{:#x}", B256::repeat_byte(5)),
+            "from": format!("{MINER:#x}"), "blockHash": format!("{:#x}", block.hash),
+            "blockNumber": "0x0", "transactionIndex": "0x0"});
+        let receipt = json!({"type": "0x0", "status": "0x1", "cumulativeGasUsed": "0x5208",
+            "logs": [], "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": format!("{:#x}", B256::repeat_byte(5)), "transactionIndex": "0x0",
+            "blockHash": format!("{:#x}", block.hash), "blockNumber": "0x0", "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x9", "from": format!("{MINER:#x}"),
+            "to": format!("{PAID:#x}"), "contractAddress": null});
+        let uncle = serde_json::to_value(Header::default()).unwrap();
+        type Patch = Box<dyn Fn(&str, Value) -> Value + Send + Sync>;
+        let cases: Vec<(&str, Patch)> = vec![
+            ("transactions do not hash", {
+                let tx = tx.clone();
+                Box::new(move |m, mut v| {
+                    if m == "eth_getBlockByHash" {
+                        v["transactions"] = json!([tx]);
+                    }
+                    v
+                })
+            }),
+            ("receipts do not hash", {
+                let receipt = receipt.clone();
+                Box::new(move |m, v| {
+                    if m == "eth_getBlockReceipts" {
+                        json!([receipt])
+                    } else {
+                        v
+                    }
+                })
+            }),
+            ("ommers do not hash", {
+                let uncle = uncle.clone();
+                Box::new(move |m, mut v| match m {
+                    "eth_getBlockByHash" => {
+                        v["uncles"] = json!([format!("{:#x}", B256::repeat_byte(6))]);
+                        v
+                    }
+                    "eth_getUncleByBlockHashAndIndex" => uncle.clone(),
+                    _ => v,
+                })
+            }),
+        ];
+        for (want, patch) in cases {
+            let inner = chain_rpc(0);
+            let rpc = Fake::new(move |m, p| {
+                let v = match m {
+                    "eth_getUncleByBlockHashAndIndex" => Value::Null,
+                    _ => (inner.answer)(m, p)?,
+                };
+                Ok(patch(m, v))
+            });
+            let err = verified_reward(&rpc, block).await.unwrap_err();
+            assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
+        }
+    }
+
     /// A partition the mirror lacks fails; a cached copy that no longer verifies, as an interrupted
     /// or damaged download would leave it, is fetched again; the cache keeps within its budget.
     #[tokio::test]

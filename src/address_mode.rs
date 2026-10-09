@@ -1326,5 +1326,26 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        // Published late, the partition is used, but only once its last block is final for the nest.
+        build(
+            &chain_rpc(2 * SPAN + 5),
+            mirror.path().to_str().unwrap(),
+            1,
+            (SPAN, 2 * SPAN - 1),
+            4,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        d.catch_up(&state, 2 * SPAN - 2).await;
+        assert_eq!(history.header_coverage().unwrap(), covered);
+        assert_eq!(d.main.calls().get("eth_getBlockByNumber"), Some(&2));
+        d.catch_up(&state, 2 * SPAN - 1).await;
+        assert_eq!(history.header_coverage().unwrap(), vec![(5, 2 * SPAN - 1)]);
+        assert_eq!(
+            history.coverage(Action::MinedBlocks, &miner).unwrap(),
+            vec![(5, 2 * SPAN - 1)]
+        );
     }
 }
