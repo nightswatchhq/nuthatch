@@ -1792,7 +1792,7 @@ mod tests {
             _ => (main.answer)(m, p),
         });
         let d = Discoverer::new(main, trace);
-        let err = d.discover(&h, A, 0, 63).await.unwrap_err();
+        let err = d.discover_now(&h, A, 0, 63).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("not a 32-byte topic"),
             "{err:#}"
