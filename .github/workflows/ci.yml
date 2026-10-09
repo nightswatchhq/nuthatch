@@ -1032,7 +1032,7 @@ jobs:
           chmod +x bin/nuthatch
           bash .github/workflows/tip-lag.sh || {
             echo "::warning::tip lag over its ceiling; measuring once more on a fresh server"
-            bash .github/workflows/tip-lag.sh
+            PORT=8291 RPC_PORT=8549 bash .github/workflows/tip-lag.sh
           }
       - name: upload tip lag report
         if: always()
