@@ -1568,10 +1568,15 @@ mod tests {
             })
         });
         let d = Discoverer::new(main, trace);
-        let roots = d.normal_transactions(A, 400, 499).await.unwrap();
+        let (roots, internal) = d.normal_transactions(A, 400, 499).await.unwrap();
         let hashes: Vec<&str> = roots.iter().map(|r| r.hash.as_str()).collect();
         assert_eq!(hashes, ["0xcc"]);
         assert!(!roots[0].outgoing);
+        assert_eq!(
+            internal,
+            ["0xdd"],
+            "the factory's creation is an internal transaction"
+        );
     }
 
     /// Two providers that disagree about where a transaction is give no row, not a mixture.
