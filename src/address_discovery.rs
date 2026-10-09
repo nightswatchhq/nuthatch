@@ -1168,6 +1168,36 @@ mod tests {
         );
     }
 
+    /// A probe block that really is empty proves nothing either way, so the next one is tried.
+    #[tokio::test]
+    async fn an_empty_probe_block_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, _) = chain(false);
+        // Blocks 1,000 to 1,099 have no transactions except the first; only it has traces.
+        let main = script(move |m, p| match m {
+            "eth_getBlockTransactionCountByNumber" => Ok(json!(if hex_u64(&p[0])? == 1_000 {
+                "0x3"
+            } else {
+                "0x0"
+            })),
+            _ => (main.answer)(m, p),
+        });
+        let trace = script(|m, p| match m {
+            "trace_filter" => Ok(json!([])),
+            "trace_block" => Ok(if hex_u64(&p[0])? == 1_000 {
+                json!([{"x": 1}])
+            } else {
+                json!([])
+            }),
+            other => bail!("unexpected {other}"),
+        });
+        let d = Discoverer::new(main, trace);
+        d.discover(&h, A, 1_000, 1_099)
+            .await
+            .expect("the empty midpoint is skipped and block 1,000 has traces");
+    }
+
     #[tokio::test]
     async fn a_trace_source_with_no_traces_is_not_believed() {
         let dir = tempfile::tempdir().unwrap();
