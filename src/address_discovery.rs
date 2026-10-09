@@ -270,6 +270,28 @@ fn padded(address: &str) -> String {
     format!("0x{:0>64}", address.trim_start_matches("0x"))
 }
 
+/// Whether `trace_filter` with `side` set to `a` would return this frame: `fromAddress` matches a
+/// call's or creation's sender and a selfdestructing contract; `toAddress` a call's callee, a
+/// creation's new contract and a selfdestruct's beneficiary.
+fn frame_side_is(f: &Value, side: &str, a: &str) -> bool {
+    let action = f.get("action").unwrap_or(&Value::Null);
+    let result = f.get("result").unwrap_or(&Value::Null);
+    let keys: &[(&Value, &str)] = if side == "fromAddress" {
+        &[(action, "from"), (action, "address")]
+    } else {
+        &[
+            (action, "to"),
+            (result, "address"),
+            (action, "refundAddress"),
+        ]
+    };
+    keys.iter().any(|(v, k)| {
+        v.get(*k)
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case(a))
+    })
+}
+
 /// Cache entries a window fetched, committed once at its end rather than one commit per fetch.
 type CachedTx = (Vec<u8>, Map<String, Value>);
 
@@ -350,16 +372,21 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     /// The root frames from or to `a`.
     async fn normal_transactions(&self, a: &str, from: u64, to: u64) -> Result<Vec<TxRef>> {
         let mut frames = Vec::new();
+        let mut empty_sides = Vec::new();
         for side in ["fromAddress", "toAddress"] {
-            frames.extend(
-                ranged(&self.trace, &self.trace_window, from, to, "trace_filter", |s, e| {
-                    json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}"), side: [a] }])
-                })
-                .await?,
-            );
+            let got = ranged(&self.trace, &self.trace_window, from, to, "trace_filter", |s, e| {
+                json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}"), side: [a] }])
+            })
+            .await?;
+            if got.is_empty() {
+                empty_sides.push(side);
+            }
+            frames.extend(got);
         }
-        if frames.is_empty() {
-            self.check_empty_traces(from, to).await?;
+        // Each side is judged on its own: rows from one say nothing about whether the other's
+        // empty answer is true.
+        if !empty_sides.is_empty() {
+            self.check_empty_traces(a, &empty_sides, from, to).await?;
         }
         let mut roots: BTreeMap<String, TxRef> = BTreeMap::new();
         for f in &frames {
@@ -395,10 +422,12 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         Ok(roots.into_values().collect())
     }
 
-    /// An empty answer from a filter is only believed if the trace source demonstrably has traces
-    /// for the range: some providers answer `[]` for blocks they never traced.
-    async fn check_empty_traces(&self, from: u64, to: u64) -> Result<()> {
-        // Every empty window is probed, a block with transactions at a time, so a refused probe
+    /// `sides` are the `trace_filter` directions that answered nothing over `[from, to]`. Each is
+    /// believed only if the trace source demonstrably has traces for the range (some providers
+    /// answer `[]` for blocks they never traced) and none of a probe block's frames touches `a` on
+    /// that side, which the filter would have had to return.
+    async fn check_empty_traces(&self, a: &str, sides: &[&str], from: u64, to: u64) -> Result<()> {
+        // Every empty side is probed, a block with transactions at a time, so a refused probe
         // cannot be skipped on the retry.
         let mid = from + (to - from) / 2;
         for probe in [mid, from, to] {
@@ -417,13 +446,21 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 .call("trace_block", json!([format!("0x{probe:x}")]))
                 .await
                 .context("trace_block, checking an empty trace_filter window")?;
-            if traced.as_array().is_some_and(|t| !t.is_empty()) {
-                return Ok(());
+            let Some(block_frames) = traced.as_array().filter(|t| !t.is_empty()) else {
+                bail!(
+                    "the trace source returned no traces for block {probe}, which holds \
+                     transactions; not recording [{from}, {to}] as covered"
+                );
+            };
+            for side in sides {
+                if block_frames.iter().any(|f| frame_side_is(f, side, a)) {
+                    bail!(
+                        "trace_filter {side} answered nothing for [{from}, {to}], but block \
+                         {probe} has a frame {side} {a}; not recording the window as covered"
+                    );
+                }
             }
-            bail!(
-                "the trace source returned no traces for block {probe}, which holds transactions; \
-                 not recording [{from}, {to}] as covered"
-            );
+            return Ok(());
         }
         Ok(())
     }
@@ -474,11 +511,15 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         ];
         let mut seen = BTreeSet::new();
         let mut logs = Vec::new();
+        let mut empty = Vec::new();
         for topics in filters {
             let got = ranged(&self.main, &self.log_window, from, to, "eth_getLogs", |s, e| {
                 json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}"), "topics": topics }])
             })
             .await?;
+            if got.is_empty() {
+                empty.push(topics.clone());
+            }
             for log in got {
                 if log.get("removed").and_then(Value::as_bool) == Some(true) {
                     bail!("a removed log in finalized range [{from}, {to}]: {log}");
@@ -492,7 +533,52 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 }
             }
         }
+        if !empty.is_empty() {
+            self.check_empty_logs(&who, &empty, from, to).await?;
+        }
         Ok(logs)
+    }
+
+    /// Each positional filter that answered nothing is checked against the same event signatures
+    /// in a probe block with no address position: a log there with the address where the filter
+    /// looked means the filter's empty answer was false. Rows from the filter at the other
+    /// position say nothing about this one.
+    async fn check_empty_logs(&self, who: &str, empty: &[Value], from: u64, to: u64) -> Result<()> {
+        let probe = from + (to - from) / 2;
+        let mut probed: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for topics in empty {
+            let sig = topics[0].clone();
+            let position = topics.as_array().map_or(0, |t| t.len().saturating_sub(1));
+            let key = sig.to_string();
+            if !probed.contains_key(&key) {
+                let got = self
+                    .main
+                    .call(
+                        "eth_getLogs",
+                        json!([{ "fromBlock": format!("0x{probe:x}"), "toBlock": format!("0x{probe:x}"), "topics": [sig] }]),
+                    )
+                    .await
+                    .context("eth_getLogs, checking an empty positional filter")?;
+                let got = got
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?;
+                probed.insert(key.clone(), got);
+            }
+            let hit = probed[&key].iter().any(|log| {
+                log.get("topics")
+                    .and_then(|t| t.get(position))
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.eq_ignore_ascii_case(who))
+            });
+            if hit {
+                bail!(
+                    "eth_getLogs {topics} answered nothing for [{from}, {to}], but block {probe} has \
+                     such a log; not recording the window as covered"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Block timestamps for the logs' blocks: from the log when the provider includes it, else the
@@ -1196,6 +1282,70 @@ mod tests {
         d.discover(&h, A, 1_000, 1_099)
             .await
             .expect("the empty midpoint is skipped and block 1,000 has traces");
+    }
+
+    /// One direction answering rows says nothing about the other's empty answer: an incoming
+    /// transaction the toAddress filter dropped, while fromAddress found the outgoing one, must
+    /// keep the window uncovered.
+    #[tokio::test]
+    async fn an_empty_side_is_checked_though_the_other_found_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, trace) = chain(false);
+        let incoming = json!({"transactionHash": "0xdd", "blockNumber": 149, "traceAddress": [],
+            "type": "call", "action": {"from": "0x09", "to": A, "value": "0x1"}});
+        let trace = script(move |m, p| match m {
+            // toAddress silently answers nothing, though block 149 pays A.
+            "trace_filter" if p[0].get("toAddress").is_some() => Ok(json!([])),
+            "trace_block" if hex_u64(&p[0])? == 149 => Ok(json!([incoming, {"x": 1}])),
+            _ => (trace.answer)(m, p),
+        });
+        let d = Discoverer::new(main, trace);
+        let err = d.discover(&h, A, 100, 199).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("trace_filter toAddress answered nothing"),
+            "{err:#}"
+        );
+    }
+
+    /// The same for the positional log filters: rows with the address in topic 1 say nothing about
+    /// an empty answer for topic 2.
+    #[tokio::test]
+    async fn an_empty_log_filter_is_checked_though_another_found_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let who = padded(A);
+        let other = padded("0x0000000000000000000000000000000000000009");
+        let log = |topics: Value| {
+            json!({"address": "0x7070", "topics": topics, "data": format!("0x{:0>64}", "1"),
+                   "blockNumber": "0x1f", "blockTimestamp": "0x20", "transactionHash": "0xcc",
+                   "transactionIndex": "0x0", "logIndex": "0x0", "blockHash": "0xbb", "removed": false})
+        };
+        let sent = log(json!([TRANSFER, who, other]));
+        let received = log(json!([TRANSFER, other, who]));
+        let (main, trace) = chain(false);
+        let main = script(move |m, p| match m {
+            "eth_getLogs" => {
+                let f = &p[0];
+                let single = f["fromBlock"] == f["toBlock"];
+                let topics = f["topics"].as_array().unwrap();
+                Ok(
+                    if single && topics.len() == 1 && topics[0] == json!(TRANSFER) {
+                        // The probe: block 31 holds a transfer to A.
+                        json!([received.clone()])
+                    } else if topics.len() == 2 && topics[0] == json!(TRANSFER) {
+                        json!([sent.clone()])
+                    } else {
+                        json!([])
+                    },
+                )
+            }
+            _ => (main.answer)(m, p),
+        });
+        let d = Discoverer::new(main, trace);
+        let err = d.discover(&h, A, 0, 63).await.unwrap_err();
+        assert!(format!("{err:#}").contains("eth_getLogs"), "{err:#}");
+        assert!(format!("{err:#}").contains("answered nothing"), "{err:#}");
     }
 
     #[tokio::test]
