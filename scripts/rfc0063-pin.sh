@@ -7,6 +7,8 @@
 # - getminedblocks (blocktype=blocks), for each case in mined.tsv: every block Etherscan lists for
 #   the address, kept to the case's range. Etherscan takes no range for this action, so the whole
 #   list is paged and the range applied here.
+# - txlist, for each case in created.tsv: the contract's rows over the case's range, its creation
+#   among them.
 # The key stays in the environment and reaches curl on its standard input, never its arguments.
 set -euo pipefail
 : "${ETHERSCAN_KEY:?set ETHERSCAN_KEY}"
@@ -49,4 +51,9 @@ grep -v '^#' "$HERE/tests/fixtures/rfc0063/mined.tsv" | while IFS=$'\t' read -r 
   jq -c --argjson f "$from" --argjson t "$to" 'select((.blockNumber | tonumber) >= $f and (.blockNumber | tonumber) <= $t)' "$OUT/$name.all" > "$OUT/$name.jsonl"
   echo "$name: $(wc -l < "$OUT/$name.all" | tr -d ' ') blocks listed, $(wc -l < "$OUT/$name.jsonl" | tr -d ' ') in [$from, $to]"
   rm -f "$OUT/$name.all" "$OUT/$name.page"
+done
+
+grep -v '^#' "$HERE/tests/fixtures/rfc0063/created.tsv" | while IFS=$'\t' read -r name address from to _; do
+  fetch "action=txlist&address=$address&startblock=$from&endblock=$to&page=1&offset=1000&sort=asc" > "$OUT/$name.jsonl"
+  echo "$name: $(wc -l < "$OUT/$name.jsonl" | tr -d ' ') rows"
 done

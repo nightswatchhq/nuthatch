@@ -169,10 +169,16 @@ free key, whose answers cap at 1,000 rows, so the pinning splits ranges at that 
    fixtures for an internal-only receipt, a failed ancestor, a creation, a selfdestruct and an EIP-7702
    authorisation. Field parity and identical `traceId`s by address and by `txhash`.
 5. **Withdrawals and block production.** `0x7a25bd5f286fb722e7578c62e86a675ff0a00b15`, Ethereum
-   17,034,870 to 17,300,000: 4,333 withdrawals, exact indices and amounts, cross-checked against block
-   bodies. Pinned proposer fixtures for `getminedblocks` and reward parity. (Lido's withdrawal vault
-   was the first choice; Etherscan returns no withdrawals for it at all, which is to be understood
-   before this slice.)
+   17,034,870 to 17,300,000: 3,131 withdrawals (the pinned file holds 4,333 rows, the overlap of its
+   split pinning), exact indices and every field, read from block bodies. Pinned proposer fixtures
+   for `getminedblocks`, before and after the Merge and with an uncle, and reward parity to the wei.
+   (Lido's withdrawal vault was the first choice, and the address this RFC first gave for it was
+   mistyped: `0xB9D7934878B5FB9610B3Fe8A5e441e8faF7E293f` fails its own EIP-55 checksum, and Etherscan
+   rightly has nothing for it. The vault is `0xB9D7934878B5FB9610B3fE8A5e441e8fad7E293f`, and Etherscan
+   does list its withdrawals, withdrawal index 1,041,981 in block 17,100,000 among them.) Two things
+   stay open after this slice. `getminedblocks` takes no range, so it answers `NUTHATCH_INCOMPLETE`
+   unless the address is covered from genesis; and withdrawals cost one block body per block, about
+   269,000 calls for this gate's range. Slice 2 addresses both with hosted global partitions.
 6. **The rotki adapter.** rotki's own test suite passes with nuthatch first in the order, and a
    fresh rotki profile for a pinned wallet produces the same history events as with Etherscan.
 7. **MEV.** Pinned relay and non-relay blocks for a known proposer: amounts equal beaconcha.in's for
