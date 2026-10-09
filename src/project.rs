@@ -989,6 +989,8 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
 /// derived from the nest's own first table, plus a README. Idempotent: if `views/` already exists (an
 /// `add` on a nest whose author already wrote views), it's left untouched. The starter is entirely
 /// comments, so it's a no-op for the query surface and validates clean until the author uncomments it.
+const GITATTRIBUTES: &str = "*.sql linguist-detectable\nabis/** linguist-generated\n";
+
 fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<()> {
     let views = dir.join("views");
     if views.exists() {
@@ -996,6 +998,13 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
     }
     std::fs::create_dir_all(&views)
         .with_context(|| format!("cannot create {}", views.display()))?;
+
+    // GitHub counts SQL as data, so without this a nest repo shows no language. Hidden, so it stays
+    // outside the data identity.
+    let attrs = dir.join(".gitattributes");
+    if !attrs.exists() {
+        std::fs::write(&attrs, GITATTRIBUTES).context("failed to write .gitattributes")?;
+    }
 
     std::fs::write(
         views.join("README.md"),
@@ -2242,6 +2251,10 @@ mod tests {
         scaffold_views(dir.path(), &schema).unwrap();
         let starter = std::fs::read_to_string(dir.path().join("views/10-example.sql")).unwrap();
         assert!(dir.path().join("views/README.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap(),
+            GITATTRIBUTES
+        );
         // References the nest's real table, and every line is a comment (a no-op that validates clean).
         assert!(starter.contains("usdc__transfer"));
         assert!(starter
