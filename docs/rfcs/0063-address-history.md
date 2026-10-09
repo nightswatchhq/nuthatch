@@ -150,6 +150,46 @@ delivered `value` is reconciled against the builder-to-proposer payment in that 
 relay claims is unknown, never zero; two relays claiming one block is a conflict, surfaced. Proposer
 attribution (validator index) comes from a Beacon API source when one is configured.
 
+**Block partitions.** Reading withdrawals and fee recipients from bodies costs one call per block
+per nest: about 269,000 calls for the slice-5 gate's 265,000 blocks, and roughly 9 million for the
+post-Shanghai chain. Since that scan is the same for every address, it is done once, by
+`nuthatch partitions` on our boxes, and published; a nest that opts in downloads it.
+
+- **What is published.** For each span of 10,000 blocks, one Parquet file holding every block's
+  full execution header and complete, ordered withdrawal list, each RLP-encoded exactly as the
+  chain hashes it, plus a manifest listing the files. Only finalized spans are built. The file is
+  deterministic: the same range builds to the same bytes, so two builds can be compared byte for
+  byte, and an interrupted build resumes from its manifest.
+- **Who uses it.** Only a nest whose `[address_history.mirror]` names the mirror's URL, the chain,
+  the blocks to take from it and a cache budget in MB. Nothing is fetched before that, not even a
+  catalogue. The default is still the direct path of slice 5, which needs no mirror, and a
+  filesystem path in `url` imports partitions from local files.
+- **What the nest checks.** Every header is hashed from its own bytes; numbers run contiguously
+  across the whole span; each header's parent hash is the previous block's hash; and the last
+  block's hash must equal the one the nest's own RPC returns at that height, at or below the
+  finality the nest already serves through. That anchors the whole span to the user's RPC rather
+  than to us. Each block's withdrawals root is then recomputed from its full list, as a Merkle
+  Patricia trie keyed by position within the block (EIP-4895), so a missing, altered, reordered or
+  invented withdrawal fails. Only then does anything become coverage. A missing partition, a short
+  one, or one that fails any check records nothing, and its blocks answer `NUTHATCH_INCOMPLETE`:
+  the body scan does not stand in for it. The manifest's claims never become coverage, because the
+  nest never reads the manifest.
+- **Rewards.** `blockReward` needs every fee, which headers cannot give. For the few blocks a
+  watched address produced, the nest fetches the block's transactions, receipts and ommers from its
+  own RPC by the verified block hash, recomputes the transactions root, receipts root and ommers
+  hash against the header, and only then sums each transaction's gas used (from cumulative gas)
+  times its effective tip, plus the fork's issuance and the ommer inclusion reward before the Merge.
+- **What leaves the machine.** The mirror sees the nest's IP and the block ranges it downloads,
+  never an address: every partition is fetched whole, whatever it holds.
+- **What it costs.** Measured: 461 bytes a block at 14 million, 690 at 20 million (Cancun headers
+  and sixteen withdrawals), zstd-compressed. By those figures the whole chain would be roughly
+  12 to 16 GB, a sensible optional archive and not a compulsory download, which is why
+  partitions are fetched by range into a bounded, disposable cache: a nest keeps what it extracted
+  for its addresses and deletes the files, and an address added later may download a partition
+  again.
+- **Where it runs.** The producer is ours and is listed on the website under Hosted. Wallet queries
+  are never routed to it: each nest answers its own.
+
 ## 9. Slices and their gates
 
 Every gate is parity against Etherscan for a pinned wallet and range, exact hash sets and the fields
@@ -158,9 +198,18 @@ free key, whose answers cap at 1,000 rows, so the pinning splits ranges at that 
 
 1. **Coverage, `/api` and pagination.** 1,001 records in one block page through with exact
    identities; an uncovered range answers `NUTHATCH_INCOMPLETE`; a reorg invalidates the tail.
-2. **Headers and `getblocknobytime`.** Sampled before/after answers match Etherscan and satisfy the
-   adjacent-header inequalities; the hosted headers nest stays under 2 GB RSS while ingesting and
-   answering concurrently.
+2. **Block partitions, headers and `getblocknobytime`** (§8). Publication is deterministic: one
+   range built twice gives byte-identical files. Verification refuses, as incomplete, a partition
+   with a withdrawal dropped, a field altered, withdrawals reordered within a block, the range
+   truncated, a partition omitted, or a parent link broken; an interrupted download is recovered
+   by fetching the partition again. Bytes per block and laptop ingest time are measured and
+   reported. `getblocknobytime` answers only from verified headers, and sampled before and after
+   answers equal Etherscan's, pre-London blocks among them. Slice 5's parity gates pass again
+   through downloaded partitions, with no per-user body scan for withdrawals and bodies hydrated
+   only for blocks a watched address produced; `getminedblocks` honours rotki's `startblock` and
+   `endblock`, which rotki does send (`eth2.py:822`), so no genesis coverage is needed; bounded
+   and unbounded requests, partition boundaries and pagination are covered. The producer's RSS is
+   measured while it builds.
 3. **Token transfers and normal transactions.** vitalik.eth (`0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045`),
    Ethereum blocks 18,000,000 to 20,000,000: `txlist` (2,929 rows) and `tokentx` (7,614) hash sets
    equal Etherscan's, with `txlist` field parity; `tokennfttx` (669) and `token1155tx` (55) likewise
@@ -198,7 +247,9 @@ Figures marked (target) are confirmed by the first measurement, then frozen as b
 
 1. **Memory.** Idle RSS (target) under 100 MB per chain, under 300 MB while backfilling. No DBSP,
    Burrmill or Parquet sealing in this mode unless a measurement shows a need.
-2. **Disk.** Only rows touching watched addresses, plus coverage, under compact binary keys.
+2. **Disk.** Only rows touching watched addresses, plus coverage, under compact binary keys; with a
+   mirror, also one timestamp per verified block for `getblocknobytime`, and a partition cache
+   bounded by the `cache_mb` the operator chose.
 3. **RPC.** A 5-minute poll; the widest windows the provider accepts; each hash hydrated once; the
    idle call rate reported on `/metrics`.
 4. **Speed.** A 1,000-row `/api` page in (target) under 10 ms from an index keyed (address, block,
@@ -207,5 +258,7 @@ Figures marked (target) are confirmed by the first measurement, then frozen as b
 6. **Start.** Under 1 s from a covered store to serving; nothing to run but the binary.
 7. **Keys.** A trace-capable RPC is the only required credential, and the nest says which chain
    needs one and why.
-8. **Private by default.** No head count prompt; localhost only; no outbound call but the RPCs.
+8. **Private by default.** No head count prompt; localhost only; no outbound call but the RPCs and,
+   once `[address_history.mirror]` names one, the partition mirror. That is the one other call, and
+   it sees the nest's IP and the block ranges it downloads, never an address (§8).
 9. **Offline.** Covered history serves with the RPC down; gaps answer `NUTHATCH_INCOMPLETE`.

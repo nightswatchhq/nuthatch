@@ -174,6 +174,21 @@ pub async fn fetch(rpc: &impl Rpc, b: u64) -> Result<Published> {
     })
 }
 
+/// [`fetch`], retried after a pause: a provider's brief refusal partway through a span should cost a
+/// wait, not the span.
+async fn fetch_patiently(rpc: &impl Rpc, b: u64) -> Result<Published> {
+    let mut pause = std::time::Duration::from_secs(15);
+    for _ in 0..3 {
+        match fetch(rpc, b).await {
+            Ok(p) => return Ok(p),
+            Err(e) => tracing::warn!("block {b}: {e:#}; trying again in {}s", pause.as_secs()),
+        }
+        tokio::time::sleep(pause).await;
+        pause *= 2;
+    }
+    fetch(rpc, b).await
+}
+
 /// A block whose header and withdrawals a partition carried and the nest has checked.
 #[derive(Debug, Clone)]
 pub struct VerifiedBlock {
@@ -567,7 +582,7 @@ pub async fn build(
             continue;
         }
         let blocks: Vec<Published> = futures::stream::iter(start..=end)
-            .map(|b| fetch(rpc, b))
+            .map(|b| fetch_patiently(rpc, b))
             .buffered(concurrency)
             .try_collect()
             .await?;
