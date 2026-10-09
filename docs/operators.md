@@ -128,7 +128,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:4.14.0
+  ghcr.io/nightswatchhq/nuthatch:5.0.0
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -166,7 +166,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:4.15.0-scaled worker --help
+docker run --rm ghcr.io/nightswatchhq/nuthatch:5.0.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -1503,7 +1503,8 @@ stated explicitly rather than left to be discovered.
 
 **Binary upgrades.** Proven in production across 0.3.0 → 0.6.0 → 0.6.2 → 1.0.0 on a box serving public
 traffic throughout: each was a binary swap and a restart, with no data migration and no flag changes.
-Every 4.x release since has been the same swap and restart, and each release's notes carry a
+Every 4.x release since has been the same swap and restart, and so is 5.0.0 for a nest without a
+`[screening]` table, which 5.0.0 refuses until it is deleted. Each release's notes carry a
 **Compatibility and upgrade** section that says so, or names the migration or re-index if one is
 needed.
 
@@ -1607,29 +1608,32 @@ advertises the tools it can actually answer.
 
 ## Stability contract
 
-Nuthatch follows **semantic versioning**, and **4.x is the stable line**. This section is the
-commitment, not a description of habits: what a release on the 4.x line may do to you, what waits for
-5.0, and what is deliberately outside the promise.
+Nuthatch follows **semantic versioning**, and **5.x is the stable line**. This section is the
+commitment, not a description of habits: what a release on the 5.x line may do to you, what waits for
+6.0, and what is deliberately outside the promise.
 
-### The promise, for 4.x
+4.x held this promise from 4.0.0 to 4.15.2. 5.0.0 broke it twice, both for the removed WASM layer: a
+`[screening]` table no longer loads, and the `screen_status` MCP tool is gone ([notes](releases/v5.0.0.md)).
 
-From 4.0.0 to the last 4.x release:
+### The promise, for 5.x
 
-1. **Config keeps working.** A `nuthatch.toml`, `mounts.toml` or `entities.toml` that works on a 4.x
-   release works on every later 4.x release, with the same meaning.
-2. **Data directories upgrade drop-in.** A later 4.x opens a data directory written by an earlier 4.x
+From 5.0.0 to the last 5.x release:
+
+1. **Config keeps working.** A `nuthatch.toml`, `mounts.toml` or `entities.toml` that works on a 5.x
+   release works on every later 5.x release, with the same meaning.
+2. **Data directories upgrade drop-in.** A later 5.x opens a data directory written by an earlier 5.x
    in place: replace the binary and restart. No re-index, no re-seal, no migration command.
 3. **The HTTP, SQL and MCP surfaces do not break.** No route, response field, generated table or
    column, or MCP tool is removed, renamed or retyped.
 
-**Upgrade only.** The promise runs forwards. A later 4.x may update the on-disk format as it opens a
-directory, and an earlier 4.x is not promised to read the result. To keep a way back, copy the data
+**Upgrade only.** The promise runs forwards. A later 5.x may update the on-disk format as it opens a
+directory, and an earlier 5.x is not promised to read the result. To keep a way back, copy the data
 directory before upgrading.
 
-### How releases are cut on 4.x
+### How releases are cut on 5.x
 
-- **A released 4.x only ever gets patch releases** (4.0.1, 4.0.2, ...), and a patch only fixes.
-- **Features wait for the next monthly minor** (4.1, 4.2, ...). A minor may add; it may not break
+- **A released 5.x only ever gets patch releases** (5.0.1, 5.0.2, ...), and a patch only fixes.
+- **Features wait for the next monthly minor** (5.1, 5.2, ...). A minor may add; it may not break
   anything in the table below.
 - **Correctness and security fixes ship immediately**, as a patch, without waiting for the month.
 - **A correctness fix is not a break**, even where an answer changes: a wrong answer made right is
@@ -1639,9 +1643,9 @@ directory before upgrading.
   what to change. A security fix with no compatible form may break a surface in a patch. In every one
   of these cases the release notes say so, name the fix, and explain why.
 
-### What a minor may change, and what waits for 5.0
+### What a minor may change, and what waits for 6.0
 
-| Surface | A 4.x minor may | Reserved for 5.0 |
+| Surface | A 5.x minor may | Reserved for 6.0 |
 |---|---|---|
 | `nuthatch.toml`, `mounts.toml`, `entities.toml` keys | add a key; deprecate one with a startup warning | remove or rename a key, or change its type or meaning |
 | nest `schema_version` | bump it when the upgrade is in place and automatic | a bump that requires a re-index |
@@ -1654,23 +1658,23 @@ directory before upgrading.
 
 **MCP tools are advertised per nest** (RFC-0025): a nest lists the tools it can answer, so discover
 them with `tools/list` rather than hardcoding the list. The promise is that a tool a nest advertises
-on a 4.x release is still advertised, under the same name and with compatible arguments, for that
-nest on every later 4.x. Tool descriptions and the layout of result text may change; the data a
+on a 5.x release is still advertised, under the same name and with compatible arguments, for that
+nest on every later 5.x. Tool descriptions and the layout of result text may change; the data a
 result carries does not.
 
 **Deprecation window.** A deprecation is announced in at least one minor before removal, removal
-comes **no sooner than 90 days** after that release, and removal itself waits for 5.0. The warning
+comes **no sooner than 90 days** after that release, and removal itself waits for 6.0. The warning
 names the replacement. That is the floor rather than the target: anything an operator wires into a
 unit file, a scrape config or a dashboard gets longer.
 
-### Not covered by 4.x, deliberately
+### Not covered by 5.x, deliberately
 
 Stated because a platform team will ask, and because a vague promise is worse than a narrow one.
 
 - **Downgrades**, above. Upgrade only.
 - **Off-by-default cargo features: `graph`, `folds` and `counter`.**
   None is in the published binaries or images, and all are experimental: their config keys, routes,
-  on-disk state and behaviour may change or go in any 4.x release. A build that enables one is not
+  on-disk state and behaviour may change or go in any 5.x release. A build that enables one is not
   covered by any line above for what that feature adds. (`graph` is RFC-0053's partial read surface
   and RFC-0060's parked endpoint; `folds` is RFC-0059, parked; `counter` is x402.)
 - **The SQL dialect itself.** The tables and columns are nuthatch's and are covered; the functions and
@@ -1703,7 +1707,7 @@ be found. What a test enforces in the required CI job:
   segment's hash, the hot store's rows and watermarks, `/sql` over sealed and hot rows, `/entity`
   point reads and an authored entity's value. It then indexes two more blocks and seals, and checks
   those too. Renaming a redb table or changing the NID derivation turns it red. The tree holds that
-  one data directory and a `config-4.0` beside it; no later 4.x minor has added a directory of its
+  one data directory and a `config-4.0` beside it; no later release has added a directory of its
   own, and none is ever rewritten.
 - **Config:** the same file freezes a `nuthatch.toml`, `mounts.toml` and `entities.toml` as a 4.0
   user writes them, and checks what each key means, not only that it parses. Four more committed
