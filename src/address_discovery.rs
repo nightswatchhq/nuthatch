@@ -231,8 +231,6 @@ pub struct Discoverer<M, T> {
     /// Every this-many empty trace windows, one is checked against `trace_block`; the first always.
     pub empty_sample: u64,
     empties: AtomicU64,
-    /// Whether each address is an EOA, for the nonce check; learned once.
-    eoa: Mutex<BTreeMap<String, bool>>,
 }
 
 impl<M: Rpc, T: Rpc> Discoverer<M, T> {
@@ -244,7 +242,6 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             log_window: Window::new(100_000),
             empty_sample: 8,
             empties: AtomicU64::new(0),
-            eoa: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -355,17 +352,13 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     /// must equal the nonce's movement. A contract's nonce counts its creations instead, and a
     /// delegated account (EIP-7702) can move without sending, so neither is checked.
     async fn check_nonce(&self, a: &str, from: u64, to: u64, outgoing: u64) -> Result<()> {
-        let known = self.eoa.lock().expect("eoa lock").get(a).copied();
-        let eoa = match known {
-            Some(e) => e,
-            None => {
-                let code = self.main.call("eth_getCode", json!([a, "latest"])).await?;
-                let e = code.as_str().is_some_and(|c| c == "0x");
-                self.eoa.lock().expect("eoa lock").insert(a.to_string(), e);
-                e
-            }
-        };
-        if !eoa {
+        // Code is read at the window's end, not today: an account delegated under EIP-7702 since
+        // was a plain EOA through all of its earlier history.
+        let code = self
+            .main
+            .call("eth_getCode", json!([a, format!("0x{to:x}")]))
+            .await?;
+        if code.as_str() != Some("0x") {
             return Ok(());
         }
         let nonce_at = |b: u64| async move {
@@ -808,6 +801,34 @@ mod tests {
         );
     }
 
+    /// A provider that silently truncates at 10,000 results: a span answering that many is split
+    /// until each answer is believably whole.
+    #[tokio::test]
+    async fn a_suspiciously_full_answer_is_split() {
+        let rpc = script(|_, p| {
+            let s = hex_u64(&p[0]["fromBlock"])?;
+            let e = hex_u64(&p[0]["toBlock"])?;
+            let n = if e - s + 1 > 2 {
+                SUSPICIOUSLY_FULL
+            } else {
+                (e - s + 1) as usize
+            };
+            Ok(Value::Array(vec![json!(1); n]))
+        });
+        let w = Window::new(100_000);
+        let got = ranged(
+            &rpc,
+            &w,
+            0,
+            3,
+            "eth_getLogs",
+            |s, e| json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}") }]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.len(), 4, "one item per block, not a truncated page");
+    }
+
     #[test]
     fn a_batch_transfer_decodes_every_id() {
         // ids [1, 2], values [10, 20]
@@ -923,6 +944,10 @@ mod tests {
                     if f.get("fromAddress").is_some() && s <= 150 && 150 <= e {
                         json!([{"transactionHash": "0xaa", "blockNumber": 150, "traceAddress": [],
                                 "type": "call", "action": {"from": A, "to": "0x01"}}])
+                    } else if f.get("toAddress").is_some() && s <= 300 && 300 <= e {
+                        // An internal call to A: a txlistinternal row, never a txlist one.
+                        json!([{"transactionHash": "0xbb", "blockNumber": 300, "traceAddress": [0],
+                                "type": "call", "action": {"from": "0x02", "to": A}}])
                     } else {
                         json!([])
                     }
@@ -947,7 +972,11 @@ mod tests {
         let (main, trace) = chain(false);
         let d = Discoverer::new(main, trace);
         let found = d.discover(&h, A, 0, 499).await.unwrap();
-        assert_eq!(found.txlist.len(), 1);
+        assert_eq!(
+            found.txlist.len(),
+            1,
+            "the internal call at 300 is not a normal transaction"
+        );
         assert_eq!(found.txlist[0].record["hash"], "0xaa");
         assert_eq!(
             d.trace_window.get(),
@@ -1000,6 +1029,42 @@ mod tests {
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(main, blind);
+        let err = d.discover(&h, A, 100, 199).await.unwrap_err();
+        assert!(format!("{err:#}").contains("by its nonce"), "{err:#}");
+    }
+
+    /// Code at the window's end means a contract or a delegated account, whose nonce does not count
+    /// sent transactions; code only later (a delegation made since) still leaves the window checked.
+    #[tokio::test]
+    async fn the_nonce_check_reads_code_at_the_windows_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let blind = || {
+            script(|m, _| match m {
+                "trace_filter" => Ok(json!([])),
+                "trace_block" => Ok(json!([{"x": 1}])),
+                other => bail!("unexpected {other}"),
+            })
+        };
+        let code_from = |delegated_at: u64| {
+            let (main, _) = chain(false);
+            script(move |m, p| match m {
+                "eth_getCode" => {
+                    let b = hex_u64(&p[1])?;
+                    Ok(json!(if b >= delegated_at {
+                        "0xef0100aa"
+                    } else {
+                        "0x"
+                    }))
+                }
+                _ => (main.answer)(m, p),
+            })
+        };
+        let d = Discoverer::new(code_from(150), blind());
+        d.discover(&h, A, 100, 199)
+            .await
+            .expect("delegated by the window's end, so the nonce is not held to the traces");
+        let d = Discoverer::new(code_from(10_000), blind());
         let err = d.discover(&h, A, 100, 199).await.unwrap_err();
         assert!(format!("{err:#}").contains("by its nonce"), "{err:#}");
     }
@@ -1064,5 +1129,79 @@ mod tests {
             100,
             "token coverage still ends at 99"
         );
+    }
+
+    fn mode(h: &AddressHistory, end: u64) -> crate::address_mode::ModeState {
+        crate::address_mode::ModeState::new(h.clone(), 1, std::time::Duration::from_secs(300), true)
+            .with_range(0, Some(end), 0)
+    }
+
+    fn filtered_from(asked: &Mutex<Vec<(String, Value)>>) -> Vec<u64> {
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| m == "trace_filter")
+            .map(|(_, p)| hex_u64(&p[0]["fromBlock"]).unwrap())
+            .collect()
+    }
+
+    /// The cursor's catch-up covers every window to `end_block`, and a later pass starts where
+    /// coverage ends rather than refetching.
+    #[tokio::test]
+    async fn catch_up_covers_to_the_end_and_resumes_from_coverage() {
+        use crate::address_mode::Discovery;
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, trace) = chain(false);
+        let d = Discoverer::new(Counted::new(main), Counted::new(trace));
+
+        d.catch_up(&mode(&h, 99_999), 1_000_000).await;
+        for action in DISCOVERED {
+            assert_eq!(
+                h.coverage(action, A).unwrap(),
+                vec![(0, 99_999)],
+                "{action:?}"
+            );
+        }
+        let req = crate::address_history::PageRequest {
+            address: A.into(),
+            start_block: Some(0),
+            end_block: Some(99_999),
+            sort: crate::address_history::Sort::Asc,
+            page: 1,
+            offset: 10,
+            generation: None,
+        };
+        let crate::address_history::Answer::Rows(rows) = h.page(Action::TxList, &req).unwrap()
+        else {
+            panic!("covered")
+        };
+        assert_eq!(rows.len(), 1, "the transaction at block 150");
+
+        let first_pass = filtered_from(&d.trace.inner().asked).len();
+        d.catch_up(&mode(&h, 149_999), 1_000_000).await;
+        let second: Vec<u64> = filtered_from(&d.trace.inner().asked)[first_pass..].to_vec();
+        assert!(!second.is_empty());
+        assert!(
+            second.iter().all(|b| *b >= 100_000),
+            "the second pass refetched below its coverage: {:?}",
+            second.iter().min()
+        );
+        assert_eq!(h.coverage(Action::TxList, A).unwrap(), vec![(0, 149_999)]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_window_records_nothing() {
+        use crate::address_mode::Discovery;
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, _) = chain(false);
+        let down = script(|_, _| bail!("connection refused"));
+        let d = Discoverer::new(Counted::new(main), Counted::new(down));
+        d.catch_up(&mode(&h, 99_999), 1_000_000).await;
+        for action in DISCOVERED {
+            assert!(h.coverage(action, A).unwrap().is_empty(), "{action:?}");
+        }
     }
 }
