@@ -6792,32 +6792,35 @@ mod tests {
 
         let history = AddressHistory::open(
             Store::open(&dir.path().join("ah.redb")).unwrap(),
+            1,
             &[who.into()],
         )
         .unwrap();
         let mut record = serde_json::Map::new();
         record.insert("blockNumber".into(), json!("7"));
         record.insert("hash".into(), json!("0xabc"));
+        let row = Row {
+            block: 7,
+            tx_index: 0,
+            position: 0,
+            record,
+        };
+        let generation = history.generation().unwrap();
         history
-            .insert(
-                Action::TxList,
-                who,
-                &[Row {
-                    block: 7,
-                    tx_index: 0,
-                    position: 0,
-                    record,
-                }],
-            )
+            .record(Action::TxList, who, &[row], (0, 20), generation)
             .unwrap();
-        history.mark_covered(Action::TxList, who, 0, 20).unwrap();
         let mut state = test_state(dir.path(), 2);
         state.address_history = Some(history);
         let (_, body) = get(router(SharedNest::new(state)), &path).await;
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             json,
-            json!({"status": "1", "message": "OK", "result": [{"blockNumber": "7", "hash": "0xabc"}]})
+            json!({
+                "status": "1",
+                "message": "OK",
+                "result": [{"blockNumber": "7", "hash": "0xabc"}],
+                "generation": "0",
+            })
         );
     }
 

@@ -173,6 +173,7 @@ const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverag
 const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
 const META: TableDefinition<&str, u64> = TableDefinition::new("ah_meta");
 const HEAD: &str = "head";
+const GENERATION: &str = "generation";
 
 const KEY_LEN: usize = 20 + 8 * 3;
 
@@ -222,6 +223,9 @@ pub struct PageRequest {
     pub sort: Sort,
     pub page: u64,
     pub offset: u64,
+    /// The generation page 1 was cut from. Pages after the first carry it, so a reorg or unwatch
+    /// between pages reads incomplete instead of silently shifting rows across a page boundary.
+    pub generation: Option<u64>,
 }
 
 #[cfg(test)]
@@ -234,12 +238,13 @@ thread_local! {
 #[derive(Clone)]
 pub struct AddressHistory {
     store: Store,
+    chain_id: u64,
 }
 
 impl AddressHistory {
     /// Open the tables, and add `seed` (the configured addresses) to the watched set. Addresses
     /// already watched are left alone, and none are removed: the set outlives the config that seeded it.
-    pub fn open(store: Store, seed: &[String]) -> Result<AddressHistory> {
+    pub fn open(store: Store, chain_id: u64, seed: &[String]) -> Result<AddressHistory> {
         let seed: Vec<Address> = seed
             .iter()
             .map(|a| parse_address(a))
@@ -258,7 +263,22 @@ impl AddressHistory {
             }
         }
         wtx.commit()?;
-        Ok(AddressHistory { store })
+        Ok(AddressHistory { store, chain_id })
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Bumped by every change that removes rows or coverage. A fetch records the generation it
+    /// started under, and [`AddressHistory::record`] refuses its result if a reorg or unwatch came
+    /// in between, so rows a reorg dropped are never re-marked complete.
+    pub fn generation(&self) -> Result<u64> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx
+            .open_table(META)?
+            .get(GENERATION)?
+            .map_or(0, |v| v.value()))
     }
 
     pub fn watched(&self) -> Result<Vec<String>> {
@@ -300,54 +320,44 @@ impl AddressHistory {
                 wtx.open_table(COVERAGE)?
                     .remove(coverage_key(&a, action).as_slice())?;
             }
+            bump_generation(&wtx)?;
         }
         wtx.commit()?;
         Ok(())
     }
 
-    pub fn insert(&self, action: Action, address: &str, rows: &[Row]) -> Result<()> {
-        let a = parse_address(address)?;
-        let wtx = self.store.database().begin_write()?;
-        {
-            let mut t = wtx.open_table(action.table())?;
-            let mut buf = Vec::new();
-            for r in rows {
-                let claimed = r.record.get("blockNumber").and_then(Value::as_str);
-                if claimed != Some(r.block.to_string().as_str()) {
-                    bail!(
-                        "{} row at block {} carries blockNumber {claimed:?}",
-                        action.etherscan(),
-                        r.block
-                    );
-                }
-                buf.clear();
-                encode_record(&r.record, &mut buf)?;
-                t.insert(
-                    row_key(&a, r.block, r.tx_index, r.position).as_slice(),
-                    buf.as_slice(),
-                )?;
-            }
-        }
-        wtx.commit()?;
-        Ok(())
-    }
-
-    /// Record that `[from, to]` is complete for (address, action): every row in it is stored.
-    pub fn mark_covered(&self, action: Action, address: &str, from: u64, to: u64) -> Result<()> {
+    /// Store a fetch's result: `rows` and the claim that `[from, to]` is complete for (address,
+    /// action), in one transaction. Refused if the address is not watched or the generation moved
+    /// since the fetch began, because either way the claim no longer describes what is stored.
+    pub fn record(
+        &self,
+        action: Action,
+        address: &str,
+        rows: &[Row],
+        (from, to): (u64, u64),
+        generation: u64,
+    ) -> Result<()> {
         if to < from {
             bail!("coverage interval [{from}, {to}] is empty");
         }
         let a = parse_address(address)?;
         let wtx = self.store.database().begin_write()?;
         {
-            let mut t = wtx.open_table(COVERAGE)?;
-            let key = coverage_key(&a, action);
-            let mut spans = match t.get(key.as_slice())? {
-                Some(v) => decode_spans(v.value())?,
-                None => Vec::new(),
-            };
-            spans.push((from, to));
-            t.insert(key.as_slice(), encode_spans(&merge(spans)).as_slice())?;
+            if wtx.open_table(WATCHED)?.get(a.as_slice())?.is_none() {
+                bail!("{} is not watched", address_hex(&a));
+            }
+            let now = wtx
+                .open_table(META)?
+                .get(GENERATION)?
+                .map_or(0, |v| v.value());
+            if now != generation {
+                bail!("address history changed during the fetch (generation {generation} -> {now}); refetch");
+            }
+            if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
+                bail!("a row at block {} lies outside [{from}, {to}]", r.block);
+            }
+            put_rows(&wtx, action, &a, rows)?;
+            cover(&wtx, action, &a, from, to)?;
         }
         wtx.commit()?;
         Ok(())
@@ -382,26 +392,33 @@ impl AddressHistory {
     pub fn invalidate_above(&self, block: u64) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         {
-            // Every address with rows has coverage, so coverage keys name every range to drain.
             let mut c = wtx.open_table(COVERAGE)?;
             let entries: Vec<(Vec<u8>, Vec<u8>)> = c
                 .iter()?
                 .map(|e| e.map(|(k, v)| (k.value().to_vec(), v.value().to_vec())))
                 .collect::<std::result::Result<_, _>>()?;
-            for (key, spans) in entries {
-                let a: Address = key[..20].try_into()?;
-                let action = Action::ALL
-                    .into_iter()
-                    .find(|x| x.code() == key[20])
-                    .ok_or_else(|| anyhow!("coverage key carries unknown action {}", key[20]))?;
-                if let Some(above) = block.checked_add(1) {
-                    let mut t = wtx.open_table(action.table())?;
-                    drain(
-                        &mut t,
-                        &row_key(&a, above, 0, 0),
-                        &row_key(&a, u64::MAX, u64::MAX, u64::MAX),
-                    )?;
+            // Rows can outlive their coverage (a fetch stored them, then a reorg cut the span), so
+            // the addresses to drain are every watched one and every covered one, not coverage alone.
+            let mut holders: std::collections::BTreeSet<Address> = wtx
+                .open_table(WATCHED)?
+                .iter()?
+                .map(|e| e.map(|(k, _)| k.value().try_into().expect("watched keys are 20 bytes")))
+                .collect::<std::result::Result<_, _>>()?;
+            holders.extend(entries.iter().map(|(k, _)| -> Address {
+                k[..20].try_into().expect("coverage keys are 21 bytes")
+            }));
+            if let Some(above) = block.checked_add(1) {
+                for a in &holders {
+                    for action in Action::ALL {
+                        drain(
+                            &mut wtx.open_table(action.table())?,
+                            &row_key(a, above, 0, 0),
+                            &row_key(a, u64::MAX, u64::MAX, u64::MAX),
+                        )?;
+                    }
                 }
+            }
+            for (key, spans) in entries {
                 let kept: Vec<(u64, u64)> = decode_spans(&spans)?
                     .into_iter()
                     .filter(|(from, _)| *from <= block)
@@ -413,21 +430,37 @@ impl AddressHistory {
                     c.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
                 }
             }
-            let mut m = wtx.open_table(META)?;
-            let head = m.get(HEAD)?.map(|v| v.value());
-            if head.is_some_and(|h| h > block) {
-                m.insert(HEAD, block)?;
+            {
+                let mut m = wtx.open_table(META)?;
+                let head = m.get(HEAD)?.map(|v| v.value());
+                if head.is_some_and(|h| h > block) {
+                    m.insert(HEAD, block)?;
+                }
             }
+            bump_generation(&wtx)?;
         }
         wtx.commit()?;
         Ok(())
     }
 
     pub fn page(&self, action: Action, req: &PageRequest) -> Result<Answer> {
+        Ok(self.page_at(action, req)?.0)
+    }
+
+    /// A page, and the generation it was read at, from one read transaction.
+    pub fn page_at(&self, action: Action, req: &PageRequest) -> Result<(Answer, u64)> {
         let a = parse_address(&req.address)?;
         let rtx = self.store.database().begin_read()?;
+        let meta = rtx.open_table(META)?;
+        let generation = meta.get(GENERATION)?.map_or(0, |v| v.value());
+        let answer = |a: Answer| Ok((a, generation));
+        if req.generation.is_some_and(|g| g != generation) {
+            return answer(Answer::Incomplete(
+                "address history changed between pages; start again from page 1".into(),
+            ));
+        }
         let start = req.start_block.unwrap_or(0);
-        let head = rtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
+        let head = meta.get(HEAD)?.map(|v| v.value());
         let spans = match rtx
             .open_table(COVERAGE)?
             .get(coverage_key(&a, action).as_slice())?
@@ -435,26 +468,32 @@ impl AddressHistory {
             Some(v) => decode_spans(v.value())?,
             None => Vec::new(),
         };
+        if req.end_block.is_some_and(|e| e < start) {
+            return answer(Answer::Rows(Vec::new()));
+        }
         let Some(&(_, covered_to)) = spans.iter().find(|(f, t)| *f <= start && start <= *t) else {
-            return Ok(Answer::Incomplete(format!(
+            return answer(Answer::Incomplete(format!(
                 "{} for {} is not indexed at block {start}",
                 action.etherscan(),
                 address_hex(&a)
             )));
         };
+        // Etherscan reads an absent or far-future `endblock` as "up to now". The nest's now is the
+        // head it has seen; without one it cannot say where history ends.
         let end = match (req.end_block, head) {
             (Some(e), Some(h)) => e.min(h),
             (Some(e), None) => e,
-            (None, _) => covered_to,
+            (None, Some(h)) => h,
+            (None, None) => {
+                return answer(Answer::Incomplete("the chain head is not known yet".into()));
+            }
         };
-        if end < start {
-            return Ok(Answer::Rows(Vec::new()));
-        }
-        if end > covered_to {
-            return Ok(Answer::Incomplete(format!(
-                "{} for {} is indexed through block {covered_to}, not {end}",
+        if end < start || end > covered_to {
+            return answer(Answer::Incomplete(format!(
+                "{} for {} is indexed through block {covered_to}, not {}",
                 action.etherscan(),
-                address_hex(&a)
+                address_hex(&a),
+                req.end_block.unwrap_or(end)
             )));
         }
         let t = rtx.open_table(action.table())?;
@@ -480,8 +519,72 @@ impl AddressHistory {
                 decode_record(v.value()).map(Value::Object)
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Answer::Rows(rows))
+        answer(Answer::Rows(rows))
     }
+
+    /// Raw writes for tests that need a store in a state `record` would refuse to produce.
+    #[cfg(test)]
+    fn insert(&self, action: Action, address: &str, rows: &[Row]) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        put_rows(&wtx, action, &parse_address(address)?, rows)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mark_covered(&self, action: Action, address: &str, from: u64, to: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        cover(&wtx, action, &parse_address(address)?, from, to)?;
+        wtx.commit()?;
+        Ok(())
+    }
+}
+
+fn put_rows(wtx: &redb::WriteTransaction, action: Action, a: &Address, rows: &[Row]) -> Result<()> {
+    let mut t = wtx.open_table(action.table())?;
+    let mut buf = Vec::new();
+    for r in rows {
+        let claimed = r.record.get("blockNumber").and_then(Value::as_str);
+        if claimed != Some(r.block.to_string().as_str()) {
+            bail!(
+                "{} row at block {} carries blockNumber {claimed:?}",
+                action.etherscan(),
+                r.block
+            );
+        }
+        buf.clear();
+        encode_record(&r.record, &mut buf)?;
+        t.insert(
+            row_key(a, r.block, r.tx_index, r.position).as_slice(),
+            buf.as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+fn cover(
+    wtx: &redb::WriteTransaction,
+    action: Action,
+    a: &Address,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    let mut t = wtx.open_table(COVERAGE)?;
+    let key = coverage_key(a, action);
+    let mut spans = match t.get(key.as_slice())? {
+        Some(v) => decode_spans(v.value())?,
+        None => Vec::new(),
+    };
+    spans.push((from, to));
+    t.insert(key.as_slice(), encode_spans(&merge(spans)).as_slice())?;
+    Ok(())
+}
+
+fn bump_generation(wtx: &redb::WriteTransaction) -> Result<()> {
+    let mut m = wtx.open_table(META)?;
+    let next = m.get(GENERATION)?.map_or(0, |v| v.value()) + 1;
+    m.insert(GENERATION, next)?;
+    Ok(())
 }
 
 fn drain(t: &mut redb::Table<&'static [u8], &'static [u8]>, lo: &[u8], hi: &[u8]) -> Result<()> {
@@ -579,7 +682,13 @@ const OTHER_KEY: u8 = 0xff;
 const V_TEXT: u8 = 0;
 const V_HEX: u8 = 1;
 const V_DECIMAL: u8 = 2;
-const V_JSON: u8 = 3;
+const V_NULL: u8 = 3;
+const V_FALSE: u8 = 4;
+const V_TRUE: u8 = 5;
+/// A JSON number, kept as its literal so it prints back exactly.
+const V_NUMBER: u8 = 6;
+const V_ARRAY: u8 = 7;
+const V_OBJECT: u8 = 8;
 
 /// A record as rotki reads it: Etherscan's mostly hex and decimal strings, packed so a hash costs 32
 /// bytes and a block number a few. Every value round-trips to the exact string it was given; anything
@@ -594,15 +703,70 @@ fn encode_record(record: &Map<String, Value>, out: &mut Vec<u8>) -> Result<()> {
                 put_bytes(out, k.as_bytes());
             }
         }
-        match v {
-            Value::String(s) => encode_string(s, out),
-            other => {
-                out.push(V_JSON);
-                put_bytes(out, serde_json::to_string(other)?.as_bytes());
+        encode_value(v, out);
+    }
+    Ok(())
+}
+
+fn encode_value(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::String(s) => encode_string(s, out),
+        Value::Null => out.push(V_NULL),
+        Value::Bool(false) => out.push(V_FALSE),
+        Value::Bool(true) => out.push(V_TRUE),
+        Value::Number(n) => {
+            out.push(V_NUMBER);
+            put_bytes(out, n.to_string().as_bytes());
+        }
+        Value::Array(items) => {
+            out.push(V_ARRAY);
+            put_varint(out, items.len() as u128);
+            for item in items {
+                encode_value(item, out);
+            }
+        }
+        Value::Object(fields) => {
+            out.push(V_OBJECT);
+            put_varint(out, fields.len() as u128);
+            for (k, item) in fields {
+                put_bytes(out, k.as_bytes());
+                encode_value(item, out);
             }
         }
     }
-    Ok(())
+}
+
+fn decode_value(raw: &mut &[u8]) -> Result<Value> {
+    Ok(match take_u8(raw)? {
+        V_TEXT => Value::String(String::from_utf8(take_bytes(raw)?.to_vec())?),
+        V_HEX => Value::String(format!(
+            "0x{}",
+            alloy_primitives::hex::encode(take_bytes(raw)?)
+        )),
+        V_DECIMAL => Value::String(take_varint(raw)?.to_string()),
+        V_NULL => Value::Null,
+        V_FALSE => Value::Bool(false),
+        V_TRUE => Value::Bool(true),
+        V_NUMBER => Value::Number(std::str::from_utf8(take_bytes(raw)?)?.parse()?),
+        V_ARRAY => {
+            let n = take_varint(raw)?;
+            let mut items = Vec::new();
+            for _ in 0..n {
+                items.push(decode_value(raw)?);
+            }
+            Value::Array(items)
+        }
+        V_OBJECT => {
+            let n = take_varint(raw)?;
+            let mut fields = Map::new();
+            for _ in 0..n {
+                let k = String::from_utf8(take_bytes(raw)?.to_vec())?;
+                fields.insert(k, decode_value(raw)?);
+            }
+            Value::Object(fields)
+        }
+        t => bail!("unknown record value tag {t}"),
+    })
 }
 
 fn encode_string(s: &str, out: &mut Vec<u8>) {
@@ -645,16 +809,7 @@ fn decode_record(mut raw: &[u8]) -> Result<Map<String, Value>> {
                 .ok_or_else(|| anyhow!("unknown record key {tag}"))?
                 .to_string()
         };
-        let value = match take_u8(&mut raw)? {
-            V_TEXT => Value::String(String::from_utf8(take_bytes(&mut raw)?.to_vec())?),
-            V_HEX => Value::String(format!(
-                "0x{}",
-                alloy_primitives::hex::encode(take_bytes(&mut raw)?)
-            )),
-            V_DECIMAL => Value::String(take_varint(&mut raw)?.to_string()),
-            V_JSON => serde_json::from_slice(take_bytes(&mut raw)?)?,
-            t => bail!("unknown record value tag {t}"),
-        };
+        let value = decode_value(&mut raw)?;
         out.insert(key, value);
     }
     if !raw.is_empty() {
@@ -692,6 +847,10 @@ fn take_varint(raw: &mut &[u8]) -> Result<u128> {
     let mut n: u128 = 0;
     for shift in (0..128).step_by(7) {
         let b = take_u8(raw)?;
+        // The 19th byte has room for 2 bits; anything more would be shifted out silently.
+        if shift == 126 && b > 0x03 {
+            bail!("varint overflows 128 bits");
+        }
         n |= u128::from(b & 0x7f) << shift;
         if b & 0x80 == 0 {
             return Ok(n);
@@ -710,9 +869,15 @@ fn take_bytes<'a>(raw: &mut &'a [u8]) -> Result<&'a [u8]> {
     Ok(b)
 }
 
-/// The Etherscan envelope for `/api`.
-pub fn ok(result: Value) -> Value {
-    serde_json::json!({ "status": "1", "message": "OK", "result": result })
+/// The Etherscan envelope for `/api`. `generation` is ours: a client paging past page 1 sends it
+/// back, and Etherscan clients that do not know it ignore an extra key.
+pub fn ok(result: Value, generation: u64) -> Value {
+    serde_json::json!({
+        "status": "1",
+        "message": "OK",
+        "result": result,
+        "generation": generation.to_string(),
+    })
 }
 
 pub fn unsupported(why: &str) -> Value {
@@ -741,14 +906,22 @@ pub fn respond(
     let Some(history) = history else {
         return unsupported("this nest has no [address_history]");
     };
+    if let Some(c) = get("chainid") {
+        if c.parse::<u64>().ok() != Some(history.chain_id) {
+            return unsupported(&format!(
+                "chainid {c} is not this nest's chain {}",
+                history.chain_id
+            ));
+        }
+    }
     if get("txhash").is_some() {
         return unsupported("txhash-scoped lookups are not served yet");
     }
     match parse_request(params) {
         Err(e) => error(e),
-        Ok(req) => match history.page(act, &req) {
-            Ok(Answer::Rows(rows)) => ok(Value::Array(rows)),
-            Ok(Answer::Incomplete(why)) => incomplete(&why),
+        Ok(req) => match history.page_at(act, &req) {
+            Ok((Answer::Rows(rows), generation)) => ok(Value::Array(rows), generation),
+            Ok((Answer::Incomplete(why), _)) => incomplete(&why),
             Err(e) => error(format!("{e:#}")),
         },
     }
@@ -783,6 +956,7 @@ fn parse_request(params: &std::collections::HashMap<String, String>) -> Result<P
         sort,
         page,
         offset,
+        generation: num("generation")?,
     })
 }
 
@@ -797,7 +971,10 @@ mod tests {
     fn history() -> (tempfile::TempDir, AddressHistory) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
-        (dir, AddressHistory::open(store, &[ALICE.into()]).unwrap())
+        (
+            dir,
+            AddressHistory::open(store, 1, &[ALICE.into()]).unwrap(),
+        )
     }
 
     fn tx(block: u64, tx_index: u64) -> Row {
@@ -843,6 +1020,7 @@ mod tests {
             sort: Sort::Asc,
             page,
             offset,
+            generation: None,
         }
     }
 
@@ -1156,10 +1334,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
         {
-            let h = AddressHistory::open(Store::open(&path).unwrap(), &[ALICE.into()]).unwrap();
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
             h.watch(BOB).unwrap();
         }
-        let h = AddressHistory::open(Store::open(&path).unwrap(), &[]).unwrap();
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[]).unwrap();
         assert_eq!(h.watched().unwrap().len(), 2);
     }
 
@@ -1178,7 +1356,7 @@ mod tests {
             "gas": "0x0",
             "functionName": "transfer(address _to, uint256 _value)",
             "tokenValue": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
-            "authorizationList": [{"chainId": "1"}],
+            "authorizationList": [{"chainId": "1", "yParity": 0, "nested": [true, false, null, 1.5, -3]}],
             "someNewField": "0xABCD",
         });
         let Value::Object(record) = raw.clone() else {
@@ -1187,6 +1365,10 @@ mod tests {
         let mut buf = Vec::new();
         encode_record(&record, &mut buf).unwrap();
         assert_eq!(Value::Object(decode_record(&buf).unwrap()), raw);
+        assert!(
+            !buf.windows(10).any(|w| w == b"{\"chainId\""),
+            "a nested value is packed, not stored as JSON text"
+        );
 
         // An Etherscan txlist row as it arrives: hashes and addresses dominate, and pack to bytes.
         let row = serde_json::json!({
@@ -1270,5 +1452,175 @@ mod tests {
             poll_interval: Some("0s".into()),
             ..ok.clone()
         });
+    }
+
+    fn open_ended(h: &AddressHistory) -> Answer {
+        h.page(
+            Action::TxList,
+            &PageRequest {
+                end_block: None,
+                ..req(0, 0, 1, 10)
+            },
+        )
+        .unwrap()
+    }
+
+    /// An absent `endblock` means up to the head, and coverage short of the head is incomplete,
+    /// not a shorter history.
+    #[test]
+    fn an_absent_endblock_needs_coverage_through_the_head() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 99).unwrap();
+        assert!(
+            matches!(open_ended(&h), Answer::Incomplete(_)),
+            "no head, no end"
+        );
+        h.set_head(200).unwrap();
+        assert!(matches!(open_ended(&h), Answer::Incomplete(_)));
+        h.mark_covered(Action::TxList, ALICE, 101, 200).unwrap();
+        assert!(
+            matches!(open_ended(&h), Answer::Incomplete(_)),
+            "a gap at 100"
+        );
+        h.mark_covered(Action::TxList, ALICE, 100, 100).unwrap();
+        assert_eq!(open_ended(&h), Answer::Rows(vec![]));
+    }
+
+    #[test]
+    fn a_range_starting_past_the_head_is_incomplete_not_empty() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 100).unwrap();
+        h.set_head(100).unwrap();
+        assert!(matches!(
+            h.page(Action::TxList, &req(150, 99_999_999, 1, 10))
+                .unwrap(),
+            Answer::Incomplete(_)
+        ));
+        assert_eq!(
+            h.page(Action::TxList, &req(50, 40, 1, 10)).unwrap(),
+            Answer::Rows(vec![]),
+            "an endblock before the startblock asks for nothing"
+        );
+    }
+
+    /// A row stored without coverage (a fetch interrupted, or one whose span a reorg cut) must not
+    /// survive a reorg and resurface once the range is covered again.
+    #[test]
+    fn a_reorg_drops_rows_that_had_no_coverage() {
+        let (_d, h) = history();
+        h.insert(Action::TxList, ALICE, &[tx(120, 0)]).unwrap();
+        h.invalidate_above(100).unwrap();
+        let g = h.generation().unwrap();
+        h.record(Action::TxList, ALICE, &[], (0, 150), g).unwrap();
+        assert_eq!(
+            h.page(Action::TxList, &req(0, 150, 1, 10)).unwrap(),
+            Answer::Rows(vec![])
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_straddles_a_reorg_or_unwatch_is_refused() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        h.invalidate_above(100).unwrap();
+        let err = h
+            .record(Action::TxList, ALICE, &[tx(90, 0)], (0, 100), g)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed during the fetch"),
+            "{err}"
+        );
+        assert!(h.coverage(Action::TxList, ALICE).unwrap().is_empty());
+
+        h.watch(BOB).unwrap();
+        let g = h.generation().unwrap();
+        h.unwatch(BOB).unwrap();
+        assert!(
+            h.record(Action::TxList, BOB, &[], (0, 1), g).is_err(),
+            "unwatched"
+        );
+        let g = h.generation().unwrap();
+        h.watch(BOB).unwrap();
+        assert!(
+            h.record(Action::TxList, BOB, &[tx(5, 0)], (6, 9), g)
+                .is_err(),
+            "a row outside the span it claims"
+        );
+        h.record(Action::TxList, BOB, &[tx(5, 0)], (0, 9), g)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_later_page_from_an_older_generation_is_incomplete() {
+        let (_d, h) = history();
+        let rows: Vec<Row> = (0..3).map(|i| tx(10 + i, 0)).collect();
+        let g = h.generation().unwrap();
+        h.record(Action::TxList, ALICE, &rows, (0, 20), g).unwrap();
+        let q = |page: &str, generation: Option<&str>| {
+            let mut p = vec![
+                ("module", "account"),
+                ("action", "txlist"),
+                ("address", ALICE),
+                ("startblock", "0"),
+                ("endblock", "20"),
+                ("offset", "2"),
+                ("page", page),
+            ];
+            if let Some(g) = generation {
+                p.push(("generation", g));
+            }
+            respond(Some(&h), &params(&p))
+        };
+        let first = q("1", None);
+        let seen = first["generation"].as_str().unwrap().to_string();
+        assert_eq!(hashes(&q("2", Some(&seen))).len(), 1);
+        h.invalidate_above(11).unwrap();
+        let second = q("2", Some(&seen));
+        assert!(
+            second["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn a_chainid_for_another_chain_is_unsupported() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 10).unwrap();
+        let q = |chain: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("chainid", chain),
+                    ("module", "account"),
+                    ("action", "txlist"),
+                    ("address", ALICE),
+                    ("endblock", "10"),
+                ]),
+            )
+        };
+        assert_eq!(q("1")["status"], "1");
+        for other in ["8453", "x"] {
+            let a = q(other);
+            assert!(
+                a["result"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("NUTHATCH_UNSUPPORTED:"),
+                "{other}: {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_varint_past_128_bits_is_refused() {
+        let mut max = Vec::new();
+        put_varint(&mut max, u128::MAX);
+        assert_eq!(take_varint(&mut max.as_slice()).unwrap(), u128::MAX);
+        let mut over = vec![0x80u8; 18];
+        over.push(0x04);
+        assert!(take_varint(&mut over.as_slice()).is_err());
     }
 }
