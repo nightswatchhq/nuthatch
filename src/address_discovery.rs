@@ -40,6 +40,7 @@ const SCAN_CONCURRENCY: usize = 8;
 /// Ethereum mainnet's forks that change what a block body carries or what its miner earns.
 const SHANGHAI: u64 = 17_034_870;
 const MERGE: u64 = 15_537_394;
+const LONDON: u64 = 12_965_000;
 const CONSTANTINOPLE: u64 = 7_280_000;
 const BYZANTIUM: u64 = 4_370_000;
 
@@ -620,6 +621,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         if header.is_null() {
             bail!("the main endpoint has no block {b}");
         }
+        let number = hex_u64(header.get("number").unwrap_or(&Value::Null))
+            .with_context(|| format!("block {b} number"))?;
+        if number != b {
+            bail!("asked for block {b}, the main endpoint answered with block {number}");
+        }
         Ok((b, header))
     }
 
@@ -636,19 +642,38 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         let receipts = receipts
             .as_array()
             .ok_or_else(|| anyhow!("receipts of block {b} are not a list"))?;
-        let quantity = |v: Option<&Value>| -> Result<U256> {
-            match v.and_then(Value::as_str) {
-                Some(s) => Ok(U256::from_str_radix(s.trim_start_matches("0x"), 16)?),
-                None => Ok(U256::ZERO),
-            }
+        let txs = header
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("block {b} lists no transactions"))?;
+        if receipts.len() != txs.len() {
+            bail!(
+                "block {b} has {} transactions and {} receipts",
+                txs.len(),
+                receipts.len()
+            );
+        }
+        let quantity = |v: &Value, field: &str| -> Result<U256> {
+            let s = v
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("block {b}: no {field}"))?;
+            Ok(U256::from_str_radix(s.trim_start_matches("0x"), 16)?)
         };
-        let base_fee = quantity(header.get("baseFeePerGas"))?;
+        let base_fee = if b >= LONDON {
+            quantity(header, "baseFeePerGas")?
+        } else {
+            U256::ZERO
+        };
         let mut fees = U256::ZERO;
-        for r in receipts {
-            let price = r
-                .get("effectiveGasPrice")
-                .ok_or_else(|| anyhow!("a receipt in block {b} has no effectiveGasPrice"))?;
-            fees += quantity(r.get("gasUsed"))? * (quantity(Some(price))? - base_fee);
+        for (r, tx) in receipts.iter().zip(txs) {
+            if r.get("transactionHash") != Some(tx) {
+                bail!("block {b}'s receipts do not follow its transactions");
+            }
+            let tip = quantity(r, "effectiveGasPrice")?
+                .checked_sub(base_fee)
+                .ok_or_else(|| anyhow!("block {b}: a receipt priced under the base fee"))?;
+            fees += quantity(r, "gasUsed")? * tip;
         }
         let ether = U256::from(1_000_000_000_000_000_000u64);
         let static_reward = if b >= MERGE {
@@ -2610,7 +2635,7 @@ mod tests {
                     let b = hex_u64(&p[0])?;
                     let mut h = json!({"number": format!("0x{b:x}"), "timestamp": format!("0x{:x}", 1_000 + b),
                         "miner": if b % 10 == 5 { B } else { "0x0000000000000000000000000000000000000077" },
-                        "baseFeePerGas": "0x64", "uncles": [], "withdrawals": []});
+                        "baseFeePerGas": "0x64", "uncles": [], "withdrawals": [], "transactions": ["0x01", "0x02"]});
                     if b % 10 == 2 {
                         h["withdrawals"] = json!([
                             {"index": "0xa", "validatorIndex": "0x1", "address": A, "amount": "0x5"},
@@ -2625,8 +2650,8 @@ mod tests {
                     h
                 }
                 "eth_getBlockReceipts" => json!([
-                    {"gasUsed": "0x5208", "effectiveGasPrice": "0x66"},
-                    {"gasUsed": "0x2", "effectiveGasPrice": "0x64"},
+                    {"transactionHash": "0x01", "gasUsed": "0x5208", "effectiveGasPrice": "0x66"},
+                    {"transactionHash": "0x02", "gasUsed": "0x2", "effectiveGasPrice": "0x64"},
                 ]),
                 other => bail!("unexpected {other}"),
             })
@@ -2707,7 +2732,8 @@ mod tests {
         let (_, trace) = chain(false);
         let d = Discoverer::new(bodies(None), trace);
         let reward = |b: u64, uncles: usize, base: Option<&str>| {
-            let mut h = json!({"uncles": vec![json!("0x0"); uncles]});
+            let mut h =
+                json!({"uncles": vec![json!("0x0"); uncles], "transactions": ["0x01", "0x02"]});
             if let Some(f) = base {
                 h["baseFeePerGas"] = json!(f);
             }
@@ -2730,6 +2756,60 @@ mod tests {
             (5_000_000_000_000_000_000u128 + 21_000 * 102 + 200 + 2 * 156_250_000_000_000_000)
                 .to_string()
         );
+    }
+
+    /// An answer that does not account for the whole block fails the scan instead of recording a
+    /// reward or an empty window: a body for another height, receipts that do not match the body's
+    /// transactions, and a fee field that is missing.
+    #[tokio::test]
+    async fn an_incomplete_block_answer_fails_the_scan() {
+        let cases: [(&str, fn(&str, &mut Value)); 6] = [
+            ("answered with block", |m, v| {
+                if m == "eth_getBlockByNumber" {
+                    v["number"] = json!("0x1");
+                }
+            }),
+            ("2 transactions and 1 receipts", |m, v| {
+                if m == "eth_getBlockReceipts" {
+                    v.as_array_mut().unwrap().pop();
+                }
+            }),
+            ("no baseFeePerGas", |m, v| {
+                if m == "eth_getBlockByNumber" {
+                    v.as_object_mut().unwrap().remove("baseFeePerGas");
+                }
+            }),
+            ("no gasUsed", |m, v| {
+                if m == "eth_getBlockReceipts" {
+                    v[0].as_object_mut().unwrap().remove("gasUsed");
+                }
+            }),
+            ("do not follow its transactions", |m, v| {
+                if m == "eth_getBlockReceipts" {
+                    v[0]["transactionHash"] = json!("0x03");
+                }
+            }),
+            ("under the base fee", |m, v| {
+                if m == "eth_getBlockReceipts" {
+                    v[1]["effectiveGasPrice"] = json!("0x63");
+                }
+            }),
+        ];
+        for (want, spoil) in cases {
+            let good = bodies(None);
+            let main = script(move |m, p| {
+                let mut v = (good.answer)(m, p)?;
+                spoil(m, &mut v);
+                Ok(v)
+            });
+            let (_, trace) = chain(false);
+            let d = Discoverer::new(main, trace);
+            let err = d
+                .scan_blocks(&[B.into()], 17_100_005, 17_100_005, &Pending::default())
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
+        }
     }
 
     /// The cursor's block pass reads each body once for every address that lacks it, and an address
