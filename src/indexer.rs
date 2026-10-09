@@ -3368,6 +3368,7 @@ async fn build_nest(
         nid,
         // Set by `spawn_runtime` for a co-tenanted nest; a solo `dev` nest has no mounts health surface.
         runtime_health: None,
+        address_history: None,
         admin_enabled,
         admin_token,
         nest_info: Arc::new(nest_info),

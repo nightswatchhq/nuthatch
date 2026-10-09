@@ -6,6 +6,7 @@
 //! drives the pipeline through the `Source` trait.
 
 pub mod abi;
+pub mod address_history;
 pub mod alerts;
 pub mod allowlist;
 pub mod analytics;

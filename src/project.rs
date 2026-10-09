@@ -156,6 +156,7 @@ async fn scaffold(args: InitArgs) -> Result<()> {
         webhooks: Vec::new(),
         extract: Extract::default(),
         calls: Vec::new(),
+        address_history: None,
     };
     config.save(&dir)?;
 
@@ -770,6 +771,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             ..Extract::default()
         },
         calls: Vec::new(),
+        address_history: None,
     };
     config.save(&dir)?;
     let table_count = write_nest_artifacts(&dir, &chain.name, &config)?;

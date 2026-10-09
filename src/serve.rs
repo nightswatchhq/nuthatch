@@ -315,6 +315,9 @@ pub struct AppState {
     /// `None` for a solo `dev` nest, which has no mounts around it and falls back to the global
     /// poll-freshness check.
     pub runtime_health: Option<(String, Arc<crate::health::RuntimeHealth>)>,
+    /// RFC-0063: the watched-address history `/api` serves. `None` on a nest without
+    /// `[address_history]`, which answers every `/api` request unsupported.
+    pub address_history: Option<crate::address_history::AddressHistory>,
 }
 
 /// A hot-swappable handle to the `AppState` backing one served endpoint (RFC-0020 slice 2). The router
@@ -415,7 +418,8 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/exposure/{address}", get(exposure))
             .route("/flags", get(flags))
             .route("/nest", get(nest))
-            .route("/shape", get(shape)),
+            .route("/shape", get(shape))
+            .route("/api", get(etherscan_api)),
     ))
     // Count every served request for `/metrics` (the operator's billing signal).
     .layer(axum::middleware::from_fn(count_request))
@@ -1115,6 +1119,21 @@ async fn admin_index(
 /// `GET /nest` - static nest metadata for the admin UI's Nest tab (RFC-0010 Part A).
 async fn nest(State(s): State<AppState>) -> impl IntoResponse {
     Json((*s.nest_info).clone())
+}
+
+/// `GET /api` - the Etherscan-shaped account surface over the nest's watched addresses (RFC-0063).
+async fn etherscan_api(
+    State(s): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let answer = tokio::task::spawn_blocking(move || {
+        crate::address_history::respond(s.address_history.as_ref(), &q)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        serde_json::json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e}") })
+    });
+    Json(answer)
 }
 
 /// The nest's capability *shape* (RFC-0025): which capability-gated MCP surfaces are live, so the
@@ -5811,6 +5830,7 @@ mod tests {
             admin_token: None,
             nest_info: Arc::new(json!({ "name": "t" })),
             runtime_health: None,
+            address_history: None,
         }
     }
 
@@ -6745,6 +6765,60 @@ mod tests {
                 assert!(json.get("maintained").is_none(), "{json}");
             }
         }
+    }
+
+    /// RFC-0063: `/api` is routed, answers from the nest's address history, and says unsupported on a
+    /// nest without one rather than an empty success rotki would take as no history.
+    #[tokio::test]
+    async fn the_etherscan_api_route_serves_address_history() {
+        use crate::address_history::{Action, AddressHistory, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let who = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+        let path =
+            format!("/api?module=account&action=txlist&address={who}&startblock=0&endblock=20");
+
+        let bare = router(SharedNest::new(test_state(dir.path(), 2)));
+        let (status, body) = get(bare, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "0", "{json}");
+        assert!(
+            json["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{json}"
+        );
+
+        let history = AddressHistory::open(
+            Store::open(&dir.path().join("ah.redb")).unwrap(),
+            &[who.into()],
+        )
+        .unwrap();
+        let mut record = serde_json::Map::new();
+        record.insert("blockNumber".into(), json!("7"));
+        record.insert("hash".into(), json!("0xabc"));
+        history
+            .insert(
+                Action::TxList,
+                who,
+                &[Row {
+                    block: 7,
+                    tx_index: 0,
+                    position: 0,
+                    record,
+                }],
+            )
+            .unwrap();
+        history.mark_covered(Action::TxList, who, 0, 20).unwrap();
+        let mut state = test_state(dir.path(), 2);
+        state.address_history = Some(history);
+        let (_, body) = get(router(SharedNest::new(state)), &path).await;
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            json!({"status": "1", "message": "OK", "result": [{"blockNumber": "7", "hash": "0xabc"}]})
+        );
     }
 
     /// #1399: with one `--rpc`, `--seal-direct --concurrency 6` ran one window at a time, and the only
