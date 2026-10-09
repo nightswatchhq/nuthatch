@@ -1,8 +1,8 @@
 # Subgraph stopgap S0: the BNB and Polygon sample
 
-**Measured 2026-10-06 for [#1940](https://github.com/nightswatchhq/nuthatch/issues/1940).** Part of the
+**Measured 2026-10-06 for [#1940](https://github.com/nuthatch-org/nuthatch/issues/1940).** Part of the
 [subgraph stopgap](subgraph-stopgap.md) programme. Nothing here is fixed; every defect is listed for S1
-([#1941](https://github.com/nightswatchhq/nuthatch/issues/1941)) with a CID that reproduces it.
+([#1941](https://github.com/nuthatch-org/nuthatch/issues/1941)) with a CID that reproduces it.
 
 ## Verdict
 
@@ -258,7 +258,7 @@ Each reproduces with the CID given on the default or `graph` build at `35f50b8`.
 - How many of a deployment's real GraphQL **queries** a nest would answer, beyond BetSwirl's published
   client. Field coverage overstates that, as [the compatibility reference](graph-compatibility-what-it-is.md)
   says: one refused field fails the query.
-- The orphan list. That is S2 ([#1942](https://github.com/nightswatchhq/nuthatch/issues/1942)); this
+- The orphan list. That is S2 ([#1942](https://github.com/nuthatch-org/nuthatch/issues/1942)); this
   sample was drawn from Lodestar's version of it, which is not S2's verified list.
 - Correctness of any answered value. No nest served a row, and no sampled deployment has an indexer to
   diff against, which is the point of them. BetSwirl's Polygon twin is the one available reference, once

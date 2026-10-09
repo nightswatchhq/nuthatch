@@ -491,7 +491,7 @@ materialisation.
 
 ## §13 - What v1 cannot express, measured on a real nest
 
-Added 2026-09-07 from nightswatchhq/nuthatch#1193, which is closed in favour of this section. It is a
+Added 2026-09-07 from nuthatch-org/nuthatch#1193, which is closed in favour of this section. It is a
 measurement rather than a proposal: the 2026 feature freeze stands, and none of the three shapes below
 is carved out.
 

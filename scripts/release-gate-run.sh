@@ -37,7 +37,7 @@
 #                 unset means the copy is used as it stands
 #   GATE_REFRESH_SCRIPT  what a config's helsinki and local refreshes run
 #                        (default deploy/release-gate/refresh-from-helsinki.sh beside this)
-#   GATE_REPO     (default nightswatchhq/nuthatch)
+#   GATE_REPO     (default nuthatch-org/nuthatch)
 #   GATE_TARGET   release asset target         (default x86_64-unknown-linux-gnu)
 #   GATE_PASSES   passes per binary            (default 3)
 #   GATE_CONCURRENCY  statements in flight at once (default 2, as 8107's SQL_MAX_CONCURRENCY); a
@@ -50,7 +50,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 state=${GATE_STATE:-$HOME/release-gate}
 nest=${GATE_NEST:-$state/alloc-nest}
 set_file=${GATE_SET:-}
-repo=${GATE_REPO:-nightswatchhq/nuthatch}
+repo=${GATE_REPO:-nuthatch-org/nuthatch}
 target=${GATE_TARGET:-x86_64-unknown-linux-gnu}
 passes=${GATE_PASSES:-3}
 concurrency=${GATE_CONCURRENCY:-2}

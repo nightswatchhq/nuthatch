@@ -100,4 +100,4 @@ deny = [
 unknown-registry = "deny"
 unknown-git = "deny"
 # Burrmill, the analytical engine, pinned by rev.
-allow-git = ["https://github.com/nightswatchhq/burrmill"]
+allow-git = ["https://github.com/nuthatch-org/burrmill"]

@@ -83,7 +83,7 @@ fn statuses(r: &Rig, except: &[(&str, Option<&str>)]) {
         };
         out.push_str(&format!(
             "release-gate/{nest}\t{state}\t{nest} {state} against 4.3.0\t\
-             https://github.com/nightswatchhq/nuthatch/actions/runs/{nest}\n"
+             https://github.com/nuthatch-org/nuthatch/actions/runs/{nest}\n"
         ));
     }
     std::fs::write(r.state.join("status-sha-4.3.1"), out).unwrap();
@@ -145,7 +145,7 @@ fn a_red_nest_refuses_the_roll_and_names_its_status() {
     assert!(out.contains("release-gate/alloc-nest"), "{out}");
     assert!(out.contains("alloc-nest failure against 4.3.0"), "{out}");
     assert!(
-        out.contains("https://github.com/nightswatchhq/nuthatch/actions/runs/alloc-nest"),
+        out.contains("https://github.com/nuthatch-org/nuthatch/actions/runs/alloc-nest"),
         "{out}"
     );
     assert!(

@@ -123,7 +123,7 @@ can show the row that differs. The canonical form decides what counts as the sam
 - Every value compares exactly as served, floats included: a float one bit off, or an integer that
   comes back as a float, is a different answer. Floats were rounded to 12 significant digits until
   #1883, when two fresh 4.7.0 servers answered every production set alike to the last bit
-  ([the record](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/reproducibility-2026-10-05.md)). A baseline from a binary before 4.6.0, which summed
+  ([the record](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/reproducibility-2026-10-05.md)). A baseline from a binary before 4.6.0, which summed
   DOUBLE in arrival order, can differ from a later one in the last digit.
   The rows go through jq, and only jq 1.7 or later keeps each number's digits and form: an older one parses
   every number to a double, so 9007199254740993 would match 9007199254740992 and 1.0 would match 1.
@@ -244,7 +244,7 @@ refusals, its regressions against production's times, answers that differ from p
 its own peak, and a statement production fails can neither regress nor differ. Only a production run that could not be measured (exit 2) posts `error`.
 
 **The result** reaches the release as a commit status on the candidate's commit, context
-`release-gate/alloc-nest`, posted with `gh api repos/nightswatchhq/nuthatch/statuses/<sha>`:
+`release-gate/alloc-nest`, posted with `gh api repos/nuthatch-org/nuthatch/statuses/<sha>`:
 `pending` when it starts, then `success`, `failure` (with the failed queries named) or `error`
 (the gate could not run). The full output stays in `~/release-gate/runs/` on the ThinkPad.
 

@@ -1,7 +1,7 @@
 # Subgraph stopgap: nests for subgraphs the network does not serve
 
 **Opened 2026-10-06. Status: S0 in progress, S2 done.** This file is the central tracker. Issues carry the
-detail and are labelled [`subgraph-stopgap`](https://github.com/nightswatchhq/nuthatch/labels/subgraph-stopgap).
+detail and are labelled [`subgraph-stopgap`](https://github.com/nuthatch-org/nuthatch/labels/subgraph-stopgap).
 
 ## Why
 
@@ -42,7 +42,7 @@ Two deliverables, in order of how certain their value is:
 | Graph-dialect GraphQL read surface | `src/graph_query.rs`, RFC-0053 (parked, shipped parts supported) | 2026-09-12 |
 | BNB and Polygon chain presets | `src/chains.rs` | |
 | deployment and allocation state | `graph-allocations-nest` | |
-| precedent: an unserved deployment ported | [doudouchain-v2-nest](https://github.com/nightswatchhq/doudouchain-v2-nest) | |
+| precedent: an unserved deployment ported | [doudouchain-v2-nest](https://github.com/nuthatch-org/doudouchain-v2-nest) | |
 
 No slice below needs new capability in the default binary. RFC-0053 and RFC-0044 stay parked: this
 programme fixes what the BNB and Polygon sample shows broken in what already shipped, and starts no
@@ -52,10 +52,10 @@ further slices of either.
 
 | slice | issue | what | fails if | status |
 | --- | --- | --- | --- | --- |
-| S0 | [#1940](https://github.com/nightswatchhq/nuthatch/issues/1940) | `init --from-subgraph` and `port-emit` on 15-20 published `bsc` and `matic` deployments, mixed shapes; record init success, fields answered, backfill cost | fewer than half the sample yield a serving nest that answers at least a third of its report-exact fields, or BetSwirl BNB Chain does not; the offer then narrows to S2 alone | not started |
-| S1 | [#1941](https://github.com/nightswatchhq/nuthatch/issues/1941) | fix what S0 broke; CID to serving GraphQL surface end to end on both chains, golden tests from the sample | a sample deployment that should port does not | waits on S0 |
-| S2 | [#1942](https://github.com/nightswatchhq/nuthatch/issues/1942) | resolve each manifest's `network:` from IPFS; view of `bsc`/`matic` deployments with signal or an indexing agreement and zero active allocations; alert on new entries | the list disagrees with the network subgraph's allocation counts at a pinned block | done: Lodestar's `/subgraphs/migration` is the list, verified exact at a pinned block; verifier and alert in #1945 |
-| S3 | [#1943](https://github.com/nightswatchhq/nuthatch/issues/1943) | per-subgraph handback package: coverage report, how to run, how to point back at the network | someone who did not build it cannot stand one up from the package alone | waits on S1 |
+| S0 | [#1940](https://github.com/nuthatch-org/nuthatch/issues/1940) | `init --from-subgraph` and `port-emit` on 15-20 published `bsc` and `matic` deployments, mixed shapes; record init success, fields answered, backfill cost | fewer than half the sample yield a serving nest that answers at least a third of its report-exact fields, or BetSwirl BNB Chain does not; the offer then narrows to S2 alone | not started |
+| S1 | [#1941](https://github.com/nuthatch-org/nuthatch/issues/1941) | fix what S0 broke; CID to serving GraphQL surface end to end on both chains, golden tests from the sample | a sample deployment that should port does not | waits on S0 |
+| S2 | [#1942](https://github.com/nuthatch-org/nuthatch/issues/1942) | resolve each manifest's `network:` from IPFS; view of `bsc`/`matic` deployments with signal or an indexing agreement and zero active allocations; alert on new entries | the list disagrees with the network subgraph's allocation counts at a pinned block | done: Lodestar's `/subgraphs/migration` is the list, verified exact at a pinned block; verifier and alert in #1945 |
+| S3 | [#1943](https://github.com/nuthatch-org/nuthatch/issues/1943) | per-subgraph handback package: coverage report, how to run, how to point back at the network | someone who did not build it cannot stand one up from the package alone | waits on S1 |
 
 S0 and S2 are independent and run in parallel. S0 is the slice that can stop the stopgap half.
 

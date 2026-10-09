@@ -12,7 +12,7 @@ reproduced and is withdrawn (#1844).
 
 The published release, not a local build, so anyone can run the same bytes.
 
-- Release: [v4.7.0](https://github.com/nightswatchhq/nuthatch/releases/tag/v4.7.0), tag commit `da4dc65`
+- Release: [v4.7.0](https://github.com/nuthatch-org/nuthatch/releases/tag/v4.7.0), tag commit `da4dc65`
 - Asset: `nuthatch-aarch64-apple-darwin.tar.gz`, sha256
   `7ed1c2d89de0ed42ee599bb2e62f71ac169ac2e5bed5057d6dfdca01dee46d2d`, checked against the release's
   `.sha256` file
@@ -21,7 +21,7 @@ The published release, not a local build, so anyone can run the same bytes.
 
 ## Nest
 
-[`nightswatchhq/obib-case6`](https://github.com/nightswatchhq/obib-case6) at `main` as of the run:
+[`nuthatch-org/obib-case6`](https://github.com/nuthatch-org/obib-case6) at `main` as of the run:
 the Uniswap V2 factory `0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f`, `PairCreated` discovering
 children, `Swap` on each child, `block_timestamps = false`.
 

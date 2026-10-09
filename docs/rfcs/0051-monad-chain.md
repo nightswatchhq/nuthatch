@@ -7,9 +7,9 @@
   addendum's items 10 to 14 say why, and what would move it to the tag.
 - Author: Pete
 - Date: September 2026
-- Tracking issue: [#1136](https://github.com/nightswatchhq/nuthatch/issues/1136)
+- Tracking issue: [#1136](https://github.com/nuthatch-org/nuthatch/issues/1136)
 - RFC number: the draft carried a provisional 0043, which was already taken; 0050 is the sibling
-  Robinhood Chain draft ([#1133](https://github.com/nightswatchhq/nuthatch/issues/1133)), so this
+  Robinhood Chain draft ([#1133](https://github.com/nuthatch-org/nuthatch/issues/1133)), so this
   is 0051. See the maintainer addendum at the end for the other `[VERIFY]` items.
 
 -----
@@ -295,7 +295,7 @@ A benchmark that would **reopen the design:** if a paid archive endpoint cannot 
 - DefiLlama — Monad chain: <https://defillama.com/chain/monad>
 - category-labs/monad: <https://github.com/category-labs/monad>
 - category-labs/monad-bft: <https://github.com/category-labs/monad-bft>
-- nuthatch README: <https://github.com/nightswatchhq/nuthatch>
+- nuthatch README: <https://github.com/nuthatch-org/nuthatch>
 
 -----
 
@@ -307,7 +307,7 @@ A benchmark that would **reopen the design:** if a paid archive endpoint cannot 
 
 The `[VERIFY]` items and action items above are checked against the tree at `f7a4bdd4` and the
 live endpoints on 2026-09-03; the body above is left as written. The probes are recorded on
-[#1136](https://github.com/nightswatchhq/nuthatch/issues/1136), with the `doctor` output.
+[#1136](https://github.com/nuthatch-org/nuthatch/issues/1136), with the `doctor` output.
 
 1. **RFC number.** 0043 is taken (lessons from Amp). 0050 is the Robinhood Chain draft. This is
    0051, and the header says so.

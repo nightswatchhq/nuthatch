@@ -10,7 +10,7 @@ autotests = false
 rust-version = "1.95"
 description = "Be your own indexer. One Rust binary, one command, live in under two minutes."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/nightswatchhq/nuthatch"
+repository = "https://github.com/nuthatch-org/nuthatch"
 homepage = "https://www.nuthatch-indexer.com"
 readme = "README.md"
 keywords = ["blockchain", "indexer", "ethereum", "self-hosted", "mcp"]
@@ -118,7 +118,7 @@ bytes = "1"
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 # The analytical engine (RFC-0044 Amendment 2), pinned by rev. Its arrow is not ours, so no batch
 # crosses; rows cross as JSON, and Arrow results as IPC.
-burrmill = { git = "https://github.com/nightswatchhq/burrmill", rev = "0777d7620a862ae55cbce09938199f32324b3112", default-features = false, features = ["datafusion"] }
+burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "0777d7620a862ae55cbce09938199f32324b3112", default-features = false, features = ["datafusion"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
 # satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via

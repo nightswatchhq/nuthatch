@@ -22,7 +22,7 @@
   subgraph-style resync gamble, and the "be your own indexer" promise stops at v1.
 - Nature: design RFC. **The single most differentiating item in the Jul-Aug set** - content-addressed
   immutable segments give us a capability subgraphs structurally cannot have.
-- Origin: roadmap thread 4 ([`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)); definition settled 2026-07-21.
+- Origin: roadmap thread 4 ([`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)); definition settled 2026-07-21.
 
 ## Abstract
 

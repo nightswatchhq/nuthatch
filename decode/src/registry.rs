@@ -223,7 +223,7 @@ pub const BLOCK_COLUMNS: &[(&str, &str, StorageKind)] = &[
     // `EpochManager` counts epochs in **L1** blocks while an indexed log carries an **L2** block, so
     // an epoch boundary has to be guessed from the first *observed* event instead, leaving a window
     // of several thousand blocks whose contents are filed against the wrong epoch
-    // (nightswatchhq/nuthatch#1116).
+    // (nuthatch-org/nuthatch#1116).
     //
     // **0 on a chain that does not report it**, which is most of them, following `base_fee_per_gas`
     // above: 0 is the honest value for "the field did not exist".
@@ -1985,7 +1985,7 @@ mod stored_roundtrip {
 mod tests {
     use super::*;
 
-    /// nightswatchhq/nuthatch#1116 - the L1 block an L2 block was sequenced against.
+    /// nuthatch-org/nuthatch#1116 - the L1 block an L2 block was sequenced against.
     ///
     /// The bridge between the two block spaces. `EpochManager` counts epochs in L1 blocks while an
     /// indexed log carries an L2 block, so without this an epoch boundary has to be guessed from the

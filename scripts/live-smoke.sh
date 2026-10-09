@@ -11,14 +11,14 @@
 # SMOKE_ATTEMPTS attempts with backoff between them; only when every one fails is the run red.
 #
 # Env: NUTHATCH_BIN, SMOKE_LIMIT_SECS (180), SMOKE_ATTEMPTS (3), SMOKE_LISTEN (127.0.0.1:18288),
-#      SMOKE_REPO (nightswatchhq/nuthatch), SMOKE_TAG (latest published release). Needs curl, jq, gh.
+#      SMOKE_REPO (nuthatch-org/nuthatch), SMOKE_TAG (latest published release). Needs curl, jq, gh.
 
 set -uo pipefail
 
 LIMIT="${SMOKE_LIMIT_SECS:-180}"
 ATTEMPTS="${SMOKE_ATTEMPTS:-3}"
 LISTEN="${SMOKE_LISTEN:-127.0.0.1:18288}"
-REPO="${SMOKE_REPO:-nightswatchhq/nuthatch}"
+REPO="${SMOKE_REPO:-nuthatch-org/nuthatch}"
 API="http://$LISTEN"
 USDC=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
 SHUTDOWN_SECS=30

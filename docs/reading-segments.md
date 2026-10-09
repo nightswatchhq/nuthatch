@@ -9,7 +9,7 @@ sealed. The hot tip lives in `nuthatch.redb` and is not Parquet; an external eng
 this directory sees history through the last sealed block, not the unfinalised window.
 
 RFC-0047 C1. FLBA32 (`FIXED_LEN_BYTE_ARRAY(32)`) is not what is written; that would be a format
-version ([#1222](https://github.com/nightswatchhq/nuthatch/issues/1222)), not a write-down of
+version ([#1222](https://github.com/nuthatch-org/nuthatch/issues/1222)), not a write-down of
 current behaviour.
 
 ## Directory layout
@@ -120,7 +120,7 @@ footer, and so a change of bytes is a change of name rather than a silent rewrit
 holds both.
 
 There is no `sort_order`, no per-column `logical_type`, and no segment-level stats in the
-catalogue. Those are [#1223](https://github.com/nightswatchhq/nuthatch/issues/1223),
+catalogue. Those are [#1223](https://github.com/nuthatch-org/nuthatch/issues/1223),
 not this page. Unknown fields should be ignored (the `registry_snapshot` / `provisional`
 defaults already work that way).
 

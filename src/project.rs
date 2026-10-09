@@ -2724,11 +2724,11 @@ abi = "abis/tok.json"
     #[test]
     fn ordinary_git_sources_still_qualify() {
         for ok in [
-            "https://github.com/nightswatchhq/poa-nest",
-            "https://github.com/nightswatchhq/poa-nest.git",
+            "https://github.com/nuthatch-org/poa-nest",
+            "https://github.com/nuthatch-org/poa-nest.git",
             "http://internal.example/nest.git",
             "ssh://git@github.com/x/y.git",
-            "git@github.com:nightswatchhq/poa-nest.git",
+            "git@github.com:nuthatch-org/poa-nest.git",
             "git://legacy.example/x.git",
             "/srv/nests/mine.git",
         ] {

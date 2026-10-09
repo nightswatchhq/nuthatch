@@ -173,8 +173,8 @@ recommendation to build any of it**: billing, metering and paid access are out o
    second host, which this deployment does not have.
 
 **One prerequisite, and it has just been met.** The serving path took 31 segfaults on 2026-09-06 on
-3.5.0 ([#1165](https://github.com/nightswatchhq/nuthatch/issues/1165)); 3.5.1 gives each DuckDB
-instance a private spill directory ([#1182](https://github.com/nightswatchhq/nuthatch/pull/1182)) and
+3.5.0 ([#1165](https://github.com/nuthatch-org/nuthatch/issues/1165)); 3.5.1 gives each DuckDB
+instance a private spill directory ([#1182](https://github.com/nuthatch-org/nuthatch/pull/1182)) and
 the box has recorded none since 12:50 UTC. Nobody should attach a price to a surface that falls over
 thirty-one times a day, and as of 15:06 UTC that is no longer the surface. One day of quiet is not a
 proof, and the pricing question does not become live until it is.

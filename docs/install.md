@@ -42,10 +42,10 @@ binary: 4.1.0 references `hypot` and `hypotf` at `GLIBC_2.35`, where libm re-ver
 also the glibc the release is *built* on (`ubuntu-22.04` in `.github/workflows/release.yml`), which is
 a coincidence and not the reason: up to 4.0.2 the binary referenced nothing newer than `GLIBC_2.34`
 and ran on RHEL 9, and stating the build baseline as the requirement once wrongly excluded it
-([#978](https://github.com/nightswatchhq/nuthatch/issues/978)). The floor is what the loader checks.
+([#978](https://github.com/nuthatch-org/nuthatch/issues/978)). The floor is what the loader checks.
 The aarch64 binary has the same floor: built on `ubuntu-22.04-arm` (glibc 2.35), it references `hypot`
 and `hypotf` at `GLIBC_2.35` and nothing newer, read the same way off a 4.11.0 build on 2026-10-06
-([#1961](https://github.com/nightswatchhq/nuthatch/issues/1961)).
+([#1961](https://github.com/nuthatch-org/nuthatch/issues/1961)).
 
 **No C++ runtime.** The binary links `libc`, `libm` and `libgcc`. Releases before 4.1 embedded DuckDB,
 which is C++, and also needed libstdc++ from GCC 11 (`GLIBCXX_3.4.29`).
@@ -61,7 +61,7 @@ binary therefore carries a **build provenance attestation**, signed by GitHub's 
 workflow run that produced it and recorded in a public transparency log. It needs no key from us:
 
 ```sh
-gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nightswatchhq/nuthatch
+gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nuthatch-org/nuthatch
 ```
 
 That answers what a checksum cannot: which repository, which commit and which workflow built the file.
@@ -76,21 +76,21 @@ This is the only route on a platform without a prebuilt binary, **Intel Macs inc
 
 ```sh
 rustup toolchain install 1.95.0
-cargo +1.95.0 install --git https://github.com/nightswatchhq/nuthatch nuthatch
+cargo +1.95.0 install --git https://github.com/nuthatch-org/nuthatch nuthatch
 ```
 
 The toolchain pin is load-bearing. `rust-toolchain.toml` pins 1.95.0 because `dbsp` hits a
 next-trait-solver ICE on 1.97, and **that file does not apply to `cargo install --git`**, which builds
 in a temporary directory of its own. Without `+1.95.0`, a 1.97 default toolchain fails after a full
 dependency build with `error: could not compile dbsp` and installs nothing
-([#534](https://github.com/nightswatchhq/nuthatch/issues/534)).
+([#534](https://github.com/nuthatch-org/nuthatch/issues/534)).
 
 The Intel Mac build is not in CI and has not been verified on Intel hardware. If it fails, an issue
 with the error is welcome.
 
 ## Container images
 
-Published per release to `ghcr.io/nightswatchhq/nuthatch`: `:<version>` for embedded mode,
+Published per release to `ghcr.io/nuthatch-org/nuthatch`: `:<version>` for embedded mode,
 `:<version>-scaled` for the scaled build. The image ships the same binary attached to the release, so
 the two cannot drift. Its base is `debian:bookworm-slim` (glibc 2.36), which must stay at or above the
 release builder's glibc.

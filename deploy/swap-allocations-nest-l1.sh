@@ -22,8 +22,8 @@
 # serves with its own ExecStart, fallbacks and drop-ins.
 #
 # Order, for #1882: apply kittiwake's db/schema.sql (two nullable epoch columns) as the app role, run
-# `check`, run `swap` (Chief schedules it), roll kittiwake (nightswatchhq/kittiwake#201), then
-# Lodestar (nightswatchhq/lodestar#325). Each of the two consumers also reads a nest without the L1
+# `check`, run `swap` (Chief schedules it), roll kittiwake (nuthatch-org/kittiwake#201), then
+# Lodestar (nuthatch-org/lodestar#325). Each of the two consumers also reads a nest without the L1
 # range, so a rollback here never strands them.
 #
 # Smoke statements: SMOKE (default ~/Projects/kittiwake/nuthatch-gate/smoke/graph-allocations-nest.sql).
@@ -40,7 +40,7 @@ case "$mode" in
     stamp=$2 ;;
   *) echo "usage: $0 check | swap | rollback <stamp>" >&2; exit 2 ;;
 esac
-[ -f "$smoke" ] || { echo "no smoke file at $smoke: clone nightswatchhq/kittiwake or set SMOKE" >&2; exit 2; }
+[ -f "$smoke" ] || { echo "no smoke file at $smoke: clone nuthatch-org/kittiwake or set SMOKE" >&2; exit 2; }
 ssh_() { ssh -i "$key" -o BatchMode=yes -o ServerAliveInterval=15 "$host" "$@"; }
 work=/root/alloc-l1-swap-$stamp
 job=alloc-l1-$mode-$stamp

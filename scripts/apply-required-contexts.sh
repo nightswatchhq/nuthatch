@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
 done
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-repo="${GITHUB_REPOSITORY:-nightswatchhq/nuthatch}"
+repo="${GITHUB_REPOSITORY:-nuthatch-org/nuthatch}"
 token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 if [ -z "$token" ]; then

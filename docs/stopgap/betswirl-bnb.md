@@ -7,13 +7,13 @@
 
 The package for one stopgap nest: what it answers, how to run it yourself, and how to go back to The
 Graph network. It is written for someone who did not build the nest. The programme is in
-[docs/subgraph-stopgap.md](https://github.com/nightswatchhq/nuthatch/blob/main/docs/subgraph-stopgap.md).
+[docs/subgraph-stopgap.md](https://github.com/nuthatch-org/nuthatch/blob/main/docs/subgraph-stopgap.md).
 
 | | |
 | --- | --- |
 | Subgraph deployment | `Qmd5oqyojVx5wWSFuWfKz3YVLPHdE3KU5458Qqq3SVeGEB`, network `bsc` |
 | Unserved on the network since | 2026-09-17 11:31 UTC (last allocation closed) |
-| Nest | [nightswatchhq/betswirl-bnb-nest](https://github.com/nightswatchhq/betswirl-bnb-nest) |
+| Nest | [nuthatch-org/betswirl-bnb-nest](https://github.com/nuthatch-org/betswirl-bnb-nest) |
 | Hosted endpoint | `https://betswirl-bnb.89.167.109.4.sslip.io/subgraphs/id/Qmd5oqyojVx5wWSFuWfKz3YVLPHdE3KU5458Qqq3SVeGEB` |
 | Mirror | `https://pub-bc282d5016f242a783a6c28cbcd4401a.r2.dev`, listed at [nuthatch-indexer.com/mirror](https://nuthatch-indexer.com/mirror) |
 | Binary | the `nuthatch-graph` release download, 4.11.0 or later |
@@ -25,7 +25,7 @@ predates the 4.11.0 release and will be corrected with the nest's next re-index.
 
 Every field of the four GraphQL documents BetSwirl's client sends (`@betswirl/sdk-core` 0.1.27) answers
 exactly: 30 leaf fields on a bet, 17 on a token. The documents are in the nest's
-[`queries/`](https://github.com/nightswatchhq/betswirl-bnb-nest/tree/main/queries): `bet.graphql`
+[`queries/`](https://github.com/nuthatch-org/betswirl-bnb-nest/tree/main/queries): `bet.graphql`
 (variables `{"id": "<bet id>"}`), `bets.graphql` (`{"first": 20}`, plus `skip`, `where`, `orderBy`,
 `orderDirection`), `token.graphql` (`{"id": "<token address>"}`) and `tokens.graphql` (`{"first": 10}`).
 Anything else is refused by name, never answered with a substitute. The gas token answers as
@@ -41,7 +41,7 @@ send that query to the endpoint: it either answers or names the field it refuses
 history, more on a busy machine, measured on 2026-10-06 (the comparison query below is that kind too); `token` and `tokens` take about 1.5 s; a
 repeated query takes milliseconds. A query that runs past 29 s returns HTTP 200 with an `errors` body
 naming the time budget. Both are being worked on in
-[nuthatch#1951](https://github.com/nightswatchhq/nuthatch/issues/1951).
+[nuthatch#1951](https://github.com/nuthatch-org/nuthatch/issues/1951).
 
 ## Run it yourself
 
@@ -61,14 +61,14 @@ export BNB_ARCHIVE_RPC=   # required: your archive endpoint
 : "${BNB_ARCHIVE_RPC:?set BNB_ARCHIVE_RPC first}"
 
 # 1. the graph build
-curl -fLO "https://github.com/nightswatchhq/nuthatch/releases/download/$VERSION/$FILE"
-curl -fLO "https://github.com/nightswatchhq/nuthatch/releases/download/$VERSION/$FILE.sha256"
+curl -fLO "https://github.com/nuthatch-org/nuthatch/releases/download/$VERSION/$FILE"
+curl -fLO "https://github.com/nuthatch-org/nuthatch/releases/download/$VERSION/$FILE.sha256"
 sha256sum -c "$FILE.sha256"                        # Mac: shasum -a 256 -c. Checks the download, not who built it
-gh attestation verify "$FILE" --repo nightswatchhq/nuthatch && echo verified   # who built it (gh needs login)
+gh attestation verify "$FILE" --repo nuthatch-org/nuthatch && echo verified   # who built it (gh needs login)
 tar xzf "$FILE"
 
 # 2. the nest, filled from the mirror instead of a 109-million-block backfill
-git clone https://github.com/nightswatchhq/betswirl-bnb-nest
+git clone https://github.com/nuthatch-org/betswirl-bnb-nest
 ./nuthatch seed --dir betswirl-bnb-nest --from https://pub-bc282d5016f242a783a6c28cbcd4401a.r2.dev
 # seed ends by suggesting a bare `nuthatch dev`; use step 3 instead, which this nest needs.
 

@@ -2,7 +2,7 @@
 
 The bar a nuthatch release must clear before it's pointed at someone's real workload, unattended.
 Reconciled against [CLAUDE.md](../CLAUDE.md) (non-negotiables + build order), the
-[RFC series](rfcs/README.md), the [issue queue](https://github.com/nightswatchhq/nuthatch/issues), and
+[RFC series](rfcs/README.md), the [issue queue](https://github.com/nuthatch-org/nuthatch/issues), and
 [CI](../.github/workflows/ci.yml) on **2026-08-20** (repo at `2.6.0`), and re-read against **4.10.1**
 on 2026-10-05 for the engine rows, the benchmark gates and the state of every issue it cites.
 
@@ -10,7 +10,7 @@ This is a *standing* checklist - the target, not a claim it's all done. Status r
 verifiable today. When you cut a release, walk it top to bottom and update the flags with evidence.
 
 **Every 🟡 and ⛔ names the issue that tracks it.** This file answers *"is this safe to ship?"*; the
-[issue queue](https://github.com/nightswatchhq/nuthatch/issues) answers *"what is being done about
+[issue queue](https://github.com/nuthatch-org/nuthatch/issues) answers *"what is being done about
 it?"* - and the issue is the one that moves. Do not record work here that has no issue, and do not
 close an issue by editing this file.
 

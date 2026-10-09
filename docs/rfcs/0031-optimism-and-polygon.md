@@ -41,7 +41,7 @@ Two pulls, one push.
 **The pull.** Every "can nuthatch index X?" conversation that ends in "no" ends there because of a
 three-element array (`chains::all()`), not because of difficulty. Optimism and Polygon are the two
 chains that come up most after mainnet/Arbitrum/Base. The catalogue already over-promises them: the
-`uniswap-v3` entry in `nightswatchhq/nests` advertises `["Arbitrum","Ethereum","Optimism","Base",
+`uniswap-v3` entry in `nuthatch-org/nests` advertises `["Arbitrum","Ethereum","Optimism","Base",
 "Polygon"]`, two of which nuthatch cannot index at all. We are shipping a claim we cannot honour.
 
 **The push.** RFC-0030 asserted a bar without exercising it on a hard case. Gnosis passed cleanly and
@@ -235,7 +235,7 @@ copy of `BASE` with `name: "optimism"`, `chain_id: 10`, `finality: FinalizedTag 
    only, but it gates slice 2 and it is the reusable output of this RFC.
 2. **Slice 2 - Polygon.** The constant, aliases, `all()`, and a `lookup()` test mirroring the existing
    per-chain ones. Ships behind the conservative `Depth(512)`.
-3. **Slice 3 - catalogue correction.** Fix the `uniswap-v3` entry in `nightswatchhq/nests`, which
+3. **Slice 3 - catalogue correction.** Fix the `uniswap-v3` entry in `nuthatch-org/nests`, which
    advertises Optimism and Polygon today. After slice 2, Polygon becomes true and Optimism must be
    removed until §1 resolves. **This is user-visible and should not wait for slices 1-2.**
 4. **Slice 4 - reorg observation.** Run a Polygon cursor against the tip for a sustained period and

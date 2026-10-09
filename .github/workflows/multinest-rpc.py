@@ -8,7 +8,7 @@ three ways:
 
   1. **A large ABI.** Ten event types on one contract, several of them eight inputs wide, so decode
      carries ten topic0 registrations and ten tables per nest rather than one. The ABI is the real
-     Uniswap V4 `PoolManager` one (nightswatchhq/uniswap-v4-ethereum), read from a file rather than
+     Uniswap V4 `PoolManager` one (nuthatch-org/uniswap-v4-ethereum), read from a file rather than
      hardcoded here - see below.
   2. **A high event rate**, from many contracts each emitting every block.
   3. **At tip, not mid-backfill.** The tip *moves*: `eth_blockNumber` advances by `TIP_STEP` blocks

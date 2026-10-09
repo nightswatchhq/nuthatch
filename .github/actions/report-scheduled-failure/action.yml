@@ -2,7 +2,7 @@ name: Report a scheduled-run failure
 description: >
   Open a GitHub issue when a scheduled run fails, so a red cron cannot sit unseen.
 
-# **Why this exists at all** (nightswatchhq/nuthatch#1130). `required contexts match protection`
+# **Why this exists at all** (nuthatch-org/nuthatch#1130). `required contexts match protection`
 # failed on `main` every day from 2026-08-28 to 2026-09-02 and the streak was found only while
 # retiring an unrelated gate. Nobody was ignoring it; there was no surface on which it appeared:
 #
@@ -63,7 +63,7 @@ runs:
           "" \
           "A scheduled run attaches its check to no pull request and is not what the branch badge" \
           "reflects, so this issue is the only thing that will surface it. Filed automatically by" \
-          ".github/actions/report-scheduled-failure (nightswatchhq/nuthatch#1130)." \
+          ".github/actions/report-scheduled-failure (nuthatch-org/nuthatch#1130)." \
           "" \
           "Close this once the check is green again. It will be refiled if it fails after that," \
           "and no duplicate is filed while it stays open.")"

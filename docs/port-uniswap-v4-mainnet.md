@@ -17,7 +17,7 @@ and where the two disagree this one is the evidence.
 | Entities / fields | 19 / 231, of which 90 are `BigDecimal` |
 
 Chosen because a user's queries stopped returning data, not because we picked it
-(nightswatchhq/graph-support#32). The canonical deployment
+(nuthatch-org/graph-support#32). The canonical deployment
 `QmZsgJLiLQKpb8hxTmQ5LWyrFVvfWzVaL4WK8dfFBn7EeK` answers `indexing_error`; Ellipfra's redeployment
 above carries the fixes and is both the thing ported and the diff reference, because diffing a port
 of one manifest against a different manifest would fail the slice for the wrong reason.

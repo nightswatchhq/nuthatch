@@ -1,4 +1,4 @@
-# The published container image (ghcr.io/nightswatchhq/nuthatch).
+# The published container image (ghcr.io/nuthatch-org/nuthatch).
 #
 # It copies the **same** release binary that is attached to the GitHub Release rather than rebuilding
 # from source, so the image and the tarball are byte-identical. A separate build would be a second
@@ -10,7 +10,7 @@
 FROM debian:bookworm-slim
 
 # The MCP Registry verifies an image belongs to its entry (server.json) by this label.
-LABEL io.modelcontextprotocol.server.name="io.github.nightswatchhq/nuthatch"
+LABEL io.modelcontextprotocol.server.name="io.github.nuthatch-org/nuthatch"
 
 # `ca-certificates` is the only runtime dependency: outbound HTTPS to RPC endpoints, ABI resolvers and
 # webhook sinks. Everything else nuthatch needs is statically in the binary - that is the point of it.

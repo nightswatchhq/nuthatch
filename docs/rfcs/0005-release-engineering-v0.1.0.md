@@ -86,7 +86,7 @@ Unchanged from v1.
 
 - **GitHub Releases** - canonical, unchanged.
 - **crates.io / Homebrew** - unchanged.
-- **5a. NEW: OCI image, first-class.** `ghcr.io/nightswatchhq/nuthatch:{version}`,
+- **5a. NEW: OCI image, first-class.** `ghcr.io/nuthatch-org/nuthatch:{version}`,
   multi-arch (amd64/arm64), distroless-or-scratch base + the static-ish binary, image
   runs as non-root, data dir at a declared volume path, config via mounted
   `nuthatch.toml` + env overrides for the operator-relevant knobs (listen addr, RPC

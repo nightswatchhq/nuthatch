@@ -19,9 +19,9 @@
   RFC-0022 (the distributed scheduler cannot place or drain a cursor it has no health signal for).
 - Nature: **mini-RFC** - a bounded design decision, not a new capability. Scope is deliberately four
   questions (§3-§6); everything else is implementation detail.
-- Origin: [issue #147](https://github.com/nightswatchhq/nuthatch/issues/147), found in the full-repo
+- Origin: [issue #147](https://github.com/nuthatch-org/nuthatch/issues/147), found in the full-repo
   audit (concurrency dimension). Sprint
-  [amiable-axolotl](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/sprint-amiable-axolotl.md), tier 1.
+  [amiable-axolotl](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/sprint-amiable-axolotl.md), tier 1.
 
 ## Abstract
 

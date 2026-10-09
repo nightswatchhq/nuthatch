@@ -96,7 +96,7 @@ segments where the rows say to, not where the clock says to, so the sealed outpu
 either side of the change. What it costs is freshness, and the ceiling is stated below.
 
 The right-hand column is a clean 54-minute window taken after a rolling restart, with no traffic of
-mine in it. [`docs/sprint-frugal-finch.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/sprint-frugal-finch.md) step 2 asks for this repeated across a full day before the
+mine in it. [`docs/sprint-frugal-finch.md`](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/sprint-frugal-finch.md) step 2 asks for this repeated across a full day before the
 number is written down, and that has not been done.
 
 Every nest, over the same 54 minutes:
@@ -279,8 +279,8 @@ Ranked by how likely an operator is to meet it.
    2026-09-06** on 3.5.0, `tokio-rt-worker` killed with `status=11/SEGV`. The cause was several
    DuckDB instances in one process defaulting `temp_directory` to the nest's own data directory and
    overwriting each other's spilled blocks
-   ([#1165](https://github.com/nightswatchhq/nuthatch/issues/1165),
-   [#1182](https://github.com/nightswatchhq/nuthatch/pull/1182)). 3.5.1 gives each instance a private
+   ([#1165](https://github.com/nuthatch-org/nuthatch/issues/1165),
+   [#1182](https://github.com/nuthatch-org/nuthatch/pull/1182)). 3.5.1 gives each instance a private
    spill directory. The box has recorded **no kernel segfault since 12:50 UTC** and `NRestarts=0`
    across all four units since the 15:06 roll. The query that reliably killed 3.5.0 now returns a
    clean out-of-memory instead.

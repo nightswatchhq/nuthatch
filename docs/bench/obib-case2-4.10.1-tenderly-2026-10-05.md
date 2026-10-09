@@ -15,7 +15,7 @@ the same 343,845 `Transfer` rows that derivation starts from.
 
 The published release, not a local build.
 
-- Release: [v4.10.1](https://github.com/nightswatchhq/nuthatch/releases/tag/v4.10.1), tag commit `12759bb`
+- Release: [v4.10.1](https://github.com/nuthatch-org/nuthatch/releases/tag/v4.10.1), tag commit `12759bb`
 - Asset: `nuthatch-aarch64-apple-darwin.tar.gz`, sha256
   `714ad73e92b2e9698db135416f3361ea3acf208f823462bb0deb4f77fcef4bce`, equal to the release's
   `.sha256` file

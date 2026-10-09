@@ -38,7 +38,7 @@ not to infer work that remains.
 
 - [2027 direction](roadmap-2027.md)
 - The progress log, the sprint scopes and the July-August 2026 roadmap left the tree on 2026-10-08.
-  They are kept at [`ede03ca7`](https://github.com/nightswatchhq/nuthatch/tree/ede03ca7/docs); sprint
+  They are kept at [`ede03ca7`](https://github.com/nuthatch-org/nuthatch/tree/ede03ca7/docs); sprint
   labels remain on GitHub issues as provenance.
 
 When a document and a live issue disagree about outstanding work, the issue wins. If the disagreement

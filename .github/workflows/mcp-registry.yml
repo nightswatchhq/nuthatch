@@ -1,4 +1,4 @@
-# Publishes `server.json` to the official MCP Registry as `io.github.nightswatchhq/nuthatch`.
+# Publishes `server.json` to the official MCP Registry as `io.github.nuthatch-org/nuthatch`.
 #
 # By GitHub OIDC rather than `mcp-publisher login github`: the interactive login grants an
 # organisation's namespace only when the registry's GitHub app can read the caller's role there, and

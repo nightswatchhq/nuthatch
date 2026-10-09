@@ -13,7 +13,7 @@ still honestly unfinished.
 before a build ships. This document is the *run* guide - what must be true in your environment.
 [Reading sealed segments without nuthatch](reading-segments.md) is the contract for pointing
 DuckDB, DataFusion, or another engine at the same Parquet directory. What is deferred and why
-lives in the [issue queue](https://github.com/nightswatchhq/nuthatch/issues)
+lives in the [issue queue](https://github.com/nuthatch-org/nuthatch/issues)
 (the `parked` label means *decided against for now*, not *forgotten*); [`backlog.md`](backlog.md)
 explains how to read it and the [RFC index](rfcs/README.md) says what each RFC is.
 
@@ -97,7 +97,7 @@ journalctl -u nuthatch -f          # a clean progress line during backfill, then
 `scripts/deploy-nest.sh install <binary> <version>` puts the binary at
 `/usr/local/bin/nuthatch-<version>`; `scripts/deploy-nest.sh roll <unit> <version> --smoke <file>`
 points the unit at it, restarts, and waits until `/ready` reports that version. It then runs every
-statement in the smoke file against `/sql`. Nightswatch's production units keep their smoke files,
+statement in the smoke file against `/sql`. Nuthatch's production units keep their smoke files,
 one per unit and one statement per line, in the private kittiwake repo under `nuthatch-gate/smoke/`,
 because they carry its statements; `deploy/roll-helsinki-from-mac.sh` reads them from `SMOKE_DIR`
 (default `~/Projects/kittiwake/nuthatch-gate/smoke`) and copies each unit's file to the box.
@@ -128,7 +128,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nightswatchhq/nuthatch:5.0.1
+  ghcr.io/nuthatch-org/nuthatch:5.0.1
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -166,7 +166,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nightswatchhq/nuthatch:5.0.1-scaled worker --help
+docker run --rm ghcr.io/nuthatch-org/nuthatch:5.0.1-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -523,7 +523,7 @@ keeps paying it for as long as it runs. "Be your own indexer" does not mean this
 means you are the one who sees it.
 
 **Measured on our own reference deployment**
-([#750](https://github.com/nightswatchhq/nuthatch/issues/750), audited 2026-08-22): four nests, one
+([#750](https://github.com/nuthatch-org/nuthatch/issues/750), audited 2026-08-22): four nests, one
 week, **~11.8M RPC requests** against **~100 HTTP requests served** (the sum of the table below) -
 roughly **118,000 RPC requests per HTTP request answered**. Only `graph-staking-nest`'s figure was
 checked against the auditor's own `/metrics` probes and corrected down, from a raw 40 to **~39
@@ -609,7 +609,7 @@ own published pay-as-you-go rates, checked 2026-08-22. Sources:
 
 A nest sitting at tip on Arbitrum costs on the order of **~$134/month** against a paid provider (with ~$93 of that being the header fetches). That figure is this computation, not a measurement - the reference deployment itself paid nothing for it, because it runs against a free endpoint.
 
-**Measured against a paid endpoint, 2026-09-06** ([#1173](https://github.com/nightswatchhq/nuthatch/issues/1173)):
+**Measured against a paid endpoint, 2026-09-06** ([#1173](https://github.com/nuthatch-org/nuthatch/issues/1173)):
 the allocations nest on the Lodestar box, at tip on Alchemy, over 45 seconds - 268 `eth_getBlockByNumber`,
 61 `eth_getLogs` and 84 `eth_blockNumber` a minute, **~9,900 CU a minute, ~430M a month, roughly $185**.
 The computation above had the shape right and the attribution wrong. Headers are bought only for blocks
@@ -1823,7 +1823,7 @@ Stated plainly, because finding them yourself in production would be worse.
   data. It refuses rather than truncating, because a partial tip would silently change the answer to an
   aggregate. Generous enough to be invisible on a normal chain; it exists so a deep-finality tip turns
   into a clear error instead of an OOM that takes co-tenants with it.
-- **Container images are published** to `ghcr.io/nightswatchhq/nuthatch` - `:<version>` for embedded,
+- **Container images are published** to `ghcr.io/nuthatch-org/nuthatch` - `:<version>` for embedded,
   `:<version>-scaled` for the scaled build. The recipe above still works if you would rather build one.
 - **Secrets live in on-disk config *in embedded mode*.** Private RPC URLs and webhook HMAC secrets sit
   in the nest's `nuthatch.toml`, so the mitigation there is filesystem permissions: `0700`, owned by

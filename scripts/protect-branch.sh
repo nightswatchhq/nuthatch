@@ -6,7 +6,7 @@ branch="${1:?branch name}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 contexts=$(grep -v '^#' "$root/.github/required-checks.txt" | grep -v '^$' | python3 -c \
   'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
-gh api --method PUT "repos/${GITHUB_REPOSITORY:-nightswatchhq/nuthatch}/branches/${branch}/protection" \
+gh api --method PUT "repos/${GITHUB_REPOSITORY:-nuthatch-org/nuthatch}/branches/${branch}/protection" \
   --input - <<EOF
 {
   "required_status_checks": {

@@ -27,7 +27,7 @@ off-chain state need their query surface reviewed explicitly. That is a boundary
 rather than discovering it in the middle of an outage.
 
 We have just used this shape for
-[DOUDOCHAIN_V2](https://github.com/nightswatchhq/doudouchain-v2-nest), whose deployment was
+[DOUDOCHAIN_V2](https://github.com/nuthatch-org/doudouchain-v2-nest), whose deployment was
 unreachable on the network. The port vendors the deployment's pinned source ABIs, indexes its 13
 fixed Arbitrum contracts, and has a hosted fallback for its raw event surface. Its IPFS-derived
 entities are deliberately not claimed as parity.
