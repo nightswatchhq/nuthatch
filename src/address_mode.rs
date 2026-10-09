@@ -72,7 +72,13 @@ pub struct ModeState {
     calls: Mutex<BTreeMap<(String, String), u64>>,
     windows: AtomicU64,
     discovery_errors: AtomicU64,
+    /// Traces one transaction into the store, for a `txhash` lookup the store cannot yet answer.
+    pub tracer: Option<Tracer>,
 }
+
+/// See [`ModeState::tracer`].
+pub type Tracer =
+    Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync>;
 
 impl ModeState {
     pub fn new(
@@ -99,7 +105,13 @@ impl ModeState {
             calls: Mutex::new(BTreeMap::new()),
             windows: AtomicU64::new(0),
             discovery_errors: AtomicU64::new(0),
+            tracer: None,
         }
+    }
+
+    pub fn with_tracer(mut self, tracer: Tracer) -> Self {
+        self.tracer = Some(tracer);
+        self
     }
 
     pub fn with_range(mut self, start_block: u64, end_block: Option<u64>, depth: u64) -> Self {
@@ -232,15 +244,21 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     .min(to);
                 let outcome = async {
                     let generation = state.history.generation()?;
-                    let found = self.discover(&state.history, &address, next, end).await?;
+                    let pending = crate::address_discovery::Pending::default();
+                    let found = self
+                        .discover(&state.history, &address, next, end, &pending)
+                        .await;
+                    // What was fetched is kept even when the window fails, so its retry refetches
+                    // only what it still lacks.
                     let history = state.history.clone();
                     let who = address.clone();
                     tokio::task::spawn_blocking(move || {
+                        pending.persist(&history)?;
                         crate::address_discovery::record(
                             &history,
                             &who,
                             (next, end),
-                            found,
+                            found?,
                             generation,
                         )
                     })
@@ -360,6 +378,24 @@ async fn api(
     State(s): State<Arc<ModeState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
+    // A txhash lookup needs no coverage: a transaction the store has not traced is traced now.
+    if let (Some("txlistinternal"), Some(hash), Some(tracer)) = (
+        q.get("action").map(String::as_str),
+        q.get("txhash").cloned(),
+        s.tracer.clone(),
+    ) {
+        let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x")).ok();
+        if let Some(key) = key.filter(|k| k.len() == 32) {
+            let known = blocking(&s, move |h| Ok(h.tx_internals(&key)?.is_some())).await;
+            if matches!(known, Ok(false)) {
+                if let Err(e) = tracer(hash).await {
+                    return Json(
+                        json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e:#}") }),
+                    );
+                }
+            }
+        }
+    }
     Json(
         blocking(&s, move |h| {
             Ok(crate::address_history::respond(Some(h), &q))
@@ -598,12 +634,30 @@ pub async fn dev(
         Some(crate::chains::Finality::FinalizedTag { fallback_depth }) => fallback_depth,
         None => 64,
     };
+    let discovery = Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
+    // Tracing for a txhash lookup waits on the same chain check the cursor does.
+    let verified = Arc::new(tokio::sync::OnceCell::<()>::new());
+    let tracer: Tracer = {
+        let (discovery, history, verified) = (discovery.clone(), history.clone(), verified.clone());
+        Arc::new(move |hash: String| {
+            let (discovery, history, verified) =
+                (discovery.clone(), history.clone(), verified.clone());
+            Box::pin(async move {
+                if verified.get().is_none() {
+                    bail!("the RPC's chain has not been checked yet; try again shortly");
+                }
+                let pending = crate::address_discovery::Pending::default();
+                discovery
+                    .internal_rows_of(&history, &hash, &pending)
+                    .await?;
+                tokio::task::spawn_blocking(move || pending.persist(&history)).await?
+            })
+        })
+    };
     let state = Arc::new(
-        ModeState::new(history, chain_id, poll_interval, loopback).with_range(
-            ah.start_block.unwrap_or(0),
-            ah.end_block,
-            depth,
-        ),
+        ModeState::new(history, chain_id, poll_interval, loopback)
+            .with_range(ah.start_block.unwrap_or(0), ah.end_block, depth)
+            .with_tracer(tracer),
     );
     tracing::info!(
         "address history: {} watched from block {}, polling every {}s",
@@ -615,17 +669,20 @@ pub async fn dev(
     // offline. A wrong chain stops the cursor before it fetches anything.
     let task_state = state.clone();
     let work = tokio::spawn(async move {
-        for (role, rpc) in [("main", &main), ("trace", &trace)] {
+        for (role, rpc) in [
+            ("main", discovery.main.inner()),
+            ("trace", discovery.trace.inner()),
+        ] {
             if let Err(e) = rpc.verify_chain_ids(chain_id).await {
                 task_state.stop(format!("the {role} RPC: {e:#}"));
                 return;
             }
         }
+        let _ = verified.set(());
         task_state.rpc_requests.store(
-            main.request_count() + trace.request_count(),
+            discovery.main.inner().request_count() + discovery.trace.inner().request_count(),
             Ordering::Relaxed,
         );
-        let discovery = Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
         cursor(task_state, MainHead(discovery.clone()), discovery).await;
     });
     let work_abort = work.abort_handle();

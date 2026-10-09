@@ -85,7 +85,7 @@ required-features = ["crash-points"]
 # BSD-2-Clause, already on deny.toml's allowlist, pure Rust - no effect on the static binary.
 Inflector = { version = "0.11.3", optional = true }
 nuthatch-decode = { path = "decode" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 futures = "0.3"
 alloy-json-abi = "1.6"

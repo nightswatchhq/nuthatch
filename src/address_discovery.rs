@@ -21,8 +21,9 @@ use std::sync::Mutex;
 use crate::address_history::{Action, AddressHistory, Row};
 
 /// The actions discovery fills; the others stay incomplete until their slices land.
-pub const DISCOVERED: [Action; 4] = [
+pub const DISCOVERED: [Action; 5] = [
     Action::TxList,
+    Action::TxListInternal,
     Action::TokenTx,
     Action::TokenNftTx,
     Action::Token1155Tx,
@@ -298,13 +299,26 @@ fn frame_side_is(f: &Value, side: &str, a: &str) -> bool {
     })
 }
 
-/// Cache entries a window fetched, committed once at its end rather than one commit per fetch.
+/// Cache entries a window fetched, committed once at its end rather than one commit per fetch,
+/// and committed whether or not the window is recorded, so a retried window refetches nothing.
 type CachedTx = (Vec<u8>, Map<String, Value>);
 
 #[derive(Default)]
-struct Pending {
+pub struct Pending {
     txs: Mutex<Vec<CachedTx>>,
     timestamps: Mutex<Vec<(u64, u64)>>,
+    /// A transaction's whole internal list, by hash, for `txhash` lookups.
+    internals: Mutex<Vec<crate::address_history::TxInternals>>,
+}
+
+impl Pending {
+    /// Commit what was fetched. Blocking: call it off the async workers.
+    pub fn persist(self, history: &AddressHistory) -> Result<()> {
+        history.cache_txs(&self.txs.into_inner().expect("pending lock"))?;
+        history.cache_block_timestamps(&self.timestamps.into_inner().expect("pending lock"))?;
+        history.cache_tx_internals(&self.internals.into_inner().expect("pending lock"))?;
+        Ok(())
+    }
 }
 
 /// A normal transaction a trace root names: its hash, its block, whether the watched address sent
@@ -321,12 +335,10 @@ struct TxRef {
 #[derive(Debug, Default)]
 pub struct Found {
     pub txlist: Vec<Row>,
+    pub txlistinternal: Vec<Row>,
     pub tokentx: Vec<Row>,
     pub tokennfttx: Vec<Row>,
     pub token1155tx: Vec<Row>,
-    /// Hydrated transactions and block timestamps the window fetched, written with its rows.
-    cached_txs: Vec<CachedTx>,
-    cached_timestamps: Vec<(u64, u64)>,
 }
 
 /// Discovery over a main endpoint pool (logs, hydration, nonces) and a trace one, which may be the
@@ -348,35 +360,106 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         }
     }
 
-    /// Discover `[from, to]` for `address` (lowercase `0x…`). An error means nothing may be recorded.
+    /// Discover `[from, to]` for `address` (lowercase `0x…`). An error means nothing may be recorded;
+    /// what was fetched before it is in `pending` either way.
     pub async fn discover(
         &self,
         history: &AddressHistory,
         address: &str,
         from: u64,
         to: u64,
+        pending: &Pending,
     ) -> Result<Found> {
         let a = address.to_ascii_lowercase();
-        let (txs, logs) = futures::try_join!(
+        let ((txs, internal), logs) = futures::try_join!(
             self.normal_transactions(&a, from, to),
             self.token_logs(&a, from, to)
         )?;
-        let pending = Pending::default();
         let mut found = Found {
-            txlist: self.hydrate(history, &txs, &pending).await?,
+            txlist: self.hydrate(history, &txs, pending).await?,
             ..Found::default()
         };
-        let timestamps = self.timestamps(history, &logs, &pending).await?;
+        for hash in &internal {
+            let rows = self.internal_rows_of(history, hash, pending).await?;
+            found.txlistinternal.extend(
+                rows.into_iter()
+                    .filter(|row| touches(&row.record, &a))
+                    .map(|mut row| {
+                        row.record
+                            .insert("hash".into(), Value::String(hash.clone()));
+                        address_mode_order(row)
+                    }),
+            );
+        }
+        let timestamps = self.timestamps(history, &logs, pending).await?;
         for log in &logs {
             transfer_rows(log, &a, &timestamps, &mut found)?;
         }
-        found.cached_txs = pending.txs.into_inner().expect("pending lock");
-        found.cached_timestamps = pending.timestamps.into_inner().expect("pending lock");
         Ok(found)
     }
 
-    /// The root frames from or to `a`.
-    async fn normal_transactions(&self, a: &str, from: u64, to: u64) -> Result<Vec<TxRef>> {
+    /// Every internal transaction of `hash`, as Etherscan's `txhash` form lists them: from the cache,
+    /// else from one `trace_transaction`.
+    pub async fn internal_rows_of(
+        &self,
+        history: &AddressHistory,
+        hash: &str,
+        pending: &Pending,
+    ) -> Result<Vec<Row>> {
+        let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x"))?;
+        let records = match history.tx_internals(&key)? {
+            Some(r) => r,
+            None => {
+                let trace = self
+                    .trace
+                    .call("trace_transaction", json!([hash]))
+                    .await
+                    .with_context(|| format!("trace_transaction {hash}"))?;
+                let frames = trace
+                    .as_array()
+                    .ok_or_else(|| anyhow!("trace_transaction {hash} answered a non-list"))?;
+                let Some(root) = frames.first() else {
+                    bail!("trace_transaction {hash} answered no frames");
+                };
+                let block = hex_u64(root.get("blockNumber").unwrap_or(&Value::Null))?;
+                let ts = self.block_timestamp(history, block, pending).await?;
+                let records = internal_records(frames, ts)?;
+                pending
+                    .internals
+                    .lock()
+                    .expect("pending lock")
+                    .push((key, records.clone()));
+                records
+            }
+        };
+        records
+            .into_iter()
+            .map(|record| {
+                let num = |k: &str| -> Result<u64> {
+                    record
+                        .get(k)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("internal record lacks {k}"))?
+                        .parse()
+                        .with_context(|| format!("internal record {k}"))
+                };
+                Ok(Row {
+                    block: num("blockNumber")?,
+                    tx_index: num("transactionIndex")?,
+                    position: num(TRACE_INDEX)?,
+                    record,
+                })
+            })
+            .collect()
+    }
+
+    /// The root frames from or to `a`, and the transactions with an internal frame touching `a`.
+    async fn normal_transactions(
+        &self,
+        a: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<(Vec<TxRef>, Vec<String>)> {
         let mut frames = Vec::new();
         let mut empty_sides = Vec::new();
         for side in ["fromAddress", "toAddress"] {
@@ -395,6 +478,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             self.check_empty_traces(a, &empty_sides, from, to).await?;
         }
         let mut roots: BTreeMap<String, TxRef> = BTreeMap::new();
+        let mut internal: BTreeSet<String> = BTreeSet::new();
         for f in &frames {
             let root = f
                 .get("traceAddress")
@@ -404,6 +488,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 continue;
             };
             if !root {
+                if let Some(record) = internal_record(f)? {
+                    if touches(&record, a) {
+                        internal.insert(hash.to_ascii_lowercase());
+                    }
+                }
                 continue;
             }
             let action = f.get("action").unwrap_or(&Value::Null);
@@ -426,7 +515,10 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         }
         let outgoing = roots.values().filter(|r| r.outgoing).count() as u64;
         self.check_nonce(a, from, to, outgoing).await?;
-        Ok(roots.into_values().collect())
+        Ok((
+            roots.into_values().collect(),
+            internal.into_iter().collect(),
+        ))
     }
 
     /// `sides` are the `trace_filter` directions that answered nothing over `[from, to]`. Each is
@@ -790,6 +882,172 @@ pub fn txlist_record(
     Ok(r)
 }
 
+/// Our key beside Etherscan's: the frame's position in the transaction's whole trace, in pre-order.
+/// Unique within the transaction and the same however the frame is reached, which Etherscan's own
+/// `traceId` is not.
+pub const TRACE_INDEX: &str = "nuthatchTraceIndex";
+
+/// A trace frame as an Etherscan internal transaction, or `None` for a frame Etherscan does not
+/// list: a delegatecall, a static call, or a call that moves no value. Creations are listed at any
+/// value and typed by their opcode; a selfdestruct is listed as `self-destruct`. Context the frame
+/// alone cannot give (failure inherited from an ancestor, block, position) is added by
+/// [`internal_records`].
+fn internal_record(f: &Value) -> Result<Option<Map<String, Value>>> {
+    let action = f.get("action").unwrap_or(&Value::Null);
+    let result = f.get("result").unwrap_or(&Value::Null);
+    let lower = |v: &Value, k: &str| -> String {
+        v.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let dec_or_zero = |v: &Value, k: &str| -> Result<String> {
+        match v.get(k).and_then(Value::as_str) {
+            Some(s) => decimal(s),
+            None => Ok("0".into()),
+        }
+    };
+    let (kind, from, to, value, created, gas, gas_used) =
+        match f.get("type").and_then(Value::as_str) {
+            Some("call") => {
+                let call = action
+                    .get("callType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("call");
+                let value = dec_or_zero(action, "value")?;
+                if !matches!(call, "call" | "callcode") || value == "0" {
+                    return Ok(None);
+                }
+                (
+                    "call".to_string(),
+                    lower(action, "from"),
+                    lower(action, "to"),
+                    value,
+                    String::new(),
+                    dec_or_zero(action, "gas")?,
+                    dec_or_zero(result, "gasUsed")?,
+                )
+            }
+            Some("create") => (
+                action
+                    .get("creationMethod")
+                    .and_then(Value::as_str)
+                    .unwrap_or("create")
+                    .to_string(),
+                lower(action, "from"),
+                String::new(),
+                dec_or_zero(action, "value")?,
+                lower(result, "address"),
+                dec_or_zero(action, "gas")?,
+                dec_or_zero(result, "gasUsed")?,
+            ),
+            Some("suicide") => (
+                "self-destruct".to_string(),
+                lower(action, "address"),
+                lower(action, "refundAddress"),
+                dec_or_zero(action, "balance")?,
+                String::new(),
+                "0".to_string(),
+                "0".to_string(),
+            ),
+            _ => return Ok(None),
+        };
+    let mut r = Map::new();
+    let mut put = |k: &str, v: String| {
+        r.insert(k.to_string(), Value::String(v));
+    };
+    put("from", from);
+    put("to", to);
+    put("value", value);
+    put("contractAddress", created);
+    put("input", String::new());
+    put("type", kind);
+    put("gas", gas);
+    put("gasUsed", gas_used);
+    Ok(Some(r))
+}
+
+/// Whether an internal record moves value from, to or into existence at `a`.
+fn touches(record: &Map<String, Value>, a: &str) -> bool {
+    ["from", "to", "contractAddress"]
+        .iter()
+        .any(|k| record.get(*k).and_then(Value::as_str) == Some(a))
+}
+
+/// Etherscan's error text for a trace error: geth's wording, lowercased.
+fn err_code(error: &str) -> String {
+    match error {
+        "Reverted" => "execution reverted".into(),
+        "Out of gas" => "out of gas".into(),
+        "Bad instruction" => "invalid opcode".into(),
+        "Bad jump destination" => "invalid jump destination".into(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+/// Every internal transaction of one transaction's whole trace, in the `txhash` form Etherscan
+/// gives, each with the `traceId` its address form carries and our [`TRACE_INDEX`]. A frame inside a
+/// reverted call is marked failed though it succeeded itself, as Etherscan marks it; `errCode` is the
+/// frame's own error only.
+fn internal_records(frames: &[Value], timestamp: u64) -> Result<Vec<Map<String, Value>>> {
+    let reverted: Vec<Vec<Value>> = frames
+        .iter()
+        .filter(|f| f.get("error").is_some_and(|e| !e.is_null()))
+        .filter_map(|f| f.get("traceAddress").and_then(Value::as_array).cloned())
+        .collect();
+    let mut out = Vec::new();
+    for (index, f) in frames.iter().enumerate() {
+        let path = f
+            .get("traceAddress")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("a trace frame without traceAddress: {f}"))?;
+        if path.is_empty() {
+            continue;
+        }
+        let Some(body) = internal_record(f)? else {
+            continue;
+        };
+        let own = f.get("error").and_then(Value::as_str);
+        let failed = own.is_some() || reverted.iter().any(|r| path.starts_with(r));
+        let mut r = Map::new();
+        let mut put = |k: &str, v: String| {
+            r.insert(k.to_string(), Value::String(v));
+        };
+        put(
+            "blockNumber",
+            hex_u64(f.get("blockNumber").unwrap_or(&Value::Null))?.to_string(),
+        );
+        put(
+            "transactionIndex",
+            hex_u64(f.get("transactionPosition").unwrap_or(&Value::Null))?.to_string(),
+        );
+        put("timeStamp", timestamp.to_string());
+        r.extend(body);
+        let mut put = |k: &str, v: String| {
+            r.insert(k.to_string(), Value::String(v));
+        };
+        put("traceId", format!("0{}", "_1".repeat(path.len())));
+        put("isError", if failed { "1".into() } else { "0".into() });
+        put("errCode", own.map(err_code).unwrap_or_default());
+        put(TRACE_INDEX, index.to_string());
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// An internal row in the order Etherscan's address form prints it, `hash` after `timeStamp`.
+fn address_mode_order(mut row: Row) -> Row {
+    let mut ordered = Map::new();
+    for k in ["blockNumber", "transactionIndex", "timeStamp", "hash"] {
+        if let Some(v) = row.record.remove(k) {
+            ordered.insert(k.to_string(), v);
+        }
+    }
+    ordered.extend(std::mem::take(&mut row.record));
+    row.record = ordered;
+    row
+}
+
 /// One log's Etherscan rows: an ERC-20 `Transfer` (three topics) goes to `tokentx`, an ERC-721
 /// `Transfer` (four, the token id indexed) to `tokennfttx`, an ERC-1155 transfer to `token1155tx`
 /// with one row per id. Rows sort by log index, then by element within a batch.
@@ -958,10 +1216,9 @@ pub fn record(
     found: Found,
     generation: u64,
 ) -> Result<()> {
-    history.cache_txs(&found.cached_txs)?;
-    history.cache_block_timestamps(&found.cached_timestamps)?;
     for (action, rows) in [
         (Action::TxList, found.txlist),
+        (Action::TxListInternal, found.txlistinternal),
         (Action::TokenTx, found.tokentx),
         (Action::TokenNftTx, found.tokennfttx),
         (Action::Token1155Tx, found.token1155tx),
@@ -1124,6 +1381,22 @@ mod tests {
 
     const A: &str = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045";
 
+    impl<M: Rpc, T: Rpc> Discoverer<M, T> {
+        /// One window as the cursor runs it: discover, then keep what was fetched either way.
+        async fn discover_now(
+            &self,
+            history: &AddressHistory,
+            address: &str,
+            from: u64,
+            to: u64,
+        ) -> Result<Found> {
+            let pending = Pending::default();
+            let found = self.discover(history, address, from, to, &pending).await;
+            pending.persist(history)?;
+            found
+        }
+    }
+
     fn history(dir: &std::path::Path) -> AddressHistory {
         AddressHistory::open(Store::open(&dir.join("t.redb")).unwrap(), 1, &[A.into()]).unwrap()
     }
@@ -1209,7 +1482,7 @@ mod tests {
         let h = history(dir.path());
         let (main, trace) = chain(false);
         let d = Discoverer::new(main, trace);
-        let found = d.discover(&h, A, 0, 499).await.unwrap();
+        let found = d.discover_now(&h, A, 0, 499).await.unwrap();
         assert_eq!(
             found.txlist.len(),
             1,
@@ -1230,7 +1503,7 @@ mod tests {
         // Hydrated once: after the window is recorded, a second pass asks for no transaction again.
         record(&h, A, (0, 499), found, h.generation().unwrap()).unwrap();
         let before = d.main.asked.lock().unwrap().len();
-        d.discover(&h, A, 0, 499).await.unwrap();
+        d.discover_now(&h, A, 0, 499).await.unwrap();
         let again: Vec<String> = d.main.asked.lock().unwrap()[before..]
             .iter()
             .map(|(m, _)| m.clone())
@@ -1285,7 +1558,7 @@ mod tests {
             _ => (main.answer)(m, p),
         });
         let d = Discoverer::new(main, trace);
-        let err = d.discover(&h, A, 100, 199).await.unwrap_err();
+        let err = d.discover_now(&h, A, 100, 199).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("not recording a mixture"),
             "{err:#}"
@@ -1317,7 +1590,7 @@ mod tests {
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(main, trace);
-        d.discover(&h, A, 1_000, 1_099)
+        d.discover_now(&h, A, 1_000, 1_099)
             .await
             .expect("the empty midpoint is skipped and block 1,000 has traces");
     }
@@ -1392,7 +1665,7 @@ mod tests {
         let h = history(dir.path());
         let (main, trace) = chain(true);
         let d = Discoverer::new(main, trace);
-        let err = d.discover(&h, A, 1_000, 1_099).await.unwrap_err();
+        let err = d.discover_now(&h, A, 1_000, 1_099).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("no traces for block"),
             "{err:#}"
@@ -1411,7 +1684,7 @@ mod tests {
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(main, blind);
-        let err = d.discover(&h, A, 100, 199).await.unwrap_err();
+        let err = d.discover_now(&h, A, 100, 199).await.unwrap_err();
         assert!(format!("{err:#}").contains("by its nonce"), "{err:#}");
     }
 
@@ -1443,11 +1716,11 @@ mod tests {
             })
         };
         let d = Discoverer::new(code_from(150), blind());
-        d.discover(&h, A, 100, 199)
+        d.discover_now(&h, A, 100, 199)
             .await
             .expect("delegated by the window's end, so the nonce is not held to the traces");
         let d = Discoverer::new(code_from(10_000), blind());
-        let err = d.discover(&h, A, 100, 199).await.unwrap_err();
+        let err = d.discover_now(&h, A, 100, 199).await.unwrap_err();
         assert!(format!("{err:#}").contains("by its nonce"), "{err:#}");
     }
 
@@ -1467,7 +1740,7 @@ mod tests {
             _ => (main.answer)(m, p),
         });
         let d = Discoverer::new(main, trace);
-        let err = d.discover(&h, A, 0, 63).await.unwrap_err();
+        let err = d.discover_now(&h, A, 0, 63).await.unwrap_err();
         assert!(format!("{err:#}").contains("removed log"), "{err:#}");
     }
 
@@ -1523,7 +1796,7 @@ mod tests {
             _ => (main.answer)(m, p),
         });
         let d = Discoverer::new(main, trace);
-        let found = d.discover(&h, A, 0, 63).await.unwrap();
+        let found = d.discover_now(&h, A, 0, 63).await.unwrap();
         assert_eq!(
             found.tokentx.len(),
             1,
@@ -1628,5 +1901,279 @@ mod tests {
         for action in DISCOVERED {
             assert!(h.coverage(action, A).unwrap().is_empty(), "{action:?}");
         }
+    }
+
+    fn frame(ta: &[u64], kind: &str, action: Value, result: Value, error: Option<&str>) -> Value {
+        json!({"traceAddress": ta, "type": kind, "action": action, "result": result,
+               "error": error, "blockNumber": 19_000_016, "transactionPosition": 5,
+               "transactionHash": "0x93a7"})
+    }
+
+    /// Mainnet transaction 0x93a7cdc1…a917 (block 19,000,016), against Etherscan's answer for it:
+    /// a reverted call carrying value, a delegatecall Etherscan omits, and a call that succeeded
+    /// inside a reverted parent, which Etherscan lists as failed with no error code of its own.
+    #[test]
+    fn internal_records_follow_etherscan_on_a_failed_ancestor() {
+        let call = |from: &str, to: &str, value: &str, ct: &str| json!({"from": from, "to": to, "value": value, "callType": ct, "gas": "0x10"});
+        let frames = [
+            frame(
+                &[],
+                "call",
+                call("0xd857", "0x881d", "0x4e28e2290f0000", "call"),
+                json!(null),
+                Some("Reverted"),
+            ),
+            frame(
+                &[0],
+                "call",
+                call("0x881d", "0x74de", "0x4e28e2290f0000", "call"),
+                json!(null),
+                Some("Reverted"),
+            ),
+            frame(
+                &[0, 0],
+                "call",
+                call("0x74de", "0x7cdf", "0x4e28e2290f0000", "delegatecall"),
+                json!(null),
+                Some("Reverted"),
+            ),
+            frame(
+                &[0, 0, 0],
+                "call",
+                call("0x74de", "0x1111", "0x4d79ce42f07800", "call"),
+                json!(null),
+                Some("Reverted"),
+            ),
+            frame(
+                &[0, 0, 0, 0],
+                "call",
+                call("0x1111", "0xc02a", "0x4d79ce42f07800", "call"),
+                json!({"gasUsed": "0x5da6"}),
+                None,
+            ),
+            frame(
+                &[0, 0, 0, 1],
+                "call",
+                call("0x1111", "0xc02a", "0x0", "call"),
+                json!({"gasUsed": "0x0"}),
+                None,
+            ),
+        ];
+        let rows = internal_records(&frames, 1_705_173_747).unwrap();
+        let got: Vec<(String, String, String, String, String, String)> = rows
+            .iter()
+            .map(|r| {
+                let s = |k: &str| r[k].as_str().unwrap().to_string();
+                (
+                    s("to"),
+                    s("value"),
+                    s("isError"),
+                    s("errCode"),
+                    s("traceId"),
+                    s(TRACE_INDEX),
+                )
+            })
+            .collect();
+        let want = [
+            (
+                "0x74de",
+                "22000000000000000",
+                "1",
+                "execution reverted",
+                "0_1",
+                "1",
+            ),
+            (
+                "0x1111",
+                "21807500000000000",
+                "1",
+                "execution reverted",
+                "0_1_1_1",
+                "3",
+            ),
+            ("0xc02a", "21807500000000000", "1", "", "0_1_1_1_1", "4"),
+        ]
+        .map(|(a, b, c, d, e, f)| {
+            (
+                a.to_string(),
+                b.to_string(),
+                c.to_string(),
+                d.to_string(),
+                e.to_string(),
+                f.to_string(),
+            )
+        });
+        assert_eq!(got, want);
+        assert_eq!(rows[2]["gasUsed"], "23974");
+        assert_eq!(rows[0]["transactionIndex"], "5");
+    }
+
+    /// Mainnet transaction 0x84bde65f…4ee8 (block 19,000,010): a CREATE2 at zero value, which
+    /// Etherscan lists by its opcode, and the new contract's selfdestruct paying its beneficiary.
+    #[test]
+    fn internal_records_list_creations_and_selfdestructs() {
+        let frames = [
+            frame(
+                &[],
+                "call",
+                json!({"from": "0xa7fb", "to": "0xc77a", "value": "0x0", "callType": "call"}),
+                json!({"gasUsed": "0x1"}),
+                None,
+            ),
+            frame(
+                &[0],
+                "create",
+                json!({"from": "0xc77a", "value": "0x0", "gas": "0x92ca", "creationMethod": "create2"}),
+                json!({"address": "0x1d29", "gasUsed": "0x22e3"}),
+                None,
+            ),
+            frame(
+                &[0, 2],
+                "suicide",
+                json!({"address": "0x1d29", "refundAddress": "0xa7fb", "balance": "0x71afd498d0000"}),
+                json!(null),
+                None,
+            ),
+        ];
+        let rows = internal_records(&frames, 1).unwrap();
+        assert_eq!(rows.len(), 2);
+        let (create, kill) = (&rows[0], &rows[1]);
+        assert_eq!(
+            (
+                create["type"].as_str(),
+                create["contractAddress"].as_str(),
+                create["to"].as_str()
+            ),
+            (Some("create2"), Some("0x1d29"), Some(""))
+        );
+        assert_eq!(
+            (create["gas"].as_str(), create["gasUsed"].as_str()),
+            (Some("37578"), Some("8931"))
+        );
+        assert_eq!(
+            (
+                kill["type"].as_str(),
+                kill["from"].as_str(),
+                kill["to"].as_str(),
+                kill["value"].as_str()
+            ),
+            (
+                Some("self-destruct"),
+                Some("0x1d29"),
+                Some("0xa7fb"),
+                Some("2000000000000000")
+            )
+        );
+        assert_eq!(
+            (kill["gas"].as_str(), kill["traceId"].as_str()),
+            (Some("0"), Some("0_1_1"))
+        );
+        assert!(
+            touches(create, "0x1d29"),
+            "a creation touches the contract it creates"
+        );
+    }
+
+    /// A window finds an internal transfer to the watched address, traces its transaction once, and
+    /// answers the same frame by address and by txhash under the same position.
+    #[tokio::test]
+    async fn an_internal_transfer_is_found_and_answered_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, _) = chain(false);
+        let tx = "0x00000000000000000000000000000000000000000000000000000000000000ee";
+        let whole = json!([
+            {"traceAddress": [], "type": "call", "transactionHash": tx, "blockNumber": 300,
+             "transactionPosition": 2, "action": {"from": "0x02", "to": "0x03", "value": "0x0", "callType": "call"}},
+            {"traceAddress": [0], "type": "call", "transactionHash": tx, "blockNumber": 300,
+             "transactionPosition": 2, "action": {"from": "0x03", "to": "0x04", "value": "0x0", "callType": "call"}},
+            {"traceAddress": [0, 0], "type": "call", "transactionHash": tx, "blockNumber": 300,
+             "transactionPosition": 2, "action": {"from": "0x03", "to": A, "value": "0x5", "callType": "call", "gas": "0x8fc"},
+             "result": {"gasUsed": "0x0"}},
+        ]);
+        let traced = whole.clone();
+        let trace = script(move |m, p| match m {
+            "trace_filter" => {
+                let f = &p[0];
+                let (s, e) = (hex_u64(&f["fromBlock"])?, hex_u64(&f["toBlock"])?);
+                Ok(if f.get("toAddress").is_some() && s <= 300 && 300 <= e {
+                    json!([traced[2]])
+                } else {
+                    json!([])
+                })
+            }
+            "trace_transaction" => Ok(whole.clone()),
+            "trace_block" => Ok(json!([{"x": 1}])),
+            other => bail!("unexpected {other}"),
+        });
+        let d = Discoverer::new(main, trace);
+        let found = d.discover_now(&h, A, 300, 399).await.unwrap();
+        assert_eq!(found.txlistinternal.len(), 1);
+        let row = &found.txlistinternal[0];
+        assert_eq!(row.record["hash"], tx);
+        assert_eq!(row.record["traceId"], "0_1_1");
+        assert_eq!(row.record["value"], "5");
+        assert_eq!(row.position, 2, "pre-order position in the whole trace");
+        let keys: Vec<&String> = row.record.keys().take(4).collect();
+        assert_eq!(
+            keys,
+            ["blockNumber", "transactionIndex", "timeStamp", "hash"]
+        );
+
+        let by_hash = crate::address_history::respond(
+            Some(&h),
+            &[
+                ("module", "account"),
+                ("action", "txlistinternal"),
+                ("txhash", tx),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        );
+        let only = &by_hash["result"][0];
+        assert_eq!(
+            only[TRACE_INDEX], row.record[TRACE_INDEX],
+            "the same frame either way"
+        );
+        assert!(
+            only.get("traceId").is_none(),
+            "Etherscan's txhash form has no traceId"
+        );
+        assert!(only.get("hash").is_none());
+        let traced_calls = d
+            .trace
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| m == "trace_transaction")
+            .count();
+        assert_eq!(traced_calls, 1);
+    }
+
+    #[test]
+    fn a_txhash_not_yet_traced_is_unsupported_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let ask = |action: &str, hash: &str| {
+            crate::address_history::respond(
+                Some(&h),
+                &[("module", "account"), ("action", action), ("txhash", hash)]
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let unseen = format!("0x{}", "ab".repeat(32));
+        assert!(ask("txlistinternal", &unseen)["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("NUTHATCH_UNSUPPORTED:"));
+        assert!(ask("txlist", &unseen)["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("NUTHATCH_UNSUPPORTED:"));
+        assert_eq!(ask("txlistinternal", "0x12")["status"], "0");
     }
 }
