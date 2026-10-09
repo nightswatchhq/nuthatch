@@ -105,29 +105,43 @@ rotki once every slice below passes.
 
 ## 7. RPC and cost
 
-| Chain | Source | Traces |
-|---|---|---|
-| Ethereum | GraphOps | `trace_filter` and `trace_block` answer (probed 2026-10-09) |
-| Base | GraphOps | `trace_block` answers; `trace_filter` to be confirmed on a non-empty range |
-| Arbitrum | Alchemy | GraphOps serves no trace methods (probed 2026-10-09) |
-| Optimism, Gnosis, Polygon, BSC, Scroll | Alchemy | to be probed per chain before its slice |
+Probed 2026-10-09 at a busy block on each chain:
+
+| Chain | Source | `trace_filter` | `trace_block` | `debug_traceBlockByNumber` |
+|---|---|---|---|---|
+| Ethereum | GraphOps | yes | yes | no |
+| Base | GraphOps, Alchemy | yes | yes | Alchemy only |
+| Gnosis | Alchemy | yes | yes | yes |
+| BSC | Alchemy | yes | yes | yes |
+| Optimism | Alchemy | yes after Bedrock; **an empty success before it** | as `trace_filter` | yes |
+| Polygon | Alchemy | no, "not supported after the Erigon-to-Bor migration" | yes | yes |
+| Arbitrum | Alchemy | no | no | yes after Nitro; "missing trie node" before it |
+| Scroll | Alchemy | no, worded as "not enabled for this app" | no | yes |
 
 Filtered traces are cheap: two directional queries over a million blocks at 10,000-block windows are
-about 200 requests plus pagination and hydration. Block-by-block tracing is the expensive fallback and
-is used only where a chain has no `trace_filter`. Every figure here is to be replaced by a measured
-one before the chain ships.
+about 200 requests plus pagination and hydration. Polygon, Arbitrum and Scroll have no filter, so
+every block in a covered range is traced once and shared across watched addresses: the expensive path.
 
-## 8. MEV and block production
+**Optimism before Bedrock answers `trace_filter` with an empty success** while
+`debug_traceBlockByNumber` returns calls for the same block. Trusting it would serve empty history as
+complete. That range, and Arbitrum before Nitro, answer `NUTHATCH_UNSUPPORTED` so rotki falls back.
+Every figure here is replaced by a measured one before its chain ships.
+
+## 8. MEV, withdrawals and block production
 
 Withdrawals come from block bodies (EIP-4895). Fee-recipient blocks come from headers; rewards from
-receipts' priority fees. **MEV stays on rotki's existing beaconcha.in path at first**: relay-reported
-MEV amounts and proposer attribution are not in execution RPC, and the Beacon API alone does not
-carry relay payments. Missing relay evidence is unknown, never zero.
+receipts' priority fees. **MEV comes from the MEV-Boost relays' public data API**
+(`/relay/v1/data/bidtraces/proposer_payload_delivered`, keyless, probed on Flashbots 2026-10-09): for
+each block a watched fee recipient produced, the major relays are asked what they delivered, and the
+delivered `value` is reconciled against the builder-to-proposer payment in that block. A block no
+relay claims is unknown, never zero; two relays claiming one block is a conflict, surfaced. Proposer
+attribution (validator index) comes from a Beacon API source when one is configured.
 
 ## 9. Slices and their gates
 
 Every gate is parity against Etherscan for a pinned wallet and range, exact hash sets and the fields
-rotki reads, run on both boxes.
+rotki reads, run on both boxes. The reference answers were pinned on 2026-10-09 with an Etherscan V2
+free key, whose answers cap at 1,000 rows, so the pinning splits ranges at that cap.
 
 1. **Coverage, `/api` and pagination.** 1,001 records in one block page through with exact
    identities; an uncovered range answers `NUTHATCH_INCOMPLETE`; a reorg invalidates the tail.
@@ -135,20 +149,44 @@ rotki reads, run on both boxes.
    adjacent-header inequalities; the hosted headers nest stays under 2 GB RSS while ingesting and
    answering concurrently.
 3. **Token transfers and normal transactions.** vitalik.eth (`0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045`),
-   Ethereum blocks 18,000,000 to 20,000,000: `tokentx` and `txlist` hash sets equal Etherscan's, and
-   `txlist` field parity. A non-empty wallet and range is pinned per further chain before its turn.
-4. **Internal transactions.** The same wallet and range, plus pinned fixtures for an internal-only
-   receipt, a failed ancestor, a creation, a selfdestruct and an EIP-7702 authorisation. Field parity
-   and identical `traceId`s by address and by `txhash`.
-5. **Withdrawals and block production.** Lido Withdrawal Vault
-   (`0xB9D7934878B5FB9610B3Fe8A5e441e8faF7E293f`), Ethereum 17,034,870 to 17,044,870: exact
-   withdrawal indices and amounts. Pinned proposer fixtures for `getminedblocks` and reward parity.
+   Ethereum blocks 18,000,000 to 20,000,000: `txlist` (2,929 rows) and `tokentx` (7,614) hash sets
+   equal Etherscan's, with `txlist` field parity; `tokennfttx` (669) and `token1155tx` (55) likewise
+   once the union question is settled. A non-empty wallet and range is pinned per further chain.
+4. **Internal transactions.** The same wallet and range (`txlistinternal`, 15 rows), plus pinned
+   fixtures for an internal-only receipt, a failed ancestor, a creation, a selfdestruct and an EIP-7702
+   authorisation. Field parity and identical `traceId`s by address and by `txhash`.
+5. **Withdrawals and block production.** `0x7a25bd5f286fb722e7578c62e86a675ff0a00b15`, Ethereum
+   17,034,870 to 17,300,000: 4,333 withdrawals, exact indices and amounts, cross-checked against block
+   bodies. Pinned proposer fixtures for `getminedblocks` and reward parity. (Lido's withdrawal vault
+   was the first choice; Etherscan returns no withdrawals for it at all, which is to be understood
+   before this slice.)
 6. **The rotki adapter.** rotki's own test suite passes with nuthatch first in the order, and a
    fresh rotki profile for a pinned wallet produces the same history events as with Etherscan.
+7. **MEV.** Pinned relay and non-relay blocks for a known proposer: amounts equal beaconcha.in's for
+   the fields rotki reads, and rotki's final events count no income twice.
 
 Chains go Ethereum first (every slice), then Base, then the rest in the order rotki's users need.
 
 ## 10. What this does not do
 
-No hosted per-address history. No relay-reported MEV in v1. No promise of completeness on a chain
-until its gates pass; until then that chain answers `NUTHATCH_UNSUPPORTED` and rotki falls back.
+No hosted per-address history. No completeness claimed for a chain or era until its gates pass;
+until then it answers `NUTHATCH_UNSUPPORTED` and rotki falls back.
+
+## 11. Lightweight by requirement
+
+A rotki-mode nest runs on a laptop beside a desktop app (Chief, 2026-10-09). Each item is a gate.
+Figures marked (target) are confirmed by the first measurement, then frozen as budgets.
+
+1. **Memory.** Idle RSS (target) under 100 MB per chain, under 300 MB while backfilling. No DBSP,
+   Burrmill or Parquet sealing in this mode unless a measurement shows a need.
+2. **Disk.** Only rows touching watched addresses, plus coverage, under compact binary keys.
+3. **RPC.** A 5-minute poll; the widest windows the provider accepts; each hash hydrated once; the
+   idle call rate reported on `/metrics`.
+4. **Speed.** A 1,000-row `/api` page in (target) under 10 ms from an index keyed (address, block,
+   position), never a scan. Backfill resumes from coverage after a crash.
+5. **Addresses change at runtime.** Adding a watched address starts its backfill without a restart.
+6. **Start.** Under 1 s from a covered store to serving; nothing to run but the binary.
+7. **Keys.** A trace-capable RPC is the only required credential, and the nest says which chain
+   needs one and why.
+8. **Private by default.** No head count prompt; localhost only; no outbound call but the RPCs.
+9. **Offline.** Covered history serves with the RPC down; gaps answer `NUTHATCH_INCOMPLETE`.
