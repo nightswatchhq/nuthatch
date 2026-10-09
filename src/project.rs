@@ -989,7 +989,16 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
 /// derived from the nest's own first table, plus a README. Idempotent: if `views/` already exists (an
 /// `add` on a nest whose author already wrote views), it's left untouched. The starter is entirely
 /// comments, so it's a no-op for the query surface and validates clean until the author uncomments it.
+const GITATTRIBUTES: &str = "*.sql linguist-detectable\nabis/** linguist-generated\n";
+
 fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<()> {
+    // GitHub counts SQL as data, so without this a nest repo shows no language. Hidden, so it stays
+    // outside the data identity.
+    let attrs = dir.join(".gitattributes");
+    if !attrs.exists() {
+        std::fs::write(&attrs, GITATTRIBUTES).context("failed to write .gitattributes")?;
+    }
+
     let views = dir.join("views");
     if views.exists() {
         return Ok(()); // author already has a views/ - never clobber it
@@ -2242,6 +2251,10 @@ mod tests {
         scaffold_views(dir.path(), &schema).unwrap();
         let starter = std::fs::read_to_string(dir.path().join("views/10-example.sql")).unwrap();
         assert!(dir.path().join("views/README.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap(),
+            GITATTRIBUTES
+        );
         // References the nest's real table, and every line is a comment (a no-op that validates clean).
         assert!(starter.contains("usdc__transfer"));
         assert!(starter
@@ -2255,6 +2268,25 @@ mod tests {
             std::fs::read_to_string(dir.path().join("views/10-example.sql")).unwrap(),
             "-- author's edit",
             "existing views/ is never clobbered"
+        );
+
+        // A nest that already has views/ still gets the attributes, and an author's own are kept.
+        let old = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(old.path().join("views")).unwrap();
+        scaffold_views(old.path(), &schema).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(old.path().join(".gitattributes")).unwrap(),
+            GITATTRIBUTES
+        );
+        std::fs::write(
+            old.path().join(".gitattributes"),
+            "*.md linguist-documentation\n",
+        )
+        .unwrap();
+        scaffold_views(old.path(), &schema).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(old.path().join(".gitattributes")).unwrap(),
+            "*.md linguist-documentation\n"
         );
     }
 
