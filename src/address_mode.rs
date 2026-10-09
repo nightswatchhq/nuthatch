@@ -202,6 +202,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             }
         };
         for address in watched {
+            let mut recorded_through: Option<u64> = None;
             loop {
                 let next = match crate::address_discovery::next_uncovered(
                     &state.history,
@@ -215,6 +216,15 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     }
                 };
                 if next > to {
+                    break;
+                }
+                // A recorded window must move coverage past it; one that did not would be fetched
+                // again forever, at the provider's expense.
+                if recorded_through.is_some_and(|r| next <= r) {
+                    state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        "address history: coverage for {address} did not advance past {next}; stopping this pass"
+                    );
                     break;
                 }
                 let end = next
@@ -241,6 +251,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 state.set_calls("trace", self.trace.calls());
                 match outcome {
                     Ok(()) => {
+                        recorded_through = Some(end);
                         state.windows.fetch_add(1, Ordering::Relaxed);
                         tracing::info!("address history: {address} covered through {end}");
                     }
