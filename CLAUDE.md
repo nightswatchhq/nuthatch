@@ -238,6 +238,15 @@ unconfigured.
 > receiver on the Helsinki host where we own the ingress log, `chain` kept under the registry-only
 > rule, and the number published early with its caveat in the same sentence.
 >
+> **RFC-0063 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0063](docs/rfcs/0063-address-history.md) (address history) on 2026-10-09 for rotki, whose
+> founder said yes to a local indexer source the same day (rotki/rotki#13335). Chief's words: build
+> everything rotki needs, extending nuthatch as far as that takes. It reopens #272, #277 and #308 from
+> frozen-for-2027, now scoped as RFC-0063 slices. A rotki-mode nest is its own cursor beside the
+> event pipeline, per user and local, Etherscan-shaped at `/api`. It polls every 5 minutes and is
+> gated to stay lightweight. Only address-free data such as timestamp to block is hosted. Seven slices,
+> each gated on Etherscan parity, MEV from the relays included.
+>
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
 > the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred
@@ -301,6 +310,13 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
   indexer picks each one up ([docs/subgraph-stopgap.md](docs/subgraph-stopgap.md)). It is the stock
   binary run as an operator would, not a platform: no billing, no accounts, nothing in this tree built
   for it. The hosted-platform retirement above otherwise stands.
+  **Amended 2026-10-09 by Chief: we may offer to host nests for people and teams**, not only stopgap
+  subgraphs. The same terms bind: the stock binary run as an operator would, on the ThinkPad or our
+  VPSes, no billing, no accounts, nothing in this tree built for it. It is an offer made to a named
+  user, not a platform or a public service; a hosted need that requires a change here is a normal
+  nuthatch feature on its own merits, or it is not built. That includes a direct offer to a named
+  Graph user whose subgraph is hurt by the Studio sunset or a chain's deprecation; the 2026-10-08
+  stopgap hold still rules out promotion and any approach through the Foundation.
 - Token, staking, decentralized network features (a possible future Graph Horizon data
   service is explicitly deferred).
 - Non-EVM chains before EVM is airtight.
