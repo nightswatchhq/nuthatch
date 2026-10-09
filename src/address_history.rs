@@ -1009,6 +1009,11 @@ mod tests {
             h.page(Action::TxList, &r).unwrap(),
             Answer::Incomplete(_)
         ));
+        assert_eq!(
+            h.page(Action::TxList, &req(150, 160, 1, 10)).unwrap(),
+            Answer::Rows(vec![]),
+            "a range inside the second span is covered"
+        );
         h.mark_covered(Action::TxList, ALICE, 100, 100).unwrap();
         assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(0, 200)]);
         assert_eq!(h.page(Action::TxList, &r).unwrap(), Answer::Rows(vec![]));
