@@ -2763,7 +2763,8 @@ mod tests {
     /// transactions, and a fee field that is missing.
     #[tokio::test]
     async fn an_incomplete_block_answer_fails_the_scan() {
-        let cases: [(&str, fn(&str, &mut Value)); 6] = [
+        type Spoil = fn(&str, &mut Value);
+        let cases: [(&str, Spoil); 6] = [
             ("answered with block", |m, v| {
                 if m == "eth_getBlockByNumber" {
                     v["number"] = json!("0x1");
