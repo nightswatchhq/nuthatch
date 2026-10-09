@@ -6078,6 +6078,18 @@ mod tests {
     /// `"seconds_since_poll":5` vs `6`.
     const VOLATILE: &[&str] = &["seconds_since_poll", "last_poll_unixtime"];
 
+    /// `/ready` computes an age from its own clock read, so a second can tick between the test's `now`
+    /// and the handler's: assert the age set, allowing that tick.
+    fn assert_age(json: &serde_json::Value, key: &str, set: u64) {
+        let got = json[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{key} is not a number: {json}"));
+        assert!(
+            (set..=set + 2).contains(&got),
+            "{key}: set {set}s ago, reported {got}: {json}"
+        );
+    }
+
     /// Drive one GET through a router and return `(status, body)` - the whole observable response, so
     /// a parity assertion cannot pass on status alone.
     ///
@@ -6657,7 +6669,7 @@ mod tests {
         assert_eq!(json["stalled"], json!(true));
         assert_eq!(json["seal_direct_stalled"], json!(true));
         // The operator can tell slow from dead without a second tool.
-        assert_eq!(json["seconds_since_seal_progress"], json!(36_000));
+        assert_age(&json, "seconds_since_seal_progress", 36_000);
         handle.end_seal_direct();
     }
 
@@ -6696,7 +6708,7 @@ mod tests {
         );
         assert_eq!(json["ready"], json!(true));
         assert_eq!(json["seal_direct_stalled"], json!(false));
-        assert_eq!(json["seconds_since_seal_progress"], json!(60));
+        assert_age(&json, "seconds_since_seal_progress", 60);
         handle.end_seal_direct();
     }
 
@@ -7143,12 +7155,9 @@ mod tests {
         );
         assert_eq!(json["tip_seal_stalled"], json!(true));
         assert_eq!(json["seal_lag_blocks"], json!(739_192));
-        assert_eq!(
-            json["seconds_since_seal_progress"],
-            json!(46_800),
-            "the tip path must report its own seal clock, not null - it was null on exactly the \
-             nests that needed it"
-        );
+        // The tip path must report its own seal clock, not null: it was null on exactly the nests
+        // that needed it.
+        assert_age(&json, "seconds_since_seal_progress", 46_800);
         assert_eq!(
             json["seal_direct_stalled"],
             json!(false),
