@@ -236,6 +236,17 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// `--poll-interval` wins over `poll_interval` in `[address_history]`, which wins over the default.
+pub fn poll_interval(
+    flag: Option<Duration>,
+    config: &crate::address_history::AddressHistoryConfig,
+) -> Result<Duration> {
+    match flag {
+        Some(d) => Ok(d),
+        None => config.poll_interval(),
+    }
+}
+
 /// `nuthatch dev` on a rotki-mode nest.
 pub async fn dev(
     dir: &Path,
@@ -253,10 +264,7 @@ pub async fn dev(
             crate::config::CONFIG_FILE
         );
     }
-    let poll_interval = match args.poll_interval {
-        Some(d) => d,
-        None => ah.poll_interval()?,
-    };
+    let poll_interval = poll_interval(args.poll_interval, ah)?;
     let store = crate::store::Store::open(&dir.join(crate::config::DB_FILE))?;
     let history = AddressHistory::open(store, config.nest.chain_id, &ah.addresses)?;
 
@@ -431,6 +439,27 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    /// Five minutes, written out: a test that compared against the constant would move with it.
+    #[test]
+    fn the_poll_interval_defaults_to_five_minutes_and_the_flag_wins() {
+        let mut cfg = crate::address_history::AddressHistoryConfig {
+            addresses: vec![ALICE.into()],
+            start_block: None,
+            end_block: None,
+            poll_interval: None,
+        };
+        assert_eq!(
+            poll_interval(None, &cfg).unwrap(),
+            Duration::from_secs(5 * 60)
+        );
+        cfg.poll_interval = Some("2m".into());
+        assert_eq!(poll_interval(None, &cfg).unwrap(), Duration::from_secs(120));
+        assert_eq!(
+            poll_interval(Some(Duration::from_secs(7)), &cfg).unwrap(),
+            Duration::from_secs(7)
+        );
     }
 
     #[tokio::test]
