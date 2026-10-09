@@ -65,6 +65,17 @@ addresses = ["$2"]
 start_block = $3
 end_block = $4
 EOF
+  if [ -n "${MIRROR:-}" ]; then
+    cat >> "$WORK/$1/nuthatch.toml" <<EOF
+
+[address_history.mirror]
+url = "${MIRROR_DIR:-$MIRROR}"
+chain_id = 1
+from_block = $3
+to_block = $4
+cache_mb = 64
+EOF
+  fi
   if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "FAIL: port $PORT is already in use" >&2
     exit 1
@@ -141,14 +152,33 @@ same_rows() { # label fields ours theirs: the two files hold the same rows, as m
   esac
 }
 
+calls() { # method: how many times the running nest has called it
+  curl -s "$URL/metrics" | sed -n "s/^nuthatch_address_history_rpc_calls_total{endpoint=\"main\",method=\"$1\"} //p" | grep . || echo 0
+}
+
+blocktimes() { # case: the running nest's getblocknobytime answers equal Etherscan's for that case
+  local c=$1 n=0 t closest want got
+  while IFS=$'\t' read -r t closest want; do
+    got=$(curl -s "$URL/api?module=block&action=getblocknobytime&timestamp=$t&closest=$closest" | jq -r .result)
+    n=$((n + 1))
+    [ "$got" = "$want" ] || { echo "  BLOCKTIME $c $t $closest: ours $got, Etherscan $want"; FAILED=1; }
+  done < <(jq -r --arg c "$c" 'select(.case == $c) | [.timestamp, .closest, .block] | @tsv' "$CASES/blocktimes.jsonl")
+  [ "$n" -gt 0 ] || { echo "FAIL: no blocktimes for $c" >&2; exit 1; }
+  echo "$c: $n getblocknobytime answers compared"
+}
+
 # The internal-transaction fields compared: every one rotki reads, plus Etherscan's failure fields.
 INTERNAL='{hash,blockNumber,timeStamp,from,to,value,traceId,gas,gasUsed,type,isError,errCode,contractAddress}'
 BYHASH='{parent,blockNumber,timeStamp,from,to,value,gas,gasUsed,type,isError,errCode,contractAddress,traceId}'
 
 PHASES=${PHASES:-13456}
+if [[ $PHASES == *7* ]] && [ -z "${MIRROR:-}" ]; then
+  echo "FAIL: phase 7 needs MIRROR, a directory of partitions for the gate's ranges" >&2
+  exit 1
+fi
 # Phase 2 runs inside phase 1, on its nest, so it cannot be chosen alone.
-if ! [[ $PHASES =~ ^[13456]+$ ]]; then
-  echo "FAIL: PHASES=$PHASES; choose from 1 (vitalik, with its txhash phase), 3, 4, 5 and 6" >&2
+if ! [[ $PHASES =~ ^[134567]+$ ]]; then
+  echo "FAIL: PHASES=$PHASES; choose from 1 (vitalik, with its txhash phase), 3, 4, 5, 6 and 7" >&2
   exit 1
 fi
 if [[ $PHASES == *1* ]]; then
@@ -253,6 +283,22 @@ echo "withdrawals: $(wc -l < "$WORK/wi.ours" | tr -d ' ') indices ours, $(wc -l 
 for i in $(comm -13 "$WORK/wi.ours" "$WORK/wi.theirs"); do echo "  MISSING withdrawal $i"; FAILED=1; done
 for i in $(comm -23 "$WORK/wi.ours" "$WORK/wi.theirs"); do echo "  EXTRA   withdrawal $i"; FAILED=1; done
 same_rows "withdrawals, every field" . "$WORK/withdrawals.jsonl" "$WORK/withdrawals.theirs"
+if [ -n "${MIRROR:-}" ]; then
+  # Pages of 1,000 under one generation read the same rows as one page of 10,000.
+  : > "$WORK/paged.jsonl"
+  gen=""
+  for p in 1 2 3 4; do
+    body=$(api "action=txsBeaconWithdrawal&address=$W&startblock=17034870&endblock=17300000&page=$p&offset=1000${gen:+&generation=$gen}")
+    gen=$(jq -r .generation <<<"$body")
+    jq -c '.result[]' <<<"$body" >> "$WORK/paged.jsonl"
+  done
+  cmp -s "$WORK/paged.jsonl" "$WORK/withdrawals.jsonl" || { echo "  PAGES   withdrawals in pages of 1,000 differ from one page"; FAILED=1; }
+  bodies=$(calls eth_getBlockByNumber)
+  echo "withdrawals: $bodies eth_getBlockByNumber calls through the mirror (anchors and the per-address path, no body scan)"
+  [ "$bodies" -lt 100 ] || { echo "  BODIES  $bodies block reads: the mirror did not replace the body scan"; FAILED=1; }
+  echo "withdrawals: partition cache $(du -sk "$WORK/withdrawals/partitions" | cut -f1) KB of a 65,536 KB budget"
+  blocktimes withdrawals
+fi
 echo "RPC calls (withdrawals):"
 curl -s "$URL/metrics" | grep '^nuthatch_address_history_rpc_calls_total' | sed 's/^nuthatch_address_history_rpc_calls_total/  /' | mask
 stop
@@ -267,6 +313,18 @@ while IFS=$'\t' read -r name address from to _; do
   all_rows getminedblocks "$address" "$from" "$to" "$WORK/$name.jsonl"
   same_rows "$name" '{blockNumber,timeStamp,blockReward}' "$WORK/$name.jsonl" "$CASES/$name.jsonl"
   echo "$name: $(wc -l < "$WORK/$name.jsonl" | tr -d ' ') blocks, reward $(jq -r .blockReward "$WORK/$name.jsonl" | head -1)"
+  if [ -n "${MIRROR:-}" ]; then
+    # Rewards hydrate only the blocks the address produced; an unbounded request is incomplete,
+    # because the nest holds nothing from genesis.
+    hydrated=$(calls eth_getBlockByHash)
+    [ "$hydrated" = "$(wc -l < "$WORK/$name.jsonl" | tr -d ' ')" ] || { echo "  HYDRATE $name: $hydrated bodies for its blocks"; FAILED=1; }
+    [ "$(calls eth_getBlockByNumber)" -lt 10 ] || { echo "  BODIES  $name read blocks by number"; FAILED=1; }
+    case $(api "action=getminedblocks&address=$address&blocktype=blocks&page=1&offset=1000" | jq -r .result) in
+      NUTHATCH_INCOMPLETE:*) ;;
+      *) echo "  UNBOUNDED $name answered without genesis coverage"; FAILED=1 ;;
+    esac
+    if [ "$name" = mined-post-merge ]; then blocktimes mined-post-merge; fi
+  fi
   stop
 done < "$WORK/mined.tsv.rows"
 fi
@@ -283,6 +341,38 @@ while IFS=$'\t' read -r name address from to _; do
   echo "$name: $(wc -l < "$WORK/$name.jsonl" | tr -d ' ') rows, the first to \"$(jq -r .to "$WORK/$name.jsonl" | head -1)\" creating $(jq -r .contractAddress "$WORK/$name.jsonl" | head -1)"
   stop
 done < "$WORK/created.tsv.rows"
+fi
+
+if [[ $PHASES == *7* ]]; then
+# Phase 7: the partitions themselves. A rebuild is byte-identical; a mirror missing a partition
+# leaves its blocks incomplete; pre-London headers answer getblocknobytime.
+key=address-history/v1/1/0020000000.parquet
+"$BIN" partitions --from 20000000 --to 20009999 --out "$WORK/rebuilt" --concurrency 6 > "$WORK/rebuilt.log" 2>&1 \
+  || { echo "FAIL: rebuilding partition 20000000:" >&2; tail -5 "$WORK/rebuilt.log" | mask >&2; exit 1; }
+if cmp -s "$WORK/rebuilt/$key" "$MIRROR/$key"; then
+  echo "partitions: 20000000 rebuilt byte-identical ($(wc -c < "$MIRROR/$key" | tr -d ' ') bytes)"
+else
+  echo "  REBUILD partition 20000000 differs from the published one"; FAILED=1
+fi
+
+mkdir -p "$WORK/holed"
+cp -R "$MIRROR/." "$WORK/holed/"
+rm "$WORK/holed/$key"
+MIRROR_DIR="$WORK/holed" start holed 0x6af88356dd961e2a0db451070dd93c8c2667f7a8 20000000 20000299
+for _ in $(seq 60); do
+  grep -q "partition \[20000000, 20009999\] not used" "$WORK/holed.log" && break
+  sleep 2
+done
+case $(api "action=getminedblocks&address=0x6af88356dd961e2a0db451070dd93c8c2667f7a8&startblock=20000000&endblock=20000299&blocktype=blocks" | jq -r .result) in
+  NUTHATCH_INCOMPLETE:*) echo "holed: a missing partition answers incomplete" ;;
+  *) echo "  HOLE    a missing partition did not answer incomplete"; FAILED=1 ;;
+esac
+stop
+
+start headers-pre-london 0x5e1ec7ed000000000000000000000000000000a1 12000000 12009999
+wait_covered headers-pre-london 0x5e1ec7ed000000000000000000000000000000a1 12000000 12009999 txsBeaconWithdrawal
+blocktimes headers-pre-london
+stop
 fi
 
 if [ "$FAILED" -ne 0 ]; then
