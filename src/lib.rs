@@ -7,6 +7,7 @@
 
 pub mod abi;
 pub mod address_history;
+pub mod address_mode;
 pub mod alerts;
 pub mod allowlist;
 pub mod analytics;

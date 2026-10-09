@@ -287,6 +287,8 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // RFC-0059: `folds/folds.toml`, authored nest config that only a `folds` build reads; see its
     // entries in KNOWN_UNDOCUMENTED.
     ("src/folds.rs", Some(&["FoldsToml", "FoldDecl"])),
+    // RFC-0063: `[address_history]` in `nuthatch.toml`.
+    ("src/address_history.rs", Some(&["AddressHistoryConfig"])),
 ];
 
 /// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not
@@ -294,6 +296,7 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 /// config file lands on this list by accident.
 const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/count.rs", "the per-machine head-count answer, not nest config"), // RFC-0054 hook
+    ("src/address_mode.rs", "the /api/watch request body, not nest config"),
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
     (
         "src/mount_jobs.rs",

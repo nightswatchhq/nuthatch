@@ -54,6 +54,10 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     let cors = crate::serve::cors_layer(&args.cors)?;
     let dir = PathBuf::from(&args.dir);
     let mut config = Config::load(&dir)?;
+    // RFC-0063: an address-history nest runs its own light path and none of what follows.
+    if config.address_history.is_some() {
+        return crate::address_mode::dev(&dir, config, &args, cors).await;
+    }
     apply_dev_args(&mut config, &args);
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
