@@ -13,7 +13,7 @@
 set -euo pipefail
 v=${1:?usage: roll-helsinki-from-mac.sh <version> [--override '<reason>'] [unit ...]}; shift
 host=${ROLL_HOST:-root@89.167.109.4}
-repo=${ROLL_REPO:-nightswatchhq/nuthatch}
+repo=${ROLL_REPO:-nuthatch-org/nuthatch}
 smoke_dir=${SMOKE_DIR:-$HOME/Projects/kittiwake/nuthatch-gate/smoke}
 override="" units=()
 while [ $# -gt 0 ]; do
@@ -62,7 +62,7 @@ if [ -n "$override" ]; then
   printf '\n*** OVERRIDE: rolling v%s past its release gates ***\n*** reason: %s ***\n\n' "$v" "$override"
 fi
 
-[ -d "$smoke_dir" ] || { echo "no smoke directory at $smoke_dir: clone nightswatchhq/kittiwake or set SMOKE_DIR" >&2; exit 2; }
+[ -d "$smoke_dir" ] || { echo "no smoke directory at $smoke_dir: clone nuthatch-org/kittiwake or set SMOKE_DIR" >&2; exit 2; }
 smokes=()
 for u in "${units[@]}"; do
   if [ -f "$smoke_dir/${u%-next}.sql" ]; then smokes+=("${u%-next}.sql")
@@ -72,8 +72,8 @@ done
 # The smoke files ride over the same connection on stdin, into a directory beside the clone.
 COPYFILE_DISABLE=1 tar -C "$smoke_dir" -cf - -T /dev/null ${smokes[@]+"${smokes[@]}"} | ssh "$host" "V=$v; UNITS='${units[*]}'; "'set -e
 d=/tmp/nuthatch-roll-$V; rm -rf "$d" "$d-smoke"; mkdir "$d-smoke"; tar -xf - -C "$d-smoke"
-git clone -q --depth 1 --branch "v$V" https://github.com/nightswatchhq/nuthatch "$d"; cd "$d"
-u=https://github.com/nightswatchhq/nuthatch/releases/download/v$V/nuthatch-x86_64-unknown-linux-gnu.tar.gz
+git clone -q --depth 1 --branch "v$V" https://github.com/nuthatch-org/nuthatch "$d"; cd "$d"
+u=https://github.com/nuthatch-org/nuthatch/releases/download/v$V/nuthatch-x86_64-unknown-linux-gnu.tar.gz
 curl -fsSL -o n.tgz "$u"; curl -fsSL -o n.sha "$u.sha256"
 echo "$(cut -d" " -f1 n.sha)  n.tgz" | sha256sum -c --quiet
 mkdir x; tar xzf n.tgz -C x; bin=$(find x -type f -name nuthatch | head -1)

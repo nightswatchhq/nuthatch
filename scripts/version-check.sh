@@ -34,7 +34,7 @@ while IFS= read -r line; do
     *":$WANT"*|*':<version>'*|*':{version}'*) printf "  OK   %s\n" "$line" ;;
     *) printf "  STALE %s\n" "$line"; fail=$((fail + 1)) ;;
   esac
-done < <(grep -rn "ghcr.io/nightswatchhq/nuthatch:" --include="*.md" . 2>/dev/null | grep -v "^./target" | grep -v "/rfcs/")
+done < <(grep -rn "ghcr.io/nuthatch-org/nuthatch:" --include="*.md" . 2>/dev/null | grep -v "^./target" | grep -v "/rfcs/")
 
 # 2. Cargo.toml is the source of truth and must agree with itself.
 have=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)

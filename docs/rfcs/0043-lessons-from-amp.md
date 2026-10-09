@@ -53,8 +53,8 @@ That is a good design. It is also, on inspection, a design for a different produ
 The report that prompted this RFC nominates two artefacts as its strongest evidence. Both need
 discounting before use, and the discount is not small.
 
-1. **`nightswatchhq/camp-node`**, put forward as "the highest-signal artifact available", is a
-   repository in **this project's own GitHub organisation**. Nuthatch is `nightswatchhq/nuthatch`.
+1. **`nuthatch-org/camp-node`**, put forward as "the highest-signal artifact available", is a
+   repository in **this project's own GitHub organisation**. Nuthatch is `nuthatch-org/nuthatch`.
    Whatever camp-node is worth to us, it is not outside corroboration, and a recommendation to go
    and discover it is a recommendation to read our own shelf.
 2. **The "independent" benchmark** (The Graph forum, 2026-06-09, camp-node v0.5.1 against public

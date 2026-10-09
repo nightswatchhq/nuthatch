@@ -61,7 +61,7 @@ Closing them is at least two handlers plus an unknown, for 2.7% on a count of em
 entities. This sprint does not add events to chase them.
 
 `stakedIndexersCount` (entities with stake > 0) was a missing `StakeSlashed` on the
-legacy ABI. That is a nest PR (`nightswatchhq/graph-allocations-nest#1`), set-exact at
+legacy ABI. That is a nest PR (`nuthatch-org/graph-allocations-nest#1`), set-exact at
 97 vs the subgraph's entity set of 97. The subgraph's own `stakedIndexersCount` field
 is 88. That nine-entity drift is theirs.
 

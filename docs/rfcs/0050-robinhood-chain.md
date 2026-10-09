@@ -7,7 +7,7 @@
   what was measured.
 - Author: Pete
 - Date: September 2026
-- Tracking issue: [#1133](https://github.com/nightswatchhq/nuthatch/issues/1133)
+- Tracking issue: [#1133](https://github.com/nuthatch-org/nuthatch/issues/1133)
 - Target release: written as "2.x (post-2.4.0 unlisted-chain support)"; the tree is at 3.x, see
   the maintainer addendum at the end.
 
@@ -256,7 +256,7 @@ For Robinhood Chain the tags are well-defined and *not* dangerously close to the
 - Arbitrum — Block numbers and time: https://docs.arbitrum.io/arbitrum-essentials/arbitrum-vs-ethereum/block-numbers-and-time
 - Arbitrum — Sequencer / batch posting: https://docs.arbitrum.io/how-arbitrum-works/deep-dives/sequencer
 - Crypto Times — What Is Robinhood Chain (L2BEAT July 2026 assessment): https://www.cryptotimes.io/learn/what-is-robinhood-chain/
-- Nuthatch repo: https://github.com/nightswatchhq/nuthatch
+- Nuthatch repo: https://github.com/nuthatch-org/nuthatch
 
 ---
 

@@ -2,13 +2,13 @@
 
 **Status: superseded in part on 2026-09-08.** The feature freeze this document set out ended that
 day, lifted in full by Chief, and the work chosen is RFC-0044 through RFC-0048 built in full
-(`CLAUDE.md`, build-order status; sprint [halcyon-hoopoe](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/sprint-halcyon-hoopoe.md)). The five
+(`CLAUDE.md`, build-order status; sprint [halcyon-hoopoe](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/sprint-halcyon-hoopoe.md)). The five
 workstreams below stand as direction and the thesis is unrepudiated - the freeze ended because there
 was design worth building, not because the discipline failed. The parked list below is **not**
 reopened by this: [frozen-for-2027.md](frozen-for-2027.md) keeps its own one-at-a-time rule.
 
 **Status: agreed 2026-08-20.** Direction doc, not an RFC slate. Companion to
-[high-level-roadmap-jul-aug-2026.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md), which covered the previous
+[high-level-roadmap-jul-aug-2026.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md), which covered the previous
 window and is now historical record.
 
 **2026-08-31 update.** The capability items deferred by this direction were closed into
@@ -38,11 +38,11 @@ best in class*.
 The week this was decided produced the argument for it. Every defect worth finding came from *running*
 the product rather than extending it, and the most serious was not in an exotic corner:
 
-- A single dropped connection killed an eight-hour backfill at 87.6% ([#651](https://github.com/nightswatchhq/nuthatch/issues/651)).
-- A nest served old data under a new content address, silently ([#653](https://github.com/nightswatchhq/nuthatch/issues/653)).
+- A single dropped connection killed an eight-hour backfill at 87.6% ([#651](https://github.com/nuthatch-org/nuthatch/issues/651)).
+- A nest served old data under a new content address, silently ([#653](https://github.com/nuthatch-org/nuthatch/issues/653)).
 - The **flagship first run on Ethereum mainnet indexes 15 events in 90 seconds**, and behind a
   provider that refuses over-wide ranges without saying why, it stalls permanently
-  ([#672](https://github.com/nightswatchhq/nuthatch/issues/672)).
+  ([#672](https://github.com/nuthatch-org/nuthatch/issues/672)).
 
 That last one had been true for months. Nobody noticed because every nest we operate passes an
 explicit `--window` and runs on chains whose providers tolerate wide ranges. **We had never once run
@@ -62,25 +62,25 @@ The acceptance bar of RFC-0015 - *a stranger goes from an address to querying, d
 two minutes* - was written a month ago and **never measured**. The first time anyone ran it was the
 week of this doc, and it failed.
 
-- [#672](https://github.com/nightswatchhq/nuthatch/issues/672) the first run stalls behind a capped provider. The biggest single item here.
-- [#676](https://github.com/nightswatchhq/nuthatch/issues/676) instrument the bar so it cannot rot again. Prerequisite for the above: four identical runs measured 2, 15, 28 and 198 events, so nothing could be evaluated at all until the measurement was made deterministic.
-- [#674](https://github.com/nightswatchhq/nuthatch/issues/674) 24 subcommands, with scaled-mode ones ranking above `sql`. RFC-0015's own non-goal says the enterprise breadth must not be the front door.
-- [#675](https://github.com/nightswatchhq/nuthatch/issues/675) the one blemish on `init`'s otherwise excellent output.
+- [#672](https://github.com/nuthatch-org/nuthatch/issues/672) the first run stalls behind a capped provider. The biggest single item here.
+- [#676](https://github.com/nuthatch-org/nuthatch/issues/676) instrument the bar so it cannot rot again. Prerequisite for the above: four identical runs measured 2, 15, 28 and 198 events, so nothing could be evaluated at all until the measurement was made deterministic.
+- [#674](https://github.com/nuthatch-org/nuthatch/issues/674) 24 subcommands, with scaled-mode ones ranking above `sql`. RFC-0015's own non-goal says the enterprise breadth must not be the front door.
+- [#675](https://github.com/nuthatch-org/nuthatch/issues/675) the one blemish on `init`'s otherwise excellent output.
 
 ### 2. Correctness and bug fixes
 
 Where most of the value has been. The pattern to keep: find them by running real nests against real
 chains, and verify with a mutation rather than a green test.
 
-- [#663](https://github.com/nightswatchhq/nuthatch/issues/663) a declared event that never fired takes a whole view down.
-- [#656](https://github.com/nightswatchhq/nuthatch/issues/656), [#657](https://github.com/nightswatchhq/nuthatch/issues/657), [#671](https://github.com/nightswatchhq/nuthatch/issues/671) retry storms, the seal-direct refusal's cost, alias renames.
-- [#649](https://github.com/nightswatchhq/nuthatch/issues/649) the Lodestar parity gaps, which are the best correctness harness we have: a real subgraph to disagree with, field by field.
+- [#663](https://github.com/nuthatch-org/nuthatch/issues/663) a declared event that never fired takes a whole view down.
+- [#656](https://github.com/nuthatch-org/nuthatch/issues/656), [#657](https://github.com/nuthatch-org/nuthatch/issues/657), [#671](https://github.com/nuthatch-org/nuthatch/issues/671) retry storms, the seal-direct refusal's cost, alias renames.
+- [#649](https://github.com/nuthatch-org/nuthatch/issues/649) the Lodestar parity gaps, which are the best correctness harness we have: a real subgraph to disagree with, field by field.
 
 ### 3. Security
 
 Small and specific, which is how it should stay.
 
-- [#289](https://github.com/nightswatchhq/nuthatch/issues/289) DuckDB `allowed_directories` is not enforced on the build we bundle. *Closed; DuckDB left the binary in 4.1.*
+- [#289](https://github.com/nuthatch-org/nuthatch/issues/289) DuckDB `allowed_directories` is not enforced on the build we bundle. *Closed; DuckDB left the binary in 4.1.*
 - The standing rules that already hold and must keep holding: a component with zero capabilities is
   deterministic by construction; an IPFS document's host is discarded so a log cannot choose what the
   indexer connects to; no phone-home.
@@ -90,9 +90,9 @@ Small and specific, which is how it should stay.
 Measured, not asserted. Benchmarks are CI artefacts and regressions fail the build - that rule exists
 and wants enforcing rather than restating.
 
-- [#295](https://github.com/nightswatchhq/nuthatch/issues/295) hold a persistent DuckDB connection instead of rebuilding the world per query. *Closed; the SQL engine is Burrmill since 4.1, and sessions are pooled.*
-- [#296](https://github.com/nightswatchhq/nuthatch/issues/296) a compact binary row format instead of JSON-string storage.
-- The remaining open performance item is [#296](https://github.com/nightswatchhq/nuthatch/issues/296),
+- [#295](https://github.com/nuthatch-org/nuthatch/issues/295) hold a persistent DuckDB connection instead of rebuilding the world per query. *Closed; the SQL engine is Burrmill since 4.1, and sessions are pooled.*
+- [#296](https://github.com/nuthatch-org/nuthatch/issues/296) a compact binary row format instead of JSON-string storage.
+- The remaining open performance item is [#296](https://github.com/nuthatch-org/nuthatch/issues/296),
   compact binary rows. Tip-lag evidence, the published backfill number, and the wider RFC-0004
   performance set are deferred in [frozen-for-2027.md](frozen-for-2027.md); the hostile-contract RAM
   budget (#286) was closed after its evidence landed.
@@ -100,10 +100,10 @@ and wants enforcing rather than restating.
 ### 5. Maintenance and marketing
 
 Including the thing this week proved is not optional: **shipped endpoints go stale**. Polygon shipped
-one day and failed its own endpoint bar the next ([#679](https://github.com/nightswatchhq/nuthatch/issues/679)), because a recorded measurement is a snapshot presented as a property.
+one day and failed its own endpoint bar the next ([#679](https://github.com/nuthatch-org/nuthatch/issues/679)), because a recorded measurement is a snapshot presented as a property.
 
 - Recurring endpoint probes rather than one-time gates.
-- CI health: [#639](https://github.com/nightswatchhq/nuthatch/issues/639) disk, [#621](https://github.com/nightswatchhq/nuthatch/issues/621) fuzz budget, [#619](https://github.com/nightswatchhq/nuthatch/issues/619) a review gate that accepts the word "pending".
+- CI health: [#639](https://github.com/nuthatch-org/nuthatch/issues/639) disk, [#621](https://github.com/nuthatch-org/nuthatch/issues/621) fuzz budget, [#619](https://github.com/nuthatch-org/nuthatch/issues/619) a review gate that accepts the word "pending".
 - Distribution: the nests catalogue and the port queue. Porting an unserved subgraph and posting it in
   that protocol's own channel is the cheapest credible marketing we have, because the artefact is the
   argument.

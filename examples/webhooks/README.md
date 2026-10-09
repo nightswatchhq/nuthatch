@@ -56,7 +56,7 @@ receiver to be hit hard.
 past finality, so a delivery is final. `"tip"` parses and is meant to be the faster,
 may-retract alternative eventually, but nothing delivers on it yet: a webhook configured with
 `finality = "tip"` is refused at `nuthatch.toml` load (not silently ignored) - see
-[#577](https://github.com/nightswatchhq/nuthatch/issues/577). Use `"sealed"` (the default) until
+[#577](https://github.com/nuthatch-org/nuthatch/issues/577). Use `"sealed"` (the default) until
 that lands.
 
 **Delivery is at-least-once, so make your handler idempotent.** A non-2xx leaves the entry in

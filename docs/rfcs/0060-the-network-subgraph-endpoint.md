@@ -23,10 +23,10 @@ programs they run (§2). It unparks the surface **for those 21 operations only**
 RFC-0053's coverage grind.
 
 **Nature:** new binary capability (RFC-0059, plus consistent reads pinned to a hash), a first-party
-nest (`nightswatchhq/graph-network-nest`), and an operated public endpoint.
+nest (`nuthatch-org/graph-network-nest`), and an operated public endpoint.
 
-**Research input:** two research briefs of 2026-09-21, kept verbatim in `nightswatch-misc` under
-[`plans/the-graph/research/`](https://github.com/nightswatchhq/nightswatch-misc/tree/main/plans/the-graph/research).
+**Research input:** two research briefs of 2026-09-21, kept verbatim in `nuthatch-misc` under
+[`plans/the-graph/research/`](https://github.com/nuthatch-org/nuthatch-misc/tree/main/plans/the-graph/research).
 Their claims were checked against source on the same day. Where a brief and this RFC disagree, this
 RFC is the record, and §12 lists each correction.
 

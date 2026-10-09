@@ -139,7 +139,7 @@ MSG
 fi
 
 live=$(curl -fsS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/repos/${GITHUB_REPOSITORY:-nightswatchhq/nuthatch}/branches/main/protection" \
+  "https://api.github.com/repos/${GITHUB_REPOSITORY:-nuthatch-org/nuthatch}/branches/main/protection" \
   | python3 -c "import json,sys; print('\n'.join(sorted(json.load(sys.stdin)['required_status_checks']['contexts'])))")
 
 if [ -z "$live" ]; then

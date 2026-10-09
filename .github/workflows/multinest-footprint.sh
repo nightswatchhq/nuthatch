@@ -24,7 +24,7 @@
 #
 # ## What makes the scenario adversarial
 #
-#   - **Large ABI.** The real Uniswap V4 `PoolManager` ABI (nightswatchhq/uniswap-v4-ethereum): ten
+#   - **Large ABI.** The real Uniswap V4 `PoolManager` ABI (nuthatch-org/uniswap-v4-ethereum): ten
 #     events, `Initialize` and `Swap` eight inputs each. Ten topic0 registrations and ten tables per
 #     nest, against `footprint.sh`'s one.
 #   - **Dense.** NESTS nests on ONE cursor - the density the budget is stated in terms of.

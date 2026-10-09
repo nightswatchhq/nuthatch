@@ -60,7 +60,7 @@ done
 [ "$PROD_UNIT" != "$STAGED_UNIT" ] && [ "$PROD_DIR" != "$STAGED_DIR" ] && [ "$PROD_PORT" != "$STAGED_PORT" ] \
   || { echo "production and staged must be different units, directories and ports" >&2; exit 2; }
 smoke=${SMOKE/#\~\//$HOME/}
-[ -f "$smoke" ] || { echo "no smoke file at $smoke: clone nightswatchhq/kittiwake or fix SMOKE" >&2; exit 2; }
+[ -f "$smoke" ] || { echo "no smoke file at $smoke: clone nuthatch-org/kittiwake or fix SMOKE" >&2; exit 2; }
 host=${SWAP_HOST:-root@89.167.109.4}
 key=${SWAP_KEY:-$HOME/.ssh/hetzner_drpc}
 ssh_() { ssh -i "$key" -o BatchMode=yes -o ServerAliveInterval=15 "$host" "$@"; }

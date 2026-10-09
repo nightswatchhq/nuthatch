@@ -30,7 +30,7 @@ anonymous.
 ## Supported versions
 
 Only the latest release receives security fixes: the newest tag on
-[GitHub Releases](https://github.com/nightswatchhq/nuthatch/releases/latest). A fix ships as a new
+[GitHub Releases](https://github.com/nuthatch-org/nuthatch/releases/latest). A fix ships as a new
 release on that line, not as a backport to an older one, so upgrading is the remedy. Releases are
 cut from tagged commits on `main`, published to GitHub Releases with per-artifact SHA-256, and
 reproducible from the pinned toolchain (see

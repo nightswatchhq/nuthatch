@@ -12,7 +12,7 @@ one better written than the entry it came from. A second list is a list that dri
 | Question | Where it is answered |
 |---|---|
 | What is each RFC, and is it built? | [RFC index](rfcs/README.md) |
-| **What is left to do?** | **[Open issues](https://github.com/nightswatchhq/nuthatch/issues)** |
+| **What is left to do?** | **[Open issues](https://github.com/nuthatch-org/nuthatch/issues)** |
 | What is the current sprint or a deferred capability? | [Documentation guide](README.md) |
 | What must be true before this runs unattended? | [prod-readiness.md](prod-readiness.md) |
 | How do I prove a claim on my own hardware? | [verification.md](verification.md) |
@@ -122,7 +122,7 @@ you finish; a bullet in a document gets closed when someone remembers.
 
 Dated records, not live plans. Read them for *why*, never for *what is left*:
 
-- [progress-log.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/progress-log.md) - what happened, when
+- [progress-log.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/progress-log.md) - what happened, when
 - `sprint-*.md` - completed sprint scopes as they stood, kept at
-  [`ede03ca7`](https://github.com/nightswatchhq/nuthatch/tree/ede03ca7/docs)
-- [high-level-roadmap-jul-aug-2026.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md) - the architecture session that produced RFCs 0032-0035
+  [`ede03ca7`](https://github.com/nuthatch-org/nuthatch/tree/ede03ca7/docs)
+- [high-level-roadmap-jul-aug-2026.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md) - the architecture session that produced RFCs 0032-0035

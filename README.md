@@ -3,7 +3,7 @@
 > **Turn an EVM contract's history into a local SQL database.** One Rust binary, no Postgres, no
 > subgraph to write, and an MCP server built in.
 
-[![ci](https://github.com/nightswatchhq/nuthatch/actions/workflows/ci.yml/badge.svg)](https://github.com/nightswatchhq/nuthatch/actions/workflows/ci.yml)
+[![ci](https://github.com/nuthatch-org/nuthatch/actions/workflows/ci.yml/badge.svg)](https://github.com/nuthatch-org/nuthatch/actions/workflows/ci.yml)
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
 ```sh
@@ -25,7 +25,7 @@ and a job for your own RPC (`--rpc`).
 
 Those five lines, run as written on the 4.10.1 release on 2026-10-05, took 13 s from the `curl` to a
 non-zero count in a clean macOS shell on an M5 Pro, and 21 s in a fresh `ubuntu:24.04` container
-([docs/readme-check-2026-10-05.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/readme-check-2026-10-05.md), which records every command in
+([docs/readme-check-2026-10-05.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/readme-check-2026-10-05.md), which records every command in
 this file).
 
 | | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
@@ -74,7 +74,7 @@ console rendered from them. The nests were stopped on 2026-09-29.
 
 More at [nuthatch-indexer.com/stories](https://www.nuthatch-indexer.com/stories).
 
-Nightswatch does not run a hosted nest service.
+Nuthatch does not run a hosted nest service.
 
 ---
 
@@ -96,7 +96,7 @@ artifact with `objdump -T` rather than inferred:
 
 - **glibc 2.35 or newer** - the measured ABI floor, and also what the release is *built* on. Up to
   4.0.2 the binary referenced no symbol newer than `GLIBC_2.34`, so 2.34 was what you needed to run
-  it and 2.35 only what we compiled it on ([#978](https://github.com/nightswatchhq/nuthatch/issues/978));
+  it and 2.35 only what we compiled it on ([#978](https://github.com/nuthatch-org/nuthatch/issues/978));
   4.1.0 references `hypot` at `GLIBC_2.35`, where libm re-versioned it, so the two numbers now agree.
 
 It links `libc`, `libm` and `libgcc` and no C++ runtime. Releases before 4.1 embedded DuckDB and
@@ -109,7 +109,7 @@ Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.3
 checksum cannot give you:
 
 ```sh
-gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nightswatchhq/nuthatch
+gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nuthatch-org/nuthatch
 ```
 
 **From source**, which is the only route on a platform we do not publish a binary for, Intel Macs
@@ -117,13 +117,13 @@ included (the Intel build has not been verified on Intel hardware):
 
 ```sh
 rustup toolchain install 1.95.0
-cargo +1.95.0 install --git https://github.com/nightswatchhq/nuthatch nuthatch
+cargo +1.95.0 install --git https://github.com/nuthatch-org/nuthatch nuthatch
 ```
 
 The `+1.95.0` is required: `cargo install --git` ignores the repo's toolchain pin, and a newer
 default toolchain fails to compile a dependency.
 
-**Container images** are published per release to `ghcr.io/nightswatchhq/nuthatch` - `:<version>` for
+**Container images** are published per release to `ghcr.io/nuthatch-org/nuthatch` - `:<version>` for
 embedded, `:<version>-scaled` for the scaled build. The image ships the *same binary attached to the
 release*, so the two cannot drift.
 
@@ -317,7 +317,7 @@ without an account, in the row above. The artifacts are
 `nuthatch bench backfill` re-runs any of them.
 The case-2 nest is committed at [`obib-case2/`](obib-case2/) - keyless, so the endpoint arrives via
 `--rpc`, and verified to rebuild from a clean checkout.
-The case-6 nest is published at [`nightswatchhq/obib-case6`](https://github.com/nightswatchhq/obib-case6)
+The case-6 nest is published at [`nuthatch-org/obib-case6`](https://github.com/nuthatch-org/obib-case6)
 so the run can be reproduced rather than believed, and is submitted upstream as
 [sentioxyz/open-blockchain-indexer-benchmark#3](https://github.com/sentioxyz/open-blockchain-indexer-benchmark/pull/3).
 Case 6 needs no account at all: the release binary, that nest and the public gateway are the whole
@@ -343,10 +343,10 @@ Two things the case 1 number is worth knowing about:
 
 Case 6 found a defect too, in the harness rather than the indexer: `bench backfill` fetched a fixed
 address list, so a **factory nest was measured without its children** - 232 events in 2.6 s against an
-expected 35,039, reported as a success ([#310](https://github.com/nightswatchhq/nuthatch/issues/310)).
+expected 35,039, reported as a success ([#310](https://github.com/nuthatch-org/nuthatch/issues/310)).
 Running an outside benchmark has now found two things our own testing did not.
 
-**Analytical queries** run on [Burrmill](https://github.com/nightswatchhq/burrmill), our engine on
+**Analytical queries** run on [Burrmill](https://github.com/nuthatch-org/burrmill), our engine on
 DataFusion, over sealed Parquet. Until 4.1 they ran on DuckDB, and the change was not made for speed:
 on our largest nest, through `/sql`, Burrmill took about **2.5 times DuckDB's time** per statement
 with eight times the memory allowed to each session, measured 2026-10-01 for the
@@ -373,7 +373,7 @@ RPC ingestion  →  deterministic decode  →  redb hot store (the unsealed tip)
 - **Deterministic core.** Decode, reorg handling and entity derivation are deterministic and
   re-executable: same inputs, same content-addressed output. No LLM sits in the data path.
 - **Single writer, read-only queries.** One ingestion thread writes; `/sql` attaches read-only.
-  Analytical SQL has run on [Burrmill](https://github.com/nightswatchhq/burrmill), our engine on
+  Analytical SQL has run on [Burrmill](https://github.com/nuthatch-org/burrmill), our engine on
   DataFusion, since 4.1.0; DuckDB was the engine before that and is no longer in the binary.
 - **Derived tables are circuits.** The three built-in relations and any entity declared in
   `entities.toml` are maintained by DBSP as blocks arrive; a reorg is a retraction. On Arbitrum,

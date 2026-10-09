@@ -3,16 +3,16 @@
 Design documents for the post-skeleton phase. Numbered in build order; each states its
 dependencies. Status lifecycle: **Draft → Accepted → Implemented → (Superseded / Parked)**.
 For everything *deferred or not-yet-done* across the whole series, the source of truth is
-**[the issue queue](https://github.com/nightswatchhq/nuthatch/issues)** - one issue per leftover, with
+**[the issue queue](https://github.com/nuthatch-org/nuthatch/issues)** - one issue per leftover, with
 `parked` marking what is deferred by decision. [backlog.md](../backlog.md) explains how to read that
 queue and records the standing decisions behind it; it no longer keeps a second list. For the bar a release must clear before it's pointed at a real
 workload unattended, see the **[production-readiness checklist](../prod-readiness.md)**.
-RFCs **0019-0023** derive from the **[Jul-Aug 2026 roadmap](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)**
+RFCs **0019-0023** derive from the **[Jul-Aug 2026 roadmap](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)**
 (strategy agreed 2026-07-21); their decisions log is the authority for the choices they encode.
 RFCs **0032-0035** derive from the **2026-08-04 architecture session** with GraphOps, whose working
 notes are unpublished; each of the four restates the decisions it encodes so it stands alone.
 Build order for that set is **0032 → 0033 → 0034 → 0035**, and 0035 is the 2.0 release itself.
-Statuses last reconciled against the [progress log](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/progress-log.md) on 2026-08-20.
+Statuses last reconciled against the [progress log](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/progress-log.md) on 2026-08-20.
 **Dispositions of 2026-09-08 (Chief):** 0013, 0018 and 0021 closed; 0003, 0023, 0031, 0033, 0034 and 0036
 deferred again. Those rows carry the decision at the head of their status cell, ahead of the measured
 history that earned it. Deferred means deferred and recorded, in the sense of

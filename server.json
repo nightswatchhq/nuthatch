@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.nightswatchhq/nuthatch",
+  "name": "io.github.nuthatch-org/nuthatch",
   "title": "nuthatch",
   "description": "Query an EVM contract's indexed history with SQL, via a local nuthatch nest and nuthatch dev.",
   "version": "4.0.0",
   "repository": {
-    "url": "https://github.com/nightswatchhq/nuthatch",
+    "url": "https://github.com/nuthatch-org/nuthatch",
     "source": "github"
   },
   "websiteUrl": "https://www.nuthatch-indexer.com",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/nightswatchhq/nuthatch:4.0.0",
+      "identifier": "ghcr.io/nuthatch-org/nuthatch:4.0.0",
       "transport": {
         "type": "stdio"
       },

@@ -6,7 +6,7 @@
 - Related: [RFC-0007](../rfcs/0007-launch-and-validation.md) Phases 1-3, [home-turf.md](home-turf.md),
   [show-hn.md](show-hn.md), [nest-catalogue.md](../nest-catalogue.md),
   [validation/README.md](../validation/README.md),
-  [strategy-review-2026-08-19.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/launch/strategy-review-2026-08-19.md)
+  [strategy-review-2026-08-19.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/launch/strategy-review-2026-08-19.md)
 
 ## The thesis in one line
 
@@ -172,7 +172,7 @@ In order. Nothing here blocks on anything below it.
 4. **Run the loop three times**, chosen against the criteria in §2.
 5. **Build the port-queue nest** ([port-queue-nest.md](port-queue-nest.md)), starting by confirming
    the one unverified claim in its §5. Runs in parallel with 3 and 4, blocks neither.
-6. **Then Show HN**, per [strategy-review-2026-08-19.md](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/launch/strategy-review-2026-08-19.md) and RFC-0007
+6. **Then Show HN**, per [strategy-review-2026-08-19.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/launch/strategy-review-2026-08-19.md) and RFC-0007
    Phase 2.
 7. **Open the awesome-selfhosted PR** whenever. It is independent of all of the above and costs an
    hour.
@@ -182,7 +182,7 @@ maintained by one person, and everything is open source.
 
 ## 6. What is unverified
 
-- Which nests are actually published is the [nests index](https://github.com/nightswatchhq/nests),
+- Which nests are actually published is the [nests index](https://github.com/nuthatch-org/nests),
   not this file and not the catalogue. The five named here come from the catalogue's own 2026-08-04
   note and should be re-read before any of them is named in a public post.
 - awesome-selfhosted's current inclusion criteria have not been re-read against nuthatch. Check

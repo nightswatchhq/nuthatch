@@ -290,13 +290,13 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
   has no concept of it. Per-tenant billing and authz stay out and are the gateway's job. The
   earlier wording drew the line at "cooperating tenants an operator picked - not paying strangers",
   which asked a question nobody could answer from the code.
-  **Amended 2026-09-29: Nightswatch does not run a hosted nest service.** The 2026-09-23 override
-  that approved one is withdrawn, and the platform built under it (`nightswatchhq/nuthatch-hosted`)
+  **Amended 2026-09-29: Nuthatch does not run a hosted nest service.** The 2026-09-23 override
+  that approved one is withdrawn, and the platform built under it (`nuthatch-org/nuthatch-hosted`)
   is retired. Hosted nests will be offered by GraphOps on its own platform, running the stock
   binary like any other operator, which is why the website's hosted page says "coming soon".
   Nothing in this tree is built for it: a hosted need that would require a change here is a normal
   nuthatch feature on its own merits, or it is not built.
-  **Amended 2026-10-06: Chief lifted that rule for the subgraph stopgap.** Nightswatch serves stopgap
+  **Amended 2026-10-06: Chief lifted that rule for the subgraph stopgap.** Nuthatch serves stopgap
   nests for BNB and Polygon subgraphs the network does not serve, on the ThinkPad or new VPSes, until an
   indexer picks each one up ([docs/subgraph-stopgap.md](docs/subgraph-stopgap.md)). It is the stock
   binary run as an operator would, not a platform: no billing, no accounts, nothing in this tree built

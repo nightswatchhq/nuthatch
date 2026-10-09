@@ -5,7 +5,7 @@ behind the `folds` cargo feature, **off by default**, and a regular nuthatch use
 unless they opt in (§ Packaging). Tracking #1441. S0 is #1439; S1 to S4 are filed when S0 reports.
 
 > **S0 reported 2026-09-21: continue** (#1439, harness and results in
-> nightswatchhq/graph-network-nest#1). The Network nest's saved-clock, epoch and pause chain was run in
+> nuthatch-org/graph-network-nest#1). The Network nest's saved-clock, epoch and pause chain was run in
 > carry-and-window form over the sealed replay.
 >
 > - **Exactness:** it matched the one-shot views exactly at 24 blocks, and the reference matched the
@@ -66,7 +66,7 @@ mechanism, with a durable seed that advances with sealing.
 
 ## 0. The measurement
 
-The Network Subgraph nest (`nightswatchhq/graph-network-nest`, LEARNINGS.md, 2026-09-21) replayed
+The Network Subgraph nest (`nuthatch-org/graph-network-nest`, LEARNINGS.md, 2026-09-21) replayed
 Arbitrum One from the protocol's first block to head. The replay produced **10,285** sealed segments.
 Its 26 views total 1,694 lines of SQL. 19 of them use window functions, and 3 are recursive
 (`05-epoch-schedule`, `41-delegation`, `45-indexer`). Every GraphQL request evaluated those views over
@@ -393,7 +393,7 @@ Each slice's acceptance is written so it can fail.
   *Stop* if a fold cannot carry its state, or if head evaluation does not fit those targets. Either
   answer is worth having.
 
-  **Reported 2026-09-21: continue** (#1439, nightswatchhq/graph-network-nest#1).
+  **Reported 2026-09-21: continue** (#1439, nuthatch-org/graph-network-nest#1).
 
   | Criterion | Result |
   |---|---|
@@ -408,7 +408,7 @@ Each slice's acceptance is written so it can fail.
   ledger with three window partitions after every one of 181 recorded events. All agreed, and
   dropping the delegated carry turned the test red (#1476). S1 must still measure and integrate
   that fold in the resident runtime. The separate redb hot-tail clock probe in
-  nightswatchhq/graph-network-nest#1 peaked at 288.6 MiB, above S0's 256 MiB target.
+  nuthatch-org/graph-network-nest#1 peaked at 288.6 MiB, above S0's 256 MiB target.
 - **S1 - folds in the runtime.** Load `folds/`, bind carries and window-scoped facts, check the schema
   and volatility at load, declare keys, and read at `n` on demand from a checkpoint built by
   `nuthatch fold build`. *Accept when:*

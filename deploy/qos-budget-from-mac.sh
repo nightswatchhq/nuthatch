@@ -19,7 +19,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 settings="NUTHATCH_BURRMILL_MEMORY_LIMIT=704MB NUTHATCH_ANALYTICS_THREADS=4 NUTHATCH_MAX_RSS=2048MB NUTHATCH_INGESTION_RESERVATION=384MB NUTHATCH_RUNTIME_HEADROOM=960MB"
 
 [ -f "$repo/scripts/deploy-nest.sh" ] || { echo "no scripts/deploy-nest.sh under $repo" >&2; exit 2; }
-[ -f "$smoke_dir/$unit.sql" ] || { echo "no $smoke_dir/$unit.sql: clone nightswatchhq/kittiwake or set SMOKE_DIR" >&2; exit 2; }
+[ -f "$smoke_dir/$unit.sql" ] || { echo "no $smoke_dir/$unit.sql: clone nuthatch-org/kittiwake or set SMOKE_DIR" >&2; exit 2; }
 
 COPYFILE_DISABLE=1 tar -cf - -C "$repo/scripts" deploy-nest.sh -C "$smoke_dir" "$unit.sql" |
   ssh "$host" "UNIT=$unit SETTINGS='$settings'; "'set -euo pipefail

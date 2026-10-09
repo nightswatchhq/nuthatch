@@ -16,7 +16,7 @@
   interesting part.
 - Origin: a Graph Discord thread (2026-08-01/02). A subgraph developer with a stalled Arbitrum
   deployment mentioned running a second subgraph on Gnosis. We shipped them
-  [`poa-nest`](https://github.com/nightswatchhq/poa-nest) for Arbitrum in a day; we could not have
+  [`poa-nest`](https://github.com/nuthatch-org/poa-nest) for Arbitrum in a day; we could not have
   helped at all on Gnosis, because nuthatch does not know the chain exists.
 
 ## 1. The gap

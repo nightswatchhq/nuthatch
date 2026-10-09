@@ -112,7 +112,7 @@ answers from local disk.
 
 **It leaks the query pattern to a third party.** A facilitator that sees every payment sees the
 timing, size and frequency of every paid question. On a product whose adjacent sibling
-([nutcracker](https://github.com/nightswatchhq/nutcracker)) exists specifically because metadata
+([nutcracker](https://github.com/nuthatch-org/nutcracker)) exists specifically because metadata
 about queries is the thing worth protecting, that is not a detail to wave through.
 
 ### 5.2 Verify at the counter, settle in the back office

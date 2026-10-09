@@ -20,7 +20,7 @@
 - Nature: design RFC. Mostly *plumbing over an artifact that already exists* - RFC-0012 made the nest a
   portable content-addressed blob; this gives the blob somewhere to live and a way to be fetched by
   name. The only genuinely new surface is auth for private nests.
-- Origin: the Jul-Aug 2026 roadmap, thread 3 (see [`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)).
+- Origin: the Jul-Aug 2026 roadmap, thread 3 (see [`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)).
 
 ## Abstract
 

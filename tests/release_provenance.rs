@@ -185,7 +185,7 @@ fn the_install_path_documents_verification() {
          command exists and the release is signed; a reader who is never shown it gains nothing."
     );
     assert!(
-        s.contains("--repo nightswatchhq/nuthatch"),
+        s.contains("--repo nuthatch-org/nuthatch"),
         "the documented verify command omits `--repo`, which would accept an attestation from any \
          repository - teaching the reader a check that does not check"
     );

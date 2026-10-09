@@ -622,7 +622,7 @@ fn a_bare_mention_of_the_product_name_is_not_an_invocation() {
     let real = real_flags();
     let mut findings = Vec::new();
     check_text(
-        "nuthatch.toml, nuthatch-builder, and ghcr.io/nightswatchhq/nuthatch:2.5.0 are not commands.",
+        "nuthatch.toml, nuthatch-builder, and ghcr.io/nuthatch-org/nuthatch:2.5.0 are not commands.",
         "docs/example.md",
         &real,
         &mut findings,

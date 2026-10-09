@@ -27,7 +27,7 @@
   subgraphs, and the thing that lets nuthatch index the whole class of state-dependent nests.
 - Nature: design RFC. **Tiers 1+2 buildable now; tiers 3+4 designed now, built later.** The
   "strip-an-archive-node" executor is a **research note against RFC-0014/0003**, not a build this window.
-- Origin: roadmap thread 1 ([`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)), settled 2026-07-21.
+- Origin: roadmap thread 1 ([`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)), settled 2026-07-21.
 
 ## Abstract
 

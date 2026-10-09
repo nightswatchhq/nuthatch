@@ -23,7 +23,7 @@
   the writer pool is this same model spread across machines).
 - Nature: design RFC. **Embedded, buildable now** - no infra dependency. It relaxes one clause of the
   founding brief; that relaxation is proposed as §0 and must be accepted before §1+ is built.
-- Origin: roadmap thread 2, Decision A ([`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nightswatchhq/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)), authorized
+- Origin: roadmap thread 2, Decision A ([`docs/high-level-roadmap-jul-aug-2026.md`](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md)), authorized
   2026-07-21.
 
 ## ⚠️ Brief amendment required (see §0)
