@@ -2443,6 +2443,43 @@ mod tests {
         assert!(h.tx_internals(&key).unwrap().is_none());
     }
 
+    /// Etherscan's getminedblocks also lists uncles; this nest serves produced blocks only, and says
+    /// so rather than answering an uncle query with blocks.
+    #[test]
+    fn getminedblocks_answers_blocks_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        h.record(
+            Action::MinedBlocks,
+            A,
+            &[],
+            (0, 10),
+            h.generation().unwrap(),
+        )
+        .unwrap();
+        let ask = |kind: &str| {
+            crate::address_history::respond(
+                Some(&h),
+                &[
+                    ("module", "account"),
+                    ("action", "getminedblocks"),
+                    ("address", A),
+                    ("startblock", "0"),
+                    ("endblock", "10"),
+                    ("blocktype", kind),
+                ]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            )
+        };
+        assert_eq!(ask("blocks")["status"], "1");
+        assert!(ask("uncles")["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("NUTHATCH_UNSUPPORTED:"));
+    }
+
     #[test]
     fn a_txhash_not_yet_traced_is_unsupported_not_empty() {
         let dir = tempfile::tempdir().unwrap();

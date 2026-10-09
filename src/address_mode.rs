@@ -326,8 +326,14 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             return;
         }
         let end = from.saturating_add(BLOCK_WINDOW - 1).min(to);
-        let lacking: Vec<(String, u64)> = next.into_iter().filter(|(_, n)| *n <= end).collect();
-        let addresses: Vec<String> = lacking.iter().map(|(a, _)| a.clone()).collect();
+        // The scan reads the whole window for every address that lacks any of it, so each is
+        // recorded over the whole window.
+        let addresses: Vec<String> = next
+            .into_iter()
+            .filter(|(_, n)| *n <= end)
+            .map(|(a, _)| a)
+            .collect();
+        let lacking = addresses.clone();
         let outcome = async {
             let generation = state.history.generation()?;
             let pending = crate::address_discovery::Pending::default();
@@ -336,9 +342,9 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             tokio::task::spawn_blocking(move || {
                 pending.persist(&history)?;
                 let mut found = found?;
-                for (a, start) in lacking {
+                for a in lacking {
                     let f = found.remove(&a.to_ascii_lowercase()).unwrap_or_default();
-                    record_blocks(&history, &a, (start.max(from), end), f, generation)?;
+                    record_blocks(&history, &a, (from, end), f, generation)?;
                 }
                 Ok::<_, anyhow::Error>(())
             })
