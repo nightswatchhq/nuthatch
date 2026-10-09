@@ -1652,4 +1652,35 @@ mod tests {
         over.push(0x04);
         assert!(take_varint(&mut over.as_slice()).is_err());
     }
+
+    /// Writes a rotki-mode nest holding about 10,000 rows into `$NUTHATCH_AH_FIXTURE`, for measuring
+    /// a real process: `NUTHATCH_AH_FIXTURE=/tmp/nest cargo test --lib write_measurement_fixture -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_measurement_fixture() {
+        let dir = std::path::PathBuf::from(std::env::var("NUTHATCH_AH_FIXTURE").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"rotki\"\nchain = \"mainnet\"\nchain_id = 1\n\
+                 rpc_urls = [\"https://ethereum-rpc.publicnode.com\"]\n\n\
+                 [address_history]\naddresses = [\"{ALICE}\", \"{BOB}\"]\n"
+            ),
+        )
+        .unwrap();
+        let store = Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
+        let h = AddressHistory::open(store, 1, &[ALICE.into(), BOB.into()]).unwrap();
+        for (who, action, n) in [
+            (ALICE, Action::TxList, 4_000u64),
+            (ALICE, Action::TokenTx, 3_000),
+            (ALICE, Action::TxListInternal, 1_000),
+            (BOB, Action::TxList, 2_000),
+        ] {
+            let rows: Vec<Row> = (0..n).map(|i| tx(18_000_000 + i * 97, i % 7)).collect();
+            h.insert(action, who, &rows).unwrap();
+            h.mark_covered(action, who, 0, 20_000_000).unwrap();
+        }
+        h.set_head(20_000_000).unwrap();
+    }
 }
