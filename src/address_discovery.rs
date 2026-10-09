@@ -1889,6 +1889,45 @@ mod tests {
         assert_eq!(h.coverage(Action::TxList, A).unwrap(), vec![(0, 149_999)]);
     }
 
+    /// A window that hydrated a transaction and then failed keeps the hydration, so its retry does
+    /// not fetch that transaction again.
+    #[tokio::test]
+    async fn a_failed_window_keeps_what_it_hydrated() {
+        use crate::address_mode::Discovery;
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let log = json!({"address": "0x7070", "topics": [TRANSFER, padded(A), padded(A)],
+            "data": format!("0x{:0>64}", "1"), "blockNumber": "0x10", "transactionHash": "0xcc",
+            "transactionIndex": "0x0", "logIndex": "0x0", "blockHash": "0xbb", "removed": false});
+        // The log carries no timestamp and its block's header fails: the window fails after the
+        // transaction at block 150 is hydrated.
+        let failing = |headers_ok: bool| {
+            let (main, trace) = chain(false);
+            let log = log.clone();
+            let main = script(move |m, p| match m {
+                "eth_getLogs" => Ok(json!([log])),
+                "eth_getBlockByNumber" if hex_u64(&p[0])? == 0x10 && !headers_ok => {
+                    bail!("header unavailable")
+                }
+                _ => (main.answer)(m, p),
+            });
+            Discoverer::new(Counted::new(main), Counted::new(trace))
+        };
+        let first = failing(false);
+        first.catch_up(&mode(&h, 99_999), 1_000_000).await;
+        assert!(h.coverage(Action::TxList, A).unwrap().is_empty());
+        assert_eq!(first.main.calls().get("eth_getTransactionByHash"), Some(&1));
+
+        let second = failing(true);
+        second.catch_up(&mode(&h, 99_999), 1_000_000).await;
+        assert_eq!(h.coverage(Action::TxList, A).unwrap(), vec![(0, 99_999)]);
+        assert_eq!(
+            second.main.calls().get("eth_getTransactionByHash"),
+            None,
+            "the retry hydrated a transaction the failed window already had"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_window_records_nothing() {
         use crate::address_mode::Discovery;
