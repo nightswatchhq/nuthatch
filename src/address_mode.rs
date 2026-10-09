@@ -74,6 +74,8 @@ pub struct ModeState {
     discovery_errors: AtomicU64,
     /// Traces one transaction into the store, for a `txhash` lookup the store cannot yet answer.
     pub tracer: Option<Tracer>,
+    /// Verified block partitions, and the blocks `[address_history.mirror]` takes from them.
+    pub mirror: Option<(Arc<crate::address_partitions::Source>, (u64, u64))>,
 }
 
 /// See [`ModeState::tracer`].
@@ -106,11 +108,21 @@ impl ModeState {
             windows: AtomicU64::new(0),
             discovery_errors: AtomicU64::new(0),
             tracer: None,
+            mirror: None,
         }
     }
 
     pub fn with_tracer(mut self, tracer: Tracer) -> Self {
         self.tracer = Some(tracer);
+        self
+    }
+
+    pub fn with_mirror(
+        mut self,
+        source: Arc<crate::address_partitions::Source>,
+        blocks: (u64, u64),
+    ) -> Self {
+        self.mirror = Some((source, blocks));
         self
     }
 
@@ -286,28 +298,112 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         // Withdrawals and produced blocks come from bodies, and the definitions they are matched to
         // are Ethereum mainnet's, so only there is the block scan run.
         if state.chain_id == 1 {
-            scan_bodies(self, state, &watched, to).await;
+            let skip = state.mirror.as_ref().map(|(_, blocks)| *blocks);
+            if let Some((source, blocks)) = &state.mirror {
+                mirror_pass(self, state, &watched, to, source, *blocks).await;
+            }
+            scan_bodies(self, state, &watched, to, skip).await;
         }
+    }
+}
+
+/// The partition pass: each partition in the mirror's blocks that some watched address, or the
+/// verified headers, still lack is downloaded, verified against the RPC and read for all of them at
+/// once. A partition that is missing or fails verification records nothing, and its blocks stay
+/// incomplete: the RPC body scan does not stand in for it.
+async fn mirror_pass<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    watched: &[String],
+    to: u64,
+    source: &crate::address_partitions::Source,
+    (first, last): (u64, u64),
+) {
+    use crate::address_discovery::{next_uncovered_for, record_blocks, BLOCK_SCANNED};
+    use crate::address_partitions::{ingest, span_of, SPAN};
+    let (lo, hi) = (state.start_block.max(first), to.min(last));
+    if lo > hi {
+        return;
+    }
+    let mut start = span_of(lo).0;
+    while start <= hi {
+        let end = start + SPAN - 1;
+        // A partition is anchored at its last block, which must be final for this nest.
+        if end > to {
+            return;
+        }
+        let clip = (start.max(lo), end.min(hi));
+        let lacking: Vec<String> = watched
+            .iter()
+            .filter(|a| {
+                next_uncovered_for(&state.history, a, clip.0, &BLOCK_SCANNED)
+                    .is_ok_and(|n| n <= clip.1)
+            })
+            .cloned()
+            .collect();
+        let headers = state
+            .history
+            .header_coverage()
+            .is_ok_and(|spans| spans.iter().any(|(f, t)| *f <= clip.0 && clip.1 <= *t));
+        if lacking.is_empty() && headers {
+            start += SPAN;
+            continue;
+        }
+        let outcome = async {
+            let generation = state.history.generation()?;
+            let mut got = ingest(&d.main, source, start, &lacking, clip).await?;
+            let history = state.history.clone();
+            tokio::task::spawn_blocking(move || {
+                history.record_headers(clip, &got.timestamps)?;
+                for a in lacking {
+                    let f = got
+                        .found
+                        .remove(&a.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    record_blocks(&history, &a, clip, f, generation)?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?
+        }
+        .await;
+        state.set_calls("main", d.main.calls());
+        match outcome {
+            Ok(()) => {
+                state.windows.fetch_add(1, Ordering::Relaxed);
+                tracing::info!("address history: partition [{start}, {end}] verified and read");
+            }
+            Err(e) => {
+                state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "address history: partition [{start}, {end}] not used, its blocks stay incomplete: {e:#}"
+                );
+            }
+        }
+        start += SPAN;
     }
 }
 
 /// The block-body pass: each window is read once for every watched address that still lacks it,
 /// starting from the least covered, so an address watched later backfills without a second scan
 /// of what the others already have.
+/// Blocks in `skip` are the mirror's, and are never read here.
 async fn scan_bodies<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
     watched: &[String],
     to: u64,
+    skip: Option<(u64, u64)>,
 ) {
     use crate::address_discovery::{
         next_uncovered_for, record_blocks, BLOCK_SCANNED, BLOCK_WINDOW,
     };
     let mut last: Option<u64> = None;
+    let mut cursor = state.start_block;
     loop {
         let mut next = Vec::new();
         for a in watched {
-            match next_uncovered_for(&state.history, a, state.start_block, &BLOCK_SCANNED) {
+            match next_uncovered_for(&state.history, a, cursor, &BLOCK_SCANNED) {
                 Ok(n) => next.push((a.clone(), n)),
                 Err(e) => {
                     tracing::warn!("address history: block coverage for {a}: {e:#}");
@@ -318,6 +414,10 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
         let Some(from) = next.iter().map(|(_, n)| *n).min().filter(|n| *n <= to) else {
             return;
         };
+        if let Some((_, mirror_end)) = skip.filter(|(f, l)| *f <= from && from <= *l) {
+            cursor = mirror_end.saturating_add(1);
+            continue;
+        }
         if last.is_some_and(|l| from <= l) {
             state.discovery_errors.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
@@ -325,7 +425,10 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             );
             return;
         }
-        let end = from.saturating_add(BLOCK_WINDOW - 1).min(to);
+        let mut end = from.saturating_add(BLOCK_WINDOW - 1).min(to);
+        if let Some((first, _)) = skip.filter(|(f, _)| from < *f) {
+            end = end.min(first - 1);
+        }
         // The scan reads the whole window for every address that lacks any of it, so each is
         // recorded over the whole window.
         let addresses: Vec<String> = next
@@ -753,11 +856,31 @@ pub async fn dev(
     // Tracing for a txhash lookup waits on the same chain check the cursor does.
     let verified = Arc::new(tokio::sync::OnceCell::<()>::new());
     let tracer = tracer(discovery.clone(), history.clone(), verified.clone());
-    let state = Arc::new(
-        ModeState::new(history, chain_id, poll_interval, loopback)
-            .with_range(ah.start_block.unwrap_or(0), ah.end_block, depth)
-            .with_tracer(tracer),
-    );
+    let mut state = ModeState::new(history, chain_id, poll_interval, loopback)
+        .with_range(ah.start_block.unwrap_or(0), ah.end_block, depth)
+        .with_tracer(tracer);
+    if let Some(m) = &ah.mirror {
+        if m.chain_id != chain_id {
+            bail!(
+                "[address_history.mirror] names chain {}, and this nest is on chain {chain_id}",
+                m.chain_id
+            );
+        }
+        let source = crate::address_partitions::Source::open(
+            &m.url,
+            chain_id,
+            dir.join("partitions"),
+            m.cache_mb * 1024 * 1024,
+        )?;
+        tracing::info!(
+            "address history: blocks {} to {} from verified partitions at the configured mirror, which \
+             sees this machine's IP and the block ranges asked for, never an address",
+            m.from_block,
+            m.to_block
+        );
+        state = state.with_mirror(Arc::new(source), (m.from_block, m.to_block));
+    }
+    let state = Arc::new(state);
     tracing::info!(
         "address history: {} watched from block {}, polling every {}s",
         state.history.watched()?.len(),
@@ -1034,6 +1157,7 @@ mod tests {
             start_block: None,
             end_block: None,
             poll_interval: None,
+            mirror: None,
         };
         assert_eq!(
             poll_interval(None, &cfg).unwrap(),
@@ -1071,5 +1195,136 @@ mod tests {
             let err = refuse_event_flags(&parse(flag)).unwrap_err();
             assert!(err.to_string().contains(flag[0]), "{flag:?}: {err}");
         }
+    }
+
+    /// With a mirror, block history comes from verified partitions: no body is read over RPC in the
+    /// mirror's blocks, only each partition's anchor and the bodies of blocks a watched address
+    /// produced, and a partition the mirror lacks leaves its blocks incomplete.
+    #[tokio::test]
+    async fn the_mirror_covers_its_blocks_and_a_missing_partition_stays_incomplete() {
+        use crate::address_discovery::Discoverer;
+        use crate::address_history::{Action, Answer, PageRequest, Sort};
+        use crate::address_partitions::tests::{chain_rpc, Fake, MINER, PAID};
+        use crate::address_partitions::{build, partition_key, Source, SPAN};
+        let mirror = tempfile::tempdir().unwrap();
+        let chain = chain_rpc(2 * SPAN + 5);
+        build(
+            &chain,
+            mirror.path().to_str().unwrap(),
+            1,
+            (0, 2 * SPAN - 1),
+            4,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(mirror.path().join(partition_key(1, SPAN))).unwrap();
+
+        let main = Fake::new(move |m, p| match m {
+            "eth_getLogs" => Ok(json!([])),
+            "eth_getCode" => Ok(json!("0x")),
+            "eth_getTransactionCount" => Ok(json!("0x0")),
+            "eth_getBlockTransactionCountByNumber" => Ok(json!("0x1")),
+            _ => (chain.answer)(m, p),
+        });
+        let trace = Fake::new(|m, _| match m {
+            "trace_filter" => Ok(json!([])),
+            "trace_block" => Ok(json!([{"x": 1}])),
+            other => bail!("unexpected {other}"),
+        });
+        let d = Discoverer::new(Counted::new(main), Counted::new(trace));
+        let (paid, miner) = (format!("{PAID:#x}"), format!("{MINER:#x}"));
+        let dir = tempfile::tempdir().unwrap();
+        let history = AddressHistory::open(
+            Store::open(&dir.path().join("t.redb")).unwrap(),
+            1,
+            &[paid.clone(), miner.clone()],
+        )
+        .unwrap();
+        let source = Source::open(
+            mirror.path().to_str().unwrap(),
+            1,
+            dir.path().join("partitions"),
+            u64::MAX,
+        )
+        .unwrap();
+        let state = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+            .with_range(5, Some(2 * SPAN - 1), 0)
+            .with_mirror(Arc::new(source), (0, 2 * SPAN - 1));
+        d.catch_up(&state, 2 * SPAN + 5).await;
+
+        let covered = vec![(5, SPAN - 1)];
+        assert_eq!(
+            history.coverage(Action::BeaconWithdrawals, &paid).unwrap(),
+            covered
+        );
+        assert_eq!(
+            history.coverage(Action::MinedBlocks, &miner).unwrap(),
+            covered
+        );
+        assert_eq!(history.header_coverage().unwrap(), covered);
+        assert_eq!(
+            d.main.calls().get("eth_getBlockByNumber"),
+            Some(&2),
+            "one anchor per partition and no body"
+        );
+        assert_eq!(
+            d.main.calls().get("eth_getBlockByHash"),
+            Some(&99),
+            "blocks 100 to 9,900"
+        );
+
+        let page = |action, address: &str, start, end| {
+            history
+                .page(
+                    action,
+                    &PageRequest {
+                        address: address.into(),
+                        start_block: start,
+                        end_block: end,
+                        sort: Sort::Asc,
+                        page: 1,
+                        offset: 10_000,
+                        generation: None,
+                    },
+                )
+                .unwrap()
+        };
+        let Answer::Rows(w) = page(Action::BeaconWithdrawals, &paid, Some(5), Some(SPAN - 1))
+        else {
+            panic!("covered")
+        };
+        assert_eq!(w.len() as u64, SPAN - 5);
+        let Answer::Rows(m) = page(Action::MinedBlocks, &miner, Some(5), Some(SPAN - 1)) else {
+            panic!("covered")
+        };
+        assert_eq!(m.len(), 99);
+        for (start, end) in [(None, Some(SPAN - 1)), (Some(5), Some(SPAN + 10))] {
+            assert!(
+                matches!(
+                    page(Action::MinedBlocks, &miner, start, end),
+                    Answer::Incomplete(_)
+                ),
+                "{start:?}..{end:?}"
+            );
+        }
+        assert_eq!(
+            history
+                .block_by_time(1_600_000_000 + 12 * 77, false)
+                .unwrap(),
+            Some(77)
+        );
+        assert_eq!(
+            history
+                .block_by_time(1_600_000_000 + 12 * 77 + 1, true)
+                .unwrap(),
+            Some(78)
+        );
+        assert_eq!(
+            history
+                .block_by_time(1_600_000_000 + 12 * SPAN, true)
+                .unwrap(),
+            None
+        );
     }
 }

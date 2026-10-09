@@ -115,6 +115,13 @@ pub enum Command {
     /// hash, and leaves `dev` to follow the chain from where the mirror ends. The nest directory
     /// must be the one that was published: an edited nest is a different dataset.
     Seed(SeedArgs),
+    /// Build verifiable block partitions for address-history nests (RFC-0063 §8).
+    ///
+    /// Reads every block in a finalized range once, checks each header against its hash and each
+    /// withdrawal list against its root, and writes immutable Parquet files and a manifest to a
+    /// directory or object store. A nest that opts in through `[address_history.mirror]` downloads
+    /// them and verifies them again before using a byte.
+    Partitions(PartitionsArgs),
     /// Package a nest as a content-addressed blob - the deploy unit (RFC-0012).
     Nest(NestArgs),
     /// Move a pre-2.0 directory to identity-keyed datasets: `nests/<name>/` becomes `data/<nid>/`,
@@ -415,6 +422,27 @@ pub struct SeedArgs {
     /// Nest directory.
     #[arg(long, default_value = ".")]
     pub dir: String,
+}
+
+#[derive(Args)]
+pub struct PartitionsArgs {
+    /// The RPC to read blocks from. Its finalized block bounds what may be built.
+    #[arg(long, env = "NUTHATCH_RPC", hide_env_values = true)]
+    pub rpc: String,
+    #[arg(long, default_value_t = 1)]
+    pub chain_id: u64,
+    /// First block, a multiple of 10,000.
+    #[arg(long)]
+    pub from: u64,
+    /// Last block, one less than a multiple of 10,000.
+    #[arg(long)]
+    pub to: u64,
+    /// A directory, or `s3://bucket/prefix`.
+    #[arg(long)]
+    pub out: String,
+    /// Blocks fetched at once.
+    #[arg(long, default_value_t = 8)]
+    pub concurrency: usize,
 }
 
 #[derive(Args)]

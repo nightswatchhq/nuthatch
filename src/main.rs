@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
             }
         },
         cli::Command::Seed(a) => nuthatch::seed::run(std::path::Path::new(&a.dir), &a.from).await,
+        cli::Command::Partitions(a) => nuthatch::address_partitions::run(&a).await,
         cli::Command::Mcp(args) => {
             if args.print_config {
                 mcp::print_client_config(&args.url);

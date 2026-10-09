@@ -9,6 +9,7 @@ pub mod abi;
 pub mod address_discovery;
 pub mod address_history;
 pub mod address_mode;
+pub mod address_partitions;
 pub mod alerts;
 pub mod allowlist;
 pub mod analytics;
