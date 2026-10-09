@@ -19,8 +19,15 @@
 # withdrawals of 0x7a25bd5f286fb722e7578c62e86a675ff0a00b15 over 17,034,870-17,300,000, a body per
 # block, so the slow one (<fixtures-dir>/withdrawals-0x7a25-txsBeaconWithdrawal.jsonl); (5) one
 # nest per getminedblocks case in mined.tsv; (6) one nest per txlist case in created.tsv, contracts
-# deployed by a transaction, whose txlist opens with it. PHASES picks any of 1, 3, 4, 5 and 6 (2 runs
-# within 1).
+# deployed by a transaction, whose txlist opens with it; (7) the block partitions of slice 2: one
+# rebuilt byte for byte, a mirror missing one, and pre-London getblocknobytime. PHASES picks any of
+# 1, 3, 4, 5, 6 and 7 (2 runs within 1).
+#
+# MIRROR=<dir> runs phases 4 and 5 through partitions `nuthatch partitions` built into <dir> for their
+# ranges (17030000-17309999, 20000000-20009999, 14000000-14009999, 15340000-15349999) and phase 7
+# also needs 12000000-12009999: parity as before, plus no body scan, rewards hydrated only for
+# produced blocks, pagination, the partition cache within budget and getblocknobytime.
+# MIRROR_DIR overrides MIRROR for one nest.
 # Exits non-zero on any mismatch, after listing every one.
 set -euo pipefail
 
