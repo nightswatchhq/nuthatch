@@ -109,15 +109,19 @@ pub enum Action {
     TokenTx,
     BeaconWithdrawals,
     MinedBlocks,
+    TokenNftTx,
+    Token1155Tx,
 }
 
 impl Action {
-    pub const ALL: [Action; 5] = [
+    pub const ALL: [Action; 7] = [
         Action::TxList,
         Action::TxListInternal,
         Action::TokenTx,
         Action::BeaconWithdrawals,
         Action::MinedBlocks,
+        Action::TokenNftTx,
+        Action::Token1155Tx,
     ];
 
     pub fn from_etherscan(action: &str) -> Option<Action> {
@@ -127,6 +131,8 @@ impl Action {
             "tokentx" => Action::TokenTx,
             "txsBeaconWithdrawal" => Action::BeaconWithdrawals,
             "getminedblocks" => Action::MinedBlocks,
+            "tokennfttx" => Action::TokenNftTx,
+            "token1155tx" => Action::Token1155Tx,
             _ => return None,
         })
     }
@@ -138,6 +144,8 @@ impl Action {
             Action::TokenTx => "tokentx",
             Action::BeaconWithdrawals => "txsBeaconWithdrawal",
             Action::MinedBlocks => "getminedblocks",
+            Action::TokenNftTx => "tokennfttx",
+            Action::Token1155Tx => "token1155tx",
         }
     }
 
@@ -149,6 +157,8 @@ impl Action {
             Action::TokenTx => 3,
             Action::BeaconWithdrawals => 4,
             Action::MinedBlocks => 5,
+            Action::TokenNftTx => 6,
+            Action::Token1155Tx => 7,
         }
     }
 
@@ -159,6 +169,8 @@ impl Action {
             Action::TokenTx => TOKENTX,
             Action::BeaconWithdrawals => WITHDRAWALS,
             Action::MinedBlocks => MINED_BLOCKS,
+            Action::TokenNftTx => TOKENNFTTX,
+            Action::Token1155Tx => TOKEN1155TX,
         }
     }
 }
@@ -168,6 +180,12 @@ const TXLIST_INTERNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_
 const TOKENTX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tokentx");
 const WITHDRAWALS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_withdrawals");
 const MINED_BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_minedblocks");
+const TOKENNFTTX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tokennfttx");
+const TOKEN1155TX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_token1155tx");
+/// Hydrated transactions by hash, so a hash fetched once is never fetched again.
+const TX_CACHE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_cache");
+/// Block timestamps already read.
+const BLOCK_TS: TableDefinition<u64, u64> = TableDefinition::new("ah_block_ts");
 /// `address | action code` -> `[from, to]` pairs, inclusive, sorted and merged, 16 bytes each.
 const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverage");
 const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
@@ -259,6 +277,8 @@ impl AddressHistory {
         }
         wtx.open_table(COVERAGE)?;
         wtx.open_table(META)?;
+        wtx.open_table(TX_CACHE)?;
+        wtx.open_table(BLOCK_TS)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
@@ -274,6 +294,47 @@ impl AddressHistory {
 
     pub fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    /// A transaction already hydrated, by its 32-byte hash.
+    pub fn cached_tx(&self, hash: &[u8]) -> Result<Option<Map<String, Value>>> {
+        let rtx = self.store.database().begin_read()?;
+        match rtx.open_table(TX_CACHE)?.get(hash)? {
+            Some(v) => Ok(Some(decode_record(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn cache_txs(&self, txs: &[(Vec<u8>, Map<String, Value>)]) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(TX_CACHE)?;
+            let mut buf = Vec::new();
+            for (hash, record) in txs {
+                buf.clear();
+                encode_record(record, &mut buf)?;
+                t.insert(hash.as_slice(), buf.as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    pub fn block_timestamp(&self, block: u64) -> Result<Option<u64>> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx.open_table(BLOCK_TS)?.get(block)?.map(|v| v.value()))
+    }
+
+    pub fn cache_block_timestamps(&self, ts: &[(u64, u64)]) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(BLOCK_TS)?;
+            for (b, s) in ts {
+                t.insert(*b, *s)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
     }
 
     /// Bumped by every change that removes rows or coverage. A fetch records the generation it
