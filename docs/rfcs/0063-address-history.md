@@ -64,10 +64,23 @@ would have to index every transfer and transaction on a chain, and would see eve
   restriction; positional predicates must survive every fetch path.
 - **Normal and internal transactions.** `trace_filter` with `fromAddress`, then separately
   `toAddress` (a combined filter can mean intersection), unioned. Root frames are the normal
-  transactions; non-root value-carrying frames are the internal ones. Reverted effects are excluded,
-  including successful children of a reverted ancestor. Creations and selfdestruct beneficiaries are
-  normalised. `traceId` is a stable integer derived from the frame's position in the whole
-  transaction's trace, so an address query and a `txhash` query give the same id.
+  transactions; non-root frames are the internal ones, listed by Etherscan's rules as measured
+  against its answers in slice 4: value-carrying calls, creations at any value (typed `create` or
+  `create2`), and selfdestructs (`self-destruct`, from the dying contract to its beneficiary);
+  delegatecalls and zero-value calls are not listed.
+  **Reverted frames are listed, not excluded.** This section first said reverted effects would be
+  excluded; Etherscan does otherwise, so we match it. A frame that reverted is listed with
+  `isError` "1" and `errCode` "execution reverted"; a frame that succeeded inside a reverted
+  ancestor is listed with `isError` "1" and an empty `errCode`. rotki does not read `isError` on
+  internal rows, so it books a reverted internal transfer as a real one, from Etherscan or from us
+  alike.
+  `traceId` is Etherscan's: "0" followed by "_1" for each level of depth in the address form
+  (`[0, 2]` is "0_1_1"), which is not unique within a transaction, and absent in the `txhash` form.
+  rotki parses it with Python's `int()`, which accepts the underscores. Our own stable key is
+  `nuthatchTraceIndex`, the frame's pre-order position in the whole trace, the same whether the
+  frame is reached by address or by `txhash`.
+  An empty answer from either direction is checked on its own, never excused by rows from the
+  other (#2013).
 - **Nonce search is a cross-check, not a source.** `eth_getTransactionCount` is monotone, so a binary
   search finds every block where an EOA's nonce moved. It checks outgoing completeness cheaply. It
   is not sufficient alone: EIP-7702 authorisations move the nonce without a sent transaction, and
