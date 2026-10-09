@@ -364,10 +364,6 @@ impl Source {
         let Some(bytes) = self.mirror.get(&partition_key(self.chain_id, from)).await? else {
             return Ok(None);
         };
-        // One that could never fit is used and not kept.
-        if bytes.len() as u64 > self.budget {
-            return Ok(Some(bytes));
-        }
         std::fs::create_dir_all(&self.cache)
             .with_context(|| format!("creating {}", self.cache.display()))?;
         let part = path.with_extension("part");

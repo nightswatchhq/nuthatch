@@ -1460,5 +1460,28 @@ mod tests {
             20 + 2,
             "twenty bodies before the mirror, its finality check and one anchor"
         );
+
+        // Coverage the RPC scan recorded before a mirror was configured does not answer for the
+        // mirror's blocks while no partition has replaced it.
+        let (_dir, d, history, state) = nest(
+            std::slice::from_ref(&paid),
+            (2 * SPAN, 2 * SPAN + 5),
+            (2 * SPAN, 3 * SPAN - 1),
+        );
+        let g = history.generation().unwrap();
+        history
+            .record(
+                Action::BeaconWithdrawals,
+                &paid,
+                &[],
+                (2 * SPAN, 2 * SPAN + 5),
+                g,
+            )
+            .unwrap();
+        d.catch_up(&state, 2 * SPAN + 5).await;
+        assert_eq!(
+            history.coverage(Action::BeaconWithdrawals, &paid).unwrap(),
+            vec![]
+        );
     }
 }
