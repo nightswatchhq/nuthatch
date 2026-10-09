@@ -366,10 +366,12 @@ mkdir -p "$WORK/holed"
 cp -R "$MIRROR/." "$WORK/holed/"
 rm "$WORK/holed/$key"
 MIRROR_DIR="$WORK/holed" start holed 0x6af88356dd961e2a0db451070dd93c8c2667f7a8 20000000 20000299
-for _ in $(seq 60); do
-  grep -q "partition \[20000000, 20009999\] not used" "$WORK/holed.log" && break
+refused=0
+for _ in $(seq 90); do
+  grep -q "partition \[20000000, 20009999\] not used.*has no partition" "$WORK/holed.log" && { refused=1; break; }
   sleep 2
 done
+[ "$refused" = 1 ] || { echo "  HOLE    the nest never tried, and refused, the missing partition"; FAILED=1; }
 case $(api "action=getminedblocks&address=0x6af88356dd961e2a0db451070dd93c8c2667f7a8&startblock=20000000&endblock=20000299&blocktype=blocks" | jq -r .result) in
   NUTHATCH_INCOMPLETE:*) echo "holed: a missing partition answers incomplete" ;;
   *) echo "  HOLE    a missing partition did not answer incomplete"; FAILED=1 ;;

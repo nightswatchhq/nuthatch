@@ -19,7 +19,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::address_discovery::{static_reward, BlockFound, Rpc};
@@ -353,7 +353,10 @@ impl Source {
         let path = self.cached(from);
         if !fresh {
             match std::fs::read(&path) {
-                Ok(b) => return Ok(Some(b)),
+                Ok(b) => {
+                    self.evict()?;
+                    return Ok(Some(b));
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
             }
@@ -361,12 +364,16 @@ impl Source {
         let Some(bytes) = self.mirror.get(&partition_key(self.chain_id, from)).await? else {
             return Ok(None);
         };
+        // One that could never fit is used and not kept.
+        if bytes.len() as u64 > self.budget {
+            return Ok(Some(bytes));
+        }
         std::fs::create_dir_all(&self.cache)
             .with_context(|| format!("creating {}", self.cache.display()))?;
         let part = path.with_extension("part");
         std::fs::write(&part, &bytes).with_context(|| format!("writing {}", part.display()))?;
         std::fs::rename(&part, &path).with_context(|| format!("renaming {}", part.display()))?;
-        self.evict(&path)?;
+        self.evict()?;
         Ok(Some(bytes))
     }
 
@@ -374,8 +381,8 @@ impl Source {
         let _ = std::fs::remove_file(self.cached(from));
     }
 
-    /// Delete the oldest partitions until the cache is within its budget, never `keep`.
-    fn evict(&self, keep: &Path) -> Result<()> {
+    /// Delete the oldest partitions until the cache is within its budget.
+    fn evict(&self) -> Result<()> {
         let mut files = Vec::new();
         for e in std::fs::read_dir(&self.cache)? {
             let e = e?;
@@ -390,10 +397,8 @@ impl Source {
             if total <= self.budget {
                 break;
             }
-            if path != keep {
-                std::fs::remove_file(&path)?;
-                total -= len;
-            }
+            std::fs::remove_file(&path)?;
+            total -= len;
         }
         Ok(())
     }
@@ -519,6 +524,14 @@ pub struct ManifestEntry {
     pub last_hash: String,
 }
 
+/// The block `rpc` calls finalized.
+pub async fn finalized(rpc: &impl Rpc) -> Result<u64> {
+    let b = rpc
+        .call("eth_getBlockByNumber", json!(["finalized", false]))
+        .await?;
+    crate::address_discovery::hex_u64(&b["number"]).context("the RPC's finalized block")
+}
+
 /// What a build wrote.
 #[derive(Debug, Default)]
 pub struct Built {
@@ -546,11 +559,7 @@ pub async fn build(
              one less than a multiple"
         );
     }
-    let finalized = rpc
-        .call("eth_getBlockByNumber", json!(["finalized", false]))
-        .await?;
-    let finalized = crate::address_discovery::hex_u64(&finalized["number"])
-        .context("the RPC's finalized block")?;
+    let finalized = finalized(rpc).await?;
     if to > finalized {
         bail!("block {to} is past the RPC's finalized block {finalized}; partitions are immutable");
     }
@@ -923,7 +932,7 @@ pub(crate) mod tests {
         assert!(format!("{err:#}").contains("whole spans"), "{err:#}");
     }
 
-    fn source(mirror: &Path, cache: &Path, budget: u64) -> Source {
+    fn source(mirror: &std::path::Path, cache: &std::path::Path, budget: u64) -> Source {
         Source::open(mirror.to_str().unwrap(), 1, cache.to_path_buf(), budget).unwrap()
     }
 
@@ -1095,6 +1104,28 @@ pub(crate) mod tests {
         let fresh = tempfile::tempdir().unwrap();
         let bad = source(corrupt.path(), fresh.path(), u64::MAX);
         assert!(ingest(&rpc, &bad, 0, &[], (0, 9)).await.is_err());
+
+        // A smaller budget on a later run is honoured on a cache hit, and a partition larger than
+        // the whole budget is used without being kept.
+        let tight = source(m.path(), c.path(), one / 2);
+        let kept = || {
+            std::fs::read_dir(c.path())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "parquet")
+                })
+                .count()
+        };
+        ingest(&rpc, &tight, SPAN, &[], (SPAN, SPAN + 9))
+            .await
+            .unwrap();
+        assert_eq!(kept(), 0, "the hit itself is evicted");
+        ingest(&rpc, &tight, 0, &[], (0, 9)).await.unwrap();
+        assert_eq!(kept(), 0, "too big to keep");
     }
 
     fn live() -> Option<crate::rpc::RpcClient> {

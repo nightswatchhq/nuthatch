@@ -319,28 +319,36 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
     source: &crate::address_partitions::Source,
     (first, last): (u64, u64),
 ) {
-    use crate::address_discovery::{next_uncovered_for, record_blocks, BLOCK_SCANNED};
-    use crate::address_partitions::{ingest, span_of, SPAN};
+    use crate::address_discovery::{record_blocks, BLOCK_SCANNED};
+    use crate::address_partitions::{finalized, ingest, span_of, SPAN};
+    // Coverage the RPC scan recorded before the mirror was configured does not count here.
+    let history = state.history.clone();
+    let kept = tokio::task::spawn_blocking(move || {
+        history.keep_verified_only(&BLOCK_SCANNED, (first, last))
+    })
+    .await;
+    if let Err(e) = kept.map_err(anyhow::Error::from).and_then(|r| r) {
+        tracing::warn!("address history: setting the mirror's blocks aside: {e:#}");
+        return;
+    }
     let (lo, hi) = (state.start_block.max(first), to.min(last));
     if lo > hi {
         return;
     }
+    let mut ceiling: Option<u64> = None;
     let mut start = span_of(lo).0;
     while start <= hi {
         let end = start + SPAN - 1;
-        // A partition is anchored at its last block, which must be final for this nest.
-        if end > to {
-            return;
-        }
         let clip = (start.max(lo), end.min(hi));
-        let lacking: Vec<String> = watched
-            .iter()
-            .filter(|a| {
-                next_uncovered_for(&state.history, a, clip.0, &BLOCK_SCANNED)
-                    .is_ok_and(|n| n <= clip.1)
+        let verified = |a: &String| {
+            BLOCK_SCANNED.iter().all(|&action| {
+                state
+                    .history
+                    .verified_coverage(action, a)
+                    .is_ok_and(|spans| spans.iter().any(|(f, t)| *f <= clip.0 && clip.1 <= *t))
             })
-            .cloned()
-            .collect();
+        };
+        let lacking: Vec<String> = watched.iter().filter(|a| !verified(a)).cloned().collect();
         let headers = state
             .history
             .header_coverage()
@@ -348,6 +356,21 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
         if lacking.is_empty() && headers {
             start += SPAN;
             continue;
+        }
+        // A partition is anchored at its last block, which the RPC must call finalized: the
+        // nest's serving depth is a guess at finality, not finality.
+        if ceiling.is_none() {
+            match finalized(&d.main).await {
+                Ok(f) => ceiling = Some(f),
+                Err(e) => {
+                    state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("address history: the RPC's finalized block: {e:#}");
+                    return;
+                }
+            }
+        }
+        if ceiling.is_some_and(|f| end > f) {
+            return;
         }
         let outcome = async {
             let generation = state.history.generation()?;
@@ -360,7 +383,7 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
                         .found
                         .remove(&a.to_ascii_lowercase())
                         .unwrap_or_default();
-                    record_blocks(&history, &a, clip, f, generation)?;
+                    record_blocks(&history, &a, clip, f, generation, true)?;
                 }
                 Ok::<_, anyhow::Error>(())
             })
@@ -447,7 +470,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
                 let mut found = found?;
                 for a in lacking {
                     let f = found.remove(&a.to_ascii_lowercase()).unwrap_or_default();
-                    record_blocks(&history, &a, (from, end), f, generation)?;
+                    record_blocks(&history, &a, (from, end), f, generation, false)?;
                 }
                 Ok::<_, anyhow::Error>(())
             })
@@ -1220,7 +1243,13 @@ mod tests {
         .unwrap();
         std::fs::remove_file(mirror.path().join(partition_key(1, SPAN))).unwrap();
 
+        // The RPC's finalized block, which the test moves.
+        let finalized = Arc::new(AtomicU64::new(2 * SPAN + 5));
+        let fin = finalized.clone();
         let main = Fake::new(move |m, p| match m {
+            "eth_getBlockByNumber" if p[0] == "finalized" => {
+                Ok(json!({"number": format!("0x{:x}", fin.load(Ordering::Relaxed))}))
+            }
             "eth_getLogs" => Ok(json!([])),
             "eth_getCode" => Ok(json!("0x")),
             "eth_getTransactionCount" => Ok(json!("0x0")),
@@ -1265,8 +1294,8 @@ mod tests {
         assert_eq!(history.header_coverage().unwrap(), covered);
         assert_eq!(
             d.main.calls().get("eth_getBlockByNumber"),
-            Some(&2),
-            "one anchor per partition and no body"
+            Some(&3),
+            "the finality check, one anchor per partition and no body"
         );
         assert_eq!(
             d.main.calls().get("eth_getBlockByHash"),
@@ -1338,14 +1367,98 @@ mod tests {
         )
         .await
         .unwrap();
-        d.catch_up(&state, 2 * SPAN - 2).await;
+        finalized.store(2 * SPAN - 2, Ordering::Relaxed);
+        let reads = d.main.calls()["eth_getBlockByNumber"];
+        d.catch_up(&state, 2 * SPAN + 5).await;
         assert_eq!(history.header_coverage().unwrap(), covered);
-        assert_eq!(d.main.calls().get("eth_getBlockByNumber"), Some(&2));
-        d.catch_up(&state, 2 * SPAN - 1).await;
+        assert_eq!(
+            d.main.calls()["eth_getBlockByNumber"],
+            reads + 1,
+            "the finality check, and no anchor past it"
+        );
+        finalized.store(2 * SPAN - 1, Ordering::Relaxed);
+        d.catch_up(&state, 2 * SPAN + 5).await;
         assert_eq!(history.header_coverage().unwrap(), vec![(5, 2 * SPAN - 1)]);
         assert_eq!(
             history.coverage(Action::MinedBlocks, &miner).unwrap(),
             vec![(5, 2 * SPAN - 1)]
+        );
+    }
+
+    /// The mirror pass runs for headers alone when nothing watched lacks the blocks, a range that
+    /// ends mid-partition still takes that partition, and the RPC scan stops where the mirror starts.
+    #[tokio::test]
+    async fn the_mirror_meets_unaligned_ranges_and_the_rpc_scan_at_its_edges() {
+        use crate::address_discovery::Discoverer;
+        use crate::address_history::Action;
+        use crate::address_partitions::tests::{chain_rpc, Fake, PAID};
+        use crate::address_partitions::{build, Source, SPAN};
+        let mirror = tempfile::tempdir().unwrap();
+        build(
+            &chain_rpc(2 * SPAN + 5),
+            mirror.path().to_str().unwrap(),
+            1,
+            (0, 2 * SPAN - 1),
+            4,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        let nest = |seed: &[String], range: (u64, u64), blocks: (u64, u64)| {
+            let chain = chain_rpc(2 * SPAN + 5);
+            let main = Fake::new(move |m, p| match m {
+                "eth_getLogs" => Ok(json!([])),
+                "eth_getCode" => Ok(json!("0x")),
+                "eth_getTransactionCount" => Ok(json!("0x0")),
+                "eth_getBlockTransactionCountByNumber" => Ok(json!("0x1")),
+                _ => (chain.answer)(m, p),
+            });
+            let trace = Fake::new(|m, _| match m {
+                "trace_filter" => Ok(json!([])),
+                "trace_block" => Ok(json!([{"x": 1}])),
+                other => bail!("unexpected {other}"),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let history =
+                AddressHistory::open(Store::open(&dir.path().join("t.redb")).unwrap(), 1, seed)
+                    .unwrap();
+            let source = Source::open(
+                mirror.path().to_str().unwrap(),
+                1,
+                dir.path().join("partitions"),
+                u64::MAX,
+            )
+            .unwrap();
+            let state = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+                .with_range(range.0, Some(range.1), 0)
+                .with_mirror(Arc::new(source), blocks);
+            (
+                dir,
+                Discoverer::new(Counted::new(main), Counted::new(trace)),
+                history,
+                state,
+            )
+        };
+
+        let (_dir, d, history, state) = nest(&[], (5, SPAN - 10), (0, 2 * SPAN - 1));
+        d.catch_up(&state, 2 * SPAN + 5).await;
+        assert_eq!(history.header_coverage().unwrap(), vec![(5, SPAN - 10)]);
+
+        let paid = format!("{PAID:#x}");
+        let (_dir, d, history, state) = nest(
+            std::slice::from_ref(&paid),
+            (SPAN - 20, SPAN + 30),
+            (SPAN, 2 * SPAN - 1),
+        );
+        d.catch_up(&state, 2 * SPAN + 5).await;
+        assert_eq!(
+            history.coverage(Action::BeaconWithdrawals, &paid).unwrap(),
+            vec![(SPAN - 20, SPAN + 30)]
+        );
+        assert_eq!(
+            d.main.calls()["eth_getBlockByNumber"],
+            20 + 2,
+            "twenty bodies before the mirror, its finality check and one anchor"
         );
     }
 }

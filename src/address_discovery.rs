@@ -382,27 +382,36 @@ pub fn static_reward(b: u64) -> alloy_primitives::U256 {
     }
 }
 
-/// Record a block scan's finds for one address over `[from, to]`.
+/// Record a block scan's finds for one address over `[from, to]`; `verified` when they were read from
+/// a verified partition rather than the RPC.
 pub fn record_blocks(
     history: &AddressHistory,
     address: &str,
     (from, to): (u64, u64),
     found: BlockFound,
     generation: u64,
+    verified: bool,
 ) -> Result<()> {
+    let record = if verified {
+        AddressHistory::record_verified
+    } else {
+        AddressHistory::record
+    };
     let within = |rows: Vec<Row>| -> Vec<Row> {
         rows.into_iter()
             .filter(|r| from <= r.block && r.block <= to)
             .collect()
     };
-    history.record(
+    record(
+        history,
         Action::BeaconWithdrawals,
         address,
         &within(found.withdrawals),
         (from, to),
         generation,
     )?;
-    history.record(
+    record(
+        history,
         Action::MinedBlocks,
         address,
         &within(found.mined),
