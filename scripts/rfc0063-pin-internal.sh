@@ -12,7 +12,8 @@ API="https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlistinter
 
 get() { # query-suffix file
   local r
-  r=$(curl -s --retry 3 "$API&$1&apikey=$ETHERSCAN_KEY")
+  # The key goes to curl on its standard input, so it never appears in a process listing.
+  r=$(printf 'url = "%s&%s&apikey=%s"\n' "$API" "$1" "$ETHERSCAN_KEY" | curl -s --retry 3 -K -)
   sleep 0.25
   if [ "$(jq -r .status <<<"$r")" != 1 ] && [ "$(jq -r .message <<<"$r")" != "No transactions found" ]; then
     echo "FAIL $1: $(jq -c .result <<<"$r" | head -c 200)" >&2

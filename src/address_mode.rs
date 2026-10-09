@@ -378,21 +378,29 @@ async fn api(
     State(s): State<Arc<ModeState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
-    // A txhash lookup needs no coverage: a transaction the store has not traced is traced now.
-    if let (Some("txlistinternal"), Some(hash), Some(tracer)) = (
-        q.get("action").map(String::as_str),
-        q.get("txhash").cloned(),
-        s.tracer.clone(),
-    ) {
-        let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x")).ok();
-        if let Some(key) = key.filter(|k| k.len() == 32) {
-            let known = blocking(&s, move |h| Ok(h.tx_internals(&key)?.is_some())).await;
-            if matches!(known, Ok(false)) {
-                if let Err(e) = tracer(hash).await {
-                    return Json(
-                        json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e:#}") }),
-                    );
+    // A txhash lookup needs no coverage: a transaction the store has not traced is traced now, once
+    // the request is one `respond` would answer.
+    let traceable = q.get("module").map(String::as_str) == Some("account")
+        && q.get("action").map(String::as_str) == Some("txlistinternal")
+        && q.get("chainid")
+            .is_none_or(|c| c.parse::<u64>().ok() == Some(s.chain_id));
+    let key = q
+        .get("txhash")
+        .and_then(|h| h.strip_prefix("0x"))
+        .and_then(|h| alloy_primitives::hex::decode(h).ok())
+        .filter(|k| k.len() == 32);
+    if let (true, Some(key), Some(hash), Some(tracer)) =
+        (traceable, key, q.get("txhash").cloned(), s.tracer.clone())
+    {
+        let known = blocking(&s, move |h| Ok(h.tx_internals(&key)?.is_some())).await;
+        if matches!(known, Ok(false)) {
+            if let Err(e) = tracer(hash).await {
+                if let Some(nf) = e.downcast_ref::<crate::address_discovery::NotFinalized>() {
+                    return Json(crate::address_history::incomplete(&nf.to_string()));
                 }
+                return Json(
+                    json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e:#}") }),
+                );
             }
         }
     }
@@ -559,6 +567,29 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
     )
 }
 
+/// Traces one transaction into `history` for a txhash lookup, once `verified` says the RPCs are on
+/// the nest's chain. Only a finalized transaction's trace is kept; a newer one is refused.
+pub fn tracer<M: Rpc, T: Rpc>(
+    discovery: Arc<Discoverer<Counted<M>, Counted<T>>>,
+    history: AddressHistory,
+    verified: Arc<tokio::sync::OnceCell<()>>,
+) -> Tracer {
+    Arc::new(move |hash: String| {
+        let (discovery, history, verified) = (discovery.clone(), history.clone(), verified.clone());
+        Box::pin(async move {
+            if verified.get().is_none() {
+                bail!("the RPC's chain has not been checked yet; try again shortly");
+            }
+            let pending = crate::address_discovery::Pending::default();
+            let finalized = history.head()?.unwrap_or(0);
+            discovery
+                .internal_rows_of(&history, &hash, &pending, finalized)
+                .await?;
+            tokio::task::spawn_blocking(move || pending.persist(&history)).await?
+        })
+    })
+}
+
 /// `--poll-interval` wins over `poll_interval` in `[address_history]`, which wins over the default.
 pub fn poll_interval(flag: Option<Duration>, config: &AddressHistoryConfig) -> Result<Duration> {
     match flag {
@@ -637,23 +668,7 @@ pub async fn dev(
     let discovery = Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
     // Tracing for a txhash lookup waits on the same chain check the cursor does.
     let verified = Arc::new(tokio::sync::OnceCell::<()>::new());
-    let tracer: Tracer = {
-        let (discovery, history, verified) = (discovery.clone(), history.clone(), verified.clone());
-        Arc::new(move |hash: String| {
-            let (discovery, history, verified) =
-                (discovery.clone(), history.clone(), verified.clone());
-            Box::pin(async move {
-                if verified.get().is_none() {
-                    bail!("the RPC's chain has not been checked yet; try again shortly");
-                }
-                let pending = crate::address_discovery::Pending::default();
-                discovery
-                    .internal_rows_of(&history, &hash, &pending)
-                    .await?;
-                tokio::task::spawn_blocking(move || pending.persist(&history)).await?
-            })
-        })
-    };
+    let tracer = tracer(discovery.clone(), history.clone(), verified.clone());
     let state = Arc::new(
         ModeState::new(history, chain_id, poll_interval, loopback)
             .with_range(ah.start_block.unwrap_or(0), ah.end_block, depth)

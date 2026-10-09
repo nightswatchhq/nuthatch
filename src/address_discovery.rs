@@ -33,12 +33,26 @@ pub const DISCOVERED: [Action; 5] = [
 pub const OUTER_WINDOW: u64 = 50_000;
 /// A sub-call returning this many items may have been truncated by the provider, so it is split.
 const SUSPICIOUSLY_FULL: usize = 10_000;
+/// The most frames one transaction's trace may have before a lookup refuses it rather than hold it.
+const MAX_TRACE_FRAMES: usize = 100_000;
 /// Hashes hydrated at once.
 const HYDRATE_CONCURRENCY: usize = 8;
 
 const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const TRANSFER_SINGLE: &str = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
 const TRANSFER_BATCH: &str = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb";
+
+/// A transaction above the finalized head, whose trace a reorg could still change.
+#[derive(Debug)]
+pub struct NotFinalized(pub u64);
+
+impl std::fmt::Display for NotFinalized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "block {} is not finalized yet", self.0)
+    }
+}
+
+impl std::error::Error for NotFinalized {}
 
 /// One JSON-RPC endpoint pool.
 pub trait Rpc: Send + Sync + 'static {
@@ -380,7 +394,9 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             ..Found::default()
         };
         for hash in &internal {
-            let rows = self.internal_rows_of(history, hash, pending).await?;
+            let rows = self
+                .internal_rows_of(history, hash, pending, u64::MAX)
+                .await?;
             found.txlistinternal.extend(
                 rows.into_iter()
                     .filter(|row| touches(&row.record, &a))
@@ -405,6 +421,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         history: &AddressHistory,
         hash: &str,
         pending: &Pending,
+        finalized: u64,
     ) -> Result<Vec<Row>> {
         let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x"))?;
         let records = match history.tx_internals(&key)? {
@@ -421,7 +438,17 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 let Some(root) = frames.first() else {
                     bail!("trace_transaction {hash} answered no frames");
                 };
+                if frames.len() > MAX_TRACE_FRAMES {
+                    bail!(
+                        "{hash} has {} trace frames, over the {MAX_TRACE_FRAMES} one lookup holds",
+                        frames.len()
+                    );
+                }
                 let block = hex_u64(root.get("blockNumber").unwrap_or(&Value::Null))?;
+                // Cached traces are never revisited, so only a finalized block's may be cached.
+                if block > finalized {
+                    return Err(anyhow!(NotFinalized(block)));
+                }
                 let ts = self.block_timestamp(history, block, pending).await?;
                 let records = internal_records(frames, ts)?;
                 pending
@@ -2214,5 +2241,100 @@ mod tests {
             .unwrap()
             .starts_with("NUTHATCH_UNSUPPORTED:"));
         assert_eq!(ask("txlistinternal", "0x12")["status"], "0");
+    }
+
+    /// The server traces a txhash it has not seen, once, keeps it only if its block is final, and
+    /// traces nothing for a request it would refuse anyway.
+    #[tokio::test]
+    async fn a_cold_txhash_is_traced_once_and_only_when_final() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let tx = format!("0x{}", "ee".repeat(32));
+        let whole = json!([
+            {"traceAddress": [], "type": "call", "blockNumber": 300, "transactionPosition": 1,
+             "action": {"from": "0x02", "to": "0x03", "value": "0x0", "callType": "call"}},
+            {"traceAddress": [0], "type": "call", "blockNumber": 300, "transactionPosition": 1,
+             "action": {"from": "0x03", "to": "0x04", "value": "0x9", "callType": "call", "gas": "0x1"},
+             "result": {"gasUsed": "0x0"}},
+        ]);
+        let (main, _) = chain(false);
+        let trace = script(move |m, _| match m {
+            "trace_transaction" => Ok(whole.clone()),
+            other => bail!("unexpected {other}"),
+        });
+        let d = std::sync::Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
+        let verified = std::sync::Arc::new(tokio::sync::OnceCell::new());
+        verified.set(()).unwrap();
+        let state = std::sync::Arc::new(
+            crate::address_mode::ModeState::new(
+                h.clone(),
+                1,
+                std::time::Duration::from_secs(300),
+                true,
+            )
+            .with_tracer(crate::address_mode::tracer(d.clone(), h.clone(), verified)),
+        );
+        let get = |path: String| {
+            let app = crate::address_mode::router(state.clone());
+            async move {
+                let resp = app
+                    .oneshot(
+                        axum::http::Request::get(path)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        let traced = || {
+            d.trace
+                .calls()
+                .get("trace_transaction")
+                .copied()
+                .unwrap_or(0)
+        };
+        let path =
+            |extra: &str| format!("/api?module=account&action=txlistinternal&txhash={tx}{extra}");
+
+        let refused = get(format!(
+            "/api?module=contract&action=txlistinternal&txhash={tx}"
+        ))
+        .await;
+        assert_eq!(refused["status"], "0");
+        let wrong_chain = get(path("&chainid=8453")).await;
+        assert_eq!(wrong_chain["status"], "0");
+        assert_eq!(traced(), 0, "nothing traced for requests respond refuses");
+
+        h.set_head(299).unwrap();
+        let young = get(path("")).await;
+        assert!(
+            young["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "{young}"
+        );
+        assert!(h
+            .tx_internals(&alloy_primitives::hex::decode(&tx[2..]).unwrap())
+            .unwrap()
+            .is_none());
+
+        h.set_head(400).unwrap();
+        let first = get(path("")).await;
+        assert_eq!(first["result"][0]["value"], "9", "{first}");
+        let calls = traced();
+        let again = get(path("")).await;
+        assert_eq!(again["result"], first["result"]);
+        assert_eq!(
+            traced(),
+            calls,
+            "the second lookup is answered from the store"
+        );
     }
 }

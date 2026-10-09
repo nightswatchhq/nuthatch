@@ -108,13 +108,28 @@ all_rows() { # action address from to file: every page at 10,000 rows, generatio
 }
 
 same_rows() { # label fields ours theirs: the two files hold the same rows, as multisets, on fields
-  local label=$1 fields=$2 d
-  d=$(diff <(jq -cS "$fields" "$3" | sort) <(jq -cS "$fields" "$4" | sort) || true)
-  if [ -n "$d" ]; then
-    echo "  ROWS    $label"
-    sed -e 's/^</    ours:  /' -e 's/^>/    theirs:/' <<<"$d" | grep -E '^    (ours|theirs)' | head -20
-    FAILED=1
+  local label=$1 fields=$2 d rc
+  # Projections go to files under `set -e`, so a jq failure stops the gate instead of reading as
+  # two empty sides that agree.
+  jq -cS "$fields" "$3" | sort > "$WORK/.ours"
+  jq -cS "$fields" "$4" | sort > "$WORK/.theirs"
+  if [ ! -s "$WORK/.theirs" ]; then
+    echo "FAIL: $label: the reference $4 holds no rows" >&2
+    exit 1
   fi
+  d=$(diff "$WORK/.ours" "$WORK/.theirs") && rc=0 || rc=$?
+  case $rc in
+    0) ;;
+    1)
+      echo "  ROWS    $label"
+      sed -e 's/^</    ours:  /' -e 's/^>/    theirs:/' <<<"$d" | grep -E '^    (ours|theirs)' | head -20
+      FAILED=1
+      ;;
+    *)
+      echo "FAIL: $label: diff could not compare ($rc)" >&2
+      exit 1
+      ;;
+  esac
 }
 
 # The internal-transaction fields compared: every one rotki reads, plus Etherscan's failure fields.
@@ -122,6 +137,11 @@ INTERNAL='{hash,blockNumber,timeStamp,from,to,value,traceId,gas,gasUsed,type,isE
 BYHASH='{parent,blockNumber,timeStamp,from,to,value,gas,gasUsed,type,isError,errCode,contractAddress,traceId}'
 
 PHASES=${PHASES:-13}
+# Phase 2 runs inside phase 1, on its nest, so there are three selections and no others.
+if ! [[ $PHASES =~ ^(1|3|13)$ ]]; then
+  echo "FAIL: PHASES=$PHASES; use 13 (all), 1 (vitalik, with its txhash phase) or 3 (the cases)" >&2
+  exit 1
+fi
 if [[ $PHASES == *1* ]]; then
 # Phase 1: vitalik.eth.
 FROM=18000000
@@ -196,6 +216,15 @@ while IFS=$'\t' read -r name address block hash _; do
   api "action=txlistinternal&txhash=$hash" | jq -c '.result[]?' > "$WORK/$name-txhash.jsonl"
   same_rows "$name by txhash" "${BYHASH/parent,/}" "$WORK/$name-txhash.jsonl" "$CASES/$name-txhash.jsonl"
   echo "$name: $(wc -l < "$WORK/$name-address.jsonl" | tr -d ' ') by address, $(wc -l < "$WORK/$name-txhash.jsonl" | tr -d ' ') by txhash"
+  if [ -z "${COLD_DONE:-}" ]; then
+    # A transaction this nest never discovered, so the lookup takes the on-demand trace path.
+    COLD=0x90efd2d8bd258966e47252dc2180da14ea6160934043b3750a9918b69fed7147
+    api "action=txlistinternal&txhash=$COLD" | jq -c --arg h "$COLD" '.result[]? | {parent: $h} + .' > "$WORK/cold.jsonl"
+    jq -c --arg h "$COLD" 'select(.parent == $h)' "$CASES/vitalik-txhash.jsonl" > "$WORK/cold.theirs"
+    same_rows "cold txhash $COLD" "$BYHASH" "$WORK/cold.jsonl" "$WORK/cold.theirs"
+    echo "cold txhash: $(wc -l < "$WORK/cold.jsonl" | tr -d ' ') rows traced on demand"
+    COLD_DONE=1
+  fi
   stop
 done < <(grep -v '^#' "$CASES/cases.tsv")
 fi
