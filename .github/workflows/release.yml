@@ -106,6 +106,18 @@ jobs:
           # #1396: no save. A tag build's cache is scoped to that tag, so no later run can read it,
           # yet each release spent ~1.6 GB of the 10 GB store CI restores from, evicting CI's entries.
           save-if: false
+      # The fat-LTO link of `nuthatch` outgrew the ARM runner's memory: v5.0.0's aarch64 build was
+      # shut down mid-link twice. Swap lets it finish without changing what the profile builds.
+      - name: swap for the fat-LTO link
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo fallocate -l 8G /swapfile.lto
+          sudo chmod 600 /swapfile.lto
+          sudo mkswap /swapfile.lto
+          sudo swapon /swapfile.lto
+          free -h
       - name: build
         run: cargo build --profile dist --locked --target ${{ matrix.target }}
       - name: package
