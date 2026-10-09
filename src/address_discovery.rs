@@ -1639,7 +1639,7 @@ mod tests {
             _ => (trace.answer)(m, p),
         });
         let d = Discoverer::new(main, trace);
-        let err = d.discover(&h, A, 100, 199).await.unwrap_err();
+        let err = d.discover_now(&h, A, 100, 199).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("trace_filter toAddress answered nothing"),
             "{err:#}"
@@ -1681,7 +1681,7 @@ mod tests {
             _ => (main.answer)(m, p),
         });
         let d = Discoverer::new(main, trace);
-        let err = d.discover(&h, A, 0, 63).await.unwrap_err();
+        let err = d.discover_now(&h, A, 0, 63).await.unwrap_err();
         assert!(format!("{err:#}").contains("eth_getLogs"), "{err:#}");
         assert!(format!("{err:#}").contains("answered nothing"), "{err:#}");
     }
