@@ -262,8 +262,14 @@ fn str_field<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("missing `{k}` in {v}"))
 }
 
-fn topic_address(word: &str) -> String {
-    format!("0x{}", &word.trim_start_matches("0x")[24..])
+fn topic_address(word: &str) -> Result<String> {
+    let hex = word.trim_start_matches("0x");
+    // Only the shape is checked: the counterparty topic comes from whatever contract emitted the
+    // log, and refusing a dirty high half would block this address's window for good.
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("not a 32-byte topic: {word}");
+    }
+    Ok(format!("0x{}", &hex[24..]))
 }
 
 fn padded(address: &str) -> String {
@@ -846,28 +852,28 @@ fn transfer_rows(
         position: (log_index << 16) | element,
         record,
     };
-    let party = |t: &str| topic_address(t);
+    let party = |t: &str| topic_address(t).map(Value::String);
     match (topics.first().copied(), topics.len()) {
         (Some(TRANSFER), 3) => {
             let mut r = base()?;
-            r.insert("from".into(), Value::String(party(topics[1])));
-            r.insert("to".into(), Value::String(party(topics[2])));
+            r.insert("from".into(), party(topics[1])?);
+            r.insert("to".into(), party(topics[2])?);
             r.insert("value".into(), Value::String(decimal(&word(0)?)?));
             tail(&mut r);
             found.tokentx.push(row(r, 0));
         }
         (Some(TRANSFER), 4) => {
             let mut r = base()?;
-            r.insert("from".into(), Value::String(party(topics[1])));
-            r.insert("to".into(), Value::String(party(topics[2])));
+            r.insert("from".into(), party(topics[1])?);
+            r.insert("to".into(), party(topics[2])?);
             r.insert("tokenID".into(), Value::String(decimal(topics[3])?));
             tail(&mut r);
             found.tokennfttx.push(row(r, 0));
         }
         (Some(TRANSFER_SINGLE), 4) => {
             let mut r = base()?;
-            r.insert("from".into(), Value::String(party(topics[2])));
-            r.insert("to".into(), Value::String(party(topics[3])));
+            r.insert("from".into(), party(topics[2])?);
+            r.insert("to".into(), party(topics[3])?);
             r.insert("tokenID".into(), Value::String(decimal(&word(0)?)?));
             r.insert("tokenValue".into(), Value::String(decimal(&word(1)?)?));
             tail(&mut r);
@@ -883,8 +889,8 @@ fn transfer_rows(
             }
             for (i, (id, value)) in ids.iter().zip(&values).enumerate() {
                 let mut r = base()?;
-                r.insert("from".into(), Value::String(party(topics[2])));
-                r.insert("to".into(), Value::String(party(topics[3])));
+                r.insert("from".into(), party(topics[2])?);
+                r.insert("to".into(), party(topics[3])?);
                 r.insert("tokenID".into(), Value::String(id.clone()));
                 r.insert("tokenValue".into(), Value::String(value.clone()));
                 tail(&mut r);
@@ -1463,6 +1469,29 @@ mod tests {
         let d = Discoverer::new(main, trace);
         let err = d.discover(&h, A, 0, 63).await.unwrap_err();
         assert!(format!("{err:#}").contains("removed log"), "{err:#}");
+    }
+
+    /// A provider that returns a short counterparty topic fails the window with an error; slicing it
+    /// panicked and took the cursor down while /ready still read ready.
+    #[tokio::test]
+    async fn a_short_topic_fails_the_window_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let short = json!({"address": "0xT0KEN", "topics": [TRANSFER, padded(A), "0x1234"],
+            "data": format!("0x{:0>64}", "1"), "blockNumber": "0x10", "blockTimestamp": "0x20",
+            "transactionHash": "0xHH", "transactionIndex": "0x1", "logIndex": "0x1",
+            "blockHash": "0xBB", "removed": false});
+        let (main, trace) = chain(false);
+        let main = script(move |m, p| match m {
+            "eth_getLogs" => Ok(json!([short])),
+            _ => (main.answer)(m, p),
+        });
+        let d = Discoverer::new(main, trace);
+        let err = d.discover(&h, A, 0, 63).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a 32-byte topic"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]

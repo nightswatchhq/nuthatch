@@ -319,6 +319,19 @@ pub async fn cursor(state: Arc<ModeState>, source: impl HeadSource, discovery: i
     }
 }
 
+/// A panicking cursor must take /ready down with it, not leave it reading ready over stale history.
+fn supervise(
+    state: Arc<ModeState>,
+    work: tokio::task::JoinHandle<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match work.await {
+            Err(e) if e.is_panic() => state.stop(format!("the cursor task panicked: {e}")),
+            _ => {}
+        }
+    })
+}
+
 pub fn router(state: Arc<ModeState>) -> Router {
     Router::new()
         .route("/api", get(api))
@@ -601,7 +614,7 @@ pub async fn dev(
     // The chain check runs in the cursor, not before serving: covered history answers at once, even
     // offline. A wrong chain stops the cursor before it fetches anything.
     let task_state = state.clone();
-    let cursor = tokio::spawn(async move {
+    let work = tokio::spawn(async move {
         for (role, rpc) in [("main", &main), ("trace", &trace)] {
             if let Err(e) = rpc.verify_chain_ids(chain_id).await {
                 task_state.stop(format!("the {role} RPC: {e:#}"));
@@ -615,8 +628,11 @@ pub async fn dev(
         let discovery = Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
         cursor(task_state, MainHead(discovery.clone()), discovery).await;
     });
+    let work_abort = work.abort_handle();
+    let cursor = supervise(state.clone(), work);
     let served = crate::serve::serve_bound(listener, router(state), cors).await;
     cursor.abort();
+    work_abort.abort();
     served
 }
 
@@ -784,6 +800,17 @@ mod tests {
         let ms = u64::try_from(fresh.started.elapsed().as_millis()).unwrap();
         fresh.last_poll.store(ms + 1, Ordering::Relaxed);
         assert!(!fresh.stalled(), "a poll just now");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_cursor_takes_ready_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let work = tokio::spawn(async { panic!("a provider answer the decoder could not take") });
+        supervise(s.clone(), work).await.unwrap();
+        let (st, r) = call(router(s), "GET", "/ready", None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{r}");
+        assert!(r["error"].as_str().unwrap().contains("panicked"), "{r}");
     }
 
     #[tokio::test]
