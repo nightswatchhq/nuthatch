@@ -889,6 +889,12 @@ pub async fn dev(
                 m.chain_id
             );
         }
+        // Before anything is served: RPC-scanned rows in the mirror's blocks must not answer while the
+        // cursor, which may never get past its chain check, has yet to replace them.
+        state.history.keep_verified_only(
+            &crate::address_discovery::BLOCK_SCANNED,
+            (m.from_block, m.to_block),
+        )?;
         let source = crate::address_partitions::Source::open(
             &m.url,
             chain_id,

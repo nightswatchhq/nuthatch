@@ -645,6 +645,17 @@ impl AddressHistory {
                     &coverage_key(&a, action),
                     (from, to),
                 )?;
+            } else {
+                // Rows the RPC wrote are not verified, whatever was there before them.
+                let key = coverage_key(&a, action);
+                let mut v = wtx.open_table(VERIFIED_COV)?;
+                let kept = match v.get(key.as_slice())? {
+                    Some(s) => Some(subtract(&decode_spans(s.value())?, (from, to))),
+                    None => None,
+                };
+                if let Some(kept) = kept {
+                    v.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
             }
             put_rows(&wtx, action, &a, rows)?;
             cover(&wtx, action, &a, from, to)?;
@@ -2025,6 +2036,14 @@ mod tests {
         assert_eq!(
             h.verified_coverage(Action::MinedBlocks, ALICE).unwrap(),
             vec![(50, 60)]
+        );
+        let g = h.generation().unwrap();
+        h.record(Action::MinedBlocks, ALICE, &[], (55, 56), g)
+            .unwrap();
+        assert_eq!(
+            h.verified_coverage(Action::MinedBlocks, ALICE).unwrap(),
+            vec![(50, 54), (57, 60)],
+            "an RPC write over verified blocks takes their mark away"
         );
     }
 
