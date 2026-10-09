@@ -113,7 +113,7 @@ jobs:
         run: |
           set -euo pipefail
           df -h /
-          sudo fallocate -l 8G /swapfile.lto
+          sudo fallocate -l 16G /swapfile.lto
           sudo chmod 600 /swapfile.lto
           sudo mkswap /swapfile.lto
           sudo swapon /swapfile.lto
