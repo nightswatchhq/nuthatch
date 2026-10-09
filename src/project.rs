@@ -992,19 +992,19 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
 const GITATTRIBUTES: &str = "*.sql linguist-detectable\nabis/** linguist-generated\n";
 
 fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<()> {
-    let views = dir.join("views");
-    if views.exists() {
-        return Ok(()); // author already has a views/ - never clobber it
-    }
-    std::fs::create_dir_all(&views)
-        .with_context(|| format!("cannot create {}", views.display()))?;
-
     // GitHub counts SQL as data, so without this a nest repo shows no language. Hidden, so it stays
     // outside the data identity.
     let attrs = dir.join(".gitattributes");
     if !attrs.exists() {
         std::fs::write(&attrs, GITATTRIBUTES).context("failed to write .gitattributes")?;
     }
+
+    let views = dir.join("views");
+    if views.exists() {
+        return Ok(()); // author already has a views/ - never clobber it
+    }
+    std::fs::create_dir_all(&views)
+        .with_context(|| format!("cannot create {}", views.display()))?;
 
     std::fs::write(
         views.join("README.md"),
@@ -2268,6 +2268,25 @@ mod tests {
             std::fs::read_to_string(dir.path().join("views/10-example.sql")).unwrap(),
             "-- author's edit",
             "existing views/ is never clobbered"
+        );
+
+        // A nest that already has views/ still gets the attributes, and an author's own are kept.
+        let old = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(old.path().join("views")).unwrap();
+        scaffold_views(old.path(), &schema).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(old.path().join(".gitattributes")).unwrap(),
+            GITATTRIBUTES
+        );
+        std::fs::write(
+            old.path().join(".gitattributes"),
+            "*.md linguist-documentation\n",
+        )
+        .unwrap();
+        scaffold_views(old.path(), &schema).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(old.path().join(".gitattributes")).unwrap(),
+            "*.md linguist-documentation\n"
         );
     }
 
