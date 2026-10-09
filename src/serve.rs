@@ -970,6 +970,22 @@ pub async fn bind_and_serve(
     Ok(())
 }
 
+/// [`bind_and_serve`] for a caller that bound the listener itself, to read its address first.
+pub async fn serve_bound(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Result<()> {
+    let app = match cors {
+        Some(layer) => cors_outside_admin(app, layer),
+        None => app,
+    };
+    tracing::info!("API live on http://{}", listener.local_addr()?);
+    serve_until(listener, app, shutdown_signal(), SHUTDOWN_GRACE).await;
+    tracing::info!("shutdown signal received; API stopped");
+    Ok(())
+}
+
 /// Serve `app` on `listener` until `shutdown` resolves, then drain connections for at most `grace`.
 async fn serve_until(
     mut listener: tokio::net::TcpListener,

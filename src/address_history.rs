@@ -171,6 +171,8 @@ const MINED_BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_min
 /// `address | action code` -> `[from, to]` pairs, inclusive, sorted and merged, 16 bytes each.
 const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverage");
 const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
+/// Addresses removed at runtime, so a restart does not re-seed them from the config.
+const UNWATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_unwatched");
 const META: TableDefinition<&str, u64> = TableDefinition::new("ah_meta");
 const HEAD: &str = "head";
 const GENERATION: &str = "generation";
@@ -243,7 +245,8 @@ pub struct AddressHistory {
 
 impl AddressHistory {
     /// Open the tables, and add `seed` (the configured addresses) to the watched set. Addresses
-    /// already watched are left alone, and none are removed: the set outlives the config that seeded it.
+    /// already watched are left alone, none are removed, and one unwatched at runtime is not brought
+    /// back by the config that first seeded it.
     pub fn open(store: Store, chain_id: u64, seed: &[String]) -> Result<AddressHistory> {
         let seed: Vec<Address> = seed
             .iter()
@@ -257,9 +260,12 @@ impl AddressHistory {
         wtx.open_table(COVERAGE)?;
         wtx.open_table(META)?;
         {
+            let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
             for a in &seed {
-                w.insert(a.as_slice(), 1)?;
+                if dropped.get(a.as_slice())?.is_none() {
+                    w.insert(a.as_slice(), 1)?;
+                }
             }
         }
         wtx.commit()?;
@@ -302,6 +308,7 @@ impl AddressHistory {
         let a = parse_address(address)?;
         let wtx = self.store.database().begin_write()?;
         wtx.open_table(WATCHED)?.insert(a.as_slice(), 1)?;
+        wtx.open_table(UNWATCHED)?.remove(a.as_slice())?;
         wtx.commit()?;
         Ok(())
     }
@@ -312,6 +319,7 @@ impl AddressHistory {
         let wtx = self.store.database().begin_write()?;
         {
             wtx.open_table(WATCHED)?.remove(a.as_slice())?;
+            wtx.open_table(UNWATCHED)?.insert(a.as_slice(), 1)?;
             let lo = row_key(&a, 0, 0, 0);
             let hi = row_key(&a, u64::MAX, u64::MAX, u64::MAX);
             for action in Action::ALL {
@@ -1339,6 +1347,20 @@ mod tests {
         }
         let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[]).unwrap();
         assert_eq!(h.watched().unwrap().len(), 2);
+
+        // Unwatching a configured address survives a restart with the same config.
+        h.unwatch(ALICE).unwrap();
+        drop(h);
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+        assert_eq!(h.watched().unwrap(), vec![BOB.to_string()]);
+        h.watch(ALICE).unwrap();
+        drop(h);
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[]).unwrap();
+        assert_eq!(
+            h.watched().unwrap().len(),
+            2,
+            "watching again clears the removal"
+        );
     }
 
     #[test]

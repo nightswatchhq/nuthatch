@@ -157,9 +157,9 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
     Ok(out)
 }
 
-/// An input file's bytes as the blob sees them: verbatim, except that `nuthatch.toml` loses its
+/// An input file's bytes as the identity sees them: verbatim, except that `nuthatch.toml` loses its
 /// `[address_history]` table (RFC-0063). The watched accounts change at runtime and are the user's
-/// private business, so they are neither part of the nest's identity nor shipped in its bundle.
+/// private business, so they are not part of what the nest is.
 fn input_bytes(dir: &Path, rel: &str) -> Result<Vec<u8>> {
     let bytes = std::fs::read(dir.join(rel)).with_context(|| format!("reading {rel}"))?;
     if rel == crate::config::CONFIG_FILE {
@@ -179,14 +179,27 @@ pub(crate) fn without_address_history(bytes: Vec<u8>) -> Result<Vec<u8>> {
     }
     let mut out = String::with_capacity(text.len());
     let mut skipping = false;
+    // Comments and blank lines met while skipping are held back: those directly above the next
+    // header belong to that table, not to this one.
+    let mut held = String::new();
     for line in text.split_inclusive('\n') {
         let t = line.trim_start();
-        if t.starts_with('[') {
-            let header = t.split('#').next().unwrap_or("").trim();
-            skipping = header == format!("[{TABLE}]");
+        if let Some(name) = table_header(t) {
+            if skipping {
+                out.push_str(&held);
+                held.clear();
+            }
+            skipping = name == TABLE;
+            if skipping {
+                continue;
+            }
         }
         if !skipping {
             out.push_str(line);
+        } else if t.trim_end().is_empty() || t.starts_with('#') {
+            held.push_str(line);
+        } else {
+            held.clear();
         }
     }
     // The cut is textual, so check it removed exactly the table: an inline or dotted form would leave
@@ -200,6 +213,21 @@ pub(crate) fn without_address_history(bytes: Vec<u8>) -> Result<Vec<u8>> {
         );
     }
     Ok(out.into_bytes())
+}
+
+/// The key a `[table]` header line names, unquoted and trimmed: `[ a ]`, `["a"]` and `['a']` all name
+/// `a`. `None` for anything else, an array-of-tables header included.
+fn table_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix('[')?;
+    if rest.starts_with('[') {
+        return None;
+    }
+    let name = rest[..rest.find(']')?].trim();
+    let unquoted = ['"', '\'']
+        .iter()
+        .find_map(|q| name.strip_prefix(*q).and_then(|n| n.strip_suffix(*q)))
+        .unwrap_or(name);
+    Some(unquoted.to_string())
 }
 
 /// Build the manifest for the nest at `dir` without writing anything - hashes every authored input and
@@ -355,6 +383,13 @@ pub fn nest_nid(dir: &Path) -> Result<String> {
 /// write an unpacked bundle *directory* instead (handy for inspecting contents). Prints the bundle's
 /// content address. Default output is `<nest-name>-<hash12>.bundle` beside the nest.
 pub fn bundle(dir: &Path, out: Option<&Path>, as_dir: bool, allow_secrets: bool) -> Result<()> {
+    if Config::load(dir).is_ok_and(|c| c.address_history.is_some()) {
+        bail!(
+            "{} declares [address_history]: an address-history nest watches private accounts and \
+             is not bundled",
+            crate::config::CONFIG_FILE
+        );
+    }
     let found = bundled_credentials(dir);
     if !found.is_empty() {
         let list = found
@@ -434,12 +469,7 @@ fn write_bundle_dir(src: &Path, out_dir: &Path, manifest: &Manifest) -> Result<(
         if let Some(p) = dst.parent() {
             std::fs::create_dir_all(p)?;
         }
-        if f.path == crate::config::CONFIG_FILE {
-            std::fs::write(&dst, input_bytes(src, &f.path)?)
-        } else {
-            std::fs::copy(src.join(&f.path), &dst).map(drop)
-        }
-        .with_context(|| format!("copying {}", f.path))?;
+        std::fs::copy(src.join(&f.path), &dst).with_context(|| format!("copying {}", f.path))?;
     }
     // Pretty-print the *stored* manifest for human readability; the blob hash is over the canonical
     // (compact) bytes, so on-disk formatting never affects identity.
@@ -469,17 +499,8 @@ fn write_bundle(src: &Path, manifest: &Manifest, out_file: &Path) -> Result<()> 
         .context("adding manifest.json to bundle")?;
 
     for f in &manifest.files {
-        let added = if f.path == crate::config::CONFIG_FILE {
-            let bytes = input_bytes(src, &f.path)?;
-            let mut header = tar::Header::new_gnu();
-            header.set_metadata(&std::fs::metadata(src.join(&f.path))?);
-            header.set_size(bytes.len() as u64);
-            header.set_cksum();
-            ar.append_data(&mut header, Path::new(&f.path), &bytes[..])
-        } else {
-            ar.append_path_with_name(src.join(&f.path), Path::new(&f.path))
-        };
-        added.with_context(|| format!("adding {} to bundle", f.path))?;
+        ar.append_path_with_name(src.join(&f.path), Path::new(&f.path))
+            .with_context(|| format!("adding {} to bundle", f.path))?;
     }
     ar.finish().context("finalising bundle")?;
     Ok(())
@@ -1349,7 +1370,7 @@ abi = "abis/c.json"
     }
 
     /// RFC-0063: the watched accounts and the poll cadence change at runtime and are private, so
-    /// neither moves the NID or the data identity, and neither is shipped in a bundle.
+    /// neither moves the NID or the data identity, and the nest is not bundled at all.
     #[test]
     fn address_history_stays_out_of_the_identity_and_the_bundle() {
         let alice = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
@@ -1359,7 +1380,8 @@ abi = "abis/c.json"
             format!(
                 "\n[address_history] # rotki\naddresses = [\"{alice}\", \"{bob}\"]\npoll_interval = \"1m\"\n"
             ),
-            format!("\n[address_history]\naddresses = [\"{bob}\"]\nstart_block = 7\n"),
+            format!("\n[ address_history ]\naddresses = [\"{bob}\"]\nstart_block = 7\n"),
+            format!("\n[\"address_history\"]\r\naddresses = [\r\n  \"{bob}\",\r\n]\r\n"),
         ];
         let mut ids = Vec::new();
         for v in &variants {
@@ -1367,18 +1389,15 @@ abi = "abis/c.json"
             address_nest(d.path(), v);
             let m = build_manifest(d.path(), None).unwrap();
             ids.push((m.nid(), m.data_identity()));
-
-            let out = tempfile::tempdir().unwrap();
-            bundle(d.path(), Some(&out.path().join("b")), true, false).unwrap();
-            let shipped = std::fs::read_to_string(out.path().join("b").join(CONFIG_FILE)).unwrap();
-            assert!(!shipped.contains("address_history"), "{shipped}");
-            assert!(!shipped.to_lowercase().contains(&bob[2..]), "{shipped}");
-            for f in &m.files {
-                let bytes = std::fs::read(out.path().join("b").join(&f.path)).unwrap();
-                assert_eq!(hex::encode(Sha256::digest(&bytes)), f.sha256, "{}", f.path);
-            }
         }
         assert!(ids.windows(2).all(|w| w[0] == w[1]), "{ids:?}");
+
+        let d = tempfile::tempdir().unwrap();
+        address_nest(d.path(), &variants[0]);
+        let out = tempfile::tempdir().unwrap();
+        let err = bundle(d.path(), Some(&out.path().join("b")), true, false).unwrap_err();
+        assert!(err.to_string().contains("not bundled"), "{err}");
+        assert!(!out.path().join("b").exists());
 
         // The cut takes the table and nothing after it: an edit in a table that follows still counts.
         let d = tempfile::tempdir().unwrap();
@@ -1408,6 +1427,18 @@ abi = "abis/c.json"
         assert_eq!(entry.sha256, hex::encode(Sha256::digest(&raw)));
     }
 
+    /// Comments directly above the next table are that table's, and survive the cut byte for byte.
+    #[test]
+    fn the_cut_keeps_the_next_tables_comments() {
+        let before = "[nest]\nname = \"n\"\n\n[address_history]\naddresses = []\n# inside\npoll_interval = \"1m\"\n\n# about extract\n[extract]\nblocks = true\n";
+        let after = "[nest]\nname = \"n\"\n\n\n# about extract\n[extract]\nblocks = true\n";
+        assert_eq!(
+            String::from_utf8(without_address_history(before.as_bytes().to_vec()).unwrap())
+                .unwrap(),
+            after
+        );
+    }
+
     #[test]
     fn an_inline_address_history_is_refused_rather_than_half_cut() {
         for form in [
@@ -1424,7 +1455,7 @@ abi = "abis/c.json"
             b"[address_history]\naddresses = []\n\n[nest]\nname = \"n\"\n".to_vec(),
         )
         .unwrap();
-        assert_eq!(kept, b"[nest]\nname = \"n\"\n");
+        assert_eq!(kept, b"\n[nest]\nname = \"n\"\n");
     }
 
     /// RFC-0062: declaring a maintained view moves the NID, as any authored input does, and not the

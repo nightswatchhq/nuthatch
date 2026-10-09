@@ -2837,6 +2837,15 @@ async fn build_nest(
     Option<tokio::task::JoinHandle<()>>,
     u64,
 )> {
+    // RFC-0063: an address-history nest runs only as a solo `dev`; mounted or served, it would get an
+    // event nest's machinery and none of its own.
+    if config.address_history.is_some() {
+        anyhow::bail!(
+            "{} declares [address_history]: an address-history nest runs only as `nuthatch dev --dir \
+             <nest>`, not in a runtime or under `serve`",
+            dir.display()
+        );
+    }
     crate::analytics_budget::validate_cursor_budget(1)?;
     // RFC-0014 extraction is configured but not yet sourceable. Refuse rather than start, because the
     // failure mode of starting is the worse one: `traces`/`state_diffs` would exist, answer queries,
@@ -11830,6 +11839,40 @@ template = "pool"
         if let Some(w) = worker {
             w.abort();
         }
+    }
+
+    /// RFC-0063: mounts and `serve` go through `build_nest`, which would give an address-history nest
+    /// an event nest's machinery and none of its own, so it refuses one before opening anything.
+    #[tokio::test]
+    async fn an_address_history_nest_is_refused_by_build_nest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"r\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [address_history]\naddresses = [\"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let Err(err) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        else {
+            panic!("an address-history nest must not build as an event nest");
+        };
+        assert!(err.to_string().contains("[address_history]"), "{err}");
+        assert!(
+            !dir.path().join(crate::config::DB_FILE).exists(),
+            "refused before opening a store"
+        );
     }
 
     /// Seed a nest's hot store with one row per block and set `LAST_BLOCK` to the max.

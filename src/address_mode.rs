@@ -3,7 +3,7 @@
 //! It shares nothing with the event path. No decode registry, no DBSP circuit, no Burrmill, no
 //! sealing: one redb handle, one cursor that reads the chain head every `poll_interval`, and a small
 //! router serving `/api`, `/health`, `/ready` and `/metrics`. Discovery (slices 3 to 5) runs inside
-//! [`poll_once`]; today a poll is exactly one RPC call.
+//! [`poll_once`]; today a poll is one head read.
 
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -20,18 +20,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::address_history::AddressHistory;
+use crate::address_history::{AddressHistory, AddressHistoryConfig};
 use crate::config::Config;
 use crate::rpc::RpcClient;
 
 /// Where the cursor reads the chain head. A trait so tests drive the loop without a network.
 pub trait HeadSource: Send + Sync + 'static {
     fn head(&self) -> impl std::future::Future<Output = Result<u64>> + Send;
+    /// Every request this source has sent so far, failovers and startup checks included.
+    fn requests(&self) -> u64;
 }
 
 impl HeadSource for RpcClient {
     async fn head(&self) -> Result<u64> {
         self.block_number().await
+    }
+
+    fn requests(&self) -> u64 {
+        self.request_count()
     }
 }
 
@@ -39,15 +45,16 @@ pub struct ModeState {
     pub history: AddressHistory,
     pub chain_id: u64,
     pub poll_interval: Duration,
-    /// Whether the server is bound to loopback. Watch and unwatch change what the nest asks its RPC
-    /// for, so they are refused on any other bind.
+    /// Whether the bound socket is a loopback address. Watch and unwatch change what the nest asks its
+    /// RPC for, so they are refused on any other bind.
     pub loopback: bool,
     started: Instant,
-    /// Unix seconds of the last successful head read; 0 for none yet.
+    /// Milliseconds after `started` of the last successful poll, plus one; 0 for none yet. Monotonic,
+    /// so a wall-clock step cannot hide a stall.
     last_poll: AtomicU64,
     polls: AtomicU64,
     poll_errors: AtomicU64,
-    rpc_calls: AtomicU64,
+    rpc_requests: AtomicU64,
 }
 
 impl ModeState {
@@ -66,37 +73,62 @@ impl ModeState {
             last_poll: AtomicU64::new(0),
             polls: AtomicU64::new(0),
             poll_errors: AtomicU64::new(0),
-            rpc_calls: AtomicU64::new(0),
+            rpc_requests: AtomicU64::new(0),
+        }
+    }
+
+    fn stalled(&self) -> bool {
+        let since_start = self.started.elapsed();
+        let last = self.last_poll.load(Ordering::Relaxed);
+        let since_poll = if last == 0 {
+            since_start
+        } else {
+            since_start.saturating_sub(Duration::from_millis(last - 1))
+        };
+        since_poll > 3 * self.poll_interval
+    }
+}
+
+/// One poll: read the head and record it. Fails on a failed head read or a failed write.
+pub async fn poll_once(state: &ModeState, source: &impl HeadSource) -> Result<u64> {
+    state.polls.fetch_add(1, Ordering::Relaxed);
+    let read = source.head().await;
+    state
+        .rpc_requests
+        .store(source.requests(), Ordering::Relaxed);
+    let recorded = match read {
+        Ok(head) => {
+            let history = state.history.clone();
+            tokio::task::spawn_blocking(move || history.set_head(head))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
+                .map(|()| head)
+        }
+        Err(e) => Err(e),
+    };
+    match recorded {
+        Ok(head) => {
+            let ms = u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+            state.last_poll.store(ms + 1, Ordering::Relaxed);
+            Ok(head)
+        }
+        Err(e) => {
+            state.poll_errors.fetch_add(1, Ordering::Relaxed);
+            Err(e)
         }
     }
 }
 
-/// One poll: read the head and record it. The only RPC call a poll makes until discovery lands.
-pub async fn poll_once(state: &ModeState, source: &impl HeadSource) -> Result<u64> {
-    state.polls.fetch_add(1, Ordering::Relaxed);
-    state.rpc_calls.fetch_add(1, Ordering::Relaxed);
-    let head = match source.head().await {
-        Ok(h) => h,
-        Err(e) => {
-            state.poll_errors.fetch_add(1, Ordering::Relaxed);
-            return Err(e);
-        }
-    };
-    let history = state.history.clone();
-    tokio::task::spawn_blocking(move || history.set_head(head)).await??;
-    state.last_poll.store(unix_now(), Ordering::Relaxed);
-    Ok(head)
-}
-
-/// Poll forever. A failed poll is logged and retried at the next tick: covered history keeps
-/// serving while the RPC is down.
+/// Poll forever, the first poll at once. A failed poll is logged and retried at the next tick:
+/// covered history keeps serving while the RPC is down.
 pub async fn cursor(state: Arc<ModeState>, source: impl HeadSource) {
     let mut tick = tokio::time::interval(state.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         if let Err(e) = poll_once(&state, &source).await {
-            tracing::warn!("address history: head read failed, retrying next poll: {e:#}");
+            tracing::warn!("address history: poll failed, retrying next interval: {e:#}");
         }
     }
 }
@@ -112,16 +144,31 @@ pub fn router(state: Arc<ModeState>) -> Router {
         .with_state(state)
 }
 
+/// Run a store read off the async workers.
+async fn blocking<T: Send + 'static>(
+    s: &Arc<ModeState>,
+    f: impl FnOnce(&AddressHistory) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let history = s.history.clone();
+    tokio::task::spawn_blocking(move || f(&history)).await?
+}
+
+fn failed(status: StatusCode, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({ "error": e.to_string() })))
+}
+
 async fn api(
     State(s): State<Arc<ModeState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     Json(
-        tokio::task::spawn_blocking(move || crate::address_history::respond(Some(&s.history), &q))
-            .await
-            .unwrap_or_else(
-                |e| json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e}") }),
-            ),
+        blocking(&s, move |h| {
+            Ok(crate::address_history::respond(Some(h), &q))
+        })
+        .await
+        .unwrap_or_else(
+            |e| json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e:#}") }),
+        ),
     )
 }
 
@@ -130,83 +177,96 @@ struct AddressBody {
     address: String,
 }
 
-async fn watched(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
-    match s.history.watched() {
+async fn watched(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
+    match blocking(&s, |h| h.watched()).await {
         Ok(w) => (StatusCode::OK, Json(json!({ "watched": w }))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{e:#}") })),
-        ),
+        Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
 
-async fn watch(State(s): State<Arc<ModeState>>, Json(b): Json<AddressBody>) -> impl IntoResponse {
+async fn watch(
+    State(s): State<Arc<ModeState>>,
+    Json(b): Json<AddressBody>,
+) -> (StatusCode, Json<Value>) {
     change(s, b.address, true).await
 }
 
-async fn unwatch(State(s): State<Arc<ModeState>>, Json(b): Json<AddressBody>) -> impl IntoResponse {
+async fn unwatch(
+    State(s): State<Arc<ModeState>>,
+    Json(b): Json<AddressBody>,
+) -> (StatusCode, Json<Value>) {
     change(s, b.address, false).await
 }
 
 async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, Json<Value>) {
     if !s.loopback {
-        return (
+        return failed(
             StatusCode::FORBIDDEN,
-            Json(json!({ "error": "the watched set changes only on a loopback bind" })),
+            "the watched set changes only on a loopback bind",
         );
     }
-    let history = s.history.clone();
-    let done = tokio::task::spawn_blocking(move || {
+    if let Err(e) = crate::address_history::parse_address(&address) {
+        return failed(StatusCode::BAD_REQUEST, format!("address `{address}`: {e}"));
+    }
+    let done = blocking(&s, move |h| {
         if add {
-            history.watch(&address)?;
+            h.watch(&address)?;
         } else {
-            history.unwatch(&address)?;
+            h.unwatch(&address)?;
         }
-        history.watched()
+        h.watched()
     })
     .await;
     match done {
-        Ok(Ok(w)) => (StatusCode::OK, Json(json!({ "watched": w }))),
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("{e:#}") })),
+        Ok(w) => (StatusCode::OK, Json(json!({ "watched": w }))),
+        Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
+    // Offline is not unready: covered history still serves, and a cursor that has not polled for
+    // three intervals is reported stalled. A store that cannot be read is unready.
+    match blocking(&s, |h| Ok((h.head()?, h.watched()?.len()))).await {
+        Ok((head, watched)) => (
+            StatusCode::OK,
+            Json(json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "mode": "address_history",
+                "ready": true,
+                "chain_id": s.chain_id,
+                "head": head,
+                "poll_interval_secs": s.poll_interval.as_secs(),
+                "stalled": s.stalled(),
+                "watched": watched,
+            })),
         ),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "mode": "address_history",
+                "ready": false,
+                "error": format!("{e:#}"),
+            })),
         ),
     }
 }
 
-async fn ready(State(s): State<Arc<ModeState>>) -> Json<Value> {
-    let last = s.last_poll.load(Ordering::Relaxed);
-    let head = s.history.head().ok().flatten();
-    // Offline is not unready: covered history still serves. A cursor that has not read the head for
-    // three intervals is reported stalled so an operator can see it.
-    let stalled = if last == 0 {
-        s.started.elapsed() > 3 * s.poll_interval
-    } else {
-        unix_now().saturating_sub(last) > 3 * s.poll_interval.as_secs()
-    };
-    Json(json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "mode": "address_history",
-        "ready": true,
-        "chain_id": s.chain_id,
-        "head": head,
-        "last_poll": (last != 0).then_some(last),
-        "poll_interval_secs": s.poll_interval.as_secs(),
-        "stalled": stalled,
-        "watched": s.history.watched().map(|w| w.len()).unwrap_or(0),
-    }))
-}
-
 async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
-    let head = s.history.head().ok().flatten().unwrap_or(0);
+    let (head, watched) = match blocking(&s, |h| Ok((h.head()?, h.watched()?.len()))).await {
+        Ok((head, watched)) => (head.unwrap_or(0), watched),
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                format!("store unreadable: {e:#}\n"),
+            );
+        }
+    };
     let body = format!(
-        "# HELP nuthatch_address_history_rpc_calls_total RPC calls made by the address-history cursor.\n\
-         # TYPE nuthatch_address_history_rpc_calls_total counter\n\
-         nuthatch_address_history_rpc_calls_total {}\n\
+        "# HELP nuthatch_address_history_rpc_requests_total RPC requests sent, startup checks and failovers included.\n\
+         # TYPE nuthatch_address_history_rpc_requests_total counter\n\
+         nuthatch_address_history_rpc_requests_total {}\n\
          # TYPE nuthatch_address_history_polls_total counter\n\
          nuthatch_address_history_polls_total {}\n\
          # TYPE nuthatch_address_history_poll_errors_total counter\n\
@@ -214,13 +274,13 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
          # TYPE nuthatch_address_history_head gauge\n\
          nuthatch_address_history_head {head}\n\
          # TYPE nuthatch_address_history_watched gauge\n\
-         nuthatch_address_history_watched {}\n",
-        s.rpc_calls.load(Ordering::Relaxed),
+         nuthatch_address_history_watched {watched}\n",
+        s.rpc_requests.load(Ordering::Relaxed),
         s.polls.load(Ordering::Relaxed),
         s.poll_errors.load(Ordering::Relaxed),
-        s.history.watched().map(|w| w.len()).unwrap_or(0),
     );
     (
+        StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
@@ -229,22 +289,39 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
     )
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// `--poll-interval` wins over `poll_interval` in `[address_history]`, which wins over the default.
-pub fn poll_interval(
-    flag: Option<Duration>,
-    config: &crate::address_history::AddressHistoryConfig,
-) -> Result<Duration> {
+pub fn poll_interval(flag: Option<Duration>, config: &AddressHistoryConfig) -> Result<Duration> {
     match flag {
         Some(d) => Ok(d),
         None => config.poll_interval(),
     }
+}
+
+/// `dev` flags that drive the event path. Accepting one here would start a healthy-looking nest that
+/// silently ignores it.
+fn refuse_event_flags(args: &crate::cli::DevArgs) -> Result<()> {
+    let set: Vec<&str> = [
+        ("--backfill", args.backfill.is_some()),
+        ("--seal-direct", args.seal_direct),
+        ("--concurrency", args.concurrency != 1),
+        ("--window", args.window.is_some()),
+        ("--finality-only", args.finality_only),
+        ("--publish-target", args.publish_target.is_some()),
+        ("--audit-rpc", args.audit_rpc.is_some()),
+        ("--state-rpc", !args.state_rpc.is_empty()),
+        ("--ipfs", !args.ipfs.is_empty()),
+        ("--registry", args.registry.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, on)| on.then_some(flag))
+    .collect();
+    if !set.is_empty() {
+        bail!(
+            "an address-history nest does not take {}: those drive an event nest's indexing",
+            set.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// `nuthatch dev` on a rotki-mode nest.
@@ -264,28 +341,36 @@ pub async fn dev(
             crate::config::CONFIG_FILE
         );
     }
+    refuse_event_flags(args)?;
     let poll_interval = poll_interval(args.poll_interval, ah)?;
+    let listener = tokio::net::TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("cannot bind {}", args.listen))?;
+    let loopback = listener.local_addr()?.ip().is_loopback();
     let store = crate::store::Store::open(&dir.join(crate::config::DB_FILE))?;
     let history = AddressHistory::open(store, config.nest.chain_id, &ah.addresses)?;
 
     let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
     let rpc = RpcClient::with_fallbacks(urls, args.rpc_fallback.clone())?;
+    rpc.verify_chain_ids(config.nest.chain_id)
+        .await
+        .context("checking the RPC is on this nest's chain")?;
     let state = Arc::new(ModeState::new(
         history,
         config.nest.chain_id,
         poll_interval,
-        crate::serve::is_localhost(&args.listen),
+        loopback,
     ));
-    rpc.verify_chain_ids(config.nest.chain_id)
-        .await
-        .context("checking the RPC is on this nest's chain")?;
+    state
+        .rpc_requests
+        .store(rpc.request_count(), Ordering::Relaxed);
     tracing::info!(
         "address history: {} watched, polling every {}s",
         state.history.watched()?.len(),
         poll_interval.as_secs()
     );
     let cursor = tokio::spawn(cursor(state.clone(), rpc));
-    let served = crate::serve::bind_and_serve(&args.listen, router(state), cors).await;
+    let served = crate::serve::serve_bound(listener, router(state), cors).await;
     cursor.abort();
     served
 }
@@ -299,14 +384,29 @@ mod tests {
     const ALICE: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
     const BOB: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
 
-    struct FixedHead(AtomicU64, AtomicU64);
+    /// A head source: 0 means down. Each read counts as `per_read` requests, as a failover would.
+    struct FixedHead {
+        head: AtomicU64,
+        reads: AtomicU64,
+        per_read: u64,
+    }
+    fn fixed(head: u64, per_read: u64) -> Arc<FixedHead> {
+        Arc::new(FixedHead {
+            head: AtomicU64::new(head),
+            reads: AtomicU64::new(0),
+            per_read,
+        })
+    }
     impl HeadSource for Arc<FixedHead> {
         async fn head(&self) -> Result<u64> {
-            self.1.fetch_add(1, Ordering::Relaxed);
-            match self.0.load(Ordering::Relaxed) {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            match self.head.load(Ordering::Relaxed) {
                 0 => bail!("down"),
                 h => Ok(h),
             }
+        }
+        fn requests(&self) -> u64 {
+            self.reads.load(Ordering::Relaxed) * self.per_read
         }
     }
 
@@ -349,9 +449,13 @@ mod tests {
     async fn a_poll_is_one_head_read_and_lands_on_ready_and_metrics() {
         let dir = tempfile::tempdir().unwrap();
         let s = state(dir.path(), true);
-        let source = Arc::new(FixedHead(AtomicU64::new(1_234), AtomicU64::new(0)));
+        let source = fixed(1_234, 1);
         assert_eq!(poll_once(&s, &source).await.unwrap(), 1_234);
-        assert_eq!(source.1.load(Ordering::Relaxed), 1, "one RPC call per poll");
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            1,
+            "one head read per poll"
+        );
 
         let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
         assert_eq!(r["head"], 1_234, "{r}");
@@ -360,23 +464,48 @@ mod tests {
         let (_, m) = call(router(s.clone()), "GET", "/metrics", None).await;
         let m = m.as_str().unwrap();
         assert!(
-            m.contains("nuthatch_address_history_rpc_calls_total 1\n"),
+            m.contains("nuthatch_address_history_rpc_requests_total 1\n"),
             "{m}"
         );
         assert!(m.contains("nuthatch_address_history_head 1234\n"), "{m}");
 
-        source.0.store(0, Ordering::Relaxed);
+        source.head.store(0, Ordering::Relaxed);
         assert!(poll_once(&s, &source).await.is_err());
         let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
         assert_eq!(r["head"], 1_234, "a failed poll keeps the last head");
         assert_eq!(r["ready"], true, "offline still serves");
+        let (_, m) = call(router(s.clone()), "GET", "/metrics", None).await;
+        assert!(m
+            .as_str()
+            .unwrap()
+            .contains("nuthatch_address_history_poll_errors_total 1\n"));
+    }
+
+    /// The counter is the source's own request count, so a read that failed over to a second
+    /// endpoint shows as two requests, not one poll.
+    #[tokio::test]
+    async fn metrics_count_requests_not_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let source = fixed(9, 2);
+        poll_once(&s, &source).await.unwrap();
+        let (_, m) = call(router(s.clone()), "GET", "/metrics", None).await;
+        let m = m.as_str().unwrap();
+        assert!(
+            m.contains("nuthatch_address_history_rpc_requests_total 2\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains("nuthatch_address_history_polls_total 1\n"),
+            "{m}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_cursor_polls_once_per_interval() {
+    async fn the_cursor_polls_once_per_interval_and_reports_a_stall() {
         let dir = tempfile::tempdir().unwrap();
         let s = state(dir.path(), true);
-        let source = Arc::new(FixedHead(AtomicU64::new(7), AtomicU64::new(0)));
+        let source = fixed(7, 1);
         let task = tokio::spawn(cursor(s.clone(), source.clone()));
         let settle = || async {
             for _ in 0..20 {
@@ -385,18 +514,31 @@ mod tests {
             }
         };
         settle().await;
-        assert_eq!(source.1.load(Ordering::Relaxed), 1, "one poll at start");
+        assert_eq!(source.reads.load(Ordering::Relaxed), 1, "one poll at start");
         tokio::time::advance(Duration::from_secs(299)).await;
         settle().await;
         assert_eq!(
-            source.1.load(Ordering::Relaxed),
+            source.reads.load(Ordering::Relaxed),
             1,
             "none before the interval"
         );
         tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
-        assert_eq!(source.1.load(Ordering::Relaxed), 2);
+        assert_eq!(source.reads.load(Ordering::Relaxed), 2);
         task.abort();
+    }
+
+    #[test]
+    fn a_cursor_quiet_for_three_intervals_is_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        assert!(!s.stalled());
+        let fresh = ModeState::new(s.history.clone(), 1, Duration::from_millis(1), true);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(fresh.stalled(), "no poll in three intervals");
+        let ms = u64::try_from(fresh.started.elapsed().as_millis()).unwrap();
+        fresh.last_poll.store(ms + 1, Ordering::Relaxed);
+        assert!(!fresh.stalled(), "a poll just now");
     }
 
     #[tokio::test]
@@ -441,10 +583,25 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn watch_is_refused_off_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), false);
+        let (st, _) = call(
+            router(s.clone()),
+            "POST",
+            "/api/watch",
+            Some(json!({"address": BOB})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert_eq!(s.history.watched().unwrap().len(), 1);
+    }
+
     /// Five minutes, written out: a test that compared against the constant would move with it.
     #[test]
     fn the_poll_interval_defaults_to_five_minutes_and_the_flag_wins() {
-        let mut cfg = crate::address_history::AddressHistoryConfig {
+        let mut cfg = AddressHistoryConfig {
             addresses: vec![ALICE.into()],
             start_block: None,
             end_block: None,
@@ -462,18 +619,29 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn watch_is_refused_off_loopback() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = state(dir.path(), false);
-        let (st, _) = call(
-            router(s.clone()),
-            "POST",
-            "/api/watch",
-            Some(json!({"address": BOB})),
-        )
-        .await;
-        assert_eq!(st, StatusCode::FORBIDDEN);
-        assert_eq!(s.history.watched().unwrap().len(), 1);
+    #[test]
+    fn event_flags_are_refused_by_name() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["nuthatch", "dev", "--dir", "x"];
+            argv.extend_from_slice(extra);
+            match crate::cli::Cli::parse_from(argv).command {
+                crate::cli::Command::Dev(a) => a,
+                _ => unreachable!(),
+            }
+        };
+        refuse_event_flags(&parse(&[])).unwrap();
+        refuse_event_flags(&parse(&["--poll-interval", "1m", "--rpc", "https://x"])).unwrap();
+        for flag in [
+            &["--backfill", "10"][..],
+            &["--seal-direct"],
+            &["--window", "100"],
+            &["--finality-only"],
+            &["--publish-target", "s3://x"],
+            &["--audit-rpc", "https://x"],
+        ] {
+            let err = refuse_event_flags(&parse(flag)).unwrap_err();
+            assert!(err.to_string().contains(flag[0]), "{flag:?}: {err}");
+        }
     }
 }
