@@ -1,6 +1,6 @@
 [package]
 name = "nuthatch"
-version = "4.15.0"
+version = "5.0.0"
 edition = "2021"
 autotests = false
 # **Measured, not asserted.** `cargo +1.85.0 check` fails outright - `cranelift-assembler-x64` needs
@@ -15,8 +15,7 @@ homepage = "https://www.nuthatch-indexer.com"
 readme = "README.md"
 keywords = ["blockchain", "indexer", "ethereum", "self-hosted", "mcp"]
 categories = ["command-line-utilities", "database", "cryptography::cryptocurrencies"]
-# Keep the published crate lean: the 1.2 MB example WASM component and its guest source aren't
-# needed to build the host (only a skipped test loads it), the scratch/docs aren't either, and
+# Keep the published crate lean: the scratch/docs aren't needed to build the host, and
 # fuzz/ is dev-only tooling (its own package, nightly-only, never in the data path per CLAUDE.md §4).
 exclude = ["/scratchpad", "/fuzz", "/decode", "/tools", "/count"]
 

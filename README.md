@@ -582,12 +582,12 @@ The guide covers the questions people actually hit:
 
 A major version is a promise about **stability**, not a claim of completeness.
 
-- **4.x is the stable line.** Within 4.x, `nuthatch.toml`, `mounts.toml` and `entities.toml` keep
+- **5.x is the stable line.** Within 5.x, `nuthatch.toml`, `mounts.toml` and `entities.toml` keep
   working; a data directory upgrades drop-in, with no re-index; and the HTTP, SQL and MCP surfaces do
   not break. Upgrade only: a downgrade is not promised. Off-by-default cargo features are
   experimental and not covered. The full terms are the
   [stability contract](docs/operators.md#stability-contract).
-- **Minors add, patches fix.** A released 4.x only gets patch releases; features wait for the next
+- **Minors add, patches fix.** A released 5.x only gets patch releases; features wait for the next
   minor, and correctness and security fixes ship at once as patches. The cadence is whatever the
   work needs: 4.1.0 to 4.10.1 shipped between 2026-10-02 and 2026-10-05, each with notes under
   [`docs/releases/`](docs/releases/).
