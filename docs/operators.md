@@ -1503,7 +1503,8 @@ stated explicitly rather than left to be discovered.
 
 **Binary upgrades.** Proven in production across 0.3.0 → 0.6.0 → 0.6.2 → 1.0.0 on a box serving public
 traffic throughout: each was a binary swap and a restart, with no data migration and no flag changes.
-Every 4.x and 5.x release since has been the same swap and restart, and each release's notes carry a
+Every 4.x release since has been the same swap and restart, and so is 5.0.0 for a nest without a
+`[screening]` table, which 5.0.0 refuses until it is deleted. Each release's notes carry a
 **Compatibility and upgrade** section that says so, or names the migration or re-index if one is
 needed.
 
