@@ -29,6 +29,20 @@ pub const DISCOVERED: [Action; 5] = [
     Action::Token1155Tx,
 ];
 
+/// The actions a scan of block bodies fills, once per block for every watched address.
+pub const BLOCK_SCANNED: [Action; 2] = [Action::BeaconWithdrawals, Action::MinedBlocks];
+
+/// Blocks per block-scan window: one body each, so a failure costs at most this many refetches.
+pub const BLOCK_WINDOW: u64 = 2_000;
+/// Bodies fetched at once. GraphOps refused hydration with 403s at eight; bodies held at eight.
+const SCAN_CONCURRENCY: usize = 8;
+
+/// Ethereum mainnet's forks that change what a block body carries or what its miner earns.
+const SHANGHAI: u64 = 17_034_870;
+const MERGE: u64 = 15_537_394;
+const CONSTANTINOPLE: u64 = 7_280_000;
+const BYZANTIUM: u64 = 4_370_000;
+
 /// Blocks per recorded window. A failure costs at most this much refetching.
 pub const OUTER_WINDOW: u64 = 50_000;
 /// A sub-call returning this many items may have been truncated by the provider, so it is split.
@@ -345,6 +359,42 @@ struct TxRef {
     failed: bool,
 }
 
+/// What a block scan found for one address.
+#[derive(Debug, Default)]
+pub struct BlockFound {
+    pub withdrawals: Vec<Row>,
+    pub mined: Vec<Row>,
+}
+
+/// Record a block scan's finds for one address over `[from, to]`.
+pub fn record_blocks(
+    history: &AddressHistory,
+    address: &str,
+    (from, to): (u64, u64),
+    found: BlockFound,
+    generation: u64,
+) -> Result<()> {
+    let within = |rows: Vec<Row>| -> Vec<Row> {
+        rows.into_iter()
+            .filter(|r| from <= r.block && r.block <= to)
+            .collect()
+    };
+    history.record(
+        Action::BeaconWithdrawals,
+        address,
+        &within(found.withdrawals),
+        (from, to),
+        generation,
+    )?;
+    history.record(
+        Action::MinedBlocks,
+        address,
+        &within(found.mined),
+        (from, to),
+        generation,
+    )
+}
+
 /// What one window found for one address, ready to record.
 #[derive(Debug, Default)]
 pub struct Found {
@@ -480,6 +530,142 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 })
             })
             .collect()
+    }
+
+    /// Read every block body in `[from, to]` once, for all of `addresses` at once: the withdrawals
+    /// paid to each (EIP-4895) and the blocks each received the fees of. A body missing, without a
+    /// miner, or without its withdrawals after Shanghai fails the scan rather than reading as none.
+    pub async fn scan_blocks(
+        &self,
+        addresses: &[String],
+        from: u64,
+        to: u64,
+        pending: &Pending,
+    ) -> Result<BTreeMap<String, BlockFound>> {
+        let watched: BTreeSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
+        let bodies: Vec<Result<(u64, Value)>> = futures::stream::iter(from..=to)
+            .map(|b| self.body(b))
+            .buffered(SCAN_CONCURRENCY)
+            .collect()
+            .await;
+        let mut found: BTreeMap<String, BlockFound> = watched
+            .iter()
+            .map(|a| (a.clone(), BlockFound::default()))
+            .collect();
+        let mut timestamps = Vec::new();
+        for body in bodies {
+            let (b, header) = body?;
+            let ts = hex_u64(header.get("timestamp").unwrap_or(&Value::Null))
+                .with_context(|| format!("block {b} timestamp"))?;
+            timestamps.push((b, ts));
+            match header.get("withdrawals").and_then(Value::as_array) {
+                Some(ws) => {
+                    for (i, w) in ws.iter().enumerate() {
+                        let to = str_field(w, "address")?.to_ascii_lowercase();
+                        let Some(f) = found.get_mut(&to) else {
+                            continue;
+                        };
+                        let mut r = Map::new();
+                        let mut put = |k: &str, v: String| {
+                            r.insert(k.to_string(), Value::String(v));
+                        };
+                        put("withdrawalIndex", decimal(str_field(w, "index")?)?);
+                        put("validatorIndex", decimal(str_field(w, "validatorIndex")?)?);
+                        put("address", to);
+                        put("amount", decimal(str_field(w, "amount")?)?);
+                        put("blockNumber", b.to_string());
+                        put("timestamp", ts.to_string());
+                        f.withdrawals.push(Row {
+                            block: b,
+                            tx_index: 0,
+                            position: i as u64,
+                            record: r,
+                        });
+                    }
+                }
+                None if b >= SHANGHAI => {
+                    bail!("block {b}'s body carries no withdrawals, though it is past Shanghai")
+                }
+                None => {}
+            }
+            let miner = str_field(&header, "miner")?.to_ascii_lowercase();
+            if let Some(f) = found.get_mut(&miner) {
+                let reward = self.block_reward(b, &header).await?;
+                let mut r = Map::new();
+                r.insert("blockNumber".into(), Value::String(b.to_string()));
+                r.insert("timeStamp".into(), Value::String(ts.to_string()));
+                r.insert("blockReward".into(), Value::String(reward));
+                f.mined.push(Row {
+                    block: b,
+                    tx_index: 0,
+                    position: 0,
+                    record: r,
+                });
+            }
+        }
+        pending
+            .timestamps
+            .lock()
+            .expect("pending lock")
+            .extend(timestamps);
+        Ok(found)
+    }
+
+    async fn body(&self, b: u64) -> Result<(u64, Value)> {
+        let header = self
+            .main
+            .call("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))
+            .await
+            .with_context(|| format!("block {b}"))?;
+        if header.is_null() {
+            bail!("the main endpoint has no block {b}");
+        }
+        Ok((b, header))
+    }
+
+    /// What Etherscan's `getminedblocks` calls `blockReward`, measured against its answers: the
+    /// priority fees the block paid its fee recipient, plus before the Merge the static reward and
+    /// a thirty-second of it for each uncle included. Burnt base fees are not counted.
+    async fn block_reward(&self, b: u64, header: &Value) -> Result<String> {
+        use alloy_primitives::U256;
+        let receipts = self
+            .main
+            .call("eth_getBlockReceipts", json!([format!("0x{b:x}")]))
+            .await
+            .with_context(|| format!("receipts of block {b}"))?;
+        let receipts = receipts
+            .as_array()
+            .ok_or_else(|| anyhow!("receipts of block {b} are not a list"))?;
+        let quantity = |v: Option<&Value>| -> Result<U256> {
+            match v.and_then(Value::as_str) {
+                Some(s) => Ok(U256::from_str_radix(s.trim_start_matches("0x"), 16)?),
+                None => Ok(U256::ZERO),
+            }
+        };
+        let base_fee = quantity(header.get("baseFeePerGas"))?;
+        let mut fees = U256::ZERO;
+        for r in receipts {
+            let price = r
+                .get("effectiveGasPrice")
+                .ok_or_else(|| anyhow!("a receipt in block {b} has no effectiveGasPrice"))?;
+            fees += quantity(r.get("gasUsed"))? * (quantity(Some(price))? - base_fee);
+        }
+        let ether = U256::from(1_000_000_000_000_000_000u64);
+        let static_reward = if b >= MERGE {
+            U256::ZERO
+        } else if b >= CONSTANTINOPLE {
+            ether * U256::from(2)
+        } else if b >= BYZANTIUM {
+            ether * U256::from(3)
+        } else {
+            ether * U256::from(5)
+        };
+        let uncles = header
+            .get("uncles")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let reward = static_reward + fees + static_reward / U256::from(32) * U256::from(uncles);
+        Ok(reward.to_string())
     }
 
     /// The root frames from or to `a`, and the transactions with an internal frame touching `a`.
@@ -1223,8 +1409,18 @@ fn batch_arrays(data: &str) -> Result<(Vec<String>, Vec<String>)> {
 
 /// The first block at or after `start` that some discovered action has not covered for `address`.
 pub fn next_uncovered(history: &AddressHistory, address: &str, start: u64) -> Result<u64> {
+    next_uncovered_for(history, address, start, &DISCOVERED)
+}
+
+/// [`next_uncovered`] over the given actions.
+pub fn next_uncovered_for(
+    history: &AddressHistory,
+    address: &str,
+    start: u64,
+    actions: &[Action],
+) -> Result<u64> {
     let mut next = u64::MAX;
-    for action in DISCOVERED {
+    for &action in actions {
         let mut at = start;
         for (from, to) in history.coverage(action, address)? {
             if from <= at && at <= to {
@@ -2365,5 +2561,206 @@ mod tests {
             calls,
             "the second lookup is answered from the store"
         );
+    }
+
+    const B: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
+
+    /// Bodies for blocks past Shanghai: block x02 pays A twice and B once, block x05 is B's.
+    fn bodies(missing_withdrawals_at: Option<u64>) -> Script {
+        script(move |m, p| {
+            Ok(match m {
+                "eth_getBlockByNumber" => {
+                    let b = hex_u64(&p[0])?;
+                    let mut h = json!({"number": format!("0x{b:x}"), "timestamp": format!("0x{:x}", 1_000 + b),
+                        "miner": if b % 10 == 5 { B } else { "0x0000000000000000000000000000000000000077" },
+                        "baseFeePerGas": "0x64", "uncles": [], "withdrawals": []});
+                    if b % 10 == 2 {
+                        h["withdrawals"] = json!([
+                            {"index": "0xa", "validatorIndex": "0x1", "address": A, "amount": "0x5"},
+                            {"index": "0xb", "validatorIndex": "0x2", "address": "0x0000000000000000000000000000000000000099", "amount": "0x6"},
+                            {"index": "0xc", "validatorIndex": "0x3", "address": B, "amount": "0x7"},
+                            {"index": "0xd", "validatorIndex": "0x4", "address": A, "amount": "0x3b9aca00"},
+                        ]);
+                    }
+                    if Some(b) == missing_withdrawals_at {
+                        h.as_object_mut().unwrap().remove("withdrawals");
+                    }
+                    h
+                }
+                "eth_getBlockReceipts" => json!([
+                    {"gasUsed": "0x5208", "effectiveGasPrice": "0x66"},
+                    {"gasUsed": "0x2", "effectiveGasPrice": "0x64"},
+                ]),
+                other => bail!("unexpected {other}"),
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_block_scan_finds_withdrawals_and_mined_blocks_for_every_address() {
+        let (_, trace) = chain(false);
+        let d = Discoverer::new(bodies(None), trace);
+        let pending = Pending::default();
+        let found = d
+            .scan_blocks(&[A.into(), B.into()], 17_100_000, 17_100_009, &pending)
+            .await
+            .unwrap();
+        let a = &found[A];
+        assert_eq!(a.withdrawals.len(), 2);
+        assert_eq!(
+            a.withdrawals[1].record,
+            json!({"withdrawalIndex": "13", "validatorIndex": "4", "address": A,
+                   "amount": "1000000000", "blockNumber": "17100002", "timestamp": "17101002"})
+            .as_object()
+            .unwrap()
+            .clone()
+        );
+        assert_eq!(
+            a.withdrawals[1].position, 3,
+            "the withdrawal's place in its block"
+        );
+        assert!(a.mined.is_empty());
+        let b = &found[B];
+        assert_eq!(b.withdrawals.len(), 1);
+        assert_eq!(b.mined.len(), 1);
+        assert_eq!(b.mined[0].record["blockNumber"], "17100005");
+        // Post-Merge: priority fees only, 21000 gas at 2 over a base fee of 100, plus 2 gas at 0.
+        assert_eq!(b.mined[0].record["blockReward"], "42000");
+        assert_eq!(
+            pending.timestamps.lock().unwrap().len(),
+            10,
+            "every body's timestamp kept"
+        );
+        assert_eq!(
+            d.main
+                .asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == "eth_getBlockByNumber")
+                .count(),
+            10,
+            "one body per block, for both addresses"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_past_shanghai_without_withdrawals_fails_the_scan() {
+        let (_, trace) = chain(false);
+        let d = Discoverer::new(bodies(Some(17_100_004)), trace);
+        let err = d
+            .scan_blocks(&[A.into()], 17_100_000, 17_100_009, &Pending::default())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("carries no withdrawals"),
+            "{err:#}"
+        );
+        let (_, trace) = chain(false);
+        let d = Discoverer::new(bodies(Some(17_000_004)), trace);
+        d.scan_blocks(&[A.into()], 17_000_000, 17_000_009, &Pending::default())
+            .await
+            .expect("before Shanghai a body has no withdrawals to carry");
+    }
+
+    /// Etherscan's blockReward, as measured: pre-Merge it adds the static reward for the fork and a
+    /// thirty-second of it per uncle (mainnet blocks 15,342,722 and 14,000,136 matched to the wei).
+    #[tokio::test]
+    async fn block_rewards_follow_the_forks() {
+        let (_, trace) = chain(false);
+        let d = Discoverer::new(bodies(None), trace);
+        let reward = |b: u64, uncles: usize, base: Option<&str>| {
+            let mut h = json!({"uncles": vec![json!("0x0"); uncles]});
+            if let Some(f) = base {
+                h["baseFeePerGas"] = json!(f);
+            }
+            let d = &d;
+            async move { d.block_reward(b, &h).await.unwrap() }
+        };
+        // Receipts pay 21000 x 102 + 2 x 100.
+        assert_eq!(reward(20_000_000, 0, Some("0x64")).await, "42000");
+        assert_eq!(
+            reward(15_342_722, 1, Some("0x64")).await,
+            (2_000_000_000_000_000_000u128 + 42_000 + 62_500_000_000_000_000).to_string()
+        );
+        assert_eq!(
+            reward(5_000_000, 0, None).await,
+            (3_000_000_000_000_000_000u128 + 21_000 * 102 + 200).to_string(),
+            "Byzantium: 3 ETH, and every fee before London"
+        );
+        assert_eq!(
+            reward(1_000_000, 2, None).await,
+            (5_000_000_000_000_000_000u128 + 21_000 * 102 + 200 + 2 * 156_250_000_000_000_000)
+                .to_string()
+        );
+    }
+
+    /// The cursor's block pass reads each body once for every address that lacks it, and an address
+    /// watched after a window was read gets only its own gap.
+    #[tokio::test]
+    async fn the_block_pass_shares_bodies_and_backfills_a_late_address() {
+        use crate::address_mode::Discovery;
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (_, trace) = chain(false);
+        let main = bodies(None);
+        let both = script(move |m, p| match m {
+            "eth_getLogs" => Ok(json!([])),
+            "eth_getCode" => Ok(json!("0x")),
+            "eth_getTransactionCount" => Ok(json!("0x0")),
+            "eth_getBlockTransactionCountByNumber" => Ok(json!("0x1")),
+            _ => (main.answer)(m, p),
+        });
+        let trace = script(move |m, p| match m {
+            "trace_block" => Ok(json!([{"x": 1}])),
+            _ => (trace.answer)(m, p),
+        });
+        let d = Discoverer::new(Counted::new(both), Counted::new(trace));
+        let state = crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        )
+        .with_range(17_100_000, Some(17_100_009), 0);
+        d.catch_up(&state, 17_200_000).await;
+        assert_eq!(
+            h.coverage(Action::BeaconWithdrawals, A).unwrap(),
+            vec![(17_100_000, 17_100_009)]
+        );
+        let bodies_read = || {
+            d.main
+                .calls()
+                .get("eth_getBlockByNumber")
+                .copied()
+                .unwrap_or(0)
+        };
+        let after_first = bodies_read();
+
+        h.watch(B).unwrap();
+        d.catch_up(&state, 17_200_000).await;
+        assert_eq!(
+            h.coverage(Action::MinedBlocks, B).unwrap(),
+            vec![(17_100_000, 17_100_009)]
+        );
+        assert_eq!(
+            bodies_read() - after_first,
+            10,
+            "B's gap read once, A's coverage not reread"
+        );
+        let req = crate::address_history::PageRequest {
+            address: B.into(),
+            start_block: Some(17_100_000),
+            end_block: Some(17_100_009),
+            sort: crate::address_history::Sort::Asc,
+            page: 1,
+            offset: 10,
+            generation: None,
+        };
+        let crate::address_history::Answer::Rows(rows) = h.page(Action::MinedBlocks, &req).unwrap()
+        else {
+            panic!("covered")
+        };
+        assert_eq!(rows.len(), 1);
     }
 }

@@ -1057,6 +1057,9 @@ pub fn respond(
     if let Some(hash) = get("txhash") {
         return by_txhash(history, act, hash);
     }
+    if act == Action::MinedBlocks && get("blocktype").is_some_and(|t| t != "blocks") {
+        return unsupported("getminedblocks is served for blocktype=blocks only");
+    }
     match parse_request(params) {
         Err(e) => error(e),
         Ok(req) => match history.page_at(act, &req) {
