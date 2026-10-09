@@ -1026,9 +1026,14 @@ jobs:
           BIN: bin/nuthatch
           OUT: tip-lag-report.json
           MAX_SEEN_P50_MS: "30"
+        # Unchanged code read 41 and 43 ms on a busy runner (f598d238, 0eaa5754) against 14-27 ms over
+        # thirty runs, so a failure is measured once more on a fresh server; the 20 ms sleep fails both.
         run: |
           chmod +x bin/nuthatch
-          bash .github/workflows/tip-lag.sh
+          bash .github/workflows/tip-lag.sh || {
+            echo "::warning::tip lag over its ceiling; measuring once more on a fresh server"
+            PORT=8291 RPC_PORT=8549 bash .github/workflows/tip-lag.sh
+          }
       - name: upload tip lag report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

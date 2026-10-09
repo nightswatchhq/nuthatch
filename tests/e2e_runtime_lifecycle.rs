@@ -476,10 +476,16 @@ async fn route_named_runtime(
     )
     .await
     .expect("spawn_runtime");
+    // `/ready` reads the nest's metrics, which the indexer updates after the store commit, so wait on
+    // those too or the first read can catch them a moment behind the store.
     let indexed = wait_until(std::time::Duration::from_secs(30), || {
         let store = &cursor.states[0].1.store;
+        let m = nuthatch::metrics::METRICS.nest(route);
         store.get_meta("last_block").ok().flatten().as_deref() == Some("6")
             && store.sealed_through() >= 4
+            && m.last_block() == 6
+            && m.sealed_through() >= 4
+            && m.seal_direct_completed() >= 4
     })
     .await;
     assert!(
