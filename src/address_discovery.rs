@@ -1681,9 +1681,16 @@ mod tests {
     #[tokio::test]
     async fn concurrent_spans_answer_exactly_what_sequential_spans_would() {
         let rpc = Capped::new(None);
-        let got = ranged(&rpc, &Window::new(100_000), 0, 2_999, "trace_filter", blocks)
-            .await
-            .unwrap();
+        let got = ranged(
+            &rpc,
+            &Window::new(100_000),
+            0,
+            2_999,
+            "trace_filter",
+            blocks,
+        )
+        .await
+        .unwrap();
         let want: Vec<Value> = (0..=2_999u64).map(|b| json!(b)).collect();
         assert_eq!(got, want);
         let most = rpc.most.load(Ordering::SeqCst);
@@ -1701,7 +1708,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("401"), "{err:#}");
-        assert!(format!("{err:#}").contains("trace_filter [2000, "), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("trace_filter [2000, "),
+            "{err:#}"
+        );
     }
 
     #[test]
