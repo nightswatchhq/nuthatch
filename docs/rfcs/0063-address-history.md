@@ -144,11 +144,23 @@ Every figure here is replaced by a measured one before its chain ships.
 
 Withdrawals come from block bodies (EIP-4895). Fee-recipient blocks come from headers; rewards from
 receipts' priority fees. **MEV comes from the MEV-Boost relays' public data API**
-(`/relay/v1/data/bidtraces/proposer_payload_delivered`, keyless, probed on Flashbots 2026-10-09): for
-each block a watched fee recipient produced, the major relays are asked what they delivered, and the
-delivered `value` is reconciled against the builder-to-proposer payment in that block. A block no
-relay claims is unknown, never zero; two relays claiming one block is a conflict, surfaced. Proposer
-attribution (validator index) comes from a Beacon API source when one is configured.
+(`/relay/v1/data/bidtraces/proposer_payload_delivered?block_number=`, keyless), asked of the six that
+answered on 2026-10-10: Flashbots, ultrasound, bloXroute regulated, Agnostic, Aestus and Titan
+(bloXroute max-profit, Eden and Manifold no longer do). It is off unless `[address_history]` sets
+`mev_relays = true`, since the relays see the nest's IP and the block numbers it asks about, which
+name the validator. For a watched address the candidates are the blocks it was fee recipient of
+(slice 5) and the blocks where it received a value transfer from the block's miner or in the
+block's last transaction (a builder's payment). A candidate becomes a row only on a relay's word:
+deliveries are matched to the canonical block by hash, a claim naming the address is preferred, no
+relay record means no MEV figure (empty, never zero), and relays that disagree make the row a
+`conflict` with no value. Relay answers are cached only at or below the served head and dropped above
+a reorg; a relay that cannot be asked fails the window rather than reading as no delivery. The rows
+are served as `module=account&action=nuthatchProducedBlocks`: block, timestamp, fee recipient and its
+block reward, the relays' recipient, value, builder and proposer keys, and the builder's payment
+transaction and value. rotki's adapter reads them ahead of beaconcha.in when the nest is in
+Ethereum's indexer order, with beaconcha.in still asked after it for what the nest cannot
+attribute, and turns them into the same block and MEV events beaconcha.in's data does; a builder's
+transfer to a block's own fee recipient counts as MEV, the block reward never twice.
 
 **Block partitions.** Reading withdrawals and fee recipients from bodies costs one call per block
 per nest: about 269,000 calls for the slice-5 gate's 265,000 blocks, and roughly 9 million for the
@@ -259,6 +271,8 @@ Figures marked (target) are confirmed by the first measurement, then frozen as b
 7. **Keys.** A trace-capable RPC is the only required credential, and the nest says which chain
    needs one and why.
 8. **Private by default.** No head count prompt; localhost only; no outbound call but the RPCs and,
-   once `[address_history.mirror]` names one, the partition mirror. That is the one other call, and
-   it sees the nest's IP and the block ranges it downloads, never an address (§8).
+   once `[address_history.mirror]` names one, the partition mirror, which sees the nest's IP and
+   the block ranges it downloads, never an address; and once `mev_relays = true`, the MEV-Boost
+   relays, which see the IP and the block numbers of the address's produced and relay-paid blocks
+   (§8). Both are off until named.
 9. **Offline.** Covered history serves with the RPC down; gaps answer `NUTHATCH_INCOMPLETE`.
