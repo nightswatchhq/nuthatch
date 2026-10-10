@@ -236,8 +236,9 @@ fn stated_limit(error: &str) -> Option<u64> {
 
 /// Run a ranged call over `[from, to]` in spans the provider accepts, concatenating the arrays in
 /// block order. Once the window's span has been served, up to `RANGE_CONCURRENCY` spans go out at
-/// once; only the run of clean answers from the front is kept, so a span that needs a smaller size
-/// discards the ones after it and they are asked again at the new size.
+/// once and are judged in order as they arrive: clean answers are kept, a fatal one fails the call
+/// at once, and a span that needs a smaller size sends the rest back to be asked again at the new
+/// size, after their answers are read so that a fatal one among them is never discarded.
 async fn ranged<R: Rpc>(
     rpc: &R,
     window: &Window,
@@ -262,7 +263,7 @@ async fn ranged<R: Rpc>(
             spans.push((s, e));
             s = e + 1;
         }
-        let answers: Vec<Result<Value>> = futures::stream::iter(spans.iter().copied())
+        let mut answers = futures::stream::iter(spans.clone())
             .map(|(s, e)| {
                 let p = params(s, e);
                 async move {
@@ -270,43 +271,64 @@ async fn ranged<R: Rpc>(
                     rpc.call(method, p).await
                 }
             })
-            .buffered(lanes)
-            .collect()
-            .await;
-        for ((s, e), answer) in spans.into_iter().zip(answers) {
-            match answer {
-                Ok(Value::Array(items)) if items.len() >= SUSPICIOUSLY_FULL => {
-                    if e == s {
-                        bail!(
-                            "{method} at block {s} answered {} items, which may be a truncated page",
-                            items.len()
-                        );
-                    }
-                    window.shrink("too many results");
-                    break;
-                }
-                Ok(Value::Array(items)) => {
+            .buffered(lanes);
+        let mut asked = spans.into_iter();
+        while let Some(answer) = answers.next().await {
+            let (s, e) = asked.next().expect("one answer per span");
+            match judge(method, s, e, answer)? {
+                Judged::Rows(items) => {
                     window.succeeded();
                     out.extend(items);
                     start = e + 1;
                 }
-                Ok(other) => bail!("{method} [{s}, {e}] answered a non-list: {other}"),
-                Err(err) if e > s => match window.shrink(&format!("{err:#}")) {
-                    Some(next) => {
-                        tracing::debug!(
-                            "{method} [{s}, {e}] refused, retrying in spans of {next}: {err:#}"
-                        );
-                        break;
+                Judged::Smaller(why) => {
+                    while let Some(later) = answers.next().await {
+                        let (s, e) = asked.next().expect("one answer per span");
+                        judge(method, s, e, later)?;
                     }
-                    None => return Err(err).with_context(|| format!("{method} [{s}, {e}]")),
-                },
-                Err(err) => {
-                    return Err(err).with_context(|| format!("{method} at block {s}"));
+                    if let Some(next) = window.shrink(&why) {
+                        tracing::debug!(
+                            "{method} [{s}, {e}] refused, retrying in spans of {next}: {why}"
+                        );
+                    }
+                    break;
                 }
             }
         }
     }
     Ok(out)
+}
+
+/// One span's answer: its rows, or a refusal about its size that a smaller span may not meet.
+enum Judged {
+    Rows(Vec<Value>),
+    Smaller(String),
+}
+
+/// Judge one span's answer by the rules a sequential scan applies; an error is fatal to the call.
+fn judge(method: &str, s: u64, e: u64, answer: Result<Value>) -> Result<Judged> {
+    match answer {
+        Ok(Value::Array(items)) if items.len() >= SUSPICIOUSLY_FULL => {
+            if e == s {
+                bail!(
+                    "{method} at block {s} answered {} items, which may be a truncated page",
+                    items.len()
+                );
+            }
+            Ok(Judged::Smaller("too many results".into()))
+        }
+        Ok(Value::Array(items)) => Ok(Judged::Rows(items)),
+        Ok(other) => bail!("{method} [{s}, {e}] answered a non-list: {other}"),
+        Err(err) if e > s => {
+            let why = format!("{err:#}");
+            if stated_limit(&why).is_some_and(|n| n >= 1) || range_shaped(&why) {
+                Ok(Judged::Smaller(why))
+            } else {
+                Err(err).with_context(|| format!("{method} [{s}, {e}]"))
+            }
+        }
+        Err(err) => Err(err).with_context(|| format!("{method} at block {s}")),
+    }
 }
 
 pub(crate) fn hex_u64(v: &Value) -> Result<u64> {
@@ -1712,6 +1734,58 @@ mod tests {
             format!("{err:#}").contains("trace_filter [2000, "),
             "{err:#}"
         );
+    }
+
+    /// Answers by span: the first time a span is asked, then every time after.
+    struct Spans(
+        Mutex<BTreeSet<(u64, u64)>>,
+        fn(u64, u64, bool) -> Option<Result<Value>>,
+    );
+    impl Rpc for Spans {
+        async fn call(&self, _: &str, p: Value) -> Result<Value> {
+            let s = hex_u64(&p[0]["fromBlock"])?;
+            let e = hex_u64(&p[0]["toBlock"])?;
+            let first = self.0.lock().unwrap().insert((s, e));
+            match (self.1)(s, e, first) {
+                Some(answer) => answer,
+                None => std::future::pending().await,
+            }
+        }
+    }
+    fn rows(s: u64, e: u64) -> Option<Result<Value>> {
+        Some(Ok(Value::Array((s..=e).map(|b| json!(b)).collect())))
+    }
+
+    /// A fatal answer to a span sent alongside one that needs a smaller size fails the call, though
+    /// that span is asked again and answers cleanly the second time.
+    #[tokio::test]
+    async fn a_fatal_answer_behind_a_refusal_is_not_discarded() {
+        let rpc = Spans(Mutex::default(), |s, e, first| match (s, e) {
+            (2, 3) => Some(Err(anyhow!("query timed out"))),
+            (4, 4) if first => Some(Err(anyhow!("401 Unauthorized"))),
+            _ => rows(s, e),
+        });
+        let err = ranged(&rpc, &Window::new(2), 0, 4, "trace_filter", blocks)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+    }
+
+    /// A fatal answer fails the call when it arrives, not when a slower span after it does.
+    #[tokio::test]
+    async fn a_fatal_answer_is_not_held_up_by_a_slower_span() {
+        let rpc = Spans(Mutex::default(), |s, e, _| match (s, e) {
+            (2, 3) => Some(Err(anyhow!("401 Unauthorized"))),
+            (4, 5) => None,
+            _ => rows(s, e),
+        });
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ranged(&rpc, &Window::new(2), 0, 5, "trace_filter", blocks),
+        )
+        .await
+        .expect("the fatal answer ends the call without waiting for [4, 5]");
+        assert!(format!("{:#}", got.unwrap_err()).contains("401"));
     }
 
     #[test]
