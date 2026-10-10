@@ -350,7 +350,7 @@ Verify a pack: signature, artifact hashes, and grant conformance
 
 Build verifiable block partitions for address-history nests (RFC-0063 §8)
 
-- `--rpc <RPC>` - The RPC to read blocks from. Its finalized block bounds what may be built
+- `--rpc <RPC>` - The RPCs to read blocks from, comma-separated and round-robined. Their finalized block bounds what may be built. Any RPC will do: every consumer verifies what is built against its own
 - `--chain-id <CHAIN_ID>` - The chain the RPC must be on, checked before anything is read
 - `--from <FROM>` - First block, a multiple of 10,000
 - `--to <TO>` - Last block, one less than a multiple of 10,000
