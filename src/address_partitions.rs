@@ -518,6 +518,10 @@ pub struct ManifestEntry {
     pub bytes: u64,
     pub sha256: String,
     pub last_hash: String,
+    /// The store's ETag for the object as uploaded, when it gives one. Absent in manifests written
+    /// before it was recorded, which are then checked on size alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e_tag: Option<String>,
 }
 
 /// The block `rpc` calls finalized.
@@ -528,11 +532,36 @@ pub async fn finalized(rpc: &impl Rpc) -> Result<u64> {
     crate::address_discovery::hex_u64(&b["number"]).context("the RPC's finalized block")
 }
 
+/// Whether the object at `key` is still the one `entry` describes: by size and, where the store
+/// gives one, ETag, which a HEAD answers; or by downloading it and checking its sha256.
+async fn intact(
+    mirror: &dyn Mirror,
+    key: &str,
+    entry: &ManifestEntry,
+    verify_existing: bool,
+) -> Result<bool> {
+    if verify_existing {
+        return Ok(mirror
+            .get(key)
+            .await?
+            .is_some_and(|bytes| crate::publish::sha256_hex(&bytes) == entry.sha256));
+    }
+    Ok(mirror.head(key).await?.is_some_and(|h| {
+        h.size == entry.bytes
+            && match (&entry.e_tag, &h.e_tag) {
+                (Some(recorded), Some(now)) => recorded == now,
+                _ => true,
+            }
+    }))
+}
+
 /// What a build wrote.
 #[derive(Debug, Default)]
 pub struct Built {
     pub written: Vec<(u64, u64)>,
     pub skipped: usize,
+    /// Partitions the manifest listed whose object no longer matched, and were built again.
+    pub rebuilt: usize,
     pub bytes: u64,
     pub blocks: u64,
 }
@@ -546,6 +575,7 @@ pub async fn build(
     chain_id: u64,
     (from, to): (u64, u64),
     concurrency: usize,
+    verify_existing: bool,
     mut progress: impl FnMut(u64, u64, u64),
 ) -> Result<Built> {
     let mirror = crate::publish::open_mirror(target)?;
@@ -582,9 +612,13 @@ pub async fn build(
     for start in (from..=to).step_by(SPAN as usize) {
         let end = start + SPAN - 1;
         let key = partition_key(chain_id, start);
-        if manifest.partitions.contains_key(&start) && mirror.head(&key).await?.is_some() {
-            built.skipped += 1;
-            continue;
+        if let Some(entry) = manifest.partitions.get(&start) {
+            if intact(mirror.as_ref(), &key, entry, verify_existing).await? {
+                built.skipped += 1;
+                continue;
+            }
+            tracing::warn!("partition {key} does not match its manifest entry; building it again");
+            built.rebuilt += 1;
         }
         let blocks: Vec<Published> = futures::stream::iter(start..=end)
             .map(|b| fetch_patiently(rpc, b))
@@ -595,6 +629,7 @@ pub async fn build(
         verify(&blocks, start, end, last).context("the blocks the RPC gave do not form a chain")?;
         let bytes = encode(&blocks)?;
         mirror.put(&key, &bytes).await?;
+        let e_tag = mirror.head(&key).await?.and_then(|h| h.e_tag);
         manifest.partitions.insert(
             start,
             ManifestEntry {
@@ -603,6 +638,7 @@ pub async fn build(
                 bytes: bytes.len() as u64,
                 sha256: crate::publish::sha256_hex(&bytes),
                 last_hash: format!("{last:#x}"),
+                e_tag,
             },
         );
         mirror
@@ -633,6 +669,7 @@ pub async fn run(args: &crate::cli::PartitionsArgs) -> Result<()> {
         args.chain_id,
         (args.from, args.to),
         args.concurrency,
+        args.verify_existing,
         |from, to, bytes| {
             let secs = started.elapsed().as_secs_f64();
             println!(
@@ -644,8 +681,9 @@ pub async fn run(args: &crate::cli::PartitionsArgs) -> Result<()> {
     .await?;
     let secs = started.elapsed().as_secs_f64().max(0.001);
     println!(
-        "{} partitions written, {} already there; {} bytes for {} blocks ({} a block), {:.0} blocks/s",
+        "{} partitions written ({} of them rebuilt), {} already there; {} bytes for {} blocks ({} a block), {:.0} blocks/s",
         built.written.len(),
+        built.rebuilt,
         built.skipped,
         built.bytes,
         built.blocks,
@@ -890,13 +928,29 @@ pub(crate) mod tests {
         let rpc = chain_rpc(2 * SPAN + 5);
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let target = |d: &tempfile::TempDir| d.path().to_str().unwrap().to_string();
-        let built = build(&rpc, &target(&a), 1, (0, 2 * SPAN - 1), 4, |_, _, _| {})
-            .await
-            .unwrap();
+        let built = build(
+            &rpc,
+            &target(&a),
+            1,
+            (0, 2 * SPAN - 1),
+            4,
+            false,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(built.written, vec![(0, SPAN - 1), (SPAN, 2 * SPAN - 1)]);
-        build(&rpc, &target(&b), 1, (0, 2 * SPAN - 1), 4, |_, _, _| {})
-            .await
-            .unwrap();
+        build(
+            &rpc,
+            &target(&b),
+            1,
+            (0, 2 * SPAN - 1),
+            4,
+            false,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
         for from in [0, SPAN] {
             let key = partition_key(1, from);
             assert_eq!(
@@ -906,9 +960,17 @@ pub(crate) mod tests {
             );
         }
         let reads = rpc.count("eth_getBlockByNumber");
-        let again = build(&rpc, &target(&a), 1, (0, 2 * SPAN - 1), 4, |_, _, _| {})
-            .await
-            .unwrap();
+        let again = build(
+            &rpc,
+            &target(&a),
+            1,
+            (0, 2 * SPAN - 1),
+            4,
+            false,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!((again.written.len(), again.skipped), (0, 2));
         assert_eq!(
             rpc.count("eth_getBlockByNumber"),
@@ -916,17 +978,96 @@ pub(crate) mod tests {
             "only the finality check"
         );
 
-        let err = build(&rpc, &target(&a), 1, (0, 3 * SPAN - 1), 4, |_, _, _| {})
-            .await
-            .unwrap_err();
+        let err = build(
+            &rpc,
+            &target(&a),
+            1,
+            (0, 3 * SPAN - 1),
+            4,
+            false,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("past the RPC's finalized"),
             "{err:#}"
         );
-        let err = build(&rpc, &target(&a), 1, (5, SPAN - 1), 4, |_, _, _| {})
+        let err = build(&rpc, &target(&a), 1, (5, SPAN - 1), 4, false, |_, _, _| {})
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("whole spans"), "{err:#}");
+    }
+
+    /// A resumed build checks each listed partition: a truncated one by size, an altered one by the
+    /// store's ETag where it gives one, and any of them by sha256 under `verify_existing`. A
+    /// partition that does not match is built again and its entry rewritten.
+    #[tokio::test]
+    async fn a_resumed_build_rebuilds_a_damaged_partition() {
+        let rpc = chain_rpc(2 * SPAN + 5);
+        let range = (0, 2 * SPAN - 1);
+        let dir = tempfile::tempdir().unwrap();
+        let fs = dir.path().to_str().unwrap().to_string();
+        build(&rpc, &fs, 1, range, 4, false, |_, _, _| {})
+            .await
+            .unwrap();
+        let path = |from: u64| dir.path().join(partition_key(1, from));
+        let (first, second) = (
+            std::fs::read(path(0)).unwrap(),
+            std::fs::read(path(SPAN)).unwrap(),
+        );
+
+        std::fs::write(path(0), &first[..first.len() / 2]).unwrap();
+        let mut altered = second.clone();
+        altered[100] ^= 0xff;
+        std::fs::write(path(SPAN), &altered).unwrap();
+        let cheap = build(&rpc, &fs, 1, range, 4, false, |_, _, _| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            (cheap.rebuilt, cheap.skipped),
+            (1, 1),
+            "the truncation shows in the size"
+        );
+        assert_eq!(std::fs::read(path(0)).unwrap(), first);
+        assert_eq!(
+            std::fs::read(path(SPAN)).unwrap(),
+            altered,
+            "a filesystem gives no ETag"
+        );
+
+        let thorough = build(&rpc, &fs, 1, range, 4, true, |_, _, _| {})
+            .await
+            .unwrap();
+        assert_eq!((thorough.rebuilt, thorough.skipped), (1, 1));
+        assert_eq!(std::fs::read(path(SPAN)).unwrap(), second);
+
+        // A store that gives ETags shows a same-size alteration without a download.
+        let store = "memory://partitions-resume";
+        build(&rpc, store, 1, range, 4, false, |_, _, _| {})
+            .await
+            .unwrap();
+        let mirror = crate::publish::open_mirror(store).unwrap();
+        let key = partition_key(1, SPAN);
+        let mut bytes = mirror.get(&key).await.unwrap().unwrap();
+        bytes[100] ^= 0xff;
+        mirror.put(&key, &bytes).await.unwrap();
+        let etag = build(&rpc, store, 1, range, 4, false, |_, _, _| {})
+            .await
+            .unwrap();
+        assert_eq!((etag.rebuilt, etag.skipped), (1, 1));
+        assert_eq!(mirror.get(&key).await.unwrap().unwrap(), second);
+    }
+
+    /// A manifest written before ETags were recorded still reads, and is checked on size.
+    #[test]
+    fn a_manifest_without_etags_still_reads() {
+        let old = r#"{"version": 1, "chain_id": 1, "span": 10000, "partitions": {"0": {"to": 9999,
+            "key": "address-history/v1/1/0000000000.parquet", "bytes": 5, "sha256": "ab",
+            "last_hash": "0x01"}}}"#;
+        let m: Manifest = serde_json::from_str(old).unwrap();
+        assert_eq!(m.partitions[&0].e_tag, None);
+        assert!(!serde_json::to_string(&m).unwrap().contains("e_tag"));
     }
 
     fn source(mirror: &std::path::Path, cache: &std::path::Path, budget: u64) -> Source {
@@ -943,6 +1084,7 @@ pub(crate) mod tests {
             1,
             (0, SPAN - 1),
             4,
+            false,
             |_, _, _| {},
         )
         .await
@@ -1061,6 +1203,7 @@ pub(crate) mod tests {
             1,
             (0, 2 * SPAN - 1),
             4,
+            false,
             |_, _, _| {},
         )
         .await

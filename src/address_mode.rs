@@ -1243,6 +1243,7 @@ mod tests {
             1,
             (0, 2 * SPAN - 1),
             4,
+            false,
             |_, _, _| {},
         )
         .await
@@ -1369,6 +1370,7 @@ mod tests {
             1,
             (SPAN, 2 * SPAN - 1),
             4,
+            false,
             |_, _, _| {},
         )
         .await
@@ -1406,6 +1408,7 @@ mod tests {
             1,
             (0, 2 * SPAN - 1),
             4,
+            false,
             |_, _, _| {},
         )
         .await

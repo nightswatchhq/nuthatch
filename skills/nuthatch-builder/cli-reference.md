@@ -356,6 +356,7 @@ Build verifiable block partitions for address-history nests (RFC-0063 §8)
 - `--to <TO>` - Last block, one less than a multiple of 10,000
 - `--out <OUT>` - A directory, or `s3://bucket/prefix`
 - `--concurrency <CONCURRENCY>` - Blocks fetched at once
+- `--verify-existing` - Download every partition the manifest already lists and check its sha256, rebuilding any that differ. Without it a listed partition is checked by size and the store's ETag alone
 
 ## `nuthatch prune`
 

@@ -451,6 +451,10 @@ pub struct PartitionsArgs {
     /// Blocks fetched at once.
     #[arg(long, default_value_t = 8)]
     pub concurrency: usize,
+    /// Download every partition the manifest already lists and check its sha256, rebuilding any that
+    /// differ. Without it a listed partition is checked by size and the store's ETag alone.
+    #[arg(long)]
+    pub verify_existing: bool,
 }
 
 #[derive(Args)]
