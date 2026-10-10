@@ -656,7 +656,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     /// What Etherscan's `getminedblocks` calls `blockReward`, measured against its answers: the
     /// priority fees the block paid its fee recipient, plus before the Merge the static reward and
     /// a thirty-second of it for each uncle included. Burnt base fees are not counted.
-    async fn block_reward(&self, b: u64, header: &Value) -> Result<String> {
+    pub(crate) async fn block_reward(&self, b: u64, header: &Value) -> Result<String> {
         use alloy_primitives::U256;
         let receipts = self
             .main
