@@ -74,6 +74,8 @@ pub struct ModeState {
     discovery_errors: AtomicU64,
     /// Traces one transaction into the store, for a `txhash` lookup the store cannot yet answer.
     pub tracer: Option<Tracer>,
+    /// Forwards `proxy` and `logs` requests to the nest's RPC.
+    pub forward: Option<crate::address_proxy::Forward>,
     /// Verified block partitions, and the blocks `[address_history.mirror]` takes from them.
     pub mirror: Option<(Arc<crate::address_partitions::Source>, (u64, u64))>,
 }
@@ -108,8 +110,14 @@ impl ModeState {
             windows: AtomicU64::new(0),
             discovery_errors: AtomicU64::new(0),
             tracer: None,
+            forward: None,
             mirror: None,
         }
+    }
+
+    pub fn with_forward(mut self, forward: crate::address_proxy::Forward) -> Self {
+        self.forward = Some(forward);
+        self
     }
 
     pub fn with_tracer(mut self, tracer: Tracer) -> Self {
@@ -590,6 +598,12 @@ async fn api(
 ) -> Json<Value> {
     // A txhash lookup needs no coverage: a transaction the store has not traced is traced now, once
     // the request is one `respond` would answer.
+    // The RPC behind the nest is the operator's; only a loopback bind lends it out.
+    if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
+        if let Some(v) = crate::address_proxy::answer(&q, s.chain_id, &forward).await {
+            return Json(v);
+        }
+    }
     let traceable = q.get("module").map(String::as_str) == Some("account")
         && q.get("action").map(String::as_str) == Some("txlistinternal")
         && q.get("chainid")
@@ -800,6 +814,23 @@ pub fn tracer<M: Rpc, T: Rpc>(
     })
 }
 
+/// Forwards a `proxy` or `logs` call to the nest's main RPC, once `verified` says it is on the
+/// nest's chain. Counted with the rest of the nest's calls.
+pub fn forward<M: Rpc, T: Rpc>(
+    discovery: Arc<Discoverer<Counted<M>, Counted<T>>>,
+    verified: Arc<tokio::sync::OnceCell<()>>,
+) -> crate::address_proxy::Forward {
+    Arc::new(move |method: String, params: Value| {
+        let (discovery, verified) = (discovery.clone(), verified.clone());
+        Box::pin(async move {
+            if verified.get().is_none() {
+                bail!("the RPC's chain has not been checked yet; try again shortly");
+            }
+            discovery.main.call(&method, params).await
+        })
+    })
+}
+
 /// `--poll-interval` wins over `poll_interval` in `[address_history]`, which wins over the default.
 pub fn poll_interval(flag: Option<Duration>, config: &AddressHistoryConfig) -> Result<Duration> {
     match flag {
@@ -881,7 +912,8 @@ pub async fn dev(
     let tracer = tracer(discovery.clone(), history.clone(), verified.clone());
     let mut state = ModeState::new(history, chain_id, poll_interval, loopback)
         .with_range(ah.start_block.unwrap_or(0), ah.end_block, depth)
-        .with_tracer(tracer);
+        .with_tracer(tracer)
+        .with_forward(forward(discovery.clone(), verified.clone()));
     if let Some(m) = &ah.mirror {
         if m.chain_id != chain_id {
             bail!(
@@ -1012,6 +1044,40 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, v)
+    }
+
+    /// The nest's RPC is lent out through `proxy` only on a loopback bind.
+    #[tokio::test]
+    async fn the_proxy_answers_only_on_loopback() {
+        for loopback in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+            let forward: crate::address_proxy::Forward =
+                Arc::new(|_, _| Box::pin(async { Ok(json!("0x10")) }));
+            let state = Arc::new(
+                ModeState::new(history, 1, Duration::from_secs(300), loopback)
+                    .with_forward(forward),
+            );
+            let (_, v) = call(
+                router(state),
+                "GET",
+                "/api?module=proxy&action=eth_blockNumber",
+                None,
+            )
+            .await;
+            if loopback {
+                assert_eq!(v["result"], "0x10");
+            } else {
+                assert!(
+                    v["result"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("NUTHATCH_UNSUPPORTED:"),
+                    "{v}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
