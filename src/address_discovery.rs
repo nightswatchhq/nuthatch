@@ -155,27 +155,29 @@ impl Window {
         self.size.load(Ordering::Relaxed)
     }
 
-    /// Shrink after a refusal, returning the new span, or `None` when the error says nothing about
-    /// the range and the call should fail as it is.
-    fn shrink(&self, error: &str) -> Option<u64> {
-        let now = self.get();
+    /// A span of `refused` blocks was refused for its size: the size a retry of it may use, which
+    /// the window takes too unless it is already smaller. A stated limit below the refused size is
+    /// taken as given; anything else halves it. Measured from the refused span, not the window, so
+    /// siblings refused at one size shrink it once, and a retry gets smaller whatever other ranges
+    /// on the window have grown it to meanwhile.
+    fn refused(&self, refused: u64, error: &str) -> u64 {
         self.streak.store(0, Ordering::Relaxed);
         let next = match stated_limit(error).filter(|n| *n >= 1) {
             Some(n) => {
                 self.ceiling.fetch_min(n, Ordering::Relaxed);
-                if n < now {
+                if n < refused {
                     n
                 } else {
-                    now / 2
+                    refused / 2
                 }
             }
-            None if range_shaped(error) => now / 2,
-            None => return None,
+            None => refused / 2,
         }
         .max(1);
-        self.size.store(next, Ordering::Relaxed);
-        self.proven.store(false, Ordering::Relaxed);
-        Some(next)
+        if self.size.fetch_min(next, Ordering::Relaxed) > next {
+            self.proven.store(false, Ordering::Relaxed);
+        }
+        next
     }
 
     fn succeeded(&self) {
@@ -265,7 +267,9 @@ async fn ranged_in<R: Rpc>(
     most: usize,
 ) -> Result<Vec<Value>> {
     let mut parts: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
-    let mut todo: VecDeque<(u64, u64)> = VecDeque::from([(from, to)]);
+    // Each range left to ask, with the largest span it may use: a refused span's retry is capped below
+    // the size it was refused at.
+    let mut todo: VecDeque<(u64, u64, u64)> = VecDeque::from([(from, to, u64::MAX)]);
     while !todo.is_empty() {
         let probing = match window.proven.load(Ordering::Relaxed) {
             true => None,
@@ -280,13 +284,13 @@ async fn ranged_in<R: Rpc>(
         let span = window.get();
         let mut spans = Vec::with_capacity(lanes);
         while spans.len() < lanes {
-            let Some((s, e)) = todo.pop_front() else {
+            let Some((s, e, cap)) = todo.pop_front() else {
                 break;
             };
-            let end = s.saturating_add(span - 1).min(e);
+            let end = s.saturating_add(span.min(cap) - 1).min(e);
             spans.push((s, end));
             if end < e {
-                todo.push_front((end + 1, e));
+                todo.push_front((end + 1, e, cap));
             }
         }
         let mut answers = futures::stream::iter(spans.clone())
@@ -308,16 +312,11 @@ async fn ranged_in<R: Rpc>(
                     parts.insert(s, items);
                 }
                 Judged::Smaller(why) => {
-                    // A refusal of a size the window has already shrunk below is old news, and
-                    // shrinking again for each sibling sent at it collapses the window.
-                    if span <= window.get() {
-                        if let Some(next) = window.shrink(&why) {
-                            tracing::debug!(
-                                "{method} [{s}, {e}] refused, retrying in spans of {next}: {why}"
-                            );
-                        }
-                    }
-                    again.push((s, e));
+                    let next = window.refused(e - s + 1, &why);
+                    tracing::debug!(
+                        "{method} [{s}, {e}] refused, retrying in spans of {next}: {why}"
+                    );
+                    again.push((s, e, next));
                 }
             }
         }
@@ -1614,19 +1613,19 @@ mod tests {
         );
         assert_eq!(stated_limit("timeout"), None);
         let w = Window::new(100_000);
-        assert_eq!(w.shrink("currently limited to 100 blocks"), Some(100));
-        assert_eq!(w.shrink("timeout"), Some(50));
+        assert_eq!(w.refused(100_000, "currently limited to 100 blocks"), 100);
+        assert_eq!(w.refused(100, "timeout"), 50);
         assert_eq!(
-            w.shrink("limited to 500 blocks"),
-            Some(25),
-            "a stated limit above now halves instead"
+            w.refused(50, "limited to 500 blocks"),
+            25,
+            "a stated limit above the refused size halves it instead"
         );
+        assert_eq!(w.refused(100_000, "timeout"), 50_000);
         assert_eq!(
-            w.shrink("401 Unauthorized: invalid API key"),
-            None,
-            "not about the range"
+            w.get(),
+            25,
+            "a refusal of a size already left behind shrinks nothing"
         );
-        assert_eq!(w.get(), 25);
 
         // Successes grow the span back, never past the stated ceiling.
         for _ in 0..REGROW_AFTER {
@@ -1901,6 +1900,75 @@ mod tests {
             concurrent <= sequential,
             "{concurrent} against {sequential}"
         );
+
+        // A stated cap makes the sequential count exact: one refusal, then every span at the cap.
+        // Four filters at once must not each pay for the refusal, nor shrink below the cap.
+        let stated = |most, together| async move {
+            let rpc = Stated(AtomicU64::new(0));
+            let w = Window::new(100_000);
+            let one = || ranged_in(&rpc, &w, 0, 2_999, "eth_getLogs", blocks, most);
+            let got = if together {
+                futures::future::try_join_all([one(), one(), one(), one()])
+                    .await
+                    .unwrap()
+            } else {
+                let mut got = Vec::new();
+                for _ in 0..4 {
+                    got.push(one().await.unwrap());
+                }
+                got
+            };
+            (got, rpc.0.load(Ordering::SeqCst))
+        };
+        let (want, sequential) = stated(1, false).await;
+        assert_eq!(sequential, 1 + 4 * 30);
+        let (got, concurrent) = stated(RANGE_CONCURRENCY, true).await;
+        assert_eq!(got, want);
+        assert_eq!(concurrent, sequential);
+    }
+
+    /// Refuses spans over 100 blocks, stating the limit.
+    struct Stated(AtomicU64);
+    impl Rpc for Stated {
+        async fn call(&self, _: &str, p: Value) -> Result<Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let s = hex_u64(&p[0]["fromBlock"])?;
+            let e = hex_u64(&p[0]["toBlock"])?;
+            tokio::time::sleep(std::time::Duration::from_millis(s % 3)).await;
+            if e - s + 1 > 100 {
+                bail!("-32602: Block range too large; currently limited to 100 blocks");
+            }
+            Ok(Value::Array((s..=e).map(|b| json!(b)).collect()))
+        }
+    }
+
+    /// A span refused for its size is asked again smaller, even when other ranges on the window
+    /// have grown it straight back meanwhile.
+    #[tokio::test]
+    async fn a_refused_span_retries_smaller_whatever_the_window_grew_to() {
+        struct Regrows(std::sync::Arc<Window>, AtomicU64);
+        impl Rpc for Regrows {
+            async fn call(&self, _: &str, p: Value) -> Result<Value> {
+                if self.1.fetch_add(1, Ordering::SeqCst) > 1_000 {
+                    bail!("401 Unauthorized: a runaway retry");
+                }
+                let s = hex_u64(&p[0]["fromBlock"])?;
+                let e = hex_u64(&p[0]["toBlock"])?;
+                if e - s + 1 > 100 {
+                    for _ in 0..8 * REGROW_AFTER {
+                        self.0.succeeded();
+                    }
+                    bail!("query timed out");
+                }
+                Ok(Value::Array((s..=e).map(|b| json!(b)).collect()))
+            }
+        }
+        let w = std::sync::Arc::new(Window::new(1_000));
+        let rpc = Regrows(w.clone(), AtomicU64::new(0));
+        let got = ranged_in(&rpc, &w, 0, 999, "trace_filter", blocks, 1)
+            .await
+            .unwrap();
+        assert_eq!(got, (0..=999u64).map(|b| json!(b)).collect::<Vec<_>>());
     }
 
     #[test]
