@@ -1,0 +1,5 @@
+# name	address	block	txhash	how it was found
+internal-only-creation	0x1d29b9e9a8540da5b537c0d36d2f77fb596d5cfe	19000010	0x84bde65ff413c92799b259dba7bd56ef2088d4354b70e33a93c99dea7ab54ee8	trace_block scan of 19000000-19000029 for a suicide frame paying out; the contract it destroys was CREATE2'd in the same transaction and has no txlist rows
+selfdestruct	0xa7fb5ca286fc3fd67525629048a4de3ba24cba2e	19000010	0x84bde65ff413c92799b259dba7bd56ef2088d4354b70e33a93c99dea7ab54ee8	the same suicide frame's beneficiary, which also sent the transaction
+failed-ancestor	0x1111111254eeb25477b68fb85ed929f73a960582	19000016	0x93a7cdc1c591356b5d9fe4bece75c0f690ee4d51e63b3aeb011d2f4b6298a917	trace_block scan of 19000000-19000029 for a value call that succeeded beneath a reverted frame
+eip7702	0x689256b5008983673cbdb97a227cf32f38798555	23500010	0x63d68742e5dc553a4fed594538f17d7b33f84921a51bece08f486d1f7eb73f40	type-4 transactions in blocks 23500000-23500060, traced for internal value sent by the account the root calls; its code at the block is 0xef0100 (delegated)

@@ -186,6 +186,8 @@ const TOKEN1155TX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_toke
 const TX_CACHE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_cache");
 /// Block timestamps already read.
 const BLOCK_TS: TableDefinition<u64, u64> = TableDefinition::new("ah_block_ts");
+/// A transaction's whole internal list, by hash, as `txhash` lookups answer it.
+const TX_INTERNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_internal");
 /// `address | action code` -> `[from, to]` pairs, inclusive, sorted and merged, 16 bytes each.
 const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverage");
 const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
@@ -212,6 +214,9 @@ fn coverage_key(a: &Address, action: Action) -> [u8; 21] {
     k[20] = action.code();
     k
 }
+
+/// A transaction hash, its block, and its whole internal list.
+pub type TxInternals = (Vec<u8>, u64, Vec<Map<String, Value>>);
 
 /// One stored record and where it sorts.
 #[derive(Debug, Clone)]
@@ -279,6 +284,7 @@ impl AddressHistory {
         wtx.open_table(META)?;
         wtx.open_table(TX_CACHE)?;
         wtx.open_table(BLOCK_TS)?;
+        wtx.open_table(TX_INTERNAL)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
@@ -313,6 +319,54 @@ impl AddressHistory {
             for (hash, record) in txs {
                 buf.clear();
                 encode_record(record, &mut buf)?;
+                t.insert(hash.as_slice(), buf.as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Every internal transaction of a transaction already traced, by its 32-byte hash.
+    pub fn tx_internals(&self, hash: &[u8]) -> Result<Option<Vec<Map<String, Value>>>> {
+        let rtx = self.store.database().begin_read()?;
+        let Some(v) = rtx.open_table(TX_INTERNAL)?.get(hash)? else {
+            return Ok(None);
+        };
+        let wrapped = decode_record(v.value())?;
+        let rows = wrapped
+            .get("rows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("a cached internal list without rows"))?
+            .iter()
+            .map(|r| {
+                r.as_object()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("an internal row is not an object"))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some(rows))
+    }
+
+    /// Keep each trace whose block is still served; a reorg that lowered the head while the trace
+    /// was in flight leaves it out.
+    pub fn cache_tx_internals(&self, txs: &[TxInternals]) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
+            let mut t = wtx.open_table(TX_INTERNAL)?;
+            let mut buf = Vec::new();
+            for (hash, block, rows) in txs {
+                if head.is_none_or(|h| *block > h) {
+                    continue;
+                }
+                let mut wrapped = Map::new();
+                wrapped.insert("blockNumber".into(), Value::String(block.to_string()));
+                wrapped.insert(
+                    "rows".into(),
+                    Value::Array(rows.iter().cloned().map(Value::Object).collect()),
+                );
+                buf.clear();
+                encode_record(&wrapped, &mut buf)?;
                 t.insert(hash.as_slice(), buf.as_slice())?;
             }
         }
@@ -505,6 +559,23 @@ impl AddressHistory {
                 if head.is_some_and(|h| h > block) {
                     m.insert(HEAD, block)?;
                 }
+            }
+            // A trace of a block the reorg replaced describes a transaction that may no longer
+            // exist there; a txhash lookup must trace it again.
+            let mut traces = wtx.open_table(TX_INTERNAL)?;
+            let mut stale = Vec::new();
+            for e in traces.iter()? {
+                let (k, v) = e?;
+                let cached = decode_record(v.value())?
+                    .get("blockNumber")
+                    .and_then(Value::as_str)
+                    .and_then(|b| b.parse::<u64>().ok());
+                if cached.is_none_or(|b| b > block) {
+                    stale.push(k.value().to_vec());
+                }
+            }
+            for k in stale {
+                traces.remove(k.as_slice())?;
             }
             bump_generation(&wtx)?;
         }
@@ -983,8 +1054,8 @@ pub fn respond(
             ));
         }
     }
-    if get("txhash").is_some() {
-        return unsupported("txhash-scoped lookups are not served yet");
+    if let Some(hash) = get("txhash") {
+        return by_txhash(history, act, hash);
     }
     match parse_request(params) {
         Err(e) => error(e),
@@ -993,6 +1064,38 @@ pub fn respond(
             Ok((Answer::Incomplete(why), _)) => incomplete(&why),
             Err(e) => error(format!("{e:#}")),
         },
+    }
+}
+
+/// A `txhash` lookup: every internal transaction of one transaction, from its cached trace. A
+/// transaction not traced yet answers unsupported here; the rotki-mode server traces it first.
+fn by_txhash(history: &AddressHistory, action: Action, hash: &str) -> Value {
+    if action != Action::TxListInternal {
+        return unsupported(&format!("{} does not take a txhash", action.etherscan()));
+    }
+    let key = match hash
+        .strip_prefix("0x")
+        .and_then(|h| alloy_primitives::hex::decode(h).ok())
+        .filter(|k| k.len() == 32)
+    {
+        Some(k) => k,
+        None => return error("Invalid txhash format"),
+    };
+    match history.tx_internals(&key) {
+        Ok(Some(rows)) => ok(
+            Value::Array(
+                rows.into_iter()
+                    .map(|mut r| {
+                        // Etherscan's txhash form carries no traceId; rotki reads its absence as 0.
+                        r.remove("traceId");
+                        Value::Object(r)
+                    })
+                    .collect(),
+            ),
+            history.generation().unwrap_or(0),
+        ),
+        Ok(None) => unsupported(&format!("{hash} has not been traced")),
+        Err(e) => error(format!("{e:#}")),
     }
 }
 
