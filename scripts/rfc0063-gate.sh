@@ -393,7 +393,7 @@ while IFS=$'\t' read -r name address from to _; do
   start "$name" "$address" "$from" "$to" "mev_relays = true"
   wait_covered "$name" "$address" "$from" "$to" nuthatchProducedBlocks
   all_rows nuthatchProducedBlocks "$address" "$from" "$to" "$WORK/$name.jsonl"
-  same_rows "$name" '{blockNumber,blockHash,timeStamp,feeRecipient,blockReward,mev,mevRecipient,mevReward,relays,proposerPubkey,paymentTx,paymentValue}' "$WORK/$name.jsonl" "$CASES/$name.jsonl"
+  same_rows "$name" '{blockNumber,blockHash,timeStamp,feeRecipient,blockReward,mev,mevRecipient,mevReward,relays,builderPubkey,proposerPubkey,paymentTx,paymentValue}' "$WORK/$name.jsonl" "$CASES/$name.jsonl"
   echo "$name: $(wc -l < "$WORK/$name.jsonl" | tr -d ' ') produced blocks, $(jq -s 'map(select(.mev == "relay")) | length' "$WORK/$name.jsonl") through relays"
   stop
 done < "$WORK/mev.tsv.rows"

@@ -103,7 +103,7 @@ relay_deliveries() { # block: every relay's deliveries for it, one JSON list; fa
       || { echo "FAIL: relay ${r%%=*} did not answer for block $b" >&2; exit 1; }
     jq -c --arg relay "${r%%=*}" --arg b "$b" '.[] | select(.block_number == $b) | {relay: $relay,
       recipient: (.proposer_fee_recipient | ascii_downcase), value, hash: (.block_hash | ascii_downcase),
-      proposer: .proposer_pubkey}' <<<"$out" >> "$OUT/.delivered"
+      builder: .builder_pubkey, proposer: .proposer_pubkey}' <<<"$out" >> "$OUT/.delivered"
   done
   jq -sc . "$OUT/.delivered"
 }
@@ -141,7 +141,7 @@ grep -v '^#' "$HERE/tests/fixtures/rfc0063/mev.tsv" | while IFS=$'\t' read -r na
         blockNumber: $b, blockHash: $h, timeStamp: $ts, feeRecipient: $fee, blockReward: $reward,
         mev: $mev, mevRecipient: ($c.recipient // ""),
         mevReward: (if $mev == "relay" then $c.value else "" end),
-        relays: ($d | map(.relay) | join(",")), proposerPubkey: ($c.proposer // ""),
+        relays: ($d | map(.relay) | join(",")), builderPubkey: ($c.builder // ""), proposerPubkey: ($c.proposer // ""),
         paymentTx: $ptx, paymentValue: $pv
       }' >> "$OUT/$name.jsonl"
   done
