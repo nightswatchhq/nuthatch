@@ -58,6 +58,11 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     if config.address_history.is_some() {
         return crate::address_mode::dev(&dir, config, &args, cors).await;
     }
+    if !args.trace_rpc.is_empty() {
+        anyhow::bail!(
+            "--trace-rpc serves an address-history nest; this nest has no [address_history]"
+        );
+    }
     apply_dev_args(&mut config, &args);
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without

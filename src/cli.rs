@@ -1405,6 +1405,12 @@ pub struct DevArgs {
     #[arg(long = "rpc-fallback", value_name = "URL")]
     pub rpc_fallback: Vec<String>,
 
+    /// Endpoint(s) answering `trace_filter` for an address-history nest (RFC-0063, repeatable).
+    /// Defaults to the nest's RPC; give an index-backed trace API here when that one re-executes
+    /// blocks to answer.
+    #[arg(long = "trace-rpc", value_name = "URL")]
+    pub trace_rpc: Vec<String>,
+
     /// Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a
     /// nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start
     /// blocks, else from a default recent window.

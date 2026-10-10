@@ -138,6 +138,9 @@ async fn main() -> Result<()> {
                          audit sealed --dir <nest>` against each nest instead"
                     );
                 }
+                if !args.trace_rpc.is_empty() {
+                    anyhow::bail!("--trace-rpc serves an address-history nest, which runs alone, not in a runtime");
+                }
                 runtime::dev(
                     dir,
                     args.listen,

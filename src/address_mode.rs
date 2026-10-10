@@ -2,10 +2,14 @@
 //!
 //! It shares nothing with the event path. No decode registry, no DBSP circuit, no Burrmill, no
 //! sealing: one redb handle, one cursor that reads the chain head every `poll_interval`, and a small
-//! router serving `/api`, `/health`, `/ready` and `/metrics`. Discovery (slices 3 to 5) runs inside
-//! [`poll_once`]; today a poll is one head read.
+//! router serving `/api`, `/health`, `/ready` and `/metrics`. After each head read the cursor
+//! discovers every watched address up to the finalized head ([`Discovery`]).
 
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use crate::address_discovery::{Counted, Discoverer, Rpc};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -55,6 +59,19 @@ pub struct ModeState {
     polls: AtomicU64,
     poll_errors: AtomicU64,
     rpc_requests: AtomicU64,
+    /// Blocks behind the chain head the nest serves through, so nothing it records can be reorged.
+    pub depth: u64,
+    /// `[address_history]`'s `start_block` and `end_block`: the history each address backfills.
+    pub start_block: u64,
+    pub end_block: Option<u64>,
+    /// Rung by watch, so a new address starts backfilling now rather than at the next poll.
+    pub wake: tokio::sync::Notify,
+    /// Why the cursor stopped for good, e.g. an RPC on the wrong chain.
+    cursor_error: Mutex<Option<String>>,
+    /// RPC calls by endpoint and method.
+    calls: Mutex<BTreeMap<(String, String), u64>>,
+    windows: AtomicU64,
+    discovery_errors: AtomicU64,
 }
 
 impl ModeState {
@@ -74,6 +91,33 @@ impl ModeState {
             polls: AtomicU64::new(0),
             poll_errors: AtomicU64::new(0),
             rpc_requests: AtomicU64::new(0),
+            depth: 0,
+            start_block: 0,
+            end_block: None,
+            wake: tokio::sync::Notify::new(),
+            cursor_error: Mutex::new(None),
+            calls: Mutex::new(BTreeMap::new()),
+            windows: AtomicU64::new(0),
+            discovery_errors: AtomicU64::new(0),
+        }
+    }
+
+    pub fn with_range(mut self, start_block: u64, end_block: Option<u64>, depth: u64) -> Self {
+        self.start_block = start_block;
+        self.end_block = end_block;
+        self.depth = depth;
+        self
+    }
+
+    fn stop(&self, why: String) {
+        tracing::error!("address history: cursor stopped: {why}");
+        *self.cursor_error.lock().expect("cursor_error lock") = Some(why);
+    }
+
+    fn set_calls(&self, endpoint: &str, calls: BTreeMap<String, u64>) {
+        let mut all = self.calls.lock().expect("calls lock");
+        for (method, n) in calls {
+            all.insert((endpoint.to_string(), method), n);
         }
     }
 
@@ -89,7 +133,143 @@ impl ModeState {
     }
 }
 
-/// One poll: read the head and record it. Fails on a failed head read or a failed write.
+impl<R: Rpc> HeadSource for Counted<R> {
+    async fn head(&self) -> Result<u64> {
+        let n = self.call("eth_blockNumber", json!([])).await?;
+        let s = n
+            .as_str()
+            .context("eth_blockNumber did not answer a string")?;
+        u64::from_str_radix(s.trim_start_matches("0x"), 16).context("eth_blockNumber")
+    }
+
+    fn requests(&self) -> u64 {
+        self.calls().values().sum()
+    }
+}
+
+/// What the cursor does after each head read. `()` does nothing, for a cursor without discovery.
+pub trait Discovery: Send + Sync + 'static {
+    fn catch_up(
+        &self,
+        state: &ModeState,
+        safe: u64,
+    ) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl Discovery for () {
+    async fn catch_up(&self, _: &ModeState, _: u64) {}
+}
+
+impl<D: Discovery> Discovery for Arc<D> {
+    async fn catch_up(&self, state: &ModeState, safe: u64) {
+        (**self).catch_up(state, safe).await
+    }
+}
+
+impl<H: HeadSource> HeadSource for Arc<H> {
+    async fn head(&self) -> Result<u64> {
+        (**self).head().await
+    }
+
+    fn requests(&self) -> u64 {
+        (**self).requests()
+    }
+}
+
+/// The head as the discoverer's main endpoint reads it, so its calls are counted with the rest.
+pub struct MainHead<M, T>(pub Arc<Discoverer<Counted<M>, Counted<T>>>);
+
+impl<M: Rpc, T: Rpc> HeadSource for MainHead<M, T> {
+    async fn head(&self) -> Result<u64> {
+        self.0.main.head().await
+    }
+
+    fn requests(&self) -> u64 {
+        self.0.main.requests() + self.0.trace.requests()
+    }
+}
+
+impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
+    /// Backfill every watched address window by window up to `safe` (or `end_block`). A failed window
+    /// records nothing and ends this pass for that address; the next poll resumes from coverage.
+    async fn catch_up(&self, state: &ModeState, safe: u64) {
+        let to = state.end_block.map_or(safe, |e| e.min(safe));
+        let watched = match state.history.watched() {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("address history: reading the watched set: {e:#}");
+                return;
+            }
+        };
+        for address in watched {
+            let mut recorded_through: Option<u64> = None;
+            loop {
+                let next = match crate::address_discovery::next_uncovered(
+                    &state.history,
+                    &address,
+                    state.start_block,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!("address history: coverage for {address}: {e:#}");
+                        break;
+                    }
+                };
+                if next > to {
+                    break;
+                }
+                // A recorded window must move coverage past it; one that did not would be fetched
+                // again forever, at the provider's expense.
+                if recorded_through.is_some_and(|r| next <= r) {
+                    state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        "address history: coverage for {address} did not advance past {next}; stopping this pass"
+                    );
+                    break;
+                }
+                let end = next
+                    .saturating_add(crate::address_discovery::OUTER_WINDOW - 1)
+                    .min(to);
+                let outcome = async {
+                    let generation = state.history.generation()?;
+                    let found = self.discover(&state.history, &address, next, end).await?;
+                    let history = state.history.clone();
+                    let who = address.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::address_discovery::record(
+                            &history,
+                            &who,
+                            (next, end),
+                            found,
+                            generation,
+                        )
+                    })
+                    .await?
+                }
+                .await;
+                state.set_calls("main", self.main.calls());
+                state.set_calls("trace", self.trace.calls());
+                match outcome {
+                    Ok(()) => {
+                        recorded_through = Some(end);
+                        state.windows.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!("address history: {address} covered through {end}");
+                    }
+                    Err(e) => {
+                        state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            "address history: [{next}, {end}] for {address} not recorded, retrying next poll: {e:#}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One poll: read the head and record the finalized head under it, which is what the nest serves
+/// through. Fails on a failed head read or a failed write.
 pub async fn poll_once(state: &ModeState, source: &impl HeadSource) -> Result<u64> {
     state.polls.fetch_add(1, Ordering::Relaxed);
     let read = source.head().await;
@@ -99,6 +279,7 @@ pub async fn poll_once(state: &ModeState, source: &impl HeadSource) -> Result<u6
     let recorded = match read {
         Ok(head) => {
             let history = state.history.clone();
+            let head = head.saturating_sub(state.depth);
             tokio::task::spawn_blocking(move || history.set_head(head))
                 .await
                 .map_err(anyhow::Error::from)
@@ -120,17 +301,35 @@ pub async fn poll_once(state: &ModeState, source: &impl HeadSource) -> Result<u6
     }
 }
 
-/// Poll forever, the first poll at once. A failed poll is logged and retried at the next tick:
-/// covered history keeps serving while the RPC is down.
-pub async fn cursor(state: Arc<ModeState>, source: impl HeadSource) {
+/// Poll forever, the first poll at once, and catch up after each. A failed poll is logged and
+/// retried at the next tick: covered history keeps serving while the RPC is down. A watch wakes it
+/// early.
+pub async fn cursor(state: Arc<ModeState>, source: impl HeadSource, discovery: impl Discovery) {
     let mut tick = tokio::time::interval(state.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tick.tick().await;
-        if let Err(e) = poll_once(&state, &source).await {
-            tracing::warn!("address history: poll failed, retrying next interval: {e:#}");
+        tokio::select! {
+            _ = tick.tick() => {}
+            () = state.wake.notified() => {}
+        }
+        match poll_once(&state, &source).await {
+            Ok(safe) => discovery.catch_up(&state, safe).await,
+            Err(e) => tracing::warn!("address history: poll failed, retrying next interval: {e:#}"),
         }
     }
+}
+
+/// A panicking cursor must take /ready down with it, not leave it reading ready over stale history.
+fn supervise(
+    state: Arc<ModeState>,
+    work: tokio::task::JoinHandle<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match work.await {
+            Err(e) if e.is_panic() => state.stop(format!("the cursor task panicked: {e}")),
+            _ => {}
+        }
+    })
 }
 
 pub fn router(state: Arc<ModeState>) -> Router {
@@ -218,15 +417,34 @@ async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, J
     })
     .await;
     match done {
-        Ok(w) => (StatusCode::OK, Json(json!({ "watched": w }))),
+        Ok(w) => {
+            if add {
+                s.wake.notify_one();
+            }
+            (StatusCode::OK, Json(json!({ "watched": w })))
+        }
         Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
 
 async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
     // Offline is not unready: covered history still serves, and a cursor that has not polled for
-    // three intervals is reported stalled. A store that cannot be read is unready.
+    // three intervals is reported stalled. A store that cannot be read is unready, and so is a
+    // cursor stopped for good: covered history still serves, but nothing will ever extend it.
+    let stopped = s.cursor_error.lock().expect("cursor_error lock").clone();
     match blocking(&s, |h| Ok((h.head()?, h.watched()?.len()))).await {
+        Ok((head, watched)) if stopped.is_some() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "mode": "address_history",
+                "ready": false,
+                "chain_id": s.chain_id,
+                "head": head,
+                "watched": watched,
+                "error": stopped,
+            })),
+        ),
         Ok((head, watched)) => (
             StatusCode::OK,
             Json(json!({
@@ -263,8 +481,22 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
             );
         }
     };
+    let mut by_method = String::from(
+        "# HELP nuthatch_address_history_rpc_calls_total RPC calls by endpoint role and method.\n\
+         # TYPE nuthatch_address_history_rpc_calls_total counter\n",
+    );
+    for ((endpoint, method), n) in s.calls.lock().expect("calls lock").iter() {
+        by_method.push_str(&format!(
+            "nuthatch_address_history_rpc_calls_total{{endpoint=\"{endpoint}\",method=\"{method}\"}} {n}\n"
+        ));
+    }
     let body = format!(
-        "# HELP nuthatch_address_history_rpc_requests_total RPC requests sent, startup checks and failovers included.\n\
+        "{by_method}\
+         # TYPE nuthatch_address_history_windows_recorded_total counter\n\
+         nuthatch_address_history_windows_recorded_total {}\n\
+         # TYPE nuthatch_address_history_discovery_errors_total counter\n\
+         nuthatch_address_history_discovery_errors_total {}\n\
+         # HELP nuthatch_address_history_rpc_requests_total RPC requests sent, startup checks and failovers included.\n\
          # TYPE nuthatch_address_history_rpc_requests_total counter\n\
          nuthatch_address_history_rpc_requests_total {}\n\
          # TYPE nuthatch_address_history_polls_total counter\n\
@@ -275,6 +507,8 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
          nuthatch_address_history_head {head}\n\
          # TYPE nuthatch_address_history_watched gauge\n\
          nuthatch_address_history_watched {watched}\n",
+        s.windows.load(Ordering::Relaxed),
+        s.discovery_errors.load(Ordering::Relaxed),
         s.rpc_requests.load(Ordering::Relaxed),
         s.polls.load(Ordering::Relaxed),
         s.poll_errors.load(Ordering::Relaxed),
@@ -351,27 +585,54 @@ pub async fn dev(
     let history = AddressHistory::open(store, config.nest.chain_id, &ah.addresses)?;
 
     let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
-    let rpc = RpcClient::with_fallbacks(urls, args.rpc_fallback.clone())?;
-    rpc.verify_chain_ids(config.nest.chain_id)
-        .await
-        .context("checking the RPC is on this nest's chain")?;
-    let state = Arc::new(ModeState::new(
-        history,
-        config.nest.chain_id,
-        poll_interval,
-        loopback,
-    ));
-    state
-        .rpc_requests
-        .store(rpc.request_count(), Ordering::Relaxed);
+    let trace_urls = if args.trace_rpc.is_empty() {
+        urls.clone()
+    } else {
+        args.trace_rpc.clone()
+    };
+    let main = RpcClient::with_fallbacks(urls, args.rpc_fallback.clone())?;
+    let trace = RpcClient::with_fallbacks(trace_urls, Vec::new())?;
+    let chain_id = config.nest.chain_id;
+    let depth = match crate::chains::lookup_by_id(chain_id).map(|c| c.finality) {
+        Some(crate::chains::Finality::Depth(n)) => n,
+        Some(crate::chains::Finality::FinalizedTag { fallback_depth }) => fallback_depth,
+        None => 64,
+    };
+    let state = Arc::new(
+        ModeState::new(history, chain_id, poll_interval, loopback).with_range(
+            ah.start_block.unwrap_or(0),
+            ah.end_block,
+            depth,
+        ),
+    );
     tracing::info!(
-        "address history: {} watched, polling every {}s",
+        "address history: {} watched from block {}, polling every {}s",
         state.history.watched()?.len(),
+        state.start_block,
         poll_interval.as_secs()
     );
-    let cursor = tokio::spawn(cursor(state.clone(), rpc));
+    // The chain check runs in the cursor, not before serving: covered history answers at once, even
+    // offline. A wrong chain stops the cursor before it fetches anything.
+    let task_state = state.clone();
+    let work = tokio::spawn(async move {
+        for (role, rpc) in [("main", &main), ("trace", &trace)] {
+            if let Err(e) = rpc.verify_chain_ids(chain_id).await {
+                task_state.stop(format!("the {role} RPC: {e:#}"));
+                return;
+            }
+        }
+        task_state.rpc_requests.store(
+            main.request_count() + trace.request_count(),
+            Ordering::Relaxed,
+        );
+        let discovery = Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
+        cursor(task_state, MainHead(discovery.clone()), discovery).await;
+    });
+    let work_abort = work.abort_handle();
+    let cursor = supervise(state.clone(), work);
     let served = crate::serve::serve_bound(listener, router(state), cors).await;
     cursor.abort();
+    work_abort.abort();
     served
 }
 
@@ -397,7 +658,7 @@ mod tests {
             per_read,
         })
     }
-    impl HeadSource for Arc<FixedHead> {
+    impl HeadSource for FixedHead {
         async fn head(&self) -> Result<u64> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             match self.head.load(Ordering::Relaxed) {
@@ -506,7 +767,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = state(dir.path(), true);
         let source = fixed(7, 1);
-        let task = tokio::spawn(cursor(s.clone(), source.clone()));
+        let task = tokio::spawn(cursor(s.clone(), source.clone(), ()));
         let settle = || async {
             for _ in 0..20 {
                 tokio::task::yield_now().await;
@@ -539,6 +800,17 @@ mod tests {
         let ms = u64::try_from(fresh.started.elapsed().as_millis()).unwrap();
         fresh.last_poll.store(ms + 1, Ordering::Relaxed);
         assert!(!fresh.stalled(), "a poll just now");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_cursor_takes_ready_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let work = tokio::spawn(async { panic!("a provider answer the decoder could not take") });
+        supervise(s.clone(), work).await.unwrap();
+        let (st, r) = call(router(s), "GET", "/ready", None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{r}");
+        assert!(r["error"].as_str().unwrap().contains("panicked"), "{r}");
     }
 
     #[tokio::test]
