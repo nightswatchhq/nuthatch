@@ -29,6 +29,15 @@ pub const DEFAULT_OFFSET: u64 = 1_000;
 /// A partition is a few MB; a smaller cache could not keep the one being verified.
 pub const MIN_CACHE_MB: u64 = 64;
 
+/// The first block a chain's `trace_filter` can be trusted from. Optimism answers it with an empty
+/// success before Bedrock, which would read as an account with no history (RFC-0063 §7).
+pub fn traced_from(chain_id: u64) -> u64 {
+    match chain_id {
+        10 => 105_235_063,
+        _ => 0,
+    }
+}
+
 /// The `[address_history]` table of `nuthatch.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1473,6 +1482,13 @@ pub fn respond(
     }
     match parse_request(params) {
         Err(e) => error(e),
+        Ok(req) if req.start_block.unwrap_or(0) < traced_from(history.chain_id) => {
+            unsupported(&format!(
+                "chain {} has no trustworthy traces before block {}",
+                history.chain_id,
+                traced_from(history.chain_id)
+            ))
+        }
         Ok(req) => match history.page_at(act, &req) {
             Ok((Answer::Rows(rows), generation)) => ok(Value::Array(rows), generation),
             Ok((Answer::Incomplete(why), _)) => incomplete(&why),
@@ -2444,6 +2460,39 @@ mod tests {
                     .unwrap()
                     .starts_with("NUTHATCH_UNSUPPORTED:"),
                 "{other}: {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn optimism_before_bedrock_is_unsupported_even_when_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let h = AddressHistory::open(store, 10, &[ALICE.into()]).unwrap();
+        let bedrock = traced_from(10);
+        h.mark_covered(Action::TxList, ALICE, 0, bedrock + 10)
+            .unwrap();
+        let q = |start: u64| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "txlist"),
+                    ("address", ALICE),
+                    ("startblock", &start.to_string()),
+                    ("endblock", &(bedrock + 10).to_string()),
+                ]),
+            )
+        };
+        assert_eq!(q(bedrock)["status"], "1");
+        for before in [0, bedrock - 1] {
+            let a = q(before);
+            assert!(
+                a["result"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("NUTHATCH_UNSUPPORTED:"),
+                "{before}: {a}"
             );
         }
     }

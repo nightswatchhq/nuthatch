@@ -936,7 +936,13 @@ pub async fn dev(
     let verified = Arc::new(tokio::sync::OnceCell::<()>::new());
     let tracer = tracer(discovery.clone(), history.clone(), verified.clone());
     let mut state = ModeState::new(history, chain_id, poll_interval, loopback)
-        .with_range(ah.start_block.unwrap_or(0), ah.end_block, depth)
+        .with_range(
+            ah.start_block
+                .unwrap_or(0)
+                .max(crate::address_history::traced_from(chain_id)),
+            ah.end_block,
+            depth,
+        )
         .with_tracer(tracer)
         .with_forward(forward(discovery.clone(), verified.clone()));
     if ah.mev_relays {
