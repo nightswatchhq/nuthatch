@@ -336,6 +336,9 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 }
                 state.set_calls("main", self.main.calls());
             }
+        } else if let Some((source, blocks)) = &state.mirror {
+            // Elsewhere a partition is read for its verified headers alone: timestamp to block.
+            mirror_pass(self, state, &[], to, source, *blocks).await;
         }
     }
 }
@@ -1498,6 +1501,57 @@ mod tests {
             history.coverage(Action::MinedBlocks, &miner).unwrap(),
             vec![(5, 2 * SPAN - 1)]
         );
+    }
+
+    /// Off Ethereum mainnet a partition is read for its headers alone, so timestamp to block is
+    /// answered there too, and no body is scanned for withdrawals or produced blocks.
+    #[tokio::test]
+    async fn off_mainnet_the_mirror_gives_headers_and_nothing_else() {
+        use crate::address_discovery::Discoverer;
+        use crate::address_history::Action;
+        use crate::address_partitions::tests::{chain_rpc, Fake, PAID};
+        use crate::address_partitions::{build, Source, SPAN};
+        let mirror = tempfile::tempdir().unwrap();
+        let chain = chain_rpc(SPAN + 5);
+        let url = mirror.path().to_str().unwrap();
+        build(&chain, url, 100, (0, SPAN - 1), 4, false, |_, _, _| {})
+            .await
+            .unwrap();
+        let main = Fake::new(move |m, p| match m {
+            "eth_getLogs" => Ok(json!([])),
+            _ => (chain.answer)(m, p),
+        });
+        let trace = Fake::new(|m, _| match m {
+            "trace_filter" => Ok(json!([])),
+            other => bail!("unexpected {other}"),
+        });
+        let d = Discoverer::new(Counted::new(main), Counted::new(trace));
+        let paid = format!("{PAID:#x}");
+        let dir = tempfile::tempdir().unwrap();
+        let history = AddressHistory::open(
+            Store::open(&dir.path().join("t.redb")).unwrap(),
+            100,
+            std::slice::from_ref(&paid),
+        )
+        .unwrap();
+        let source = Source::open(url, 100, dir.path().join("partitions"), u64::MAX).unwrap();
+        let state = ModeState::new(history.clone(), 100, Duration::from_secs(300), true)
+            .with_range(0, Some(SPAN - 1), 0)
+            .with_mirror(Arc::new(source), (0, SPAN - 1));
+        d.catch_up(&state, SPAN + 5).await;
+
+        assert_eq!(history.header_coverage().unwrap(), vec![(0, SPAN - 1)]);
+        assert_eq!(
+            history
+                .block_by_time(1_600_000_000 + 12 * 77, false)
+                .unwrap(),
+            Some(77)
+        );
+        assert!(history
+            .coverage(Action::BeaconWithdrawals, &paid)
+            .unwrap()
+            .is_empty());
+        assert_eq!(d.main.calls().get("eth_getBlockByHash"), None);
     }
 
     /// The mirror pass runs for headers alone when nothing watched lacks the blocks, a range that
