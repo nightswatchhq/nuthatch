@@ -489,6 +489,10 @@ mod tests {
         );
         assert_eq!(rows[1].record["relays"], "ultrasound,titan");
         assert_eq!(rows[5].record["paymentValue"], "3");
+        assert_eq!(
+            rows[4].record["mevRecipient"], A,
+            "of two claims, the one naming this address"
+        );
         let first = *asked.lock().unwrap();
         assert_eq!(first, 6 * 7, "every block but 102, every relay once");
 
