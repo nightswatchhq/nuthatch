@@ -215,8 +215,8 @@ fn coverage_key(a: &Address, action: Action) -> [u8; 21] {
     k
 }
 
-/// A transaction hash and its whole internal list.
-pub type TxInternals = (Vec<u8>, Vec<Map<String, Value>>);
+/// A transaction hash, its block, and its whole internal list.
+pub type TxInternals = (Vec<u8>, u64, Vec<Map<String, Value>>);
 
 /// One stored record and where it sorts.
 #[derive(Debug, Clone)]
@@ -352,8 +352,9 @@ impl AddressHistory {
         {
             let mut t = wtx.open_table(TX_INTERNAL)?;
             let mut buf = Vec::new();
-            for (hash, rows) in txs {
+            for (hash, block, rows) in txs {
                 let mut wrapped = Map::new();
+                wrapped.insert("blockNumber".into(), Value::String(block.to_string()));
                 wrapped.insert(
                     "rows".into(),
                     Value::Array(rows.iter().cloned().map(Value::Object).collect()),
@@ -552,6 +553,23 @@ impl AddressHistory {
                 if head.is_some_and(|h| h > block) {
                     m.insert(HEAD, block)?;
                 }
+            }
+            // A trace of a block the reorg replaced describes a transaction that may no longer
+            // exist there; a txhash lookup must trace it again.
+            let mut traces = wtx.open_table(TX_INTERNAL)?;
+            let mut stale = Vec::new();
+            for e in traces.iter()? {
+                let (k, v) = e?;
+                let cached = decode_record(v.value())?
+                    .get("blockNumber")
+                    .and_then(Value::as_str)
+                    .and_then(|b| b.parse::<u64>().ok());
+                if cached.is_none_or(|b| b > block) {
+                    stale.push(k.value().to_vec());
+                }
+            }
+            for k in stale {
+                traces.remove(k.as_slice())?;
             }
             bump_generation(&wtx)?;
         }

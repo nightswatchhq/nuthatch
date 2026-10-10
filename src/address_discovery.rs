@@ -393,9 +393,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             txlist: self.hydrate(history, &txs, pending).await?,
             ..Found::default()
         };
+        // Only traces of blocks the nest serves through are cached; a window is never past them.
+        let finalized = history.head()?.unwrap_or(0);
         for hash in &internal {
             let rows = self
-                .internal_rows_of(history, hash, pending, u64::MAX)
+                .internal_rows_of(history, hash, pending, finalized)
                 .await?;
             found.txlistinternal.extend(
                 rows.into_iter()
@@ -455,7 +457,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     .internals
                     .lock()
                     .expect("pending lock")
-                    .push((key, records.clone()));
+                    .push((key, block, records.clone()));
                 records
             }
         };
@@ -2178,6 +2180,14 @@ mod tests {
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(main, trace);
+        let key = alloy_primitives::hex::decode(&tx[2..]).unwrap();
+        // Served only through block 299, the trace of block 300 is neither used nor kept.
+        h.set_head(299).unwrap();
+        let err = d.discover_now(&h, A, 300, 399).await.unwrap_err();
+        assert!(err.downcast_ref::<NotFinalized>().is_some(), "{err:#}");
+        assert!(h.tx_internals(&key).unwrap().is_none());
+
+        h.set_head(400).unwrap();
         let found = d.discover_now(&h, A, 300, 399).await.unwrap();
         assert_eq!(found.txlistinternal.len(), 1);
         let row = &found.txlistinternal[0];
@@ -2220,7 +2230,13 @@ mod tests {
             .iter()
             .filter(|(m, _)| m == "trace_transaction")
             .count();
-        assert_eq!(traced_calls, 1);
+        assert_eq!(traced_calls, 2, "once refused as not final, once kept");
+
+        // A reorg below block 300 takes the trace with it; one above leaves it.
+        h.invalidate_above(300).unwrap();
+        assert!(h.tx_internals(&key).unwrap().is_some());
+        h.invalidate_above(299).unwrap();
+        assert!(h.tx_internals(&key).unwrap().is_none());
     }
 
     #[test]
