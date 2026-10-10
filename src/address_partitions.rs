@@ -622,7 +622,7 @@ pub async fn build(
 /// `nuthatch partitions`.
 pub async fn run(args: &crate::cli::PartitionsArgs) -> Result<()> {
     let rpc = crate::address_discovery::Counted::new(crate::rpc::RpcClient::with_fallbacks(
-        vec![args.rpc.clone()],
+        args.rpc.clone(),
         Vec::new(),
     )?);
     rpc.inner().verify_chain_ids(args.chain_id).await?;

@@ -426,9 +426,16 @@ pub struct SeedArgs {
 
 #[derive(Args)]
 pub struct PartitionsArgs {
-    /// The RPC to read blocks from. Its finalized block bounds what may be built.
-    #[arg(long, env = "NUTHATCH_RPC", hide_env_values = true)]
-    pub rpc: String,
+    /// The RPCs to read blocks from, comma-separated and round-robined. Their finalized block bounds
+    /// what may be built. Any RPC will do: every consumer verifies what is built against its own.
+    #[arg(
+        long,
+        env = "NUTHATCH_RPC",
+        hide_env_values = true,
+        value_delimiter = ',',
+        required = true
+    )]
+    pub rpc: Vec<String>,
     /// The chain the RPC must be on, checked before anything is read.
     #[arg(long, default_value_t = 1)]
     pub chain_id: u64,
