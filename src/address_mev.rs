@@ -173,8 +173,9 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
         rows.insert(b, r);
     }
 
-    // A relay-built block pays the proposer from the block's fee recipient, the builder, in a
-    // transaction of its own: a value transfer in from the block's miner is the candidate.
+    // A relay-built block pays the proposer in a transaction of its own, from the builder's fee
+    // recipient or, for builders that pay from another account, as the block's last
+    // transaction: those are the candidates a relay is asked about.
     let mut incoming: BTreeMap<u64, Vec<&Map<String, Value>>> = BTreeMap::new();
     for t in &txs {
         if text(t, "to") == a && text(t, "value") != "0" && text(t, "isError") != "1" {
@@ -198,7 +199,15 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("block {b} has no miner"))?
             .to_ascii_lowercase();
-        let Some(payment) = paid.iter().rev().find(|t| text(t, "from") == miner) else {
+        let last = header
+            .get("transactions")
+            .and_then(Value::as_array)
+            .map(|t| t.len().saturating_sub(1).to_string());
+        let Some(payment) = paid
+            .iter()
+            .rev()
+            .find(|t| text(t, "from") == miner || Some(text(t, "transactionIndex")) == last)
+        else {
             continue;
         };
         let record = relay_record(history, relays, b).await?;
@@ -380,6 +389,17 @@ mod tests {
                     "7",
                     "0xp3",
                 ),
+                {
+                    // A builder that pays from another account, in the block's last transaction.
+                    let mut last = tx(
+                        105,
+                        "0x00000000000000000000000000000000000000f5",
+                        "11",
+                        "0xp5",
+                    );
+                    last.record.insert("transactionIndex".into(), json!("1"));
+                    last
+                },
             ],
             (100, 199),
             g,
@@ -392,7 +412,13 @@ mod tests {
                     101 => BUILDER,
                     103 => "0x00000000000000000000000000000000000000e4",
                     _ => "0x00000000000000000000000000000000000000d9",
-                }, "baseFeePerGas": "0x1", "transactions": [], "uncles": []}),
+                }, "baseFeePerGas": "0x1",
+                   "transactions": if b == 105 { json!(["0x01", "0x02"]) } else { json!([]) },
+                   "uncles": []}),
+                "eth_getBlockReceipts" if p[0] == "0x69" => json!([
+                    {"transactionHash": "0x01", "gasUsed": "0x1", "effectiveGasPrice": "0x1"},
+                    {"transactionHash": "0x02", "gasUsed": "0x1", "effectiveGasPrice": "0x1"},
+                ]),
                 "eth_getBlockReceipts" => json!([]),
                 other => anyhow::bail!("unexpected {other}"),
             })
@@ -406,6 +432,7 @@ mod tests {
             ("titan", 101, trace(101, A, "9000")),
             ("flashbots", 104, trace(104, A, "6")),
             ("agnostic", 104, trace(104, A, "60")),
+            ("aestus", 105, trace(105, A, "11")),
         ]);
         let rows = produced_blocks(&d, &rel, &h, A, (100, 199)).await.unwrap();
         let view: Vec<(u64, String, String, String, String)> = rows
@@ -433,6 +460,13 @@ mod tests {
                     "0xp1".into()
                 ),
                 (104, A.into(), "conflict".into(), "".into(), "".into()),
+                (
+                    105,
+                    "0x00000000000000000000000000000000000000d9".into(),
+                    "relay".into(),
+                    "11".into(),
+                    "0xp5".into()
+                ),
             ]
         );
         assert_eq!(rows[1].record["relays"], "ultrasound,titan");
@@ -443,8 +477,8 @@ mod tests {
         let first = *asked.lock().unwrap();
         assert_eq!(
             first,
-            6 * 4,
-            "blocks 100, 101, 103 and 104, every relay once"
+            6 * 5,
+            "blocks 100, 101, 103, 104 and 105, every relay once"
         );
 
         // Asked again, the relays' answers come from the store.
