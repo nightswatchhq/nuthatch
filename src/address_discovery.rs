@@ -13,7 +13,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -129,6 +129,9 @@ pub struct Window {
     proven: AtomicBool,
     /// Calls in flight on this window's provider, across every range sharing it.
     permits: tokio::sync::Semaphore,
+    /// Held by the one range probing a size not yet served, so concurrent ranges do not each pay
+    /// for the same refusal.
+    probe: tokio::sync::Mutex<()>,
 }
 
 /// Successes at one span before it is tried doubled.
@@ -144,6 +147,7 @@ impl Window {
             streak: AtomicU64::new(0),
             proven: AtomicBool::new(false),
             permits: tokio::sync::Semaphore::new(RANGE_CONCURRENCY),
+            probe: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -235,10 +239,10 @@ fn stated_limit(error: &str) -> Option<u64> {
 }
 
 /// Run a ranged call over `[from, to]` in spans the provider accepts, concatenating the arrays in
-/// block order. Once the window's span has been served, up to `RANGE_CONCURRENCY` spans go out at
-/// once and are judged in order as they arrive: clean answers are kept, a fatal one fails the call
-/// at once, and a span that needs a smaller size sends the rest back to be asked again at the new
-/// size, after their answers are read so that a fatal one among them is never discarded.
+/// block order. Once the window's size has been served, up to `RANGE_CONCURRENCY` spans go out at
+/// once; until then every range on the window sends one span at a time. Answers are judged in
+/// order as they arrive: a fatal one fails the call at once, and a span refused for its size is
+/// asked again at the smaller size while the clean answers around it are kept.
 async fn ranged<R: Rpc>(
     rpc: &R,
     window: &Window,
@@ -247,21 +251,43 @@ async fn ranged<R: Rpc>(
     method: &str,
     params: impl Fn(u64, u64) -> Value,
 ) -> Result<Vec<Value>> {
-    let mut out = Vec::new();
-    let mut start = from;
-    while start <= to {
-        let span = window.get();
+    ranged_in(rpc, window, from, to, method, params, RANGE_CONCURRENCY).await
+}
+
+/// `ranged` with at most `most` spans in flight; one is the sequential scan the tests compare with.
+async fn ranged_in<R: Rpc>(
+    rpc: &R,
+    window: &Window,
+    from: u64,
+    to: u64,
+    method: &str,
+    params: impl Fn(u64, u64) -> Value,
+    most: usize,
+) -> Result<Vec<Value>> {
+    let mut parts: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
+    let mut todo: VecDeque<(u64, u64)> = VecDeque::from([(from, to)]);
+    while !todo.is_empty() {
+        let probing = match window.proven.load(Ordering::Relaxed) {
+            true => None,
+            false => Some(window.probe.lock().await),
+        };
         let lanes = if window.proven.load(Ordering::Relaxed) {
-            RANGE_CONCURRENCY
+            most
         } else {
             1
         };
+        let probing = probing.filter(|_| lanes == 1);
+        let span = window.get();
         let mut spans = Vec::with_capacity(lanes);
-        let mut s = start;
-        while s <= to && spans.len() < lanes {
-            let e = s.saturating_add(span - 1).min(to);
-            spans.push((s, e));
-            s = e + 1;
+        while spans.len() < lanes {
+            let Some((s, e)) = todo.pop_front() else {
+                break;
+            };
+            let end = s.saturating_add(span - 1).min(e);
+            spans.push((s, end));
+            if end < e {
+                todo.push_front((end + 1, e));
+            }
         }
         let mut answers = futures::stream::iter(spans.clone())
             .map(|(s, e)| {
@@ -273,30 +299,34 @@ async fn ranged<R: Rpc>(
             })
             .buffered(lanes);
         let mut asked = spans.into_iter();
+        let mut again = Vec::new();
         while let Some(answer) = answers.next().await {
             let (s, e) = asked.next().expect("one answer per span");
             match judge(method, s, e, answer)? {
                 Judged::Rows(items) => {
                     window.succeeded();
-                    out.extend(items);
-                    start = e + 1;
+                    parts.insert(s, items);
                 }
                 Judged::Smaller(why) => {
-                    while let Some(later) = answers.next().await {
-                        let (s, e) = asked.next().expect("one answer per span");
-                        judge(method, s, e, later)?;
+                    // A refusal of a size the window has already shrunk below is old news, and
+                    // shrinking again for each sibling sent at it collapses the window.
+                    if span <= window.get() {
+                        if let Some(next) = window.shrink(&why) {
+                            tracing::debug!(
+                                "{method} [{s}, {e}] refused, retrying in spans of {next}: {why}"
+                            );
+                        }
                     }
-                    if let Some(next) = window.shrink(&why) {
-                        tracing::debug!(
-                            "{method} [{s}, {e}] refused, retrying in spans of {next}: {why}"
-                        );
-                    }
-                    break;
+                    again.push((s, e));
                 }
             }
         }
+        drop(probing);
+        for range in again.into_iter().rev() {
+            todo.push_front(range);
+        }
     }
-    Ok(out)
+    Ok(parts.into_values().flatten().collect())
 }
 
 /// One span's answer: its rows, or a refusal about its size that a smaller span may not meet.
@@ -1654,6 +1684,7 @@ mod tests {
     /// A provider that caps spans at 100 blocks, answers one item per block, and finishes later
     /// spans first, so the concurrent path is out of order underneath.
     struct Capped {
+        calls: AtomicU64,
         in_flight: AtomicU64,
         most: AtomicU64,
         timed_out_once: AtomicBool,
@@ -1662,6 +1693,7 @@ mod tests {
     impl Capped {
         fn new(fatal_at: Option<u64>) -> Capped {
             Capped {
+                calls: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 most: AtomicU64::new(0),
                 timed_out_once: AtomicBool::new(false),
@@ -1671,6 +1703,7 @@ mod tests {
     }
     impl Rpc for Capped {
         async fn call(&self, _: &str, p: Value) -> Result<Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.most.fetch_max(now, Ordering::SeqCst);
             let s = hex_u64(&p[0]["fromBlock"])?;
@@ -1786,6 +1819,88 @@ mod tests {
         .await
         .expect("the fatal answer ends the call without waiting for [4, 5]");
         assert!(format!("{:#}", got.unwrap_err()).contains("401"));
+    }
+
+    /// Refuses a span whose answer would hold more than 2,000 logs, as Alchemy does, without
+    /// stating a limit. Blocks 40,000 to 41,999 hold five logs each; elsewhere every 97th holds one.
+    struct Dense {
+        calls: AtomicU64,
+    }
+    impl Rpc for Dense {
+        async fn call(&self, _: &str, p: Value) -> Result<Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let s = hex_u64(&p[0]["fromBlock"])?;
+            let e = hex_u64(&p[0]["toBlock"])?;
+            tokio::time::sleep(std::time::Duration::from_millis(s % 3)).await;
+            let logs = |b: u64| match b {
+                40_000..42_000 => 5,
+                _ if b % 97 == 0 => 1,
+                _ => 0,
+            };
+            if (s..=e).map(logs).sum::<u64>() > 2_000 {
+                bail!("query returned more than 2000 results");
+            }
+            Ok(Value::Array(
+                (s..=e)
+                    .flat_map(|b| (0..logs(b)).map(move |i| json!([b, i])))
+                    .collect(),
+            ))
+        }
+    }
+
+    /// Four filters sharing one window, all at once, make no more calls than the same four one
+    /// after the other one span at a time, and answer the same.
+    #[tokio::test]
+    async fn concurrent_spans_make_no_more_calls_than_sequential_ones() {
+        async fn four(most: usize, together: bool) -> (Vec<Vec<Value>>, u64) {
+            let rpc = Dense {
+                calls: AtomicU64::new(0),
+            };
+            let w = Window::new(100_000);
+            let one = || ranged_in(&rpc, &w, 0, 199_999, "eth_getLogs", blocks, most);
+            let got = if together {
+                futures::future::try_join_all([one(), one(), one(), one()])
+                    .await
+                    .unwrap()
+            } else {
+                let mut got = Vec::new();
+                for _ in 0..4 {
+                    got.push(one().await.unwrap());
+                }
+                got
+            };
+            (got, rpc.calls.load(Ordering::SeqCst))
+        }
+        let (want, sequential) = four(1, false).await;
+        let (got, concurrent) = four(RANGE_CONCURRENCY, true).await;
+        assert_eq!(got, want);
+        assert!(
+            concurrent <= sequential,
+            "{concurrent} calls concurrently against {sequential} one at a time"
+        );
+
+        let capped = |most| async move {
+            let rpc = Capped::new(None);
+            let got = ranged_in(
+                &rpc,
+                &Window::new(100_000),
+                0,
+                2_999,
+                "trace_filter",
+                blocks,
+                most,
+            )
+            .await
+            .unwrap();
+            (got, rpc.calls.load(Ordering::SeqCst))
+        };
+        let (want, sequential) = capped(1).await;
+        let (got, concurrent) = capped(RANGE_CONCURRENCY).await;
+        assert_eq!(got, want);
+        assert!(
+            concurrent <= sequential,
+            "{concurrent} against {sequential}"
+        );
     }
 
     #[test]
