@@ -1833,7 +1833,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(s % 3)).await;
             let logs = |b: u64| match b {
                 40_000..42_000 => 5,
-                _ if b % 97 == 0 => 1,
+                _ if b.is_multiple_of(97) => 1,
                 _ => 0,
             };
             if (s..=e).map(logs).sum::<u64>() > 2_000 {
