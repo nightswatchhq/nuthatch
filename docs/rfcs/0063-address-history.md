@@ -140,6 +140,16 @@ every block in a covered range is traced once and shared across watched addresse
 complete. That range, and Arbitrum before Nitro, answer `NUTHATCH_UNSUPPORTED` so rotki falls back.
 Every figure here is replaced by a measured one before its chain ships.
 
+Measured 2026-10-10 on Alchemy. Gnosis serves `trace_filter` over 1,000 blocks in about a second, though
+a 50,000-block window can time out or answer 503, and a timeout now reads as one so the span narrows.
+Base states a 5,000-block limit. Optimism states 5,000 and then, after about 15 seconds, 100: one
+address over 50,000 Optimism blocks is 1,000 sequential calls and took 28 minutes, so an Optimism
+backfill is hours per million blocks and the 5-minute poll keeps up with the tip easily.
+
+Partitions off Ethereum carry headers alone and serve timestamp to block. On the OP stack the
+header's `withdrawalsRoot` is the message passer's storage root from Isthmus on and the block lists
+no withdrawals, so on chains 10 and 8453 a partition holds no withdrawal list and none is checked.
+
 ## 8. MEV, withdrawals and block production
 
 Withdrawals come from block bodies (EIP-4895). Fee-recipient blocks come from headers; rewards from

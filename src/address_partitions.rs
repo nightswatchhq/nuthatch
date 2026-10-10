@@ -129,9 +129,15 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Published>> {
     Ok(out)
 }
 
+/// Whether a chain's `withdrawalsRoot` commits to beacon withdrawals. On the OP stack it is the
+/// message passer's storage root from Isthmus on, and the block lists no withdrawals.
+pub fn beacon_withdrawals(chain_id: u64) -> bool {
+    !matches!(chain_id, 10 | 8453)
+}
+
 /// One block for publication, read from `rpc` and checked against itself: its fields must hash to
 /// the hash the RPC gave, and its withdrawals to its withdrawals root.
-pub async fn fetch(rpc: &impl Rpc, b: u64) -> Result<Published> {
+pub async fn fetch(rpc: &impl Rpc, chain_id: u64, b: u64) -> Result<Published> {
     let v = rpc
         .call("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))
         .await
@@ -153,6 +159,12 @@ pub async fn fetch(rpc: &impl Rpc, b: u64) -> Result<Published> {
         bail!("block {b}'s header fields do not hash to {claimed}");
     }
     let withdrawals = match header.withdrawals_root {
+        Some(_) if !beacon_withdrawals(chain_id) => {
+            if v["withdrawals"].as_array().is_some_and(|w| !w.is_empty()) {
+                bail!("block {b} lists withdrawals, which chain {chain_id} never has");
+            }
+            None
+        }
         Some(root) => {
             let ws: Vec<Withdrawal> = serde_json::from_value(v["withdrawals"].clone())
                 .with_context(|| format!("block {b}'s withdrawals"))?;
@@ -176,17 +188,17 @@ pub async fn fetch(rpc: &impl Rpc, b: u64) -> Result<Published> {
 
 /// [`fetch`], retried after a pause: a provider's brief refusal partway through a span should cost a
 /// wait, not the span.
-async fn fetch_patiently(rpc: &impl Rpc, b: u64) -> Result<Published> {
+async fn fetch_patiently(rpc: &impl Rpc, chain_id: u64, b: u64) -> Result<Published> {
     let mut pause = std::time::Duration::from_secs(15);
     for _ in 0..3 {
-        match fetch(rpc, b).await {
+        match fetch(rpc, chain_id, b).await {
             Ok(p) => return Ok(p),
             Err(e) => tracing::warn!("block {b}: {e:#}; trying again in {}s", pause.as_secs()),
         }
         tokio::time::sleep(pause).await;
         pause *= 2;
     }
-    fetch(rpc, b).await
+    fetch(rpc, chain_id, b).await
 }
 
 /// A block whose header and withdrawals a partition carried and the nest has checked.
@@ -204,6 +216,7 @@ pub fn verify(
     from: u64,
     to: u64,
     anchor: B256,
+    chain_id: u64,
 ) -> Result<Vec<VerifiedBlock>> {
     let want = to - from + 1;
     if blocks.len() as u64 != want {
@@ -236,6 +249,7 @@ pub fn verify(
                 ws
             }
             (None, None) => Vec::new(),
+            (Some(_), None) if !beacon_withdrawals(chain_id) => Vec::new(),
             (Some(_), None) => bail!("block {n} commits to withdrawals the partition lacks"),
             (None, Some(_)) => bail!("block {n} carries withdrawals its header does not commit to"),
         };
@@ -429,7 +443,7 @@ pub async fn ingest(
         let Some(bytes) = source.fetch(from, fresh).await? else {
             bail!("the mirror has no partition for blocks [{from}, {to}]");
         };
-        match decode(&bytes).and_then(|blocks| verify(&blocks, from, to, anchor)) {
+        match decode(&bytes).and_then(|blocks| verify(&blocks, from, to, anchor, source.chain_id)) {
             Ok(v) => {
                 verified = Some(v);
                 break;
@@ -621,12 +635,13 @@ pub async fn build(
             built.rebuilt += 1;
         }
         let blocks: Vec<Published> = futures::stream::iter(start..=end)
-            .map(|b| fetch_patiently(rpc, b))
+            .map(|b| fetch_patiently(rpc, chain_id, b))
             .buffered(concurrency)
             .try_collect()
             .await?;
         let last = keccak256(&blocks.last().expect("a span holds blocks").header);
-        verify(&blocks, start, end, last).context("the blocks the RPC gave do not form a chain")?;
+        verify(&blocks, start, end, last, chain_id)
+            .context("the blocks the RPC gave do not form a chain")?;
         let bytes = encode(&blocks)?;
         mirror.put(&key, &bytes).await?;
         let e_tag = mirror.head(&key).await?.and_then(|h| h.e_tag);
@@ -835,7 +850,7 @@ pub(crate) mod tests {
         let chain = synthetic(100, 199);
         let blocks = published(&chain);
         let anchor = chain.last().unwrap().0.hash_slow();
-        let v = verify(&blocks, 100, 199, anchor).unwrap();
+        let v = verify(&blocks, 100, 199, anchor, 1).unwrap();
         assert_eq!(v.len(), 100);
         assert_eq!(v[5].withdrawals[1].address, PAID);
 
@@ -907,7 +922,7 @@ pub(crate) mod tests {
         for (want, spoil) in cases {
             let mut b = blocks.clone();
             spoil(&mut b);
-            let err = verify(&b, 100, 199, anchor).unwrap_err();
+            let err = verify(&b, 100, 199, anchor, 1).unwrap_err();
             assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
         }
         let mut pre = chain[0].0.clone();
@@ -917,8 +932,44 @@ pub(crate) mod tests {
             header: reencode(&pre),
             withdrawals: blocks[0].withdrawals.clone(),
         }];
-        let err = verify(&one, 100, 100, pre.hash_slow()).unwrap_err();
+        let err = verify(&one, 100, 100, pre.hash_slow(), 1).unwrap_err();
         assert!(format!("{err:#}").contains("does not commit to"), "{err:#}");
+    }
+
+    /// An OP-stack header's withdrawals root after Isthmus is a storage root over no withdrawals: the
+    /// partition carries the header alone there, and nowhere else.
+    #[tokio::test]
+    async fn an_op_stack_withdrawals_root_is_not_a_withdrawals_commitment() {
+        let header = Header {
+            number: 5,
+            timestamp: 1_750_000_000,
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(B256::repeat_byte(0x5a)),
+            ..Header::default()
+        };
+        let rpc_listing = |ws: Vec<Withdrawal>| {
+            let h = header.clone();
+            Fake::new(move |_, _| {
+                let mut v = serde_json::to_value(&h).unwrap();
+                v["hash"] = json!(h.hash_slow());
+                v["withdrawals"] = json!(ws);
+                Ok(v)
+            })
+        };
+        let empty = rpc_listing(Vec::new());
+        for chain in [10, 8453] {
+            let p = fetch(&empty, chain, 5).await.unwrap();
+            assert_eq!(p.withdrawals, None);
+            let v = verify(std::slice::from_ref(&p), 5, 5, header.hash_slow(), chain).unwrap();
+            assert!(v[0].withdrawals.is_empty());
+            let err = verify(&[p], 5, 5, header.hash_slow(), 1).unwrap_err();
+            assert!(format!("{err:#}").contains("lacks"), "{err:#}");
+        }
+        let err = fetch(&empty, 1, 5).await.unwrap_err();
+        assert!(format!("{err:#}").contains("do not hash"), "{err:#}");
+        let listed = rpc_listing(synthetic(0, 0)[0].1.clone());
+        let err = fetch(&listed, 10, 5).await.unwrap_err();
+        assert!(format!("{err:#}").contains("never has"), "{err:#}");
     }
 
     /// Two builds of one range publish identical files, and a build that finds them already there
@@ -1125,7 +1176,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_reward_is_refused_unless_the_body_matches_the_header() {
         let chain = synthetic(0, 0);
-        let block = &verify(&published(&chain), 0, 0, chain[0].0.hash_slow()).unwrap()[0];
+        let block = &verify(&published(&chain), 0, 0, chain[0].0.hash_slow(), 1).unwrap()[0];
         let honest = chain_rpc(0);
         assert_eq!(
             verified_reward(&honest, block).await.unwrap().to_string(),
@@ -1281,10 +1332,10 @@ pub(crate) mod tests {
         for b in [
             1_000_000, 12_000_000, 14_000_136, 17_100_000, 20_000_206, 23_000_000,
         ] {
-            let p = fetch(&rpc, b).await.unwrap();
-            let next = fetch(&rpc, b + 1).await.unwrap();
+            let p = fetch(&rpc, 1, b).await.unwrap();
+            let next = fetch(&rpc, 1, b + 1).await.unwrap();
             let anchor = keccak256(&next.header);
-            let v = verify(&[p, next], b, b + 1, anchor).unwrap();
+            let v = verify(&[p, next], b, b + 1, anchor, 1).unwrap();
             assert_eq!(v[0].header.number, b);
         }
         for (b, want) in [
@@ -1292,9 +1343,9 @@ pub(crate) mod tests {
             (14_000_136, "2137894551482662487"),
             (15_342_722, "2149854197642085641"),
         ] {
-            let p = fetch(&rpc, b).await.unwrap();
+            let p = fetch(&rpc, 1, b).await.unwrap();
             let anchor = keccak256(&p.header);
-            let v = verify(&[p], b, b, anchor).unwrap();
+            let v = verify(&[p], b, b, anchor, 1).unwrap();
             assert_eq!(
                 verified_reward(&rpc, &v[0]).await.unwrap().to_string(),
                 want,

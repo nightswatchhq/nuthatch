@@ -1204,9 +1204,12 @@ impl RpcClient {
             anyhow::Error::new(ClassifiedError { class, detail })
         };
         let resp = self.http.post(url).json(body).send().await.map_err(|e| {
+            // reqwest's own text for a timeout is "error sending request", which a caller narrowing
+            // its range on a timeout cannot tell from a refused connection.
+            let timed_out = if e.is_timeout() { "timed out: " } else { "" };
             classified(
                 FailureClass::Transient,
-                format!("transport error: {}", e.without_url()),
+                format!("transport error: {timed_out}{}", e.without_url()),
             )
         })?;
         let status = resp.status();
@@ -2478,6 +2481,31 @@ mod tests {
                 "accepted {response}"
             );
         }
+    }
+
+    /// A provider that never answers within the deadline must read as a timeout, which address
+    /// discovery narrows its span on, not as an unreachable endpoint (Gnosis `trace_filter`, 2026-10-10).
+    #[tokio::test]
+    async fn a_request_past_its_deadline_says_it_timed_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                open.push(s);
+            }
+        });
+        let client = super::RpcClient::with_timeout(
+            vec![format!("http://127.0.0.1:{port}")],
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap();
+        let error = client
+            .post_one_for_test(&serde_json::json!({"method":"trace_filter"}))
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("timed out"), "{text}");
     }
 
     /// A provider key in the URL must not travel with a transport error into logs or stored text.
