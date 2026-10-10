@@ -213,7 +213,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 return;
             }
         };
-        for address in watched {
+        for address in watched.clone() {
             let mut recorded_through: Option<u64> = None;
             loop {
                 let next = match crate::address_discovery::next_uncovered(
@@ -281,6 +281,90 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                         break;
                     }
                 }
+            }
+        }
+        // Withdrawals and produced blocks come from bodies, and the definitions they are matched to
+        // are Ethereum mainnet's, so only there is the block scan run.
+        if state.chain_id == 1 {
+            scan_bodies(self, state, &watched, to).await;
+        }
+    }
+}
+
+/// The block-body pass: each window is read once for every watched address that still lacks it,
+/// starting from the least covered, so an address watched later backfills without a second scan
+/// of what the others already have.
+async fn scan_bodies<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    watched: &[String],
+    to: u64,
+) {
+    use crate::address_discovery::{
+        next_uncovered_for, record_blocks, BLOCK_SCANNED, BLOCK_WINDOW,
+    };
+    let mut last: Option<u64> = None;
+    loop {
+        let mut next = Vec::new();
+        for a in watched {
+            match next_uncovered_for(&state.history, a, state.start_block, &BLOCK_SCANNED) {
+                Ok(n) => next.push((a.clone(), n)),
+                Err(e) => {
+                    tracing::warn!("address history: block coverage for {a}: {e:#}");
+                    return;
+                }
+            }
+        }
+        let Some(from) = next.iter().map(|(_, n)| *n).min().filter(|n| *n <= to) else {
+            return;
+        };
+        if last.is_some_and(|l| from <= l) {
+            state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "address history: block coverage did not advance past {from}; stopping this pass"
+            );
+            return;
+        }
+        let end = from.saturating_add(BLOCK_WINDOW - 1).min(to);
+        // The scan reads the whole window for every address that lacks any of it, so each is
+        // recorded over the whole window.
+        let addresses: Vec<String> = next
+            .into_iter()
+            .filter(|(_, n)| *n <= end)
+            .map(|(a, _)| a)
+            .collect();
+        let lacking = addresses.clone();
+        let outcome = async {
+            let generation = state.history.generation()?;
+            let pending = crate::address_discovery::Pending::default();
+            let found = d.scan_blocks(&addresses, from, end, &pending).await;
+            let history = state.history.clone();
+            tokio::task::spawn_blocking(move || {
+                pending.persist(&history)?;
+                let mut found = found?;
+                for a in lacking {
+                    let f = found.remove(&a.to_ascii_lowercase()).unwrap_or_default();
+                    record_blocks(&history, &a, (from, end), f, generation)?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?
+        }
+        .await;
+        state.set_calls("main", d.main.calls());
+        state.set_calls("trace", d.trace.calls());
+        match outcome {
+            Ok(()) => {
+                last = Some(end);
+                state.windows.fetch_add(1, Ordering::Relaxed);
+                tracing::info!("address history: block bodies read through {end}");
+            }
+            Err(e) => {
+                state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "address history: bodies [{from}, {end}] not recorded, retrying next poll: {e:#}"
+                );
+                return;
             }
         }
     }

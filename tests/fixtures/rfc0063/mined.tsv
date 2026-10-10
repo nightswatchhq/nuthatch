@@ -1,0 +1,4 @@
+# name	address	from	to	how it was found
+mined-post-merge	0x6af88356dd961e2a0db451070dd93c8c2667f7a8	20000000	20000299	headers of blocks 20000000-20000299 listed by fee recipient; Etherscan's getminedblocks gives this one 13 blocks in all, a solo staker, with one (20000206) in the range
+mined-pre-merge	0xf3a71cc1be5ce833c471e3f25aa391f9cd56e1aa	14000000	14000299	headers of blocks 14000000-14000299 likewise; 947 blocks in all at Etherscan, one (14000136) in the range
+mined-uncle	0xf3a71cc1be5ce833c471e3f25aa391f9cd56e1aa	15342722	15342722	the same miner's block that included one uncle, found by reading the headers of its listed blocks

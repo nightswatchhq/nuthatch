@@ -12,11 +12,16 @@
 # JSON row per line (vitalik-txlist.jsonl, vitalik-tokentx.jsonl, vitalik-tokennfttx.jsonl,
 # vitalik-token1155tx.jsonl, vitalik-txlistinternal.jsonl); re-pin them with Etherscan's account API
 # over the same range. The internal-transaction cases are committed in tests/fixtures/rfc0063 and
-# re-pinned by scripts/rfc0063-pin-internal.sh.
+# re-pinned by scripts/rfc0063-pin.sh.
 #
 # Phases: (1) vitalik's history, every hash set and the fields rotki reads; (2) each of vitalik's
-# internal transactions by txhash; (3) one single-block nest per case in cases.tsv. Exits non-zero
-# on any mismatch, after listing every one. PHASES=3 runs only the cases (phase 2 needs phase 1).
+# internal transactions by txhash; (3) one single-block nest per case in cases.tsv; (4) the beacon
+# withdrawals of 0x7a25bd5f286fb722e7578c62e86a675ff0a00b15 over 17,034,870-17,300,000, a body per
+# block, so the slow one (<fixtures-dir>/withdrawals-0x7a25-txsBeaconWithdrawal.jsonl); (5) one
+# nest per getminedblocks case in mined.tsv; (6) one nest per txlist case in created.tsv, contracts
+# deployed by a transaction, whose txlist opens with it. PHASES picks any of 1, 3, 4, 5 and 6 (2 runs
+# within 1).
+# Exits non-zero on any mismatch, after listing every one.
 set -euo pipefail
 
 BIN=${1:?usage: $0 <nuthatch-binary> <fixtures-dir>}
@@ -41,6 +46,10 @@ PID=""
 stop() { [ -n "$PID" ] && { kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; }; PID=""; }
 trap 'stop; rm -rf "$WORK"' EXIT
 FAILED=0
+
+rows() { # manifest: its case rows, or fail when it is missing or has none, so a phase cannot pass unrun
+  grep -v '^#' "$CASES/$1" > "$WORK/$1.rows" || { echo "FAIL: no cases in $CASES/$1"; exit 1; }
+}
 
 start() { # name address from to: start a nest watching one address over [from, to]
   mkdir -p "$WORK/$1"
@@ -136,10 +145,10 @@ same_rows() { # label fields ours theirs: the two files hold the same rows, as m
 INTERNAL='{hash,blockNumber,timeStamp,from,to,value,traceId,gas,gasUsed,type,isError,errCode,contractAddress}'
 BYHASH='{parent,blockNumber,timeStamp,from,to,value,gas,gasUsed,type,isError,errCode,contractAddress,traceId}'
 
-PHASES=${PHASES:-13}
-# Phase 2 runs inside phase 1, on its nest, so there are three selections and no others.
-if ! [[ $PHASES =~ ^(1|3|13)$ ]]; then
-  echo "FAIL: PHASES=$PHASES; use 13 (all), 1 (vitalik, with its txhash phase) or 3 (the cases)" >&2
+PHASES=${PHASES:-13456}
+# Phase 2 runs inside phase 1, on its nest, so it cannot be chosen alone.
+if ! [[ $PHASES =~ ^[13456]+$ ]]; then
+  echo "FAIL: PHASES=$PHASES; choose from 1 (vitalik, with its txhash phase), 3, 4, 5 and 6" >&2
   exit 1
 fi
 if [[ $PHASES == *1* ]]; then
@@ -207,6 +216,7 @@ stop
 fi
 
 if [[ $PHASES == *3* ]]; then
+rows cases.tsv
 # Phase 3: one single-block nest per case.
 while IFS=$'\t' read -r name address block hash _; do
   start "$name" "$address" "$block" "$block"
@@ -226,7 +236,53 @@ while IFS=$'\t' read -r name address block hash _; do
     COLD_DONE=1
   fi
   stop
-done < <(grep -v '^#' "$CASES/cases.tsv")
+done < "$WORK/cases.tsv.rows"
+fi
+
+if [[ $PHASES == *4* ]]; then
+# Phase 4: beacon withdrawals, read from every block body in the range.
+W=0x7a25bd5f286fb722e7578c62e86a675ff0a00b15
+start withdrawals "$W" 17034870 17300000
+wait_covered withdrawals "$W" 17034870 17300000 txsBeaconWithdrawal
+all_rows txsBeaconWithdrawal "$W" 17034870 17300000 "$WORK/withdrawals.jsonl"
+# The fixture repeats rows where its pinning split a range, as slice 3's did: compare unique rows.
+jq -cS . "$FIX/withdrawals-0x7a25-txsBeaconWithdrawal.jsonl" | sort -u > "$WORK/withdrawals.theirs"
+jq -r .withdrawalIndex "$WORK/withdrawals.jsonl" | sort -u > "$WORK/wi.ours"
+jq -r .withdrawalIndex "$WORK/withdrawals.theirs" | sort -u > "$WORK/wi.theirs"
+echo "withdrawals: $(wc -l < "$WORK/wi.ours" | tr -d ' ') indices ours, $(wc -l < "$WORK/wi.theirs" | tr -d ' ') Etherscan's ($(wc -l < "$FIX/withdrawals-0x7a25-txsBeaconWithdrawal.jsonl" | tr -d ' ') fixture rows), $(wc -l < "$WORK/withdrawals.jsonl" | tr -d ' ') rows"
+for i in $(comm -13 "$WORK/wi.ours" "$WORK/wi.theirs"); do echo "  MISSING withdrawal $i"; FAILED=1; done
+for i in $(comm -23 "$WORK/wi.ours" "$WORK/wi.theirs"); do echo "  EXTRA   withdrawal $i"; FAILED=1; done
+same_rows "withdrawals, every field" . "$WORK/withdrawals.jsonl" "$WORK/withdrawals.theirs"
+echo "RPC calls (withdrawals):"
+curl -s "$URL/metrics" | grep '^nuthatch_address_history_rpc_calls_total' | sed 's/^nuthatch_address_history_rpc_calls_total/  /' | mask
+stop
+fi
+
+if [[ $PHASES == *5* ]]; then
+rows mined.tsv
+# Phase 5: produced blocks, one nest per case.
+while IFS=$'\t' read -r name address from to _; do
+  start "$name" "$address" "$from" "$to"
+  wait_covered "$name" "$address" "$from" "$to" getminedblocks
+  all_rows getminedblocks "$address" "$from" "$to" "$WORK/$name.jsonl"
+  same_rows "$name" '{blockNumber,timeStamp,blockReward}' "$WORK/$name.jsonl" "$CASES/$name.jsonl"
+  echo "$name: $(wc -l < "$WORK/$name.jsonl" | tr -d ' ') blocks, reward $(jq -r .blockReward "$WORK/$name.jsonl" | head -1)"
+  stop
+done < "$WORK/mined.tsv.rows"
+fi
+
+if [[ $PHASES == *6* ]]; then
+rows created.tsv
+# Phase 6: contracts deployed by a transaction, every txlist field Etherscan gives but its
+# functionName guess and the confirmations that grow with the chain.
+while IFS=$'\t' read -r name address from to _; do
+  start "$name" "$address" "$from" "$to"
+  wait_covered "$name" "$address" "$from" "$to" txlist
+  all_rows txlist "$address" "$from" "$to" "$WORK/$name.jsonl"
+  same_rows "$name" 'del(.functionName, .confirmations)' "$WORK/$name.jsonl" "$CASES/$name.jsonl"
+  echo "$name: $(wc -l < "$WORK/$name.jsonl" | tr -d ' ') rows, the first to \"$(jq -r .to "$WORK/$name.jsonl" | head -1)\" creating $(jq -r .contractAddress "$WORK/$name.jsonl" | head -1)"
+  stop
+done < "$WORK/created.tsv.rows"
 fi
 
 if [ "$FAILED" -ne 0 ]; then

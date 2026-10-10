@@ -1,0 +1,2 @@
+# name	address	from	to	how it was found
+created-by-transaction	0x45e7899634140f3b490d0d5e8315cebdd62d5093	19000000	19000300	the transactions with no to in blocks 19000000-19000009, kept to one whose contract has more rows than its creation; created in 19000008 and called twice after
