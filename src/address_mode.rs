@@ -598,7 +598,8 @@ async fn api(
 ) -> Json<Value> {
     // A txhash lookup needs no coverage: a transaction the store has not traced is traced now, once
     // the request is one `respond` would answer.
-    if let Some(forward) = s.forward.clone() {
+    // The RPC behind the nest is the operator's; only a loopback bind lends it out.
+    if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
         if let Some(v) = crate::address_proxy::answer(&q, s.chain_id, &forward).await {
             return Json(v);
         }
@@ -1043,6 +1044,40 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, v)
+    }
+
+    /// The nest's RPC is lent out through `proxy` only on a loopback bind.
+    #[tokio::test]
+    async fn the_proxy_answers_only_on_loopback() {
+        for loopback in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+            let forward: crate::address_proxy::Forward =
+                Arc::new(|_, _| Box::pin(async { Ok(json!("0x10")) }));
+            let state = Arc::new(
+                ModeState::new(history, 1, Duration::from_secs(300), loopback)
+                    .with_forward(forward),
+            );
+            let (_, v) = call(
+                router(state),
+                "GET",
+                "/api?module=proxy&action=eth_blockNumber",
+                None,
+            )
+            .await;
+            if loopback {
+                assert_eq!(v["result"], "0x10");
+            } else {
+                assert!(
+                    v["result"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("NUTHATCH_UNSUPPORTED:"),
+                    "{v}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

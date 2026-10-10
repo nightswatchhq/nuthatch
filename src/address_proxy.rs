@@ -123,7 +123,21 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         .as_array()
         .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?
         .clone();
-    logs.truncate(MAX_LOGS);
+    if logs.len() > MAX_LOGS {
+        // Cut at a block boundary, so a caller restarting from the last block it was given
+        // moves on. A single block past the cap cannot be paged that way at all.
+        let cut = logs[MAX_LOGS].get("blockNumber").cloned();
+        logs.truncate(MAX_LOGS);
+        while logs.last().and_then(|l| l.get("blockNumber")).cloned() == cut {
+            logs.pop();
+        }
+        if logs.is_empty() {
+            return Ok(Answer::Unsupported(format!(
+                "block {} holds more than {MAX_LOGS} matching logs",
+                cut.unwrap_or(Value::Null)
+            )));
+        }
+    }
 
     let mut paid: BTreeMap<String, (Value, Value)> = BTreeMap::new();
     let mut stamped: BTreeMap<String, Value> = BTreeMap::new();
@@ -197,9 +211,7 @@ mod tests {
     type Calls = Arc<Mutex<Vec<(String, Value)>>>;
 
     /// A forwarder answering from `f`, recording every call.
-    fn fake(
-        f: impl Fn(&str, &Value) -> Value + Send + Sync + 'static,
-    ) -> (Forward, Calls) {
+    fn fake(f: impl Fn(&str, &Value) -> Value + Send + Sync + 'static) -> (Forward, Calls) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let seen = calls.clone();
         let f = Arc::new(f);
@@ -369,6 +381,43 @@ mod tests {
             .filter(|(m, _)| m == "eth_getTransactionReceipt")
             .count();
         assert_eq!(receipts, 2, "one receipt per transaction");
+
+        // Past the cap the answer ends at a block boundary, and one block over it is refused.
+        let dense = |blocks: Vec<u64>| {
+            let logs: Vec<Value> = blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    json!({"address": "0xc0", "topics": [], "data": "0x", "blockNumber": format!("0x{b:x}"),
+                        "blockHash": "0xbh", "logIndex": format!("0x{i:x}"), "transactionHash": "0xa",
+                        "transactionIndex": "0x0", "blockTimestamp": "0x1"})
+                })
+                .collect();
+            fake(move |m, _| match m {
+                "eth_getLogs" => json!(logs),
+                _ => json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"}),
+            })
+            .0
+        };
+        let ask = q(&[
+            ("module", "logs"),
+            ("action", "getLogs"),
+            ("fromBlock", "1"),
+            ("toBlock", "9"),
+        ]);
+        let mut blocks = vec![1; 600];
+        blocks.extend(vec![2; 600]);
+        let cut = answer(&ask, 1, &dense(blocks)).await.unwrap();
+        assert_eq!(
+            cut["result"].as_array().unwrap().len(),
+            600,
+            "block 2 is left whole for the next page"
+        );
+        let one = answer(&ask, 1, &dense(vec![1; 1001])).await.unwrap();
+        assert!(one["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("NUTHATCH_UNSUPPORTED:"));
 
         let or = answer(
             &q(&[
