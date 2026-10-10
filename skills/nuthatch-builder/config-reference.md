@@ -181,6 +181,7 @@ addresses = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"]  # the accounts to wa
 start_block = 0               # optional: history before it is never fetched, and reads incomplete
 end_block = 20000000          # optional: stop here
 poll_interval = "5m"          # optional, default 5m; `--poll-interval` overrides it
+mev_relays = false            # optional, default off: ask the MEV-Boost relays, see below
 ```
 
 On Ethereum mainnet, withdrawals, produced blocks and `getblocknobytime` can come from verified block
@@ -195,6 +196,12 @@ from_block = 17030000         # the blocks taken from the mirror; the RPC scan n
 to_block = 17309999
 cache_mb = 512                # disk the downloaded partitions may hold; at least 64
 ```
+
+`mev_relays = true` in `[address_history]` asks the MEV-Boost relays' public data API about each
+block a watched address produced, or was paid for by a relay-built block's builder, and serves the
+result as `module=account&action=nuthatchProducedBlocks`: fee recipient, block reward, the relays'
+recipient and value, the builder's payment transaction, and `mev` of `relay`, `none` or `conflict`.
+It is off by default; the relays see this machine's IP and those block numbers.
 
 Each partition is verified before use: every header hashed, linked to its parent and anchored to the
 block the nest's own RPC calls finalized, every withdrawal list hashed to its root. One that is

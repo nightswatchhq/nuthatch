@@ -43,6 +43,11 @@ pub struct AddressHistoryConfig {
     /// Block partitions to download rather than read block by block (RFC-0063 §8). Off unless named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror: Option<MirrorConfig>,
+    /// Ask the MEV-Boost relays' public data API about the blocks a watched address produced or was
+    /// paid for (RFC-0063 §8). Off unless set: the relays see this machine's IP and those block
+    /// numbers, which name the validator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mev_relays: bool,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -144,10 +149,13 @@ pub enum Action {
     MinedBlocks,
     TokenNftTx,
     Token1155Tx,
+    /// Nuthatch's own: the blocks an address produced or was paid for through a relay, with the
+    /// relays' record of each (RFC-0063 §8).
+    ProducedBlocks,
 }
 
 impl Action {
-    pub const ALL: [Action; 7] = [
+    pub const ALL: [Action; 8] = [
         Action::TxList,
         Action::TxListInternal,
         Action::TokenTx,
@@ -155,6 +163,7 @@ impl Action {
         Action::MinedBlocks,
         Action::TokenNftTx,
         Action::Token1155Tx,
+        Action::ProducedBlocks,
     ];
 
     pub fn from_etherscan(action: &str) -> Option<Action> {
@@ -166,6 +175,7 @@ impl Action {
             "getminedblocks" => Action::MinedBlocks,
             "tokennfttx" => Action::TokenNftTx,
             "token1155tx" => Action::Token1155Tx,
+            "nuthatchProducedBlocks" => Action::ProducedBlocks,
             _ => return None,
         })
     }
@@ -179,6 +189,7 @@ impl Action {
             Action::MinedBlocks => "getminedblocks",
             Action::TokenNftTx => "tokennfttx",
             Action::Token1155Tx => "token1155tx",
+            Action::ProducedBlocks => "nuthatchProducedBlocks",
         }
     }
 
@@ -192,6 +203,7 @@ impl Action {
             Action::MinedBlocks => 5,
             Action::TokenNftTx => 6,
             Action::Token1155Tx => 7,
+            Action::ProducedBlocks => 8,
         }
     }
 
@@ -204,6 +216,7 @@ impl Action {
             Action::MinedBlocks => MINED_BLOCKS,
             Action::TokenNftTx => TOKENNFTTX,
             Action::Token1155Tx => TOKEN1155TX,
+            Action::ProducedBlocks => PRODUCED_BLOCKS,
         }
     }
 }
@@ -215,6 +228,9 @@ const WITHDRAWALS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_with
 const MINED_BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_minedblocks");
 const TOKENNFTTX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tokennfttx");
 const TOKEN1155TX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_token1155tx");
+const PRODUCED_BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_producedblocks");
+/// The relays' answers about a block, by block number, kept only for blocks the nest serves.
+const RELAY_CACHE: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_relay_cache");
 /// Hydrated transactions by hash, so a hash fetched once is never fetched again.
 const TX_CACHE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_cache");
 /// Block timestamps already read.
@@ -327,6 +343,7 @@ impl AddressHistory {
         wtx.open_table(TX_INTERNAL)?;
         wtx.open_table(HEADERS)?;
         wtx.open_table(VERIFIED_COV)?;
+        wtx.open_table(RELAY_CACHE)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
@@ -731,6 +748,48 @@ impl AddressHistory {
         Ok(())
     }
 
+    /// Every stored row of (address, action) in `[from, to]`, in order.
+    pub fn rows_in(
+        &self,
+        action: Action,
+        address: &str,
+        (from, to): (u64, u64),
+    ) -> Result<Vec<Map<String, Value>>> {
+        let a = parse_address(address)?;
+        let rtx = self.store.database().begin_read()?;
+        let t = rtx.open_table(action.table())?;
+        let lo = row_key(&a, from, 0, 0);
+        let hi = row_key(&a, to, u64::MAX, u64::MAX);
+        t.range(lo.as_slice()..=hi.as_slice())?
+            .map(|e| decode_record(e?.1.value()))
+            .collect()
+    }
+
+    /// What the relays said about `block`, if it was asked before.
+    pub fn relay_record(&self, block: u64) -> Result<Option<Map<String, Value>>> {
+        let rtx = self.store.database().begin_read()?;
+        match rtx.open_table(RELAY_CACHE)?.get(block)? {
+            Some(v) => Ok(Some(decode_record(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Keep what the relays said about `block`, once the nest serves through it: a relay may still
+    /// learn of a block near the tip.
+    pub fn cache_relay_record(&self, block: u64, record: &Map<String, Value>) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
+            if head.is_some_and(|h| block <= h) {
+                let mut buf = Vec::new();
+                encode_record(record, &mut buf)?;
+                wtx.open_table(RELAY_CACHE)?.insert(block, buf.as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
     pub fn coverage(&self, action: Action, address: &str) -> Result<Vec<(u64, u64)>> {
         let a = parse_address(address)?;
         let rtx = self.store.database().begin_read()?;
@@ -803,6 +862,16 @@ impl AddressHistory {
                 let head = m.get(HEAD)?.map(|v| v.value());
                 if head.is_some_and(|h| h > block) {
                     m.insert(HEAD, block)?;
+                }
+            }
+            {
+                let mut relays = wtx.open_table(RELAY_CACHE)?;
+                let above: Vec<u64> = relays
+                    .range(block.saturating_add(1)..)?
+                    .map(|e| e.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for b in above {
+                    relays.remove(b)?;
                 }
             }
             {
@@ -1146,6 +1215,15 @@ const KNOWN_KEYS: &[&str] = &[
     "timestamp",
     "L1FeesPaid",
     "authorizationList",
+    "feeRecipient",
+    "mevRecipient",
+    "mevReward",
+    "relays",
+    "builderPubkey",
+    "proposerPubkey",
+    "paymentTx",
+    "paymentValue",
+    "mev",
 ];
 const OTHER_KEY: u8 = 0xff;
 
@@ -2152,6 +2230,7 @@ mod tests {
             end_block: None,
             poll_interval: None,
             mirror: None,
+            mev_relays: false,
         };
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);

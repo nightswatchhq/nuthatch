@@ -76,6 +76,8 @@ pub struct ModeState {
     pub tracer: Option<Tracer>,
     /// Forwards `proxy` and `logs` requests to the nest's RPC.
     pub forward: Option<crate::address_proxy::Forward>,
+    /// The MEV-Boost relays, when `mev_relays` turns them on.
+    pub relays: Option<crate::address_mev::Relays>,
     /// Verified block partitions, and the blocks `[address_history.mirror]` takes from them.
     pub mirror: Option<(Arc<crate::address_partitions::Source>, (u64, u64))>,
 }
@@ -111,8 +113,14 @@ impl ModeState {
             discovery_errors: AtomicU64::new(0),
             tracer: None,
             forward: None,
+            relays: None,
             mirror: None,
         }
+    }
+
+    pub fn with_relays(mut self, relays: crate::address_mev::Relays) -> Self {
+        self.relays = Some(relays);
+        self
     }
 
     pub fn with_forward(mut self, forward: crate::address_proxy::Forward) -> Self {
@@ -311,6 +319,23 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 mirror_pass(self, state, &watched, to, source, *blocks).await;
             }
             scan_bodies(self, state, &watched, to, skip).await;
+            if let Some(relays) = &state.relays {
+                if let Err(e) = crate::address_mev::mev_pass(
+                    self,
+                    relays,
+                    &state.history,
+                    &watched,
+                    state.start_block,
+                )
+                .await
+                {
+                    state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        "address history: MEV pass not recorded, retrying next poll: {e:#}"
+                    );
+                }
+                state.set_calls("main", self.main.calls());
+            }
         }
     }
 }
@@ -914,6 +939,15 @@ pub async fn dev(
         .with_range(ah.start_block.unwrap_or(0), ah.end_block, depth)
         .with_tracer(tracer)
         .with_forward(forward(discovery.clone(), verified.clone()));
+    if ah.mev_relays {
+        if chain_id != 1 {
+            bail!("[address_history] mev_relays is for Ethereum mainnet's relays; this nest is on chain {chain_id}");
+        }
+        tracing::info!(
+            "address history: asking the MEV-Boost relays about produced blocks; they see this machine's IP and those block numbers"
+        );
+        state = state.with_relays(crate::address_mev::relays_over_http()?);
+    }
     if let Some(m) = &ah.mirror {
         if m.chain_id != chain_id {
             bail!(
@@ -1253,6 +1287,7 @@ mod tests {
             end_block: None,
             poll_interval: None,
             mirror: None,
+            mev_relays: false,
         };
         assert_eq!(
             poll_interval(None, &cfg).unwrap(),

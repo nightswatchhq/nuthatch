@@ -21,7 +21,7 @@
 # nest per getminedblocks case in mined.tsv; (6) one nest per txlist case in created.tsv, contracts
 # deployed by a transaction, whose txlist opens with it; (7) the block partitions of slice 2: one
 # rebuilt byte for byte, a mirror missing one, and pre-London getblocknobytime. PHASES picks any of
-# 1, 3, 4, 5, 6 and 7 (2 runs within 1).
+# 1, 3, 4, 5, 6, 7 and 8 (2 runs within 1); (8) produced blocks and MEV-Boost deliveries per mev.tsv.
 #
 # MIRROR=<dir> runs phases 4 and 5 through partitions `nuthatch partitions` built into <dir> for their
 # ranges (17030000-17309999, 20000000-20009999, 14000000-14009999, 15340000-15349999) and phase 7
@@ -58,7 +58,7 @@ rows() { # manifest: its case rows, or fail when it is missing or has none, so a
   grep -v '^#' "$CASES/$1" > "$WORK/$1.rows" || { echo "FAIL: no cases in $CASES/$1"; exit 1; }
 }
 
-start() { # name address from to: start a nest watching one address over [from, to]
+start() { # name address from to [line]: a nest watching one address over [from, to]; line joins [address_history]
   mkdir -p "$WORK/$1"
   cat > "$WORK/$1/nuthatch.toml" <<EOF
 [nest]
@@ -71,6 +71,7 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
 addresses = ["$2"]
 start_block = $3
 end_block = $4
+${5:-}
 EOF
   if [ -n "${MIRROR:-}" ]; then
     cat >> "$WORK/$1/nuthatch.toml" <<EOF
@@ -184,8 +185,8 @@ if [[ $PHASES == *7* ]] && [ -z "${MIRROR:-}" ]; then
   exit 1
 fi
 # Phase 2 runs inside phase 1, on its nest, so it cannot be chosen alone.
-if ! [[ $PHASES =~ ^[134567]+$ ]]; then
-  echo "FAIL: PHASES=$PHASES; choose from 1 (vitalik, with its txhash phase), 3, 4, 5, 6 and 7" >&2
+if ! [[ $PHASES =~ ^[1345678]+$ ]]; then
+  echo "FAIL: PHASES=$PHASES; choose from 1 (vitalik, with its txhash phase), 3, 4, 5, 6, 7 and 8" >&2
   exit 1
 fi
 if [[ $PHASES == *1* ]]; then
@@ -382,6 +383,20 @@ start headers-pre-london 0x5e1ec7ed000000000000000000000000000000a1 12000000 120
 wait_covered headers-pre-london 0x5e1ec7ed000000000000000000000000000000a1 12000000 12009999 txsBeaconWithdrawal
 blocktimes headers-pre-london
 stop
+fi
+
+if [[ $PHASES == *8* ]]; then
+rows mev.tsv
+# Phase 8: produced blocks and MEV-Boost deliveries, against Etherscan's produced blocks and
+# block rewards and every relay's own deliveries, pinned by scripts/rfc0063-pin.sh.
+while IFS=$'\t' read -r name address from to _; do
+  start "$name" "$address" "$from" "$to" "mev_relays = true"
+  wait_covered "$name" "$address" "$from" "$to" nuthatchProducedBlocks
+  all_rows nuthatchProducedBlocks "$address" "$from" "$to" "$WORK/$name.jsonl"
+  same_rows "$name" '{blockNumber,blockHash,timeStamp,feeRecipient,blockReward,mev,mevRecipient,mevReward,relays,builderPubkey,proposerPubkey,paymentTx,paymentValue}' "$WORK/$name.jsonl" "$CASES/$name.jsonl"
+  echo "$name: $(wc -l < "$WORK/$name.jsonl" | tr -d ' ') produced blocks, $(jq -s 'map(select(.mev == "relay")) | length' "$WORK/$name.jsonl") through relays"
+  stop
+done < "$WORK/mev.tsv.rows"
 fi
 
 if [ "$FAILED" -ne 0 ]; then

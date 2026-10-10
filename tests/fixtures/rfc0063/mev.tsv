@@ -1,0 +1,2 @@
+# name	address	from	to	how it was found
+mev-0x11508a	0x11508abcb40bcb7e849b0c8ec3aa178b03ba4801	24640000	24660000	the fee recipients of 200 recent deliveries on six relays, kept to EOAs Etherscan also lists produced blocks for; this one has two self-built blocks (24647304, 24648123) and relay-paid blocks around them, one paid from an account other than the builder's
