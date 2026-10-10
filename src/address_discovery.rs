@@ -1942,33 +1942,36 @@ mod tests {
         }
     }
 
-    /// A span refused for its size is asked again smaller, even when other ranges on the window
-    /// have grown it straight back meanwhile.
+    /// A span refused for its size is asked again smaller, even when siblings that finish after
+    /// the refusal have grown the window straight back.
     #[tokio::test]
     async fn a_refused_span_retries_smaller_whatever_the_window_grew_to() {
+        /// Refuses spans over 100 blocks that hold block 5,000. Every other span succeeds slowly
+        /// and grows the window back to its ceiling, as busy siblings would.
         struct Regrows(std::sync::Arc<Window>, AtomicU64);
         impl Rpc for Regrows {
             async fn call(&self, _: &str, p: Value) -> Result<Value> {
-                if self.1.fetch_add(1, Ordering::SeqCst) > 1_000 {
-                    bail!("401 Unauthorized: a runaway retry");
-                }
                 let s = hex_u64(&p[0]["fromBlock"])?;
                 let e = hex_u64(&p[0]["toBlock"])?;
-                if e - s + 1 > 100 {
-                    for _ in 0..8 * REGROW_AFTER {
-                        self.0.succeeded();
+                if (s..=e).contains(&5_000) && e - s + 1 > 100 {
+                    if self.1.fetch_add(1, Ordering::SeqCst) >= 8 {
+                        bail!("401 Unauthorized: block 5,000 refused again and again");
                     }
                     bail!("query timed out");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                for _ in 0..8 * REGROW_AFTER {
+                    self.0.succeeded();
                 }
                 Ok(Value::Array((s..=e).map(|b| json!(b)).collect()))
             }
         }
         let w = std::sync::Arc::new(Window::new(1_000));
         let rpc = Regrows(w.clone(), AtomicU64::new(0));
-        let got = ranged_in(&rpc, &w, 0, 999, "trace_filter", blocks, 1)
+        let got = ranged(&rpc, &w, 0, 99_999, "trace_filter", blocks)
             .await
             .unwrap();
-        assert_eq!(got, (0..=999u64).map(|b| json!(b)).collect::<Vec<_>>());
+        assert_eq!(got, (0..=99_999u64).map(|b| json!(b)).collect::<Vec<_>>());
     }
 
     #[test]
