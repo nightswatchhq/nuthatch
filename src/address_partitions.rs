@@ -960,7 +960,7 @@ pub(crate) mod tests {
         for chain in [10, 8453] {
             let p = fetch(&empty, chain, 5).await.unwrap();
             assert_eq!(p.withdrawals, None);
-            let v = verify(&[p.clone()], 5, 5, header.hash_slow(), chain).unwrap();
+            let v = verify(std::slice::from_ref(&p), 5, 5, header.hash_slow(), chain).unwrap();
             assert!(v[0].withdrawals.is_empty());
             let err = verify(&[p], 5, 5, header.hash_slow(), 1).unwrap_err();
             assert!(format!("{err:#}").contains("lacks"), "{err:#}");
