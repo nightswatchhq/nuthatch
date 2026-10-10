@@ -579,9 +579,10 @@ impl AddressHistory {
         Ok(())
     }
 
-    /// Store a fetch's result: `rows` and the claim that `[from, to]` is complete for (address,
-    /// action), in one transaction. Refused if the address is not watched or the generation moved
-    /// since the fetch began, because either way the claim no longer describes what is stored.
+    /// Store a fetch's result: `rows`, replacing what `[from, to]` held, and the claim that the span
+    /// is complete for (address, action), in one transaction. Refused if the address is not watched
+    /// or the generation moved since the fetch began, because either way the claim no longer
+    /// describes what is stored.
     pub fn record(
         &self,
         action: Action,
@@ -593,8 +594,8 @@ impl AddressHistory {
         self.record_with(action, address, rows, span, generation, false)
     }
 
-    /// [`AddressHistory::record`] for rows read from a verified partition: they replace whatever the
-    /// span held, and the span is marked verified.
+    /// [`AddressHistory::record`] for rows read from a verified partition: the span is marked
+    /// verified.
     pub fn record_verified(
         &self,
         action: Action,
@@ -634,12 +635,14 @@ impl AddressHistory {
             if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
                 bail!("a row at block {} lies outside [{from}, {to}]", r.block);
             }
+            // A recorded span is complete, so its rows replace whatever the span held, from
+            // either source.
+            drain(
+                &mut wtx.open_table(action.table())?,
+                &row_key(&a, from, 0, 0),
+                &row_key(&a, to, u64::MAX, u64::MAX),
+            )?;
             if verified {
-                drain(
-                    &mut wtx.open_table(action.table())?,
-                    &row_key(&a, from, 0, 0),
-                    &row_key(&a, to, u64::MAX, u64::MAX),
-                )?;
                 add_span(
                     &mut wtx.open_table(VERIFIED_COV)?,
                     &coverage_key(&a, action),
@@ -1980,6 +1983,42 @@ mod tests {
 
     /// Rows the RPC scan recorded in a mirror's blocks are set aside unless a verified partition
     /// replaced them, and a verified record replaces what its span held.
+    /// An RPC scan over blocks a partition supplied replaces their rows: a row the scan did not
+    /// produce is not left beside the rows it did.
+    #[test]
+    fn a_recorded_span_replaces_the_rows_it_held() {
+        let (_d, h) = history();
+        let at = |b: u64| Row {
+            block: b,
+            tx_index: 0,
+            position: 0,
+            record: serde_json::json!({"blockNumber": b.to_string()})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let g = h.generation().unwrap();
+        h.record_verified(Action::MinedBlocks, ALICE, &[at(55), at(60)], (50, 70), g)
+            .unwrap();
+        h.record(Action::MinedBlocks, ALICE, &[at(55)], (40, 80), g)
+            .unwrap();
+        let Answer::Rows(rows) = h
+            .page(
+                Action::MinedBlocks,
+                &PageRequest {
+                    start_block: Some(40),
+                    end_block: Some(80),
+                    ..req(0, 0, 1, 10)
+                },
+            )
+            .unwrap()
+        else {
+            panic!("covered")
+        };
+        let blocks: Vec<&Value> = rows.iter().map(|r| &r["blockNumber"]).collect();
+        assert_eq!(blocks, ["55"]);
+    }
+
     #[test]
     fn only_verified_coverage_survives_in_the_mirrors_blocks() {
         let (_d, h) = history();
