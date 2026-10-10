@@ -9,6 +9,7 @@
 #   list is paged and the range applied here.
 # - txlist, for each case in created.tsv: the contract's rows over the case's range, its creation
 #   among them.
+# - getblocknobytime, for each case in blocktimes.tsv: see that section.
 # The key stays in the environment and reaches curl on its standard input, never its arguments.
 set -euo pipefail
 : "${ETHERSCAN_KEY:?set ETHERSCAN_KEY}"
@@ -57,3 +58,27 @@ grep -v '^#' "$HERE/tests/fixtures/rfc0063/created.tsv" | while IFS=$'\t' read -
   fetch "action=txlist&address=$address&startblock=$from&endblock=$to&page=1&offset=1000&sort=asc" > "$OUT/$name.jsonl"
   echo "$name: $(wc -l < "$OUT/$name.jsonl" | tr -d ' ') rows"
 done
+
+# getblocknobytime, for each case in blocktimes.tsv: at the block's own timestamp and one second
+# after it, closest before and after. The timestamp comes from Etherscan's proxy, so every number
+# here is Etherscan's.
+block_time() { # block: its timestamp, in decimal
+  local r
+  r=$(printf 'url = "https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=0x%x&boolean=false&apikey=%s"\n' "$1" "$ETHERSCAN_KEY" | curl -s --retry 3 -K -)
+  sleep 0.25
+  printf '%d\n' "$(jq -r .result.timestamp <<<"$r")"
+}
+: > "$OUT/blocktimes.jsonl"
+grep -v '^#' "$HERE/tests/fixtures/rfc0063/blocktimes.tsv" | while IFS=$'\t' read -r name block; do
+  t=$(block_time "$block")
+  for at in "$t" "$((t + 1))"; do
+    for closest in before after; do
+      r=$(printf 'url = "https://api.etherscan.io/v2/api?chainid=1&module=block&action=getblocknobytime&timestamp=%s&closest=%s&apikey=%s"\n' "$at" "$closest" "$ETHERSCAN_KEY" | curl -s --retry 3 -K -)
+      sleep 0.25
+      [ "$(jq -r .status <<<"$r")" = 1 ] || { echo "FAIL getblocknobytime $at $closest: $(jq -c .result <<<"$r")" >&2; exit 1; }
+      jq -cn --arg c "$name" --arg t "$at" --arg cl "$closest" --arg b "$(jq -r .result <<<"$r")" \
+        '{case: $c, timestamp: $t, closest: $cl, block: $b}' >> "$OUT/blocktimes.jsonl"
+    done
+  done
+done
+echo "blocktimes: $(wc -l < "$OUT/blocktimes.jsonl" | tr -d ' ') answers"

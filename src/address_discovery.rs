@@ -266,7 +266,7 @@ async fn ranged<R: Rpc>(
     Ok(out)
 }
 
-fn hex_u64(v: &Value) -> Result<u64> {
+pub(crate) fn hex_u64(v: &Value) -> Result<u64> {
     match v {
         Value::Number(n) => n.as_u64().ok_or_else(|| anyhow!("not a u64: {n}")),
         Value::String(s) => u64::from_str_radix(s.trim_start_matches("0x"), 16)
@@ -367,27 +367,51 @@ pub struct BlockFound {
     pub mined: Vec<Row>,
 }
 
-/// Record a block scan's finds for one address over `[from, to]`.
+/// The issuance a block paid its miner before the Merge, by fork; none after it.
+pub fn static_reward(b: u64) -> alloy_primitives::U256 {
+    use alloy_primitives::U256;
+    let ether = U256::from(1_000_000_000_000_000_000u64);
+    if b >= MERGE {
+        U256::ZERO
+    } else if b >= CONSTANTINOPLE {
+        ether * U256::from(2)
+    } else if b >= BYZANTIUM {
+        ether * U256::from(3)
+    } else {
+        ether * U256::from(5)
+    }
+}
+
+/// Record a block scan's finds for one address over `[from, to]`; `verified` when they were read from
+/// a verified partition rather than the RPC.
 pub fn record_blocks(
     history: &AddressHistory,
     address: &str,
     (from, to): (u64, u64),
     found: BlockFound,
     generation: u64,
+    verified: bool,
 ) -> Result<()> {
+    let record = if verified {
+        AddressHistory::record_verified
+    } else {
+        AddressHistory::record
+    };
     let within = |rows: Vec<Row>| -> Vec<Row> {
         rows.into_iter()
             .filter(|r| from <= r.block && r.block <= to)
             .collect()
     };
-    history.record(
+    record(
+        history,
         Action::BeaconWithdrawals,
         address,
         &within(found.withdrawals),
         (from, to),
         generation,
     )?;
-    history.record(
+    record(
+        history,
         Action::MinedBlocks,
         address,
         &within(found.mined),
@@ -675,16 +699,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 .ok_or_else(|| anyhow!("block {b}: a receipt priced under the base fee"))?;
             fees += quantity(r, "gasUsed")? * tip;
         }
-        let ether = U256::from(1_000_000_000_000_000_000u64);
-        let static_reward = if b >= MERGE {
-            U256::ZERO
-        } else if b >= CONSTANTINOPLE {
-            ether * U256::from(2)
-        } else if b >= BYZANTIUM {
-            ether * U256::from(3)
-        } else {
-            ether * U256::from(5)
-        };
+        let static_reward = static_reward(b);
         let uncles = header
             .get("uncles")
             .and_then(Value::as_array)

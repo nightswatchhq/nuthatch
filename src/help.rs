@@ -26,7 +26,15 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     (
         "ADVANCED",
         &[
-            "recipe", "metadata", "offchain", "publish", "seed", "nest", "migrate", "prune",
+            "recipe",
+            "metadata",
+            "offchain",
+            "publish",
+            "seed",
+            "partitions",
+            "nest",
+            "migrate",
+            "prune",
             "count", // RFC-0054 hook
         ],
     ),

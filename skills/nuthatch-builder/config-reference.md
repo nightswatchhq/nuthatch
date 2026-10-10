@@ -183,10 +183,26 @@ end_block = 20000000          # optional: stop here
 poll_interval = "5m"          # optional, default 5m; `--poll-interval` overrides it
 ```
 
+On Ethereum mainnet, withdrawals, produced blocks and `getblocknobytime` can come from verified block
+partitions (RFC-0063 §8) instead of one RPC call per block. It is off unless this table names a
+mirror, and the mirror then sees the nest's IP and the block ranges it downloads, never an address:
+
+```toml
+[address_history.mirror]
+url = "https://mirror.example/partitions"  # or a local directory of partitions, an import
+chain_id = 1                  # must be the nest's chain
+from_block = 17030000         # the blocks taken from the mirror; the RPC scan never reads them
+to_block = 17309999
+cache_mb = 512                # disk the downloaded partitions may hold; at least 64
+```
+
+Each partition is verified before use: every header hashed, linked to its parent and anchored to the
+block the nest's own RPC calls finalized, every withdrawal list hashed to its root. One that is
+missing or fails stays `NUTHATCH_INCOMPLETE`. `nuthatch partitions` builds them.
+
 The table stays out of the nest's identity and its bundle: the accounts are private and change at
 runtime through `POST /api/watch` and `POST /api/unwatch` with `{"address": "0x…"}`, accepted only on
 a loopback bind. A range the nest has not fetched answers `NUTHATCH_INCOMPLETE`, never an empty list.
-Discovery is not built yet, so today every range reads incomplete.
 
 ## `entities.toml` - authored incremental relations (RFC-0041)
 

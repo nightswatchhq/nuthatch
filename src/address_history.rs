@@ -26,6 +26,8 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// Etherscan's largest page.
 pub const MAX_OFFSET: u64 = 10_000;
 pub const DEFAULT_OFFSET: u64 = 1_000;
+/// A partition is a few MB; a smaller cache could not keep the one being verified.
+pub const MIN_CACHE_MB: u64 = 64;
 
 /// The `[address_history]` table of `nuthatch.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -38,6 +40,22 @@ pub struct AddressHistoryConfig {
     pub end_block: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<String>,
+    /// Block partitions to download rather than read block by block (RFC-0063 §8). Off unless named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<MirrorConfig>,
+}
+
+/// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
+/// take from it, and how much disk the downloaded copies may hold. The mirror sees this nest's IP
+/// and the ranges it asks for, never an address.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorConfig {
+    pub url: String,
+    pub chain_id: u64,
+    pub from_block: u64,
+    pub to_block: u64,
+    pub cache_mb: u64,
 }
 
 impl AddressHistoryConfig {
@@ -58,6 +76,21 @@ impl AddressHistoryConfig {
         if let (Some(s), Some(e)) = (self.start_block, self.end_block) {
             if e < s {
                 bail!("[address_history] end_block {e} is before start_block {s}");
+            }
+        }
+        if let Some(m) = &self.mirror {
+            if m.to_block < m.from_block {
+                bail!(
+                    "[address_history.mirror] to_block {} is before from_block {}",
+                    m.to_block,
+                    m.from_block
+                );
+            }
+            if m.cache_mb < MIN_CACHE_MB {
+                bail!(
+                    "[address_history.mirror] cache_mb {} cannot hold one partition; give it at least {MIN_CACHE_MB}",
+                    m.cache_mb
+                );
             }
         }
         self.poll_interval()?;
@@ -188,6 +221,13 @@ const TX_CACHE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_cach
 const BLOCK_TS: TableDefinition<u64, u64> = TableDefinition::new("ah_block_ts");
 /// A transaction's whole internal list, by hash, as `txhash` lookups answer it.
 const TX_INTERNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_internal");
+/// The blocks whose headers came from a verified partition, as merged `[from, to]` pairs under one key.
+/// Only within them does `BLOCK_TS` answer `getblocknobytime`.
+const HEADERS: TableDefinition<&str, &[u8]> = TableDefinition::new("ah_headers");
+const VERIFIED: &str = "verified";
+/// The part of each (address, action) coverage that came from verified partitions, in the same shape
+/// as `COVERAGE`. With a mirror configured, only this part of its blocks may answer.
+const VERIFIED_COV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_verified_coverage");
 /// `address | action code` -> `[from, to]` pairs, inclusive, sorted and merged, 16 bytes each.
 const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverage");
 const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
@@ -285,6 +325,8 @@ impl AddressHistory {
         wtx.open_table(TX_CACHE)?;
         wtx.open_table(BLOCK_TS)?;
         wtx.open_table(TX_INTERNAL)?;
+        wtx.open_table(HEADERS)?;
+        wtx.open_table(VERIFIED_COV)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
@@ -379,16 +421,102 @@ impl AddressHistory {
         Ok(rtx.open_table(BLOCK_TS)?.get(block)?.map(|v| v.value()))
     }
 
+    /// Timestamps read over RPC. A block with a verified header keeps the verified one: a slow read
+    /// landing after a partition was recorded must not replace it.
     pub fn cache_block_timestamps(&self, ts: &[(u64, u64)]) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let verified = match wtx.open_table(HEADERS)?.get(VERIFIED)? {
+                Some(v) => decode_spans(v.value())?,
+                None => Vec::new(),
+            };
+            let mut t = wtx.open_table(BLOCK_TS)?;
+            for (b, s) in ts {
+                if !verified.iter().any(|(f, l)| f <= b && b <= l) {
+                    t.insert(*b, *s)?;
+                }
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Record that every block in `[from, to]` has a verified header, with `ts` holding each one's
+    /// timestamp.
+    pub fn record_headers(&self, (from, to): (u64, u64), ts: &[(u64, u64)]) -> Result<()> {
+        let contiguous = ts.len() as u64 == to - from + 1
+            && ts.iter().zip(from..=to).all(|((b, _), want)| *b == want);
+        if !contiguous {
+            bail!("header timestamps do not cover [{from}, {to}] block by block");
+        }
         let wtx = self.store.database().begin_write()?;
         {
             let mut t = wtx.open_table(BLOCK_TS)?;
             for (b, s) in ts {
                 t.insert(*b, *s)?;
             }
+            let mut h = wtx.open_table(HEADERS)?;
+            let mut spans = match h.get(VERIFIED)? {
+                Some(v) => decode_spans(v.value())?,
+                None => Vec::new(),
+            };
+            spans.push((from, to));
+            h.insert(VERIFIED, encode_spans(&merge(spans)).as_slice())?;
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    pub fn header_coverage(&self) -> Result<Vec<(u64, u64)>> {
+        let rtx = self.store.database().begin_read()?;
+        match rtx.open_table(HEADERS)?.get(VERIFIED)? {
+            Some(v) => decode_spans(v.value()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Etherscan's `getblocknobytime`: the last block at or before `t`, or the first at or after it.
+    /// Answered only inside a run of verified headers, where a block's neighbour is known too;
+    /// `None` when no run brackets `t`. Timestamps rise strictly from block to block, which is what
+    /// lets an equal timestamp at a run's edge answer.
+    pub fn block_by_time(&self, t: u64, after: bool) -> Result<Option<u64>> {
+        let rtx = self.store.database().begin_read()?;
+        let spans = match rtx.open_table(HEADERS)?.get(VERIFIED)? {
+            Some(v) => decode_spans(v.value())?,
+            None => return Ok(None),
+        };
+        let table = rtx.open_table(BLOCK_TS)?;
+        let ts = |b: u64| -> Result<u64> {
+            table
+                .get(b)?
+                .map(|v| v.value())
+                .ok_or_else(|| anyhow!("verified block {b} has no timestamp"))
+        };
+        for (from, to) in spans {
+            if t < ts(from)? || t > ts(to)? {
+                continue;
+            }
+            let (mut lo, mut hi) = (from, to);
+            while lo < hi {
+                if after {
+                    let mid = lo + (hi - lo) / 2;
+                    if ts(mid)? >= t {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                } else {
+                    let mid = lo + (hi - lo).div_ceil(2);
+                    if ts(mid)? <= t {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+            }
+            return Ok(Some(lo));
+        }
+        Ok(None)
     }
 
     /// Bumped by every change that removes rows or coverage. A fetch records the generation it
@@ -442,6 +570,8 @@ impl AddressHistory {
                 drain(&mut t, &lo, &hi)?;
                 wtx.open_table(COVERAGE)?
                     .remove(coverage_key(&a, action).as_slice())?;
+                wtx.open_table(VERIFIED_COV)?
+                    .remove(coverage_key(&a, action).as_slice())?;
             }
             bump_generation(&wtx)?;
         }
@@ -449,16 +579,42 @@ impl AddressHistory {
         Ok(())
     }
 
-    /// Store a fetch's result: `rows` and the claim that `[from, to]` is complete for (address,
-    /// action), in one transaction. Refused if the address is not watched or the generation moved
-    /// since the fetch began, because either way the claim no longer describes what is stored.
+    /// Store a fetch's result: `rows`, replacing what `[from, to]` held, and the claim that the span
+    /// is complete for (address, action), in one transaction. Refused if the address is not watched
+    /// or the generation moved since the fetch began, because either way the claim no longer
+    /// describes what is stored.
     pub fn record(
+        &self,
+        action: Action,
+        address: &str,
+        rows: &[Row],
+        span: (u64, u64),
+        generation: u64,
+    ) -> Result<()> {
+        self.record_with(action, address, rows, span, generation, false)
+    }
+
+    /// [`AddressHistory::record`] for rows read from a verified partition: the span is marked
+    /// verified.
+    pub fn record_verified(
+        &self,
+        action: Action,
+        address: &str,
+        rows: &[Row],
+        span: (u64, u64),
+        generation: u64,
+    ) -> Result<()> {
+        self.record_with(action, address, rows, span, generation, true)
+    }
+
+    fn record_with(
         &self,
         action: Action,
         address: &str,
         rows: &[Row],
         (from, to): (u64, u64),
         generation: u64,
+        verified: bool,
     ) -> Result<()> {
         if to < from {
             bail!("coverage interval [{from}, {to}] is empty");
@@ -479,8 +635,97 @@ impl AddressHistory {
             if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
                 bail!("a row at block {} lies outside [{from}, {to}]", r.block);
             }
+            // A recorded span is complete, so its rows replace whatever the span held, from
+            // either source.
+            drain(
+                &mut wtx.open_table(action.table())?,
+                &row_key(&a, from, 0, 0),
+                &row_key(&a, to, u64::MAX, u64::MAX),
+            )?;
+            if verified {
+                add_span(
+                    &mut wtx.open_table(VERIFIED_COV)?,
+                    &coverage_key(&a, action),
+                    (from, to),
+                )?;
+            } else {
+                // Rows the RPC wrote are not verified, whatever was there before them.
+                let key = coverage_key(&a, action);
+                let mut v = wtx.open_table(VERIFIED_COV)?;
+                let kept = match v.get(key.as_slice())? {
+                    Some(s) => Some(subtract(&decode_spans(s.value())?, (from, to))),
+                    None => None,
+                };
+                if let Some(kept) = kept {
+                    v.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
+            }
             put_rows(&wtx, action, &a, rows)?;
             cover(&wtx, action, &a, from, to)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    pub fn verified_coverage(&self, action: Action, address: &str) -> Result<Vec<(u64, u64)>> {
+        let a = parse_address(address)?;
+        let rtx = self.store.database().begin_read()?;
+        match rtx
+            .open_table(VERIFIED_COV)?
+            .get(coverage_key(&a, action).as_slice())?
+        {
+            Some(v) => decode_spans(v.value()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Within `[first, last]`, drop the coverage of `actions` that did not come from verified
+    /// partitions, and its rows, so a range scanned before a mirror was configured answers
+    /// incomplete until a partition replaces it rather than standing in for one.
+    pub fn keep_verified_only(&self, actions: &[Action], (first, last): (u64, u64)) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        let mut changed = false;
+        {
+            let mut c = wtx.open_table(COVERAGE)?;
+            let v = wtx.open_table(VERIFIED_COV)?;
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = c
+                .iter()?
+                .map(|e| e.map(|(k, v)| (k.value().to_vec(), v.value().to_vec())))
+                .collect::<std::result::Result<_, _>>()?;
+            for (key, spans) in entries {
+                let Some(&action) = actions.iter().find(|a| a.code() == key[20]) else {
+                    continue;
+                };
+                let spans = decode_spans(&spans)?;
+                let verified = match v.get(key.as_slice())? {
+                    Some(s) => decode_spans(s.value())?,
+                    None => Vec::new(),
+                };
+                let mut kept = subtract(&spans, (first, last));
+                kept.extend(intersect(&spans, &intersect(&verified, &[(first, last)])));
+                let kept = merge(kept);
+                if kept == spans {
+                    continue;
+                }
+                changed = true;
+                let a: Address = key[..20].try_into().expect("coverage keys are 21 bytes");
+                let mut rows = wtx.open_table(action.table())?;
+                for (f, t) in subtract_all(&intersect(&spans, &[(first, last)]), &verified) {
+                    drain(
+                        &mut rows,
+                        &row_key(&a, f, 0, 0),
+                        &row_key(&a, t, u64::MAX, u64::MAX),
+                    )?;
+                }
+                if kept.is_empty() {
+                    c.remove(key.as_slice())?;
+                } else {
+                    c.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
+            }
+            if changed {
+                bump_generation(&wtx)?;
+            }
         }
         wtx.commit()?;
         Ok(())
@@ -560,22 +805,56 @@ impl AddressHistory {
                     m.insert(HEAD, block)?;
                 }
             }
-            // A trace of a block the reorg replaced describes a transaction that may no longer
-            // exist there; a txhash lookup must trace it again.
-            let mut traces = wtx.open_table(TX_INTERNAL)?;
-            let mut stale = Vec::new();
-            for e in traces.iter()? {
-                let (k, v) = e?;
-                let cached = decode_record(v.value())?
-                    .get("blockNumber")
-                    .and_then(Value::as_str)
-                    .and_then(|b| b.parse::<u64>().ok());
-                if cached.is_none_or(|b| b > block) {
-                    stale.push(k.value().to_vec());
+            {
+                // A trace of a block the reorg replaced describes a transaction that may no longer
+                // exist there; a txhash lookup must trace it again.
+                let mut traces = wtx.open_table(TX_INTERNAL)?;
+                let mut stale = Vec::new();
+                for e in traces.iter()? {
+                    let (k, v) = e?;
+                    let cached = decode_record(v.value())?
+                        .get("blockNumber")
+                        .and_then(Value::as_str)
+                        .and_then(|b| b.parse::<u64>().ok());
+                    if cached.is_none_or(|b| b > block) {
+                        stale.push(k.value().to_vec());
+                    }
+                }
+                for k in stale {
+                    traces.remove(k.as_slice())?;
                 }
             }
-            for k in stale {
-                traces.remove(k.as_slice())?;
+            {
+                let mut v = wtx.open_table(VERIFIED_COV)?;
+                let entries: Vec<(Vec<u8>, Vec<u8>)> = v
+                    .iter()?
+                    .map(|e| e.map(|(k, v)| (k.value().to_vec(), v.value().to_vec())))
+                    .collect::<std::result::Result<_, _>>()?;
+                for (key, spans) in entries {
+                    let kept =
+                        subtract(&decode_spans(&spans)?, (block.saturating_add(1), u64::MAX));
+                    if kept.is_empty() {
+                        v.remove(key.as_slice())?;
+                    } else {
+                        v.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                    }
+                }
+            }
+            {
+                let mut h = wtx.open_table(HEADERS)?;
+                let kept: Option<Vec<(u64, u64)>> = match h.get(VERIFIED)? {
+                    Some(v) => Some(
+                        decode_spans(v.value())?
+                            .into_iter()
+                            .filter(|(from, _)| *from <= block)
+                            .map(|(from, to)| (from, to.min(block)))
+                            .collect(),
+                    ),
+                    None => None,
+                };
+                if let Some(kept) = kept {
+                    h.insert(VERIFIED, encode_spans(&kept).as_slice())?;
+                }
             }
             bump_generation(&wtx)?;
         }
@@ -735,6 +1014,57 @@ fn drain(t: &mut redb::Table<&'static [u8], &'static [u8]>, lo: &[u8], hi: &[u8]
     for k in keys {
         t.remove(k.as_slice())?;
     }
+    Ok(())
+}
+
+/// `spans` without the blocks of `[from, to]`.
+fn subtract(spans: &[(u64, u64)], (from, to): (u64, u64)) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(f, t) in spans {
+        if t < from || f > to {
+            out.push((f, t));
+            continue;
+        }
+        if f < from {
+            out.push((f, from - 1));
+        }
+        if t > to {
+            out.push((to + 1, t));
+        }
+    }
+    out
+}
+
+fn subtract_all(spans: &[(u64, u64)], others: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    others
+        .iter()
+        .fold(spans.to_vec(), |left, &other| subtract(&left, other))
+}
+
+fn intersect(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(af, at) in a {
+        for &(bf, bt) in b {
+            let (f, t) = (af.max(bf), at.min(bt));
+            if f <= t {
+                out.push((f, t));
+            }
+        }
+    }
+    merge(out)
+}
+
+fn add_span(
+    t: &mut redb::Table<&'static [u8], &'static [u8]>,
+    key: &[u8],
+    span: (u64, u64),
+) -> Result<()> {
+    let mut spans = match t.get(key)? {
+        Some(v) => decode_spans(v.value())?,
+        None => Vec::new(),
+    };
+    spans.push(span);
+    t.insert(key, encode_spans(&merge(spans)).as_slice())?;
     Ok(())
 }
 
@@ -1040,6 +1370,9 @@ pub fn respond(
     let get = |k: &str| params.get(k).map(String::as_str);
     let module = get("module").unwrap_or("");
     let action = get("action").unwrap_or("");
+    if module == "block" && action == "getblocknobytime" {
+        return block_no_by_time(history, params);
+    }
     let Some(act) = Action::from_etherscan(action).filter(|_| module == "account") else {
         return unsupported(&format!("{module}/{action} is not served by this nest"));
     };
@@ -1067,6 +1400,41 @@ pub fn respond(
             Ok((Answer::Incomplete(why), _)) => incomplete(&why),
             Err(e) => error(format!("{e:#}")),
         },
+    }
+}
+
+/// `block/getblocknobytime`, from verified headers only.
+fn block_no_by_time(
+    history: Option<&AddressHistory>,
+    params: &std::collections::HashMap<String, String>,
+) -> Value {
+    let Some(history) = history else {
+        return unsupported("this nest has no [address_history]");
+    };
+    let get = |k: &str| params.get(k).map(String::as_str);
+    if let Some(c) = get("chainid") {
+        if c.parse::<u64>().ok() != Some(history.chain_id) {
+            return unsupported(&format!(
+                "chainid {c} is not this nest's chain {}",
+                history.chain_id
+            ));
+        }
+    }
+    let Some(t) = get("timestamp").and_then(|t| t.parse::<u64>().ok()) else {
+        return error("Invalid timestamp");
+    };
+    let after = match get("closest") {
+        Some("before") => false,
+        Some("after") => true,
+        _ => return error("Invalid closest value, use before or after"),
+    };
+    match history.block_by_time(t, after) {
+        Ok(Some(b)) => ok(
+            Value::String(b.to_string()),
+            history.generation().unwrap_or(0),
+        ),
+        Ok(None) => incomplete(&format!("no verified headers bracket timestamp {t}")),
+        Err(e) => error(format!("{e:#}")),
     }
 }
 
@@ -1396,7 +1764,7 @@ mod tests {
         for (module, action) in [
             ("account", "balancemulti"),
             ("contract", "getabi"),
-            ("block", "getblocknobytime"),
+            ("block", "getblockreward"),
             ("logs", "txlist"),
         ] {
             let a = respond(
@@ -1613,6 +1981,169 @@ mod tests {
         assert!(parse_address("0xD8dA6BF26964aF9D7eEd9e03E53415D37aA96045").is_err());
     }
 
+    /// Rows the RPC scan recorded in a mirror's blocks are set aside unless a verified partition
+    /// replaced them, and a verified record replaces what its span held.
+    /// An RPC scan over blocks a partition supplied replaces their rows: a row the scan did not
+    /// produce is not left beside the rows it did.
+    #[test]
+    fn a_recorded_span_replaces_the_rows_it_held() {
+        let (_d, h) = history();
+        let at = |b: u64| Row {
+            block: b,
+            tx_index: 0,
+            position: 0,
+            record: serde_json::json!({"blockNumber": b.to_string()})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let g = h.generation().unwrap();
+        h.record_verified(Action::MinedBlocks, ALICE, &[at(55), at(60)], (50, 70), g)
+            .unwrap();
+        h.record(Action::MinedBlocks, ALICE, &[at(55)], (40, 80), g)
+            .unwrap();
+        let Answer::Rows(rows) = h
+            .page(
+                Action::MinedBlocks,
+                &PageRequest {
+                    start_block: Some(40),
+                    end_block: Some(80),
+                    ..req(0, 0, 1, 10)
+                },
+            )
+            .unwrap()
+        else {
+            panic!("covered")
+        };
+        let blocks: Vec<&Value> = rows.iter().map(|r| &r["blockNumber"]).collect();
+        assert_eq!(blocks, ["55"]);
+    }
+
+    #[test]
+    fn only_verified_coverage_survives_in_the_mirrors_blocks() {
+        let (_d, h) = history();
+        let at = |b: u64| Row {
+            block: b,
+            tx_index: 0,
+            position: 0,
+            record: serde_json::json!({"blockNumber": b.to_string()})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let g = h.generation().unwrap();
+        h.record(
+            Action::MinedBlocks,
+            ALICE,
+            &[at(10), at(60), at(90)],
+            (0, 100),
+            g,
+        )
+        .unwrap();
+        h.record_verified(Action::MinedBlocks, ALICE, &[at(55)], (50, 70), g)
+            .unwrap();
+        h.keep_verified_only(&[Action::MinedBlocks], (40, 80))
+            .unwrap();
+        assert_eq!(
+            h.coverage(Action::MinedBlocks, ALICE).unwrap(),
+            vec![(0, 39), (50, 70), (81, 100)]
+        );
+        assert_eq!(
+            h.verified_coverage(Action::MinedBlocks, ALICE).unwrap(),
+            vec![(50, 70)]
+        );
+        assert!(
+            h.generation().unwrap() > g,
+            "a page cut before this must not continue"
+        );
+        let Answer::Rows(rows) = h
+            .page(
+                Action::MinedBlocks,
+                &PageRequest {
+                    start_block: Some(50),
+                    end_block: Some(70),
+                    ..req(0, 0, 1, 10)
+                },
+            )
+            .unwrap()
+        else {
+            panic!("covered")
+        };
+        assert_eq!(rows.len(), 1, "block 60 from the RPC is gone, 55 verified");
+        assert_eq!(rows[0]["blockNumber"], "55");
+        h.invalidate_above(60).unwrap();
+        assert_eq!(
+            h.verified_coverage(Action::MinedBlocks, ALICE).unwrap(),
+            vec![(50, 60)]
+        );
+        let g = h.generation().unwrap();
+        h.record(Action::MinedBlocks, ALICE, &[], (55, 56), g)
+            .unwrap();
+        assert_eq!(
+            h.verified_coverage(Action::MinedBlocks, ALICE).unwrap(),
+            vec![(50, 54), (57, 60)],
+            "an RPC write over verified blocks takes their mark away"
+        );
+    }
+
+    /// `getblocknobytime` answers only inside verified headers, an equal timestamp naming its own
+    /// block either way, and a reorg below them takes the answer away.
+    #[test]
+    fn getblocknobytime_answers_from_verified_headers_only() {
+        let (_d, h) = history();
+        let ask = |t: &str, closest: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "block"),
+                    ("action", "getblocknobytime"),
+                    ("timestamp", t),
+                    ("closest", closest),
+                ]),
+            )
+        };
+        assert!(ask("1000", "before")["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("NUTHATCH_INCOMPLETE:"));
+        // Blocks 100..=110 at 1000, 1012, ...; 99 and 111 are unread RPC timestamps, not verified.
+        h.cache_block_timestamps(&[(99, 988), (111, 1132)]).unwrap();
+        let ts: Vec<(u64, u64)> = (100..=110).map(|b| (b, 1000 + 12 * (b - 100))).collect();
+        h.record_headers((100, 110), &ts).unwrap();
+        // A slow RPC read landing after the partition does not replace a verified timestamp.
+        h.cache_block_timestamps(&[(105, 1)]).unwrap();
+        for (t, closest, want) in [
+            ("1000", "before", "100"),
+            ("1000", "after", "100"),
+            ("1005", "before", "100"),
+            ("1005", "after", "101"),
+            ("1120", "before", "110"),
+            ("1120", "after", "110"),
+        ] {
+            assert_eq!(ask(t, closest)["result"], want, "{t} {closest}");
+        }
+        for (t, closest) in [("999", "after"), ("1121", "before")] {
+            assert!(
+                ask(t, closest)["result"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("NUTHATCH_INCOMPLETE:"),
+                "{t} {closest}"
+            );
+        }
+        assert!(ask("1005", "nearest")["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("Error!"));
+        assert!(h.record_headers((100, 102), &ts[..2]).is_err());
+        h.invalidate_above(105).unwrap();
+        assert_eq!(h.header_coverage().unwrap(), vec![(100, 105)]);
+        assert!(ask("1100", "before")["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("NUTHATCH_INCOMPLETE:"));
+    }
+
     #[test]
     fn config_validation() {
         let ok = AddressHistoryConfig {
@@ -1620,6 +2151,7 @@ mod tests {
             start_block: None,
             end_block: None,
             poll_interval: None,
+            mirror: None,
         };
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);
@@ -1639,6 +2171,33 @@ mod tests {
         });
         bad(AddressHistoryConfig {
             poll_interval: Some("0s".into()),
+            ..ok.clone()
+        });
+        let mirror = MirrorConfig {
+            url: "https://example.org".into(),
+            chain_id: 1,
+            from_block: 10,
+            to_block: 20,
+            cache_mb: MIN_CACHE_MB,
+        };
+        AddressHistoryConfig {
+            mirror: Some(mirror.clone()),
+            ..ok.clone()
+        }
+        .validate()
+        .unwrap();
+        bad(AddressHistoryConfig {
+            mirror: Some(MirrorConfig {
+                to_block: 9,
+                ..mirror.clone()
+            }),
+            ..ok.clone()
+        });
+        bad(AddressHistoryConfig {
+            mirror: Some(MirrorConfig {
+                cache_mb: MIN_CACHE_MB - 1,
+                ..mirror
+            }),
             ..ok.clone()
         });
     }
