@@ -514,5 +514,13 @@ mod tests {
         });
         assert!(relay_record(&h, &down, 100).await.is_err());
         assert!(h.relay_record(100).unwrap().is_none());
+
+        // A block past what the nest serves is asked about but not kept: a relay may yet learn
+        // of it.
+        let (rel, asked) = relays(vec![]);
+        relay_record(&h, &rel, 2_000).await.unwrap();
+        relay_record(&h, &rel, 2_000).await.unwrap();
+        assert_eq!(*asked.lock().unwrap(), 2 * 6);
+        assert!(h.relay_record(2_000).unwrap().is_none());
     }
 }
