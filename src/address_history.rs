@@ -347,12 +347,18 @@ impl AddressHistory {
         Ok(Some(rows))
     }
 
+    /// Keep each trace whose block is still served; a reorg that lowered the head while the trace
+    /// was in flight leaves it out.
     pub fn cache_tx_internals(&self, txs: &[TxInternals]) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         {
+            let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
             let mut t = wtx.open_table(TX_INTERNAL)?;
             let mut buf = Vec::new();
             for (hash, block, rows) in txs {
+                if head.is_none_or(|h| *block > h) {
+                    continue;
+                }
                 let mut wrapped = Map::new();
                 wrapped.insert("blockNumber".into(), Value::String(block.to_string()));
                 wrapped.insert(

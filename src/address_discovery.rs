@@ -2237,6 +2237,14 @@ mod tests {
         assert!(h.tx_internals(&key).unwrap().is_some());
         h.invalidate_above(299).unwrap();
         assert!(h.tx_internals(&key).unwrap().is_none());
+
+        // A trace fetched before a reorg and persisted after it is not kept.
+        h.set_head(400).unwrap();
+        let pending = Pending::default();
+        d.internal_rows_of(&h, tx, &pending, 400).await.unwrap();
+        h.invalidate_above(299).unwrap();
+        pending.persist(&h).unwrap();
+        assert!(h.tx_internals(&key).unwrap().is_none());
     }
 
     #[test]
